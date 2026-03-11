@@ -1,0 +1,15 @@
+[package]
+name = "sisvsim"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "SystemVerilog simulator targeting IEEE 1800-2017/2023"
+license = "Apache-2.0"
+
+[[bin]]
+name = "sisvsim"
+path = "src/main.rs"
+
+[lib]
+name = "sisvsim"
+path = "src/lib.rs"
