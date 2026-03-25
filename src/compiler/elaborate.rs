@@ -1,7 +1,7 @@
 //! Elaborator: converts parsed AST into a flat simulation model.
 //! Resolves net/variable declarations, continuous assigns, always blocks.
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use crate::ast::*;
 use crate::ast::decl::*;
 use crate::ast::module::*;
@@ -158,12 +158,18 @@ pub fn elaborate_module(
                 let is_signed = is_type_signed(&nd.data_type);
                 for decl in &nd.declarators {
                     let w = width_with_unpacked_dims(&decl.dimensions, width);
+                    // supply0 → constant 0, supply1 → constant 1
+                    let init_value = match nd.net_type {
+                        NetType::Supply0 => Value::zero(w),
+                        NetType::Supply1 => Value::ones(w),
+                        _ => Value::new(w),
+                    };
                     let sig = Signal {
                         name: decl.name.name.clone(),
                         width: w,
                         is_signed,
                         direction: None,
-                        value: Value::new(w),
+                        value: init_value,
                     };
                     elab.signals.insert(decl.name.name.clone(), sig);
                     // Wire with initializer → continuous assign (not constant eval)
@@ -256,6 +262,9 @@ pub fn elaborate_module(
                         rhs: rhs.clone(),
                     });
                 }
+            }
+            ModuleItem::GateInstantiation(gi) => {
+                gate_inst_to_assigns(gi, &mut elab);
             }
             ModuleItem::AlwaysConstruct(ac) => {
                 elab.always_blocks.push(AlwaysBlock {
@@ -362,9 +371,14 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule) {
                 let width = resolve_type_width_with_params(&nd.data_type, Some(&elab.parameters));
                 let is_signed = is_type_signed(&nd.data_type);
                 for decl in &nd.declarators {
+                    let init_value = match nd.net_type {
+                        NetType::Supply0 => Value::zero(width),
+                        NetType::Supply1 => Value::ones(width),
+                        _ => Value::new(width),
+                    };
                     let sig = Signal {
                         name: decl.name.name.clone(), width, is_signed,
-                        direction: None, value: Value::new(width),
+                        direction: None, value: init_value,
                     };
                     elab.signals.insert(decl.name.name.clone(), sig);
                     if let Some(init_expr) = &decl.init {
@@ -424,6 +438,9 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule) {
                 for (lhs, rhs) in &ca.assignments {
                     elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone() });
                 }
+            }
+            ModuleItem::GateInstantiation(gi) => {
+                gate_inst_to_assigns(gi, elab);
             }
             ModuleItem::AlwaysConstruct(ac) => {
                 elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone() });
@@ -642,7 +659,7 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
     match &expr.kind {
         ExprKind::Number(num) => {
             match num {
-                NumberLiteral::Integer { size, signed, base, value } => {
+                NumberLiteral::Integer { size, signed, base, value, .. } => {
                     let w = size.unwrap_or(32);
                     let r = match base {
                         NumberBase::Binary => 2, NumberBase::Octal => 8,
@@ -701,7 +718,7 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
 /// Handles recursive/multi-level hierarchies by walking all levels depth-first.
 pub fn inline_instantiations(
     elab: &mut ElaboratedModule,
-    modules: &std::collections::HashMap<String, &crate::ast::module::ModuleDeclaration>,
+    modules: &HashMap<String, &crate::ast::module::ModuleDeclaration>,
 ) -> Result<(), String> {
     let module_name = elab.name.clone();
     let top_mod = match modules.get(&module_name) {
@@ -751,7 +768,7 @@ fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_mod: &crate::ast::module::ModuleDeclaration,
     prefix: &str,
-    modules: &std::collections::HashMap<String, &crate::ast::module::ModuleDeclaration>,
+    modules: &HashMap<String, &crate::ast::module::ModuleDeclaration>,
 ) -> Result<(), String> {
     use crate::ast::decl::*;
     use crate::ast::module::*;
@@ -798,7 +815,7 @@ fn inline_module_items(
                 };
 
                 // Build port mapping: sub_port_name -> parent_expression
-                let mut port_map: std::collections::HashMap<String, Expression> = std::collections::HashMap::new();
+                let mut port_map: HashMap<String, Expression> = HashMap::new();
 
                 let sub_port_names: Vec<String> = match &sub_mod.ports {
                     PortList::Ansi(ports) => ports.iter().map(|p| p.name.name.clone()).collect(),
@@ -900,21 +917,41 @@ fn inline_module_items(
                 }
 
                 // Declare sub-module port signals
-                if let PortList::Ansi(ports) = &sub_mod.ports {
-                    for port in ports {
-                        let width = port.data_type.as_ref()
-                            .map(|dt| resolve_type_width_with_params(dt, Some(&elab.parameters)))
-                            .unwrap_or(1);
-                        let sig_name = format!("{}{}", inst_prefix, port.name.name);
-                        if sig_name.contains("mem_la_write") || sig_name.contains("mem_la_read") {
+                match &sub_mod.ports {
+                    PortList::Ansi(ports) => {
+                        for port in ports {
+                            let width = port.data_type.as_ref()
+                                .map(|dt| resolve_type_width_with_params(dt, Some(&elab.parameters)))
+                                .unwrap_or(1);
+                            let sig_name = format!("{}{}", inst_prefix, port.name.name);
+                            elab.signals.insert(sig_name.clone(), Signal {
+                                name: sig_name, width,
+                                is_signed: port.data_type.as_ref().map(|dt| is_type_signed(dt)).unwrap_or(false),
+                                direction: port.direction,
+                                value: Value::new(width),
+                            });
                         }
-                        elab.signals.insert(sig_name.clone(), Signal {
-                            name: sig_name, width,
-                            is_signed: port.data_type.as_ref().map(|dt| is_type_signed(dt)).unwrap_or(false),
-                            direction: port.direction,
-                            value: Value::new(width),
-                        });
                     }
+                    PortList::NonAnsi(_names) => {
+                        // For non-ANSI, port signals are declared via PortDeclaration items
+                        // in the module body. Process those here.
+                        let effective_items = collect_effective_items(&sub_mod.items, &elab.parameters);
+                        for sub_item in &effective_items {
+                            if let ModuleItem::PortDeclaration(pd) = sub_item {
+                                let width = resolve_type_width_with_params(&pd.data_type, Some(&elab.parameters));
+                                let is_signed = is_type_signed(&pd.data_type);
+                                for decl in &pd.declarators {
+                                    let sig_name = format!("{}{}", inst_prefix, decl.name.name);
+                                    elab.signals.insert(sig_name.clone(), Signal {
+                                        name: sig_name, width, is_signed,
+                                        direction: Some(pd.direction),
+                                        value: Value::new(width),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    PortList::Empty => {}
                 }
 
                 // Declare internal nets/vars (including from generate blocks)
@@ -925,10 +962,15 @@ fn inline_module_items(
                             let width = resolve_type_width_with_params(&nd.data_type, Some(&elab.parameters));
                             for decl in &nd.declarators {
                                 let sig_name = format!("{}{}", inst_prefix, decl.name.name);
+                                let init_value = match nd.net_type {
+                                    NetType::Supply0 => Value::zero(width),
+                                    NetType::Supply1 => Value::ones(width),
+                                    _ => Value::new(width),
+                                };
                                 elab.signals.insert(sig_name.clone(), Signal {
                                     name: sig_name, width,
                                     is_signed: is_type_signed(&nd.data_type),
-                                    direction: None, value: Value::new(width),
+                                    direction: None, value: init_value,
                                 });
                             }
                         }
@@ -964,24 +1006,51 @@ fn inline_module_items(
                 }
 
                 // Port connection assigns
-                if let PortList::Ansi(ports) = &sub_mod.ports {
-                    for port in ports {
-                        if let Some(parent_expr) = port_map.get(&port.name.name) {
-                            let sub_sig_name = format!("{}{}", inst_prefix, port.name.name);
-                            let sub_expr = make_ident_expr(&sub_sig_name);
-                            match port.direction {
-                                Some(PortDirection::Input) | Some(PortDirection::Inout) => {
-                                    elab.continuous_assigns.push(ContinuousAssignment {
-                                        lhs: sub_expr, rhs: parent_expr.clone(),
-                                    });
+                // Build a direction map for port signals (needed for non-ANSI ports)
+                let port_directions: HashMap<String, PortDirection> = {
+                    let mut dirs = HashMap::new();
+                    match &sub_mod.ports {
+                        PortList::Ansi(ports) => {
+                            for port in ports {
+                                if let Some(dir) = port.direction {
+                                    dirs.insert(port.name.name.clone(), dir);
                                 }
-                                Some(PortDirection::Output) => {
-                                    elab.continuous_assigns.push(ContinuousAssignment {
-                                        lhs: parent_expr.clone(), rhs: sub_expr,
-                                    });
-                                }
-                                _ => {}
                             }
+                        }
+                        PortList::NonAnsi(_) => {
+                            let effective_items = collect_effective_items(&sub_mod.items, &elab.parameters);
+                            for sub_item in &effective_items {
+                                if let ModuleItem::PortDeclaration(pd) = sub_item {
+                                    for decl in &pd.declarators {
+                                        dirs.insert(decl.name.name.clone(), pd.direction);
+                                    }
+                                }
+                            }
+                        }
+                        PortList::Empty => {}
+                    }
+                    dirs
+                };
+
+                for (port_name, parent_expr) in &port_map {
+                    let sub_sig_name = format!("{}{}", inst_prefix, port_name);
+                    let sub_expr = make_ident_expr(&sub_sig_name);
+                    match port_directions.get(port_name) {
+                        Some(PortDirection::Input) | Some(PortDirection::Inout) => {
+                            elab.continuous_assigns.push(ContinuousAssignment {
+                                lhs: sub_expr, rhs: parent_expr.clone(),
+                            });
+                        }
+                        Some(PortDirection::Output) => {
+                            elab.continuous_assigns.push(ContinuousAssignment {
+                                lhs: parent_expr.clone(), rhs: sub_expr,
+                            });
+                        }
+                        _ => {
+                            // Unknown direction (not declared) — treat as input
+                            elab.continuous_assigns.push(ContinuousAssignment {
+                                lhs: sub_expr, rhs: parent_expr.clone(),
+                            });
                         }
                     }
                 }
@@ -989,13 +1058,20 @@ fn inline_module_items(
                 // Collect sub-module local signal names (ports + internal nets/vars)
                 // Only these should be prefixed during rewriting
                 let mut local_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-                if let PortList::Ansi(ports) = &sub_mod.ports {
-                    for port in ports { local_names.insert(port.name.name.clone()); }
+                match &sub_mod.ports {
+                    PortList::Ansi(ports) => {
+                        for port in ports { local_names.insert(port.name.name.clone()); }
+                    }
+                    PortList::NonAnsi(names) => {
+                        for name in names { local_names.insert(name.name.clone()); }
+                    }
+                    PortList::Empty => {}
                 }
                 for sub_item in &effective_decl_items {
                     match sub_item {
                         ModuleItem::NetDeclaration(nd) => { for d in &nd.declarators { local_names.insert(d.name.name.clone()); } }
                         ModuleItem::DataDeclaration(dd) => { for d in &dd.declarators { local_names.insert(d.name.name.clone()); } }
+                        ModuleItem::PortDeclaration(pd) => { for d in &pd.declarators { local_names.insert(d.name.name.clone()); } }
                         _ => {}
                     }
                 }
@@ -1008,6 +1084,17 @@ fn inline_module_items(
                         for (lhs, rhs) in &ca.assignments {
                             let new_lhs = rewrite_expr(lhs, &inst_prefix, &port_map, &local_names);
                             let new_rhs = rewrite_expr(rhs, &inst_prefix, &port_map, &local_names);
+                            elab.continuous_assigns.push(ContinuousAssignment {
+                                lhs: new_lhs, rhs: new_rhs,
+                            });
+                        }
+                    }
+                    // Gate-level primitives → continuous assigns with rewritten signals
+                    if let ModuleItem::GateInstantiation(gi) = sub_item {
+                        let assigns = gate_inst_to_assign_pairs(gi);
+                        for (lhs, rhs) in assigns {
+                            let new_lhs = rewrite_expr(&lhs, &inst_prefix, &port_map, &local_names);
+                            let new_rhs = rewrite_expr(&rhs, &inst_prefix, &port_map, &local_names);
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: new_lhs, rhs: new_rhs,
                             });
@@ -1072,6 +1159,111 @@ fn inline_module_items(
 }
 
 /// Create an identifier expression from a signal name.
+/// Convert gate-level primitive instantiations to continuous assigns.
+/// Adds the resulting assigns directly to the elaborated module.
+fn gate_inst_to_assigns(gi: &crate::ast::decl::GateInstantiation, elab: &mut ElaboratedModule) {
+    for (lhs, rhs) in gate_inst_to_assign_pairs(gi) {
+        elab.continuous_assigns.push(ContinuousAssignment { lhs, rhs });
+    }
+}
+
+/// Convert gate-level primitive instantiation to (lhs, rhs) pairs for continuous assigns.
+/// For `and g(out, in1, in2)` → `assign out = in1 & in2`
+fn gate_inst_to_assign_pairs(
+    gi: &crate::ast::decl::GateInstantiation,
+) -> Vec<(crate::ast::expr::Expression, crate::ast::expr::Expression)> {
+    use crate::ast::decl::GateType;
+    use crate::ast::expr::*;
+    use crate::ast::Span;
+
+    let mut result = Vec::new();
+
+    for inst in &gi.instances {
+        if inst.terminals.len() < 2 { continue; }
+
+        match gi.gate_type {
+            // N-input gates: first terminal is output, rest are inputs
+            // out = in1 OP in2 OP in3 ...
+            GateType::And | GateType::Nand | GateType::Or | GateType::Nor |
+            GateType::Xor | GateType::Xnor => {
+                let out = &inst.terminals[0];
+                let inputs = &inst.terminals[1..];
+                if inputs.is_empty() { continue; }
+
+                let op = match gi.gate_type {
+                    GateType::And | GateType::Nand => BinaryOp::BitAnd,
+                    GateType::Or | GateType::Nor => BinaryOp::BitOr,
+                    GateType::Xor | GateType::Xnor => BinaryOp::BitXor,
+                    _ => unreachable!(),
+                };
+
+                // Build chain: in1 OP in2 OP in3 ...
+                let mut expr = inputs[0].clone();
+                for inp in &inputs[1..] {
+                    expr = Expression::new(
+                        ExprKind::Binary { op, left: Box::new(expr), right: Box::new(inp.clone()) },
+                        Span::dummy(),
+                    );
+                }
+
+                // For nand/nor/xnor: invert the result
+                if matches!(gi.gate_type, GateType::Nand | GateType::Nor | GateType::Xnor) {
+                    expr = Expression::new(
+                        ExprKind::Unary { op: UnaryOp::BitNot, operand: Box::new(expr) },
+                        Span::dummy(),
+                    );
+                }
+
+                result.push((out.clone(), expr));
+            }
+
+            // buf: output = input (may have multiple outputs)
+            // buf (out1, out2, ..., in)  — last terminal is input
+            GateType::Buf => {
+                let input = inst.terminals.last().unwrap();
+                for out in &inst.terminals[..inst.terminals.len() - 1] {
+                    result.push((out.clone(), input.clone()));
+                }
+            }
+
+            // not: output = ~input (may have multiple outputs)
+            // not (out1, out2, ..., in)
+            GateType::Not => {
+                let input = inst.terminals.last().unwrap();
+                let inv = Expression::new(
+                    ExprKind::Unary { op: UnaryOp::BitNot, operand: Box::new(input.clone()) },
+                    Span::dummy(),
+                );
+                for out in &inst.terminals[..inst.terminals.len() - 1] {
+                    result.push((out.clone(), inv.clone()));
+                }
+            }
+
+            // bufif0/bufif1/notif0/notif1: tri-state — approximate as pass-through
+            // bufif1 (out, in, ctrl) → assign out = ctrl ? in : 1'bz
+            // For simulation simplicity, treat as: out = in (ignoring the enable)
+            GateType::Bufif0 | GateType::Bufif1 | GateType::Notif0 | GateType::Notif1 => {
+                if inst.terminals.len() >= 3 {
+                    let out = &inst.terminals[0];
+                    let input = &inst.terminals[1];
+                    let _ctrl = &inst.terminals[2];
+                    let expr = if matches!(gi.gate_type, GateType::Notif0 | GateType::Notif1) {
+                        Expression::new(
+                            ExprKind::Unary { op: UnaryOp::BitNot, operand: Box::new(input.clone()) },
+                            Span::dummy(),
+                        )
+                    } else {
+                        input.clone()
+                    };
+                    result.push((out.clone(), expr));
+                }
+            }
+        }
+    }
+
+    result
+}
+
 fn make_ident_expr(name: &str) -> crate::ast::expr::Expression {
     use crate::ast::expr::*;
     use crate::ast::{Identifier, Span};
@@ -1083,6 +1275,7 @@ fn make_ident_expr(name: &str) -> crate::ast::expr::Expression {
                 selects: Vec::new(),
             }],
             span: Span::dummy(),
+            cached_signal_id: std::cell::Cell::new(None),
         }),
         Span::dummy(),
     )
@@ -1095,14 +1288,14 @@ fn rewrite_expr_all(
 ) -> crate::ast::expr::Expression {
     // Create an "everything" local_names set by using a set that always matches
     let all = AllNames;
-    rewrite_expr_impl(expr, prefix, &std::collections::HashMap::new(), &all)
+    rewrite_expr_impl(expr, prefix, &HashMap::new(), &all)
 }
 
 /// Rewrite an expression: prefix only local signal identifiers with the instance prefix.
 fn rewrite_expr(
     expr: &crate::ast::expr::Expression,
     prefix: &str,
-    port_map: &std::collections::HashMap<String, crate::ast::expr::Expression>,
+    port_map: &HashMap<String, crate::ast::expr::Expression>,
     local_names: &std::collections::HashSet<String>,
 ) -> crate::ast::expr::Expression {
     rewrite_expr_impl(expr, prefix, port_map, local_names)
@@ -1117,7 +1310,7 @@ impl NameSet for AllNames { fn contains_name(&self, _: &str) -> bool { true } }
 fn rewrite_expr_impl(
     expr: &crate::ast::expr::Expression,
     prefix: &str,
-    port_map: &std::collections::HashMap<String, crate::ast::expr::Expression>,
+    port_map: &HashMap<String, crate::ast::expr::Expression>,
     local_names: &dyn NameSet,
 ) -> crate::ast::expr::Expression {
     use crate::ast::expr::*;
@@ -1135,6 +1328,7 @@ fn rewrite_expr_impl(
                         selects: hier.path.last().map(|s| s.selects.clone()).unwrap_or_default(),
                     }],
                     span: Span::dummy(),
+                    cached_signal_id: std::cell::Cell::new(None),
                 })
             } else {
                 // Not a local signal (e.g., enum constant) — keep as-is
@@ -1188,10 +1382,44 @@ fn rewrite_expr_impl(
 }
 
 /// Rewrite a statement: prefix identifiers.
+/// Rewrite signal names inside a TimingControl during module inlining.
+fn rewrite_timing_control(
+    control: &crate::ast::stmt::TimingControl,
+    prefix: &str,
+    port_map: &HashMap<String, crate::ast::expr::Expression>,
+    local_names: &std::collections::HashSet<String>,
+) -> crate::ast::stmt::TimingControl {
+    use crate::ast::stmt::*;
+    match control {
+        TimingControl::Delay(expr) => TimingControl::Delay(rewrite_expr(expr, prefix, port_map, local_names)),
+        TimingControl::Event(ec) => TimingControl::Event(match ec {
+            EventControl::Star | EventControl::ParenStar => ec.clone(),
+            EventControl::Identifier(id) => {
+                if local_names.contains(&id.name) {
+                    EventControl::Identifier(crate::ast::Identifier {
+                        name: format!("{}{}", prefix, id.name),
+                        span: id.span,
+                    })
+                } else {
+                    ec.clone()
+                }
+            }
+            EventControl::EventExpr(exprs) => {
+                EventControl::EventExpr(exprs.iter().map(|ee| EventExpr {
+                    edge: ee.edge,
+                    expr: rewrite_expr(&ee.expr, prefix, port_map, local_names),
+                    iff: ee.iff.as_ref().map(|e| rewrite_expr(e, prefix, port_map, local_names)),
+                    span: ee.span,
+                }).collect())
+            }
+        }),
+    }
+}
+
 fn rewrite_stmt(
     stmt: &crate::ast::stmt::Statement,
     prefix: &str,
-    port_map: &std::collections::HashMap<String, crate::ast::expr::Expression>,
+    port_map: &HashMap<String, crate::ast::expr::Expression>,
     local_names: &std::collections::HashSet<String>,
 ) -> crate::ast::stmt::Statement {
     use crate::ast::stmt::*;
@@ -1228,7 +1456,7 @@ fn rewrite_stmt(
         },
         StatementKind::Expr(e) => StatementKind::Expr(rewrite_expr(e, prefix, port_map, local_names)),
         StatementKind::TimingControl { control, stmt: inner } => StatementKind::TimingControl {
-            control: control.clone(),
+            control: rewrite_timing_control(control, prefix, port_map, local_names),
             stmt: Box::new(rewrite_stmt(inner, prefix, port_map, local_names)),
         },
         StatementKind::For { init, condition, step, body } => StatementKind::For {

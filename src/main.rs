@@ -18,7 +18,8 @@ fn print_usage() {
     eprintln!("  -I <dir>         Add include directory (not yet used)");
     eprintln!("  -D <macro>[=val] Define preprocessor macro (not yet used)");
     eprintln!("  -g <spec>        Language generation (e.g. -g2012, ignored)");
-    eprintln!("  -y <dir>         Library directory (not yet used)");
+    eprintln!("  -y <dir>         Library directory for module resolution");
+    eprintln!("  --lib <dir>      Library directory for module resolution (same as -y)");
     eprintln!("  -v               Be verbose");
     eprintln!("  -V               Print version and exit");
     eprintln!("  -E               Preprocess only (not yet used)");
@@ -27,6 +28,8 @@ fn print_usage() {
     eprintln!("  --dump-tokens    Print the token stream");
     eprintln!("  --dump-ast       Print the AST");
     eprintln!("  --max-time <N>   Set simulation time limit (default: 100000)");
+    eprintln!("  --settle-limit <N> Combinatorial settle iteration limit (default: 100)");
+    eprintln!("  --activity-mon     Show top-10 most triggered blocks and toggling signals");
     eprintln!("  -Wall            Enable all warnings");
     eprintln!("  -W <type>        Enable/disable warnings (ignored)");
 }
@@ -100,6 +103,9 @@ fn main() {
     let mut no_sim = false;
     let mut verbose = false;
     let mut _output_file: Option<String> = None;
+    let mut lib_dirs: Vec<String> = Vec::new();
+    let mut settle_limit: Option<u32> = None;
+    let mut activity_mon = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -127,6 +133,14 @@ fn main() {
                 // -g <generation> — accept and skip
                 i += 1;
             }
+            "-y" => {
+                i += 1;
+                if i < args.len() { lib_dirs.push(args[i].clone()); }
+            }
+            "--lib" => {
+                i += 1;
+                if i < args.len() { lib_dirs.push(args[i].clone()); }
+            }
             "-v" => { verbose = true; }
             "-V" => { print_version(); std::process::exit(0); }
             "-E" => { /* preprocess only — not yet */ }
@@ -142,6 +156,13 @@ fn main() {
                     max_time = args[i].parse().unwrap_or(100_000);
                 }
             }
+            "--settle-limit" => {
+                i += 1;
+                if i < args.len() {
+                    settle_limit = Some(args[i].parse().unwrap_or(100));
+                }
+            }
+            "--activity-mon" => { activity_mon = true; }
             _ if arg.starts_with("-o") && arg.len() > 2 => {
                 _output_file = Some(arg[2..].to_string());
             }
@@ -164,7 +185,8 @@ fn main() {
             _ if arg.starts_with("-I") => { /* include dir */ }
             _ if arg.starts_with("-D") => { /* define */ }
             _ if arg.starts_with("-W") => { /* warning flags */ }
-            _ if arg.starts_with("-y") => { /* library dir */ }
+            _ if arg.starts_with("-y") && arg.len() > 2 => { lib_dirs.push(arg[2..].to_string()); }
+            _ if arg.starts_with("-y") => { /* -y with no arg, ignore */ }
             _ if arg.starts_with("-l") => { /* library file */ }
             _ if arg.starts_with("-t") => { /* target type */ }
             _ if arg.starts_with("-p") => { /* target flag */ }
@@ -287,12 +309,13 @@ fn main() {
     if verbose {
         println!("Max time: {}", max_time);
         if let Some(ref t) = top_module { println!("Top module: {}", t); }
+        if !lib_dirs.is_empty() { println!("Library dirs: {}", lib_dirs.join(", ")); }
     } else {
         println!("Max time: {}", max_time);
     }
     println!("------------------------------");
 
-    match sisvsim::simulate_multi(&sources, max_time, top_module.as_deref()) {
+    match sisvsim::simulate_multi(&sources, max_time, top_module.as_deref(), &lib_dirs, &source_files, settle_limit, activity_mon) {
         Ok(sim) => {
             println!("------------------------------");
             println!("Simulation finished at time {}", sim.time);

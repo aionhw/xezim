@@ -6,6 +6,7 @@
 pub mod value;
 pub mod elaborate;
 pub mod simulator;
+pub mod bytecode;
 
 pub use value::Value;
 pub use elaborate::{elaborate_module, ElaboratedModule};
