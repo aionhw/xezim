@@ -1683,7 +1683,7 @@ impl Simulator {
                 if let Some(id) = hier.cached_signal_id.get() {
                     let width = self.signal_widths[id];
                     let mut resized = val.resize(width);
-                    if self.signal_signed[id] { resized.is_signed = true; }
+                    resized.is_signed = self.signal_signed[id];
                     let changed = self.signal_table[id] != resized;
                     if changed {
                         self.mark_dirty_id(id);
@@ -1696,7 +1696,7 @@ impl Simulator {
                     hier.cached_signal_id.set(Some(id));
                     let width = self.signal_widths[id];
                     let mut resized = val.resize(width);
-                    if self.signal_signed[id] { resized.is_signed = true; }
+                    resized.is_signed = self.signal_signed[id];
                     let changed = self.signal_table[id] != resized;
                     if changed {
                         self.mark_dirty_id(id);
@@ -1839,19 +1839,21 @@ impl Simulator {
                 }
             }
             ExprKind::Binary { op, left, right } => {
-                // For context-dependent binary ops, propagate context width
-                let ctx_w = if ctx_width > 0 { ctx_width } else { 0 };
-                let l = self.eval_expr_ctx(left, ctx_w);
-                let r = self.eval_expr_ctx(right, ctx_w);
-                // For non-shift arithmetic, widen operands to max context width
-                let wl = if ctx_w > 0 && matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul
-                    | BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::BitXnor) {
-                    l.resize(l.width.max(r.width).max(ctx_w))
-                } else { l };
-                let wr = if ctx_w > 0 && matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul
-                    | BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::BitXnor) {
-                    r.resize(wl.width)
-                } else { r };
+                let is_arith_or_bitwise = matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul
+                    | BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::BitXnor);
+                // IEEE §11.6.1: For context-determined operations, the width is
+                // max(lhs_width, rhs_width, context_width), computed BEFORE evaluation
+                // so that sub-expressions are widened to the full expression width.
+                let self_det_w = if is_arith_or_bitwise {
+                    let lw = self.infer_width(left);
+                    let rw = self.infer_width(right);
+                    lw.max(rw).max(ctx_width)
+                } else { ctx_width };
+                let l = self.eval_expr_ctx(left, self_det_w);
+                let r = self.eval_expr_ctx(right, self_det_w);
+                let max_w = l.width.max(r.width).max(self_det_w);
+                let wl = if is_arith_or_bitwise && max_w > l.width { l.resize(max_w) } else { l };
+                let wr = if is_arith_or_bitwise && max_w > r.width { r.resize(max_w) } else { r };
                 match op {
                     BinaryOp::Add => wl.add(&wr), BinaryOp::Sub => wl.sub(&wr), BinaryOp::Mul => wl.mul(&wr), BinaryOp::Div => wl.div(&wr),
                     BinaryOp::Mod => wl.modulo(&wr), BinaryOp::Power => wl.power(&wr),
@@ -1863,7 +1865,7 @@ impl Simulator {
                     BinaryOp::Lt => wl.less_than(&wr), BinaryOp::Leq => wl.leq(&wr), BinaryOp::Gt => wl.greater_than(&wr), BinaryOp::Geq => wl.geq(&wr),
                     BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft => {
                         // Widen left operand to context width before shifting
-                        let wide_l = if ctx_w > wl.width { wl.resize(ctx_w) } else { wl };
+                        let wide_l = if self_det_w > wl.width { wl.resize(self_det_w) } else { wl };
                         wide_l.shift_left(&wr)
                     }
                     BinaryOp::ShiftRight => wl.shift_right(&wr), BinaryOp::ArithShiftRight => wl.arith_shift_right(&wr),
@@ -2242,7 +2244,7 @@ impl Simulator {
         if let Some(&id) = self.signal_name_to_id.get(name) {
             let width = self.signal_widths[id];
             let mut resized = val.resize(width);
-            if self.signal_signed[id] { resized.is_signed = true; }
+            resized.is_signed = self.signal_signed[id];
             let changed = self.signal_table[id] != resized;
             if changed {
                 self.signal_table[id] = resized;

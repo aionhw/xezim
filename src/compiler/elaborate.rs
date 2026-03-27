@@ -84,10 +84,12 @@ pub fn elaborate_module(
         if let ParameterKind::Data { data_type, assignments } = &param.kind {
             for assign in assignments {
                 let mut width = resolve_type_width(data_type);
-                let signed = is_type_signed(data_type);
-                // Parameters with implicit type (no explicit type) default to 32-bit
+                let mut signed = is_type_signed(data_type);
+                // IEEE 1800-2017 §6.20.2: Parameters with implicit type (no explicit type)
+                // default to 32-bit signed integer.
                 if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
                     width = 32;
+                    signed = true;
                 }
                 let val = if let Some(override_val) = param_overrides.get(&assign.name.name) {
                     override_val.clone()
@@ -96,7 +98,9 @@ pub fn elaborate_module(
                     if signed { v.is_signed = true; }
                     v
                 } else {
-                    Value::zero(width)
+                    let mut v = Value::zero(width);
+                    if signed { v.is_signed = true; }
+                    v
                 };
                 elab.parameters.insert(assign.name.name.clone(), val);
             }
@@ -228,10 +232,11 @@ pub fn elaborate_module(
             ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
                 if let ParameterKind::Data { data_type, assignments } = &pd.kind {
                     let mut width = resolve_type_width(data_type);
-                    let signed = is_type_signed(data_type);
-                    // Parameters with implicit type default to 32-bit
+                    let mut signed = is_type_signed(data_type);
+                    // IEEE 1800-2017 §6.20.2: implicit type → signed 32-bit
                     if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
                         width = 32;
+                        signed = true;
                     }
                     for assign in assignments {
                         let val = if elab.parameters.contains_key(&assign.name.name) {
@@ -242,7 +247,8 @@ pub fn elaborate_module(
                             elab.parameters.insert(assign.name.name.clone(), v.clone());
                             v
                         } else {
-                            let v = Value::zero(width);
+                            let mut v = Value::zero(width);
+                            if signed { v.is_signed = true; }
                             elab.parameters.insert(assign.name.name.clone(), v.clone());
                             v
                         };
@@ -323,7 +329,55 @@ pub fn elaborate_module(
         }
     }
 
+    // IEEE 1800-2017 §6.10: Implicit nets — identifiers used in continuous assigns
+    // or port connections that are not explicitly declared become implicit 1-bit wires.
+    create_implicit_nets(&mut elab);
+
     Ok(elab)
+}
+
+/// Create implicit 1-bit wire signals for identifiers referenced in continuous assigns
+/// but not declared anywhere (IEEE 1800-2017 §6.10).
+fn create_implicit_nets(elab: &mut ElaboratedModule) {
+    let mut implicit_names = Vec::new();
+    for ca in &elab.continuous_assigns {
+        collect_ident_names(&ca.lhs, &mut implicit_names);
+        collect_ident_names(&ca.rhs, &mut implicit_names);
+    }
+    implicit_names.sort();
+    implicit_names.dedup();
+    for name in implicit_names {
+        if !elab.signals.contains_key(&name) && !elab.parameters.contains_key(&name) {
+            elab.signals.insert(name.clone(), Signal {
+                name, width: 1, is_signed: false,
+                direction: None, value: Value::new(1),
+            });
+        }
+    }
+}
+
+/// Collect all plain identifier names from an expression tree.
+fn collect_ident_names(expr: &Expression, out: &mut Vec<String>) {
+    match &expr.kind {
+        ExprKind::Ident(hier) => {
+            if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+                out.push(hier.path[0].name.name.clone());
+            }
+        }
+        ExprKind::Unary { operand, .. } => collect_ident_names(operand, out),
+        ExprKind::Binary { left, right, .. } => { collect_ident_names(left, out); collect_ident_names(right, out); }
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            collect_ident_names(condition, out); collect_ident_names(then_expr, out); collect_ident_names(else_expr, out);
+        }
+        ExprKind::Concatenation(parts) => { for p in parts { collect_ident_names(p, out); } }
+        ExprKind::Replication { count, exprs } => { collect_ident_names(count, out); for e in exprs { collect_ident_names(e, out); } }
+        ExprKind::Index { expr, index } => { collect_ident_names(expr, out); collect_ident_names(index, out); }
+        ExprKind::RangeSelect { expr, left, right, .. } => { collect_ident_names(expr, out); collect_ident_names(left, out); collect_ident_names(right, out); }
+        ExprKind::Paren(inner) => collect_ident_names(inner, out),
+        ExprKind::Call { func, args } => { collect_ident_names(func, out); for a in args { collect_ident_names(a, out); } }
+        ExprKind::MemberAccess { expr, .. } => collect_ident_names(expr, out),
+        _ => {}
+    }
 }
 
 /// Helper: process a slice of module items into the elaborated module.

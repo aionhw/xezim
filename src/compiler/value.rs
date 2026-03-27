@@ -306,9 +306,12 @@ impl Value {
             return Value::new(self.width.max(other.width));
         }
         let w = self.width.max(other.width);
+        let result_signed = self.is_signed && other.is_signed;
         let a = self.to_u64().unwrap_or(0);
         let b = other.to_u64().unwrap_or(0);
-        Value::from_u64(a.wrapping_add(b), w)
+        let mut v = Value::from_u64(a.wrapping_add(b), w);
+        v.is_signed = result_signed;
+        v
     }
 
     pub fn sub(&self, other: &Value) -> Value {
@@ -316,17 +319,23 @@ impl Value {
             return Value::new(self.width.max(other.width));
         }
         let w = self.width.max(other.width);
+        let result_signed = self.is_signed && other.is_signed;
         let a = self.to_u64().unwrap_or(0);
         let b = other.to_u64().unwrap_or(0);
-        Value::from_u64(a.wrapping_sub(b), w)
+        let mut v = Value::from_u64(a.wrapping_sub(b), w);
+        v.is_signed = result_signed;
+        v
     }
 
     pub fn mul(&self, other: &Value) -> Value {
         if self.has_xz() || other.has_xz() { return Value::new(self.width.max(other.width)); }
         let w = self.width.max(other.width);
+        let result_signed = self.is_signed && other.is_signed;
         let a = self.to_u64().unwrap_or(0);
         let b = other.to_u64().unwrap_or(0);
-        Value::from_u64(a.wrapping_mul(b), w)
+        let mut v = Value::from_u64(a.wrapping_mul(b), w);
+        v.is_signed = result_signed;
+        v
     }
 
     pub fn div(&self, other: &Value) -> Value {
@@ -967,6 +976,23 @@ impl Value {
                                 }
                             }
                         }
+                    }
+                }
+            }
+            // IEEE §5.7.1: If the MSB digit is x, upper bits fill with x.
+            // If the MSB digit is z, upper bits fill with z.
+            // Otherwise, upper bits fill with 0.
+            let specified_bits = s.chars().count() * bits_per_digit;
+            if specified_bits < width as usize {
+                let msb_char = s.chars().next().unwrap_or('0');
+                let fill = match msb_char {
+                    'x' | 'X' => LogicBit::X,
+                    'z' | 'Z' | '?' => LogicBit::Z,
+                    _ => LogicBit::Zero,
+                };
+                if fill != LogicBit::Zero {
+                    for b in specified_bits..width as usize {
+                        val.set_bit(b, fill);
                     }
                 }
             }
