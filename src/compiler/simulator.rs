@@ -447,11 +447,14 @@ pub struct Simulator {
     event_waiters_swap: Vec<EventWaiter>,
     /// VCD dump state
     vcd_file: Option<String>,
-    vcd_writer: Option<std::io::BufWriter<std::fs::File>>,
+    vcd_writer: Option<super::vcd_sink::VcdSink>,
     vcd_id_map: HashMap<String, String>,
     vcd_enabled: bool,
     vcd_last_time: u64,
     vcd_prev_signals: HashMap<String, Value>,
+    /// Worker-thread count. >=2 routes VCD/AITRACE dumps through a
+    /// background writer thread (see vcd_sink::VcdSink).
+    threads: usize,
     /// AITRACE mode: when true, $dumpfile/$dumpvars emit AITRACE-T instead of VCD
     pub aitrace_mode: bool,
     /// Pre-computed combinatorial entries with sensitivity sets.
@@ -583,6 +586,7 @@ impl Simulator {
             vcd_enabled: false,
             vcd_last_time: u64::MAX,
             vcd_prev_signals: HashMap::new(),
+            threads: 1,
             aitrace_mode: false,
             comb_entries: Vec::new(),
             comb_dep_by_id: Vec::new(),
@@ -618,12 +622,10 @@ impl Simulator {
         sim_dbg_eprintln!("[DEBUG] plusargs set: {:?}", self.plusargs);
     }
 
-    /// Configure the worker-thread count. `n >= 2` enables threaded VCD/AITRACE
-    /// dump sinks; `n == 1` keeps everything inline. Currently advisory only —
-    /// it controls dump offload, not core simulation parallelism.
-    pub fn set_threads(&mut self, _n: usize) {
-        // Wired to lib.rs threads parameter. Future stages can use this to
-        // enable parallel settle / edge dispatch.
+    /// Configure the worker-thread count. `n >= 2` enables the background
+    /// VCD/AITRACE writer thread; `n == 1` keeps the dump path inline.
+    pub fn set_threads(&mut self, n: usize) {
+        self.threads = n.max(1);
     }
 
     #[inline]
@@ -4559,7 +4561,11 @@ impl Simulator {
                 return;
             }
         };
-        let mut w = std::io::BufWriter::new(file);
+        let mut w: super::vcd_sink::VcdSink = if self.threads >= 2 {
+            super::vcd_sink::VcdSink::threaded(file)
+        } else {
+            super::vcd_sink::VcdSink::inline(file)
+        };
 
         // Collect and sort signal names for deterministic output
         let mut sig_names: Vec<String> = self.signals.keys().cloned().collect();
@@ -4701,28 +4707,22 @@ impl Simulator {
                 };
                 if changed {
                     changes.push((vcd_id.clone(), val.clone()));
+                    self.vcd_prev_signals.insert(name.clone(), val.clone());
                 }
             }
         }
 
         if changes.is_empty() { return; }
 
-        let w = self.vcd_writer.as_mut().unwrap();
-
-        // Write timestamp if we haven't yet for this time
-        if self.time != self.vcd_last_time {
-            let _ = writeln!(w, "#{}", self.time);
+        let time_marker = if self.time != self.vcd_last_time {
             self.vcd_last_time = self.time;
-        }
+            Some(self.time)
+        } else {
+            None
+        };
 
-        // Write changed values
-        for (id, val) in &changes {
-            Self::vcd_write_value(w, val, id);
-        }
-
-        // Update previous snapshot from signal_table
-        for (id, name) in self.id_to_name.iter().enumerate() {
-            self.vcd_prev_signals.insert(name.clone(), self.signal_table[id].clone());
+        if let Some(sink) = self.vcd_writer.as_mut() {
+            sink.post_vcd_changes(time_marker, changes);
         }
     }
 
@@ -4802,7 +4802,11 @@ impl Simulator {
                 return;
             }
         };
-        let mut w = std::io::BufWriter::new(file);
+        let mut w: super::vcd_sink::VcdSink = if self.threads >= 2 {
+            super::vcd_sink::VcdSink::threaded(file)
+        } else {
+            super::vcd_sink::VcdSink::inline(file)
+        };
 
         // Collect and sort signal names
         let mut sig_names: Vec<String> = self.signals.keys().cloned().collect();

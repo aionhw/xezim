@@ -110,7 +110,11 @@ impl VcdSink {
                     write_vcd_value(w, val, id);
                 }
             }
-            Mode::Threaded { pending, tx: Some(tx), .. } => {
+            Mode::Threaded { buf, pending, tx: Some(tx), .. } => {
+                if !buf.is_empty() {
+                    let chunk = std::mem::replace(buf, Vec::with_capacity(CHUNK_CAPACITY));
+                    let _ = tx.send(WorkerMsg::Chunk(chunk));
+                }
                 pending.push(VcdTimestep { time, changes });
                 if pending.len() >= VCD_BATCH_FLUSH {
                     let batch = std::mem::replace(pending, Vec::with_capacity(VCD_BATCH_FLUSH));
@@ -142,6 +146,14 @@ impl Write for VcdSink {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         match &mut self.mode {
             Mode::Inline(w) => w.write(data),
+            Mode::Threaded { buf, pending, tx: Some(tx), .. } => {
+                if !pending.is_empty() {
+                    let batch = std::mem::replace(pending, Vec::with_capacity(VCD_BATCH_FLUSH));
+                    let _ = tx.send(WorkerMsg::VcdBatch(batch));
+                }
+                buf.extend_from_slice(data);
+                Ok(data.len())
+            }
             Mode::Threaded { buf, .. } => {
                 buf.extend_from_slice(data);
                 Ok(data.len())
