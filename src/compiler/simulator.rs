@@ -1910,10 +1910,6 @@ impl Simulator {
             let wids: Vec<(usize, String)> = writes.iter()
                 .filter_map(|w| self.signal_name_to_id.get(w).map(|&id| (id, w.clone())))
                 .collect();
-            let rids: Vec<usize> = reads.iter()
-                .filter_map(|r| self.signal_name_to_id.get(r).copied())
-                .collect();
-            let has_unresolved_reads = reads.len() != rids.len();
 
             // Detect identity assigns: assign dst = src (simple signal-to-signal copy)
             let direct_copy = if let (ExprKind::Ident(lhs_hier), ExprKind::Ident(rhs_hier)) = (&ca.lhs.kind, &ca.rhs.kind) {
@@ -1931,6 +1927,45 @@ impl Simulator {
             let scope_hint = self
                 .infer_contassign_scope_hint(&ca.lhs, &ca.rhs)
                 .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads));
+
+            // Resolve reads, retrying with scope_hint prefix for bare local names.
+            // Without this, references like `mem_valid` from a top-level cont_assign
+            // would not match `testbench.mem_valid` in signal_name_to_id, and the
+            // entry would be marked has_unresolved_reads=true and re-fired every
+            // settle iteration.
+            let mut rids: Vec<usize> = Vec::with_capacity(reads.len());
+            let mut unresolved_count = 0usize;
+            for r in &reads {
+                if let Some(&id) = self.signal_name_to_id.get(r) {
+                    rids.push(id);
+                    continue;
+                }
+                let mut found = false;
+                if let Some(scope) = &scope_hint {
+                    let qualified = format!("{}.{}", scope, r);
+                    if let Some(&id) = self.signal_name_to_id.get(&qualified) {
+                        rids.push(id);
+                        found = true;
+                    }
+                }
+                if !found { unresolved_count += 1; }
+            }
+            let has_unresolved_reads = unresolved_count > 0;
+            if has_unresolved_reads && std::env::var("SISVSIM_DUMP_UNRESOLVED").is_ok() {
+                let unresolved: Vec<&String> = reads.iter()
+                    .filter(|r| {
+                        if self.signal_name_to_id.contains_key(*r) { return false; }
+                        if let Some(scope) = &scope_hint {
+                            if self.signal_name_to_id.contains_key(&format!("{}.{}", scope, r)) {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .collect();
+                eprintln!("[UNRES] cont_assign scope={:?} unresolved={:?} resolved={}/{}",
+                    scope_hint, unresolved, rids.len(), reads.len());
+            }
             entries.push(CombEntry {
                 item,
                 scope_hint,
@@ -2546,6 +2581,10 @@ impl Simulator {
         eprintln!("[PROF] settle={:.1}ms edges={:.1}ms nba={:.1}ms process={:.1}ms snap={:.1}ms sched={:.1}ms",
             t_settle as f64/1e6, t_edges as f64/1e6, t_nba as f64/1e6,
             t_process as f64/1e6, t_snap as f64/1e6, t_sched as f64/1e6);
+        let unresolved = self.comb_entries.iter().filter(|e| e.has_unresolved_reads).count();
+        eprintln!("[PROF] settle_calls={} settle_iters={} max_iters={} entry_evals={} unresolved_entries={}/{}",
+            self.settle_calls, self.settle_iters, self.max_settle_iters, self.entry_evals,
+            unresolved, self.comb_entries.len());
         eprintln!("[PHASE] simulate: {:.1}ms ({} iters, {:.2}µs/iter)",
             sim_elapsed.as_secs_f64() * 1000.0, self.loop_iters,
             sim_elapsed.as_secs_f64() * 1e6 / self.loop_iters.max(1) as f64);
