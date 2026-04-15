@@ -1,3 +1,0 @@
-[submodule "sv-parser"]
-	path = sv-parser
-	url = git@github.com:aionhw/sv-parser
