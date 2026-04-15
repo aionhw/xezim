@@ -33,7 +33,7 @@ pub fn parse_str(source: &str) -> Result<ParseResult, Vec<diagnostics::Diagnosti
 
 /// Simulate a single source string.
 pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, String> {
-    simulate_multi(&[source.to_string()], max_time, None, &[], &[], None, false, None, None, &[], false, &[])
+    simulate_multi(&[source.to_string()], max_time, None, &[], &[], None, false, None, None, &[], false, &[], 1)
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +114,7 @@ pub fn simulate_multi(
     defines: &[(String, Option<String>)],
     aitrace: bool,
     plusargs: &[String],
+    threads: usize,
 ) -> Result<compiler::Simulator, String> {
     let _t0 = std::time::Instant::now();
     let (_definitions, elab) = parse_and_elaborate_multi(sources, top_module_name, include_dirs, source_paths, defines)?;
@@ -125,6 +126,7 @@ pub fn simulate_multi(
     sim.activity_mon = activity_mon;
     sim.aitrace_mode = aitrace;
     sim.set_plusargs(plusargs);
+    sim.set_threads(threads);
 
     if let Some(sdf_path) = sdf_file {
         let sdf_content = std::fs::read_to_string(sdf_path)

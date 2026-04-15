@@ -20,7 +20,8 @@ fn test_uvm_mock() {
         None,
         &[],
         false,
-        &[]
+        &[],
+        1,
     );
     
     assert!(res.is_ok(), "UVM Mock test failed: {:?}", res.err());
@@ -48,7 +49,8 @@ fn test_uvm_complete() {
         None,
         &defines,
         false,
-        &[]
+        &[],
+        1,
     );
 
     assert!(res.is_ok(), "UVM Complete test failed: {:?}", res.err());
@@ -78,7 +80,8 @@ fn test_uvm_hello_world() {
         None,
         &defines,
         false,
-        &[]
+        &[],
+        1,
     );
     
     assert!(res.is_ok(), "UVM Hello World test failed: {:?}", res.err());

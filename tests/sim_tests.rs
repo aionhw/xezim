@@ -29,6 +29,7 @@ fn sim_ok_plusargs(src: &str, plusargs: &[&str]) -> sisvsim::compiler::Simulator
         &[],
         false,
         &plusargs_vec,
+        1,
     ) {
         Ok(sim) => sim,
         Err(e) => panic!("Simulation failed: {}", e),

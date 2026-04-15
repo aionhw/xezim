@@ -219,6 +219,7 @@ fn main() {
     let mut sim_debug = false;
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut plusargs: Vec<String> = Vec::new();
+    let mut threads: usize = 1;
 
     let mut include_dirs: Vec<String> = Vec::new();
     let mut defines: Vec<(String, Option<String>)> = Vec::new();
@@ -328,6 +329,15 @@ fn main() {
             "--sdf-max" => { sdf_select = Some(sisvsim::compiler::sdf::DelaySelect::Max); }
             "--aitrace" => { aitrace = true; }
             "--sim_debug" => { sim_debug = true; }
+            "--threads" => {
+                i += 1;
+                if i < args.len() {
+                    threads = args[i].parse().unwrap_or(1).max(1);
+                }
+            }
+            _ if arg.starts_with("--threads=") => {
+                threads = arg["--threads=".len()..].parse().unwrap_or(1).max(1);
+            }
             "--dpi-lib" => {
                 i += 1;
                 if i < args.len() { dpi_libs.push(args[i].clone()); }
@@ -437,7 +447,7 @@ fn main() {
     sisvsim::compiler::simulator::set_sim_debug(sim_debug);
     sisvsim::compiler::simulator::set_dpi_libs(&dpi_libs);
 
-    match sisvsim::simulate_multi(&sources, max_time, top_module.as_deref(), &include_dirs, &source_files, settle_limit, activity_mon, sdf_file.as_deref(), sdf_select, &defines, aitrace, &plusargs) {
+    match sisvsim::simulate_multi(&sources, max_time, top_module.as_deref(), &include_dirs, &source_files, settle_limit, activity_mon, sdf_file.as_deref(), sdf_select, &defines, aitrace, &plusargs, threads) {
         Ok(sim) => {
             println!("------------------------------");
             println!("Simulation finished at time {}", sim.time);

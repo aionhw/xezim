@@ -5,6 +5,7 @@
 use super::value::Value;
 use crate::ast::expr::*;
 use crate::ast::stmt::*;
+use std::sync::Arc;
 use ahash::AHashMap as HashMap;
 
 /// A register in the bytecode VM. Registers hold Values.
@@ -69,6 +70,11 @@ pub enum Insn {
 
     /// Non-blocking assign: signal_table[id] <= reg (scheduled via NBA queue).
     NbaAssign(usize, RegId, u32),  // (signal_id, value_reg, width)
+    /// Non-blocking partial assign: signal_table[id][hi:lo] <= reg.
+    /// Read-modify-write at exec time using current signal value as base.
+    NbaAssignRange(usize, u32, u32, RegId), // (signal_id, hi, lo, value_reg)
+    /// Non-blocking bit assign: signal_table[id][bit_idx_reg] <= reg.
+    NbaAssignBitDyn(usize, RegId, RegId), // (signal_id, idx_reg, value_reg)
     /// Blocking assign: signal_table[id] = reg.
     BlockingAssign(usize, RegId, u32), // (signal_id, value_reg, width)
 
@@ -80,6 +86,12 @@ pub enum Insn {
     /// Marks end of a compiled block (no-op, helps debugging).
     /// Copy src register to dest register.
     Move(RegId, RegId),       // (dest, src)
+
+    /// Fallback: invoke the AST interpreter on an untranslated statement.
+    /// Used for rare constructs (e.g. $display, complex LHS) so an edge
+    /// block containing one unsupported stmt can still run most of its
+    /// body as fast bytecode instead of falling back wholesale to AST.
+    StmtFallback(Arc<Statement>),
 
     Nop,
 }
@@ -100,6 +112,11 @@ pub struct BytecodeCompiler<'a> {
     signal_widths: &'a [u32],
     arrays: &'a HashMap<String, (i64, i64, u32)>,
     widths: &'a HashMap<String, u32>,
+    pub bail_reason: Option<&'static str>,
+    /// When true, unsupported statements emit `StmtFallback` instead of
+    /// failing compilation. Safe for edge blocks where the AST interpreter's
+    /// statement path is the same one used by the non-compiled fallback.
+    pub allow_ast_fallback: bool,
 }
 
 impl<'a> BytecodeCompiler<'a> {
@@ -118,6 +135,27 @@ impl<'a> BytecodeCompiler<'a> {
             signal_widths,
             arrays,
             widths,
+            bail_reason: None,
+            allow_ast_fallback: false,
+        }
+    }
+
+    pub fn set_ast_fallback(&mut self, allow: bool) {
+        self.allow_ast_fallback = allow;
+    }
+
+    fn emit_fallback(&mut self, stmt: &Statement) -> bool {
+        if self.allow_ast_fallback {
+            self.emit(Insn::StmtFallback(Arc::new(stmt.clone())));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn bail(&mut self, reason: &'static str) {
+        if self.bail_reason.is_none() {
+            self.bail_reason = Some(reason);
         }
     }
 
@@ -165,31 +203,65 @@ impl<'a> BytecodeCompiler<'a> {
         None
     }
 
-    /// Compile a statement. Returns true if successfully compiled.
+    /// Compile a statement. Returns true on success.
+    /// When `allow_ast_fallback` is set, any nested failure rolls back and
+    /// emits a single `StmtFallback` for the whole statement.
     pub fn compile_stmt(&mut self, stmt: &Statement) -> bool {
+        let start = self.insns.len();
+        let start_reg = self.next_reg;
+        if self.compile_stmt_strict(stmt) {
+            return true;
+        }
+        if self.allow_ast_fallback {
+            self.insns.truncate(start);
+            self.next_reg = start_reg;
+            self.emit(Insn::StmtFallback(Arc::new(stmt.clone())));
+            return true;
+        }
+        false
+    }
+
+    fn compile_stmt_strict(&mut self, stmt: &Statement) -> bool {
         match &stmt.kind {
             StatementKind::Null => true,
             StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
                 let width = self.infer_lhs_width(lvalue);
+                let start = self.insns.len();
+                let start_reg = self.next_reg;
                 if let Some(val_reg) = self.compile_expr(rvalue, width) {
                     if width > 0 {
                         self.emit(Insn::Resize(val_reg, width));
                     }
-                    self.compile_nba_target(lvalue, val_reg, width)
+                    if self.compile_nba_target(lvalue, val_reg, width) {
+                        return true;
+                    }
+                    self.bail("nba_target");
                 } else {
-                    false
+                    self.bail("nba_rvalue");
                 }
+                // Roll back partial work and emit fallback if allowed.
+                self.insns.truncate(start);
+                self.next_reg = start_reg;
+                self.emit_fallback(stmt)
             }
             StatementKind::BlockingAssign { lvalue, rvalue } => {
                 let width = self.infer_lhs_width(lvalue);
+                let start = self.insns.len();
+                let start_reg = self.next_reg;
                 if let Some(val_reg) = self.compile_expr(rvalue, width) {
                     if width > 0 {
                         self.emit(Insn::Resize(val_reg, width));
                     }
-                    self.compile_blocking_target(lvalue, val_reg, width)
+                    if self.compile_blocking_target(lvalue, val_reg, width) {
+                        return true;
+                    }
+                    self.bail("blocking_target");
                 } else {
-                    false
+                    self.bail("blocking_rvalue");
                 }
+                self.insns.truncate(start);
+                self.next_reg = start_reg;
+                self.emit_fallback(stmt)
             }
             StatementKind::If { condition, then_stmt, else_stmt, .. } => {
                 if let Some(cond_reg) = self.compile_expr(condition, 0) {
@@ -259,7 +331,68 @@ impl<'a> BytecodeCompiler<'a> {
                 true
             }
             // Bail out on anything else (timing controls, loops, system tasks, etc.)
-            _ => false,
+            StatementKind::Expr(e) => {
+                let n: &'static str = match &e.kind {
+                    ExprKind::SystemCall { name, .. } => match name.as_str() {
+                        "$display" => "Expr_display",
+                        "$write" => "Expr_write",
+                        "$strobe" => "Expr_strobe",
+                        "$monitor" => "Expr_monitor",
+                        "$finish" => "Expr_finish",
+                        "$stop" => "Expr_stop",
+                        _ => "Expr_syscall_other",
+                    },
+                    ExprKind::Call { .. } => "Expr_Call",
+                    ExprKind::Unary { op, .. } => match op {
+                        UnaryOp::PreIncr => "Expr_PreIncr",
+                        UnaryOp::PreDecr => "Expr_PreDecr",
+                        UnaryOp::PostIncr => "Expr_PostIncr",
+                        UnaryOp::PostDecr => "Expr_PostDecr",
+                        _ => "Expr_UnaryOther",
+                    },
+                    ExprKind::Binary { .. } => "Expr_Binary",
+                    ExprKind::Ident(_) => "Expr_Ident",
+                    ExprKind::Number(_) => "Expr_Number",
+                    ExprKind::Paren(_) => "Expr_Paren",
+                    ExprKind::Index { .. } => "Expr_Index",
+                    ExprKind::RangeSelect { .. } => "Expr_RangeSelect",
+                    ExprKind::Conditional { .. } => "Expr_Conditional",
+                    ExprKind::Concatenation(_) => "Expr_Concat",
+                    ExprKind::Replication { .. } => "Expr_Replication",
+                    ExprKind::MemberAccess { .. } => "Expr_MemberAccess",
+                    ExprKind::AssignmentPattern(_) => "Expr_AsgnPat",
+                    _ => "Expr_other",
+                };
+                self.bail(n);
+                self.emit_fallback(stmt)
+            }
+            other => {
+                let name: &'static str = match other {
+                    StatementKind::Expr(_) => "Expr",
+                    StatementKind::For { .. } => "For",
+                    StatementKind::Foreach { .. } => "Foreach",
+                    StatementKind::While { .. } => "While",
+                    StatementKind::DoWhile { .. } => "DoWhile",
+                    StatementKind::Repeat { .. } => "Repeat",
+                    StatementKind::Forever { .. } => "Forever",
+                    StatementKind::TimingControl { .. } => "TimingControl",
+                    StatementKind::EventTrigger { .. } => "EventTrigger",
+                    StatementKind::Wait { .. } => "Wait",
+                    StatementKind::WaitFork => "WaitFork",
+                    StatementKind::Disable(_) => "Disable",
+                    StatementKind::Return(_) => "Return",
+                    StatementKind::Break => "Break",
+                    StatementKind::Continue => "Continue",
+                    StatementKind::Assertion(_) => "Assertion",
+                    StatementKind::ProceduralContinuous(_) => "ProceduralContinuous",
+                    StatementKind::VarDecl { .. } => "VarDecl",
+                    StatementKind::Coverpoint { .. } => "Coverpoint",
+                    StatementKind::Cross { .. } => "Cross",
+                    _ => "Other",
+                };
+                self.bail_reason = Some(name);
+                self.emit_fallback(stmt)
+            }
         }
     }
 
@@ -294,7 +427,7 @@ impl<'a> BytecodeCompiler<'a> {
                     UnaryOp::BitAnd => self.emit(Insn::ReduceAnd(dest, src)),
                     UnaryOp::BitOr => self.emit(Insn::ReduceOr(dest, src)),
                     UnaryOp::BitXor => self.emit(Insn::ReduceXor(dest, src)),
-                    _ => return None, // bail on incr/decr etc.
+                    _ => { self.bail("UnaryOp_other"); return None; }
                 }
                 Some(dest)
             }
@@ -333,7 +466,7 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     BinaryOp::ShiftRight => self.emit(Insn::Shr(dest, l, r)),
                     BinaryOp::ArithShiftRight => self.emit(Insn::AShr(dest, l, r)),
-                    _ => return None,
+                    _ => { self.bail("BinaryOp_other"); return None; }
                 }
                 Some(dest)
             }
@@ -373,12 +506,26 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(dest)
             }
             ExprKind::RangeSelect { expr, left, right, kind, .. } => {
-                if *kind != RangeKind::Constant { return None; }
+                if *kind != RangeKind::Constant { self.bail("RangeSelect_nonconst"); return None; }
                 let base = self.compile_expr(expr, 0)?;
                 let l = self.compile_expr(left, 0)?;
                 let r = self.compile_expr(right, 0)?;
                 let dest = self.alloc_reg();
                 self.emit(Insn::RangeSelect(dest, base, l, r));
+                Some(dest)
+            }
+            ExprKind::Replication { count, exprs } => {
+                let n = self.eval_const_expr(count)?;
+                if n == 0 || n > 1024 { self.bail("Replication_bad_count"); return None; }
+                let mut regs = Vec::with_capacity((exprs.len() * n as usize).max(1));
+                for _ in 0..n {
+                    for e in exprs {
+                        let r = self.compile_expr(e, 0)?;
+                        regs.push(r);
+                    }
+                }
+                let dest = self.alloc_reg();
+                self.emit(Insn::Concat(dest, regs));
                 Some(dest)
             }
             ExprKind::Concatenation(parts) => {
@@ -402,10 +549,24 @@ impl<'a> BytecodeCompiler<'a> {
                         let r = self.compile_expr(args.first()?, 0)?;
                         Some(r)
                     }
-                    _ => None, // bail on other system calls
+                    other => { self.bail("SystemCall_other"); let _ = other; None }
                 }
             }
-            _ => None,
+            other => {
+                let n: &'static str = match other {
+                    ExprKind::StringLiteral(_) => "Expr_StringLiteral",
+                    ExprKind::Replication { .. } => "Expr_Replication",
+                    ExprKind::AssignmentPattern(_) => "Expr_AssignmentPattern",
+                    ExprKind::Call { .. } => "Expr_Call",
+                    ExprKind::Inside { .. } => "Expr_Inside",
+                    ExprKind::MemberAccess { .. } => "Expr_MemberAccess",
+                    ExprKind::Range(..) => "Expr_Range",
+                    ExprKind::NamedArg { .. } => "Expr_NamedArg",
+                    _ => "Expr_other",
+                };
+                self.bail(n);
+                None
+            }
         }
     }
 
@@ -415,7 +576,10 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(id) = self.lookup_signal_id(hier) {
                     self.emit(Insn::NbaAssign(id, val_reg, width));
                     true
-                } else { false }
+                } else {
+                    self.bail("nba_ident_unresolved");
+                    false
+                }
             }
             ExprKind::Index { expr, index } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
@@ -425,11 +589,33 @@ impl<'a> BytecodeCompiler<'a> {
                             return true;
                         }
                     }
+                    if let Some(id) = self.lookup_signal_id(hier) {
+                        if let Some(idx_reg) = self.compile_expr(index, 0) {
+                            self.emit(Insn::NbaAssignBitDyn(id, idx_reg, val_reg));
+                            return true;
+                        }
+                    }
                 }
+                self.bail("nba_index_other");
                 false
             }
-            // TODO: bit-select NBA, range-select NBA
-            _ => false,
+            ExprKind::RangeSelect { expr, left, right, kind } => {
+                if *kind != RangeKind::Constant { self.bail("nba_range_nonconst"); return false; }
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if let Some(id) = self.lookup_signal_id(hier) {
+                        if let (Some(hi), Some(lo)) = (self.eval_const_expr(left), self.eval_const_expr(right)) {
+                            self.emit(Insn::NbaAssignRange(id, hi, lo, val_reg));
+                            let _ = width;
+                            return true;
+                        }
+                    }
+                }
+                self.bail("nba_range_unresolved");
+                false
+            }
+            ExprKind::Concatenation(_) => { self.bail("nba_concat"); false }
+            ExprKind::MemberAccess { .. } => { self.bail("nba_member_access"); false }
+            _ => { self.bail("nba_other"); false }
         }
     }
 
@@ -470,6 +656,14 @@ impl<'a> BytecodeCompiler<'a> {
                 } else { 32 }
             }
             _ => 32,
+        }
+    }
+
+    fn eval_const_expr(&self, e: &Expression) -> Option<u32> {
+        match &e.kind {
+            ExprKind::Number(n) => self.eval_number_static(n)?.to_u64().map(|v| v as u32),
+            ExprKind::Paren(inner) => self.eval_const_expr(inner),
+            _ => None,
         }
     }
 

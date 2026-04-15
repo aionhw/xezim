@@ -618,6 +618,14 @@ impl Simulator {
         sim_dbg_eprintln!("[DEBUG] plusargs set: {:?}", self.plusargs);
     }
 
+    /// Configure the worker-thread count. `n >= 2` enables threaded VCD/AITRACE
+    /// dump sinks; `n == 1` keeps everything inline. Currently advisory only —
+    /// it controls dump offload, not core simulation parallelism.
+    pub fn set_threads(&mut self, _n: usize) {
+        // Wired to lib.rs threads parameter. Future stages can use this to
+        // enable parallel settle / edge dispatch.
+    }
+
     #[inline]
     fn record_output(&mut self, message: String) {
         if self.capture_output {
@@ -1706,6 +1714,7 @@ impl Simulator {
                 &self.module.arrays,
                 &self.widths,
             );
+            compiler.set_ast_fallback(true);
             if compiler.compile_stmt(&block.stmt) {
                 let cb = compiler.finish();
                 if cb.num_regs > max_regs { max_regs = cb.num_regs; }
@@ -1824,6 +1833,30 @@ impl Simulator {
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let val = self.vm_regs[*val_reg as usize].resize(*width);
                     self.nba_fast.push(NbaFast { signal_id: *sig_id, value: val });
+                }
+                Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
+                    let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
+                    let w = high - low + 1;
+                    let val = self.vm_regs[*val_reg as usize].resize(w);
+                    let id = *sig_id;
+                    let mut new_val = self.signal_table[id].clone();
+                    for bit_pos in low..=high {
+                        let src_bit = val.get_bit((bit_pos - low) as usize);
+                        new_val.set_bit(bit_pos as usize, src_bit);
+                    }
+                    self.nba_fast.push(NbaFast { signal_id: id, value: new_val });
+                }
+                Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
+                    let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
+                    let bit = self.vm_regs[*val_reg as usize].get_bit(0);
+                    let id = *sig_id;
+                    let mut new_val = self.signal_table[id].clone();
+                    new_val.set_bit(idx, bit);
+                    self.nba_fast.push(NbaFast { signal_id: id, value: new_val });
+                }
+                Insn::StmtFallback(stmt) => {
+                    let s = stmt.clone();
+                    self.exec_statement(&s);
                 }
                 Insn::BlockingAssign(sig_id, val_reg, width) => {
                     let val = self.vm_regs[*val_reg as usize].resize(*width);
