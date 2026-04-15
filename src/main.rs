@@ -1,91 +1,197 @@
-//! sisvsim: CLI tool for parsing and simulating SystemVerilog files.
-//! Supports iverilog-compatible command-line arguments.
-
 use std::env;
 use std::path::Path;
-use sisvsim::diagnostics::format_diagnostic;
 
 fn print_usage() {
-    eprintln!("Usage: sisvsim [options] sourcefile ...");
-    eprintln!();
-    eprintln!("A SystemVerilog simulator compatible with common iverilog flags.");
-    eprintln!();
+    eprintln!("Usage: sisvsim [options] <source_files> [plusargs]");
     eprintln!("Options:");
-    eprintln!("  -o <file>        Place output in <file> (not yet used)");
-    eprintln!("  -s <topmodule>   Specify the top-level module to elaborate");
-    eprintln!("  -c <cmdfile>     Read source file list from <cmdfile>");
-    eprintln!("  -f <cmdfile>     Same as -c");
-    eprintln!("  -I <dir>         Add include directory (not yet used)");
-    eprintln!("  -D <macro>[=val] Define preprocessor macro (not yet used)");
-    eprintln!("  -g <spec>        Language generation (e.g. -g2012, ignored)");
-    eprintln!("  -y <dir>         Library directory for module resolution");
-    eprintln!("  --lib <dir>      Library directory for module resolution (same as -y)");
-    eprintln!("  -v               Be verbose");
+    eprintln!("  -v               Verbose output");
     eprintln!("  -V               Print version and exit");
-    eprintln!("  -E               Preprocess only (not yet used)");
-    eprintln!("  --sim            Run simulation (default when source files given)");
-    eprintln!("  --no-sim         Parse only, do not simulate");
-    eprintln!("  --dump-tokens    Print the token stream");
-    eprintln!("  --dump-ast       Print the AST");
-    eprintln!("  --max-time <N>   Set simulation time limit (default: 100000)");
-    eprintln!("  --settle-limit <N> Combinatorial settle iteration limit (default: 100)");
-    eprintln!("  --activity-mon     Show top-10 most triggered blocks and toggling signals");
-    eprintln!("  -Wall            Enable all warnings");
-    eprintln!("  -W <type>        Enable/disable warnings (ignored)");
+    eprintln!("  -I <dir>         Add directory to include search path");
+    eprintln!("  -D <name>[=val]  Define a macro");
+    eprintln!("  -s <topmodule>   Specify the top-level module to elaborate");
+    eprintln!("  --no-sim         Parse and elaborate only, do not run simulation");
+    eprintln!("  --max-time <n>   Set maximum simulation time (default: 100000)");
+    eprintln!("  --sim_debug      Enable simulator [DEBUG]/[OPT] output");
+    eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
+    eprintln!("Compatibility:");
+    eprintln!("  -Ifoo, -DNAME=V  Accepted");
+    eprintln!("  +incdir+dir1+dir2 / +define+FOO=1+BAR Accepted");
+    eprintln!("  +NAME / +NAME=VALUE passed to $test$plusargs/$value$plusargs");
+    eprintln!("  -f/-c filelist   Recursive; options inside filelist are supported");
 }
 
 fn print_version() {
-    eprintln!("sisvsim 0.1.0 (SystemVerilog Simulator)");
-    eprintln!("Targeting IEEE 1800-2017/2023");
+    println!("sisvsim version 0.1.0");
 }
 
-/// Read a command file: one source file per line, # comments, +args ignored.
-fn read_command_file(path: &str) -> Result<Vec<String>, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Error reading command file '{}': {}", path, e))?;
-    let mut files = Vec::new();
-    let mut in_block_comment = false;
-    for line in content.lines() {
-        let line = line.trim();
-        // Block comment handling
-        if in_block_comment {
-            if let Some(idx) = line.find("*/") {
-                let remainder = line[idx + 2..].trim();
-                in_block_comment = false;
-                if !remainder.is_empty() && !remainder.starts_with('#') && !remainder.starts_with('+') && !remainder.starts_with("//") {
-                    files.push(remainder.to_string());
+fn push_define_token(tok: &str, defines: &mut Vec<(String, Option<String>)>) {
+    if tok.is_empty() {
+        return;
+    }
+    if let Some(pos) = tok.find('=') {
+        defines.push((tok[..pos].to_string(), Some(tok[pos + 1..].to_string())));
+    } else {
+        defines.push((tok.to_string(), None));
+    }
+}
+
+fn push_plus_incdir(arg: &str, include_dirs: &mut Vec<String>, lib_dirs: &mut Vec<String>) {
+    if !arg.starts_with("+incdir+") {
+        return;
+    }
+    let payload = &arg[8..];
+    for dir in payload.split('+').filter(|s| !s.is_empty()) {
+        include_dirs.push(dir.to_string());
+        lib_dirs.push(dir.to_string());
+    }
+}
+
+fn push_plus_define(arg: &str, defines: &mut Vec<(String, Option<String>)>) {
+    if !arg.starts_with("+define+") {
+        return;
+    }
+    let payload = &arg[8..];
+    for d in payload.split('+').filter(|s| !s.is_empty()) {
+        push_define_token(d, defines);
+    }
+}
+
+fn resolve_rel(base: &Path, p: &str) -> String {
+    let pp = Path::new(p);
+    if pp.is_absolute() {
+        p.to_string()
+    } else if pp.exists() {
+        p.to_string()
+    } else {
+        base.join(pp).to_string_lossy().to_string()
+    }
+}
+
+fn split_filelist_line(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for ch in line.chars() {
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                } else {
+                    cur.push(ch);
                 }
             }
-            continue;
-        }
-        if let Some(idx) = line.find("/*") {
-            in_block_comment = true;
-            let before = line[..idx].trim();
-            if !before.is_empty() && !before.starts_with('#') && !before.starts_with('+') {
-                files.push(before.to_string());
+            None => {
+                if ch == '"' || ch == '\'' {
+                    quote = Some(ch);
+                } else if ch.is_whitespace() {
+                    if !cur.is_empty() {
+                        out.push(cur.clone());
+                        cur.clear();
+                    }
+                } else {
+                    cur.push(ch);
+                }
             }
-            if line[idx + 2..].find("*/").is_some() {
-                in_block_comment = false;
-            }
-            continue;
         }
-        // Line comment
-        if line.is_empty() || line.starts_with('#') { continue; }
-        if let Some(idx) = line.find("//") {
-            let before = line[..idx].trim();
-            if !before.is_empty() && !before.starts_with('+') {
-                files.push(before.to_string());
-            }
-            continue;
-        }
-        // +args: compiler arguments, skip
-        if line.starts_with('+') { continue; }
-        // -flags inside command files
-        if line.starts_with('-') { continue; }
-        // Source file
-        files.push(line.to_string());
     }
-    Ok(files)
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn process_command_file(
+    path: &str,
+    source_files: &mut Vec<String>,
+    include_dirs: &mut Vec<String>,
+    defines: &mut Vec<(String, Option<String>)>,
+    lib_dirs: &mut Vec<String>,
+    plusargs: &mut Vec<String>,
+) -> Result<(), String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Cannot read command file '{}': {}", path, e))?;
+    let base = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+
+    for raw in content.lines() {
+        let mut line = raw.trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
+            continue;
+        }
+        if let Some((prefix, _)) = line.split_once("//") {
+            line = prefix.trim();
+            if line.is_empty() {
+                continue;
+            }
+        }
+        let toks = split_filelist_line(line);
+        if toks.is_empty() {
+            continue;
+        }
+
+        let mut i = 0usize;
+        while i < toks.len() {
+            let t = toks[i].as_str();
+            match t {
+                "-I" => {
+                    i += 1;
+                    if i < toks.len() {
+                        include_dirs.push(resolve_rel(base, &toks[i]));
+                    }
+                }
+                "-D" => {
+                    i += 1;
+                    if i < toks.len() {
+                        push_define_token(&toks[i], defines);
+                    }
+                }
+                "-y" | "--lib" => {
+                    i += 1;
+                    if i < toks.len() {
+                        let d = resolve_rel(base, &toks[i]);
+                        lib_dirs.push(d.clone());
+                        include_dirs.push(d);
+                    }
+                }
+                "-f" | "-c" => {
+                    i += 1;
+                    if i < toks.len() {
+                        let nested = resolve_rel(base, &toks[i]);
+                        process_command_file(&nested, source_files, include_dirs, defines, lib_dirs, plusargs)?;
+                    }
+                }
+                _ if t.starts_with("-I") && t.len() > 2 => {
+                    include_dirs.push(resolve_rel(base, &t[2..]));
+                }
+                _ if t.starts_with("-D") && t.len() > 2 => {
+                    push_define_token(&t[2..], defines);
+                }
+                _ if t.starts_with("-y") && t.len() > 2 => {
+                    let d = resolve_rel(base, &t[2..]);
+                    lib_dirs.push(d.clone());
+                    include_dirs.push(d);
+                }
+                _ if t.starts_with("-f") && t.len() > 2 => {
+                    let nested = resolve_rel(base, &t[2..]);
+                    process_command_file(&nested, source_files, include_dirs, defines, lib_dirs, plusargs)?;
+                }
+                _ if t.starts_with("+incdir+") => {
+                    push_plus_incdir(t, include_dirs, lib_dirs);
+                }
+                _ if t.starts_with("+define+") => {
+                    push_plus_define(t, defines);
+                }
+                _ if t.starts_with('+') => {
+                    plusargs.push(t.to_string());
+                }
+                _ if t.starts_with('-') => {}
+                _ => {
+                    source_files.push(resolve_rel(base, t));
+                }
+            }
+            i += 1;
+        }
+    }
+    Ok(())
 }
 
 fn main() {
@@ -104,49 +210,99 @@ fn main() {
     let mut verbose = false;
     let mut _output_file: Option<String> = None;
     let mut lib_dirs: Vec<String> = Vec::new();
+    let mut log_file: Option<String> = None;
     let mut settle_limit: Option<u32> = None;
     let mut activity_mon = false;
+    let mut sdf_file: Option<String> = None;
+    let mut sdf_select: Option<sisvsim::compiler::sdf::DelaySelect> = None;
+    let mut aitrace = false;
+    let mut sim_debug = false;
+    let mut dpi_libs: Vec<String> = Vec::new();
+    let mut plusargs: Vec<String> = Vec::new();
+
+    let mut include_dirs: Vec<String> = Vec::new();
+    let mut defines: Vec<(String, Option<String>)> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
-            // iverilog-compatible flags
+            "-h" | "--help" => { print_usage(); std::process::exit(0); }
+            "-I" => {
+                i += 1;
+                if i < args.len() { include_dirs.push(args[i].clone()); }
+            }
+            _ if arg.starts_with("-I") && arg.len() > 2 => {
+                include_dirs.push(arg[2..].to_string());
+            }
+            "-D" => {
+                i += 1;
+                if i < args.len() {
+                    push_define_token(&args[i], &mut defines);
+                }
+            }
+            _ if arg.starts_with("-D") && arg.len() > 2 => {
+                push_define_token(&arg[2..], &mut defines);
+            }
             "-o" => {
                 i += 1;
                 if i < args.len() { _output_file = Some(args[i].clone()); }
+            }
+            _ if arg.starts_with("-o") && arg.len() > 2 => {
+                _output_file = Some(arg[2..].to_string());
+            }
+            "-l" => {
+                i += 1;
+                if i < args.len() { log_file = Some(args[i].clone()); }
+            }
+            _ if arg.starts_with("-l") && arg.len() > 2 => {
+                log_file = Some(arg[2..].to_string());
             }
             "-s" => {
                 i += 1;
                 if i < args.len() { top_module = Some(args[i].clone()); }
             }
+            _ if arg.starts_with("-s") && arg.len() > 2 => {
+                top_module = Some(arg[2..].to_string());
+            }
             "-c" | "-f" => {
                 i += 1;
                 if i < args.len() {
-                    match read_command_file(&args[i]) {
-                        Ok(files) => source_files.extend(files),
+                    match process_command_file(&args[i], &mut source_files, &mut include_dirs, &mut defines, &mut lib_dirs, &mut plusargs) {
+                        Ok(()) => {}
                         Err(e) => { eprintln!("{}", e); std::process::exit(1); }
                     }
                 }
             }
-            "-g" => {
-                // -g <generation> — accept and skip
-                i += 1;
+            _ if arg.starts_with("-f") && arg.len() > 2 => {
+                match process_command_file(&arg[2..], &mut source_files, &mut include_dirs, &mut defines, &mut lib_dirs, &mut plusargs) {
+                    Ok(()) => {}
+                    Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                }
             }
             "-y" => {
                 i += 1;
-                if i < args.len() { lib_dirs.push(args[i].clone()); }
+                if i < args.len() { lib_dirs.push(args[i].clone()); include_dirs.push(args[i].clone()); }
+            }
+            _ if arg.starts_with("-y") && arg.len() > 2 => {
+                lib_dirs.push(arg[2..].to_string());
+                include_dirs.push(arg[2..].to_string());
             }
             "--lib" => {
                 i += 1;
-                if i < args.len() { lib_dirs.push(args[i].clone()); }
+                if i < args.len() { lib_dirs.push(args[i].clone()); include_dirs.push(args[i].clone()); }
+            }
+            _ if arg.starts_with("+incdir+") => {
+                push_plus_incdir(arg, &mut include_dirs, &mut lib_dirs);
+            }
+            _ if arg.starts_with("+define+") => {
+                push_plus_define(arg, &mut defines);
+            }
+            _ if arg.starts_with('+') => {
+                plusargs.push(arg.clone());
             }
             "-v" => { verbose = true; }
             "-V" => { print_version(); std::process::exit(0); }
-            "-E" => { /* preprocess only — not yet */ }
-            "-Wall" => { /* accept and ignore */ }
-            // sisvsim-specific flags
-            "--sim" => { /* default behavior */ }
             "--no-sim" => { no_sim = true; }
             "--dump-tokens" => { dump_tokens = true; no_sim = true; }
             "--dump-ast" => { dump_ast = true; no_sim = true; }
@@ -163,44 +319,23 @@ fn main() {
                 }
             }
             "--activity-mon" => { activity_mon = true; }
-            _ if arg.starts_with("-o") && arg.len() > 2 => {
-                _output_file = Some(arg[2..].to_string());
+            "--sdf" => {
+                i += 1;
+                if i < args.len() { sdf_file = Some(args[i].clone()); }
             }
-            _ if arg.starts_with("-s") && arg.len() > 2 => {
-                top_module = Some(arg[2..].to_string());
+            "--sdf-min" => { sdf_select = Some(sisvsim::compiler::sdf::DelaySelect::Min); }
+            "--sdf-typ" => { sdf_select = Some(sisvsim::compiler::sdf::DelaySelect::Typ); }
+            "--sdf-max" => { sdf_select = Some(sisvsim::compiler::sdf::DelaySelect::Max); }
+            "--aitrace" => { aitrace = true; }
+            "--sim_debug" => { sim_debug = true; }
+            "--dpi-lib" => {
+                i += 1;
+                if i < args.len() { dpi_libs.push(args[i].clone()); }
             }
-            _ if arg.starts_with("-c") && arg.len() > 2 => {
-                match read_command_file(&arg[2..]) {
-                    Ok(files) => source_files.extend(files),
-                    Err(e) => { eprintln!("{}", e); std::process::exit(1); }
-                }
-            }
-            _ if arg.starts_with("-f") && arg.len() > 2 => {
-                match read_command_file(&arg[2..]) {
-                    Ok(files) => source_files.extend(files),
-                    Err(e) => { eprintln!("{}", e); std::process::exit(1); }
-                }
-            }
-            _ if arg.starts_with("-g") => { /* -g2012, -g2005-sv, etc — ignore */ }
-            _ if arg.starts_with("-I") => { /* include dir */ }
-            _ if arg.starts_with("-D") => { /* define */ }
-            _ if arg.starts_with("-W") => { /* warning flags */ }
-            _ if arg.starts_with("-y") && arg.len() > 2 => { lib_dirs.push(arg[2..].to_string()); }
-            _ if arg.starts_with("-y") => { /* -y with no arg, ignore */ }
-            _ if arg.starts_with("-l") => { /* library file */ }
-            _ if arg.starts_with("-t") => { /* target type */ }
-            _ if arg.starts_with("-p") => { /* target flag */ }
-            _ if arg.starts_with("-T") => { /* timing */ }
-            _ if arg.starts_with("-B") => { /* tool path */ }
-            _ if arg.starts_with("-N") => { /* netlist dump */ }
-            _ if arg.starts_with("-M") => { /* dependency file */ }
-            _ if arg.starts_with("-m") => { /* VPI module */ }
-            _ if arg.starts_with("-L") => { /* VPI path */ }
             _ if arg.starts_with('-') => {
                 eprintln!("Warning: unknown flag '{}' (ignored)", arg);
             }
             _ => {
-                // Positional argument = source file
                 source_files.push(arg.clone());
             }
         }
@@ -213,17 +348,19 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Read all source files
+    if let Some(ref path) = log_file {
+        if let Err(e) = sisvsim::set_log_file(path) {
+            eprintln!("Error: cannot open log file '{}': {}", path, e);
+            std::process::exit(1);
+        }
+    }
+
     let mut sources: Vec<String> = Vec::new();
     let mut file_labels: Vec<String> = Vec::new();
     for sf in &source_files {
         let path = Path::new(sf);
         if !path.exists() {
             eprintln!("Error: file '{}' not found", sf);
-            std::process::exit(1);
-        }
-        if path.is_dir() {
-            eprintln!("Error: '{}' is a directory, not a source file", sf);
             std::process::exit(1);
         }
         match std::fs::read_to_string(path) {
@@ -238,11 +375,10 @@ fn main() {
         }
     }
 
-    // Dump tokens mode
     if dump_tokens {
-        for (label, source) in file_labels.iter().zip(sources.iter()) {
+        for (i, (label, source)) in file_labels.iter().zip(sources.iter()).enumerate() {
             println!("=== Tokens: {} ===", label);
-            let tokens = sisvsim::tokenize(source);
+            let tokens = sisvsim::tokenize_file(source, None);
             for tok in &tokens {
                 println!("{:?} '{}' @ {}..{}", tok.kind, tok.text, tok.span.start, tok.span.end);
             }
@@ -250,19 +386,15 @@ fn main() {
         return;
     }
 
-    // Dump AST mode
     if dump_ast {
         for (label, source) in file_labels.iter().zip(sources.iter()) {
             println!("=== AST: {} ===", label);
             match sisvsim::parse_str(source) {
                 Ok(result) => {
-                    for diag in &result.diagnostics {
-                        eprintln!("{}", format_diagnostic(source, diag));
-                    }
-                    println!("{:#?}", result.source_text);
+                    println!("{:#?}", result.source);
                 }
                 Err(diags) => {
-                    for diag in &diags { eprintln!("{}", format_diagnostic(source, diag)); }
+                    for diag in &diags { eprintln!("{}", diag); }
                     std::process::exit(1);
                 }
             }
@@ -270,62 +402,61 @@ fn main() {
         return;
     }
 
-    // Parse-only mode
     if no_sim {
         let mut total_desc = 0;
         let mut total_err = 0;
         let mut total_warn = 0;
-        for (label, source) in file_labels.iter().zip(sources.iter()) {
-            match sisvsim::parse_str(source) {
-                Ok(result) => {
-                    for diag in &result.diagnostics {
-                        eprintln!("[{}] {}", label, format_diagnostic(source, diag));
-                    }
-                    total_desc += result.source_text.descriptions.len();
-                    total_err += result.diagnostics.iter()
-                        .filter(|d| d.severity == sisvsim::diagnostics::Severity::Error).count();
-                    total_warn += result.diagnostics.iter()
-                        .filter(|d| d.severity == sisvsim::diagnostics::Severity::Warning).count();
-                }
-                Err(diags) => {
-                    for diag in &diags { eprintln!("[{}] {}", label, format_diagnostic(source, diag)); }
-                    std::process::exit(1);
-                }
+
+        for (i, (label, source)) in file_labels.iter().zip(sources.iter()).enumerate() {
+            let result = sv_parser::parse(source);
+            for err in &result.errors {
+                let (line, col) = byte_to_line_col(&result.source_text, err.span.start);
+                eprintln!("[{}] {}:{}: error: {}", label, line, col, err.message);
             }
+            total_desc += result.source.descriptions.len();
+            total_err += result.errors.len();
+            total_warn += result.warnings.len();
         }
         println!("Parsed {} file(s): {} descriptions, {} errors, {} warnings",
             sources.len(), total_desc, total_err, total_warn);
         if total_err > 0 { std::process::exit(1); }
+
+        match sisvsim::parse_and_elaborate_multi(&sources, top_module.as_deref(), &include_dirs, &source_files, &defines) {
+            Ok(_) => { println!("Elaboration successful"); }
+            Err(e) => {
+                eprintln!("Simulation error: {}", e);
+                std::process::exit(1);
+            }
+        }
         return;
     }
 
-    // Simulation mode (default)
     println!("=== sisvsim ===");
-    if file_labels.len() == 1 {
-        println!("File: {}", file_labels[0]);
-    } else {
-        println!("Files: {}", file_labels.join(", "));
-    }
-    if verbose {
-        println!("Max time: {}", max_time);
-        if let Some(ref t) = top_module { println!("Top module: {}", t); }
-        if !lib_dirs.is_empty() { println!("Library dirs: {}", lib_dirs.join(", ")); }
-    } else {
-        println!("Max time: {}", max_time);
-    }
+    println!("Max time: {}", max_time);
     println!("------------------------------");
+    sisvsim::compiler::simulator::set_sim_debug(sim_debug);
+    sisvsim::compiler::simulator::set_dpi_libs(&dpi_libs);
 
-    match sisvsim::simulate_multi(&sources, max_time, top_module.as_deref(), &lib_dirs, &source_files, settle_limit, activity_mon) {
+    match sisvsim::simulate_multi(&sources, max_time, top_module.as_deref(), &include_dirs, &source_files, settle_limit, activity_mon, sdf_file.as_deref(), sdf_select, &defines, aitrace, &plusargs) {
         Ok(sim) => {
             println!("------------------------------");
             println!("Simulation finished at time {}", sim.time);
-            if sim.finished {
-                println!("($finish called)");
-            }
+            if sim.finished { println!("($finish called)"); }
         }
         Err(e) => {
             eprintln!("Simulation error: {}", e);
             std::process::exit(1);
         }
     }
+}
+
+fn byte_to_line_col(source: &str, byte_offset: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut col = 1;
+    for (i, ch) in source.char_indices() {
+        if i >= byte_offset { break; }
+        if ch == '\n' { line += 1; col = 1; }
+        else { col += 1; }
+    }
+    (line, col)
 }

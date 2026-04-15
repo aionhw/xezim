@@ -1,13 +1,143 @@
 //! Simulation tests for the SystemVerilog compiler/simulator.
 
-use sisvsim::simulate;
+use sisvsim::{simulate, simulate_multi};
 use sisvsim::compiler::Value;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn sim_ok(src: &str) -> sisvsim::compiler::Simulator {
     match simulate(src, 100_000) {
         Ok(sim) => sim,
         Err(e) => panic!("Simulation failed: {}", e),
     }
+}
+
+fn sim_ok_plusargs(src: &str, plusargs: &[&str]) -> sisvsim::compiler::Simulator {
+    let source = src.to_string();
+    let plusargs_vec: Vec<String> = plusargs.iter().map(|s| (*s).to_string()).collect();
+    match simulate_multi(
+        &[source],
+        100_000,
+        None,
+        &[],
+        &[],
+        None,
+        false,
+        None,
+        None,
+        &[],
+        false,
+        &plusargs_vec,
+    ) {
+        Ok(sim) => sim,
+        Err(e) => panic!("Simulation failed: {}", e),
+    }
+}
+
+fn temp_file_path(tag: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut p = std::env::temp_dir();
+    p.push(format!("sisvsim_{}_{}_{}", tag, std::process::id(), nanos));
+    p
+}
+
+#[test]
+fn test_sim_test_plusargs() {
+    let sim = sim_ok_plusargs(
+        "
+        module test;
+            int a, b;
+            initial begin
+                a = $test$plusargs(\"FOO\");
+                b = $test$plusargs(\"BAR\");
+                $display(\"a=%0d b=%0d\", a, b);
+                $finish;
+            end
+        endmodule
+        ",
+        &["+FOO", "+N=42"],
+    );
+    assert!(sim.output[0].message.contains("a=1 b=0"));
+}
+
+#[test]
+fn test_sim_value_plusargs() {
+    let sim = sim_ok_plusargs(
+        "
+        module test;
+            int n;
+            initial begin
+                n = 0;
+                if ($value$plusargs(\"N=%0d\", n))
+                    $display(\"n=%0d\", n);
+                else
+                    $display(\"n=miss\");
+                $finish;
+            end
+        endmodule
+        ",
+        &["+N=123"],
+    );
+    assert!(sim.output[0].message.contains("n=123"));
+}
+
+#[test]
+fn test_sim_readmemh_loads_array_data() {
+    let mem_path = temp_file_path("readmemh.hex");
+    let out_path = temp_file_path("readmemh.out");
+    fs::write(&mem_path, "01\nab\n0f\n").expect("write mem file");
+    let mem_path_sv = mem_path.to_string_lossy().replace('\\', "\\\\");
+    let out_path_sv = out_path.to_string_lossy().replace('\\', "\\\\");
+    let src = format!(
+        "
+        module test;
+            reg [7:0] mem [0:3];
+            integer fd;
+            initial begin
+                $readmemh(\"{}\", mem);
+                fd = $fopen(\"{}\", \"w\");
+                $fwrite(fd, \"%02h %02h %02h\\n\", mem[0], mem[1], mem[2]);
+                $fclose(fd);
+                $finish;
+            end
+        endmodule
+        ",
+        mem_path_sv,
+        out_path_sv
+    );
+    let _sim = sim_ok(&src);
+    let contents = fs::read_to_string(&out_path).expect("read readmemh output");
+    let _ = fs::remove_file(&mem_path);
+    let _ = fs::remove_file(&out_path);
+    assert_eq!(contents, "01 ab 0f\n");
+}
+
+#[test]
+fn test_sim_fopen_fwrite_fclose_writes_file() {
+    let out_path = temp_file_path("fwrite.out");
+    let out_path_sv = out_path.to_string_lossy().replace('\\', "\\\\");
+    let src = format!(
+        "
+        module test;
+            integer fd;
+            initial begin
+                fd = $fopen(\"{}\", \"w\");
+                $fwrite(fd, \"hello %0d\\n\", 42);
+                $fclose(fd);
+                $finish;
+            end
+        endmodule
+        ",
+        out_path_sv
+    );
+    let _sim = sim_ok(&src);
+    let contents = fs::read_to_string(&out_path).expect("read fwrite output");
+    let _ = fs::remove_file(&out_path);
+    assert_eq!(contents, "hello 42\n");
 }
 
 #[test]

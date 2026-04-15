@@ -131,6 +131,40 @@ impl<'a> BytecodeCompiler<'a> {
         self.insns.push(insn);
     }
 
+    fn hier_raw_name(hier: &HierarchicalIdentifier) -> String {
+        hier.path
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    fn lookup_signal_id(&self, hier: &HierarchicalIdentifier) -> Option<usize> {
+        let raw = Self::hier_raw_name(hier);
+        if let Some(&id) = self.signal_name_to_id.get(&raw) {
+            return Some(id);
+        }
+        if hier.path.len() == 1 {
+            let leaf = &hier.path[0].name.name;
+            return self.signal_name_to_id.get(leaf).copied();
+        }
+        None
+    }
+
+    fn lookup_array_name(&self, hier: &HierarchicalIdentifier) -> Option<String> {
+        let raw = Self::hier_raw_name(hier);
+        if self.arrays.contains_key(&raw) {
+            return Some(raw);
+        }
+        if hier.path.len() == 1 {
+            let leaf = &hier.path[0].name.name;
+            if self.arrays.contains_key(leaf) {
+                return Some(leaf.clone());
+            }
+        }
+        None
+    }
+
     /// Compile a statement. Returns true if successfully compiled.
     pub fn compile_stmt(&mut self, stmt: &Statement) -> bool {
         match &stmt.kind {
@@ -240,8 +274,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(r)
             }
             ExprKind::Ident(hier) => {
-                let name = hier.path.last().map(|s| s.name.name.as_str())?;
-                let &id = self.signal_name_to_id.get(name)?;
+                let id = self.lookup_signal_id(hier)?;
                 let r = self.alloc_reg();
                 if self.signal_signed[id] {
                     self.emit(Insn::LoadSignalSigned(r, id));
@@ -325,11 +358,10 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Index { expr, index } => {
                 // Array element access
                 if let ExprKind::Ident(hier) = &expr.kind {
-                    let name = hier.path.last().map(|s| s.name.name.as_str())?;
-                    if self.arrays.contains_key(name) {
+                    if let Some(name) = self.lookup_array_name(hier) {
                         let idx_reg = self.compile_expr(index, 0)?;
                         let dest = self.alloc_reg();
-                        self.emit(Insn::LoadArrayElem(dest, name.to_string(), idx_reg));
+                        self.emit(Insn::LoadArrayElem(dest, name, idx_reg));
                         return Some(dest);
                     }
                 }
@@ -380,18 +412,16 @@ impl<'a> BytecodeCompiler<'a> {
     fn compile_nba_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
-                let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                if let Some(&id) = self.signal_name_to_id.get(name) {
+                if let Some(id) = self.lookup_signal_id(hier) {
                     self.emit(Insn::NbaAssign(id, val_reg, width));
                     true
                 } else { false }
             }
             ExprKind::Index { expr, index } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
-                    let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                    if self.arrays.contains_key(name) {
+                    if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            self.emit(Insn::NbaAssignArray(name.to_string(), idx_reg, val_reg, width));
+                            self.emit(Insn::NbaAssignArray(name, idx_reg, val_reg, width));
                             return true;
                         }
                     }
@@ -406,8 +436,7 @@ impl<'a> BytecodeCompiler<'a> {
     fn compile_blocking_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
-                let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                if let Some(&id) = self.signal_name_to_id.get(name) {
+                if let Some(id) = self.lookup_signal_id(hier) {
                     self.emit(Insn::BlockingAssign(id, val_reg, width));
                     true
                 } else { false }
@@ -419,20 +448,25 @@ impl<'a> BytecodeCompiler<'a> {
     fn infer_lhs_width(&self, lhs: &Expression) -> u32 {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
-                let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                if let Some(&id) = self.signal_name_to_id.get(name) {
+                if let Some(id) = self.lookup_signal_id(hier) {
                     self.signal_widths[id]
                 } else {
-                    self.widths.get(name).copied().unwrap_or(32)
+                    let raw = Self::hier_raw_name(hier);
+                    self.widths.get(&raw).copied().unwrap_or(32)
                 }
             }
             ExprKind::Index { expr, .. } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
-                    let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                    if let Some((_, _, elem_w)) = self.arrays.get(name) {
+                    if let Some(name) = self.lookup_array_name(hier) {
+                        if let Some((_, _, elem_w)) = self.arrays.get(&name) {
+                            return *elem_w;
+                        }
+                    }
+                    let raw = Self::hier_raw_name(hier);
+                    if let Some((_, _, elem_w)) = self.arrays.get(&raw) {
                         return *elem_w;
                     }
-                    self.widths.get(name).copied().unwrap_or(32)
+                    self.widths.get(&raw).copied().unwrap_or(32)
                 } else { 32 }
             }
             _ => 32,

@@ -7,6 +7,8 @@ pub mod value;
 pub mod elaborate;
 pub mod simulator;
 pub mod bytecode;
+pub mod sdf;
+pub mod native_codegen;
 
 pub use value::Value;
 pub use elaborate::{elaborate_module, ElaboratedModule};

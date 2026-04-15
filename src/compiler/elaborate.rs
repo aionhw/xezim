@@ -2,7 +2,8 @@
 //! Resolves net/variable declarations, continuous assigns, always blocks.
 
 use ahash::AHashMap as HashMap;
-use crate::ast::*;
+use ahash::AHashSet as HashSet;
+use crate::ast::{Identifier, Span};
 use crate::ast::decl::*;
 use crate::ast::module::*;
 use crate::ast::types::*;
@@ -16,8 +17,12 @@ pub struct Signal {
     pub name: String,
     pub width: u32,
     pub is_signed: bool,
+    pub is_real: bool,
+    pub is_const: bool,
     pub direction: Option<PortDirection>,
     pub value: Value,
+    /// Name of the data type (e.g. class name).
+    pub type_name: Option<String>,
 }
 
 /// A continuous assignment: assign lhs = rhs.
@@ -40,6 +45,90 @@ pub struct InitialBlock {
     pub stmt: Statement,
 }
 
+/// Elaborated class definition.
+#[derive(Debug, Clone)]
+pub struct ElaboratedClass {
+    pub name: String,
+    pub extends: Option<String>,
+    pub properties: HashMap<String, Signal>,
+    pub methods: HashMap<String, ClassMethod>,
+    /// Properties marked as 'rand' or 'randc'.
+    pub random_properties: HashSet<String>,
+    /// Constraints: name -> constraint declaration.
+    pub constraints: HashMap<String, ClassConstraint>,
+}
+
+/// DPI import metadata used by the simulator for foreign-call dispatch.
+#[derive(Debug, Clone)]
+pub struct DpiImportSpec {
+    pub c_name: String,
+    pub property: Option<DPIProperty>,
+    pub proto: DPIProto,
+}
+
+pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
+    let mut properties = HashMap::new();
+    let mut methods = HashMap::new();
+    let mut random_properties = HashSet::new();
+    let mut constraints = HashMap::new();
+    for item in &c.items {
+        match item {
+            ClassItem::Property(p) => {
+                let width = resolve_type_width(&p.data_type, None, None);
+                let is_signed = is_type_signed(&p.data_type);
+                let is_rand = p.qualifiers.contains(&ClassQualifier::Rand) || p.qualifiers.contains(&ClassQualifier::Randc);
+                let is_const = p.qualifiers.contains(&ClassQualifier::Const);
+                let is_real = is_type_real(&p.data_type);
+                for decl in &p.declarators {
+                    let mut v = if let Some(init) = &decl.init {
+                        let mut val = eval_const_expr_val(init, &HashMap::new()).resize(width);
+                        if is_real { val = Value::from_f64(val.to_f64()); }
+                        val
+                    } else if is_real {
+                        Value::from_f64(0.0)
+                    } else {
+                        Value::new(width)
+                    };
+                    if is_signed { v.is_signed = true; }
+                    properties.insert(decl.name.name.clone(), Signal { is_const: false,
+                        name: decl.name.name.clone(),
+                        width,
+                        is_signed,
+                        is_real,
+                        direction: None,
+                        value: v,
+                        type_name: get_type_name(&p.data_type),
+                    });
+                    if is_rand {
+                        random_properties.insert(decl.name.name.clone());
+                    }
+                }
+            }
+            ClassItem::Method(m) => {
+                let name = match &m.kind {
+                    ClassMethodKind::Function(f) => f.name.name.name.clone(),
+                    ClassMethodKind::Task(t) => t.name.name.name.clone(),
+                    ClassMethodKind::PureVirtual(f) => f.name.name.name.clone(),
+                    ClassMethodKind::Extern(f) => f.name.name.name.clone(),
+                };
+                methods.insert(name, m.clone());
+            }
+            ClassItem::Constraint(con) => {
+                constraints.insert(con.name.name.clone(), con.clone());
+            }
+            _ => {}
+        }
+    }
+    ElaboratedClass {
+        name: c.name.name.clone(),
+        extends: c.extends.as_ref().map(|e| e.name.name.clone()),
+        properties,
+        methods,
+        random_properties,
+        constraints,
+    }
+}
+
 /// Elaborated module ready for simulation.
 #[derive(Debug)]
 pub struct ElaboratedModule {
@@ -54,6 +143,28 @@ pub struct ElaboratedModule {
     pub typedefs: HashMap<String, u32>,
     /// Array declarations: base_name -> (lo_index, hi_index, element_width)
     pub arrays: HashMap<String, (i64, i64, u32)>,
+    /// Associative arrays (string-keyed)
+    pub associative_arrays: HashSet<String>,
+    /// Class definitions: name -> elaborated class.
+    pub classes: HashMap<String, ElaboratedClass>,
+    /// Covergroup definitions: name -> AST declaration.
+    pub covergroups: HashMap<String, CovergroupDeclaration>,
+    /// Module-level function declarations.
+    pub functions: HashMap<String, FunctionDeclaration>,
+    /// Module-level task declarations.
+    pub tasks: HashMap<String, TaskDeclaration>,
+    /// DPI imports by SV-visible symbol name.
+    pub dpi_imports: HashMap<String, DpiImportSpec>,
+    /// Clocking block definitions: name -> AST declaration.
+    pub clocking_blocks: HashMap<String, ClockingDeclaration>,
+    /// Let declarations visible in the elaborated scope.
+    pub lets: HashMap<String, LetDeclaration>,
+    /// Bound interface modport views: signal -> (member -> direction).
+    pub modport_views: HashMap<String, HashMap<String, PortDirection>>,
+    /// Clocking block signals: block name -> (signal -> direction).
+    pub clocking_signal_dirs: HashMap<String, HashMap<String, PortDirection>>,
+    /// Specify path delays: destination signal name -> delay (time units).
+    pub specify_delays: HashMap<String, u64>,
 }
 
 impl ElaboratedModule {
@@ -68,30 +179,387 @@ impl ElaboratedModule {
             parameters: HashMap::new(),
             typedefs: HashMap::new(),
             arrays: HashMap::new(),
+            associative_arrays: HashSet::new(),
+            classes: HashMap::new(),
+            covergroups: HashMap::new(),
+            functions: HashMap::new(),
+            tasks: HashMap::new(),
+            dpi_imports: HashMap::new(),
+            clocking_blocks: HashMap::new(),
+            lets: HashMap::new(),
+            modport_views: HashMap::new(),
+            clocking_signal_dirs: HashMap::new(),
+            specify_delays: HashMap::new(),
         }
     }
 }
 
-/// Elaborate a module declaration into a simulation model.
+/// A unified representation of a module or interface.
+#[derive(Debug, Clone, Copy)]
+pub enum Definition<'a> {
+    Module(&'a ModuleDeclaration),
+    Interface(&'a crate::ast::module::InterfaceDeclaration),
+    Program(&'a crate::ast::module::ProgramDeclaration),
+    Class(&'a crate::ast::decl::ClassDeclaration),
+    Covergroup(&'a crate::ast::decl::CovergroupDeclaration),
+    Package(&'a crate::ast::module::PackageDeclaration),
+    Typedef(&'a crate::ast::decl::TypedefDeclaration),
+}
+
+impl<'a> Definition<'a> {
+    pub fn name(&self) -> &str {
+        match self {
+            Definition::Module(m) => &m.name.name,
+            Definition::Interface(i) => &i.name.name,
+            Definition::Program(p) => &p.name.name,
+            Definition::Class(c) => &c.name.name,
+            Definition::Covergroup(cg) => &cg.name.name,
+            Definition::Package(p) => &p.name.name,
+            Definition::Typedef(t) => &t.name.name,
+        }
+    }
+
+    pub fn params(&self) -> &[ParameterDeclaration] {
+        match self {
+            Definition::Module(m) => &m.params,
+            Definition::Interface(i) => &i.params,
+            Definition::Program(p) => &p.params,
+            Definition::Class(c) => &c.params,
+            Definition::Covergroup(_) | Definition::Package(_) | Definition::Typedef(_) => &[],
+        }
+    }
+
+    pub fn ports(&self) -> &PortList {
+        match self {
+            Definition::Module(m) => &m.ports,
+            Definition::Interface(i) => &i.ports,
+            Definition::Program(p) => &p.ports,
+            Definition::Class(_) | Definition::Covergroup(_) | Definition::Package(_) | Definition::Typedef(_) => &PortList::Empty,
+        }
+    }
+        pub fn items(&self) -> &[ModuleItem] {
+        match self {
+        Definition::Module(m) => &m.items,
+        Definition::Interface(i) => &i.items,
+        Definition::Program(p) => &p.items,
+        Definition::Class(_) | Definition::Covergroup(_) | Definition::Package(_) | Definition::Typedef(_) => &[],
+        }
+        }
+        }
+
+fn get_type_name(dt: &DataType) -> Option<String> {
+    match dt {
+        DataType::TypeReference { name, .. } => Some(name.name.name.clone()),
+        DataType::Interface { name, .. } => Some(name.name.clone()),
+        _ => None,
+    }
+}
+
+fn dpi_proto_sv_name(proto: &DPIProto) -> String {
+    match proto {
+        DPIProto::Function(fd) => fd.name.name.name.clone(),
+        DPIProto::Task(td) => td.name.name.name.clone(),
+    }
+}
+
+fn register_dpi_import(di: &DPIImport, elab: &mut ElaboratedModule) -> Result<(), String> {
+    let sv_name = dpi_proto_sv_name(&di.proto);
+    if elab.dpi_imports.contains_key(&sv_name) {
+        return Err(format!("Duplicate DPI import declaration '{}'", sv_name));
+    }
+    let c_name = di.c_name.clone().unwrap_or_else(|| sv_name.clone());
+    elab.dpi_imports.insert(sv_name, DpiImportSpec {
+        c_name,
+        property: di.property,
+        proto: di.proto.clone(),
+    });
+    Ok(())
+}
+
+fn is_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> bool {
+    match &expr.kind {
+        ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
+        ExprKind::Ident(hier) => {
+            let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+            params.contains_key(name)
+        }
+        ExprKind::Unary { operand, .. } => is_const_expr(operand, params),
+        ExprKind::Binary { left, right, .. } => is_const_expr(left, params) && is_const_expr(right, params),
+        ExprKind::Conditional { condition, then_expr, else_expr } => is_const_expr(condition, params) && is_const_expr(then_expr, params) && is_const_expr(else_expr, params),
+        ExprKind::Concatenation(parts) => parts.iter().all(|p| is_const_expr(p, params)),
+        ExprKind::Paren(inner) => is_const_expr(inner, params),
+        _ => false, // Calls (new()) etc. are not constant
+    }
+}
+
+/// Elaborate a module or interface declaration into a simulation model.
 pub fn elaborate_module(
-    module: &ModuleDeclaration,
+    module: Definition,
     param_overrides: &HashMap<String, Value>,
 ) -> Result<ElaboratedModule, String> {
-    let mut elab = ElaboratedModule::new(module.name.name.clone());
+    elaborate_module_with_defs(module, param_overrides, None, &[], &[])
+}
+
+pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
+    if let DataType::Enum(et) = &td.data_type {
+        let base_width = et.base_type.as_ref()
+            .map(|bt| resolve_type_width(bt, Some(&elab.parameters), Some(&elab.typedefs)))
+            .unwrap_or(32);
+        let mut next_val: u64 = 0;
+        for member in &et.members {
+            let val = if let Some(init) = &member.init {
+                eval_const_expr(init, &elab.parameters)
+            } else { next_val };
+            next_val = val.wrapping_add(1);
+            let v = Value::from_u64(val, base_width);
+            elab.parameters.insert(member.name.name.clone(), v.clone());
+            elab.signals.insert(member.name.name.clone(), Signal { is_const: false,
+                name: member.name.name.clone(),
+                width: base_width,
+                is_signed: false,
+                is_real: false,
+                direction: None,
+                value: v,
+                type_name: None,
+            });
+        }
+        // Register the typedef width
+        elab.typedefs.insert(td.name.name.clone(), base_width);
+    } else {
+        // Non-enum typedef: resolve width from the underlying type
+        let w = resolve_type_width(&td.data_type, Some(&elab.parameters), Some(&elab.typedefs));
+        elab.typedefs.insert(td.name.name.clone(), w);
+    }
+}
+
+fn resolve_interface_modport_view(
+    interface_name: &str,
+    modport_name: &str,
+    all_defs: Option<&HashMap<String, Definition>>,
+) -> Option<HashMap<String, PortDirection>> {
+    let defs = all_defs?;
+    let idef = match defs.get(interface_name) {
+        Some(Definition::Interface(i)) => i,
+        _ => return None,
+    };
+    for item in &idef.items {
+        if let ModuleItem::ModportDeclaration(md) = item {
+            for mp in &md.items {
+                if mp.name.name == modport_name {
+                    let mut dirs = HashMap::new();
+                    for p in &mp.ports {
+                        dirs.insert(p.name.name.clone(), p.direction);
+                    }
+                    return Some(dirs);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn validate_class_constraint_expr(expr: &Expression, allowed: &HashSet<String>) -> Result<(), String> {
+    match &expr.kind {
+        ExprKind::Ident(hier) => {
+            if hier.path.len() == 1 {
+                let n = &hier.path[0].name.name;
+                if n != "this" && n != "super" && n != "new" && !allowed.contains(n) {
+                    return Err(format!("Undeclared identifier '{}' in class constraint", n));
+                }
+            }
+        }
+        ExprKind::Unary { operand, .. } => validate_class_constraint_expr(operand, allowed)?,
+        ExprKind::Binary { left, right, .. } => {
+            validate_class_constraint_expr(left, allowed)?;
+            validate_class_constraint_expr(right, allowed)?;
+        }
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            validate_class_constraint_expr(condition, allowed)?;
+            validate_class_constraint_expr(then_expr, allowed)?;
+            validate_class_constraint_expr(else_expr, allowed)?;
+        }
+        ExprKind::Concatenation(parts) => {
+            for p in parts {
+                validate_class_constraint_expr(p, allowed)?;
+            }
+        }
+        ExprKind::Replication { count, exprs } => {
+            validate_class_constraint_expr(count, allowed)?;
+            for e in exprs {
+                validate_class_constraint_expr(e, allowed)?;
+            }
+        }
+        ExprKind::Index { expr, index } => {
+            validate_class_constraint_expr(expr, allowed)?;
+            validate_class_constraint_expr(index, allowed)?;
+        }
+        ExprKind::RangeSelect { expr, left, right, .. } => {
+            validate_class_constraint_expr(expr, allowed)?;
+            validate_class_constraint_expr(left, allowed)?;
+            validate_class_constraint_expr(right, allowed)?;
+        }
+        ExprKind::Inside { expr, ranges } => {
+            validate_class_constraint_expr(expr, allowed)?;
+            for r in ranges {
+                validate_class_constraint_expr(r, allowed)?;
+            }
+        }
+        ExprKind::Range(lo, hi) => {
+            validate_class_constraint_expr(lo, allowed)?;
+            validate_class_constraint_expr(hi, allowed)?;
+        }
+        ExprKind::Paren(inner) => validate_class_constraint_expr(inner, allowed)?,
+        ExprKind::Call { func, args } => {
+            validate_class_constraint_expr(func, allowed)?;
+            for a in args {
+                validate_class_constraint_expr(a, allowed)?;
+            }
+        }
+        ExprKind::SystemCall { args, .. } => {
+            for a in args {
+                validate_class_constraint_expr(a, allowed)?;
+            }
+        }
+        ExprKind::MemberAccess { expr, .. } => validate_class_constraint_expr(expr, allowed)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_constraint_item_names(item: &ConstraintItem, allowed: &HashSet<String>) -> Result<(), String> {
+    match item {
+        ConstraintItem::Expr(expr) => validate_class_constraint_expr(expr, allowed)?,
+        ConstraintItem::Inside { expr, range, .. } => {
+            validate_class_constraint_expr(expr, allowed)?;
+            for r in range {
+                match r {
+                    ConstraintRange::Value(e) => validate_class_constraint_expr(e, allowed)?,
+                    ConstraintRange::Range { lo, hi } => {
+                        validate_class_constraint_expr(lo, allowed)?;
+                        validate_class_constraint_expr(hi, allowed)?;
+                    }
+                }
+            }
+        }
+        ConstraintItem::Implication { condition, constraint, .. } => {
+            validate_class_constraint_expr(condition, allowed)?;
+            validate_constraint_item_names(constraint, allowed)?;
+        }
+        ConstraintItem::IfElse { condition, then_item, else_item, .. } => {
+            validate_class_constraint_expr(condition, allowed)?;
+            validate_constraint_item_names(then_item, allowed)?;
+            if let Some(ei) = else_item {
+                validate_constraint_item_names(ei, allowed)?;
+            }
+        }
+        ConstraintItem::Foreach { array, item, .. } => {
+            validate_class_constraint_expr(array, allowed)?;
+            validate_constraint_item_names(item, allowed)?;
+        }
+        ConstraintItem::Soft(inner) => validate_constraint_item_names(inner, allowed)?,
+        ConstraintItem::Block(items) => {
+            for it in items {
+                validate_constraint_item_names(it, allowed)?;
+            }
+        }
+        ConstraintItem::Solve { before, after, .. } => {
+            for id in before {
+                if !allowed.contains(&id.name) {
+                    return Err(format!("Undeclared identifier '{}' in class constraint", id.name));
+                }
+            }
+            for id in after {
+                if !allowed.contains(&id.name) {
+                    return Err(format!("Undeclared identifier '{}' in class constraint", id.name));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_class_constraints(c: &ClassDeclaration) -> Result<(), String> {
+    let mut allowed = HashSet::new();
+    for item in &c.items {
+        if let ClassItem::Property(p) = item {
+            for d in &p.declarators {
+                allowed.insert(d.name.name.clone());
+            }
+        }
+    }
+    for item in &c.items {
+        if let ClassItem::Constraint(con) = item {
+            for it in &con.items {
+                validate_constraint_item_names(it, &allowed)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn elaborate_module_with_defs(
+    module: Definition,
+    param_overrides: &HashMap<String, Value>,
+    all_defs: Option<&HashMap<String, Definition>>,
+    top_level_imports: &[ImportDeclaration],
+    top_level_lets: &[LetDeclaration],
+) -> Result<ElaboratedModule, String> {
+    let mut elab = ElaboratedModule::new(module.name().to_string());
+
+    // Process top-level typedefs and other global definitions from all_defs
+    if let Some(defs) = all_defs {
+        for def in defs.values() {
+            match def {
+                Definition::Typedef(td) => { process_typedef(td, &mut elab); }
+                Definition::Class(c) => {
+                    validate_class_constraints(c)?;
+                    elab.classes.insert(c.name.name.clone(), elaborate_class(c));
+                }
+                Definition::Covergroup(cg) => { elab.covergroups.insert(cg.name.name.clone(), (*cg).clone()); }
+                _ => {}
+            }
+        }
+    }
+
+    // Process top-level imports
+    for imp in top_level_imports {
+        if let Some(defs) = all_defs {
+            process_import(imp, &mut elab, defs)?;
+        }
+    }
+
+    for l in top_level_lets {
+        elab.lets.insert(l.name.name.clone(), l.clone());
+    }
 
     // Process parameters
-    for param in &module.params {
+    for param in module.params() {
         if let ParameterKind::Data { data_type, assignments } = &param.kind {
             for assign in assignments {
-                let mut width = resolve_type_width(data_type);
+                let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let mut signed = is_type_signed(data_type);
+                let mut is_real = is_type_real(data_type);
+
                 // IEEE 1800-2017 §6.20.2: Parameters with implicit type (no explicit type)
                 // default to 32-bit signed integer.
                 if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
-                    width = 32;
-                    signed = true;
+                    // Check if the initialization value is real. If so, parameter is real.
+                    let init_is_real = if let Some(override_val) = param_overrides.get(&assign.name.name) {
+                        override_val.is_real
+                    } else if let Some(init) = &assign.init {
+                        eval_const_expr_val(init, &elab.parameters).is_real
+                    } else { false };
+
+                    if init_is_real {
+                        width = 64;
+                        is_real = true;
+                    } else {
+                        width = 32;
+                        signed = true;
+                    }
                 }
-                let val = if let Some(override_val) = param_overrides.get(&assign.name.name) {
+
+                let mut val = if let Some(override_val) = param_overrides.get(&assign.name.name) {
                     override_val.clone()
                 } else if let Some(init) = &assign.init {
                     let mut v = eval_const_expr_val(init, &elab.parameters).resize(width);
@@ -102,30 +570,47 @@ pub fn elaborate_module(
                     if signed { v.is_signed = true; }
                     v
                 };
+
+                if is_real {
+                    val = Value::from_f64(val.to_f64());
+                }
+
                 elab.parameters.insert(assign.name.name.clone(), val);
             }
         }
     }
 
     // Process ports
-    match &module.ports {
+    match module.ports() {
         PortList::Ansi(ports) => {
             for port in ports {
+                let modport_view = match port.data_type.as_ref() {
+                    Some(DataType::Interface { name, modport: Some(mp), .. }) => {
+                        resolve_interface_modport_view(&name.name, &mp.name, all_defs)
+                    }
+                    _ => None,
+                };
                 let width = port.data_type.as_ref()
-                    .map(|dt| resolve_type_width_with_params(dt, Some(&elab.parameters)))
+                    .map(|dt| resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs)))
                     .unwrap_or(1);
                 let is_signed = port.data_type.as_ref()
                     .map(|dt| is_type_signed(dt))
                     .unwrap_or(false);
-                let sig = Signal {
+                let is_real = port.data_type.as_ref().map(is_type_real).unwrap_or(false);
+                let sig = Signal { is_const: false,
                     name: port.name.name.clone(),
                     width,
                     is_signed,
+                    is_real,
                     direction: port.direction,
-                    value: Value::new(width),
+                    value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                    type_name: port.data_type.as_ref().and_then(get_type_name),
                 };
                 elab.port_order.push(port.name.name.clone());
                 elab.signals.insert(port.name.name.clone(), sig);
+                if let Some(view) = modport_view {
+                    elab.modport_views.insert(port.name.name.clone(), view);
+                }
             }
         }
         PortList::NonAnsi(names) => {
@@ -137,43 +622,98 @@ pub fn elaborate_module(
         PortList::Empty => {}
     }
 
-    // Process module items
-    for item in &module.items {
+    // Process items
+    if let Definition::Package(p) = module {
+        for item in &p.items {
+            match item {
+                crate::ast::decl::PackageItem::Typedef(td) => {
+                    process_typedef(td, &mut elab);
+                }
+                crate::ast::decl::PackageItem::Parameter(pd) => {
+                    if let ParameterKind::Data { data_type, assignments } = &pd.kind {
+                        let width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                        let is_signed = is_type_signed(data_type);
+                        for assign in assignments {
+                            if let Some(init) = &assign.init {
+                                let mut v = eval_const_expr_val(init, &elab.parameters).resize(width);
+                                if is_signed { v.is_signed = true; }
+                                elab.parameters.insert(assign.name.name.clone(), v);
+                            }
+                        }
+                    }
+                }
+                crate::ast::decl::PackageItem::Class(c) => {
+                    validate_class_constraints(c)?;
+                    elab.classes.insert(c.name.name.clone(), elaborate_class(c));
+                }
+                crate::ast::decl::PackageItem::Let(l) => {
+                    elab.lets.insert(l.name.name.clone(), l.clone());
+                }
+                crate::ast::decl::PackageItem::DPIImport(di) => {
+                    register_dpi_import(di, &mut elab)?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for item in module.items() {
         match item {
             ModuleItem::PortDeclaration(pd) => {
-                let width = resolve_type_width_with_params(&pd.data_type, Some(&elab.parameters));
+                let port_modport_view = match &pd.data_type {
+                    DataType::Interface { name, modport: Some(mp), .. } => {
+                        resolve_interface_modport_view(&name.name, &mp.name, all_defs)
+                    }
+                    _ => None,
+                };
+                let width = resolve_type_width(&pd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let is_signed = is_type_signed(&pd.data_type);
+                let is_real = is_type_real(&pd.data_type);
                 for decl in &pd.declarators {
-                    let sig = Signal {
+                    if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
+                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                    }
+                    let sig = Signal { is_const: false,
                         name: decl.name.name.clone(),
                         width,
                         is_signed,
+                        is_real,
                         direction: Some(pd.direction),
-                        value: Value::new(width),
+                        value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                        type_name: get_type_name(&pd.data_type),
                     };
                     if !elab.port_order.contains(&decl.name.name) {
                         elab.port_order.push(decl.name.name.clone());
                     }
                     elab.signals.insert(decl.name.name.clone(), sig);
+                    if let Some(view) = &port_modport_view {
+                        elab.modport_views.insert(decl.name.name.clone(), view.clone());
+                    }
                 }
             }
             ModuleItem::NetDeclaration(nd) => {
-                let width = resolve_type_width_with_params(&nd.data_type, Some(&elab.parameters));
+                let width = resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let is_signed = is_type_signed(&nd.data_type);
+                let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
+                    if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
+                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                    }
                     let w = width_with_unpacked_dims(&decl.dimensions, width);
                     // supply0 → constant 0, supply1 → constant 1
                     let init_value = match nd.net_type {
                         NetType::Supply0 => Value::zero(w),
                         NetType::Supply1 => Value::ones(w),
-                        _ => Value::new(w),
+                        _ => if is_real { Value::from_f64(0.0) } else { Value::new(w) },
                     };
-                    let sig = Signal {
+                    let sig = Signal { is_const: false,
                         name: decl.name.name.clone(),
                         width: w,
                         is_signed,
+                        is_real,
                         direction: None,
                         value: init_value,
+                        type_name: get_type_name(&nd.data_type),
                     };
                     elab.signals.insert(decl.name.name.clone(), sig);
                     // Wire with initializer → continuous assign (not constant eval)
@@ -186,144 +726,229 @@ pub fn elaborate_module(
                 }
             }
             ModuleItem::DataDeclaration(dd) => {
+                let data_modport_view = match &dd.data_type {
+                    DataType::Interface { name, modport: Some(mp), .. } => {
+                        resolve_interface_modport_view(&name.name, &mp.name, all_defs)
+                    }
+                    _ => None,
+                };
                 let width = match &dd.data_type {
                     DataType::TypeReference { name, .. } => {
-                        elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width_with_params(&dd.data_type, Some(&elab.parameters)))
+                        elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
                     }
-                    _ => resolve_type_width_with_params(&dd.data_type, Some(&elab.parameters)),
+                    _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                 };
                 let is_signed = is_type_signed(&dd.data_type);
                 for decl in &dd.declarators {
+                    if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
+                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                    }
+                    if let Some(UnpackedDimension::Associative { .. }) = decl.dimensions.first() {
+                        elab.associative_arrays.insert(decl.name.name.clone());
+                    }
                     // Check for unpacked array dimensions (e.g., memory [0:255])
                     let array_range = extract_array_range(&decl.dimensions, &elab.parameters);
                     if let Some((lo, hi)) = array_range {
                         // Register this as an array for the simulator
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        let is_real = is_type_real(&dd.data_type);
                         // Create individual element signals: name[lo], name[lo+1], ..., name[hi]
                         for idx in lo..=hi {
                             let elem_name = format!("{}[{}]", decl.name.name, idx);
-                            let sig = Signal {
+                            let sig = Signal { is_const: dd.const_kw,
                                 name: elem_name.clone(),
                                 width,
                                 is_signed,
+                                is_real,
                                 direction: None,
-                                value: Value::new(width),
+                                value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                                type_name: get_type_name(&dd.data_type),
                             };
                             elab.signals.insert(elem_name, sig);
                         }
                     } else {
+                        let is_real = is_type_real(&dd.data_type);
                         let w = width;
-                        let init_val = if let Some(init_expr) = &decl.init {
-                            let mut rv = eval_const_expr_val(init_expr, &elab.parameters).resize(w);
-                            if is_signed { rv.is_signed = true; }
-                            rv
-                        } else { Value::new(w) };
-                        let sig = Signal {
+                        let (init_val, procedural_init) = if let Some(init_expr) = &decl.init {
+                            if is_const_expr(init_expr, &elab.parameters) {
+                                let mut rv = eval_const_expr_val(init_expr, &elab.parameters).resize(w);
+                                if is_signed { rv.is_signed = true; }
+                                if is_real { rv = Value::from_f64(rv.to_f64()); }
+                                (rv, None)
+                            } else {
+                                (if is_real { Value::from_f64(0.0) } else { Value::new(w) }, Some(init_expr.clone()))
+                            }
+                        } else { (if is_real { Value::from_f64(0.0) } else { Value::new(w) }, None) };
+                        
+                        let sig = Signal { is_const: dd.const_kw,
                             name: decl.name.name.clone(),
                             width: w,
                             is_signed,
+                            is_real,
                             direction: None,
                             value: init_val,
+                            type_name: get_type_name(&dd.data_type),
                         };
                         elab.signals.insert(decl.name.name.clone(), sig);
+                        if let Some(view) = &data_modport_view {
+                            elab.modport_views.insert(decl.name.name.clone(), view.clone());
+                        }
+                        
+                        if let Some(expr) = procedural_init {
+                            elab.initial_blocks.push(InitialBlock {
+                                stmt: Statement::new(StatementKind::BlockingAssign {
+                                    lvalue: make_ident_expr(&decl.name.name),
+                                    rvalue: expr,
+                                }, decl.name.span),
+                            });
+                        }
                     }
                 }
             }
             ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
                 if let ParameterKind::Data { data_type, assignments } = &pd.kind {
-                    let mut width = resolve_type_width(data_type);
+                    let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                     let mut signed = is_type_signed(data_type);
+                    let mut is_real = is_type_real(data_type);
                     // IEEE 1800-2017 §6.20.2: implicit type → signed 32-bit
                     if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
                         width = 32;
                         signed = true;
                     }
                     for assign in assignments {
-                        let val = if elab.parameters.contains_key(&assign.name.name) {
-                            elab.parameters.get(&assign.name.name).cloned().unwrap_or(Value::zero(width))
+                        if elab.signals.contains_key(&assign.name.name) || elab.parameters.contains_key(&assign.name.name) {
+                            return Err(format!("Duplicate declaration of '{}'", assign.name.name));
+                        }
+                        let mut current_width = width;
+                        let mut current_is_real = is_real;
+                        let mut current_signed = signed;
+
+                        if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
+                            let init_is_real = if elab.parameters.contains_key(&assign.name.name) {
+                                elab.parameters.get(&assign.name.name).map(|v| v.is_real).unwrap_or(false)
+                            } else if let Some(init) = &assign.init {
+                                eval_const_expr_val(init, &elab.parameters).is_real
+                            } else { false };
+
+                            if init_is_real {
+                                current_width = 64;
+                                current_is_real = true;
+                                current_signed = false;
+                            }
+                        }
+
+                        let mut val = if elab.parameters.contains_key(&assign.name.name) {
+                            elab.parameters.get(&assign.name.name).cloned().unwrap_or(Value::zero(current_width))
                         } else if let Some(init) = &assign.init {
-                            let mut v = eval_const_expr_val(init, &elab.parameters).resize(width);
-                            if signed { v.is_signed = true; }
-                            elab.parameters.insert(assign.name.name.clone(), v.clone());
+                            let mut v = eval_const_expr_val(init, &elab.parameters).resize(current_width);
+                            if current_signed { v.is_signed = true; }
                             v
                         } else {
-                            let mut v = Value::zero(width);
-                            if signed { v.is_signed = true; }
-                            elab.parameters.insert(assign.name.name.clone(), v.clone());
+                            let mut v = Value::zero(current_width);
+                            if current_signed { v.is_signed = true; }
                             v
                         };
-                        let sig = Signal {
+
+                        if current_is_real {
+                            val = Value::from_f64(val.to_f64());
+                        }
+
+                        if !elab.parameters.contains_key(&assign.name.name) {
+                            elab.parameters.insert(assign.name.name.clone(), val.clone());
+                        }
+
+                        // Also add as a signal so it can be read in expressions
+                        elab.signals.insert(assign.name.name.clone(), Signal { is_const: false,
                             name: assign.name.name.clone(),
-                            width, is_signed: signed,
-                            direction: None, value: val,
-                        };
-                        elab.signals.insert(assign.name.name.clone(), sig);
+                            width: current_width,
+                            is_signed: current_signed,
+                            is_real: current_is_real,
+                            direction: None,
+                            value: val,
+                            type_name: get_type_name(data_type),
+                        });
                     }
                 }
+            }
+            ModuleItem::TypedefDeclaration(td) => {
+                process_typedef(td, &mut elab);
+            }
+            ModuleItem::FunctionDeclaration(fd) => {
+                elab.functions.insert(fd.name.name.name.clone(), fd.clone());
+            }
+            ModuleItem::TaskDeclaration(td) => {
+                elab.tasks.insert(td.name.name.name.clone(), td.clone());
             }
             ModuleItem::ContinuousAssign(ca) => {
                 for (lhs, rhs) in &ca.assignments {
-                    elab.continuous_assigns.push(ContinuousAssignment {
-                        lhs: lhs.clone(),
-                        rhs: rhs.clone(),
-                    });
+                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone() });
                 }
-            }
-            ModuleItem::GateInstantiation(gi) => {
-                gate_inst_to_assigns(gi, &mut elab);
             }
             ModuleItem::AlwaysConstruct(ac) => {
-                elab.always_blocks.push(AlwaysBlock {
-                    kind: ac.kind,
-                    stmt: ac.stmt.clone(),
-                });
+                elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone() });
             }
             ModuleItem::InitialConstruct(ic) => {
-                elab.initial_blocks.push(InitialBlock {
-                    stmt: ic.stmt.clone(),
-                });
-            }
-            ModuleItem::TypedefDeclaration(td) => {
-                // Extract enum constants as parameters
-                if let DataType::Enum(et) = &td.data_type {
-                    let base_width = et.base_type.as_ref()
-                        .map(|bt| resolve_type_width(bt))
-                        .unwrap_or(32);
-                    let mut next_val: u64 = 0;
-                    for member in &et.members {
-                        let val = if let Some(init) = &member.init {
-                            eval_const_expr(init, &elab.parameters)
-                        } else {
-                            next_val
-                        };
-                        next_val = val + 1;
-                        let v = Value::from_u64(val, base_width);
-                        elab.parameters.insert(member.name.name.clone(), v.clone());
-                        elab.signals.insert(member.name.name.clone(), Signal {
-                            name: member.name.name.clone(),
-                            width: base_width,
-                            is_signed: false,
-                            direction: None,
-                            value: v,
-                        });
-                    }
-                    // Register the typedef width
-                    elab.typedefs.insert(td.name.name.clone(), base_width);
-                } else {
-                    // Non-enum typedef: resolve width from the underlying type
-                    let w = resolve_type_width(&td.data_type);
-                    elab.typedefs.insert(td.name.name.clone(), w);
-                }
-            }
-            ModuleItem::FunctionDeclaration(_) | ModuleItem::TaskDeclaration(_) => {
-                // Functions/tasks stored for call resolution
+                elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone() });
             }
             ModuleItem::GenerateRegion(gr) => {
                 // Recursively process generate region items
-                elaborate_items(&gr.items, &mut elab);
+                elaborate_items(&gr.items, &mut elab, all_defs)?;
             }
             ModuleItem::GenerateIf(gi) => {
-                elaborate_generate_if(&gi.branches, &mut elab);
+                elaborate_generate_if(&gi.branches, &mut elab, all_defs)?;
+            }
+            ModuleItem::GenerateFor(gf) => {
+                elaborate_generate_for(gf, &mut elab, all_defs)?;
+            }
+            ModuleItem::CovergroupDeclaration(cg) => {
+                elab.covergroups.insert(cg.name.name.clone(), cg.clone());
+            }
+            ModuleItem::ClockingDeclaration(cd) => {
+                let mut dirs = HashMap::new();
+                for s in &cd.signals {
+                    dirs.insert(s.name.name.clone(), s.direction);
+                }
+                elab.clocking_signal_dirs.insert(cd.name.name.clone(), dirs);
+                elab.clocking_blocks.insert(cd.name.name.clone(), cd.clone());
+            }
+            ModuleItem::ClassDeclaration(cd) => {
+                validate_class_constraints(cd)?;
+                elab.classes.insert(cd.name.name.clone(), elaborate_class(cd));
+            }
+            ModuleItem::LetDeclaration(ld) => {
+                elab.lets.insert(ld.name.name.clone(), ld.clone());
+            }
+            ModuleItem::SpecifyBlock(sb) => {
+                for p in &sb.paths {
+                    let d = eval_const_expr(&p.delay, &elab.parameters);
+                    elab.specify_delays.insert(p.dst.name.clone(), d);
+                }
+            }
+            ModuleItem::ModuleInstantiation(inst) => {
+                for hi in &inst.instances {
+                    // Register the instance name so it's recognized during validation.
+                    // It will be fully elaborated during inlining.
+                    if !elab.signals.contains_key(&hi.name.name) {
+                        elab.signals.insert(hi.name.name.clone(), Signal {
+                            is_const: false,
+                            name: hi.name.name.clone(),
+                            width: 1,
+                            is_signed: false,
+                            is_real: false,
+                            direction: None,
+                            value: Value::new(1),
+                            type_name: Some(inst.module_name.name.clone()),
+                        });
+                    }
+                }
+            }
+            ModuleItem::ImportDeclaration(imp) => {
+                if let Some(defs) = all_defs {
+                    process_import(imp, &mut elab, defs)?;
+                }
+            }
+            ModuleItem::DPIImport(di) => {
+                register_dpi_import(di, &mut elab)?;
             }
             _ => {}
         }
@@ -333,7 +958,205 @@ pub fn elaborate_module(
     // or port connections that are not explicitly declared become implicit 1-bit wires.
     create_implicit_nets(&mut elab);
 
+    // Validate that all identifiers in procedural blocks are declared.
+    for ib in &elab.initial_blocks { validate_stmt_idents(&ib.stmt, &elab, &mut HashSet::new())?; }
+    for ab in &elab.always_blocks { validate_stmt_idents(&ab.stmt, &elab, &mut HashSet::new())?; }
+
     Ok(elab)
+}
+
+fn validate_stmt_idents(stmt: &Statement, elab: &ElaboratedModule, locals: &mut HashSet<String>) -> Result<(), String> {
+    match &stmt.kind {
+        StatementKind::BlockingAssign { lvalue, rvalue } | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+            if let ExprKind::Ident(hier) = &lvalue.kind {
+                let name = if hier.path.len() == 1 {
+                    Some(hier.path[0].name.name.clone())
+                } else {
+                    // Hierarchical name: join segments
+                    Some(hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join("."))
+                };
+                if let Some(n) = name {
+                    if let Some(sig) = elab.signals.get(&n) {
+                        if sig.is_const {
+                            return Err(format!("Illegal write to constant identifier '{}'", n));
+                        }
+                        if sig.direction == Some(PortDirection::Input) {
+                            return Err(format!("Illegal write to input identifier '{}'", n));
+                        }
+                    }
+                }
+            }
+            if let ExprKind::MemberAccess { expr, member } = &lvalue.kind {
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if hier.path.len() == 1 {
+                        let base = &hier.path[0].name.name;
+                        if let Some(view) = elab.modport_views.get(base) {
+                            if view.get(&member.name) == Some(&PortDirection::Input) {
+                                return Err(format!("Illegal write to input identifier '{}.{}'", base, member.name));
+                            }
+                        }
+                        if let Some(dirs) = elab.clocking_signal_dirs.get(base) {
+                            if dirs.get(&member.name) == Some(&PortDirection::Input) {
+                                return Err(format!("Illegal write to input identifier '{}.{}'", base, member.name));
+                            }
+                        }
+                    }
+                }
+            }
+            validate_expr_idents(lvalue, elab, locals)?;
+            validate_expr_idents(rvalue, elab, locals)?;
+        }
+        StatementKind::If { condition, then_stmt, else_stmt, .. } => {
+            validate_expr_idents(condition, elab, locals)?;
+            validate_stmt_idents(then_stmt, elab, locals)?;
+            if let Some(eb) = else_stmt { validate_stmt_idents(eb, elab, locals)?; }
+        }
+        StatementKind::Case { expr, items, .. } => {
+            validate_expr_idents(expr, elab, locals)?;
+            for item in items {
+                for p in &item.patterns { validate_expr_idents(p, elab, locals)?; }
+                validate_stmt_idents(&item.stmt, elab, locals)?;
+            }
+        }
+        StatementKind::For { init, condition, step, body } => {
+            let mut for_locals = Vec::new();
+            for fi in init { match fi {
+                ForInit::VarDecl { name, init: e, .. } => {
+                    validate_expr_idents(e, elab, locals)?;
+                    locals.insert(name.name.clone());
+                    for_locals.push(name.name.clone());
+                }
+                ForInit::Assign { lvalue, rvalue } => {
+                    validate_expr_idents(lvalue, elab, locals)?;
+                    validate_expr_idents(rvalue, elab, locals)?;
+                }
+            }}
+            if let Some(c) = condition { validate_expr_idents(c, elab, locals)?; }
+            for s in step { validate_expr_idents(s, elab, locals)?; }
+            validate_stmt_idents(body, elab, locals)?;
+            for n in for_locals { locals.remove(&n); }
+        }
+        StatementKind::Foreach { array, body, vars } => {
+            validate_expr_idents(array, elab, locals)?;
+            let mut foreach_locals = Vec::new();
+            for v in vars {
+                if let Some(id) = v {
+                    locals.insert(id.name.clone());
+                    foreach_locals.push(id.name.clone());
+                }
+            }
+            validate_stmt_idents(body, elab, locals)?;
+            for n in foreach_locals { locals.remove(&n); }
+        }
+        StatementKind::While { condition, body } | StatementKind::DoWhile { body, condition } => {
+            validate_expr_idents(condition, elab, locals)?;
+            validate_stmt_idents(body, elab, locals)?;
+        }
+        StatementKind::Repeat { count, body } => {
+            validate_expr_idents(count, elab, locals)?;
+            validate_stmt_idents(body, elab, locals)?;
+        }
+        StatementKind::Forever { body } => validate_stmt_idents(body, elab, locals)?,
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            for s in stmts { validate_stmt_idents(s, elab, locals)?; }
+        }
+        StatementKind::TimingControl { control, stmt } => {
+            match control {
+                TimingControl::Delay(e) => validate_expr_idents(e, elab, locals)?,
+                TimingControl::Event(ev) => validate_event_idents(ev, elab, locals)?,
+            }
+            validate_stmt_idents(stmt, elab, locals)?;
+        }
+        StatementKind::Expr(e) => validate_expr_idents(e, elab, locals)?,
+        StatementKind::Wait { condition, stmt } => {
+            validate_expr_idents(condition, elab, locals)?;
+            validate_stmt_idents(stmt, elab, locals)?;
+        }
+        StatementKind::Assertion(a) => {
+            validate_expr_idents(&a.expr, elab, locals)?;
+            if let Some(s) = &a.action { validate_stmt_idents(s, elab, locals)?; }
+            if let Some(s) = &a.else_action { validate_stmt_idents(s, elab, locals)?; }
+        }
+        StatementKind::Return(e) => { if let Some(expr) = e { validate_expr_idents(expr, elab, locals)?; } }
+        StatementKind::VarDecl { declarators, .. } => {
+            for d in declarators { if let Some(init) = &d.init { validate_expr_idents(init, elab, locals)?; } }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &HashSet<String>) -> Result<(), String> {
+    match &expr.kind {
+        ExprKind::Ident(hier) => {
+            // Only check plain identifiers for now (hierarchical might be valid across modules)
+            if hier.path.len() == 1 {
+                let name = &hier.path[0].name.name;
+                if name == "new" || name.starts_with('$') || name == "super" || name == "this" {
+                    return Ok(());
+                }
+                if !elab.signals.contains_key(name) && !elab.parameters.contains_key(name) &&
+                   !elab.functions.contains_key(name) && !elab.tasks.contains_key(name) &&
+                   !elab.dpi_imports.contains_key(name) &&
+                   !elab.arrays.contains_key(name) && !elab.associative_arrays.contains(name) &&
+                   !elab.classes.contains_key(name) && !elab.typedefs.contains_key(name) &&
+                   !elab.clocking_blocks.contains_key(name) && !elab.lets.contains_key(name) &&
+                   !locals.contains(name) {
+                   return Err(format!("Undeclared identifier '{}'", name));
+                }            }
+        }
+        ExprKind::Unary { operand, .. } => validate_expr_idents(operand, elab, locals)?,
+        ExprKind::Binary { left, right, .. } => { validate_expr_idents(left, elab, locals)?; validate_expr_idents(right, elab, locals)?; }
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            validate_expr_idents(condition, elab, locals)?;
+            validate_expr_idents(then_expr, elab, locals)?;
+            validate_expr_idents(else_expr, elab, locals)?;
+        }
+        ExprKind::Concatenation(parts) => { for p in parts { validate_expr_idents(p, elab, locals)?; } }
+        ExprKind::Replication { count, exprs } => {
+            validate_expr_idents(count, elab, locals)?;
+            for e in exprs { validate_expr_idents(e, elab, locals)?; }
+        }
+        ExprKind::Index { expr, index } => {
+            validate_expr_idents(expr, elab, locals)?;
+            validate_expr_idents(index, elab, locals)?;
+        }
+        ExprKind::RangeSelect { expr, left, right, .. } => {
+            validate_expr_idents(expr, elab, locals)?;
+            validate_expr_idents(left, elab, locals)?;
+            validate_expr_idents(right, elab, locals)?;
+        }
+        ExprKind::Paren(inner) => validate_expr_idents(inner, elab, locals)?,
+        ExprKind::Call { func, args } => {
+            validate_expr_idents(func, elab, locals)?;
+            for a in args { validate_expr_idents(a, elab, locals)?; }
+        }
+        ExprKind::SystemCall { name, args } => {
+            // $dumpvars/$dumpfile args can be scope references (module/instance names),
+            // not regular signals — skip validation for these system calls.
+            let skip = matches!(name.as_str(), "$dumpvars" | "$dumpfile");
+            if !skip {
+                for a in args { validate_expr_idents(a, elab, locals)?; }
+            }
+        }
+        ExprKind::MemberAccess { expr, .. } => validate_expr_idents(expr, elab, locals)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_event_idents(ev: &EventControl, elab: &ElaboratedModule, locals: &HashSet<String>) -> Result<(), String> {
+    match ev {
+        EventControl::EventExpr(exprs) => { for ee in exprs { validate_expr_idents(&ee.expr, elab, locals)?; } }
+        EventControl::Identifier(id) => {
+            if !elab.signals.contains_key(&id.name) && !elab.parameters.contains_key(&id.name) && !locals.contains(&id.name) {
+                return Err(format!("Undeclared identifier '{}'", id.name));
+            }
+        }
+        EventControl::HierIdentifier(e) => validate_expr_idents(e, elab, locals)?,
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Create implicit 1-bit wire signals for identifiers referenced in continuous assigns
@@ -348,9 +1171,10 @@ fn create_implicit_nets(elab: &mut ElaboratedModule) {
     implicit_names.dedup();
     for name in implicit_names {
         if !elab.signals.contains_key(&name) && !elab.parameters.contains_key(&name) {
-            elab.signals.insert(name.clone(), Signal {
+            elab.signals.insert(name.clone(), Signal { is_const: false,
                 name, width: 1, is_signed: false,
                 direction: None, value: Value::new(1),
+                is_real: false, type_name: None,
             });
         }
     }
@@ -382,57 +1206,49 @@ fn collect_ident_names(expr: &Expression, out: &mut Vec<String>) {
 
 /// Helper: process a slice of module items into the elaborated module.
 /// This is extracted so it can be called recursively for generate regions.
-/// Evaluate a generate-if: pick the first branch whose condition is true (or the else branch).
-fn elaborate_generate_if(
-    branches: &[(Option<Expression>, Vec<ModuleItem>)],
-    elab: &mut ElaboratedModule,
-) {
-    for (cond_opt, items) in branches {
-        match cond_opt {
-            Some(cond) => {
-                // Evaluate condition as a constant expression using current parameters
-                let val = eval_const_expr(cond, &elab.parameters);
-                if val != 0 {
-                    elaborate_items(items, elab);
-                    return;
-                }
-            }
-            None => {
-                // Unconditional else branch
-                elaborate_items(items, elab);
-                return;
-            }
-        }
-    }
-}
-
-fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule) {
+fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: Option<&HashMap<String, Definition>>) -> Result<(), String> {
     for item in items {
         match item {
             ModuleItem::PortDeclaration(pd) => {
-                let width = resolve_type_width_with_params(&pd.data_type, Some(&elab.parameters));
+                let port_modport_view = match &pd.data_type {
+                    DataType::Interface { name, modport: Some(mp), .. } => {
+                        resolve_interface_modport_view(&name.name, &mp.name, all_defs)
+                    }
+                    _ => None,
+                };
+                let width = resolve_type_width(&pd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let is_signed = is_type_signed(&pd.data_type);
+                let is_real = is_type_real(&pd.data_type);
                 for decl in &pd.declarators {
-                    let sig = Signal {
+                    if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
+                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                    }
+                    let sig = Signal { is_const: false,
                         name: decl.name.name.clone(), width, is_signed,
-                        direction: Some(pd.direction), value: Value::new(width),
+                        direction: Some(pd.direction), value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                        is_real, type_name: get_type_name(&pd.data_type),
                     };
                     elab.signals.insert(decl.name.name.clone(), sig);
                     elab.port_order.push(decl.name.name.clone());
+                    if let Some(view) = &port_modport_view {
+                        elab.modport_views.insert(decl.name.name.clone(), view.clone());
+                    }
                 }
             }
             ModuleItem::NetDeclaration(nd) => {
-                let width = resolve_type_width_with_params(&nd.data_type, Some(&elab.parameters));
+                let width = resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let is_signed = is_type_signed(&nd.data_type);
+                let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
                     let init_value = match nd.net_type {
                         NetType::Supply0 => Value::zero(width),
                         NetType::Supply1 => Value::ones(width),
-                        _ => Value::new(width),
+                        _ => if is_real { Value::from_f64(0.0) } else { Value::new(width) },
                     };
-                    let sig = Signal {
+                    let sig = Signal { is_const: false,
                         name: decl.name.name.clone(), width, is_signed,
                         direction: None, value: init_value,
+                        is_real, type_name: get_type_name(&nd.data_type),
                     };
                     elab.signals.insert(decl.name.name.clone(), sig);
                     if let Some(init_expr) = &decl.init {
@@ -444,46 +1260,78 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule) {
                 }
             }
             ModuleItem::DataDeclaration(dd) => {
+                let data_modport_view = match &dd.data_type {
+                    DataType::Interface { name, modport: Some(mp), .. } => {
+                        resolve_interface_modport_view(&name.name, &mp.name, all_defs)
+                    }
+                    _ => None,
+                };
                 let width = match &dd.data_type {
                     DataType::TypeReference { name, .. } => {
-                        elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width_with_params(&dd.data_type, Some(&elab.parameters)))
+                        elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
                     }
-                    _ => resolve_type_width_with_params(&dd.data_type, Some(&elab.parameters)),
+                    _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                 };
                 let is_signed = is_type_signed(&dd.data_type);
+                let is_real = is_type_real(&dd.data_type);
                 for decl in &dd.declarators {
+                    if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
+                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                    }
+                    if let Some(UnpackedDimension::Associative { .. }) = decl.dimensions.first() {
+                        elab.associative_arrays.insert(decl.name.name.clone());
+                    }
                     let array_range = extract_array_range(&decl.dimensions, &elab.parameters);
                     if let Some((lo, hi)) = array_range {
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
                         for idx in lo..=hi {
                             let elem_name = format!("{}[{}]", decl.name.name, idx);
-                            let sig = Signal { name: elem_name.clone(), width, is_signed, direction: None, value: Value::new(width) };
+                            let sig = Signal { is_const: dd.const_kw,
+                                name: elem_name.clone(), width, is_signed, is_real, direction: None,
+                                value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                                type_name: get_type_name(&dd.data_type)
+                            };
                             elab.signals.insert(elem_name, sig);
                         }
                     } else {
                         let init_val = if let Some(init_expr) = &decl.init {
                             let mut rv = eval_const_expr_val(init_expr, &elab.parameters).resize(width);
                             if is_signed { rv.is_signed = true; }
+                            if is_real { rv = Value::from_f64(rv.to_f64()); }
                             rv
-                        } else { Value::new(width) };
-                        let sig = Signal { name: decl.name.name.clone(), width, is_signed, direction: None, value: init_val };
+                        } else if is_real {
+                            Value::from_f64(0.0)
+                        } else {
+                            Value::new(width)
+                        };
+                        let sig = Signal { is_const: dd.const_kw, name: decl.name.name.clone(), width, is_signed, is_real, direction: None, value: init_val, type_name: get_type_name(&dd.data_type) };
                         elab.signals.insert(decl.name.name.clone(), sig);
+                        if let Some(view) = &data_modport_view {
+                            elab.modport_views.insert(decl.name.name.clone(), view.clone());
+                        }
                     }
                 }
             }
             ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
                 if let ParameterKind::Data { data_type, assignments } = &pd.kind {
-                    let mut width = resolve_type_width_with_params(data_type, Some(&elab.parameters));
+                    let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                     let signed = is_type_signed(data_type);
                     if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) { width = 32; }
                     for assign in assignments {
+                        if elab.signals.contains_key(&assign.name.name) || elab.parameters.contains_key(&assign.name.name) {
+                            return Err(format!("Duplicate declaration of '{}'", assign.name.name));
+                        }
                         if !elab.parameters.contains_key(&assign.name.name) {
                             let val = if let Some(init) = &assign.init {
                                 let mut v = eval_const_expr_val(init, &elab.parameters).resize(width);
                                 if signed { v.is_signed = true; }
                                 v
                             } else { Value::zero(width) };
-                            elab.parameters.insert(assign.name.name.clone(), val);
+                            elab.parameters.insert(assign.name.name.clone(), val.clone());
+                            elab.signals.insert(assign.name.name.clone(), Signal { is_const: false,
+                                name: assign.name.name.clone(), width, is_signed: signed,
+                                direction: None, value: val, is_real: is_type_real(data_type), type_name: get_type_name(data_type),
+                            });
                         }
                     }
                 }
@@ -502,54 +1350,132 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule) {
             ModuleItem::InitialConstruct(ic) => {
                 elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone() });
             }
-            ModuleItem::TypedefDeclaration(td) => {
-                if let DataType::Enum(et) = &td.data_type {
-                    let base_width = et.base_type.as_ref()
-                        .map(|bt| resolve_type_width(bt))
-                        .unwrap_or(32);
-                    let mut next_val: u64 = 0;
-                    for member in &et.members {
-                        let val = if let Some(init) = &member.init {
-                            eval_const_expr(init, &elab.parameters)
-                        } else { next_val };
-                        next_val = val + 1;
-                        let v = Value::from_u64(val, base_width);
-                        elab.parameters.insert(member.name.name.clone(), v.clone());
-                        elab.signals.insert(member.name.name.clone(), Signal {
-                            name: member.name.name.clone(), width: base_width,
-                            is_signed: false, direction: None, value: v,
+            ModuleItem::ModuleInstantiation(inst) => {
+                for hi in &inst.instances {
+                    if !elab.signals.contains_key(&hi.name.name) {
+                        elab.signals.insert(hi.name.name.clone(), Signal {
+                            is_const: false,
+                            name: hi.name.name.clone(), width: 1,
+                            is_signed: false, direction: None, value: Value::new(1), type_name: Some(inst.module_name.name.clone()),
+                            is_real: false,
                         });
                     }
-                    elab.typedefs.insert(td.name.name.clone(), base_width);
-                } else {
-                    let w = resolve_type_width(&td.data_type);
-                    elab.typedefs.insert(td.name.name.clone(), w);
                 }
             }
+            ModuleItem::TypedefDeclaration(td) => {
+                process_typedef(td, elab);
+            }
             ModuleItem::GenerateRegion(gr) => {
-                elaborate_items(&gr.items, elab);
+                elaborate_items(&gr.items, elab, all_defs)?;
             }
             ModuleItem::GenerateIf(gi) => {
-                elaborate_generate_if(&gi.branches, elab);
+                elaborate_generate_if(&gi.branches, elab, all_defs)?;
+            }
+            ModuleItem::GenerateFor(gf) => {
+                elaborate_generate_for(gf, elab, all_defs)?;
+            }
+
+            ModuleItem::ClassDeclaration(cd) => {
+                validate_class_constraints(cd)?;
+                elab.classes.insert(cd.name.name.clone(), elaborate_class(cd));
+            }
+            ModuleItem::ClockingDeclaration(cd) => {
+                let mut dirs = HashMap::new();
+                for s in &cd.signals {
+                    dirs.insert(s.name.name.clone(), s.direction);
+                }
+                elab.clocking_signal_dirs.insert(cd.name.name.clone(), dirs);
+                elab.clocking_blocks.insert(cd.name.name.clone(), cd.clone());
+            }
+            ModuleItem::LetDeclaration(ld) => {
+                elab.lets.insert(ld.name.name.clone(), ld.clone());
+            }
+            ModuleItem::SpecifyBlock(sb) => {
+                for p in &sb.paths {
+                    let d = eval_const_expr(&p.delay, &elab.parameters);
+                    elab.specify_delays.insert(p.dst.name.clone(), d);
+                }
+            }
+            ModuleItem::FunctionDeclaration(fd) => {
+                elab.functions.insert(fd.name.name.name.clone(), fd.clone());
+            }
+            ModuleItem::TaskDeclaration(td) => {
+                elab.tasks.insert(td.name.name.name.clone(), td.clone());
+            }
+            ModuleItem::ImportDeclaration(imp) => {
+                if let Some(defs) = all_defs {
+                    process_import(imp, elab, defs)?;
+                }
+            }
+            ModuleItem::DPIImport(di) => {
+                register_dpi_import(di, elab)?;
             }
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// Evaluate a generate-if: pick the first branch whose condition is true (or the else branch).
+fn elaborate_generate_if(branches: &[(Option<Expression>, Vec<ModuleItem>)], elab: &mut ElaboratedModule, all_defs: Option<&HashMap<String, Definition>>) -> Result<(), String> {
+    for (cond, items) in branches {
+        match cond {
+            Some(c) => {
+                if !is_const_expr(c, &elab.parameters) {
+                    return Err(format!("Generate if condition must be a constant expression"));
+                }
+                let val = eval_const_expr(c, &elab.parameters);
+                if val != 0 {
+                    return elaborate_items(items, elab, all_defs);
+                }
+            }
+            None => {
+                // Unconditional else branch
+                return elaborate_items(items, elab, all_defs);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn elaborate_generate_for(gf: &GenerateFor, elab: &mut ElaboratedModule, all_defs: Option<&HashMap<String, Definition>>) -> Result<(), String> {
+    let var = &gf.var;
+    let mut i = gf.init_val;
+    for _ in 0..10000 {
+        elab.parameters.insert(var.clone(), Value::from_u64(i as u64, 32));
+        let cond_val = eval_const_expr(&gf.cond, &elab.parameters);
+        if cond_val == 0 { break; }
+        elaborate_items(&gf.items, elab, all_defs)?;
+        // Evaluate increment: handle i++, i=i+1, etc.
+        match &gf.incr.kind {
+            ExprKind::Unary { op: UnaryOp::PostIncr, .. } | ExprKind::Unary { op: UnaryOp::PreIncr, .. } => { i += 1; }
+            ExprKind::Unary { op: UnaryOp::PostDecr, .. } | ExprKind::Unary { op: UnaryOp::PreDecr, .. } => { i -= 1; }
+            _ => {
+                // Try to evaluate as expression (e.g. i = i + 1 expanded by parser)
+                let new_val = eval_const_expr(&gf.incr, &elab.parameters) as i64;
+                if new_val == i { i += 1; } else { i = new_val; }
+            }
+        }
+    }
+    elab.parameters.remove(var);
+    Ok(())
 }
 
 /// Resolve the width of a data type.
-pub fn resolve_type_width(dt: &DataType) -> u32 {
-    resolve_type_width_with_params(dt, None)
-}
-
-pub fn resolve_type_width_with_params(dt: &DataType, params: Option<&HashMap<String, Value>>) -> u32 {
+pub fn resolve_type_width(
+    dt: &DataType,
+    params: Option<&HashMap<String, Value>>,
+    typedefs: Option<&HashMap<String, u32>>
+) -> u32 {
     match dt {
         DataType::IntegerVector { dimensions, .. } => {
             if dimensions.is_empty() { return 1; }
             let mut total = 1u32;
             for dim in dimensions {
                 if let PackedDimension::Range { left, right, .. } = dim {
-                    if let (Some(l), Some(r)) = (const_eval_i64_with_params(left, params), const_eval_i64_with_params(right, params)) {
+                    let lv = const_eval_i64_with_params(left, params);
+                    let rv = const_eval_i64_with_params(right, params);
+                    if let (Some(l), Some(r)) = (lv, rv) {
                         let w = (l - r).abs() + 1;
                         total *= w as u32;
                     }
@@ -571,7 +1497,9 @@ pub fn resolve_type_width_with_params(dt: &DataType, params: Option<&HashMap<Str
             let mut total = 1u32;
             for dim in dimensions {
                 if let PackedDimension::Range { left, right, .. } = dim {
-                    if let (Some(l), Some(r)) = (const_eval_i64_with_params(left, params), const_eval_i64_with_params(right, params)) {
+                    let lv = const_eval_i64_with_params(left, params);
+                    let rv = const_eval_i64_with_params(right, params);
+                    if let (Some(l), Some(r)) = (lv, rv) {
                         let w = (l - r).abs() + 1;
                         total *= w as u32;
                     }
@@ -579,9 +1507,43 @@ pub fn resolve_type_width_with_params(dt: &DataType, params: Option<&HashMap<Str
             }
             total
         }
-        DataType::TypeReference { dimensions, .. } => {
-            if dimensions.is_empty() { 32 } // Default for user-defined types
-            else { 32 }
+        DataType::TypeReference { name, dimensions, .. } => {
+            let mut base_width = if let Some(td) = typedefs {
+                td.get(&name.name.name).copied().unwrap_or(32)
+            } else {
+                32
+            };
+            if !dimensions.is_empty() {
+                for dim in dimensions {
+                    if let PackedDimension::Range { left, right, .. } = dim {
+                        if let (Some(l), Some(r)) = (const_eval_i64_with_params(left, params), const_eval_i64_with_params(right, params)) {
+                            let w = (l - r).abs() + 1;
+                            base_width *= w as u32;
+                        }
+                    }
+                }
+            }
+            base_width
+        }
+        DataType::Simple { kind, .. } => match kind {
+            SimpleType::String => 1024, // Dynamic string, allocate 128 chars max
+            SimpleType::Chandle => 64,
+            SimpleType::Event => 1,
+        },
+        DataType::Enum(e) => {
+            if let Some(bt) = &e.base_type {
+                resolve_type_width(bt, params, typedefs)
+            } else {
+                32
+            }
+        }
+        DataType::Struct(s) => {
+            let mut total = 0u32;
+            for member in &s.members {
+                let mw = resolve_type_width(&member.data_type, params, typedefs);
+                total += mw * member.declarators.len() as u32;
+            }
+            total
         }
         DataType::Void(_) => 0,
         _ => 32,
@@ -594,84 +1556,71 @@ pub fn is_type_signed(dt: &DataType) -> bool {
         DataType::IntegerVector { signing, .. } => matches!(signing, Some(Signing::Signed)),
         DataType::IntegerAtom { kind, signing, .. } => {
             if let Some(s) = signing { return matches!(s, Signing::Signed); }
-            // Default signedness per LRM
-            matches!(kind, IntegerAtomType::Byte | IntegerAtomType::ShortInt |
-                     IntegerAtomType::Int | IntegerAtomType::LongInt | IntegerAtomType::Integer)
+            match kind {
+                IntegerAtomType::Byte | IntegerAtomType::ShortInt | IntegerAtomType::Int | IntegerAtomType::LongInt | IntegerAtomType::Integer => true,
+                IntegerAtomType::Time => false,
+            }
         }
+        DataType::Implicit { signing, .. } => matches!(signing, Some(Signing::Signed)),
+        DataType::Real { .. } => true,
         _ => false,
     }
 }
 
-/// Simple constant expression evaluator for dimension ranges.
-fn const_eval_u64(expr: &Expression) -> Option<u64> {
-    // Try i64 first, then convert
-    const_eval_i64(expr).map(|v| v as u64)
-}
-
-fn const_eval_i64(expr: &Expression) -> Option<i64> {
-    const_eval_i64_with_params(expr, None)
+pub fn is_type_real(dt: &DataType) -> bool {
+    matches!(dt, DataType::Real { .. })
 }
 
 fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<String, Value>>) -> Option<i64> {
     match &expr.kind {
         ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
-            let clean: String = value.chars().filter(|c| *c != '_').collect();
-            match base {
-                NumberBase::Decimal => clean.parse::<i64>().ok(),
-                NumberBase::Hex => u64::from_str_radix(&clean, 16).ok().map(|v| v as i64),
-                NumberBase::Binary => u64::from_str_radix(&clean, 2).ok().map(|v| v as i64),
-                NumberBase::Octal => u64::from_str_radix(&clean, 8).ok().map(|v| v as i64),
-            }
+            let r = match base { NumberBase::Binary => 2, NumberBase::Octal => 8, NumberBase::Hex => 16, NumberBase::Decimal => 10 };
+            i64::from_str_radix(&value.replace('_', ""), r).ok()
         }
-        ExprKind::Unary { op: UnaryOp::Minus, operand } => {
-            const_eval_i64_with_params(operand, params).map(|v| -v)
-        }
-        ExprKind::Unary { op: UnaryOp::Plus, operand } => {
-            const_eval_i64_with_params(operand, params)
-        }
-        ExprKind::Binary { op: BinaryOp::Sub, left, right, .. } => {
-            let l = const_eval_i64_with_params(left, params)?;
-            let r = const_eval_i64_with_params(right, params)?;
-            Some(l.wrapping_sub(r))
-        }
-        ExprKind::Binary { op: BinaryOp::Add, left, right, .. } => {
-            let l = const_eval_i64_with_params(left, params)?;
-            let r = const_eval_i64_with_params(right, params)?;
-            Some(l.wrapping_add(r))
-        }
-        ExprKind::Binary { op: BinaryOp::Mul, left, right, .. } => {
-            let l = const_eval_i64_with_params(left, params)?;
-            let r = const_eval_i64_with_params(right, params)?;
-            Some(l.wrapping_mul(r))
-        }
-        ExprKind::Binary { op: BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft, left, right, .. } => {
-            let l = const_eval_i64_with_params(left, params)?;
-            let r = const_eval_i64_with_params(right, params)?;
-            Some(l.wrapping_shl(r as u32))
-        }
-        ExprKind::Binary { op: BinaryOp::ShiftRight, left, right, .. } => {
-            let l = const_eval_i64_with_params(left, params)?;
-            let r = const_eval_i64_with_params(right, params)?;
-            Some(l.wrapping_shr(r as u32))
-        }
-        ExprKind::Binary { op: BinaryOp::BitOr, left, right, .. } => {
-            let l = const_eval_i64_with_params(left, params)?;
-            let r = const_eval_i64_with_params(right, params)?;
-            Some(l | r)
-        }
-        ExprKind::Binary { op: BinaryOp::BitAnd, left, right, .. } => {
-            let l = const_eval_i64_with_params(left, params)?;
-            let r = const_eval_i64_with_params(right, params)?;
-            Some(l & r)
-        }
-        ExprKind::Paren(inner) => const_eval_i64_with_params(inner, params),
+        ExprKind::Number(NumberLiteral::UnbasedUnsized('0')) => Some(0),
+        ExprKind::Number(NumberLiteral::UnbasedUnsized('1')) => Some(1),
         ExprKind::Ident(hier) => {
             if let Some(p) = params {
                 let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                p.get(name).and_then(|v| v.to_u64()).map(|v| v as i64)
-            } else {
-                None
+                p.get(name).and_then(|v| v.to_i64())
+            } else { None }
+        }
+        ExprKind::Binary { op, left, right } => {
+            let l = const_eval_i64_with_params(left, params)?;
+            let r = const_eval_i64_with_params(right, params)?;
+            match op {
+                BinaryOp::Add => Some(l + r),
+                BinaryOp::Sub => Some(l - r),
+                BinaryOp::Mul => Some(l * r),
+                BinaryOp::Div => if r != 0 { Some(l / r) } else { None },
+                BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft => Some(l << r),
+                BinaryOp::ShiftRight | BinaryOp::ArithShiftRight => Some(l >> r),
+                _ => None,
             }
+        }
+        ExprKind::Unary { op, operand } => {
+            let v = const_eval_i64_with_params(operand, params)?;
+            match op {
+                UnaryOp::Minus => Some(-v),
+                UnaryOp::Plus => Some(v),
+                _ => None,
+            }
+        }
+        ExprKind::Paren(e) => const_eval_i64_with_params(e, params),
+        ExprKind::SystemCall { name, args } if name == "$clog2" => {
+            if let Some(arg) = args.first() {
+                let val = const_eval_i64_with_params(arg, params)?;
+                if val <= 1 { Some(0) }
+                else {
+                    let mut res = 0;
+                    let mut tmp = val - 1;
+                    while tmp > 0 {
+                        tmp >>= 1;
+                        res += 1;
+                    }
+                    Some(res)
+                }
+            } else { None }
         }
         _ => None,
     }
@@ -680,27 +1629,54 @@ fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<String,
 /// Extract array range from unpacked dimensions. Returns Some((lo, hi)) for
 /// `[lo:hi]` or `[size]` (which means [0:size-1]).
 fn extract_array_range(dims: &[crate::ast::types::UnpackedDimension], params: &HashMap<String, Value>) -> Option<(i64, i64)> {
-    use crate::ast::types::UnpackedDimension;
     if dims.is_empty() { return None; }
     match &dims[0] {
-        UnpackedDimension::Range { left, right, .. } => {
+        crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
             let l = const_eval_i64_with_params(left, Some(params)).unwrap_or(0);
             let r = const_eval_i64_with_params(right, Some(params)).unwrap_or(0);
             let lo = l.min(r);
             let hi = l.max(r);
             Some((lo, hi))
         }
-        UnpackedDimension::Expression { expr, .. } => {
+        crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
             let size = const_eval_i64_with_params(expr, Some(params)).unwrap_or(0);
             if size > 0 { Some((0, size - 1)) } else { None }
+        }
+        crate::ast::types::UnpackedDimension::Unsized(_) | 
+        crate::ast::types::UnpackedDimension::Queue { .. } => {
+            // For dynamic arrays and queues, allocate a fixed-size buffer for simulation
+            Some((0, 63))
+        }
+        crate::ast::types::UnpackedDimension::Associative { .. } => {
+            // Associative arrays are purely dynamic
+            None
         }
         _ => None,
     }
 }
 
 fn width_with_unpacked_dims(dims: &[crate::ast::types::UnpackedDimension], base_width: u32) -> u32 {
-    // For now, just return base width (arrays not fully supported in sim)
-    base_width
+    if dims.is_empty() { return base_width; }
+    let mut total_elements = 1u32;
+    for dim in dims {
+        match dim {
+            crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
+                let l = const_eval_i64_with_params(left, None).unwrap_or(0);
+                let r = const_eval_i64_with_params(right, None).unwrap_or(0);
+                total_elements *= ((l - r).abs() + 1) as u32;
+            }
+            crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
+                let size = const_eval_i64_with_params(expr, None).unwrap_or(0);
+                total_elements *= size.max(1) as u32;
+            }
+            crate::ast::types::UnpackedDimension::Unsized(_) | 
+            crate::ast::types::UnpackedDimension::Queue { .. } |
+            crate::ast::types::UnpackedDimension::Associative { .. } => {
+                total_elements *= 64;
+            }
+        }
+    }
+    base_width * total_elements
 }
 
 /// Evaluate a constant expression (for enum values, parameter defaults, etc.)
@@ -710,7 +1686,7 @@ fn eval_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> u64 {
 
 /// Evaluate a constant expression, returning a full Value (preserving width/sign).
 fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Value {
-    match &expr.kind {
+    let res = match &expr.kind {
         ExprKind::Number(num) => {
             match num {
                 NumberLiteral::Integer { size, signed, base, value, .. } => {
@@ -723,12 +1699,13 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     v.is_signed = *signed;
                     v
                 }
-                NumberLiteral::Real(f) => Value::from_u64(*f as u64, 64),
+                NumberLiteral::Real(f) => Value::from_f64(*f),
                 NumberLiteral::UnbasedUnsized(c) => match c {
                     '0' => Value::zero(1), '1' => Value::from_u64(1, 1), _ => Value::new(1),
                 },
             }
         }
+        ExprKind::StringLiteral(s) => Value::from_string(s),
         ExprKind::Ident(hier) => {
             let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
             params.get(name).cloned().unwrap_or(Value::zero(32))
@@ -741,6 +1718,14 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 BinaryOp::Sub => l.sub(&r),
                 BinaryOp::Mul => l.mul(&r),
                 BinaryOp::Div => l.div(&r),
+                BinaryOp::Mod => l.modulo(&r),
+                BinaryOp::Power => l.power(&r),
+                BinaryOp::Eq => l.is_equal(&r),
+                BinaryOp::Neq => l.is_not_equal(&r),
+                BinaryOp::Lt => l.less_than(&r),
+                BinaryOp::Leq => l.less_equal(&r),
+                BinaryOp::Gt => l.greater_than(&r),
+                BinaryOp::Geq => l.greater_equal(&r),
                 BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft => l.shift_left(&r),
                 BinaryOp::ShiftRight => l.shift_right(&r),
                 BinaryOp::BitOr => l.bitwise_or(&r),
@@ -751,7 +1736,7 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         ExprKind::Unary { op, operand } => {
             let v = eval_const_expr_val(operand, params);
             match op {
-                UnaryOp::Minus => { let mut r = Value::zero(v.width).sub(&v).resize(v.width); r.is_signed = true; r }
+                UnaryOp::Minus => v.negate(),
                 UnaryOp::Plus => v,
                 UnaryOp::BitNot => v.bitwise_not(),
                 UnaryOp::LogNot => v.logic_not(),
@@ -759,28 +1744,120 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             }
         }
         ExprKind::Paren(inner) => eval_const_expr_val(inner, params),
+        ExprKind::SystemCall { name, args } if name == "$clog2" => {
+            if let Some(arg) = args.first() {
+                let v = eval_const_expr_val(arg, params);
+                let val = v.to_u64().unwrap_or(0);
+                if val <= 1 { Value::from_u64(0, 32) }
+                else {
+                    let mut res = 0;
+                    let mut tmp = val - 1;
+                    while tmp > 0 {
+                        tmp >>= 1;
+                        res += 1;
+                    }
+                    Value::from_u64(res, 32)
+                }
+            } else { Value::zero(32) }
+        }
         ExprKind::Conditional { condition, then_expr, else_expr } => {
             let c = eval_const_expr_val(condition, params);
             if c.is_true() { eval_const_expr_val(then_expr, params) }
             else { eval_const_expr_val(else_expr, params) }
         }
         _ => Value::zero(32),
-    }
+    };
+    // eprintln!("[DEBUG] eval_const_expr_val: {:?} -> {}", expr, res.to_dec_string());
+    res
 }
 
 /// Inline module instantiations: replace instances with their continuous assigns and always blocks.
 /// Handles recursive/multi-level hierarchies by walking all levels depth-first.
 pub fn inline_instantiations(
     elab: &mut ElaboratedModule,
-    modules: &HashMap<String, &crate::ast::module::ModuleDeclaration>,
+    definitions: &HashMap<String, Definition>,
 ) -> Result<(), String> {
+    // Populate class and covergroup definitions from global scope
+    for (name, def) in definitions {
+        match def {
+            Definition::Class(c) => { elab.classes.insert(name.clone(), elaborate_class(c)); }
+            Definition::Covergroup(cg) => { elab.covergroups.insert(name.clone(), (*cg).clone()); }
+            Definition::Package(p) => {
+                for item in &p.items {
+                    match item {
+                        crate::ast::decl::PackageItem::Class(c) => {
+                            elab.classes.insert(c.name.name.clone(), elaborate_class(c));
+                        }
+                        crate::ast::decl::PackageItem::Typedef(td) => {
+                            process_typedef(td, elab);
+                        }
+                        crate::ast::decl::PackageItem::Parameter(pd) => {
+                            if let ParameterKind::Data { data_type, assignments } = &pd.kind {
+                                let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                                let mut is_signed = is_type_signed(data_type);
+                                if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
+                                    width = 32;
+                                    is_signed = true;
+                                }
+                                for assign in assignments {
+                                    if let Some(init) = &assign.init {
+                                        let mut v = eval_const_expr_val(init, &elab.parameters).resize(width);
+                                        if is_signed { v.is_signed = true; }
+                                        elab.parameters.insert(assign.name.name.clone(), v);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     let module_name = elab.name.clone();
-    let top_mod = match modules.get(&module_name) {
+    let top_def = match definitions.get(&module_name) {
         Some(m) => *m,
         None => return Err(format!("Top module '{}' not found in module map", module_name)),
     };
     // Recursively inline starting from the top module's items
-    inline_module_items(elab, top_mod, "", modules)
+    let top_params = elab.parameters.clone();
+    inline_module_items(elab, top_def, "", definitions, &mut HashMap::new(), &top_params)?;
+
+    // Identify interface instances at top level
+    let mut top_interface_names = HashSet::new();
+    for item in top_def.items() {
+        if let ModuleItem::ModuleInstantiation(inst) = item {
+            if definitions.get(&inst.module_name.name).map_or(false, |d| matches!(d, Definition::Interface(_))) {
+                for hi in &inst.instances {
+                    top_interface_names.insert(hi.name.name.clone());
+                }
+            }
+        }
+    }
+
+    // Final rewrite of all blocks to convert MemberAccess to HierarchicalIdentifier and handle local signals
+    let local_names = elab.signals.keys().cloned().collect::<std::collections::HashSet<_>>();
+    let port_map = HashMap::new();
+    let mut interface_map = HashMap::new();
+    for name in top_interface_names {
+        interface_map.insert(name.clone(), name);
+    }
+    let prefix = "";
+
+    for block in &mut elab.always_blocks {
+        block.stmt = rewrite_stmt(&block.stmt, prefix, &port_map, &local_names, &interface_map);
+    }
+    for block in &mut elab.initial_blocks {
+        block.stmt = rewrite_stmt(&block.stmt, prefix, &port_map, &local_names, &interface_map);
+    }
+    for assign in &mut elab.continuous_assigns {
+        assign.lhs = rewrite_expr(&assign.lhs, prefix, &port_map, &local_names, &interface_map);
+        assign.rhs = rewrite_expr(&assign.rhs, prefix, &port_map, &local_names, &interface_map);
+    }
+
+    Ok(())
 }
 
 /// Recursively inline all instantiations found in `source_mod`, using `prefix` for signal naming.
@@ -818,188 +1895,328 @@ fn collect_effective_items(items: &[ModuleItem], params: &HashMap<String, Value>
     result
 }
 
+fn is_interface_type(dt: &DataType, definitions: &HashMap<String, Definition>) -> bool {
+    match dt {
+        DataType::TypeReference { name, .. } => {
+            if definitions.contains_key(&name.name.name) { return true; }
+            false
+        }
+        DataType::Interface { name, .. } => {
+            if definitions.contains_key(&name.name) { return true; }
+            false
+        }
+        _ => false,
+    }
+}
+
 fn inline_module_items(
     elab: &mut ElaboratedModule,
-    source_mod: &crate::ast::module::ModuleDeclaration,
+    source_def: Definition,
     prefix: &str,
-    modules: &HashMap<String, &crate::ast::module::ModuleDeclaration>,
+    definitions: &HashMap<String, Definition>,
+    interface_map: &mut HashMap<String, String>,
+    local_params: &HashMap<String, Value>,
 ) -> Result<(), String> {
-    use crate::ast::decl::*;
-    use crate::ast::module::*;
-    use crate::ast::expr::*;
-    use super::value::Value;
-
     // First pass: collect typedef names from this module so we can distinguish them from instantiations
     let mut local_typedefs: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for item in &source_mod.items {
+    for item in source_def.items() {
         if let ModuleItem::TypedefDeclaration(td) = item {
             local_typedefs.insert(td.name.name.clone());
         }
     }
 
-    for item in &source_mod.items {
+    // Identify interface ports in the current module/interface
+    let mut interface_ports: std::collections::HashSet<String> = std::collections::HashSet::new();
+    match source_def.ports() {
+        PortList::Ansi(ports) => {
+            for port in ports {
+                if let Some(dt) = &port.data_type {
+                    if is_interface_type(dt, definitions) {
+                        interface_ports.insert(port.name.name.clone());
+                    }
+                }
+            }
+        }
+        _ => {} // Non-ANSI might need deeper check but skipping for now
+    }
+
+    let effective_source_items = collect_effective_items(source_def.items(), local_params);
+    for item in &effective_source_items {
         if let ModuleItem::ModuleInstantiation(inst) = item {
             let sub_mod_name = &inst.module_name.name;
-            let sub_mod = match modules.get(sub_mod_name) {
+            let sub_mod = match definitions.get(sub_mod_name) {
                 Some(m) => *m,
                 None => {
-                    // Skip if this is a typedef name (user-defined type parsed as instantiation)
+                    // Check if it's a typedef-based variable declaration (happens if parser was unsure)
                     if elab.typedefs.contains_key(sub_mod_name) || local_typedefs.contains(sub_mod_name) {
+                        let width = elab.typedefs.get(sub_mod_name).copied().unwrap_or(32);
+                        let is_real = sub_mod_name == "real";
+                        for hi in &inst.instances {
+                            let sig_name = format!("{}{}", prefix, hi.name.name);
+                            elab.signals.insert(sig_name.clone(), Signal { is_const: false,
+                                name: sig_name, width, is_signed: is_real, direction: None,
+                                value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                                is_real, type_name: Some(sub_mod_name.clone()),
+                            });
+                        }
                         continue;
                     }
-                    let context = if prefix.is_empty() {
-                        " ".to_string()
-                    } else {
-                        format!(" (as '{}') ", prefix.trim_end_matches('.'))
-                    };
-                    let available = modules.keys().cloned().collect::<Vec<_>>().join(", ");
-                    return Err(format!(
-                        "Module '{}' not found. Instantiated{}but not defined in any source file. Available modules: {}",
-                        sub_mod_name, context, available
-                    ));
+                    return Err(format!("Module '{}' instantiated but not found", sub_mod_name));
                 }
             };
 
-            for hier_inst in &inst.instances {
-                let inst_name = &hier_inst.name.name;
-                let inst_prefix = if prefix.is_empty() {
-                    format!("{}.", inst_name)
-                } else {
-                    format!("{}{}.", prefix, inst_name)
-                };
-
-                // Build port mapping: sub_port_name -> parent_expression
-                let mut port_map: HashMap<String, Expression> = HashMap::new();
-
-                let sub_port_names: Vec<String> = match &sub_mod.ports {
-                    PortList::Ansi(ports) => ports.iter().map(|p| p.name.name.clone()).collect(),
-                    PortList::NonAnsi(names) => names.iter().map(|n| n.name.clone()).collect(),
-                    PortList::Empty => Vec::new(),
-                };
-
-                for (i, conn) in hier_inst.connections.iter().enumerate() {
-                    match conn {
-                        PortConnection::Named { name, expr } => {
-                            if let Some(e) = expr {
-                                // Rewrite the parent expression with the current prefix context
-                                // (for nested: parent expressions reference the enclosing scope)
-                                let rewritten = if prefix.is_empty() {
-                                    e.clone()
-                                } else {
-                                    rewrite_expr_all(e, prefix)
-                                };
-                                port_map.insert(name.name.clone(), rewritten);
+            for hi in &inst.instances {
+                let inst_name = &hi.name.name;
+                let inst_prefix = format!("{}{}.", prefix, inst_name);
+                let mut scoped_eval_params = elab.parameters.clone();
+                if !prefix.is_empty() {
+                    for (k, v) in &elab.parameters {
+                        if let Some(local_name) = k.strip_prefix(prefix) {
+                            if !local_name.contains('.') {
+                                scoped_eval_params.insert(local_name.to_string(), v.clone());
                             }
                         }
-                        PortConnection::Ordered(Some(e)) => {
-                            if i < sub_port_names.len() {
-                                let rewritten = if prefix.is_empty() {
-                                    e.clone()
-                                } else {
-                                    rewrite_expr_all(e, prefix)
-                                };
-                                port_map.insert(sub_port_names[i].clone(), rewritten);
-                            }
-                        }
-                        _ => {}
                     }
                 }
 
-                // Process sub-module parameters (e.g., #(parameter W=8))
-                // Build override map from instantiation #(.WIDTH(8))
-                let mut param_overrides: HashMap<String, Value> = HashMap::new();
-                if let Some(pconns) = &inst.params {
-                    let param_names: Vec<String> = sub_mod.params.iter().filter_map(|p| {
-                        if let ParameterKind::Data { assignments, .. } = &p.kind {
-                            assignments.first().map(|a| a.name.name.clone())
-                        } else { None }
-                    }).collect();
-                    for (i, pc) in pconns.iter().enumerate() {
-                        match pc {
-                            ParamConnection::Named { name, value: Some(expr) } => {
-                                let v = eval_const_expr_val(expr, &elab.parameters);
-                                param_overrides.insert(name.name.clone(), v);
-                            }
-                            ParamConnection::Ordered(Some(expr)) => {
-                                if i < param_names.len() {
-                                    let v = eval_const_expr_val(expr, &elab.parameters);
-                                    param_overrides.insert(param_names[i].clone(), v);
+                // Build port map and interface map
+                let mut port_map = HashMap::new();
+                let mut sub_interface_map = HashMap::new();
+
+                // Identify interface ports in the sub-module
+                let mut sub_interface_ports: std::collections::HashSet<String> = std::collections::HashSet::new();
+                match sub_mod.ports() {
+                    PortList::Ansi(ports) => {
+                        for port in ports {
+                            if let Some(dt) = &port.data_type {
+                                if is_interface_type(dt, definitions) {
+                                    sub_interface_ports.insert(port.name.name.clone());
                                 }
                             }
-                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+
+                if !hi.connections.is_empty() {
+                    match &hi.connections[0] { // Simplification: check if first is wildcard
+                        PortConnection::Wildcard => {
+                            // Wildcard: connect all ports to same-named signals in parent
+                            match sub_mod.ports() {
+                                PortList::Ansi(ports) => {
+                                    for port in ports {
+                                        let name = &port.name.name;
+                                        let parent_name = format!("{}{}", prefix, name);
+                                        if sub_interface_ports.contains(name) {
+                                            sub_interface_map.insert(name.clone(), parent_name.clone());
+                                        } else {
+                                            port_map.insert(name.clone(), make_ident_expr(&parent_name));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {
+                            for (i, conn) in hi.connections.iter().enumerate() {
+                                match conn {
+                                    PortConnection::Named { name, expr } => {
+                                        if let Some(e) = expr {
+                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::new(), &elab.signals.keys().cloned().collect(), interface_map);
+                                            if sub_interface_ports.contains(&name.name) {
+                                                if let ExprKind::Ident(hier) = &rewritten_e.kind {
+                                                    let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
+                                                    sub_interface_map.insert(name.name.clone(), if_full_path);
+                                                }
+                                            } else {
+                                                port_map.insert(name.name.clone(), rewritten_e);
+                                            }
+                                        }
+                                    }
+                                    PortConnection::Ordered(expr) => {
+                                        if let Some(e) = expr {
+                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::new(), &elab.signals.keys().cloned().collect(), interface_map);
+                                            if let Some(port) = sub_mod.ports().get(i) {
+                                                let port_name = port.name();
+                                                if sub_interface_ports.contains(port_name) {
+                                                    if let ExprKind::Ident(hier) = &rewritten_e.kind {
+                                                        let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
+                                                        sub_interface_map.insert(port_name.to_string(), if_full_path);
+                                                    }
+                                                } else {
+                                                    port_map.insert(port_name.to_string(), rewritten_e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
                     }
                 }
-                for param in &sub_mod.params {
-                    if let ParameterKind::Data { data_type, assignments } = &param.kind {
-                        let mut width = resolve_type_width(data_type);
-                        if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
-                            width = 32;
+
+                // Resolve parameters for the sub-module
+                let mut sub_params = HashMap::new();
+                if let Some(param_conns) = &inst.params {
+                    for (i, conn) in param_conns.iter().enumerate() {
+                        match conn {
+                            ParamConnection::Named { name, value } => {
+                                if let Some(ParamValue::Expr(v)) = value {
+                                    let mut val = eval_const_expr_val(v, &scoped_eval_params);
+                                    // Check if target parameter is real or implicit real
+                                    for p_decl in sub_mod.params() {
+                                        if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
+                                            if assignments.iter().any(|a| a.name.name == name.name) {
+                                                if is_type_real(data_type) {
+                                                    val = Value::from_f64(val.to_f64());
+                                                } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
+                                                    if val.is_real {
+                                                        val = Value::from_f64(val.to_f64());
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    sub_params.insert(name.name.clone(), val);
+                                }
+                            }
+                            ParamConnection::Ordered(value) => {
+                                if let Some(ParamValue::Expr(v)) = value {
+                                    if let Some(p_decl) = sub_mod.params().get(i) {
+                                        if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
+                                            let mut val = eval_const_expr_val(v, &scoped_eval_params);
+                                            if is_type_real(data_type) {
+                                                val = Value::from_f64(val.to_f64());
+                                            } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
+                                                if val.is_real {
+                                                    val = Value::from_f64(val.to_f64());
+                                                }
+                                            }
+                                            sub_params.insert(assignments[0].name.name.clone(), val);
+                                        }
+                                    }
+                                }
+                            }
                         }
+                    }
+                }
+
+                // Internal parameter map for resolving default parameters that depend on each other
+                let mut sub_local_params = sub_params.clone();
+                
+                // Helper to add parameters from a list of items
+                let add_params_from_items = |items: &[ModuleItem], local_map: &mut HashMap<String, Value>| {
+                    let effective_items = collect_effective_items(items, local_map);
+                    for item in &effective_items {
+                        if let ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) = item {
+                            if let ParameterKind::Data { data_type, assignments } = &pd.kind {
+                                for assign in assignments {
+                                    if !local_map.contains_key(&assign.name.name) {
+                                        if let Some(init) = &assign.init {
+                                            let mut val = eval_const_expr_val(init, local_map);
+                                            if is_type_real(data_type) {
+                                                val = Value::from_f64(val.to_f64());
+                                            } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
+                                                if val.is_real {
+                                                    val = Value::from_f64(val.to_f64());
+                                                }
+                                            }
+                                            local_map.insert(assign.name.name.clone(), val);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+
+                // 1. Parameters from port list
+                for p_decl in sub_mod.params() {
+                    if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
                         for assign in assignments {
-                            let val = if let Some(ovr) = param_overrides.get(&assign.name.name) {
-                                ovr.clone().resize(width)
-                            } else if let Some(init) = &assign.init {
-                                eval_const_expr_val(init, &elab.parameters).resize(width)
-                            } else {
-                                Value::zero(width)
-                            };
-                            elab.parameters.insert(assign.name.name.clone(), val);
-                        }
-                    }
-                }
-                // Process parameter/localparam items inside the sub-module body
-                for sub_item in &sub_mod.items {
-                    if let ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) = sub_item {
-                        if let ParameterKind::Data { data_type, assignments } = &pd.kind {
-                            let mut width = resolve_type_width_with_params(data_type, Some(&elab.parameters));
-                            if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
-                                width = 32;
-                            }
-                            for assign in assignments {
-                                if !elab.parameters.contains_key(&assign.name.name) {
-                                    let val = if let Some(init) = &assign.init {
-                                        eval_const_expr_val(init, &elab.parameters).resize(width)
-                                    } else {
-                                        Value::zero(width)
-                                    };
-                                    elab.parameters.insert(assign.name.name.clone(), val);
+                            if !sub_local_params.contains_key(&assign.name.name) {
+                                if let Some(init) = &assign.init {
+                                    let mut val = eval_const_expr_val(init, &sub_local_params);
+                                    if is_type_real(data_type) {
+                                        val = Value::from_f64(val.to_f64());
+                                    } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
+                                        if val.is_real {
+                                            val = Value::from_f64(val.to_f64());
+                                        }
+                                    }
+                                    sub_local_params.insert(assign.name.name.clone(), val);
                                 }
                             }
                         }
                     }
+                }
+                
+                // 2. Parameters from module items
+                add_params_from_items(sub_mod.items(), &mut sub_local_params);
+
+                // Inline all resolved parameters into global map with prefix
+                for (name, val) in &sub_local_params {
+                    let full_name = format!("{}{}", inst_prefix, name);
+                    elab.parameters.insert(full_name.clone(), val.clone());
+                    // Also add as a signal for simulation access
+                    elab.signals.insert(full_name.clone(), Signal { is_const: false,
+                        name: full_name,
+                        width: val.width,
+                        is_signed: val.is_signed,
+                        is_real: val.is_real,
+                        direction: None,
+                        value: val.clone(),
+                        type_name: None,
+                    });
                 }
 
                 // Declare sub-module port signals
-                match &sub_mod.ports {
+                // Build a param map that includes both elab.parameters (global,
+                // full-name keys) and sub_local_params (unprefixed short names)
+                // so port type widths like `[W-1:0]` resolve against the sub's
+                // overridden parameter values.
+                let port_type_params = {
+                    let mut m = elab.parameters.clone();
+                    for (k, v) in &sub_local_params {
+                        m.insert(k.clone(), v.clone());
+                    }
+                    m
+                };
+                match sub_mod.ports() {
                     PortList::Ansi(ports) => {
                         for port in ports {
+                            if sub_interface_ports.contains(&port.name.name) { continue; }
                             let width = port.data_type.as_ref()
-                                .map(|dt| resolve_type_width_with_params(dt, Some(&elab.parameters)))
+                                .map(|dt| resolve_type_width(dt, Some(&port_type_params), Some(&elab.typedefs)))
                                 .unwrap_or(1);
                             let sig_name = format!("{}{}", inst_prefix, port.name.name);
-                            elab.signals.insert(sig_name.clone(), Signal {
+                            let is_real = port.data_type.as_ref().map(is_type_real).unwrap_or(false);
+                            elab.signals.insert(sig_name.clone(), Signal { is_const: false,
                                 name: sig_name, width,
                                 is_signed: port.data_type.as_ref().map(|dt| is_type_signed(dt)).unwrap_or(false),
+                                is_real,
                                 direction: port.direction,
-                                value: Value::new(width),
+                                value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                                type_name: port.data_type.as_ref().and_then(get_type_name),
                             });
                         }
                     }
                     PortList::NonAnsi(_names) => {
-                        // For non-ANSI, port signals are declared via PortDeclaration items
-                        // in the module body. Process those here.
-                        let effective_items = collect_effective_items(&sub_mod.items, &elab.parameters);
+                        let effective_items = collect_effective_items(sub_mod.items(), &sub_local_params);
                         for sub_item in &effective_items {
                             if let ModuleItem::PortDeclaration(pd) = sub_item {
-                                let width = resolve_type_width_with_params(&pd.data_type, Some(&elab.parameters));
+                                if is_interface_type(&pd.data_type, definitions) { continue; }
+                                let width = resolve_type_width(&pd.data_type, Some(&sub_local_params), Some(&elab.typedefs));
                                 let is_signed = is_type_signed(&pd.data_type);
                                 for decl in &pd.declarators {
                                     let sig_name = format!("{}{}", inst_prefix, decl.name.name);
-                                    elab.signals.insert(sig_name.clone(), Signal {
+                                    elab.signals.insert(sig_name.clone(), Signal { is_const: false,
                                         name: sig_name, width, is_signed,
                                         direction: Some(pd.direction),
                                         value: Value::new(width),
+                                        is_real: is_type_real(&pd.data_type), type_name: get_type_name(&pd.data_type),
                                     });
                                 }
                             }
@@ -1009,11 +2226,47 @@ fn inline_module_items(
                 }
 
                 // Declare internal nets/vars (including from generate blocks)
-                let effective_decl_items = collect_effective_items(&sub_mod.items, &elab.parameters);
+                let effective_decl_items = collect_effective_items(sub_mod.items(), &sub_local_params);
+                // Merge elab.parameters with sub_local_params so unprefixed
+                // param references in type widths/dimensions resolve correctly
+                let sub_merged_params = {
+                    let mut m = elab.parameters.clone();
+                    for (k, v) in &sub_local_params {
+                        m.insert(k.clone(), v.clone());
+                    }
+                    m
+                };
+                for sub_item in &effective_decl_items {
+                    if let ModuleItem::TypedefDeclaration(td) = sub_item {
+                        if let DataType::Enum(et) = &td.data_type {
+                            let base_width = et.base_type.as_ref()
+                                .map(|bt| resolve_type_width(bt, Some(&sub_merged_params), Some(&elab.typedefs)))
+                                .unwrap_or(32);
+                            let mut next_val: u64 = 0;
+                            for member in &et.members {
+                                let val = if let Some(init) = &member.init {
+                                    eval_const_expr(init, &sub_merged_params)
+                                } else { next_val };
+                                next_val = val.wrapping_add(1);
+                                let v = Value::from_u64(val, base_width);
+                                elab.parameters.insert(member.name.name.clone(), v.clone());
+                                elab.signals.insert(member.name.name.clone(), Signal { is_const: false,
+                                    name: member.name.name.clone(), width: base_width,
+                                    is_signed: false, direction: None, value: v, type_name: None,
+                                    is_real: false,
+                                });
+                            }
+                            elab.typedefs.insert(td.name.name.clone(), base_width);
+                        } else {
+                            let w = resolve_type_width(&td.data_type, Some(&sub_merged_params), Some(&elab.typedefs));
+                            elab.typedefs.insert(td.name.name.clone(), w);
+                        }
+                    }
+                }
                 for sub_item in &effective_decl_items {
                     match sub_item {
                         ModuleItem::NetDeclaration(nd) => {
-                            let width = resolve_type_width_with_params(&nd.data_type, Some(&elab.parameters));
+                            let width = resolve_type_width(&nd.data_type, Some(&sub_merged_params), Some(&elab.typedefs));
                             for decl in &nd.declarators {
                                 let sig_name = format!("{}{}", inst_prefix, decl.name.name);
                                 let init_value = match nd.net_type {
@@ -1021,36 +2274,45 @@ fn inline_module_items(
                                     NetType::Supply1 => Value::ones(width),
                                     _ => Value::new(width),
                                 };
-                                elab.signals.insert(sig_name.clone(), Signal {
+                                elab.signals.insert(sig_name.clone(), Signal { is_const: false,
                                     name: sig_name, width,
                                     is_signed: is_type_signed(&nd.data_type),
+                                    is_real: is_type_real(&nd.data_type),
                                     direction: None, value: init_value,
-                                });
-                            }
+                                    type_name: get_type_name(&nd.data_type),
+                                });                            }
                         }
                         ModuleItem::DataDeclaration(dd) => {
-                            let width = resolve_type_width_with_params(&dd.data_type, Some(&elab.parameters));
+                            let width = match &dd.data_type {
+                                DataType::TypeReference { name, .. } => {
+                                    elab.typedefs.get(&name.name.name).copied()
+                                        .unwrap_or(resolve_type_width(&dd.data_type, Some(&sub_merged_params), Some(&elab.typedefs)))
+                                }
+                                _ => resolve_type_width(&dd.data_type, Some(&sub_merged_params), Some(&elab.typedefs)),
+                            };
                             let is_signed = is_type_signed(&dd.data_type);
                             for decl in &dd.declarators {
                                 let base_name = decl.name.name.clone();
                                 let sig_name = format!("{}{}", inst_prefix, base_name);
-                                let array_range = extract_array_range(&decl.dimensions, &elab.parameters);
+                                let array_range = extract_array_range(&decl.dimensions, &sub_merged_params);
                                 if let Some((lo, hi)) = array_range {
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));
                                     for idx in lo..=hi {
                                         let elem_name = format!("{}[{}]", sig_name, idx);
-                                        elab.signals.insert(elem_name.clone(), Signal {
+                                        elab.signals.insert(elem_name.clone(), Signal { is_const: dd.const_kw,
                                             name: elem_name, width, is_signed,
                                             direction: None, value: Value::new(width),
+                                            is_real: is_type_real(&dd.data_type), type_name: get_type_name(&dd.data_type),
                                         });
                                     }
                                 } else {
                                     let init_val = if let Some(init_expr) = &decl.init {
-                                        eval_const_expr_val(init_expr, &elab.parameters).resize(width)
+                                        eval_const_expr_val(init_expr, &sub_merged_params).resize(width)
                                     } else { Value::new(width) };
-                                    elab.signals.insert(sig_name.clone(), Signal {
+                                    elab.signals.insert(sig_name.clone(), Signal { is_const: dd.const_kw,
                                         name: sig_name, width, is_signed,
                                         direction: None, value: init_val,
+                                        is_real: is_type_real(&dd.data_type), type_name: get_type_name(&dd.data_type),
                                     });
                                 }
                             }
@@ -1060,10 +2322,9 @@ fn inline_module_items(
                 }
 
                 // Port connection assigns
-                // Build a direction map for port signals (needed for non-ANSI ports)
                 let port_directions: HashMap<String, PortDirection> = {
                     let mut dirs = HashMap::new();
-                    match &sub_mod.ports {
+                    match sub_mod.ports() {
                         PortList::Ansi(ports) => {
                             for port in ports {
                                 if let Some(dir) = port.direction {
@@ -1072,7 +2333,7 @@ fn inline_module_items(
                             }
                         }
                         PortList::NonAnsi(_) => {
-                            let effective_items = collect_effective_items(&sub_mod.items, &elab.parameters);
+                            let effective_items = collect_effective_items(sub_mod.items(), &sub_merged_params);
                             for sub_item in &effective_items {
                                 if let ModuleItem::PortDeclaration(pd) = sub_item {
                                     for decl in &pd.declarators {
@@ -1087,6 +2348,7 @@ fn inline_module_items(
                 };
 
                 for (port_name, parent_expr) in &port_map {
+                    if sub_interface_ports.contains(port_name) { continue; }
                     let sub_sig_name = format!("{}{}", inst_prefix, port_name);
                     let sub_expr = make_ident_expr(&sub_sig_name);
                     match port_directions.get(port_name) {
@@ -1101,7 +2363,6 @@ fn inline_module_items(
                             });
                         }
                         _ => {
-                            // Unknown direction (not declared) — treat as input
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: sub_expr, rhs: parent_expr.clone(),
                             });
@@ -1109,10 +2370,15 @@ fn inline_module_items(
                     }
                 }
 
-                // Collect sub-module local signal names (ports + internal nets/vars)
-                // Only these should be prefixed during rewriting
+                // Collect sub-module local signal names
                 let mut local_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-                match &sub_mod.ports {
+                // Include module parameter port list names (e.g. picorv32 #(parameter PROGADDR_RESET = ...))
+                for p_decl in sub_mod.params() {
+                    if let ParameterKind::Data { assignments, .. } = &p_decl.kind {
+                        for assign in assignments { local_names.insert(assign.name.name.clone()); }
+                    }
+                }
+                match sub_mod.ports() {
                     PortList::Ansi(ports) => {
                         for port in ports { local_names.insert(port.name.name.clone()); }
                     }
@@ -1126,417 +2392,550 @@ fn inline_module_items(
                         ModuleItem::NetDeclaration(nd) => { for d in &nd.declarators { local_names.insert(d.name.name.clone()); } }
                         ModuleItem::DataDeclaration(dd) => { for d in &dd.declarators { local_names.insert(d.name.name.clone()); } }
                         ModuleItem::PortDeclaration(pd) => { for d in &pd.declarators { local_names.insert(d.name.name.clone()); } }
+                        ModuleItem::FunctionDeclaration(fd) => { local_names.insert(fd.name.name.name.clone()); }
+                        ModuleItem::TaskDeclaration(td) => { local_names.insert(td.name.name.name.clone()); }
+                        ModuleItem::ModuleInstantiation(inst) => {
+                            if elab.typedefs.contains_key(&inst.module_name.name) || local_typedefs.contains(&inst.module_name.name) {
+                                for hi in &inst.instances { local_names.insert(hi.name.name.clone()); }
+                            }
+                        }
+                        ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                            if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                                for assign in assignments { local_names.insert(assign.name.name.clone()); }
+                            }
+                        }
                         _ => {}
                     }
                 }
 
-                // Inline the sub-module's continuous assigns (rewrite signal names with inst_prefix)
-                // Collect all effective items from the sub-module, resolving generates
-                let effective_items = collect_effective_items(&sub_mod.items, &elab.parameters);
+                // Build a rewrite_port_map that excludes output ports.
+                // Output ports should use the local prefixed name (inst_prefix + port_name)
+                // rather than the parent expression, because:
+                //   - Input ports: the sub-module reads from the parent → use parent expr
+                //   - Output ports: the sub-module writes to its local reg → use prefixed local name
+                //     (a continuous assign parent = local handles the connection)
+                let rewrite_port_map: HashMap<String, Expression> = port_map.iter()
+                    .filter(|(name, _)| {
+                        !matches!(port_directions.get(name.as_str()), Some(PortDirection::Output))
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+
+                // Inline the sub-module's continuous assigns
+                let effective_items = collect_effective_items(sub_mod.items(), &sub_merged_params);
                 for sub_item in &effective_items {
+                    if let ModuleItem::FunctionDeclaration(fd) = sub_item {
+                        let mut new_fd = fd.clone();
+                        new_fd.name.name.name = format!("{}{}", inst_prefix, fd.name.name.name);
+                        for p in &mut new_fd.ports {
+                            if let Some(def) = &p.default {
+                                p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map));
+                            }
+                        }
+                        new_fd.items = fd.items.iter()
+                            .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map))
+                            .collect();
+                        elab.functions.insert(new_fd.name.name.name.clone(), new_fd);
+                    }
+                    if let ModuleItem::TaskDeclaration(td) = sub_item {
+                        let mut new_td = td.clone();
+                        new_td.name.name.name = format!("{}{}", inst_prefix, td.name.name.name);
+                        for p in &mut new_td.ports {
+                            if let Some(def) = &p.default {
+                                p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map));
+                            }
+                        }
+                        new_td.items = td.items.iter()
+                            .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map))
+                            .collect();
+                        elab.tasks.insert(new_td.name.name.name.clone(), new_td);
+                    }
                     if let ModuleItem::ContinuousAssign(ca) = sub_item {
                         for (lhs, rhs) in &ca.assignments {
-                            let new_lhs = rewrite_expr(lhs, &inst_prefix, &port_map, &local_names);
-                            let new_rhs = rewrite_expr(rhs, &inst_prefix, &port_map, &local_names);
+                            let new_lhs = rewrite_expr(lhs, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map);
+                            let new_rhs = rewrite_expr(rhs, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map);
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: new_lhs, rhs: new_rhs,
                             });
                         }
                     }
-                    // Gate-level primitives → continuous assigns with rewritten signals
                     if let ModuleItem::GateInstantiation(gi) = sub_item {
                         let assigns = gate_inst_to_assign_pairs(gi);
                         for (lhs, rhs) in assigns {
-                            let new_lhs = rewrite_expr(&lhs, &inst_prefix, &port_map, &local_names);
-                            let new_rhs = rewrite_expr(&rhs, &inst_prefix, &port_map, &local_names);
+                            let new_lhs = rewrite_expr(&lhs, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map);
+                            let new_rhs = rewrite_expr(&rhs, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map);
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: new_lhs, rhs: new_rhs,
                             });
                         }
                     }
-                    // Wire declarations with initializers → continuous assigns
                     if let ModuleItem::NetDeclaration(nd) = sub_item {
                         for decl in &nd.declarators {
                             if let Some(init_expr) = &decl.init {
                                 let lhs_name = format!("{}{}", inst_prefix, decl.name.name);
                                 let new_lhs = make_ident_expr(&lhs_name);
-                                let new_rhs = rewrite_expr(init_expr, &inst_prefix, &port_map, &local_names);
+                                let new_rhs = rewrite_expr(init_expr, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map);
                                 elab.continuous_assigns.push(ContinuousAssignment {
                                     lhs: new_lhs, rhs: new_rhs,
                                 });
                             }
                         }
                     }
+                    if let ModuleItem::SpecifyBlock(sb) = sub_item {
+                        for p in &sb.paths {
+                            let dst_expr = rewrite_expr(
+                                &make_ident_expr(&p.dst.name),
+                                &inst_prefix,
+                                &rewrite_port_map,
+                                &local_names,
+                                &sub_interface_map,
+                            );
+                            if let ExprKind::Ident(hier) = &dst_expr.kind {
+                                let dst_name = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
+                                let d = eval_const_expr(&p.delay, &elab.parameters);
+                                elab.specify_delays.insert(dst_name, d);
+                            }
+                        }
+                    }
                     if let ModuleItem::AlwaysConstruct(ac) = sub_item {
                         elab.always_blocks.push(super::elaborate::AlwaysBlock {
                             kind: ac.kind,
-                            stmt: rewrite_stmt(&ac.stmt, &inst_prefix, &port_map, &local_names),
+                            stmt: rewrite_stmt(&ac.stmt, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map),
                         });
                     }
                     if let ModuleItem::InitialConstruct(ic) = sub_item {
                         elab.initial_blocks.push(super::elaborate::InitialBlock {
-                            stmt: rewrite_stmt(&ic.stmt, &inst_prefix, &port_map, &local_names),
+                            stmt: rewrite_stmt(&ic.stmt, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map),
                         });
-                    }
-                    // Propagate enum constants from sub-module typedefs
-                    if let ModuleItem::TypedefDeclaration(td) = sub_item {
-                        if let DataType::Enum(et) = &td.data_type {
-                            let base_width = et.base_type.as_ref()
-                                .map(|bt| resolve_type_width(bt)).unwrap_or(32);
-                            let mut next_val: u64 = 0;
-                            for member in &et.members {
-                                let val = if let Some(init) = &member.init {
-                                    eval_const_expr(init, &elab.parameters)
-                                } else { next_val };
-                                next_val = val + 1;
-                                let v = Value::from_u64(val, base_width);
-                                // Enum constants are global (not prefixed)
-                                if !elab.parameters.contains_key(&member.name.name) {
-                                    elab.parameters.insert(member.name.name.clone(), v.clone());
-                                    elab.signals.insert(member.name.name.clone(), Signal {
-                                        name: member.name.name.clone(), width: base_width,
-                                        is_signed: false, direction: None, value: v,
-                                    });
-                                }
-                            }
-                            elab.typedefs.insert(td.name.name.clone(), base_width);
-                        }
                     }
                 }
 
-                // *** RECURSE: inline any sub-sub-module instantiations ***
-                inline_module_items(elab, sub_mod, &inst_prefix, modules)?;
+                // Recurse into sub-module instantiations
+                inline_module_items(elab, sub_mod, &inst_prefix, definitions, &mut sub_interface_map, &sub_merged_params)?;
             }
         }
     }
     Ok(())
 }
 
-/// Create an identifier expression from a signal name.
-/// Convert gate-level primitive instantiations to continuous assigns.
-/// Adds the resulting assigns directly to the elaborated module.
-fn gate_inst_to_assigns(gi: &crate::ast::decl::GateInstantiation, elab: &mut ElaboratedModule) {
-    for (lhs, rhs) in gate_inst_to_assign_pairs(gi) {
+fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Expression)> {
+    let mut pairs = Vec::new();
+    for inst in &gi.instances {
+        if inst.terminals.len() < 2 { continue; }
+        let out = inst.terminals[0].clone();
+        let in1 = inst.terminals[1].clone();
+        match gi.gate_type {
+            GateType::And => {
+                let mut rhs = in1;
+                for i in 2..inst.terminals.len() {
+                    rhs = Expression::new(ExprKind::Binary { op: BinaryOp::BitAnd, left: Box::new(rhs), right: Box::new(inst.terminals[i].clone()) }, out.span);
+                }
+                pairs.push((out, rhs));
+            }
+            GateType::Or => {
+                let mut rhs = in1;
+                for i in 2..inst.terminals.len() {
+                    rhs = Expression::new(ExprKind::Binary { op: BinaryOp::BitOr, left: Box::new(rhs), right: Box::new(inst.terminals[i].clone()) }, out.span);
+                }
+                pairs.push((out, rhs));
+            }
+            GateType::Not => {
+                let rhs = Expression::new(ExprKind::Unary { op: UnaryOp::BitNot, operand: Box::new(in1) }, out.span);
+                pairs.push((out, rhs));
+            }
+            _ => {}
+        }
+    }
+    pairs
+}
+
+fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
+    let pairs = gate_inst_to_assign_pairs(gi);
+    for (lhs, rhs) in pairs {
         elab.continuous_assigns.push(ContinuousAssignment { lhs, rhs });
     }
 }
 
-/// Convert gate-level primitive instantiation to (lhs, rhs) pairs for continuous assigns.
-/// For `and g(out, in1, in2)` → `assign out = in1 & in2`
-fn gate_inst_to_assign_pairs(
-    gi: &crate::ast::decl::GateInstantiation,
-) -> Vec<(crate::ast::expr::Expression, crate::ast::expr::Expression)> {
-    use crate::ast::decl::GateType;
-    use crate::ast::expr::*;
-    use crate::ast::Span;
-
-    let mut result = Vec::new();
-
-    for inst in &gi.instances {
-        if inst.terminals.len() < 2 { continue; }
-
-        match gi.gate_type {
-            // N-input gates: first terminal is output, rest are inputs
-            // out = in1 OP in2 OP in3 ...
-            GateType::And | GateType::Nand | GateType::Or | GateType::Nor |
-            GateType::Xor | GateType::Xnor => {
-                let out = &inst.terminals[0];
-                let inputs = &inst.terminals[1..];
-                if inputs.is_empty() { continue; }
-
-                let op = match gi.gate_type {
-                    GateType::And | GateType::Nand => BinaryOp::BitAnd,
-                    GateType::Or | GateType::Nor => BinaryOp::BitOr,
-                    GateType::Xor | GateType::Xnor => BinaryOp::BitXor,
-                    _ => unreachable!(),
-                };
-
-                // Build chain: in1 OP in2 OP in3 ...
-                let mut expr = inputs[0].clone();
-                for inp in &inputs[1..] {
-                    expr = Expression::new(
-                        ExprKind::Binary { op, left: Box::new(expr), right: Box::new(inp.clone()) },
-                        Span::dummy(),
-                    );
-                }
-
-                // For nand/nor/xnor: invert the result
-                if matches!(gi.gate_type, GateType::Nand | GateType::Nor | GateType::Xnor) {
-                    expr = Expression::new(
-                        ExprKind::Unary { op: UnaryOp::BitNot, operand: Box::new(expr) },
-                        Span::dummy(),
-                    );
-                }
-
-                result.push((out.clone(), expr));
-            }
-
-            // buf: output = input (may have multiple outputs)
-            // buf (out1, out2, ..., in)  — last terminal is input
-            GateType::Buf => {
-                let input = inst.terminals.last().unwrap();
-                for out in &inst.terminals[..inst.terminals.len() - 1] {
-                    result.push((out.clone(), input.clone()));
-                }
-            }
-
-            // not: output = ~input (may have multiple outputs)
-            // not (out1, out2, ..., in)
-            GateType::Not => {
-                let input = inst.terminals.last().unwrap();
-                let inv = Expression::new(
-                    ExprKind::Unary { op: UnaryOp::BitNot, operand: Box::new(input.clone()) },
-                    Span::dummy(),
-                );
-                for out in &inst.terminals[..inst.terminals.len() - 1] {
-                    result.push((out.clone(), inv.clone()));
-                }
-            }
-
-            // bufif0/bufif1/notif0/notif1: tri-state — approximate as pass-through
-            // bufif1 (out, in, ctrl) → assign out = ctrl ? in : 1'bz
-            // For simulation simplicity, treat as: out = in (ignoring the enable)
-            GateType::Bufif0 | GateType::Bufif1 | GateType::Notif0 | GateType::Notif1 => {
-                if inst.terminals.len() >= 3 {
-                    let out = &inst.terminals[0];
-                    let input = &inst.terminals[1];
-                    let _ctrl = &inst.terminals[2];
-                    let expr = if matches!(gi.gate_type, GateType::Notif0 | GateType::Notif1) {
-                        Expression::new(
-                            ExprKind::Unary { op: UnaryOp::BitNot, operand: Box::new(input.clone()) },
-                            Span::dummy(),
-                        )
-                    } else {
-                        input.clone()
-                    };
-                    result.push((out.clone(), expr));
-                }
-            }
-        }
-    }
-
-    result
+fn make_ident_expr(name: &str) -> Expression {
+    Expression::new(ExprKind::Ident(HierarchicalIdentifier {
+        root: None,
+        path: vec![HierPathSegment { name: Identifier { name: name.to_string(), span: Span::dummy() }, selects: Vec::new() }],
+        span: Span::dummy(),
+        cached_signal_id: std::cell::Cell::new(None),
+    }), Span::dummy())
 }
 
-fn make_ident_expr(name: &str) -> crate::ast::expr::Expression {
-    use crate::ast::expr::*;
-    use crate::ast::{Identifier, Span};
-    Expression::new(
-        ExprKind::Ident(HierarchicalIdentifier {
-            root: None,
-            path: vec![HierPathSegment {
-                name: Identifier { name: name.to_string(), span: Span::dummy() },
-                selects: Vec::new(),
-            }],
-            span: Span::dummy(),
-            cached_signal_id: std::cell::Cell::new(None),
-        }),
-        Span::dummy(),
-    )
+fn rewrite_expr(expr: &Expression, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Expression {
+    rewrite_expr_impl(expr, prefix, port_map, local_names, interface_map)
 }
 
-/// Rewrite all identifiers in an expression with prefix (used for parent-scope port connections).
-fn rewrite_expr_all(
-    expr: &crate::ast::expr::Expression,
-    prefix: &str,
-) -> crate::ast::expr::Expression {
-    // Create an "everything" local_names set by using a set that always matches
-    let all = AllNames;
-    rewrite_expr_impl(expr, prefix, &HashMap::new(), &all)
-}
-
-/// Rewrite an expression: prefix only local signal identifiers with the instance prefix.
-fn rewrite_expr(
-    expr: &crate::ast::expr::Expression,
-    prefix: &str,
-    port_map: &HashMap<String, crate::ast::expr::Expression>,
-    local_names: &std::collections::HashSet<String>,
-) -> crate::ast::expr::Expression {
-    rewrite_expr_impl(expr, prefix, port_map, local_names)
-}
-
-/// Trait for checking if a name should be prefixed.
-trait NameSet { fn contains_name(&self, name: &str) -> bool; }
-impl NameSet for std::collections::HashSet<String> { fn contains_name(&self, name: &str) -> bool { self.contains(name) } }
-struct AllNames;
-impl NameSet for AllNames { fn contains_name(&self, _: &str) -> bool { true } }
-
-fn rewrite_expr_impl(
-    expr: &crate::ast::expr::Expression,
-    prefix: &str,
-    port_map: &HashMap<String, crate::ast::expr::Expression>,
-    local_names: &dyn NameSet,
-) -> crate::ast::expr::Expression {
-    use crate::ast::expr::*;
-    use crate::ast::{Identifier, Span};
-
+fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Expression {
     let new_kind = match &expr.kind {
         ExprKind::Ident(hier) => {
-            let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-            if local_names.contains_name(name) {
-                let new_name = format!("{}{}", prefix, name);
-                ExprKind::Ident(HierarchicalIdentifier {
-                    root: None,
-                    path: vec![HierPathSegment {
-                        name: Identifier { name: new_name, span: Span::dummy() },
-                        selects: hier.path.last().map(|s| s.selects.clone()).unwrap_or_default(),
-                    }],
-                    span: Span::dummy(),
-                    cached_signal_id: std::cell::Cell::new(None),
-                })
+            if hier.root.is_some() { return expr.clone(); }
+            if hier.path.is_empty() { return expr.clone(); }
+            let name = &hier.path[0].name.name;
+            if let Some(if_prefix) = interface_map.get(name) {
+                let mut new_hier = hier.clone();
+                new_hier.path[0].name.name = if_prefix.clone();
+                return Expression::new(ExprKind::Ident(new_hier), expr.span);
+            }
+            if let Some(mapped) = port_map.get(name) {
+                return mapped.clone();
+            }
+            if local_names.contains(name) {
+                let mut new_hier = hier.clone();
+                new_hier.path[0].name.name = format!("{}{}", prefix, name);
+                ExprKind::Ident(new_hier)
             } else {
-                // Not a local signal (e.g., enum constant) — keep as-is
                 expr.kind.clone()
             }
         }
-        ExprKind::Binary { op, left, right } => ExprKind::Binary {
-            op: *op,
-            left: Box::new(rewrite_expr_impl(left, prefix, port_map, local_names)),
-            right: Box::new(rewrite_expr_impl(right, prefix, port_map, local_names)),
-        },
         ExprKind::Unary { op, operand } => ExprKind::Unary {
             op: *op,
-            operand: Box::new(rewrite_expr_impl(operand, prefix, port_map, local_names)),
+            operand: Box::new(rewrite_expr_impl(operand, prefix, port_map, local_names, interface_map)),
+        },
+        ExprKind::Binary { op, left, right } => ExprKind::Binary {
+            op: *op,
+            left: Box::new(rewrite_expr_impl(left, prefix, port_map, local_names, interface_map)),
+            right: Box::new(rewrite_expr_impl(right, prefix, port_map, local_names, interface_map)),
         },
         ExprKind::Conditional { condition, then_expr, else_expr } => ExprKind::Conditional {
-            condition: Box::new(rewrite_expr_impl(condition, prefix, port_map, local_names)),
-            then_expr: Box::new(rewrite_expr_impl(then_expr, prefix, port_map, local_names)),
-            else_expr: Box::new(rewrite_expr_impl(else_expr, prefix, port_map, local_names)),
+            condition: Box::new(rewrite_expr_impl(condition, prefix, port_map, local_names, interface_map)),
+            then_expr: Box::new(rewrite_expr_impl(then_expr, prefix, port_map, local_names, interface_map)),
+            else_expr: Box::new(rewrite_expr_impl(else_expr, prefix, port_map, local_names, interface_map)),
         },
         ExprKind::Concatenation(parts) => ExprKind::Concatenation(
-            parts.iter().map(|p| rewrite_expr_impl(p, prefix, port_map, local_names)).collect()
+            parts.iter().map(|p| rewrite_expr_impl(p, prefix, port_map, local_names, interface_map)).collect(),
         ),
         ExprKind::Replication { count, exprs } => ExprKind::Replication {
-            count: Box::new(rewrite_expr_impl(count, prefix, port_map, local_names)),
-            exprs: exprs.iter().map(|e| rewrite_expr_impl(e, prefix, port_map, local_names)).collect(),
+            count: Box::new(rewrite_expr_impl(count, prefix, port_map, local_names, interface_map)),
+            exprs: exprs.iter().map(|e| rewrite_expr_impl(e, prefix, port_map, local_names, interface_map)).collect(),
         },
-        ExprKind::Index { expr: e, index } => ExprKind::Index {
-            expr: Box::new(rewrite_expr_impl(e, prefix, port_map, local_names)),
-            index: Box::new(rewrite_expr_impl(index, prefix, port_map, local_names)),
+        ExprKind::Index { expr: base, index } => ExprKind::Index {
+            expr: Box::new(rewrite_expr_impl(base, prefix, port_map, local_names, interface_map)),
+            index: Box::new(rewrite_expr_impl(index, prefix, port_map, local_names, interface_map)),
         },
-        ExprKind::RangeSelect { expr: e, kind, left, right } => ExprKind::RangeSelect {
-            expr: Box::new(rewrite_expr_impl(e, prefix, port_map, local_names)),
+        ExprKind::RangeSelect { expr: base, kind, left, right } => ExprKind::RangeSelect {
+            expr: Box::new(rewrite_expr_impl(base, prefix, port_map, local_names, interface_map)),
             kind: *kind,
-            left: Box::new(rewrite_expr_impl(left, prefix, port_map, local_names)),
-            right: Box::new(rewrite_expr_impl(right, prefix, port_map, local_names)),
+            left: Box::new(rewrite_expr_impl(left, prefix, port_map, local_names, interface_map)),
+            right: Box::new(rewrite_expr_impl(right, prefix, port_map, local_names, interface_map)),
         },
-        ExprKind::Paren(inner) => ExprKind::Paren(Box::new(rewrite_expr_impl(inner, prefix, port_map, local_names))),
+        ExprKind::MemberAccess { expr: base, member } => {
+            let rewritten_base = rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
+            if let ExprKind::Ident(mut hier) = rewritten_base.kind {
+                hier.path.push(HierPathSegment {
+                    name: member.clone(),
+                    selects: Vec::new(),
+                });
+                ExprKind::Ident(hier)
+            } else {
+                ExprKind::MemberAccess {
+                    expr: Box::new(rewritten_base),
+                    member: member.clone(),
+                }
+            }
+        }
+        ExprKind::Paren(inner) => ExprKind::Paren(Box::new(rewrite_expr_impl(inner, prefix, port_map, local_names, interface_map))),
         ExprKind::Call { func, args } => ExprKind::Call {
-            func: Box::new(rewrite_expr_impl(func, prefix, port_map, local_names)),
-            args: args.iter().map(|a| rewrite_expr_impl(a, prefix, port_map, local_names)).collect(),
+            func: Box::new(rewrite_expr_impl(func, prefix, port_map, local_names, interface_map)),
+            args: args.iter().map(|a| rewrite_expr_impl(a, prefix, port_map, local_names, interface_map)).collect(),
         },
         ExprKind::SystemCall { name, args } => ExprKind::SystemCall {
             name: name.clone(),
-            args: args.iter().map(|a| rewrite_expr_impl(a, prefix, port_map, local_names)).collect(),
+            args: args.iter().map(|a| rewrite_expr_impl(a, prefix, port_map, local_names, interface_map)).collect(),
         },
-        // Literals and constants pass through unchanged
         other => other.clone(),
     };
     Expression::new(new_kind, expr.span)
 }
 
-/// Rewrite a statement: prefix identifiers.
-/// Rewrite signal names inside a TimingControl during module inlining.
-fn rewrite_timing_control(
-    control: &crate::ast::stmt::TimingControl,
-    prefix: &str,
-    port_map: &HashMap<String, crate::ast::expr::Expression>,
-    local_names: &std::collections::HashSet<String>,
-) -> crate::ast::stmt::TimingControl {
-    use crate::ast::stmt::*;
-    match control {
-        TimingControl::Delay(expr) => TimingControl::Delay(rewrite_expr(expr, prefix, port_map, local_names)),
-        TimingControl::Event(ec) => TimingControl::Event(match ec {
-            EventControl::Star | EventControl::ParenStar => ec.clone(),
-            EventControl::Identifier(id) => {
-                if local_names.contains(&id.name) {
-                    EventControl::Identifier(crate::ast::Identifier {
-                        name: format!("{}{}", prefix, id.name),
-                        span: id.span,
-                    })
-                } else {
-                    ec.clone()
-                }
-            }
-            EventControl::EventExpr(exprs) => {
-                EventControl::EventExpr(exprs.iter().map(|ee| EventExpr {
-                    edge: ee.edge,
-                    expr: rewrite_expr(&ee.expr, prefix, port_map, local_names),
-                    iff: ee.iff.as_ref().map(|e| rewrite_expr(e, prefix, port_map, local_names)),
-                    span: ee.span,
-                }).collect())
-            }
-        }),
-    }
-}
-
-fn rewrite_stmt(
-    stmt: &crate::ast::stmt::Statement,
-    prefix: &str,
-    port_map: &HashMap<String, crate::ast::expr::Expression>,
-    local_names: &std::collections::HashSet<String>,
-) -> crate::ast::stmt::Statement {
-    use crate::ast::stmt::*;
+fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Statement {
     let new_kind = match &stmt.kind {
         StatementKind::BlockingAssign { lvalue, rvalue } => StatementKind::BlockingAssign {
-            lvalue: rewrite_expr(lvalue, prefix, port_map, local_names),
-            rvalue: rewrite_expr(rvalue, prefix, port_map, local_names),
+            lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
+            rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
         },
         StatementKind::NonblockingAssign { lvalue, delay, rvalue } => StatementKind::NonblockingAssign {
-            lvalue: rewrite_expr(lvalue, prefix, port_map, local_names),
-            delay: delay.as_ref().map(|d| rewrite_expr(d, prefix, port_map, local_names)),
-            rvalue: rewrite_expr(rvalue, prefix, port_map, local_names),
+            lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
+            delay: delay.as_ref().map(|d| rewrite_expr(d, prefix, port_map, local_names, interface_map)),
+            rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
         },
+        StatementKind::Expr(expr) => StatementKind::Expr(rewrite_expr(expr, prefix, port_map, local_names, interface_map)),
         StatementKind::If { unique_priority, condition, then_stmt, else_stmt } => StatementKind::If {
             unique_priority: *unique_priority,
-            condition: rewrite_expr(condition, prefix, port_map, local_names),
-            then_stmt: Box::new(rewrite_stmt(then_stmt, prefix, port_map, local_names)),
-            else_stmt: else_stmt.as_ref().map(|s| Box::new(rewrite_stmt(s, prefix, port_map, local_names))),
-        },
-        StatementKind::SeqBlock { name, stmts } => StatementKind::SeqBlock {
-            name: name.clone(),
-            stmts: stmts.iter().map(|s| rewrite_stmt(s, prefix, port_map, local_names)).collect(),
+            condition: rewrite_expr(condition, prefix, port_map, local_names, interface_map),
+            then_stmt: Box::new(rewrite_stmt(then_stmt, prefix, port_map, local_names, interface_map)),
+            else_stmt: else_stmt.as_ref().map(|s| Box::new(rewrite_stmt(s, prefix, port_map, local_names, interface_map))),
         },
         StatementKind::Case { unique_priority, kind, expr, items } => StatementKind::Case {
             unique_priority: *unique_priority,
             kind: *kind,
-            expr: rewrite_expr(expr, prefix, port_map, local_names),
-            items: items.iter().map(|ci| CaseItem {
-                patterns: ci.patterns.iter().map(|p| rewrite_expr(p, prefix, port_map, local_names)).collect(),
-                is_default: ci.is_default,
-                stmt: rewrite_stmt(&ci.stmt, prefix, port_map, local_names),
-                span: ci.span,
+            expr: rewrite_expr(expr, prefix, port_map, local_names, interface_map),
+            items: items.iter().map(|item| CaseItem {
+                patterns: item.patterns.iter().map(|p| rewrite_expr(p, prefix, port_map, local_names, interface_map)).collect(),
+                is_default: item.is_default,
+                stmt: rewrite_stmt(&item.stmt, prefix, port_map, local_names, interface_map),
+                span: item.span,
             }).collect(),
-        },
-        StatementKind::Expr(e) => StatementKind::Expr(rewrite_expr(e, prefix, port_map, local_names)),
-        StatementKind::TimingControl { control, stmt: inner } => StatementKind::TimingControl {
-            control: rewrite_timing_control(control, prefix, port_map, local_names),
-            stmt: Box::new(rewrite_stmt(inner, prefix, port_map, local_names)),
         },
         StatementKind::For { init, condition, step, body } => StatementKind::For {
             init: init.iter().map(|fi| match fi {
-                ForInit::Assign { lvalue, rvalue } => ForInit::Assign {
-                    lvalue: rewrite_expr(lvalue, prefix, port_map, local_names),
-                    rvalue: rewrite_expr(rvalue, prefix, port_map, local_names),
-                },
-                ForInit::VarDecl { data_type, name, init: init_expr } => ForInit::VarDecl {
+                ForInit::VarDecl { data_type, name, init } => ForInit::VarDecl {
                     data_type: data_type.clone(),
                     name: name.clone(),
-                    init: rewrite_expr(init_expr, prefix, port_map, local_names),
+                    init: rewrite_expr(init, prefix, port_map, local_names, interface_map),
+                },
+                ForInit::Assign { lvalue, rvalue } => ForInit::Assign {
+                    lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
+                    rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
                 },
             }).collect(),
-            condition: condition.as_ref().map(|c| rewrite_expr(c, prefix, port_map, local_names)),
-            step: step.iter().map(|s| rewrite_expr(s, prefix, port_map, local_names)).collect(),
-            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names)),
+            condition: condition.as_ref().map(|c| rewrite_expr(c, prefix, port_map, local_names, interface_map)),
+            step: step.iter().map(|s| rewrite_expr(s, prefix, port_map, local_names, interface_map)).collect(),
+            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
         },
         StatementKind::While { condition, body } => StatementKind::While {
-            condition: rewrite_expr(condition, prefix, port_map, local_names),
-            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names)),
+            condition: rewrite_expr(condition, prefix, port_map, local_names, interface_map),
+            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
+        },
+        StatementKind::Repeat { count, body } => StatementKind::Repeat {
+            count: rewrite_expr(count, prefix, port_map, local_names, interface_map),
+            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
         },
         StatementKind::Forever { body } => StatementKind::Forever {
-            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names)),
+            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
+        },
+        StatementKind::TimingControl { control, stmt: body } => StatementKind::TimingControl {
+            control: match control {
+                TimingControl::Delay(e) => TimingControl::Delay(rewrite_expr(e, prefix, port_map, local_names, interface_map)),
+                TimingControl::Event(ev) => TimingControl::Event(rewrite_event_control(ev, prefix, port_map, local_names, interface_map)),
+            },
+            stmt: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
+        },
+        StatementKind::SeqBlock { name, stmts } => StatementKind::SeqBlock {
+            name: name.clone(),
+            stmts: stmts.iter().map(|s| rewrite_stmt(s, prefix, port_map, local_names, interface_map)).collect(),
+        },
+        StatementKind::EventTrigger { nonblocking, name, span } => StatementKind::EventTrigger {
+            nonblocking: *nonblocking,
+            name: Identifier {
+                name: if let Some(mapped) = port_map.get(&name.name) {
+                    if let ExprKind::Ident(h) = &mapped.kind { h.path[0].name.name.clone() } else { name.name.clone() }
+                } else if local_names.contains(&name.name) {
+                    format!("{}.{}", prefix, name.name)
+                } else {
+                    name.name.clone()
+                },
+                span: name.span,
+            },
+            span: *span,
+        },
+        StatementKind::ParBlock { name, stmts, join_type } => StatementKind::ParBlock {
+            name: name.clone(),
+            stmts: stmts.iter().map(|s| rewrite_stmt(s, prefix, port_map, local_names, interface_map)).collect(),
+            join_type: *join_type,
         },
         other => other.clone(),
     };
     Statement::new(new_kind, stmt.span)
+}
+
+fn rewrite_event_control(ev: &EventControl, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> EventControl {
+    match ev {
+        EventControl::Identifier(id) => {
+            let name = if let Some(mapped) = port_map.get(&id.name) {
+                if let ExprKind::Ident(h) = &mapped.kind { h.path[0].name.name.clone() } else { id.name.clone() }
+            } else if local_names.contains(&id.name) {
+                format!("{}.{}", prefix, id.name)
+            } else {
+                id.name.clone()
+            };
+            EventControl::Identifier(Identifier { name, span: id.span })
+        }
+        EventControl::HierIdentifier(expr) => EventControl::HierIdentifier(rewrite_expr(expr, prefix, port_map, local_names, interface_map)),
+        EventControl::EventExpr(exprs) => EventControl::EventExpr(exprs.iter().map(|e| {
+            EventExpr {
+                edge: e.edge,
+                expr: rewrite_expr(&e.expr, prefix, port_map, local_names, interface_map),
+                iff: e.iff.as_ref().map(|i| rewrite_expr(i, prefix, port_map, local_names, interface_map)),
+                span: e.span,
+            }
+        }).collect()),
+        other => other.clone(),
+    }
+}
+fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &HashMap<String, Definition>) -> Result<(), String> {
+    for ii in &imp.items {
+        let pkg_name = &ii.package.name;
+        if let Some(Definition::Package(pkg)) = defs.get(pkg_name) {
+            if let Some(sym) = &ii.item {
+                let sym_name = &sym.name;
+                let mut found = false;
+                for pi in &pkg.items {
+                    match pi {
+                        PackageItem::Parameter(pd) => {
+                            if let ParameterKind::Data { data_type, assignments } = &pd.kind {
+                                for assign in assignments {
+                                    if &assign.name.name == sym_name {
+                                        let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                                        let mut signed = is_type_signed(data_type);
+                                        let is_real = is_type_real(data_type);
+                                        if matches!(data_type, DataType::Implicit { .. }) {
+                                            width = 32;
+                                            signed = true;
+                                        }
+                                        let v = if let Some(init) = &assign.init {
+                                            let mut v = eval_const_expr_val(init, &elab.parameters).resize(width);
+                                            if signed { v.is_signed = true; }
+                                            if is_real { v = Value::from_f64(v.to_f64()); }
+                                            v
+                                        } else { Value::zero(width) };
+                                        elab.parameters.insert(assign.name.name.clone(), v.clone());
+                                        elab.signals.insert(assign.name.name.clone(), Signal {
+                                            is_const: false, name: assign.name.name.clone(),
+                                            width, is_signed: signed, is_real, direction: None,
+                                            value: v, type_name: get_type_name(data_type),
+                                        });
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        PackageItem::Typedef(td) => {
+                            if &td.name.name == sym_name {
+                                process_typedef(td, elab);
+                                found = true;
+                            }
+                        }
+                        PackageItem::Function(fd) => {
+                            if &fd.name.name.name == sym_name {
+                                elab.functions.insert(fd.name.name.name.clone(), fd.clone());
+                                found = true;
+                            }
+                        }
+                        PackageItem::Task(td) => {
+                            if &td.name.name.name == sym_name {
+                                elab.tasks.insert(td.name.name.name.clone(), td.clone());
+                                found = true;
+                            }
+                        }
+                        PackageItem::DPIImport(di) => {
+                            if &dpi_proto_sv_name(&di.proto) == sym_name {
+                                register_dpi_import(di, elab)?;
+                                found = true;
+                            }
+                        }
+                        PackageItem::Class(c) => {
+                            if &c.name.name == sym_name {
+                                elab.classes.insert(c.name.name.clone(), elaborate_class(c));
+                                found = true;
+                            }
+                        }
+                        PackageItem::Data(dd) => {
+                            if dd.declarators.iter().any(|decl| &decl.name.name == sym_name) {
+                                let width = match &dd.data_type {
+                                    DataType::TypeReference { name, .. } => {
+                                        elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                                    }
+                                    _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
+                                };
+                                let is_signed = is_type_signed(&dd.data_type);
+                                let is_real = is_type_real(&dd.data_type);
+                                for decl in &dd.declarators {
+                                    if &decl.name.name == sym_name {
+                                        let v = if let Some(init) = &decl.init {
+                                            eval_const_expr_val(init, &elab.parameters).resize(width)
+                                        } else { Value::zero(width) };
+                                        elab.signals.insert(decl.name.name.clone(), Signal {
+                                            is_const: dd.const_kw, name: decl.name.name.clone(),
+                                            width, is_signed, is_real, direction: None,
+                                            value: v, type_name: get_type_name(&dd.data_type),
+                                        });
+                                    }
+                                }
+                                found = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if found { break; }
+                }
+                if !found {
+                    return Err(format!("Symbol '{}' not found in package '{}'", sym_name, pkg_name));
+                }
+            } else {
+                // Wildcard import
+                for pi in &pkg.items {
+                    match pi {
+                        PackageItem::Parameter(pd) => {
+                            if let ParameterKind::Data { data_type, assignments } = &pd.kind {
+                                let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                                let mut signed = is_type_signed(data_type);
+                                let is_real = is_type_real(data_type);
+                                if matches!(data_type, DataType::Implicit { .. }) {
+                                    width = 32;
+                                    signed = true;
+                                }
+                                for assign in assignments {
+                                    if let Some(init) = &assign.init {
+                                        let mut v = eval_const_expr_val(init, &elab.parameters).resize(width);
+                                        if signed { v.is_signed = true; }
+                                        if is_real { v = Value::from_f64(v.to_f64()); }
+                                        elab.parameters.insert(assign.name.name.clone(), v.clone());
+                                        elab.signals.insert(assign.name.name.clone(), Signal {
+                                            is_const: false, name: assign.name.name.clone(),
+                                            width, is_signed: signed, is_real, direction: None,
+                                            value: v, type_name: get_type_name(data_type),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        PackageItem::Typedef(td) => {
+                            process_typedef(td, elab);
+                        }
+                        PackageItem::Function(fd) => {
+                            elab.functions.insert(fd.name.name.name.clone(), fd.clone());
+                        }
+                        PackageItem::Task(td) => {
+                            elab.tasks.insert(td.name.name.name.clone(), td.clone());
+                        }
+                        PackageItem::DPIImport(di) => {
+                            register_dpi_import(di, elab)?;
+                        }
+                        PackageItem::Class(c) => {
+                            elab.classes.insert(c.name.name.clone(), elaborate_class(c));
+                        }
+                        PackageItem::Data(dd) => {
+                            let width = match &dd.data_type {
+                                DataType::TypeReference { name, .. } => {
+                                    elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                                }
+                                _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
+                            };
+                            let is_signed = is_type_signed(&dd.data_type);
+                            let is_real = is_type_real(&dd.data_type);
+                            for decl in &dd.declarators {
+                                let v = if let Some(init) = &decl.init {
+                                    eval_const_expr_val(init, &elab.parameters).resize(width)
+                                } else { Value::zero(width) };
+                                elab.signals.insert(decl.name.name.clone(), Signal {
+                                    is_const: dd.const_kw, name: decl.name.name.clone(),
+                                    width, is_signed, is_real, direction: None,
+                                    value: v, type_name: get_type_name(&dd.data_type),
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            return Err(format!("Package '{}' not found", pkg_name));
+        }
+    }
+    Ok(())
 }

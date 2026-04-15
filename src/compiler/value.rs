@@ -47,7 +47,7 @@ impl fmt::Display for LogicBit {
 }
 
 /// Storage for value bits. Values ≤64 bits use inline u64 pair.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ValueStorage {
     /// Packed: val_bits holds 0/1, xz_bits marks X/Z.
     /// bit i: val=bit i of val_bits, xz=bit i of xz_bits
@@ -58,11 +58,13 @@ enum ValueStorage {
 }
 
 /// An arbitrary-width 4-state logic value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Value {
     storage: ValueStorage,
     pub width: u32,
     pub is_signed: bool,
+    /// When true, the inline val_bits hold f64 bits (IEEE 754).
+    pub is_real: bool,
 }
 
 impl Value {
@@ -78,42 +80,83 @@ impl Value {
             Self {
                 storage: ValueStorage::Inline { val_bits: 0, xz_bits: Self::mask(width) },
                 width,
-                is_signed: false,
+                is_signed: false, is_real: false,
             }
         } else {
             Self {
                 storage: ValueStorage::Wide(vec![LogicBit::X; width as usize]),
                 width,
-                is_signed: false,
+                is_signed: false, is_real: false,
             }
         }
     }
 
     pub fn zero(width: u32) -> Self {
         if width <= 64 {
-            Self { storage: ValueStorage::Inline { val_bits: 0, xz_bits: 0 }, width, is_signed: false }
+            Self { storage: ValueStorage::Inline { val_bits: 0, xz_bits: 0 }, width, is_signed: false, is_real: false }
         } else {
-            Self { storage: ValueStorage::Wide(vec![LogicBit::Zero; width as usize]), width, is_signed: false }
+            Self { storage: ValueStorage::Wide(vec![LogicBit::Zero; width as usize]), width, is_signed: false, is_real: false }
         }
     }
 
     pub fn from_u64(val: u64, width: u32) -> Self {
         if width <= 64 {
             let mask = Self::mask(width);
-            Self { storage: ValueStorage::Inline { val_bits: val & mask, xz_bits: 0 }, width, is_signed: false }
+            Self { storage: ValueStorage::Inline { val_bits: val & mask, xz_bits: 0 }, width, is_signed: false, is_real: false }
         } else {
             let mut bits = vec![LogicBit::Zero; width as usize];
             for i in 0..64.min(width as usize) {
                 if (val >> i) & 1 == 1 { bits[i] = LogicBit::One; }
             }
-            Self { storage: ValueStorage::Wide(bits), width, is_signed: false }
+            Self { storage: ValueStorage::Wide(bits), width, is_signed: false, is_real: false }
         }
     }
 
     /// Create a Value from pre-computed inline bits (for cached number literals).
     #[inline]
     pub fn from_inline(val_bits: u64, xz_bits: u64, width: u32) -> Self {
-        Self { storage: ValueStorage::Inline { val_bits, xz_bits }, width, is_signed: false }
+        Self { storage: ValueStorage::Inline { val_bits, xz_bits }, width, is_signed: false, is_real: false }
+    }
+
+    /// Create a Value holding an f64 (stored as its IEEE 754 bit pattern in a 64-bit inline).
+    pub fn from_f64(f: f64) -> Self {
+        Self { storage: ValueStorage::Inline { val_bits: f.to_bits(), xz_bits: 0 }, width: 64, is_signed: false, is_real: true }
+    }
+
+    pub fn from_string(s: &str) -> Self {
+        let bytes = s.as_bytes();
+        let width = (bytes.len() * 8) as u32;
+        if width <= 64 {
+            let mut val_bits = 0u64;
+            for (i, &b) in bytes.iter().rev().enumerate() {
+                val_bits |= (b as u64) << (i * 8);
+            }
+            Self { storage: ValueStorage::Inline { val_bits, xz_bits: 0 }, width, is_signed: false, is_real: false }
+        } else {
+            let mut bits = Vec::with_capacity(width as usize);
+            for &b in bytes.iter().rev() {
+                for i in 0..8 {
+                    bits.push(if (b >> i) & 1 == 1 { LogicBit::One } else { LogicBit::Zero });
+                }
+            }
+            Self { storage: ValueStorage::Wide(bits), width, is_signed: false, is_real: false }
+        }
+    }
+
+    /// Extract f64 from a real-typed value.
+    pub fn to_f64(&self) -> f64 {
+        if self.is_real {
+            match &self.storage {
+                ValueStorage::Inline { val_bits, .. } => f64::from_bits(*val_bits),
+                _ => 0.0,
+            }
+        } else {
+            if self.is_signed {
+                self.to_i64().unwrap_or(0) as f64
+            } else {
+                self.to_u64().unwrap_or(0) as f64
+            }
+        }
     }
 
     /// Extract inline bits for caching. Returns None for Wide values.
@@ -125,7 +168,6 @@ impl Value {
         }
     }
 
-    /// Get the raw val/xz bits. For Wide values, computes from first 64 bits.
     pub fn raw_bits(&self) -> (u64, u64) {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => (*val_bits, *xz_bits),
@@ -160,7 +202,7 @@ impl Value {
     }
 
     #[inline(always)]
-    fn has_xz(&self) -> bool {
+    pub fn has_xz(&self) -> bool {
         match &self.storage {
             ValueStorage::Inline { xz_bits, .. } => *xz_bits != 0,
             ValueStorage::Wide(bits) => bits.iter().any(|b| matches!(b, LogicBit::X | LogicBit::Z)),
@@ -239,6 +281,12 @@ impl Value {
     /// Resize to target width. If narrowing, truncate. If widening, zero/sign-extend.
     pub fn resize(&self, target: u32) -> Value {
         if target == 0 { return Value::zero(0); }
+        if self.is_real {
+            if target == 64 { return self.clone(); }
+            // convert the real value to an integer (rounding to nearest)
+            let f = self.to_f64();
+            return Value::from_u64(f.round() as u64, target);
+        }
         if target == self.width {
             return self.clone();
         }
@@ -249,7 +297,7 @@ impl Value {
                     // Truncate
                     Value {
                         storage: ValueStorage::Inline { val_bits: *val_bits & mask, xz_bits: *xz_bits & mask },
-                        width: target, is_signed: self.is_signed,
+                        width: target, is_signed: self.is_signed, is_real: false,
                     }
                 } else {
                     // Widen
@@ -259,18 +307,18 @@ impl Value {
                             let ext_mask = mask & !Self::mask(self.width);
                             Value {
                                 storage: ValueStorage::Inline { val_bits: *val_bits | ext_mask, xz_bits: *xz_bits },
-                                width: target, is_signed: self.is_signed,
+                                width: target, is_signed: self.is_signed, is_real: false,
                             }
                         } else {
                             Value {
                                 storage: ValueStorage::Inline { val_bits: *val_bits, xz_bits: *xz_bits },
-                                width: target, is_signed: self.is_signed,
+                                width: target, is_signed: self.is_signed, is_real: false,
                             }
                         }
                     } else {
                         Value {
                             storage: ValueStorage::Inline { val_bits: *val_bits, xz_bits: *xz_bits },
-                            width: target, is_signed: self.is_signed,
+                            width: target, is_signed: self.is_signed, is_real: false,
                         }
                     }
                 }
@@ -285,7 +333,7 @@ impl Value {
                         ValueStorage::Inline { val_bits: fill_val, xz_bits: 0 }
                     } else {
                         ValueStorage::Wide(vec![fill; target as usize])
-                    }, width: target, is_signed: self.is_signed }
+                    }, width: target, is_signed: self.is_signed , is_real: false }
                 } else {
                     Value::zero(target)
                 };
@@ -301,7 +349,24 @@ impl Value {
 
     // === Arithmetic ===
 
+    pub fn negate(&self) -> Value {
+        if self.is_real {
+            return Value::from_f64(-self.to_f64());
+        }
+        if self.has_xz() {
+            return Value::new(self.width);
+        }
+        let w = self.width;
+        let v = self.to_u64().unwrap_or(0);
+        let mut r = Value::from_u64(v.wrapping_neg(), w);
+        r.is_signed = true;
+        r
+    }
+
     pub fn add(&self, other: &Value) -> Value {
+        if self.is_real || other.is_real {
+            return Value::from_f64(self.to_f64() + other.to_f64());
+        }
         if self.has_xz() || other.has_xz() {
             return Value::new(self.width.max(other.width));
         }
@@ -315,6 +380,9 @@ impl Value {
     }
 
     pub fn sub(&self, other: &Value) -> Value {
+        if self.is_real || other.is_real {
+            return Value::from_f64(self.to_f64() - other.to_f64());
+        }
         if self.has_xz() || other.has_xz() {
             return Value::new(self.width.max(other.width));
         }
@@ -328,6 +396,9 @@ impl Value {
     }
 
     pub fn mul(&self, other: &Value) -> Value {
+        if self.is_real || other.is_real {
+            return Value::from_f64(self.to_f64() * other.to_f64());
+        }
         if self.has_xz() || other.has_xz() { return Value::new(self.width.max(other.width)); }
         let w = self.width.max(other.width);
         let result_signed = self.is_signed && other.is_signed;
@@ -339,6 +410,9 @@ impl Value {
     }
 
     pub fn div(&self, other: &Value) -> Value {
+        if self.is_real || other.is_real {
+            return Value::from_f64(self.to_f64() / other.to_f64());
+        }
         if self.has_xz() || other.has_xz() { return Value::new(self.width.max(other.width)); }
         let w = self.width.max(other.width);
         let a = self.to_u64().unwrap_or(0);
@@ -355,6 +429,9 @@ impl Value {
     }
 
     pub fn modulo(&self, other: &Value) -> Value {
+        if self.is_real || other.is_real {
+            return Value::from_f64(self.to_f64() % other.to_f64());
+        }
         if self.has_xz() || other.has_xz() { return Value::new(self.width.max(other.width)); }
         let w = self.width.max(other.width);
         let b = other.to_u64().unwrap_or(0);
@@ -371,6 +448,9 @@ impl Value {
     }
 
     pub fn power(&self, other: &Value) -> Value {
+        if self.is_real || other.is_real {
+            return Value::from_f64(self.to_f64().powf(other.to_f64()));
+        }
         if self.has_xz() || other.has_xz() { return Value::new(self.width); }
         let base = self.to_u64().unwrap_or(0);
         let exp = other.to_u64().unwrap_or(0);
@@ -387,13 +467,13 @@ impl Value {
             (ValueStorage::Inline { val_bits: av, xz_bits: ax }, ValueStorage::Inline { val_bits: bv, xz_bits: bx }) => {
                 if *ax == 0 && *bx == 0 {
                     // Fast path: no X/Z
-                    Value { storage: ValueStorage::Inline { val_bits: av & bv, xz_bits: 0 }, width: w, is_signed: false }
+                    Value { storage: ValueStorage::Inline { val_bits: av & bv, xz_bits: 0 }, width: w, is_signed: false, is_real: false }
                 } else {
                     // X propagation for AND: 0 & X = 0, 1 & X = X
                     let any_xz = ax | bx;
                     let result_val = av & bv & !any_xz;
                     let result_xz = any_xz & !((!av & !ax) | (!bv & !bx)); // known 0 kills X
-                    Value { storage: ValueStorage::Inline { val_bits: result_val, xz_bits: result_xz & Self::mask(w) }, width: w, is_signed: false }
+                    Value { storage: ValueStorage::Inline { val_bits: result_val, xz_bits: result_xz & Self::mask(w) }, width: w, is_signed: false, is_real: false }
                 }
             }
             _ => self.bitwise_op_slow(other, |a, b| match (a, b) {
@@ -409,12 +489,12 @@ impl Value {
         match (&self.storage, &other.storage) {
             (ValueStorage::Inline { val_bits: av, xz_bits: ax }, ValueStorage::Inline { val_bits: bv, xz_bits: bx }) => {
                 if *ax == 0 && *bx == 0 {
-                    Value { storage: ValueStorage::Inline { val_bits: av | bv, xz_bits: 0 }, width: w, is_signed: false }
+                    Value { storage: ValueStorage::Inline { val_bits: av | bv, xz_bits: 0 }, width: w, is_signed: false, is_real: false }
                 } else {
                     let any_xz = ax | bx;
                     let result_val = (av | bv) & !any_xz;
                     let result_xz = any_xz & !((av & !ax) | (bv & !bx)); // known 1 kills X
-                    Value { storage: ValueStorage::Inline { val_bits: result_val | ((av & !ax) | (bv & !bx)), xz_bits: result_xz & Self::mask(w) }, width: w, is_signed: false }
+                    Value { storage: ValueStorage::Inline { val_bits: result_val | ((av & !ax) | (bv & !bx)), xz_bits: result_xz & Self::mask(w) }, width: w, is_signed: false, is_real: false }
                 }
             }
             _ => self.bitwise_op_slow(other, |a, b| match (a, b) {
@@ -431,7 +511,7 @@ impl Value {
             (ValueStorage::Inline { val_bits: av, xz_bits: ax }, ValueStorage::Inline { val_bits: bv, xz_bits: bx }) => {
                 let any_xz = ax | bx;
                 let result_val = (av ^ bv) & !any_xz;
-                Value { storage: ValueStorage::Inline { val_bits: result_val, xz_bits: any_xz & Self::mask(w) }, width: w, is_signed: false }
+                Value { storage: ValueStorage::Inline { val_bits: result_val, xz_bits: any_xz & Self::mask(w) }, width: w, is_signed: false, is_real: false }
             }
             _ => self.bitwise_op_slow(other, |a, b| match (a, b) {
                 (LogicBit::Zero, LogicBit::Zero) | (LogicBit::One, LogicBit::One) => LogicBit::Zero,
@@ -452,7 +532,7 @@ impl Value {
                 let mask = Self::mask(self.width);
                 Value {
                     storage: ValueStorage::Inline { val_bits: (!val_bits & !xz_bits) & mask, xz_bits: *xz_bits },
-                    width: self.width, is_signed: self.is_signed,
+                    width: self.width, is_signed: self.is_signed, is_real: false,
                 }
             }
             ValueStorage::Wide(bits) => {
@@ -461,7 +541,7 @@ impl Value {
                     LogicBit::One => LogicBit::Zero,
                     _ => LogicBit::X,
                 }).collect();
-                Value { storage: ValueStorage::Wide(new_bits), width: self.width, is_signed: self.is_signed }
+                Value { storage: ValueStorage::Wide(new_bits), width: self.width, is_signed: self.is_signed , is_real: false }
             }
         }
     }
@@ -491,7 +571,7 @@ impl Value {
                         val_bits: (val_bits << amt) & mask,
                         xz_bits: (xz_bits << amt) & mask,
                     },
-                    width: self.width, is_signed: self.is_signed,
+                    width: self.width, is_signed: self.is_signed, is_real: false,
                 }
             }
             _ => {
@@ -518,7 +598,7 @@ impl Value {
                         val_bits: val_bits >> amt,
                         xz_bits: xz_bits >> amt,
                     },
-                    width: self.width, is_signed: self.is_signed,
+                    width: self.width, is_signed: self.is_signed, is_real: false,
                 }
             }
             _ => {
@@ -543,7 +623,7 @@ impl Value {
                 if amt >= self.width {
                     return if sign == LogicBit::One {
                         let mask = Self::mask(self.width);
-                        Value { storage: ValueStorage::Inline { val_bits: mask, xz_bits: 0 }, width: self.width, is_signed: true }
+                        Value { storage: ValueStorage::Inline { val_bits: mask, xz_bits: 0 }, width: self.width, is_signed: true , is_real: false }
                     } else { Value::zero(self.width) };
                 }
                 let shifted_val = val_bits >> amt;
@@ -553,12 +633,12 @@ impl Value {
                     let ext = mask & !Self::mask(self.width - amt);
                     Value {
                         storage: ValueStorage::Inline { val_bits: shifted_val | ext, xz_bits: shifted_xz },
-                        width: self.width, is_signed: true,
+                        width: self.width, is_signed: true, is_real: false,
                     }
                 } else {
                     Value {
                         storage: ValueStorage::Inline { val_bits: shifted_val, xz_bits: shifted_xz },
-                        width: self.width, is_signed: self.is_signed,
+                        width: self.width, is_signed: self.is_signed, is_real: false,
                     }
                 }
             }
@@ -578,6 +658,9 @@ impl Value {
     // === Comparison ===
 
     pub fn is_equal(&self, other: &Value) -> Value {
+        if self.is_real || other.is_real {
+            return Value::from_u64((self.to_f64() == other.to_f64()) as u64, 1);
+        }
         if self.has_xz() || other.has_xz() { return Value::new(1); } // X
         // IEEE 1800: if either operand is signed, sign-extend both to max width
         if (self.is_signed || other.is_signed) && self.width != other.width {
@@ -591,6 +674,9 @@ impl Value {
     }
 
     pub fn is_not_equal(&self, other: &Value) -> Value {
+        if self.is_real || other.is_real {
+            return Value::from_u64((self.to_f64() != other.to_f64()) as u64, 1);
+        }
         if self.has_xz() || other.has_xz() { return Value::new(1); }
         if (self.is_signed || other.is_signed) && self.width != other.width {
             let w = self.width.max(other.width);
@@ -618,6 +704,9 @@ impl Value {
 
     pub fn less_than(&self, other: &Value) -> Value {
         if self.has_xz() || other.has_xz() { return Value::new(1); }
+        if self.is_real || other.is_real {
+            return Value::from_u64((self.to_f64() < other.to_f64()) as u64, 1);
+        }
         if self.is_signed || other.is_signed {
             let a = self.to_i64().unwrap_or(0);
             let b = other.to_i64().unwrap_or(0);
@@ -631,6 +720,9 @@ impl Value {
 
     pub fn less_equal(&self, other: &Value) -> Value {
         if self.has_xz() || other.has_xz() { return Value::new(1); }
+        if self.is_real || other.is_real {
+            return Value::from_u64((self.to_f64() <= other.to_f64()) as u64, 1);
+        }
         if self.is_signed || other.is_signed {
             Value::from_u64((self.to_i64().unwrap_or(0) <= other.to_i64().unwrap_or(0)) as u64, 1)
         } else {
@@ -673,6 +765,9 @@ impl Value {
 
     /// Returns Some(true) if nonzero, Some(false) if zero, None if contains X/Z.
     pub fn is_nonzero(&self) -> Option<bool> {
+        if self.is_real {
+            return Some(self.to_f64() != 0.0);
+        }
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => {
                 if *xz_bits != 0 { None }
@@ -780,6 +875,23 @@ impl Value {
     /// This is for existing code that uses value.bits[i] or value.bits.first().
     pub fn bits_first(&self) -> LogicBit {
         self.get_bit(0)
+    }
+
+    /// Extract string content from bit vector.
+    pub fn to_string(&self) -> String {
+        let mut s = Vec::new();
+        let bytes = self.width / 8;
+        for b in 0..bytes {
+            let mut byte_val = 0u8;
+            for bit in 0..8 {
+                if self.get_bit((b * 8 + bit) as usize) == LogicBit::One { byte_val |= 1 << bit; }
+            }
+            if byte_val == 0 { break; }
+            s.push(byte_val);
+        }
+        // SV strings are MSB-first, so byte 0 is the LAST character.
+        s.reverse();
+        String::from_utf8_lossy(&s).into_owned()
     }
 }
 
@@ -897,12 +1009,15 @@ impl Value {
             Self::from_u64(Self::mask(width), width)
         } else {
             let bits = vec![LogicBit::One; width as usize];
-            Self { storage: ValueStorage::Wide(bits), width, is_signed: false }
+            Self { storage: ValueStorage::Wide(bits), width, is_signed: false, is_real: false }
         }
     }
 
     /// Decimal string representation
     pub fn to_dec_string(&self) -> String {
+        if self.is_real {
+            return format!("{:?}", self.to_f64());
+        }
         if self.has_unknown() {
             return "x".to_string();
         }
@@ -925,6 +1040,47 @@ impl Value {
             format!("-{}", max - result)
         } else {
             format!("{}", result)
+        }
+    }
+
+    /// Convert packed bytes to a SystemVerilog-style string.
+    /// Interprets the value as big-endian bytes (MSB first) and
+    /// trims leading NUL bytes introduced by widening.
+    pub fn to_sv_string(&self) -> String {
+        let num_bytes = ((self.width + 7) / 8) as usize;
+        if num_bytes == 0 {
+            return String::new();
+        }
+        let mut out: Vec<u8> = Vec::new();
+        let mut started = false;
+        for bi in (0..num_bytes).rev() {
+            let mut byte = 0u8;
+            for b in 0..8usize {
+                let bit_idx = bi * 8 + b;
+                if bit_idx >= self.width as usize {
+                    break;
+                }
+                if self.get_bit(bit_idx) == LogicBit::One {
+                    byte |= 1u8 << b;
+                }
+            }
+            if !started {
+                if byte == 0 {
+                    continue;
+                }
+                started = true;
+            }
+            if started {
+                if byte == 0 {
+                    break;
+                }
+                out.push(byte);
+            }
+        }
+        if !started {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&out).to_string()
         }
     }
 
@@ -1067,13 +1223,13 @@ impl Value {
             Self {
                 storage: ValueStorage::Inline { val_bits: mask, xz_bits: mask },
                 width,
-                is_signed: false,
+                is_signed: false, is_real: false,
             }
         } else {
             Self {
                 storage: ValueStorage::Wide(vec![LogicBit::Z; width as usize]),
                 width,
-                is_signed: false,
+                is_signed: false, is_real: false,
             }
         }
     }

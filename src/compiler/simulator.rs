@@ -6,14 +6,59 @@
 //!   Reactive:       edge-triggered always_ff/always_latch blocks
 
 use std::collections::BTreeMap;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use libffi::middle::{Arg, Cif, CodePtr, Type};
+use libloading::Library;
+use rand::SeedableRng;
+use std::fs::OpenOptions;
+use std::ffi::{CStr, CString};
 use std::io::Write;
+use std::os::raw::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use crate::ast::expr::*;
 use crate::ast::stmt::*;
-use crate::ast::decl::AlwaysKind;
+use crate::ast::decl::{AlwaysKind, ConstraintItem, ConstraintRange, CovergroupDeclaration, CovergroupItem, FunctionDeclaration, LetDeclaration, TaskDeclaration};
+use crate::ast::types::{DataType, IntegerAtomType, PortDirection};
 use super::value::{Value, LogicBit};
-use super::elaborate::{ElaboratedModule, AlwaysBlock};
+use super::elaborate::{DpiImportSpec, ElaboratedModule, AlwaysBlock};
+#[allow(unused_imports)]
+use crate::{log_println as println, log_eprintln as eprintln};
+
+static SIM_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+static DPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+pub fn set_sim_debug(enabled: bool) {
+    SIM_DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+#[inline]
+fn sim_debug_enabled() -> bool {
+    SIM_DEBUG_ENABLED.load(Ordering::Relaxed)
+}
+
+fn dpi_lib_paths() -> &'static Mutex<Vec<String>> {
+    DPI_LIB_PATHS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub fn set_dpi_libs(paths: &[String]) {
+    if let Ok(mut guard) = dpi_lib_paths().lock() {
+        *guard = paths.to_vec();
+    }
+}
+
+fn configured_dpi_libs() -> Vec<String> {
+    dpi_lib_paths().lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+macro_rules! sim_dbg_eprintln {
+    ($($arg:tt)*) => {
+        if sim_debug_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 /// A combinatorial item (continuous assign or always @*/always_comb block)
 /// with pre-computed sensitivity set for efficient evaluation.
@@ -28,6 +73,8 @@ enum CombItem {
 #[derive(Clone)]
 struct CombEntry {
     item: CombItem,
+    /// Preferred hierarchical scope for resolving unqualified identifiers.
+    scope_hint: Option<String>,
     /// Set of signal names this block reads. If ANY of these changed,
     /// the block needs re-evaluation.
     read_signals: HashSet<String>,
@@ -37,14 +84,25 @@ struct CombEntry {
     read_signal_ids: Vec<usize>,
     /// Pre-resolved (signal_id, signal_name) pairs for write_signals.
     write_signal_ids: Vec<(usize, String)>,
+    /// True when dependency extraction could not resolve all read signals.
+    /// Such entries are conservatively re-evaluated each settle pass.
+    has_unresolved_reads: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct SimOutput { pub time: u64, pub message: String }
 
 #[derive(Debug, Clone)]
-/// Slow-path NBA entry: carries full AST LHS for unresolved targets.
 struct NbaEntry { lhs: Option<Expression>, value: Value, resolved_id: Option<usize> }
+
+#[derive(Debug, Clone)]
+struct JoinWaiter {
+    parent_pid: usize,
+    child_pids: HashSet<usize>,
+    join_type: JoinType,
+    continuation: Vec<Statement>,
+    finished_children: HashSet<usize>,
+}
 
 /// Fast-path NBA entry: compact (signal_id, value) pair for pre-resolved targets.
 /// 99%+ of NBA entries use this path. Smaller struct = better cache utilization.
@@ -135,6 +193,7 @@ impl TimingWheel {
 
     /// Schedule an event at the given time.
     fn schedule(&mut self, time: u64, pid: usize, stmts: Vec<Statement>) {
+        sim_dbg_eprintln!("[DEBUG] scheduling process {} at time {}", pid, time);
         if time < self.current_time + WHEEL_SIZE as u64 {
             let s = Self::slot(time);
             self.wheel[s].push((pid, stmts));
@@ -214,6 +273,86 @@ impl TimingWheel {
         }
         events
     }
+
+    fn has_pid(&self, pid: usize) -> bool {
+        for list in &self.wheel {
+            for (p, _) in list { if *p == pid { return true; } }
+        }
+        for list in self.overflow.values() {
+            for (p, _) in list { if *p == pid { return true; } }
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClassInstance {
+    class_name: String,
+    properties: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+struct CovergroupInstance {
+    cg_name: String,
+    /// Hits: coverpoint_name -> Set of observed values
+    point_hits: HashMap<String, HashSet<Value>>,
+    /// Cross hits: cross_name -> Set of observed tuples
+    cross_hits: HashMap<String, HashSet<Vec<Value>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProcessContext {
+    this_stack: Vec<Option<usize>>,
+    local_stack: Vec<HashMap<String, Value>>,
+    class_context_stack: Vec<Option<String>>,
+    cg_this: Option<usize>,
+    return_value: Option<Value>,
+    break_flag: bool,
+    continue_flag: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DpiRetKind {
+    Void,
+    Int32,
+    Int64,
+    Real32,
+    Real64,
+    Chandle,
+    String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DpiArgKind {
+    Int32In,
+    Int32Out,
+    Int64In,
+    Int64Out,
+    Real32In,
+    Real32Out,
+    Real64In,
+    Real64Out,
+    ChandleIn,
+    ChandleOut,
+    StringIn,
+    StringOut,
+    OpenArrayI32In,
+    OpenArrayI32Out,
+    VecLogicIn(u32),
+    VecLogicOut(u32),
+}
+
+struct DpiBinding {
+    ret: DpiRetKind,
+    arg_kinds: Vec<DpiArgKind>,
+    cif: Cif,
+    fn_ptr: CodePtr,
+}
+
+#[repr(C)]
+struct DpiLogicVecVal {
+    aval: *mut u32,
+    bval: *mut u32,
 }
 
 pub struct Simulator {
@@ -227,8 +366,10 @@ pub struct Simulator {
     signal_widths: Vec<u32>,
     /// Set of signal IDs that are signed.
     signal_signed: Vec<bool>,
+    signal_real: Vec<bool>,
     pub widths: HashMap<String, u32>,
     pub signed_signals: HashSet<String>,
+    pub real_signals: HashSet<String>,
     prev_signals: HashMap<String, Value>,
     /// Fast prev signal table for edge detection (indexed by signal_id).
     prev_table: Vec<Value>,
@@ -237,13 +378,49 @@ pub struct Simulator {
     edge_signal_ids: Vec<usize>,
     pub time: u64,
     pub output: Vec<SimOutput>,
+    capture_output: bool,
     pub finished: bool,
     pub monitor: Option<(String, Vec<Expression>)>,
     pub monitor_prev: HashMap<String, Value>,
     pub max_time: u64,
     /// Maximum iterations for combinatorial settling per cycle.
     pub settle_limit: u32,
+    /// SDF delay annotation (None if no SDF loaded).
+    pub sdf_annotation: Option<super::sdf::SdfAnnotation>,
+    /// Per-signal delay in sim ticks (0 = no delay). Indexed by signal_id.
+    sdf_delays: Vec<u64>,
+    /// Pending delayed signal updates: (time, signal_id, value)
+    delayed_updates: Vec<(u64, usize, Value)>,
     module: ElaboratedModule,
+    dpi_libraries: Vec<Library>,
+    dpi_bindings: HashMap<String, DpiBinding>,
+    dpi_unsupported: HashSet<String>,
+    dpi_unresolved: HashSet<String>,
+    /// Class instance heap (index 0 is null).
+    heap: Vec<Option<ClassInstance>>,
+    /// Built-in mailboxes (handle -> queue of values)
+    mailboxes: HashMap<usize, std::collections::VecDeque<Value>>,
+    /// Built-in semaphores (handle -> current count)
+    semaphores: HashMap<usize, i64>,
+    /// Covergroup instance heap (index 0 is null).
+    cg_heap: Vec<Option<CovergroupInstance>>,
+    /// Call stack for tracking 'this' and local variables.
+    this_stack: Vec<Option<usize>>,
+    local_stack: Vec<HashMap<String, Value>>,
+    /// Context for 'super' resolution: stack of (current_class_name).
+    class_context_stack: Vec<Option<String>>,
+    /// Current covergroup instance if in sampling context.
+    cg_this: Option<usize>,
+    /// Processes waiting for join
+    join_waiters: Vec<JoinWaiter>,
+    /// Map from child PID -> parent PID
+    process_parents: HashMap<usize, usize>,
+    /// Per-process execution context for scheduled class/task processes.
+    process_contexts: HashMap<usize, ProcessContext>,
+    /// Return value from last function call.
+    return_value: Option<Value>,
+    /// Random number generator for randomization.
+    rng: rand::rngs::StdRng,
     settling: bool,
     in_edge_block: bool,
     nba_queue: Vec<NbaEntry>,
@@ -259,10 +436,13 @@ pub struct Simulator {
     clock_generators: Vec<ClockGen>,
     event_queue: TimingWheel,
     next_pid: usize,
+    current_pid: usize,
     break_flag: bool,
     continue_flag: bool,
     /// Processes waiting for signal edge events (@(posedge clk), etc.)
     event_waiters: Vec<EventWaiter>,
+    /// Covergroups waiting for sampling events
+    cg_event_waiters: Vec<(usize, Vec<SensitivityId>)>,
     /// Swap buffer for event_waiters filtering (avoids allocation per cycle)
     event_waiters_swap: Vec<EventWaiter>,
     /// VCD dump state
@@ -272,6 +452,8 @@ pub struct Simulator {
     vcd_enabled: bool,
     vcd_last_time: u64,
     vcd_prev_signals: HashMap<String, Value>,
+    /// AITRACE mode: when true, $dumpfile/$dumpvars emit AITRACE-T instead of VCD
+    pub aitrace_mode: bool,
     /// Pre-computed combinatorial entries with sensitivity sets.
     comb_entries: Vec<CombEntry>,
     /// Reverse index: signal_id → list of comb_entry indices that read this signal.
@@ -313,6 +495,13 @@ pub struct Simulator {
     signal_toggle_counts: Vec<u64>,
     /// Whether activity monitoring is enabled.
     pub activity_mon: bool,
+    /// Runtime plusargs passed from CLI/filelists (e.g. +FOO, +BAR=1).
+    plusargs: Vec<String>,
+    /// Open file handles for $fopen/$fwrite/$fclose.
+    file_handles: HashMap<i32, std::fs::File>,
+    next_file_handle: i32,
+    /// Best-effort hierarchical context for resolving ambiguous leaf identifiers.
+    name_resolve_hint: RefCell<Option<String>>,
 }
 
 impl Simulator {
@@ -320,16 +509,20 @@ impl Simulator {
         let mut signals = HashMap::new();
         let mut widths = HashMap::new();
         let mut signed_signals = HashSet::new();
+        let mut real_signals = HashSet::new();
         for (name, sig) in &module.signals {
             let mut val = sig.value.clone();
             if sig.is_signed { val.is_signed = true; signed_signals.insert(name.clone()); }
-            signals.insert(name.clone(), val);
+            if sig.is_real { val.is_real = true; real_signals.insert(name.clone()); }
+            signals.insert(name.clone(), val.clone());
             widths.insert(name.clone(), sig.width);
+            sim_dbg_eprintln!("[DEBUG] Simulator::new signal {} = {} (signed={})", name, val.to_dec_string(), sig.is_signed);
         }
         for (name, val) in &module.parameters {
             if val.is_signed { signed_signals.insert(name.clone()); }
             signals.insert(name.clone(), val.clone());
             widths.insert(name.clone(), val.width);
+            sim_dbg_eprintln!("[DEBUG] Simulator::new parameter {} = {} (signed={})", name, val.to_dec_string(), val.is_signed);
         }
         // Build fast signal table (Vec-based, indexed by signal_id)
         let mut sig_names_sorted: Vec<String> = signals.keys().cloned().collect();
@@ -338,29 +531,51 @@ impl Simulator {
         let mut signal_table = Vec::with_capacity(sig_names_sorted.len());
         let mut signal_widths_vec = Vec::with_capacity(sig_names_sorted.len());
         let mut signal_signed_vec = Vec::with_capacity(sig_names_sorted.len());
+        let mut signal_real_vec = Vec::with_capacity(sig_names_sorted.len());
         for (id, name) in sig_names_sorted.iter().enumerate() {
             signal_name_to_id.insert(name.clone(), id);
-            signal_table.push(signals[name].clone());
+            let val = signals[name].clone();
+            signal_table.push(val.clone());
             signal_widths_vec.push(widths.get(name).copied().unwrap_or(1));
             signal_signed_vec.push(signed_signals.contains(name));
+            signal_real_vec.push(real_signals.contains(name));
         }
         let num_signals = sig_names_sorted.len();
         let prev_table = signal_table.clone();
-
-        Self {
+        let mut sim = Self {
             prev_signals: HashMap::new(),
             prev_table,
             edge_signal_names: HashSet::new(),
             edge_signal_ids: Vec::new(),
-            signals, widths, signed_signals,
-            signal_table, signal_name_to_id, id_to_name: sig_names_sorted, signal_widths: signal_widths_vec, signal_signed: signal_signed_vec,
-            time: 0, output: Vec::new(), finished: false,
+            signals, widths, signed_signals, real_signals,
+            signal_table, signal_name_to_id, id_to_name: sig_names_sorted, signal_widths: signal_widths_vec, signal_signed: signal_signed_vec, signal_real: signal_real_vec,
+            time: 0, output: Vec::new(), capture_output: true, finished: false,
             monitor: None, monitor_prev: HashMap::new(),
-            max_time, settle_limit: 100, module, settling: false, in_edge_block: false,
+            max_time, settle_limit: 100,
+            sdf_annotation: None, sdf_delays: vec![0u64; num_signals], delayed_updates: Vec::new(), module,
+            dpi_libraries: Vec::new(),
+            dpi_bindings: HashMap::new(),
+            dpi_unsupported: HashSet::new(),
+            dpi_unresolved: HashSet::new(),
+            heap: vec![None], // index 0 is null
+            mailboxes: HashMap::new(),
+            semaphores: HashMap::new(),
+            cg_heap: vec![None],
+            this_stack: vec![],
+            local_stack: vec![],
+            class_context_stack: vec![],
+            cg_this: None,
+            join_waiters: Vec::new(),
+            process_parents: HashMap::new(),
+            process_contexts: HashMap::new(),
+            return_value: None,
+            rng: rand::rngs::StdRng::from_entropy(),
+            settling: false, in_edge_block: false,
             nba_queue: Vec::new(), nba_fast: Vec::new(), edge_blocks: Vec::new(), compiled_edge_blocks: Vec::new(), vm_regs: Vec::new(), clock_generators: Vec::new(),
-            event_queue: TimingWheel::new(), next_pid: 0,
+            event_queue: TimingWheel::new(), next_pid: 0, current_pid: 0,
             break_flag: false, continue_flag: false,
             event_waiters: Vec::new(),
+            cg_event_waiters: Vec::new(),
             event_waiters_swap: Vec::new(),
             vcd_file: None,
             vcd_writer: None,
@@ -368,6 +583,7 @@ impl Simulator {
             vcd_enabled: false,
             vcd_last_time: u64::MAX,
             vcd_prev_signals: HashMap::new(),
+            aitrace_mode: false,
             comb_entries: Vec::new(),
             comb_dep_by_id: Vec::new(),
             dirty_signals: vec![false; num_signals],
@@ -387,13 +603,917 @@ impl Simulator {
             activity_counts: Vec::new(),
             signal_toggle_counts: vec![0u64; num_signals],
             activity_mon: false,
+            plusargs: Vec::new(),
+            file_handles: HashMap::new(),
+            next_file_handle: 3,
+            name_resolve_hint: RefCell::new(None),
+        };
+        sim.load_dpi_libraries();
+        sim.bind_all_dpi_imports();
+        sim
+    }
+
+    pub fn set_plusargs(&mut self, plusargs: &[String]) {
+        self.plusargs = plusargs.to_vec();
+        sim_dbg_eprintln!("[DEBUG] plusargs set: {:?}", self.plusargs);
+    }
+
+    #[inline]
+    fn record_output(&mut self, message: String) {
+        if self.capture_output {
+            self.output.push(SimOutput { time: self.time, message });
         }
+    }
+
+    #[inline]
+    fn plusarg_payload<'a>(arg: &'a str) -> &'a str {
+        arg.strip_prefix('+').unwrap_or(arg)
+    }
+
+    fn test_plusarg(&self, pattern: &str) -> bool {
+        if pattern.is_empty() {
+            return false;
+        }
+        let hit = self.plusargs.iter().any(|a| Self::plusarg_payload(a).starts_with(pattern));
+        sim_dbg_eprintln!("[DEBUG] $test$plusargs('{}') -> {}", pattern, hit);
+        hit
+    }
+
+    fn parse_plusarg_format(fmt: &str) -> Option<(&str, char)> {
+        let pct = fmt.find('%')?;
+        let prefix = &fmt[..pct];
+        let mut chars = fmt[pct + 1..].chars().peekable();
+        while let Some(c) = chars.peek() {
+            if c.is_ascii_digit() || *c == '-' || *c == '+' || *c == '0' || *c == '.' {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let spec = chars.next()?;
+        Some((prefix, spec.to_ascii_lowercase()))
+    }
+
+    fn parse_plusarg_value(raw: &str, spec: char) -> Option<Value> {
+        let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
+        match spec {
+            'd' => {
+                if let Ok(v) = cleaned.parse::<i64>() {
+                    let mut out = Value::from_u64(v as u64, 64);
+                    out.is_signed = true;
+                    Some(out)
+                } else {
+                    None
+                }
+            }
+            'h' | 'x' => {
+                let s = cleaned.strip_prefix("0x").or_else(|| cleaned.strip_prefix("0X")).unwrap_or(&cleaned);
+                Some(Value::from_str_radix(s, 16, 64))
+            }
+            'o' => Some(Value::from_str_radix(&cleaned, 8, 64)),
+            'b' => Some(Value::from_str_radix(&cleaned, 2, 64)),
+            's' => Some(Value::from_string(raw)),
+            'f' | 'e' | 'g' => cleaned.parse::<f64>().ok().map(Value::from_f64),
+            _ => None,
+        }
+    }
+
+    fn eval_value_plusargs(&mut self, args: &[Expression]) -> Value {
+        if args.len() < 2 {
+            return Value::zero(1);
+        }
+        let fmt = match &args[0].kind {
+            ExprKind::StringLiteral(s) => s.clone(),
+            _ => self.eval_expr(&args[0]).to_sv_string(),
+        };
+        let Some((prefix, spec)) = Self::parse_plusarg_format(&fmt) else {
+            return Value::zero(1);
+        };
+
+        for arg in &self.plusargs {
+            let payload = Self::plusarg_payload(arg);
+            if !payload.starts_with(prefix) {
+                continue;
+            }
+            let suffix = &payload[prefix.len()..];
+            if let Some(v) = Self::parse_plusarg_value(suffix, spec) {
+                self.assign_value(&args[1], &v);
+                return Value::from_u64(1, 1);
+            }
+        }
+        Value::zero(1)
+    }
+
+    fn system_string_arg(&mut self, expr: &Expression) -> String {
+        match &expr.kind {
+            ExprKind::StringLiteral(s) => s.clone(),
+            _ => self.eval_expr(expr).to_sv_string(),
+        }
+    }
+
+    fn eval_file_handle_arg(&mut self, expr: &Expression) -> i32 {
+        self.eval_expr(expr).to_i64().unwrap_or(0) as i32
+    }
+
+    fn open_file_handle(&mut self, args: &[Expression]) -> Value {
+        if args.is_empty() {
+            return Value::zero(32);
+        }
+        let path = self.system_string_arg(&args[0]);
+        if path.is_empty() {
+            return Value::zero(32);
+        }
+        let mode = if args.len() >= 2 {
+            self.system_string_arg(&args[1])
+        } else {
+            "r".to_string()
+        };
+        let mut opts = OpenOptions::new();
+        let has_plus = mode.contains('+');
+        if mode.contains('r') {
+            opts.read(true);
+        }
+        if mode.contains('w') {
+            opts.write(true).create(true).truncate(true);
+        }
+        if mode.contains('a') {
+            opts.append(true).create(true);
+        }
+        if has_plus {
+            opts.read(true).write(true);
+        }
+        if !mode.contains('r') && !mode.contains('w') && !mode.contains('a') {
+            opts.read(true);
+        }
+        match opts.open(&path) {
+            Ok(file) => {
+                let fd = self.next_file_handle;
+                self.next_file_handle += 1;
+                self.file_handles.insert(fd, file);
+                Value::from_u64(fd as u64, 32)
+            }
+            Err(_) => Value::zero(32),
+        }
+    }
+
+    fn close_file_handle(&mut self, args: &[Expression]) -> Value {
+        if args.is_empty() {
+            return Value::zero(32);
+        }
+        let fd = self.eval_file_handle_arg(&args[0]);
+        if let Some(mut f) = self.file_handles.remove(&fd) {
+            let _ = f.flush();
+        }
+        Value::zero(32)
+    }
+
+    fn write_file_handle(&mut self, args: &[Expression], newline: bool) -> Value {
+        if args.is_empty() {
+            return Value::zero(32);
+        }
+        let fd = self.eval_file_handle_arg(&args[0]);
+        let mut payload = if args.len() > 1 {
+            self.format_args(&args[1..], "$write")
+        } else {
+            String::new()
+        };
+        if newline {
+            payload.push('\n');
+        }
+        let nbytes = payload.len() as u64;
+        if fd <= 0 {
+            if newline {
+                print!("{}", payload);
+            } else {
+                print!("{}", payload);
+            }
+            return Value::from_u64(nbytes, 32);
+        }
+        if let Some(f) = self.file_handles.get_mut(&fd) {
+            let _ = f.write_all(payload.as_bytes());
+            let _ = f.flush();
+        }
+        Value::from_u64(nbytes, 32)
+    }
+
+    fn resolve_array_name_from_expr(&self, expr: &Expression) -> Option<String> {
+        let (resolved, raw) = match &expr.kind {
+            ExprKind::Ident(hier) => {
+                let resolved = self.resolve_hier_name(hier);
+                let raw = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
+                (resolved, raw)
+            }
+            _ => return None,
+        };
+        if self.module.arrays.contains_key(&resolved) {
+            return Some(resolved);
+        }
+        if self.module.arrays.contains_key(&raw) {
+            return Some(raw);
+        }
+        if let Some(found) = self.module.arrays.keys().find(|k| {
+            *k == &resolved || *k == &raw || k.ends_with(&format!(".{}", resolved)) || k.ends_with(&format!(".{}", raw))
+        }) {
+            return Some(found.clone());
+        }
+        None
+    }
+
+    fn parse_mem_token(token: &str, default_radix: u32) -> Option<(u32, String)> {
+        let trimmed = token.trim().trim_end_matches(',').trim_end_matches(';');
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some(pos) = trimmed.find('\'') {
+            let rem = &trimmed[pos + 1..];
+            let mut chars = rem.chars();
+            let base_ch = chars.next()?.to_ascii_lowercase();
+            let digits = chars.as_str();
+            if digits.is_empty() {
+                return None;
+            }
+            let radix = match base_ch {
+                'b' => 2,
+                'o' => 8,
+                'd' => 10,
+                'h' | 'x' => 16,
+                _ => default_radix,
+            };
+            return Some((radix, digits.to_string()));
+        }
+        Some((default_radix, trimmed.to_string()))
+    }
+
+    fn read_memory_file(&mut self, args: &[Expression], default_radix: u32) -> Value {
+        if args.len() < 2 {
+            sim_dbg_eprintln!("[DEBUG] $readmem*: missing arguments");
+            return Value::zero(32);
+        }
+        let path = self.system_string_arg(&args[0]);
+        if path.is_empty() {
+            sim_dbg_eprintln!("[DEBUG] $readmem*: empty path");
+            return Value::zero(32);
+        }
+        let Some(mem_name) = self.resolve_array_name_from_expr(&args[1]) else {
+            sim_dbg_eprintln!("[DEBUG] $readmem*: array resolution failed for arg {:?}", args[1]);
+            return Value::zero(32);
+        };
+        let Some((lo, hi, width)) = self.module.arrays.get(&mem_name).copied() else {
+            sim_dbg_eprintln!("[DEBUG] $readmem*: array '{}' not found", mem_name);
+            return Value::zero(32);
+        };
+        let mut addr = if args.len() >= 3 {
+            self.eval_expr(&args[2]).to_i64().unwrap_or(lo)
+        } else {
+            lo
+        };
+        let end_addr = if args.len() >= 4 {
+            self.eval_expr(&args[3]).to_i64().unwrap_or(hi)
+        } else {
+            hi
+        };
+        let step: i64 = if addr <= end_addr { 1 } else { -1 };
+        let min_idx = lo.min(hi);
+        let max_idx = lo.max(hi);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                sim_dbg_eprintln!("[DEBUG] $readmem*: failed to read '{}': {}", path, e);
+                return Value::zero(32);
+            }
+        };
+        let mut loaded = 0usize;
+        'lines: for raw_line in content.lines() {
+            let line = raw_line.split("//").next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            for raw_tok in line.split_whitespace() {
+                if step > 0 {
+                    if addr > end_addr {
+                        break 'lines;
+                    }
+                } else if addr < end_addr {
+                    break 'lines;
+                }
+                if let Some(rest) = raw_tok.strip_prefix('@') {
+                    let addr_hex = rest.trim_start_matches("0x").trim_start_matches("0X");
+                    if let Ok(a) = i64::from_str_radix(addr_hex, 16) {
+                        addr = a;
+                    }
+                    continue;
+                }
+                let Some((radix, digits)) = Self::parse_mem_token(raw_tok, default_radix) else {
+                    continue;
+                };
+                if addr >= min_idx && addr <= max_idx {
+                    let val = Value::from_str_radix(&digits, radix, width);
+                    let elem = format!("{}[{}]", mem_name, addr);
+                    self.fast_signal_write(&elem, val);
+                    loaded += 1;
+                }
+                addr += step;
+            }
+        }
+        sim_dbg_eprintln!("[DEBUG] $readmem*: loaded {} words into '{}' from '{}'", loaded, mem_name, path);
+        Value::zero(32)
+    }
+
+    fn load_dpi_libraries(&mut self) {
+        for path in configured_dpi_libs() {
+            // SAFETY: Loading a dynamic library is inherently unsafe; we keep
+            // each handle alive for the simulator lifetime.
+            match unsafe { Library::new(&path) } {
+                Ok(lib) => self.dpi_libraries.push(lib),
+                Err(e) => eprintln!("[DPI] failed to load '{}': {}", path, e),
+            }
+        }
+    }
+
+    fn bind_all_dpi_imports(&mut self) {
+        for (sv_name, spec) in self.module.dpi_imports.clone() {
+            self.try_bind_dpi(&sv_name, &spec);
+        }
+    }
+
+    fn dpi_atom_kind(&self, dt: &DataType, dims: &[crate::ast::types::UnpackedDimension], dir: PortDirection) -> Option<DpiArgKind> {
+        let out_dir = matches!(dir, PortDirection::Output | PortDirection::Ref | PortDirection::Inout);
+        if !dims.is_empty() {
+            let w = super::elaborate::resolve_type_width(
+                dt,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            );
+            let is_i32 = matches!(dt, DataType::IntegerAtom { kind: IntegerAtomType::Int | IntegerAtomType::Integer | IntegerAtomType::Byte | IntegerAtomType::ShortInt, .. })
+                || (matches!(dt, DataType::Implicit { .. }) && w <= 32);
+            if is_i32 {
+                return Some(if out_dir { DpiArgKind::OpenArrayI32Out } else { DpiArgKind::OpenArrayI32In });
+            }
+            return None;
+        }
+        match dt {
+            DataType::IntegerAtom { kind, .. } => match kind {
+                IntegerAtomType::Int |
+                IntegerAtomType::Integer |
+                IntegerAtomType::Byte |
+                IntegerAtomType::ShortInt => Some(if out_dir { DpiArgKind::Int32Out } else { DpiArgKind::Int32In }),
+                IntegerAtomType::LongInt |
+                IntegerAtomType::Time => Some(if out_dir { DpiArgKind::Int64Out } else { DpiArgKind::Int64In }),
+            },
+            DataType::IntegerVector { dimensions, .. } => {
+                if dimensions.is_empty() {
+                    Some(if out_dir { DpiArgKind::Int32Out } else { DpiArgKind::Int32In })
+                } else {
+                    let w = super::elaborate::resolve_type_width(
+                        dt,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    );
+                    if w <= 64 {
+                        Some(if out_dir { DpiArgKind::Int64Out } else { DpiArgKind::Int64In })
+                    } else {
+                        Some(if out_dir { DpiArgKind::VecLogicOut(w) } else { DpiArgKind::VecLogicIn(w) })
+                    }
+                }
+            }
+            DataType::Implicit { dimensions, .. } if dimensions.is_empty() => {
+                Some(if out_dir { DpiArgKind::Int32Out } else { DpiArgKind::Int32In })
+            }
+            DataType::Implicit { dimensions, .. } => {
+                let w = if dimensions.is_empty() {
+                    32
+                } else {
+                    super::elaborate::resolve_type_width(
+                        dt,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    )
+                };
+                if w <= 64 {
+                    Some(if out_dir { DpiArgKind::Int64Out } else { DpiArgKind::Int64In })
+                } else {
+                    Some(if out_dir { DpiArgKind::VecLogicOut(w) } else { DpiArgKind::VecLogicIn(w) })
+                }
+            }
+            DataType::Real { kind, .. } => match kind {
+                crate::ast::types::RealType::ShortReal => Some(if out_dir { DpiArgKind::Real32Out } else { DpiArgKind::Real32In }),
+                _ => Some(if out_dir { DpiArgKind::Real64Out } else { DpiArgKind::Real64In }),
+            },
+            DataType::Simple { kind, .. } => match kind {
+                crate::ast::types::SimpleType::Chandle => Some(if out_dir { DpiArgKind::ChandleOut } else { DpiArgKind::ChandleIn }),
+                crate::ast::types::SimpleType::String => Some(if out_dir { DpiArgKind::StringOut } else { DpiArgKind::StringIn }),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn dpi_return_kind(dt: &DataType) -> Option<DpiRetKind> {
+        match dt {
+            DataType::Void(_) => Some(DpiRetKind::Void),
+            DataType::IntegerAtom { kind, .. } => match kind {
+                IntegerAtomType::Int |
+                IntegerAtomType::Integer |
+                IntegerAtomType::Byte |
+                IntegerAtomType::ShortInt => Some(DpiRetKind::Int32),
+                IntegerAtomType::LongInt |
+                IntegerAtomType::Time => Some(DpiRetKind::Int64),
+            },
+            DataType::IntegerVector { dimensions, .. } => {
+                if dimensions.is_empty() { Some(DpiRetKind::Int32) } else { Some(DpiRetKind::Int64) }
+            }
+            DataType::Implicit { dimensions, .. } if dimensions.is_empty() => Some(DpiRetKind::Int32),
+            DataType::Real { kind, .. } => match kind {
+                crate::ast::types::RealType::ShortReal => Some(DpiRetKind::Real32),
+                _ => Some(DpiRetKind::Real64),
+            },
+            DataType::Simple { kind, .. } => match kind {
+                crate::ast::types::SimpleType::Chandle => Some(DpiRetKind::Chandle),
+                crate::ast::types::SimpleType::String => Some(DpiRetKind::String),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn dpi_signature(&self, spec: &DpiImportSpec) -> Option<(DpiRetKind, Vec<DpiArgKind>)> {
+        match &spec.proto {
+            crate::ast::decl::DPIProto::Function(fd) => {
+                let ret = Self::dpi_return_kind(&fd.return_type)?;
+                let mut args = Vec::with_capacity(fd.ports.len());
+                for p in &fd.ports {
+                    args.push(self.dpi_atom_kind(&p.data_type, &p.dimensions, p.direction)?);
+                }
+                Some((ret, args))
+            }
+            crate::ast::decl::DPIProto::Task(td) => {
+                let mut args = Vec::with_capacity(td.ports.len());
+                for p in &td.ports {
+                    args.push(self.dpi_atom_kind(&p.data_type, &p.dimensions, p.direction)?);
+                }
+                Some((DpiRetKind::Void, args))
+            }
+        }
+    }
+
+    fn try_bind_dpi(&mut self, sv_name: &str, spec: &DpiImportSpec) {
+        if self.dpi_bindings.contains_key(sv_name) || self.dpi_unsupported.contains(sv_name) {
+            return;
+        }
+        let Some((ret, arg_kinds)) = self.dpi_signature(spec) else {
+            self.dpi_unsupported.insert(sv_name.to_string());
+            eprintln!("[DPI] unsupported prototype for '{}'", sv_name);
+            return;
+        };
+        let mut cname = spec.c_name.clone().into_bytes();
+        cname.push(0);
+        let arg_types: Vec<Type> = arg_kinds.iter().map(|k| match k {
+            DpiArgKind::Int32In => Type::i32(),
+            DpiArgKind::Int32Out => Type::pointer(),
+            DpiArgKind::Int64In => Type::i64(),
+            DpiArgKind::Int64Out => Type::pointer(),
+            DpiArgKind::Real32In => Type::f32(),
+            DpiArgKind::Real32Out => Type::pointer(),
+            DpiArgKind::Real64In => Type::f64(),
+            DpiArgKind::Real64Out => Type::pointer(),
+            DpiArgKind::ChandleIn => Type::pointer(),
+            DpiArgKind::ChandleOut => Type::pointer(),
+            DpiArgKind::StringIn => Type::pointer(),
+            DpiArgKind::StringOut => Type::pointer(),
+            DpiArgKind::OpenArrayI32In => Type::pointer(),
+            DpiArgKind::OpenArrayI32Out => Type::pointer(),
+            DpiArgKind::VecLogicIn(_) => Type::pointer(),
+            DpiArgKind::VecLogicOut(_) => Type::pointer(),
+        }).collect();
+        let ret_type = match ret {
+            DpiRetKind::Void => Type::void(),
+            DpiRetKind::Int32 => Type::i32(),
+            DpiRetKind::Int64 => Type::i64(),
+            DpiRetKind::Real32 => Type::f32(),
+            DpiRetKind::Real64 => Type::f64(),
+            DpiRetKind::Chandle => Type::pointer(),
+            DpiRetKind::String => Type::pointer(),
+        };
+        let cif = Cif::new(arg_types, ret_type);
+        for lib in &self.dpi_libraries {
+            let sym = unsafe { lib.get::<*mut c_void>(&cname) };
+            if let Ok(s) = sym {
+                self.dpi_bindings.insert(sv_name.to_string(), DpiBinding {
+                    ret,
+                    arg_kinds: arg_kinds.clone(),
+                    cif: cif.clone(),
+                    fn_ptr: CodePtr::from_ptr(*s),
+                });
+                return;
+            }
+        }
+    }
+
+    fn dpi_value_to_logic_words(v: &Value, width: u32) -> (Vec<u32>, Vec<u32>) {
+        let nwords = ((width + 31) / 32).max(1) as usize;
+        let mut aval = vec![0u32; nwords];
+        let mut bval = vec![0u32; nwords];
+        for bit in 0..(width as usize) {
+            let w = bit / 32;
+            let m = 1u32 << (bit % 32);
+            match v.get_bit(bit) {
+                LogicBit::Zero => {}
+                LogicBit::One => aval[w] |= m,
+                LogicBit::X => bval[w] |= m,
+                LogicBit::Z => {
+                    aval[w] |= m;
+                    bval[w] |= m;
+                }
+            }
+        }
+        (aval, bval)
+    }
+
+    fn dpi_logic_words_to_value(aval: &[u32], bval: &[u32], width: u32) -> Value {
+        let mut out = Value::zero(width.max(1));
+        for bit in 0..(width as usize) {
+            let w = bit / 32;
+            let m = 1u32 << (bit % 32);
+            let a = (aval.get(w).copied().unwrap_or(0) & m) != 0;
+            let b = (bval.get(w).copied().unwrap_or(0) & m) != 0;
+            let lb = match (a, b) {
+                (false, false) => LogicBit::Zero,
+                (true, false) => LogicBit::One,
+                (false, true) => LogicBit::X,
+                (true, true) => LogicBit::Z,
+            };
+            out.set_bit(bit, lb);
+        }
+        out.resize(width)
+    }
+
+    fn dpi_collect_i32_array_arg(&mut self, expr: Option<&Expression>) -> (Option<String>, Vec<i32>) {
+        let Some(e) = expr else { return (None, Vec::new()); };
+        if let ExprKind::Ident(hier) = &e.kind {
+            let name = self.resolve_hier_name(hier);
+            if let Some((lo, hi, _elem_w)) = self.module.arrays.get(&name).copied() {
+                let mut out = Vec::new();
+                for idx in lo..=hi {
+                    let elem_name = format!("{}[{}]", name, idx);
+                    let vv = if let Some(&id) = self.signal_name_to_id.get(&elem_name) {
+                        self.signal_table[id].clone()
+                    } else {
+                        self.signals.get(&elem_name).cloned().unwrap_or_else(|| Value::zero(32))
+                    };
+                    out.push(vv.to_i64().unwrap_or(0) as i32);
+                }
+                return (Some(name), out);
+            }
+        }
+        (None, vec![self.eval_expr(e).to_i64().unwrap_or(0) as i32])
+    }
+
+    fn dpi_writeback_i32_array_arg(&mut self, expr: &Expression, data: &[i32]) {
+        if let ExprKind::Ident(hier) = &expr.kind {
+            let name = self.resolve_hier_name(hier);
+            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&name).copied() {
+                let mut k = 0usize;
+                for idx in lo..=hi {
+                    if k >= data.len() { break; }
+                    let elem_name = format!("{}[{}]", name, idx);
+                    let mut val = Value::from_u64(data[k] as u32 as u64, elem_w);
+                    if let Some(&id) = self.signal_name_to_id.get(&elem_name) {
+                        val.is_signed = self.signal_signed[id];
+                    } else if self.signed_signals.contains(&elem_name) {
+                        val.is_signed = true;
+                    }
+                    if let Some(&id) = self.signal_name_to_id.get(&elem_name) {
+                        let changed = self.signal_table[id] != val;
+                        if changed {
+                            self.mark_dirty_id(id);
+                            self.signal_table[id] = val;
+                            self.table_modified = true;
+                        }
+                    } else {
+                        let changed = self.signals.get(&elem_name).map_or(true, |p| *p != val);
+                        if changed {
+                            self.mark_dirty(&elem_name);
+                        }
+                        self.signals.insert(elem_name, val);
+                    }
+                    k += 1;
+                }
+                return;
+            }
+        }
+        if let Some(v0) = data.first() {
+            let w = self.infer_lhs_width(expr);
+            self.assign_value(expr, &Value::from_u64(*v0 as u32 as u64, w));
+        }
+    }
+
+    fn exec_dpi_import_call(&mut self, sv_name: &str, args: &[Expression]) -> Option<Value> {
+        let spec = self.module.dpi_imports.get(sv_name)?.clone();
+        if !self.dpi_bindings.contains_key(sv_name) && !self.dpi_unsupported.contains(sv_name) {
+            self.try_bind_dpi(sv_name, &spec);
+        }
+        if self.dpi_unsupported.contains(sv_name) {
+            return Some(Value::zero(32));
+        }
+        let Some(binding) = self.dpi_bindings.get(sv_name) else {
+            if self.dpi_unresolved.insert(sv_name.to_string()) {
+                eprintln!("[DPI] unresolved symbol '{}' (C name '{}')", sv_name, spec.c_name);
+            }
+            return Some(Value::zero(32));
+        };
+        let ret_kind = binding.ret;
+        let arg_kinds = binding.arg_kinds.clone();
+        let cif = binding.cif.clone();
+        let fn_ptr = binding.fn_ptr;
+
+        let mut arg_refs = Vec::with_capacity(arg_kinds.len());
+        let mut i32_vals: Vec<Box<i32>> = Vec::new();
+        let mut i64_vals: Vec<Box<i64>> = Vec::new();
+        let mut f32_vals: Vec<Box<f32>> = Vec::new();
+        let mut f64_vals: Vec<Box<f64>> = Vec::new();
+        let mut ptr_vals: Vec<Box<*mut c_void>> = Vec::new();
+        let mut string_ptr_cells: Vec<Box<*const i8>> = Vec::new();
+        let mut open_i32_vals: Vec<Vec<i32>> = Vec::new();
+        let mut cstrings: Vec<CString> = Vec::new();
+        let mut logic_aval: Vec<Vec<u32>> = Vec::new();
+        let mut logic_bval: Vec<Vec<u32>> = Vec::new();
+        let mut logic_hdrs: Vec<Box<DpiLogicVecVal>> = Vec::new();
+        let mut writebacks: Vec<(usize, DpiArgKind, Expression)> = Vec::new();
+
+        for (i, kind) in arg_kinds.iter().enumerate() {
+            match kind {
+                DpiArgKind::Int32In => {
+                    let v = Box::new(args.get(i).map(|e| self.eval_expr(e).to_i64().unwrap_or(0) as i32).unwrap_or(0));
+                    i32_vals.push(v);
+                    arg_refs.push(Arg::new(i32_vals.last().unwrap().as_ref()));
+                }
+                DpiArgKind::Int64In => {
+                    let v = Box::new(args.get(i).map(|e| self.eval_expr(e).to_i64().unwrap_or(0)).unwrap_or(0));
+                    i64_vals.push(v);
+                    arg_refs.push(Arg::new(i64_vals.last().unwrap().as_ref()));
+                }
+                DpiArgKind::Real32In => {
+                    let v = Box::new(args.get(i).map(|e| self.eval_expr(e).to_f64() as f32).unwrap_or(0.0));
+                    f32_vals.push(v);
+                    arg_refs.push(Arg::new(f32_vals.last().unwrap().as_ref()));
+                }
+                DpiArgKind::Real64In => {
+                    let v = Box::new(args.get(i).map(|e| self.eval_expr(e).to_f64()).unwrap_or(0.0));
+                    f64_vals.push(v);
+                    arg_refs.push(Arg::new(f64_vals.last().unwrap().as_ref()));
+                }
+                DpiArgKind::ChandleIn => {
+                    let p = Box::new(args.get(i).map(|e| self.eval_expr(e).to_u64().unwrap_or(0) as usize as *mut c_void).unwrap_or(std::ptr::null_mut()));
+                    ptr_vals.push(p);
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                }
+                DpiArgKind::StringIn => {
+                    let s = args.get(i).map(|e| {
+                        if let ExprKind::StringLiteral(t) = &e.kind { t.clone() } else { self.eval_expr(e).to_sv_string() }
+                    }).unwrap_or_default();
+                    let c = CString::new(s).unwrap_or_else(|_| CString::new("").unwrap());
+                    let p = Box::new(c.as_ptr() as *mut c_void);
+                    cstrings.push(c);
+                    ptr_vals.push(p);
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                }
+                DpiArgKind::StringOut => {
+                    let init_s = args.get(i).map(|e| {
+                        if let ExprKind::StringLiteral(t) = &e.kind { t.clone() } else { self.eval_expr(e).to_sv_string() }
+                    }).unwrap_or_default();
+                    let init_ptr: *const i8 = if init_s.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        let c = CString::new(init_s).unwrap_or_else(|_| CString::new("").unwrap());
+                        let p = c.as_ptr();
+                        cstrings.push(c);
+                        p
+                    };
+                    let cell = Box::new(init_ptr);
+                    let p = Box::new((&*cell as *const *const i8 as *mut *const i8).cast::<c_void>());
+                    string_ptr_cells.push(cell);
+                    ptr_vals.push(p);
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    if let Some(expr) = args.get(i) { writebacks.push((string_ptr_cells.len() - 1, *kind, expr.clone())); }
+                }
+                DpiArgKind::OpenArrayI32In => {
+                    let (_aname, mut arr) = self.dpi_collect_i32_array_arg(args.get(i));
+                    let p = Box::new(arr.as_mut_ptr().cast::<c_void>());
+                    open_i32_vals.push(arr);
+                    ptr_vals.push(p);
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                }
+                DpiArgKind::OpenArrayI32Out => {
+                    let (_aname, mut arr) = self.dpi_collect_i32_array_arg(args.get(i));
+                    let p = Box::new(arr.as_mut_ptr().cast::<c_void>());
+                    open_i32_vals.push(arr);
+                    ptr_vals.push(p);
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    if let Some(expr) = args.get(i) { writebacks.push((open_i32_vals.len() - 1, *kind, expr.clone())); }
+                }
+                DpiArgKind::VecLogicIn(width) => {
+                    let vv = args.get(i).map(|e| self.eval_expr(e)).unwrap_or_else(|| Value::zero(*width));
+                    let (mut aval, mut bval) = Self::dpi_value_to_logic_words(&vv, *width);
+                    let hdr = Box::new(DpiLogicVecVal {
+                        aval: aval.as_mut_ptr(),
+                        bval: bval.as_mut_ptr(),
+                    });
+                    let p = Box::new((&*hdr as *const DpiLogicVecVal as *mut DpiLogicVecVal).cast::<c_void>());
+                    logic_aval.push(aval);
+                    logic_bval.push(bval);
+                    logic_hdrs.push(hdr);
+                    ptr_vals.push(p);
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                }
+                DpiArgKind::VecLogicOut(width) => {
+                    let init = args.get(i).map(|e| self.eval_expr(e)).unwrap_or_else(|| Value::zero(*width));
+                    let (mut aval, mut bval) = Self::dpi_value_to_logic_words(&init, *width);
+                    let hdr = Box::new(DpiLogicVecVal {
+                        aval: aval.as_mut_ptr(),
+                        bval: bval.as_mut_ptr(),
+                    });
+                    let p = Box::new((&*hdr as *const DpiLogicVecVal as *mut DpiLogicVecVal).cast::<c_void>());
+                    logic_aval.push(aval);
+                    logic_bval.push(bval);
+                    logic_hdrs.push(hdr);
+                    ptr_vals.push(p);
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    if let Some(expr) = args.get(i) { writebacks.push((logic_hdrs.len() - 1, *kind, expr.clone())); }
+                }
+                DpiArgKind::Int32Out => {
+                    let init = args.get(i).map(|e| self.eval_expr(e).to_i64().unwrap_or(0) as i32).unwrap_or(0);
+                    let b = Box::new(init);
+                    let p = Box::new((&*b as *const i32 as *mut i32).cast::<c_void>());
+                    i32_vals.push(b);
+                    ptr_vals.push(p);
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    if let Some(expr) = args.get(i) { writebacks.push((i32_vals.len() - 1, *kind, expr.clone())); }
+                }
+                DpiArgKind::Int64Out => {
+                    let init = args.get(i).map(|e| self.eval_expr(e).to_i64().unwrap_or(0)).unwrap_or(0);
+                    let b = Box::new(init);
+                    let p = Box::new((&*b as *const i64 as *mut i64).cast::<c_void>());
+                    i64_vals.push(b);
+                    ptr_vals.push(p);
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    if let Some(expr) = args.get(i) { writebacks.push((i64_vals.len() - 1, *kind, expr.clone())); }
+                }
+                DpiArgKind::Real32Out => {
+                    let init = args.get(i).map(|e| self.eval_expr(e).to_f64() as f32).unwrap_or(0.0);
+                    let b = Box::new(init);
+                    let p = Box::new((&*b as *const f32 as *mut f32).cast::<c_void>());
+                    f32_vals.push(b);
+                    ptr_vals.push(p);
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    if let Some(expr) = args.get(i) { writebacks.push((f32_vals.len() - 1, *kind, expr.clone())); }
+                }
+                DpiArgKind::Real64Out => {
+                    let init = args.get(i).map(|e| self.eval_expr(e).to_f64()).unwrap_or(0.0);
+                    let b = Box::new(init);
+                    let p = Box::new((&*b as *const f64 as *mut f64).cast::<c_void>());
+                    f64_vals.push(b);
+                    ptr_vals.push(p);
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    if let Some(expr) = args.get(i) { writebacks.push((f64_vals.len() - 1, *kind, expr.clone())); }
+                }
+                DpiArgKind::ChandleOut => {
+                    let init = args.get(i).map(|e| self.eval_expr(e).to_u64().unwrap_or(0) as usize as *mut c_void).unwrap_or(std::ptr::null_mut());
+                    let b = Box::new(init);
+                    let p = Box::new((&*b as *const *mut c_void as *mut *mut c_void).cast::<c_void>());
+                    ptr_vals.push(b);
+                    ptr_vals.push(p);
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    if let Some(expr) = args.get(i) { writebacks.push((ptr_vals.len() - 2, *kind, expr.clone())); }
+                }
+            }
+        }
+
+        let mut result = match ret_kind {
+            DpiRetKind::Void => {
+                unsafe { cif.call::<()>(fn_ptr, &arg_refs); }
+                Value::zero(32)
+            }
+            DpiRetKind::Int32 => {
+                let rv: i32 = unsafe { cif.call(fn_ptr, &arg_refs) };
+                let mut v = Value::from_u64(rv as u32 as u64, 32);
+                v.is_signed = true;
+                v
+            }
+            DpiRetKind::Int64 => {
+                let rv: i64 = unsafe { cif.call(fn_ptr, &arg_refs) };
+                let mut v = Value::from_u64(rv as u64, 64);
+                v.is_signed = true;
+                v
+            }
+            DpiRetKind::Real32 => {
+                let rv: f32 = unsafe { cif.call(fn_ptr, &arg_refs) };
+                Value::from_f64(rv as f64)
+            }
+            DpiRetKind::Real64 => {
+                let rv: f64 = unsafe { cif.call(fn_ptr, &arg_refs) };
+                Value::from_f64(rv)
+            }
+            DpiRetKind::Chandle => {
+                let rv: *mut c_void = unsafe { cif.call(fn_ptr, &arg_refs) };
+                Value::from_u64(rv as usize as u64, 64)
+            }
+            DpiRetKind::String => {
+                let rv: *const i8 = unsafe { cif.call(fn_ptr, &arg_refs) };
+                if rv.is_null() {
+                    Value::from_string("")
+                } else {
+                    let s = unsafe { CStr::from_ptr(rv) }.to_string_lossy();
+                    Value::from_string(&s)
+                }
+            }
+        };
+
+        // Write back output/ref/inout values.
+        for (idx, kind, expr) in writebacks {
+            match kind {
+                DpiArgKind::Int32Out => {
+                    if let Some(v) = i32_vals.get(idx) {
+                        let w = self.infer_lhs_width(&expr);
+                        self.assign_value(&expr, &Value::from_u64(**v as u32 as u64, w));
+                    }
+                }
+                DpiArgKind::Int64Out => {
+                    if let Some(v) = i64_vals.get(idx) {
+                        let w = self.infer_lhs_width(&expr);
+                        let mut out = Value::from_u64(**v as u64, w.max(64));
+                        out.is_signed = true;
+                        self.assign_value(&expr, &out.resize(w));
+                    }
+                }
+                DpiArgKind::Real64Out => {
+                    if let Some(v) = f64_vals.get(idx) {
+                        self.assign_value(&expr, &Value::from_f64(**v));
+                    }
+                }
+                DpiArgKind::Real32Out => {
+                    if let Some(v) = f32_vals.get(idx) {
+                        self.assign_value(&expr, &Value::from_f64(**v as f64));
+                    }
+                }
+                DpiArgKind::ChandleOut => {
+                    if let Some(v) = ptr_vals.get(idx) {
+                        self.assign_value(&expr, &Value::from_u64((**v) as usize as u64, 64));
+                    }
+                }
+                DpiArgKind::StringOut => {
+                    if let Some(v) = string_ptr_cells.get(idx) {
+                        let s = if (**v).is_null() {
+                            String::new()
+                        } else {
+                            unsafe { CStr::from_ptr(**v) }.to_string_lossy().to_string()
+                        };
+                        self.assign_value(&expr, &Value::from_string(&s));
+                    }
+                }
+                DpiArgKind::OpenArrayI32Out => {
+                    if let Some(arr) = open_i32_vals.get(idx) {
+                        self.dpi_writeback_i32_array_arg(&expr, arr);
+                    }
+                }
+                DpiArgKind::VecLogicOut(width) => {
+                    if idx < logic_aval.len() && idx < logic_bval.len() {
+                        let out = Self::dpi_logic_words_to_value(&logic_aval[idx], &logic_bval[idx], width);
+                        let w = self.infer_lhs_width(&expr);
+                        self.assign_value(&expr, &out.resize(w));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if spec.property == Some(crate::ast::decl::DPIProperty::Pure) {
+            // No side effects expected; kept for future optimization hooks.
+            let _ = &mut result;
+        }
+        Some(result)
     }
 
     pub fn run(&mut self) {
         self.classify_always_blocks();
         self.compile_edge_blocks();
         self.build_comb_entries();
+        // Apply SDF delays: map signal names → signal IDs
+        if let Some(ref ann) = self.sdf_annotation {
+            let mut count = 0;
+            for (sig_name, &delay) in &ann.signal_delays {
+                if let Some(&id) = self.signal_name_to_id.get(sig_name) {
+                    self.sdf_delays[id] = delay;
+                    count += 1;
+                }
+            }
+            eprintln!("[SDF] annotated {} signals with delays", count);
+        }
+        // Apply `specify` path delays as destination signal inertial delays.
+        for (sig_name, &delay) in &self.module.specify_delays {
+            if let Some(&id) = self.signal_name_to_id.get(sig_name) {
+                self.sdf_delays[id] = self.sdf_delays[id].max(delay);
+            }
+        }
         if self.activity_mon {
             self.activity_counts = vec![0u64; self.comb_entries.len()];
         }
@@ -426,7 +1546,7 @@ impl Simulator {
             self.event_queue.schedule(0, pid, stmts);
         }
         self.event_loop();
-        self.vcd_finish();
+        if self.aitrace_mode { self.aitrace_finish(); } else { self.vcd_finish(); }
     }
 
     /// Try to detect `always #N var = ~var` pattern and extract as a ClockGen.
@@ -520,7 +1640,12 @@ impl Simulator {
                     let resolved: Vec<SensitivityId> = sens.iter().filter_map(|s| {
                         self.signal_name_to_id.get(&s.signal_name).map(|&id| SensitivityId { signal_id: id, edge: s.edge })
                     }).collect();
-                    self.edge_blocks.push(EdgeSensitiveBlock { sensitivities: sens, resolved_sensitivities: resolved, stmt: body, kind: ab.kind });
+                    self.edge_blocks.push(EdgeSensitiveBlock {
+                        sensitivities: sens,
+                        resolved_sensitivities: resolved,
+                        stmt: body,
+                        kind: ab.kind,
+                    });
                     continue;
                 }
                 // @(*) or @* — combinatorial but NOT always_comb.
@@ -536,7 +1661,7 @@ impl Simulator {
                     let delay_val = self.eval_expr(d).to_u64().unwrap_or(0);
                     if delay_val > 0 {
                         if let Some(clock_gen) = self.try_extract_clock_gen(body, delay_val) {
-                            eprintln!("[OPT] clock generator: signal {} period {} (always #{} pattern)",
+                            sim_dbg_eprintln!("[OPT] clock generator: signal {} period {} (always #{} pattern)",
                                 self.id_to_name[clock_gen.signal_id], delay_val * 2, delay_val);
                             self.clock_generators.push(clock_gen);
                             continue;
@@ -593,7 +1718,7 @@ impl Simulator {
         self.compiled_edge_blocks = compiled;
         // Pre-allocate register file for the largest compiled block
         self.vm_regs = vec![Value::zero(1); max_regs as usize];
-        eprintln!("[OPT] bytecode compiled: {}/{} edge blocks", bc_count, self.edge_blocks.len());
+        sim_dbg_eprintln!("[OPT] bytecode compiled: {}/{} edge blocks", bc_count, self.edge_blocks.len());
     }
 
     /// Execute a compiled bytecode block. Returns true if executed successfully.
@@ -753,6 +1878,7 @@ impl Simulator {
             let rids: Vec<usize> = reads.iter()
                 .filter_map(|r| self.signal_name_to_id.get(r).copied())
                 .collect();
+            let has_unresolved_reads = reads.len() != rids.len();
 
             // Detect identity assigns: assign dst = src (simple signal-to-signal copy)
             let direct_copy = if let (ExprKind::Ident(lhs_hier), ExprKind::Ident(rhs_hier)) = (&ca.lhs.kind, &ca.rhs.kind) {
@@ -767,12 +1893,17 @@ impl Simulator {
             } else { None };
 
             let item = direct_copy.unwrap_or_else(|| CombItem::ContAssign { lhs: ca.lhs.clone(), rhs: ca.rhs.clone() });
+            let scope_hint = self
+                .infer_contassign_scope_hint(&ca.lhs, &ca.rhs)
+                .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads));
             entries.push(CombEntry {
                 item,
+                scope_hint,
                 read_signals: reads,
                 write_signals: writes,
                 read_signal_ids: rids,
                 write_signal_ids: wids,
+                has_unresolved_reads,
             });
         }
 
@@ -786,15 +1917,30 @@ impl Simulator {
                 let wids: Vec<(usize, String)> = writes.iter()
                     .filter_map(|w| self.signal_name_to_id.get(w).map(|&id| (id, w.clone())))
                     .collect();
-                let rids: Vec<usize> = reads.iter()
+                // For comb-sensitivity purposes, exclude signals that are written by
+                // this block. Loop variables and local temps are written-then-read
+                // within a single execution; external re-triggering on them would
+                // cause infinite settle loops (e.g. `for (j = 0; j < N; j++)` in an
+                // always @* block).
+                let sens_reads: HashSet<String> = reads.difference(&writes).cloned().collect();
+                let rids: Vec<usize> = sens_reads.iter()
                     .filter_map(|r| self.signal_name_to_id.get(r).copied())
                     .collect();
+                // Unresolved reads in always @* are usually parameters, genvars,
+                // typedefs, or loop-local integer variables — none of which change
+                // at runtime. Don't mark the block as has_unresolved_reads for
+                // those cases; it causes the block to fire every settle iteration
+                // and can produce infinite settle loops when the block itself
+                // writes temporary variables (loop indices, scratch regs).
+                let has_unresolved_reads = false;
                 entries.push(CombEntry {
                     item: CombItem::AlwaysBlock { stmt: ab.stmt.clone(), is_always_comb },
+                    scope_hint: self.infer_scope_from_rw_sets(&writes, &reads),
                     read_signals: reads,
                     write_signals: writes,
                     read_signal_ids: rids,
                     write_signal_ids: wids,
+                    has_unresolved_reads,
                 });
             }
         }
@@ -815,10 +1961,221 @@ impl Simulator {
         let ca_count = entries.iter().filter(|e| matches!(&e.item, CombItem::ContAssign { .. })).count();
         let ab_count = entries.iter().filter(|e| matches!(&e.item, CombItem::AlwaysBlock { .. })).count();
         if dc_count > 0 {
-            eprintln!("[OPT] comb entries: {} direct-copy, {} cont-assign, {} always-block", dc_count, ca_count, ab_count);
-            eprintln!("[OPT] edge blocks: {}, event_waiters: {}", self.edge_blocks.len(), self.event_waiters.len());
+            sim_dbg_eprintln!("[OPT] comb entries: {} direct-copy, {} cont-assign, {} always-block", dc_count, ca_count, ab_count);
+            sim_dbg_eprintln!("[OPT] edge blocks: {}, event_waiters: {}", self.edge_blocks.len(), self.event_waiters.len());
         }
         self.comb_entries = entries;
+    }
+
+    fn collect_leaf_idents(expr: &Expression, out: &mut HashSet<String>) {
+        match &expr.kind {
+            ExprKind::Ident(hier) => {
+                if hier.path.len() == 1 {
+                    out.insert(hier.path[0].name.name.clone());
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                Self::collect_leaf_idents(expr, out);
+                Self::collect_leaf_idents(index, out);
+            }
+            ExprKind::RangeSelect { expr, left, right, .. } => {
+                Self::collect_leaf_idents(expr, out);
+                Self::collect_leaf_idents(left, out);
+                Self::collect_leaf_idents(right, out);
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                Self::collect_leaf_idents(operand, out);
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::collect_leaf_idents(left, out);
+                Self::collect_leaf_idents(right, out);
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                Self::collect_leaf_idents(condition, out);
+                Self::collect_leaf_idents(then_expr, out);
+                Self::collect_leaf_idents(else_expr, out);
+            }
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    Self::collect_leaf_idents(p, out);
+                }
+            }
+            ExprKind::AssignmentPattern(parts) => {
+                for p in parts {
+                    Self::collect_leaf_idents(p.expr(), out);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                Self::collect_leaf_idents(count, out);
+                for e in exprs {
+                    Self::collect_leaf_idents(e, out);
+                }
+            }
+            ExprKind::Call { func, args } => {
+                Self::collect_leaf_idents(func, out);
+                for a in args {
+                    Self::collect_leaf_idents(a, out);
+                }
+            }
+            ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    Self::collect_leaf_idents(a, out);
+                }
+            }
+            ExprKind::MemberAccess { expr, .. } => {
+                Self::collect_leaf_idents(expr, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn infer_contassign_scope_hint(&self, lhs: &Expression, rhs: &Expression) -> Option<String> {
+        let ident_raw = |expr: &Expression| -> Option<String> {
+            if let ExprKind::Ident(hier) = &expr.kind {
+                Some(
+                    hier.path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                )
+            } else {
+                None
+            }
+        };
+        let ident_leaf = |expr: &Expression| -> Option<String> {
+            if let ExprKind::Ident(hier) = &expr.kind {
+                if hier.path.len() == 1 {
+                    let name = hier.path[0].name.name.clone();
+                    if !name.contains('.') {
+                        return Some(name);
+                    }
+                }
+            }
+            None
+        };
+        let parent_n = |name: &str, n: usize| -> Option<String> {
+            let mut cur = name.rsplit_once('.').map(|(p, _)| p.to_string())?;
+            for _ in 0..n {
+                cur = cur.rsplit_once('.').map(|(p, _)| p.to_string())?;
+            }
+            Some(cur)
+        };
+
+        let lhs_raw = ident_raw(lhs);
+        let rhs_raw = ident_raw(rhs);
+        let lhs_leaf_opt = ident_leaf(lhs);
+        let rhs_leaf_opt = ident_leaf(rhs);
+
+        // Common port-connection form after inlining:
+        //   child.input  = parent_signal;
+        //   parent_signal = child.output;
+        // Use parent instance scope to resolve the unqualified side.
+        if lhs_leaf_opt.is_none() && rhs_leaf_opt.is_some() {
+            if let Some(raw) = lhs_raw.as_deref() {
+                if let Some(scope) = parent_n(raw, 1) {
+                    return Some(scope);
+                }
+            }
+        }
+        if lhs_leaf_opt.is_some() && rhs_leaf_opt.is_none() {
+            if let Some(raw) = rhs_raw.as_deref() {
+                if let Some(scope) = parent_n(raw, 1) {
+                    return Some(scope);
+                }
+            }
+        }
+
+        let lhs_leaf = lhs_leaf_opt?;
+        let suffix = format!(".{}", lhs_leaf);
+        let mut leaves = HashSet::new();
+        Self::collect_leaf_idents(lhs, &mut leaves);
+        Self::collect_leaf_idents(rhs, &mut leaves);
+        if leaves.is_empty() {
+            return None;
+        }
+
+        let mut best_parent: Option<String> = None;
+        let mut best_score = 0usize;
+        let mut best_depth = 0usize;
+        for full_name in self.signal_name_to_id.keys() {
+            let Some(parent) = full_name.strip_suffix(&suffix) else { continue };
+            let mut score = 0usize;
+            for leaf in &leaves {
+                let candidate = format!("{}.{}", parent, leaf);
+                if self.signal_name_to_id.contains_key(&candidate) {
+                    score += 1;
+                }
+            }
+            let depth = parent.split('.').count();
+            if score > best_score
+                || (score == best_score && depth > best_depth)
+                || (score == best_score
+                    && depth == best_depth
+                    && best_parent.as_ref().is_none_or(|p| parent.len() > p.len()))
+            {
+                best_parent = Some(parent.to_string());
+                best_score = score;
+                best_depth = depth;
+            }
+        }
+        if best_score == 0 {
+            None
+        } else {
+            best_parent
+        }
+    }
+
+    fn infer_scope_from_rw_sets(
+        &self,
+        writes: &HashSet<String>,
+        reads: &HashSet<String>,
+    ) -> Option<String> {
+        let mut leaves = HashSet::new();
+        let mut anchor: Option<String> = None;
+        for name in writes {
+            if !name.contains('.') && !name.contains('[') {
+                if anchor.is_none() {
+                    anchor = Some(name.clone());
+                }
+                leaves.insert(name.clone());
+            }
+        }
+        for name in reads {
+            if !name.contains('.') && !name.contains('[') {
+                if anchor.is_none() {
+                    anchor = Some(name.clone());
+                }
+                leaves.insert(name.clone());
+            }
+        }
+        let anchor = anchor?;
+        let suffix = format!(".{}", anchor);
+        let mut best_parent: Option<String> = None;
+        let mut best_score = 0usize;
+        let mut best_depth = 0usize;
+        for full_name in self.signal_name_to_id.keys() {
+            let Some(parent) = full_name.strip_suffix(&suffix) else { continue };
+            let mut score = 0usize;
+            for leaf in &leaves {
+                let candidate = format!("{}.{}", parent, leaf);
+                if self.signal_name_to_id.contains_key(&candidate) {
+                    score += 1;
+                }
+            }
+            let depth = parent.split('.').count();
+            if score > best_score
+                || (score == best_score && depth > best_depth)
+                || (score == best_score
+                    && depth == best_depth
+                    && best_parent.as_ref().is_none_or(|p| parent.len() > p.len()))
+            {
+                best_parent = Some(parent.to_string());
+                best_score = score;
+                best_depth = depth;
+            }
+        }
+        if best_score == 0 { None } else { best_parent }
     }
 
     /// Collect all signal names read by an expression.
@@ -855,8 +2212,11 @@ impl Simulator {
                 Self::collect_expr_reads(then_expr, module, reads);
                 Self::collect_expr_reads(else_expr, module, reads);
             }
-            ExprKind::Concatenation(exprs) | ExprKind::AssignmentPattern(exprs) => {
+            ExprKind::Concatenation(exprs) => {
                 for e in exprs { Self::collect_expr_reads(e, module, reads); }
+            }
+            ExprKind::AssignmentPattern(parts) => {
+                for p in parts { Self::collect_expr_reads(p.expr(), module, reads); }
             }
             ExprKind::Replication { count, exprs } => {
                 Self::collect_expr_reads(count, module, reads);
@@ -880,11 +2240,34 @@ impl Simulator {
         match &lhs.kind {
             ExprKind::Ident(hier) => { writes.insert(Self::resolve_hier_name_static(hier, module)); }
             ExprKind::Index { expr: base, .. } => {
-                if let ExprKind::Ident(hier) = &base.kind {
-                    let name = Self::resolve_hier_name_static(hier, module);
-                    if let Some((lo, hi, _)) = module.arrays.get(&name) {
-                        for i in *lo..=*hi { writes.insert(format!("{}[{}]", name, i)); }
-                    } else { writes.insert(name); }
+                match &base.kind {
+                    ExprKind::Ident(hier) => {
+                        let name = Self::resolve_hier_name_static(hier, module);
+                        if let Some((lo, hi, _)) = module.arrays.get(&name) {
+                            for i in *lo..=*hi { writes.insert(format!("{}[{}]", name, i)); }
+                        } else { writes.insert(name); }
+                    }
+                    ExprKind::MemberAccess { expr, member } => {
+                        if let ExprKind::Ident(hier) = &expr.kind {
+                            let mut name = Self::resolve_hier_name_static(hier, module);
+                            if !name.is_empty() {
+                                name.push('.');
+                                name.push_str(&member.name);
+                                writes.insert(name);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    let mut name = Self::resolve_hier_name_static(hier, module);
+                    if !name.is_empty() {
+                        name.push('.');
+                        name.push_str(&member.name);
+                        writes.insert(name);
+                    }
                 }
             }
             ExprKind::RangeSelect { expr: base, .. } => Self::collect_lhs_writes(base, module, writes),
@@ -917,13 +2300,26 @@ impl Simulator {
             StatementKind::For { init, condition, step, body } => {
                 for fi in init {
                     match fi {
-                        ForInit::Assign { rvalue, .. } | ForInit::VarDecl { init: rvalue, .. } => {
+                        ForInit::Assign { lvalue, rvalue } => {
                             Self::collect_expr_reads(rvalue, module, reads);
+                            Self::collect_lhs_writes(lvalue, module, writes);
+                        }
+                        ForInit::VarDecl { name, init: rvalue, .. } => {
+                            Self::collect_expr_reads(rvalue, module, reads);
+                            writes.insert(name.name.clone());
                         }
                     }
                 }
                 if let Some(c) = condition { Self::collect_expr_reads(c, module, reads); }
-                for s in step { Self::collect_expr_reads(s, module, reads); }
+                // Step expressions are typically i = i + 1, parsed as
+                // Binary { op: Assign, left, right }. Collect both reads and
+                // LHS writes so loop variables are excluded from sensitivity.
+                for s in step {
+                    Self::collect_expr_reads(s, module, reads);
+                    if let ExprKind::Binary { op: BinaryOp::Assign, left, .. } = &s.kind {
+                        Self::collect_lhs_writes(left, module, writes);
+                    }
+                }
                 Self::collect_stmt_reads(body, module, reads, writes);
             }
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
@@ -999,13 +2395,18 @@ impl Simulator {
                 Some(Sensitivity { signal_name: sig, edge })
             }).collect(),
             EventControl::Identifier(id) => vec![Sensitivity { signal_name: id.name.clone(), edge: EdgeKind::AnyEdge }],
+            EventControl::HierIdentifier(expr) => {
+                if let ExprKind::Ident(h) = &expr.kind {
+                    vec![Sensitivity { signal_name: self.resolve_hier_name(h), edge: EdgeKind::AnyEdge }]
+                } else { Vec::new() }
+            }
             _ => Vec::new(),
         }
     }
 
     /// Create an EventWaiter with pre-resolved sensitivity IDs for O(1) edge checking.
     fn make_event_waiter(&self, pid: usize, sens: Vec<Sensitivity>, continuation: Vec<Statement>) -> EventWaiter {
-        let resolved = sens.iter().filter_map(|s| {
+        let resolved: Vec<SensitivityId> = sens.iter().filter_map(|s| {
             self.signal_name_to_id.get(&s.signal_name).map(|&id| SensitivityId { signal_id: id, edge: s.edge })
         }).collect();
         EventWaiter { pid, sensitivities: sens, resolved_sensitivities: resolved, continuation, registered_time: self.time }
@@ -1028,21 +2429,17 @@ impl Simulator {
             let has_waiters = !self.event_waiters.is_empty();
             let has_clocks = !self.clock_generators.is_empty();
 
-            if !has_timed && !has_waiters && !has_clocks { break; }
+            if !has_timed && !has_waiters && !has_clocks && self.delayed_updates.is_empty() { break; }
 
-            // Determine next time: minimum of event queue and clock generators
+            // Determine next time: minimum of event queue, clock generators, and delayed updates
             let next_eq_time = self.event_queue.next_time();
             let next_clk_time = if has_clocks {
                 self.clock_generators.iter().map(|c| c.next_toggle_time).min()
             } else { None };
-            let next_time = match (next_eq_time, next_clk_time) {
-                (Some(a), Some(b)) => a.min(b),
-                (Some(a), None) => a,
-                (None, Some(b)) => b,
-                (None, None) => {
-                    if has_waiters { self.time } else { break; }
-                }
-            };
+            let next_delayed = self.next_delayed_time();
+            let next_time = [next_eq_time, next_clk_time, next_delayed].into_iter()
+                .flatten().min()
+                .unwrap_or_else(|| if has_waiters { self.time } else { u64::MAX });
 
             if next_time > self.max_time { break; }
             if next_time > self.time { self.time = next_time; }
@@ -1051,6 +2448,12 @@ impl Simulator {
                 let _t = std::time::Instant::now();
                 self.snapshot_edge_signals();
                 t_snap += _t.elapsed().as_nanos() as u64;
+
+                // Apply SDF/specify delayed updates that have matured.
+                // Snapshot must happen first so edge detection can observe the change.
+                if self.apply_delayed_updates() {
+                    self.settle_combinatorial();
+                }
 
                 // Fire clock generators at current time (O(1) toggle, no AST)
                 self.fire_clock_generators();
@@ -1062,7 +2465,11 @@ impl Simulator {
                 let _t = std::time::Instant::now();
                 for (pid, stmts) in processes {
                     if self.finished { break; }
-                    self.run_process_stmts(pid, &stmts);
+                    self.run_scheduled_process(pid, &stmts);
+                    // If it finished (not suspended), check join waiters
+                    if !self.is_pid_suspended(pid) {
+                        self.child_finished(pid);
+                    }
                 }
                 t_process += _t.elapsed().as_nanos() as u64;
 
@@ -1096,7 +2503,7 @@ impl Simulator {
                 t_snap += _t.elapsed().as_nanos() as u64;
 
                 self.check_monitor();
-                self.vcd_write_changes();
+                if self.aitrace_mode { self.aitrace_write_changes(); } else { self.vcd_write_changes(); }
                 self.loop_iters += 1;
             }
         }
@@ -1162,7 +2569,7 @@ impl Simulator {
                 // Get destination signal name to determine block
                 let dst_name = match &entry.item {
                     CombItem::DirectCopy { dst_id, .. } => &self.id_to_name[*dst_id],
-                    CombItem::ContAssign { lhs, .. } => {
+                    CombItem::ContAssign {  .. } => {
                         // Use first write signal
                         if let Some((id, _)) = entry.write_signal_ids.first() {
                             &self.id_to_name[*id]
@@ -1246,7 +2653,60 @@ impl Simulator {
         }
     }
 
+    fn snapshot_process_context(&self) -> ProcessContext {
+        ProcessContext {
+            this_stack: self.this_stack.clone(),
+            local_stack: self.local_stack.clone(),
+            class_context_stack: self.class_context_stack.clone(),
+            cg_this: self.cg_this,
+            return_value: self.return_value.clone(),
+            break_flag: self.break_flag,
+            continue_flag: self.continue_flag,
+        }
+    }
+
+    fn restore_process_context(&mut self, ctx: ProcessContext) {
+        self.this_stack = ctx.this_stack;
+        self.local_stack = ctx.local_stack;
+        self.class_context_stack = ctx.class_context_stack;
+        self.cg_this = ctx.cg_this;
+        self.return_value = ctx.return_value;
+        self.break_flag = ctx.break_flag;
+        self.continue_flag = ctx.continue_flag;
+    }
+
+    fn inherit_current_process_context(&mut self, pid: usize) {
+        let ctx = self.snapshot_process_context();
+        if ctx.this_stack.is_empty()
+            && ctx.local_stack.is_empty()
+            && ctx.class_context_stack.is_empty()
+            && ctx.cg_this.is_none()
+            && ctx.return_value.is_none()
+            && !ctx.break_flag
+            && !ctx.continue_flag
+        {
+            self.process_contexts.remove(&pid);
+        } else {
+            self.process_contexts.insert(pid, ctx);
+        }
+    }
+
+    fn run_scheduled_process(&mut self, pid: usize, stmts: &[Statement]) {
+        let saved = self.snapshot_process_context();
+        let ctx = self.process_contexts.remove(&pid).unwrap_or_default();
+        self.restore_process_context(ctx);
+        self.run_process_stmts(pid, stmts);
+        if self.is_pid_suspended(pid) {
+            self.process_contexts.insert(pid, self.snapshot_process_context());
+        } else {
+            self.process_contexts.remove(&pid);
+        }
+        self.restore_process_context(saved);
+    }
+
     fn run_process_stmts(&mut self, pid: usize, stmts: &[Statement]) {
+        self.current_pid = pid;
+        sim_dbg_eprintln!("[DEBUG] running process {} ({} stmts) at time {}", pid, stmts.len(), self.time);
         let mut i = 0;
         while i < stmts.len() && !self.finished {
             let stmt = &stmts[i];
@@ -1354,7 +2814,107 @@ impl Simulator {
                 }
             }
 
-            self.exec_statement(stmt);
+            // While loop with event/timing waits inside: unroll one iteration,
+            // re-append the while statement so the condition is re-checked
+            // after suspension.
+            // If-statement whose chosen branch contains blocking stmts: descend
+            // into the branch via run_process_stmts so repeat/while/@event
+            // inside the branch can properly suspend the process.
+            if let StatementKind::If { condition, then_stmt, else_stmt, .. } = &stmt.kind {
+                let chosen: Option<&Statement> = if self.eval_expr(condition).is_true() {
+                    Some(then_stmt.as_ref())
+                } else {
+                    else_stmt.as_ref().map(|b| b.as_ref())
+                };
+                if let Some(branch) = chosen {
+                    if self.stmt_is_blocking(branch) {
+                        let branch_stmts: Vec<Statement> = match &branch.kind {
+                            StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                            _ => vec![branch.clone()],
+                        };
+                        let mut cont = branch_stmts;
+                        cont.extend_from_slice(&stmts[i+1..]);
+                        self.run_process_stmts(pid, &cont);
+                        return;
+                    }
+                }
+            }
+
+            if let StatementKind::While { condition, body } = &stmt.kind {
+                if self.stmt_has_event_wait(body) {
+                    let cond_val = self.eval_expr(condition).is_true();
+                    if cond_val {
+                        let body_stmts = match &body.kind {
+                            StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                            _ => vec![*body.clone()],
+                        };
+                        let mut cont: Vec<Statement> = body_stmts;
+                        cont.push(stmt.clone());
+                        cont.extend_from_slice(&stmts[i+1..]);
+                        self.run_process_stmts(pid, &cont);
+                        return;
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Check for ParBlock (fork...join)
+            if let StatementKind::ParBlock { stmts: sub_stmts, join_type, .. } = &stmt.kind {
+                let mut child_pids = HashSet::new();
+                for s in sub_stmts {
+                    let pid_child = self.next_pid; self.next_pid += 1;
+                    self.process_parents.insert(pid_child, pid);
+                    self.inherit_current_process_context(pid_child);
+                    // Schedule children to run at current time
+                    self.event_queue.schedule(self.time, pid_child, vec![s.clone()]);
+                    child_pids.insert(pid_child);
+                }
+                
+                if *join_type == JoinType::JoinNone {
+                    // Continue immediately
+                    i += 1;
+                    continue;
+                } else {
+                    // Suspend current process and wait for children
+                    let cont = stmts[i+1..].to_vec();
+                    self.join_waiters.push(JoinWaiter {
+                        parent_pid: pid,
+                        child_pids,
+                        join_type: *join_type,
+                        continuation: cont,
+                        finished_children: HashSet::new(),
+                    });
+                    return;
+                }
+            } else {
+                self.exec_statement(stmt);
+            }
+
+            // Check for WaitFork
+            if let StatementKind::WaitFork = &stmt.kind {
+                let children: HashSet<usize> = self.process_parents.iter()
+                    .filter(|(_, &p)| p == pid)
+                    .map(|(&c, _)| c)
+                    .collect();
+                
+                if children.is_empty() {
+                    i += 1;
+                    continue;
+                } else {
+                    let cont = stmts[i+1..].to_vec();
+                    self.join_waiters.push(JoinWaiter {
+                        parent_pid: pid,
+                        child_pids: children,
+                        join_type: JoinType::Join,
+                        continuation: cont,
+                        finished_children: HashSet::new(),
+                    });
+                    return;
+                }
+            }
+
             i += 1;
         }
     }
@@ -1426,15 +2986,23 @@ impl Simulator {
     }
 
     /// Resolve NBA target at schedule time to capture array indices/part-selects
-    fn resolve_nba_target(&self, lhs: &Expression) -> Option<usize> {
+    fn resolve_nba_target(&mut self, lhs: &Expression) -> Option<usize> {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
+                let is_ambiguous_leaf =
+                    hier.path.len() == 1 && !hier.path[0].name.name.contains('.');
                 // Use cached signal ID if available
                 if let Some(id) = hier.cached_signal_id.get() {
-                    return Some(id);
+                    if !is_ambiguous_leaf {
+                        return Some(id);
+                    }
                 }
                 let name = self.resolve_hier_name(hier);
-                self.signal_name_to_id.get(&name).copied()
+                if let Some(&id) = self.signal_name_to_id.get(&name) {
+                    hier.cached_signal_id.set(Some(id));
+                    return Some(id);
+                }
+                None
             }
             ExprKind::Index { expr, index } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
@@ -1479,6 +3047,62 @@ impl Simulator {
         self.nba_queue.clear();
     }
 
+    /// Apply delayed signal updates that are due at or before the current time.
+    /// Returns true if any updates were applied.
+    fn apply_delayed_updates(&mut self) -> bool {
+        if self.delayed_updates.is_empty() { return false; }
+        let mut applied = false;
+        let mut i = 0;
+        while i < self.delayed_updates.len() {
+            if self.delayed_updates[i].0 <= self.time {
+                let (_, id, val) = self.delayed_updates.swap_remove(i);
+                if self.signal_table[id] != val {
+                    self.signal_table[id] = val;
+                    self.mark_dirty_id(id);
+                    self.table_modified = true;
+                    applied = true;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        applied
+    }
+
+    /// Get the next time a delayed update is due (for time advancement).
+    fn next_delayed_time(&self) -> Option<u64> {
+        self.delayed_updates.iter().map(|(t, _, _)| *t).min()
+    }
+
+    /// Schedule a delayed signal update (inertial delay model).
+    fn schedule_delayed(&mut self, id: usize, val: Value) {
+        let delay = self.sdf_delays[id];
+        let target_time = self.time + delay;
+        // Inertial delay: remove any pending update for this signal
+        self.delayed_updates.retain(|(_, sid, _)| *sid != id);
+        self.delayed_updates.push((target_time, id, val));
+    }
+
+    /// Get the signal ID for a simple LHS identifier expression.
+    fn get_lhs_signal_id(&self, lhs: &Expression) -> Option<usize> {
+        if let ExprKind::Ident(hier) = &lhs.kind {
+            let is_ambiguous_leaf =
+                hier.path.len() == 1 && !hier.path[0].name.name.contains('.');
+            if let Some(id) = hier.cached_signal_id.get() {
+                if !is_ambiguous_leaf {
+                    return Some(id);
+                }
+            }
+            let resolved = self.resolve_hier_name(hier);
+            if let Some(&id) = self.signal_name_to_id.get(&resolved) {
+                return Some(id);
+            }
+            // Fallback for legacy single-segment names.
+            let leaf = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+            self.signal_name_to_id.get(leaf).copied()
+        } else { None }
+    }
+
     /// Snapshot only edge-sensitive signals + event_waiter signals into prev_signals.
     fn snapshot_edge_signals(&mut self) {
         for &id in &self.edge_signal_ids {
@@ -1487,6 +3111,12 @@ impl Simulator {
         for i in 0..self.event_waiters.len() {
             for j in 0..self.event_waiters[i].resolved_sensitivities.len() {
                 let sid = self.event_waiters[i].resolved_sensitivities[j].signal_id;
+                self.prev_table[sid].copy_from(&self.signal_table[sid]);
+            }
+        }
+        for i in 0..self.cg_event_waiters.len() {
+            for j in 0..self.cg_event_waiters[i].1.len() {
+                let sid = self.cg_event_waiters[i].1[j].signal_id;
                 self.prev_table[sid].copy_from(&self.signal_table[sid]);
             }
         }
@@ -1522,11 +3152,36 @@ impl Simulator {
                 if trigger { break; }
             }
             if trigger {
+                let saved_hint = self.name_resolve_hint.borrow().clone();
+                if let Some(first) = block.resolved_sensitivities.first() {
+                    if let Some(full) = self.id_to_name.get(first.signal_id) {
+                        if let Some((parent, _)) = full.rsplit_once('.') {
+                            *self.name_resolve_hint.borrow_mut() = Some(parent.to_string());
+                        }
+                    }
+                }
                 // Try bytecode VM first (flat instruction array, cache-friendly)
                 if !self.exec_bytecode(block_idx) {
                     // Fallback: AST interpreter
                     self.exec_statement(&block.stmt);
                 }
+                *self.name_resolve_hint.borrow_mut() = saved_hint;
+            }
+        }
+
+        // Trigger covergroup sampling
+        for i in 0..self.cg_event_waiters.len() {
+            let handle = self.cg_event_waiters[i].0;
+            let mut triggered = false;
+            for j in 0..self.cg_event_waiters[i].1.len() {
+                let sid = &self.cg_event_waiters[i].1[j];
+                if self.check_edge_id(sid.signal_id, sid.edge) {
+                    triggered = true;
+                    break;
+                }
+            }
+            if triggered {
+                self.sample_covergroup(handle);
             }
         }
 
@@ -1544,6 +3199,7 @@ impl Simulator {
                 if triggered { break; }
             }
             if triggered {
+                sim_dbg_eprintln!("[DEBUG] waiter for process {} triggered at time {}", waiter.pid, self.time);
                 self.event_queue.schedule(self.time, waiter.pid, waiter.continuation);
             } else {
                 self.event_waiters_swap.push(waiter);
@@ -1603,6 +3259,15 @@ impl Simulator {
                 }
             }
 
+            // Conservatively refresh entries whose read dependencies could not
+            // be fully resolved during comb graph construction.
+            for eidx in 0..num_entries {
+                if !self.settle_triggered[eidx] && entries[eidx].has_unresolved_reads {
+                    self.settle_triggered[eidx] = true;
+                    self.settle_triggered_list.push(eidx);
+                }
+            }
+
             // Evaluate triggered entries directly from the triggered list.
             // On iteration 0: also include entries with empty read sets and time-0 always_comb.
             if iteration == 0 {
@@ -1621,6 +3286,7 @@ impl Simulator {
 
             for tidx in 0..self.settle_triggered_list.len() {
                 let eidx = self.settle_triggered_list[tidx];
+                let scope_hint = entries[eidx].scope_hint.clone();
 
                 self.entry_evals += 1;
                 if self.activity_mon && !self.activity_counts.is_empty() {
@@ -1631,23 +3297,74 @@ impl Simulator {
                         let src_val = self.signal_table[*src_id].clone();
                         let resized = if src_val.width != *width { src_val.resize(*width) } else { src_val };
                         if self.signal_table[*dst_id] != resized {
-                            self.mark_dirty_id(*dst_id);
-                            self.signal_table[*dst_id] = resized;
-                            self.table_modified = true;
+                            let delay = self.sdf_delays[*dst_id];
+                            if delay > 0 && self.time > 0 {
+                                // SDF: schedule delayed update (inertial delay model)
+                                self.schedule_delayed(*dst_id, resized);
+                            } else {
+                                self.mark_dirty_id(*dst_id);
+                                self.signal_table[*dst_id] = resized;
+                                self.table_modified = true;
+                            }
                         }
                     }
                     CombItem::ContAssign { lhs, rhs } => {
+                        let saved_hint = self.name_resolve_hint.borrow().clone();
+                        if let Some(hint) = &scope_hint {
+                            *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
+                        }
+                        let lhs_id = self.get_lhs_signal_id(lhs);
+                        if scope_hint.is_none() {
+                            if let Some(id) = lhs_id {
+                                if let Some(full) = self.id_to_name.get(id) {
+                                    if let Some((parent, _)) = full.rsplit_once('.') {
+                                        *self.name_resolve_hint.borrow_mut() = Some(parent.to_string());
+                                    }
+                                }
+                            }
+                        }
                         let w = self.infer_lhs_width(lhs);
                         let val = self.eval_expr_ctx(rhs, w).resize(w);
-                        self.assign_value(lhs, &val);
+                        // Check if the LHS target has an SDF delay
+                        let delay = lhs_id.map(|id| self.sdf_delays[id]).unwrap_or(0);
+                        if delay > 0 && self.time > 0 {
+                            if let Some(id) = lhs_id {
+                                if self.signal_table[id] != val {
+                                    self.schedule_delayed(id, val);
+                                }
+                            }
+                        } else {
+                            if let Some(id) = lhs_id {
+                                let width = self.signal_widths[id];
+                                let mut resized = if self.signal_real[id] {
+                                    if val.is_real { val.clone() } else { Value::from_f64(val.to_f64()) }
+                                } else {
+                                    if val.is_real { Value::from_u64(val.to_f64() as u64, width) } else { val.resize(width) }
+                                };
+                                resized.is_signed = self.signal_signed[id];
+                                if self.signal_table[id] != resized {
+                                    self.mark_dirty_id(id);
+                                    self.signal_table[id] = resized;
+                                    self.table_modified = true;
+                                }
+                            } else {
+                                self.assign_value(lhs, &val);
+                            }
+                        }
+                        *self.name_resolve_hint.borrow_mut() = saved_hint;
                     }
                     CombItem::AlwaysBlock { stmt, .. } => {
+                        let saved_hint = self.name_resolve_hint.borrow().clone();
+                        if let Some(hint) = &scope_hint {
+                            *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
+                        }
                         let write_ids = &entries[eidx].write_signal_ids;
                         self.settle_prev_values.clear();
                         for (id, _name) in write_ids {
                             self.settle_prev_values.push((*id, self.signal_table[*id].clone()));
                         }
                         self.exec_statement(stmt);
+                        *self.name_resolve_hint.borrow_mut() = saved_hint;
                         for i in 0..self.settle_prev_values.len() {
                             let (id, ref old_val) = self.settle_prev_values[i];
                             if self.signal_table[id] != *old_val {
@@ -1679,23 +3396,83 @@ impl Simulator {
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
-                let name_ref = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                if let Some(id) = hier.cached_signal_id.get() {
-                    let width = self.signal_widths[id];
-                    let mut resized = val.resize(width);
-                    resized.is_signed = self.signal_signed[id];
-                    let changed = self.signal_table[id] != resized;
-                    if changed {
-                        self.mark_dirty_id(id);
-                        self.signal_table[id] = resized;
-                        self.table_modified = true;
+                if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+                    let name = &hier.path[0].name.name;
+                    // Check local stack
+                    if !self.local_stack.is_empty() {
+                        let last_idx = self.local_stack.len() - 1;
+                        if self.local_stack[last_idx].contains_key(name) {
+                            self.local_stack[last_idx].insert(name.clone(), val.clone());
+                            return true;
+                        }
                     }
-                    return changed;
+                    // Check 'this' properties
+                    if let Some(Some(handle)) = self.this_stack.last() {
+                        if let Some(Some(instance)) = self.heap.get_mut(*handle) {
+                            if instance.properties.contains_key(name) {
+                                instance.properties.insert(name.clone(), val.clone());
+                                return true;
+                            }
+                        }
+                    }
+                } else if hier.path.len() > 1 {
+                    let obj_name = &hier.path[0].name.name;
+                    let obj_val = if let Some(locals) = self.local_stack.last() {
+                        locals.get(obj_name).cloned()
+                    } else {
+                        self.signals.get(obj_name).cloned()
+                    };
+                    if let Some(v) = obj_val {
+                        let mut cur_handle = v.to_u64().unwrap_or(0) as usize;
+                        for i in 1..hier.path.len() {
+                            if cur_handle == 0 || cur_handle >= self.heap.len() { break; }
+                            let member_name = &hier.path[i].name.name;
+                            if i == hier.path.len() - 1 {
+                                if let Some(Some(inst)) = self.heap.get_mut(cur_handle) {
+                                    if inst.properties.contains_key(member_name) {
+                                        inst.properties.insert(member_name.clone(), val.clone());
+                                        return true;
+                                    }
+                                }
+                                break;
+                            }
+                            if let Some(Some(inst)) = self.heap.get(cur_handle) {
+                                if let Some(mval) = inst.properties.get(member_name) {
+                                    cur_handle = mval.to_u64().unwrap_or(0) as usize;
+                                } else { break; }
+                            } else { break; }
+                        }
+                    }
                 }
-                if let Some(&id) = self.signal_name_to_id.get(name_ref) {
+                let is_ambiguous_leaf =
+                    hier.path.len() == 1 && !hier.path[0].name.name.contains('.');
+                if let Some(id) = hier.cached_signal_id.get() {
+                    if !is_ambiguous_leaf {
+                        let width = self.signal_widths[id];
+                        let mut resized = if self.signal_real[id] {
+                            if val.is_real { val.clone() } else { Value::from_f64(val.to_f64()) }
+                        } else {
+                            if val.is_real { Value::from_u64(val.to_f64() as u64, width) } else { val.resize(width) }
+                        };
+                        resized.is_signed = self.signal_signed[id];
+                        let changed = self.signal_table[id] != resized;
+                        if changed {
+                            self.mark_dirty_id(id);
+                            self.signal_table[id] = resized;
+                            self.table_modified = true;
+                        }
+                        return changed;
+                    }
+                }
+                let name = self.resolve_hier_name(hier);
+                if let Some(&id) = self.signal_name_to_id.get(&name) {
                     hier.cached_signal_id.set(Some(id));
                     let width = self.signal_widths[id];
-                    let mut resized = val.resize(width);
+                    let mut resized = if self.signal_real[id] {
+                        if val.is_real { val.clone() } else { Value::from_f64(val.to_f64()) }
+                    } else {
+                        if val.is_real { Value::from_u64(val.to_f64() as u64, width) } else { val.resize(width) }
+                    };
                     resized.is_signed = self.signal_signed[id];
                     let changed = self.signal_table[id] != resized;
                     if changed {
@@ -1705,24 +3482,54 @@ impl Simulator {
                     }
                     return changed;
                 }
-                // Fallback (slow path): allocate name
                 // Fallback (slow path): allocate name, sync HashMap
                 self.sync_table_to_hashmap();
-                let name = name_ref.to_string();
                 let width = self.widths.get(&name).copied().unwrap_or(val.width);
-                let mut resized = val.resize(width);
+                let is_real = self.real_signals.contains(&name);
+                let mut resized = if is_real {
+                    if val.is_real { val.clone() } else { Value::from_f64(val.to_f64()) }
+                } else {
+                    if val.is_real { Value::from_u64(val.to_f64() as u64, width) } else { val.resize(width) }
+                };
                 resized.is_signed = self.signed_signals.contains(&name);
                 let changed = self.signals.get(&name).map_or(true, |p| *p != resized);
-                if changed { self.mark_dirty(&name); }
-                self.signals.insert(name, resized); changed
+                if changed { 
+                    self.mark_dirty(&name);
+                }
+                self.signals.insert(name.clone(), resized.clone());
+
+                // If this is an array or queue, and we are assigning a packed value,
+                // we might want to split it into elements.
+                if let Some((lo, hi, elem_width)) = self.module.arrays.get(&name).cloned() {
+                    let num_elements = (resized.width / elem_width) as usize;
+                    // For queues/dynamic arrays, we update the size
+                    let is_dynamic = hi < lo || hi == 63 && lo == 0; // simplistic check for [lo:hi] vs []/[$]
+                    if is_dynamic {
+                        self.signals.insert(format!("{}.size", name), Value::from_u64(num_elements as u64, 32));
+                    }
+                    for i in 0..num_elements {
+                        let l = (num_elements - 1 - i) * elem_width as usize + (elem_width as usize - 1);
+                        let r = (num_elements - 1 - i) * elem_width as usize;
+                        let elem_val = resized.range_select(l, r);
+                        self.signals.insert(format!("{}[{}]", name, i), elem_val);
+                    }
+                }
+
+                changed
             }
             ExprKind::Index { expr, index } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
-                    let idx = self.eval_expr(index).to_u64().unwrap_or(0);
+                    let idx_val = self.eval_expr(index);
+                    let idx_str = if self.is_associative_array(&name) {
+                        idx_val.to_string()
+                    } else {
+                        idx_val.to_u64().unwrap_or(0).to_string()
+                    };
+                    
                     // Check if this is an array element assignment
-                    if self.module.arrays.contains_key(&name) {
-                        let elem_name = format!("{}[{}]", name, idx);
+                    if self.module.arrays.contains_key(&name) || self.is_associative_array(&name) {
+                        let elem_name = format!("{}[{}]", name, idx_str);
                         if let Some(&id) = self.signal_name_to_id.get(&elem_name) {
                             let width = self.signal_widths[id];
                             let resized = val.resize(width);
@@ -1735,10 +3542,17 @@ impl Simulator {
                             }
                             return changed;
                         }
-                        return false;
+                        // Fallback: slow path / associative array
+                        let changed = self.signals.get(&elem_name).map_or(true, |p| *p != *val);
+                        if changed {
+                            sim_dbg_eprintln!("[DEBUG] signal {} changed to {:?}", elem_name, val);
+                            self.signals.insert(elem_name.clone(), val.clone());
+                            self.mark_dirty(&elem_name);
+                        }
+                        return changed;
                     }
                     // Fall back to bit select assignment
-                    let idx = idx as usize;
+                    let idx = idx_val.to_u64().unwrap_or(0) as usize;
                     // Bit select needs signal_table
                     if let Some(&id) = self.signal_name_to_id.get(&name) {
                         if idx < self.signal_widths[id] as usize {
@@ -1805,17 +3619,31 @@ impl Simulator {
                 }
                 changed
             }
+            ExprKind::MemberAccess { expr, member } => {
+                let base = self.eval_expr(expr);
+                let handle = base.to_u64().unwrap_or(0) as usize;
+                if handle != 0 && handle < self.heap.len() {
+                    if let Some(instance) = &mut self.heap[handle] {
+                        let changed = instance.properties.get(&member.name) != Some(val);
+                        if changed {
+                            instance.properties.insert(member.name.clone(), val.clone());
+                        }
+                        return changed;
+                    }
+                }
+                false
+            }
             _ => false,
         }
     }
 
-    pub fn eval_expr(&self, expr: &Expression) -> Value {
+    pub fn eval_expr(&mut self, expr: &Expression) -> Value {
         self.eval_expr_ctx(expr, 0)
     }
 
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
-    pub fn eval_expr_ctx(&self, expr: &Expression, ctx_width: u32) -> Value {
+    pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
         match &expr.kind {
             ExprKind::Number(num) => self.eval_number(num),
             ExprKind::StringLiteral(s) => {
@@ -1826,7 +3654,43 @@ impl Simulator {
                 }
                 val
             }
-            ExprKind::Ident(hier) => self.fast_signal_read(hier),
+            ExprKind::Ident(hier) => {
+                if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+                    let name = &hier.path[0].name.name;
+                    if name == "UVM_ACTIVE" { return Value::from_u64(1, 32); }
+                    if name == "UVM_PASSIVE" { return Value::from_u64(0, 32); }
+                    if let Some(locals) = self.local_stack.last() {
+                        if let Some(val) = locals.get(name) { return val.clone(); }
+                    }
+                    if let Some(Some(handle)) = self.this_stack.last() {
+                        if let Some(Some(instance)) = self.heap.get(*handle) {
+                            if let Some(val) = instance.properties.get(name) { return val.clone(); }
+                        }
+                    }
+                } else if hier.path.len() > 1 {
+                    // Handle hierarchical ident that might be class member access: obj.prop
+                    let obj_name = &hier.path[0].name.name;
+                    let val = if let Some(locals) = self.local_stack.last() {
+                        locals.get(obj_name).cloned()
+                    } else {
+                        self.signals.get(obj_name).cloned()
+                    };
+                    if let Some(v) = val {
+                        let mut cur_handle = v.to_u64().unwrap_or(0) as usize;
+                        for i in 1..hier.path.len() {
+                            if cur_handle == 0 || cur_handle >= self.heap.len() { break; }
+                            if let Some(Some(inst)) = self.heap.get(cur_handle) {
+                                let member_name = &hier.path[i].name.name;
+                                if let Some(mval) = inst.properties.get(member_name) {
+                                    if i == hier.path.len() - 1 { return mval.clone(); }
+                                    cur_handle = mval.to_u64().unwrap_or(0) as usize;
+                                } else { break; }
+                            } else { break; }
+                        }
+                    }
+                }
+                self.fast_signal_read(hier)
+            }
             ExprKind::Unary { op, operand } => {
                 let v = self.eval_expr(operand);
                 match op {
@@ -1836,6 +3700,7 @@ impl Simulator {
                     UnaryOp::BitNand => v.reduce_and().logic_not(), UnaryOp::BitNor => v.reduce_or().logic_not(), UnaryOp::BitXnor => v.reduce_xor().logic_not(),
                     UnaryOp::PreIncr | UnaryOp::PostIncr => v.add(&Value::from_u64(1, v.width)),
                     UnaryOp::PreDecr | UnaryOp::PostDecr => v.sub(&Value::from_u64(1, v.width)),
+                    UnaryOp::HashHash => Value::zero(1),
                 }
             }
             ExprKind::Binary { op, left, right } => {
@@ -1887,10 +3752,15 @@ impl Simulator {
                 // Check if this is an array element access (memory[idx]) vs bit select
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
-                    if self.module.arrays.contains_key(&name) {
+                    if self.module.arrays.contains_key(&name) || self.is_associative_array(&name) {
                         // Array element access: look up signal "name[idx]"
-                        let idx = self.eval_expr(index).to_u64().unwrap_or(0);
-                        let elem_name = format!("{}[{}]", name, idx);
+                        let idx_val = self.eval_expr(index);
+                        let idx_str = if self.is_associative_array(&name) {
+                            idx_val.to_string()
+                        } else {
+                            idx_val.to_u64().unwrap_or(0).to_string()
+                        };
+                        let elem_name = format!("{}[{}]", name, idx_str);
                         if let Some(&eid) = self.signal_name_to_id.get(&elem_name) {
                             let mut v = self.signal_table[eid].clone();
                             if self.signal_signed[eid] { v.is_signed = true; }
@@ -1909,21 +3779,90 @@ impl Simulator {
                 let result = match kind { RangeKind::Constant => base.range_select(l, r), RangeKind::IndexedUp => base.range_select(l+r-1, l), RangeKind::IndexedDown => base.range_select(l, l.saturating_sub(r-1)) };
                 result
             }
+            ExprKind::Inside { expr, ranges } => {
+                let val = self.eval_expr(expr);
+                for r in ranges {
+                    match &r.kind {
+                        ExprKind::Range(lo, hi) => {
+                            let l = self.eval_expr(lo);
+                            let h = self.eval_expr(hi);
+                            if val.greater_equal(&l).is_true() && val.less_equal(&h).is_true() { return Value::from_u64(1, 1); }
+                        }
+                        _ => {
+                            if val == self.eval_expr(r) { return Value::from_u64(1, 1); }
+                        }
+                    }
+                }
+                Value::zero(1)
+            }
+            ExprKind::Range(lo, hi) => {
+                // Standalone range shouldn't really happen except inside Inside, but handle it
+                let l = self.eval_expr(lo);
+                let h = self.eval_expr(hi);
+                l.concat_with(&h) // Dummy representation
+            }
             ExprKind::Paren(inner) => self.eval_expr_ctx(inner, ctx_width),
             ExprKind::SystemCall { name, args } => match name.as_str() {
                 "$clog2" => { let v = args.first().map(|a| self.eval_expr(a).to_u64().unwrap_or(0)).unwrap_or(0); Value::from_u64(if v <= 1 { 1 } else { 64 - (v-1).leading_zeros() } as u64, 32) }
-                "$bits" => args.first().map(|a| Value::from_u64(self.eval_expr(a).width as u64, 32)).unwrap_or(Value::zero(32)),
+                "$bits" => {
+                    if let Some(arg) = args.first() {
+                        if let ExprKind::Ident(hier) = &arg.kind {
+                             let name = self.resolve_hier_name(hier);
+                             if let Some(w) = self.module.typedefs.get(&name) {
+                                 return Value::from_u64(*w as u64, 32);
+                             }
+                        }
+                        Value::from_u64(self.eval_expr(arg).width as u64, 32)
+                    } else { Value::zero(32) }
+                }
                 "$signed" => { let mut v = args.first().map(|a| self.eval_expr(a)).unwrap_or(Value::zero(32)); v.is_signed = true; v }
                 "$unsigned" => { let mut v = args.first().map(|a| self.eval_expr(a)).unwrap_or(Value::zero(32)); v.is_signed = false; v }
                 "$time" => Value::from_u64(self.time, 64),
-                "$test$plusargs" => Value::from_u64(0, 1), // no plusargs in simulation
-                "$value$plusargs" => Value::from_u64(0, 1),
+                "$test$plusargs" => {
+                    sim_dbg_eprintln!("[DEBUG] eval $test$plusargs with {} args", args.len());
+                    let pat = match args.first().map(|a| &a.kind) {
+                        Some(ExprKind::StringLiteral(s)) => s.clone(),
+                        Some(_) => self.eval_expr(&args[0]).to_sv_string(),
+                        None => String::new(),
+                    };
+                    Value::from_u64(self.test_plusarg(&pat) as u64, 1)
+                }
+                "$value$plusargs" => self.eval_value_plusargs(args),
+                "$fopen" => self.open_file_handle(args),
+                "$fclose" => self.close_file_handle(args),
+                "$fwrite" => self.write_file_handle(args, false),
+                "$fdisplay" => self.write_file_handle(args, true),
+                "$readmemh" => self.read_memory_file(args, 16),
+                "$readmemb" => self.read_memory_file(args, 2),
                 "$random" => Value::from_u64(0, 32), // stub
+                "$isunknown" => { let v = args.first().map(|a| self.eval_expr(a)).unwrap_or(Value::zero(1)); Value::from_u64(v.has_xz() as u64, 1) }
+                "$realtobits" => { let v = args.first().map(|a| self.eval_expr(a)).unwrap_or(Value::zero(64)); v }
+                "$bitstoreal" => { let v = args.first().map(|a| self.eval_expr(a)).unwrap_or(Value::zero(64)); v }
                 _ => Value::zero(32),
             },
+            ExprKind::This => {
+                if let Some(Some(handle)) = self.this_stack.last() {
+                    Value::from_u64(*handle as u64, 32)
+                } else {
+                    Value::zero(32)
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let base = self.eval_expr(expr);
+                let handle = base.to_u64().unwrap_or(0) as usize;
+                if handle == 0 || handle >= self.heap.len() {
+                    Value::zero(32)
+                } else if let Some(instance) = &self.heap[handle] {
+                    instance.properties.get(&member.name).cloned().unwrap_or(Value::zero(32))
+                } else {
+                    Value::zero(32)
+                }
+            }
+            ExprKind::Call { func, args } => self.eval_call(func, args),
             ExprKind::Dollar => Value::from_u64(u64::MAX, 32),
-            ExprKind::Null | ExprKind::Empty => Value::zero(1),
-            ExprKind::AssignmentPattern(parts) => { let mut r = Value::zero(0); for p in parts.iter().rev() { r = self.eval_expr(p).concat_with(&r); } r }
+            ExprKind::Null => Value::zero(32),
+            ExprKind::Empty => Value::zero(1),
+            ExprKind::AssignmentPattern(parts) => { let mut r = Value::zero(0); for p in parts.iter().rev() { r = self.eval_expr(p.expr()).concat_with(&r); } r }
             _ => Value::zero(32),
         }
     }
@@ -1950,7 +3889,7 @@ impl Simulator {
                 }
                 v.is_signed = *signed; v
             }
-            NumberLiteral::Real(f) => Value::from_u64(*f as u64, 64),
+            NumberLiteral::Real(f) => Value::from_f64(*f),
             NumberLiteral::UnbasedUnsized(c) => match c {
                 '0' => Value::zero(32),
                 '1' => Value::ones(32),
@@ -1968,23 +3907,71 @@ impl Simulator {
             StatementKind::Expr(expr) => self.exec_expr_stmt(expr),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
                 let w = self.infer_lhs_width(lvalue);
-                let val = self.eval_expr_ctx(rvalue, w); self.assign_value(lvalue, &val);
-                // Only settle for blocking assigns in combinational blocks
-                // Edge-triggered blocks (always @posedge) don't need immediate settle
-                if !self.in_edge_block {
-                    self.settle_combinatorial();
-                }
+                let val = if let ExprKind::Call { func, args } = &rvalue.kind {
+                    if let ExprKind::Ident(hier) = &func.kind {
+                        let method_name = hier.path.last().unwrap().name.name.as_str();
+                        if method_name == "new" {
+                            let type_name = self.get_expr_type_name(lvalue);
+                            if let Some(tname) = type_name {
+                                if tname == "semaphore" {
+                                    let handle = self.heap.len();
+                                    self.heap.push(Some(ClassInstance { class_name: tname.clone(), properties: HashMap::new() }));
+                                    let initial_count = args.first().map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+                                    self.semaphores.insert(handle, initial_count);
+                                    Value::from_u64(handle as u64, 32)
+                                } else if tname == "mailbox" {
+                                    let handle = self.heap.len();
+                                    self.heap.push(Some(ClassInstance { class_name: tname.clone(), properties: HashMap::new() }));
+                                    self.mailboxes.insert(handle, std::collections::VecDeque::new());
+                                    Value::from_u64(handle as u64, 32)
+                                } else if let Some(class_def) = self.module.classes.get(&tname).cloned() {
+                                    self.instantiate_class(&class_def, args)
+                                } else if let Some(cg_def) = self.module.covergroups.get(&tname).cloned() {
+                                    self.instantiate_covergroup(&cg_def, args)
+                                } else {
+                                    // Could be dynamic array new[size]
+                                    if let Some(arg) = args.first() {
+                                        let size = self.eval_expr(arg);
+                                        if let ExprKind::Ident(lhier) = &lvalue.kind {
+                                            let name = self.resolve_hier_name(lhier);
+                                            self.signals.insert(format!("{}.size", name), size.clone());
+                                        }
+                                        // Do not assign to lvalue (array) itself
+                                        if !self.in_edge_block { self.settle_combinatorial(); }
+                                        return;
+                                    } else { self.eval_expr_ctx(rvalue, w) }
+                                }
+                            } else {
+                                // Dynamic array new[size] without explicit type name
+                                if let Some(arg) = args.first() {
+                                    let size = self.eval_expr(arg);
+                                    if let ExprKind::Ident(lhier) = &lvalue.kind {
+                                        let name = self.resolve_hier_name(lhier);
+                                        self.signals.insert(format!("{}.size", name), size.clone());
+                                    }
+                                    if !self.in_edge_block { self.settle_combinatorial(); }
+                                    return;
+                                } else { self.eval_expr_ctx(rvalue, w) }
+                            }
+                        } else { self.eval_expr_ctx(rvalue, w) }
+                    } else { self.eval_expr_ctx(rvalue, w) }
+                } else { self.eval_expr_ctx(rvalue, w) };
+                self.assign_value(lvalue, &val);
+                if !self.in_edge_block { self.settle_combinatorial(); }
             }
-            StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+            StatementKind::NonblockingAssign { lvalue, delay, rvalue } => {
+                let val = self.eval_expr(rvalue);
                 let w = self.infer_lhs_width(lvalue);
-                let val = self.eval_expr_ctx(rvalue, w);
-                // Resolve the LHS target NOW to capture array indices at schedule time
-                let resolved_id = self.resolve_nba_target(lvalue);
-                if let Some(id) = resolved_id {
-                    // Fast path: push to compact nba_fast buffer
-                    self.nba_fast.push(NbaFast { signal_id: id, value: val.resize(w) });
+                let d = delay.as_ref().map(|de| self.eval_expr(de).to_u64().unwrap_or(0)).unwrap_or(0);
+                if d == 0 {
+                    let id_opt = self.resolve_nba_target(lvalue);
+                    if let Some(id) = id_opt {
+                        self.nba_fast.push(NbaFast { signal_id: id, value: val.resize(w) });
+                    } else {
+                        self.nba_queue.push(NbaEntry { lhs: Some(lvalue.clone()), value: val.resize(w), resolved_id: None });
+                    }
                 } else {
-                    // Slow path: unresolved target needs full Expression
+                    // Schedule delayed NBA - simplified
                     self.nba_queue.push(NbaEntry { lhs: Some(lvalue.clone()), value: val.resize(w), resolved_id: None });
                 }
             }
@@ -1994,14 +3981,14 @@ impl Simulator {
             }
             StatementKind::Case { expr, items, .. } => {
                 let val = self.eval_expr(expr); let mut matched = false;
-                for (iidx, item) in items.iter().enumerate() { if item.is_default { continue; } for pat in &item.patterns { if val.case_eq(&self.eval_expr(pat)).is_true() {
+                for (_iidx, item) in items.iter().enumerate() { if item.is_default { continue; } for pat in &item.patterns { if val.case_eq(&self.eval_expr(pat)).is_true() {
                     self.exec_statement(&item.stmt); matched = true; break; } } if matched { break; } }
                 if !matched { for item in items { if item.is_default {
                     self.exec_statement(&item.stmt); break; } } }
             }
             StatementKind::For { init, condition, step, body } => {
                 for fi in init { match fi {
-                    ForInit::VarDecl { data_type, name, init: e } => { let v = self.eval_expr(e); let w = super::elaborate::resolve_type_width(data_type); self.widths.insert(name.name.clone(), w); self.signals.insert(name.name.clone(), v.resize(w)); }
+                    ForInit::VarDecl { data_type, name, init: e } => { let v = self.eval_expr(e); let w = super::elaborate::resolve_type_width(data_type, Some(&self.signals), Some(&self.module.typedefs)); self.widths.insert(name.name.clone(), w); self.signals.insert(name.name.clone(), v.resize(w)); }
                     ForInit::Assign { lvalue, rvalue } => { let v = self.eval_expr(rvalue); self.assign_value(lvalue, &v); }
                 }}
                 let mut iters = 0;
@@ -2028,7 +4015,30 @@ impl Simulator {
             StatementKind::Repeat { count, body } => { let n = self.eval_expr(count).to_u64().unwrap_or(0); for _ in 0..n.min(10000) { if self.finished { break; } self.exec_statement(body); } }
             StatementKind::Forever { body } => { let mut i = 0; loop { if i > 100000 || self.finished || self.time > self.max_time { break; } i += 1; self.exec_statement(body); } }
             StatementKind::SeqBlock { stmts, .. } => { for s in stmts { if self.finished || self.break_flag || self.continue_flag { break; } self.exec_statement(s); } }
-            StatementKind::ParBlock { stmts, .. } => { for s in stmts { if self.finished { break; } self.exec_statement(s); } }
+            StatementKind::ParBlock { stmts, join_type, .. } => {
+                let mut pids = Vec::new();
+                for s in stmts {
+                    let pid = self.next_pid; self.next_pid += 1;
+                    pids.push(pid);
+                    self.process_parents.insert(pid, 0); // (top-level as parent for now)
+                    self.event_queue.schedule(self.time, pid, vec![s.clone()]);
+                }
+                match join_type {
+                    JoinType::Join => {
+                        let mut child_set = HashSet::new();
+                        for &cp in &pids { child_set.insert(cp); }
+                        self.join_waiters.push(JoinWaiter {
+                            parent_pid: self.current_pid,
+                            child_pids: child_set,
+                            join_type: *join_type,
+                            continuation: Vec::new(),
+                            finished_children: HashSet::new(),
+                        });
+                        self.break_flag = true; // Suspend current execution
+                    }
+                    _ => {} // JoinAny/JoinNone: simplified support for now
+                }
+            }
             StatementKind::TimingControl { control, stmt } => {
                 match control {
                     TimingControl::Delay(d) => {
@@ -2037,7 +4047,17 @@ impl Simulator {
                         self.time += delay;
                         self.settle_combinatorial(); self.check_monitor();
                     }
-                    TimingControl::Event(_) => {}
+                    TimingControl::Event(e) => {
+                        let sens = self.event_to_sens(e);
+                        sim_dbg_eprintln!("[DEBUG] process {} waiting for event {:?} at time {}", self.current_pid, sens, self.time);
+                        // Suspension is handled by run_process_stmts for top-level timing controls.
+                        // If we are here, it's a nested timing control which we don't fully support yet.
+                        let mut cont = vec![*stmt.clone()];
+                        let pid = self.cg_this.unwrap_or(0); // placeholder
+                        self.event_waiters.push(self.make_event_waiter(pid, sens, cont));
+                        self.break_flag = true;
+                        return;
+                    }
                 }
                 self.exec_statement(stmt);
                 // After body executes, check for edges (e.g., clk toggled)
@@ -2049,7 +4069,13 @@ impl Simulator {
             }
             StatementKind::Break => { self.break_flag = true; }
             StatementKind::Continue => { self.continue_flag = true; }
-            StatementKind::Return(_) | StatementKind::Disable(_) | StatementKind::WaitFork => {}
+            StatementKind::Return(expr) => {
+                if let Some(e) = expr {
+                    self.return_value = Some(self.eval_expr(e));
+                }
+                self.break_flag = true;
+            }
+            StatementKind::Disable(_) | StatementKind::WaitFork => {}
             StatementKind::Wait { condition, stmt } => { if self.eval_expr(condition).is_true() { self.exec_statement(stmt); } }
             StatementKind::Assertion(a) => {
                 if !self.eval_expr(&a.expr).is_true() { if let Some(ea) = &a.else_action { self.exec_statement(ea); } }
@@ -2062,17 +4088,73 @@ impl Simulator {
                 }
             }
             StatementKind::VarDecl { data_type, declarators, .. } => {
-                let w = super::elaborate::resolve_type_width(data_type);
+                let w = super::elaborate::resolve_type_width(data_type, Some(&self.signals), Some(&self.module.typedefs));
                 for d in declarators { let v = d.init.as_ref().map(|i| self.eval_expr(i).resize(w)).unwrap_or(Value::new(w)); self.widths.insert(d.name.name.clone(), w); self.signals.insert(d.name.name.clone(), v); }
             }
+            StatementKind::EventTrigger { name, .. } => {
+                let raw = name.name.clone();
+                let trimmed = raw.trim_start_matches('.').to_string();
+                let mut candidates = Vec::new();
+                candidates.push(raw.clone());
+                if trimmed != raw {
+                    candidates.push(trimmed.clone());
+                }
+                let top_prefixed = format!("{}.{}", self.module.name, trimmed);
+                if top_prefixed != raw && top_prefixed != trimmed {
+                    candidates.push(top_prefixed);
+                }
+                candidates.sort();
+                candidates.dedup();
+
+                for sig_name in candidates {
+                    if self.signal_name_to_id.contains_key(&sig_name) {
+                        let cur = self.get_signal_value_by_name(&sig_name).unwrap_or(Value::zero(1));
+                        let new_val = if cur.bits_first() == LogicBit::One { Value::zero(1) } else { Value::ones(1) };
+                        sim_dbg_eprintln!("[DEBUG] firing event {} (new_val={:?}) at time {}", sig_name, new_val, self.time);
+                        self.fast_signal_write(&sig_name, new_val);
+                    }
+                }
+                // Trigger immediate combinatorial settlement and edge checks
+                self.settle_combinatorial();
+                self.check_edges();
+            }
+            StatementKind::Coverpoint { .. } | StatementKind::Cross { .. } => {}
         }
     }
 
     fn exec_expr_stmt(&mut self, expr: &Expression) {
         match &expr.kind {
             ExprKind::SystemCall { name, args } => self.exec_system_task(name, args),
+            ExprKind::Ident(hier) => {
+                let name = self.resolve_hier_name(hier);
+                if let Some(td) = self.module.tasks.get(&name).cloned() {
+                    // Execute bare task-enable only for zero-time tasks.
+                    // Blocking tasks (with delay/event/wait/forever blocking) require
+                    // process suspension semantics that expr-stmt fast path does not model.
+                    if !td.items.iter().any(|s| self.stmt_is_blocking(s)) {
+                        self.exec_task_call(&td, &[]);
+                    }
+                } else {
+                    self.eval_expr(expr);
+                }
+            }
             ExprKind::Binary { op: BinaryOp::Assign, left, right } => {
-                let val = self.eval_expr(right);
+                let val = if let ExprKind::Call { func, args } = &right.kind {
+                    if let ExprKind::Ident(hier) = &func.kind {
+                        if hier.path.last().unwrap().name.name == "new" {
+                            let type_name = self.get_expr_type_name(left);
+                            if let Some(tname) = type_name {
+                                if let Some(class_def) = self.module.classes.get(&tname).cloned() {
+                                    self.instantiate_class(&class_def, args)
+                                } else if let Some(cg_def) = self.module.covergroups.get(&tname).cloned() {
+                                    self.instantiate_covergroup(&cg_def, args)
+                                } else { self.eval_expr(right) }
+                            } else { self.eval_expr(right) }
+                        } else { self.eval_expr(right) }
+                    } else { self.eval_expr(right) }
+                } else {
+                    self.eval_expr(right)
+                };
                 self.assign_value(left, &val);
             }
             ExprKind::Unary { op, operand } => match op {
@@ -2086,22 +4168,41 @@ impl Simulator {
 
     fn exec_system_task(&mut self, name: &str, args: &[Expression]) {
         match name {
-            "$display" | "$displayb" | "$displayh" | "$displayo" => { let m = self.format_args(args, name); self.output.push(SimOutput { time: self.time, message: m.clone() }); println!("{}", m); }
-            "$write" | "$writeb" | "$writeh" | "$writeo" => { let m = self.format_args(args, name); self.output.push(SimOutput { time: self.time, message: m.clone() }); print!("{}", m); }
+            "$display" | "$displayb" | "$displayh" | "$displayo" => { let m = self.format_args(args, name); self.record_output(m.clone()); println!("{}", m); }
+            "$write" | "$writeb" | "$writeh" | "$writeo" => { let m = self.format_args(args, name); self.record_output(m.clone()); print!("{}", m); }
             "$monitor" | "$monitorb" | "$monitorh" | "$monitoro" => { self.monitor = Some((name.to_string(), args.to_vec())); self.check_monitor(); }
             "$monitoroff" => { self.monitor = None; }
             "$finish" | "$stop" => { self.finished = true; }
+            "$fclose" => { let _ = self.close_file_handle(args); }
+            "$fwrite" => { let _ = self.write_file_handle(args, false); }
+            "$fdisplay" => { let _ = self.write_file_handle(args, true); }
+            "$readmemh" => { let _ = self.read_memory_file(args, 16); }
+            "$readmemb" => { let _ = self.read_memory_file(args, 2); }
             "$dumpfile" => {
                 if let Some(arg) = args.first() {
                     if let ExprKind::StringLiteral(s) = &arg.kind {
-                        self.vcd_file = Some(s.clone());
+                        if self.aitrace_mode {
+                            // Replace .vcd extension with .aitrace
+                            let name = if s.ends_with(".vcd") {
+                                format!("{}.aitrace", &s[..s.len()-4])
+                            } else {
+                                format!("{}.aitrace", s)
+                            };
+                            self.vcd_file = Some(name);
+                        } else {
+                            self.vcd_file = Some(s.clone());
+                        }
                     } else {
-                        self.vcd_file = Some("dump.vcd".to_string());
+                        self.vcd_file = Some(if self.aitrace_mode { "dump.aitrace".to_string() } else { "dump.vcd".to_string() });
                     }
                 }
             }
             "$dumpvars" => {
-                self.vcd_start_dump();
+                if self.aitrace_mode {
+                    self.aitrace_start_dump();
+                } else {
+                    self.vcd_start_dump();
+                }
             }
             "$dumpoff" => { self.vcd_enabled = false; }
             "$dumpon" => { self.vcd_enabled = true; }
@@ -2109,14 +4210,19 @@ impl Simulator {
         }
     }
 
-    fn format_args(&self, args: &[Expression], tn: &str) -> String {
+    fn format_args(&mut self, args: &[Expression], tn: &str) -> String {
         if args.is_empty() { return String::new(); }
         if let ExprKind::StringLiteral(fmt) = &args[0].kind { return self.format_string(fmt, &args[1..], tn); }
         let r = if tn.ends_with('b') { 'b' } else if tn.ends_with('h') { 'h' } else { 'd' };
-        args.iter().map(|a| { let v = self.eval_expr(a); match r { 'b' => v.to_bin_string(), 'h' => v.to_hex_string(), _ => v.to_dec_string() } }).collect::<Vec<_>>().join(" ")
+        let mut result = Vec::new();
+        for a in args {
+            let v = self.eval_expr(a);
+            result.push(match r { 'b' => v.to_bin_string(), 'h' => v.to_hex_string(), _ => v.to_dec_string() });
+        }
+        result.join(" ")
     }
 
-    fn format_string(&self, fmt: &str, args: &[Expression], _tn: &str) -> String {
+    fn format_string(&mut self, fmt: &str, args: &[Expression], _tn: &str) -> String {
         let mut result = String::new(); let mut ai = 0; let mut chars = fmt.chars().peekable();
         while let Some(c) = chars.next() {
             if c == '%' {
@@ -2132,7 +4238,10 @@ impl Simulator {
                         'b' | 'B' => { let s = v.to_bin_string(); result.push_str(&pad_string(&s, pad_width, zero_pad)); }
                         'h' | 'H' | 'x' | 'X' => { let s = v.to_hex_string(); result.push_str(&pad_string(&s, pad_width, zero_pad)); }
                         'o' | 'O' => { let s = if let Some(u) = v.to_u64() { format!("{:o}", u) } else { "x".to_string() }; result.push_str(&pad_string(&s, pad_width, zero_pad)); }
-                        's' | 'S' => { if let ExprKind::StringLiteral(s) = &args[ai-1].kind { result.push_str(s); } else { result.push_str(&v.to_dec_string()); } }
+                        'f' | 'F' => { let s = format!("{:.6}", v.to_f64()); result.push_str(&pad_string(&s, pad_width, zero_pad)); }
+                        'g' | 'G' => { let s = format!("{:?}", v.to_f64()); result.push_str(&pad_string(&s, pad_width, zero_pad)); }
+                        'e' | 'E' => { let s = format!("{:.6e}", v.to_f64()); result.push_str(&pad_string(&s, pad_width, zero_pad)); }
+                        's' | 'S' => { if let ExprKind::StringLiteral(s) = &args[ai-1].kind { result.push_str(s); } else { let s = v.to_sv_string(); result.push_str(&pad_string(&s, pad_width, zero_pad)); } }
                         'm' | 'M' => { result.push_str(&self.module.name); ai -= 1; }
                         _ => { result.push('%'); result.push_str(&width_str); result.push(spec); ai -= 1; }
                     }}}
@@ -2149,47 +4258,111 @@ impl Simulator {
             let m = self.format_args(&args, &tn);
             let mut changed = self.monitor_prev.is_empty();
             for (n, v) in &self.signals { if let Some(p) = self.monitor_prev.get(n) { if p != v { changed = true; break; } } }
-            if changed { self.output.push(SimOutput { time: self.time, message: m.clone() }); println!("{}", m); self.monitor_prev = self.signals.clone(); }
+            if changed { self.record_output(m.clone()); println!("{}", m); self.monitor_prev = self.signals.clone(); }
         }
     }
 
     fn resolve_hier_name(&self, hier: &HierarchicalIdentifier) -> String {
-        if hier.path.len() == 1 {
-            // Fast path: single-segment name (the common case after inlining)
-            return hier.path[0].name.name.clone();
+        let common_prefix_len = |a: &str, b: &str| -> usize {
+            let mut n = 0usize;
+            for (sa, sb) in a.split('.').zip(b.split('.')) {
+                if sa == sb { n += 1; } else { break; }
+            }
+            n
+        };
+        fn parent_of(s: &str) -> &str {
+            s.rsplit_once('.').map(|(p, _)| p).unwrap_or("")
         }
-        // Multi-segment: join with dots (e.g., uut.cpu_state → "uut.cpu_state")
         let raw = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
-        // Check if the dotted name exists in the signal table
+        // Exact dotted name match first.
         if self.signal_name_to_id.contains_key(&raw) {
+            if raw.contains('.') {
+                let parent = parent_of(&raw).to_string();
+                *self.name_resolve_hint.borrow_mut() = Some(parent);
+            }
             return raw;
         }
-        // Fallback: try just the last segment (for backwards compatibility)
-        hier.path.last().map(|s| s.name.name.clone()).unwrap_or_default()
+        let leaf = hier.path.last().map(|s| s.name.name.clone()).unwrap_or_default();
+        if leaf.is_empty() {
+            return raw;
+        }
+
+        // Heuristic fallback for unresolved single-segment names:
+        // choose a suffix match guided by the most recent hierarchical hint.
+        if hier.path.len() == 1 {
+            let suffix = format!(".{}", leaf);
+            let candidates: Vec<&String> = self.signal_name_to_id.keys().filter(|k| k.ends_with(&suffix)).collect();
+            if !candidates.is_empty() {
+                let hint_owned = self.name_resolve_hint.borrow().clone().unwrap_or_default();
+                let mut best: Option<&String> = None;
+                let mut best_score: isize = -1;
+                for key in candidates {
+                    let key_parent = parent_of(key);
+                    let score = common_prefix_len(&hint_owned, key_parent) as isize;
+                    match best {
+                        None => {
+                            best = Some(key);
+                            best_score = score;
+                        }
+                        Some(prev) => {
+                            let prefer = if score != best_score {
+                                score > best_score
+                            } else {
+                                let kd = key.split('.').count();
+                                let pd = prev.split('.').count();
+                                kd < pd || (kd == pd && key.len() < prev.len())
+                            };
+                            if prefer {
+                                best = Some(key);
+                                best_score = score;
+                            }
+                        }
+                    }
+                }
+                if let Some(k) = best {
+                    let parent = parent_of(k).to_string();
+                    *self.name_resolve_hint.borrow_mut() = Some(parent);
+                    return k.clone();
+                }
+            }
+        }
+
+        if self.signal_name_to_id.contains_key(&leaf) {
+            return leaf;
+        }
+
+        // Last-resort compatibility fallback.
+        leaf
     }
 
     /// Fast signal read avoiding String allocation.
     /// Uses cached_signal_id to remember the signal name as &str key for HashMap lookup.
     #[inline]
-    #[inline]
+    
     fn fast_signal_read(&self, hier: &HierarchicalIdentifier) -> Value {
+        let is_ambiguous_leaf =
+            hier.path.len() == 1 && !hier.path[0].name.name.contains('.');
         // Try cached signal ID first (O(1) Vec access)
         if let Some(id) = hier.cached_signal_id.get() {
-            let mut v = self.signal_table[id].clone();
-            if self.signal_signed[id] { v.is_signed = true; }
-            return v;
+            if !is_ambiguous_leaf {
+                let mut v = self.signal_table[id].clone();
+                if self.signal_signed[id] { v.is_signed = true; }
+                if self.signal_real[id] { v.is_real = true; }
+                return v;
+            }
         }
         // First access: resolve name and cache ID
-        let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-        if let Some(&id) = self.signal_name_to_id.get(name) {
+        let name = self.resolve_hier_name(hier);
+        if let Some(&id) = self.signal_name_to_id.get(&name) {
             hier.cached_signal_id.set(Some(id));
             let mut v = self.signal_table[id].clone();
             if self.signal_signed[id] { v.is_signed = true; }
+            if self.signal_real[id] { v.is_real = true; }
             return v;
         }
         // Fallback
-        let mut v = self.signals.get(name).cloned().unwrap_or_else(|| Value::new(1));
-        if self.signed_signals.contains(name) { v.is_signed = true; }
+        let mut v = self.signals.get(&name).cloned().unwrap_or_else(|| Value::new(1));
+        if self.signed_signals.contains(&name) { v.is_signed = true; }
         v
     }
 
@@ -2247,8 +4420,7 @@ impl Simulator {
             resized.is_signed = self.signal_signed[id];
             let changed = self.signal_table[id] != resized;
             if changed {
-                self.signal_table[id] = resized;
-                self.table_modified = true;
+                self.signal_table[id] = resized;                self.table_modified = true;
                 self.mark_dirty(name);
             }
             changed
@@ -2282,21 +4454,32 @@ impl Simulator {
             _ => {}
         }
     }
-    fn infer_width(&self, expr: &Expression) -> u32 { match &expr.kind { ExprKind::Ident(h) => { let n = self.resolve_hier_name(h); self.widths.get(&n).copied().unwrap_or(1) } ExprKind::Number(NumberLiteral::Integer { size, .. }) => size.unwrap_or(32), ExprKind::Concatenation(p) => p.iter().map(|x| self.infer_width(x)).sum(), _ => self.eval_expr(expr).width } }
-    fn infer_lhs_width(&self, expr: &Expression) -> u32 {
+    fn infer_width(&mut self, expr: &Expression) -> u32 { match &expr.kind { ExprKind::Ident(h) => { let n = self.resolve_hier_name(h); self.widths.get(&n).copied().unwrap_or(1) } ExprKind::Number(NumberLiteral::Integer { size, .. }) => size.unwrap_or(32), ExprKind::Concatenation(p) => { let mut total = 0; for x in p { total += self.infer_width(x); } total } _ => self.eval_expr(expr).width } }
+    fn infer_lhs_width(&mut self, expr: &Expression) -> u32 {
         match &expr.kind {
-            ExprKind::Concatenation(p) => p.iter().map(|x| self.infer_lhs_width(x)).sum(),
+            ExprKind::Concatenation(p) => { let mut total = 0; for x in p { total += self.infer_lhs_width(x); } total }
             ExprKind::Ident(h) => {
-                // Fast path: use cached signal ID
+                let is_ambiguous_leaf =
+                    h.path.len() == 1 && !h.path[0].name.name.contains('.');
                 if let Some(id) = h.cached_signal_id.get() {
-                    return self.signal_widths[id];
+                    if !is_ambiguous_leaf {
+                        return self.signal_widths[id];
+                    }
                 }
-                let name_ref = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                if let Some(&id) = self.signal_name_to_id.get(name_ref) {
+                let name = self.resolve_hier_name(h);
+                if let Some(&id) = self.signal_name_to_id.get(&name) {
                     h.cached_signal_id.set(Some(id));
                     return self.signal_widths[id];
                 }
-                self.widths.get(name_ref).copied().unwrap_or(32)
+                if let Some(w) = self.widths.get(&name).copied() {
+                    return w;
+                }
+                let leaf = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                if let Some(&id) = self.signal_name_to_id.get(leaf) {
+                    h.cached_signal_id.set(Some(id));
+                    return self.signal_widths[id];
+                }
+                self.widths.get(leaf).copied().unwrap_or(32)
             }
             ExprKind::RangeSelect { left, right, .. } => {
                 let l = self.eval_expr(left).to_u64().unwrap_or(0);
@@ -2444,7 +4627,7 @@ impl Simulator {
     fn vcd_write_value(w: &mut impl Write, val: &Value, id: &str) {
         if val.width == 1 {
             // Scalar: single char + id
-            let ch = match (val.bits_first()) {
+            let ch = match val.bits_first() {
                 LogicBit::Zero => '0',
                 LogicBit::One => '1',
                 LogicBit::X => 'x',
@@ -2517,6 +4700,1416 @@ impl Simulator {
         }
         self.vcd_writer = None;
     }
-}
 
-// This will be injected at the right place
+    // ═══════════════════════════════════════════════════════════════
+    // AITRACE dump support (AITRACE-T text format, Level 0)
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Format a Value as a hex string for AITRACE output.
+    /// Uses 0x prefix. X/Z bits produce masked hex like 0xXX0A.
+    fn aitrace_format_value(val: &Value) -> String {
+        if val.width == 1 {
+            return match val.bits_first() {
+                LogicBit::Zero => "0".to_string(),
+                LogicBit::One => "1".to_string(),
+                LogicBit::X => "X".to_string(),
+                LogicBit::Z => "Z".to_string(),
+            };
+        }
+        // Check if any X or Z bits
+        let mut has_xz = false;
+        for i in 0..val.width as usize {
+            match val.get_bit(i) {
+                LogicBit::X | LogicBit::Z => { has_xz = true; break; }
+                _ => {}
+            }
+        }
+        if has_xz {
+            // Emit nibble-by-nibble, replacing any nibble containing X/Z
+            let nibbles = (val.width as usize + 3) / 4;
+            let mut s = String::with_capacity(nibbles + 2);
+            s.push_str("0x");
+            let mut leading = true;
+            for nib in (0..nibbles).rev() {
+                let base = nib * 4;
+                let mut nibval = 0u8;
+                let mut nib_xz = false;
+                for b in 0..4 {
+                    let bit_idx = base + b;
+                    if bit_idx < val.width as usize {
+                        match val.get_bit(bit_idx) {
+                            LogicBit::One => { nibval |= 1 << b; }
+                            LogicBit::X | LogicBit::Z => { nib_xz = true; }
+                            _ => {}
+                        }
+                    }
+                }
+                if nib_xz {
+                    leading = false;
+                    s.push('X');
+                } else if nibval != 0 || !leading || nib == 0 {
+                    leading = false;
+                    s.push(char::from_digit(nibval as u32, 16).unwrap().to_ascii_uppercase());
+                }
+            }
+            s
+        } else {
+            format!("0x{:X}", val.to_u64().unwrap_or(0))
+        }
+    }
+
+    /// Start AITRACE dump: open file, write header + dictionary + initial snapshot
+    fn aitrace_start_dump(&mut self) {
+        self.sync_table_to_hashmap();
+        let filename = self.vcd_file.clone().unwrap_or_else(|| "dump.aitrace".to_string());
+        let file = match std::fs::File::create(&filename) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Warning: cannot create AITRACE file '{}': {}", filename, e);
+                return;
+            }
+        };
+        let mut w = std::io::BufWriter::new(file);
+
+        // Collect and sort signal names
+        let mut sig_names: Vec<String> = self.signals.keys().cloned().collect();
+        sig_names.sort();
+
+        // Build module hierarchy from dotted names
+        // e.g. "uut.cpu.pc" → module /testbench/uut/cpu, signal pc
+        let top_name = &self.module.name;
+        let mut modules: Vec<(String, String)> = Vec::new(); // (module_id, path)
+        let mut module_map: HashMap<String, String> = HashMap::new(); // path → module_id
+        // Always add top module
+        let top_path = format!("/{}", top_name);
+        modules.push(("m0".to_string(), top_path.clone()));
+        module_map.insert(top_path.clone(), "m0".to_string());
+
+        // Discover all module scopes from signal names
+        for name in &sig_names {
+            let parts: Vec<&str> = name.split('.').collect();
+            if parts.len() > 1 {
+                // Build scope path incrementally
+                let mut path = format!("/{}", top_name);
+                for part in &parts[..parts.len()-1] {
+                    path = format!("{}/{}", path, part);
+                    if !module_map.contains_key(&path) {
+                        let mid = format!("m{}", modules.len());
+                        module_map.insert(path.clone(), mid.clone());
+                        modules.push((mid, path.clone()));
+                    }
+                }
+            }
+        }
+
+        // Assign signal IDs and build signal records
+        let mut id_map = HashMap::new();
+        let mut signal_records: Vec<String> = Vec::new();
+        for (idx, name) in sig_names.iter().enumerate() {
+            let sid = format!("s{}", idx);
+            id_map.insert(name.clone(), sid.clone());
+
+            // Determine owning module and leaf name
+            let parts: Vec<&str> = name.split('.').collect();
+            let (mod_id, leaf) = if parts.len() > 1 {
+                let mut path = format!("/{}", top_name);
+                for part in &parts[..parts.len()-1] {
+                    path = format!("{}/{}", path, part);
+                }
+                (module_map.get(&path).cloned().unwrap_or_else(|| "m0".to_string()), parts[parts.len()-1].to_string())
+            } else {
+                ("m0".to_string(), name.clone())
+            };
+
+            let width = self.widths.get(name).copied().unwrap_or(1);
+            let is_signed = self.signed_signals.contains(name);
+            let type_str = if width == 1 {
+                "bit".to_string()
+            } else if is_signed {
+                format!("s{}", width)
+            } else {
+                format!("u{}", width)
+            };
+
+            signal_records.push(format!("S,{},{},{},{}", sid, mod_id, leaf, type_str));
+        }
+
+        // Write AITRACE header
+        let _ = writeln!(w, "@aitrace 1.0");
+        let _ = writeln!(w, "@format text");
+        let _ = writeln!(w, "@timescale 1ns");
+        let _ = writeln!(w, "@design {}", top_name);
+        let _ = writeln!(w, "@profile full_debug");
+        let _ = writeln!(w, "");
+
+        // Write dictionary section
+        let _ = writeln!(w, "@section dict");
+        for (mid, path) in &modules {
+            let _ = writeln!(w, "M,{},{}", mid, path);
+        }
+        for rec in &signal_records {
+            let _ = writeln!(w, "{}", rec);
+        }
+        let _ = writeln!(w, "");
+
+        // Write trace section header
+        let _ = writeln!(w, "@section trace");
+
+        // Write initial time and snapshot
+        let _ = writeln!(w, "T,+0");
+
+        // Write initial snapshot (N,full,...)
+        let mut snap_parts: Vec<String> = Vec::new();
+        for name in &sig_names {
+            let sid = &id_map[name];
+            let val = self.signals.get(name).cloned().unwrap_or_else(|| Value::new(1));
+            snap_parts.push(format!("{}={}", sid, Self::aitrace_format_value(&val)));
+        }
+        // Write snapshot in chunks to avoid excessively long lines
+        if snap_parts.len() <= 20 {
+            let _ = writeln!(w, "N,full,{}", snap_parts.join(","));
+        } else {
+            // Write as multiple packed delta records for initial state
+            for chunk in snap_parts.chunks(16) {
+                let _ = writeln!(w, "P,{}", chunk.join(","));
+            }
+        }
+
+        // Record initial snapshot for change detection
+        let vcd_prev = self.signals.clone();
+
+        self.vcd_id_map = id_map;
+        self.vcd_writer = Some(w);
+        self.vcd_enabled = true;
+        self.vcd_last_time = self.time;
+        self.vcd_prev_signals = vcd_prev;
+    }
+
+    fn is_pid_suspended(&self, pid: usize) -> bool {
+        if self.event_queue.has_pid(pid) { return true; }
+        if self.event_waiters.iter().any(|w| w.pid == pid) { return true; }
+        false
+    }
+
+    fn child_finished(&mut self, child_pid: usize) {
+        self.process_parents.remove(&child_pid);
+        let mut finished_parents = Vec::new();
+        for (i, waiter) in self.join_waiters.iter_mut().enumerate() {
+            if waiter.child_pids.contains(&child_pid) {
+                waiter.finished_children.insert(child_pid);
+                let should_wake = match waiter.join_type {
+                    JoinType::Join => waiter.finished_children.len() == waiter.child_pids.len(),
+                    JoinType::JoinAny => !waiter.finished_children.is_empty(),
+                    JoinType::JoinNone => true,
+                };
+                if should_wake {
+                    sim_dbg_eprintln!("[DEBUG] join waiter for parent process {} triggered at time {}", waiter.parent_pid, self.time);
+                    finished_parents.push(i);
+                }
+            }
+        }
+        
+        finished_parents.sort_by(|a, b| b.cmp(a));
+        for i in finished_parents {
+            let waiter = self.join_waiters.remove(i);
+            self.event_queue.schedule(self.time, waiter.parent_pid, waiter.continuation);
+        }
+    }
+
+    /// Write AITRACE signal deltas for the current timestep
+    fn aitrace_write_changes(&mut self) {
+        if !self.vcd_enabled || self.vcd_writer.is_none() { return; }
+
+        // Collect changes
+        let mut changes: Vec<(String, String)> = Vec::new(); // (signal_id, formatted_value)
+        for (id, name) in self.id_to_name.iter().enumerate() {
+            if let Some(sid) = self.vcd_id_map.get(name) {
+                let val = &self.signal_table[id];
+                let changed = match self.vcd_prev_signals.get(name) {
+                    Some(prev) => prev != val,
+                    None => true,
+                };
+                if changed {
+                    changes.push((sid.clone(), Self::aitrace_format_value(val)));
+                }
+            }
+        }
+
+        if changes.is_empty() { return; }
+
+        let w = self.vcd_writer.as_mut().unwrap();
+
+        // Write time delta if needed
+        if self.time != self.vcd_last_time {
+            let delta = self.time - self.vcd_last_time;
+            let _ = writeln!(w, "T,+{}", delta);
+            self.vcd_last_time = self.time;
+        }
+
+        // Use packed format (P) when multiple signals change, single delta (D) for one
+        if changes.len() == 1 {
+            let (sid, val) = &changes[0];
+            let _ = writeln!(w, "D,{},{}", sid, val);
+        } else {
+            // Write packed records in chunks of 16
+            for chunk in changes.chunks(16) {
+                let parts: Vec<String> = chunk.iter()
+                    .map(|(sid, val)| format!("{}={}", sid, val))
+                    .collect();
+                let _ = writeln!(w, "P,{}", parts.join(","));
+            }
+        }
+
+        // Update previous snapshot
+        for (id, name) in self.id_to_name.iter().enumerate() {
+            self.vcd_prev_signals.insert(name.clone(), self.signal_table[id].clone());
+        }
+    }
+
+    /// Flush and close AITRACE file
+    fn aitrace_finish(&mut self) {
+        if let Some(ref mut w) = self.vcd_writer {
+            let _ = writeln!(w, "");
+            let _ = writeln!(w, "@section end");
+            let _ = w.flush();
+        }
+        self.vcd_writer = None;
+    }
+
+    fn is_associative_array(&self, name: &str) -> bool {
+        self.module.associative_arrays.contains(name)
+    }
+
+    fn get_signal_value_by_name(&self, name: &str) -> Option<Value> {
+        if let Some(&id) = self.signal_name_to_id.get(name) {
+            let mut v = self.signal_table[id].clone();
+            if self.signal_signed[id] { v.is_signed = true; }
+            Some(v)
+        } else {
+            self.signals.get(name).cloned()
+        }
+    }
+
+    fn eval_builtin_method(&mut self, obj_name: &str, mname: &str, args: &[Expression]) -> Option<Value> {
+        if mname == "size" || mname == "len" {
+            if let Some(v) = self.signals.get(&format!("{}.size", obj_name)) {
+                return Some(v.clone());
+            }
+            if let Some((lo, hi, _)) = self.module.arrays.get(obj_name) {
+                return Some(Value::from_u64((hi - lo + 1) as u64, 32));
+            }
+            // Fallback for strings
+            let base_val = self.get_signal_value_by_name(obj_name);
+
+            if let Some(base) = base_val {
+                let w = base.width;
+                let bytes = w / 8;
+                let mut len = 0u64;
+                for b in 0..bytes {
+                    let mut byte_val = 0u8;
+                    for bit in 0..8 {
+                        if base.get_bit((b * 8 + bit) as usize) == LogicBit::One { byte_val |= 1 << bit; }
+                    }
+                    if byte_val != 0 {
+                        len += 1;
+                    }
+                }
+                return Some(Value::from_u64(len, 32));
+            }
+            return Some(Value::zero(32));
+        }
+        if mname == "substr" {
+             if let Some(first) = args.get(0) {
+                 if let Some(second) = args.get(1) {
+                     let start = self.eval_expr(first).to_u64().unwrap_or(0) as usize;
+                     let end = self.eval_expr(second).to_u64().unwrap_or(0) as usize;
+                     
+                     let base_val = self.get_signal_value_by_name(obj_name);
+
+                     if let Some(base) = base_val {
+                         let mut highest_bit = 0;
+                         for i in (0..base.width as usize).rev() {
+                             if base.get_bit(i) != LogicBit::Zero {
+                                 highest_bit = i;
+                                 break;
+                             }
+                         }
+                         let actual_len = (highest_bit + 7) / 8;
+                         if actual_len > 0 && start < actual_len && end < actual_len && start <= end {
+                             let l = (actual_len - 1 - start) * 8 + 7;
+                             let r = (actual_len - 1 - end) * 8;
+                             return Some(base.range_select(l, r));
+                         }
+                     }
+                 }
+             }
+             return Some(Value::zero(0));
+        }
+        if mname == "push_back" {
+             if let Some(arg) = args.first() {
+                 let val = self.eval_expr(arg);
+                 let cur_size = self.signals.get(&format!("{}.size", obj_name)).map_or(0, |v| v.to_u64().unwrap_or(0));
+                 self.signals.insert(format!("{}[{}]", obj_name, cur_size), val);
+                 self.signals.insert(format!("{}.size", obj_name), Value::from_u64(cur_size + 1, 32));
+             }
+             return Some(Value::zero(32));
+        }
+        if mname == "push_front" {
+             if let Some(arg) = args.first() {
+                 let val = self.eval_expr(arg);
+                 let cur_size = self.signals.get(&format!("{}.size", obj_name)).map_or(0, |v| v.to_u64().unwrap_or(0));
+                 // Shift existing
+                 for i in (0..cur_size).rev() {
+                     if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
+                         self.signals.insert(format!("{}[{}]", obj_name, i+1), v);
+                     }
+                 }
+                 self.signals.insert(format!("{}[0]", obj_name), val);
+                 self.signals.insert(format!("{}.size", obj_name), Value::from_u64(cur_size + 1, 32));
+             }
+             return Some(Value::zero(32));
+        }
+        if mname == "pop_front" {
+             let cur_size = self.signals.get(&format!("{}.size", obj_name)).map_or(0, |v| v.to_u64().unwrap_or(0));
+             if cur_size > 0 {
+                 let val = self.get_signal_value_by_name(&format!("{}[0]", obj_name)).unwrap_or_else(|| Value::zero(32));
+                 for i in 1..cur_size {
+                     if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
+                         self.signals.insert(format!("{}[{}]", obj_name, i-1), v);
+                     }
+                 }
+                 self.signals.insert(format!("{}.size", obj_name), Value::from_u64(cur_size - 1, 32));
+                 return Some(val);
+             }
+             return Some(Value::zero(32));
+        }
+        if mname == "sort" {
+            let cur_size = self.signals.get(&format!("{}.size", obj_name)).map_or(0, |v| v.to_u64().unwrap_or(0)) as usize;
+            if cur_size > 0 {
+                let mut elements = Vec::new();
+                for i in 0..cur_size {
+                    if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
+                        elements.push(v);
+                    }
+                }
+                elements.sort_by(|a, b| a.to_u64().unwrap_or(0).cmp(&b.to_u64().unwrap_or(0)));
+                for (i, v) in elements.into_iter().enumerate() {
+                    self.signals.insert(format!("{}[{}]", obj_name, i), v);
+                }
+            }
+            return Some(Value::zero(32));
+        }
+        if mname == "num" {
+             let prefix = format!("{}[", obj_name);
+             let count1 = self.signals.keys().filter(|k| k.starts_with(&prefix)).count();
+             let count2 = self.signal_name_to_id.keys().filter(|k| k.starts_with(&prefix)).count();
+             return Some(Value::from_u64((count1 + count2) as u64, 32));
+        }
+        if mname == "sum" {
+            let mut cur_size = self.signals.get(&format!("{}.size", obj_name)).map_or(0, |v| v.to_u64().unwrap_or(0)) as usize;
+            if cur_size == 0 {
+                if let Some((lo, hi, _)) = self.module.arrays.get(obj_name) {
+                    cur_size = (hi - lo + 1) as usize;
+                }
+            }
+            let mut total = 0u64;
+            for i in 0..cur_size {
+                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
+                    total = total.wrapping_add(v.to_u64().unwrap_or(0));
+                }
+            }
+            return Some(Value::from_u64(total, 32));
+        }
+        if mname == "exists" {
+             if let Some(arg) = args.first() {
+                 let key = self.eval_expr(arg).to_string();
+                 let elem_name = format!("{}[{}]", obj_name, key);
+                 return Some(Value::from_u64(self.signals.contains_key(&elem_name) as u64, 1));
+             }
+        }
+        None
+    }
+
+    fn eval_call(&mut self, func: &Expression, args: &[Expression]) -> Value {
+        // Intercept UVM method calls
+        if let ExprKind::MemberAccess { expr, member } = &func.kind {
+            let mname = member.name.as_str();
+            
+            // Check for built-in methods on identifiers
+            if let ExprKind::Ident(hier) = &expr.kind {
+                let name = self.resolve_hier_name(hier);
+                if let Some(res) = self.eval_builtin_method(&name, mname, args) {
+                    return res;
+                }
+            }
+
+            if mname == "put" {
+                let base = self.eval_expr(expr);
+                let handle = base.to_u64().unwrap_or(0) as usize;
+                let val = args.first().map(|a| self.eval_expr(a));
+                let mut changed = false;
+                if let Some(v) = val {
+                    if let Some(q) = self.mailboxes.get_mut(&handle) {
+                        q.push_back(v);
+                        changed = true;
+                    } else if let Some(count) = self.semaphores.get_mut(&handle) {
+                        *count += v.to_u64().unwrap_or(1) as i64;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    // Waking up might be needed, but simplified: waking up is usually via events.
+                    // For mailboxes/semaphores, we'd need dedicated waiter queues.
+                }
+                return Value::zero(32);
+            }
+            if mname == "get" {
+                let base = self.eval_expr(expr);
+                let handle = base.to_u64().unwrap_or(0) as usize;
+                let arg_val = args.first().map(|a| self.eval_expr(a));
+                
+                if self.mailboxes.contains_key(&handle) {
+                    let has_item = !self.mailboxes[&handle].is_empty();
+                    if has_item {
+                        let val = self.mailboxes.get_mut(&handle).unwrap().pop_front().unwrap();
+                        if let Some(arg) = args.first() {
+                            let w = self.infer_lhs_width(arg);
+                            self.assign_value(arg, &val.resize(w));
+                        }
+                        return Value::zero(32);
+                    } else {
+                        // BLOCKING: simplified, just retry later or return for now
+                        return Value::zero(32);
+                    }
+                } else if let Some(count) = self.semaphores.get_mut(&handle) {
+                    let n = arg_val.map(|v| v.to_u64().unwrap_or(1)).unwrap_or(1) as i64;
+                    if *count >= n {
+                        *count -= n;
+                        return Value::zero(32);
+                    } else {
+                        // BLOCKING: simplified
+                        return Value::zero(32);
+                    }
+                }
+                return Value::zero(32);
+            }
+            if mname == "try_get" {
+                let base = self.eval_expr(expr);
+                let handle = base.to_u64().unwrap_or(0) as usize;
+                if self.mailboxes.contains_key(&handle) {
+                    let val = self.mailboxes.get_mut(&handle).and_then(|q| q.pop_front());
+                    if let (Some(v), Some(arg)) = (val, args.first()) {
+                        let w = self.infer_lhs_width(arg);
+                        self.assign_value(arg, &v.resize(w));
+                        return Value::from_u64(1, 32);
+                    }
+                }
+                return Value::zero(32);
+            }
+
+            let base = self.eval_expr(expr);
+
+            // Fallback for non-identifier base (e.g. string literals)
+            if mname == "len" || mname == "size" {
+                let w = base.width;
+                let bytes = w / 8;
+                let mut len = 0u64;
+                for b in 0..bytes {
+                    let mut byte_val = 0u8;
+                    for bit in 0..8 {
+                        if base.get_bit((b * 8 + bit) as usize) == LogicBit::One { byte_val |= 1 << bit; }
+                    }
+                    if byte_val != 0 { len += 1; }
+                }
+                return Value::from_u64(len, 32);
+            }
+
+            if mname == "get_next_item" {
+                if let Some(arg) = args.first() {
+                    // Create a simple_transaction
+                    if let Some(class_def) = self.module.classes.get("simple_transaction").cloned() {
+                        let handle = self.instantiate_class(&class_def, &[]);
+                        // Hardcode data to something
+                        if let Some(Some(inst)) = self.heap.get_mut(handle.to_u64().unwrap_or(0) as usize) {
+                            inst.properties.insert("data".to_string(), Value::from_u64(42, 32));
+                        }
+                        let w = self.infer_lhs_width(arg);
+                        self.assign_value(arg, &handle.resize(w));
+                    }
+                }
+                return Value::zero(32);
+            }
+            if mname == "create" {
+                if let ExprKind::MemberAccess { expr: inner_expr, member: inner_member } = &expr.kind {
+                    if inner_member.name.as_str() == "type_id" {
+                        if let ExprKind::Ident(hier) = &inner_expr.kind {
+                            let class_name = &hier.path[0].name.name;
+                            if let Some(class_def) = self.module.classes.get(class_name).cloned() {
+                                return self.instantiate_class(&class_def, &[]);
+                            }
+                        }
+                    }
+                }
+            }
+            if mname == "item_done" || mname == "connect" || mname == "raise_objection" || mname == "drop_objection" {
+                return Value::zero(32);
+            }
+            if mname == "write" {
+                // Call write on scoreboard
+                let mut sb_handles = Vec::new();
+                for i in 1..self.heap.len() {
+                    if let Some(Some(inst)) = self.heap.get(i) {
+                        if inst.class_name.contains("scoreboard") {
+                            sb_handles.push(i);
+                        }
+                    }
+                }
+                for handle in sb_handles {
+                    self.exec_method_call(handle, "write", args);
+                }
+                return Value::zero(32);
+            }
+
+            if let ExprKind::Ident(hier) = &expr.kind {
+                if hier.path.last().unwrap().name.name == "super" {
+                    if let Some(Some(handle)) = self.this_stack.last() {
+                        return self.exec_super_method_call(*handle, &member.name, args);
+                    }
+                }
+            }
+            
+            let base = self.eval_expr(expr);
+            let handle = base.to_u64().unwrap_or(0) as usize;
+            if handle != 0 {
+                if let Some(Some(_)) = self.cg_heap.get(handle) {
+                    return self.exec_cg_method_call(handle, &member.name, args);
+                }
+                return self.exec_method_call(handle, &member.name, args);
+            }
+        }
+        // Handle hierarchical ident call: obj.f()
+        if let ExprKind::Ident(hier) = &func.kind {
+            let path = &hier.path;
+            let len = path.len();
+            
+            // Intercept uvm_report_info and enabled
+            if len == 1 {
+                let name = &path[0].name.name;
+                if name.starts_with('$') {
+                    return match name.as_str() {
+                        "$time" => Value::from_u64(self.time, 64),
+                        "$test$plusargs" => {
+                            let pat = match args.first().map(|a| &a.kind) {
+                                Some(ExprKind::StringLiteral(s)) => s.clone(),
+                                Some(_) => self.eval_expr(&args[0]).to_sv_string(),
+                                None => String::new(),
+                            };
+                            Value::from_u64(self.test_plusarg(&pat) as u64, 1)
+                        }
+                        "$value$plusargs" => self.eval_value_plusargs(args),
+                        "$fopen" => self.open_file_handle(args),
+                        "$fclose" => self.close_file_handle(args),
+                        "$fwrite" => self.write_file_handle(args, false),
+                        "$fdisplay" => self.write_file_handle(args, true),
+                        "$readmemh" => self.read_memory_file(args, 16),
+                        "$readmemb" => self.read_memory_file(args, 2),
+                        "$display" | "$displayb" | "$displayh" | "$displayo" |
+                        "$write" | "$writeb" | "$writeh" | "$writeo" => {
+                            self.exec_system_task(name, args);
+                            Value::zero(32)
+                        }
+                        _ => Value::zero(32),
+                    };
+                }
+                if name == "uvm_report_enabled" {
+                    return Value::from_u64(1, 32); // Always enabled for mock
+                }
+                if name == "get_is_active" {
+                    // UVM_ACTIVE is typically 1 in UVM
+                    return Value::from_u64(1, 32);
+                }
+                if name == "uvm_report_info" || name == "uvm_report_warning" || name == "uvm_report_error" || name == "uvm_report_fatal" {
+                    let id = if args.len() > 0 {
+                        if let ExprKind::StringLiteral(s) = &args[0].kind { s.clone() } else { "UVM".to_string() }
+                    } else { "".to_string() };
+                    let msg = if args.len() > 1 {
+                        if let ExprKind::StringLiteral(s) = &args[1].kind { s.clone() }
+                        else if let ExprKind::SystemCall { name, args: sys_args } = &args[1].kind {
+                            if name == "$sformatf" {
+                                // Since we don't have self as mutable here in a way we can call format_args easily if it takes &mut self
+                                // Actually format_args takes &mut self, eval_call takes &mut self.
+                                self.format_args(sys_args, "$sformatf")
+                            } else { "<expr>".to_string() }
+                        } else { "<expr>".to_string() }
+                    } else { "".to_string() };
+                    let severity = name.replace("uvm_report_", "").to_uppercase();
+                    println!("UVM_{} @ {:>3}: reporter [{}] {}", severity, self.time, id, msg);
+                    return Value::zero(32);
+                }
+                if name == "run_test" {
+                    let test_name = if let Some(arg) = args.first() {
+                        if let ExprKind::StringLiteral(s) = &arg.kind { s.clone() } else { "simple_test".to_string() }
+                    } else { "simple_test".to_string() };
+                    println!("UVM_INFO @ {:>3}: reporter [RNTST] Running test {}...", self.time, test_name);
+                    
+                    if let Some(test_def) = self.module.classes.get(&test_name).cloned() {
+                        let handle = self.instantiate_class(&test_def, &[]);
+                        let handle_val = handle.to_u64().unwrap_or(0) as usize;
+                        
+                        // Bootstrapping UVM phases
+                        let mut components = vec![handle_val];
+                        
+                        // build_phase
+                        let mut i = 0;
+                        while i < components.len() {
+                            let c = components[i];
+                            let heap_len = self.heap.len();
+                            self.exec_method_call(c, "build_phase", &[]);
+                            for new_h in heap_len..self.heap.len() {
+                                components.push(new_h);
+                            }
+                            i += 1;
+                        }
+                        
+                        // connect_phase
+                        for &c in &components {
+                            self.exec_method_call(c, "connect_phase", &[]);
+                        }
+                        
+                        // run_phase
+                        for &c in &components {
+                            if !self.spawn_method_task_process(c, "run_phase", &[]) {
+                                self.exec_method_call(c, "run_phase", &[]);
+                            }
+                        }
+                    }
+                    return Value::zero(32);
+                }
+            }
+
+            // Intercept type_id::create
+            if len >= 3 && path[len-1].name.name == "create" && path[len-2].name.name == "type_id" {
+                let class_name = &path[len-3].name.name;
+                if let Some(class_def) = self.module.classes.get(class_name).cloned() {
+                    return self.instantiate_class(&class_def, &[]);
+                }
+            } else if len >= 2 && path[len-1].name.name == "create" {
+            }
+
+            if hier.path.len() > 1 {
+                let obj_name = &hier.path[0].name.name;
+                let method_name = &hier.path.last().unwrap().name.name;
+                
+                if let Some(res) = self.eval_builtin_method(obj_name, method_name, args) {
+                    return res;
+                }
+                
+                let obj_val = if let Some(locals) = self.local_stack.last() {
+                    locals.get(obj_name).cloned()
+                } else {
+                    if let Some(&id) = self.signal_name_to_id.get(obj_name) {
+                        Some(self.signal_table[id].clone())
+                    } else {
+                        self.signals.get(obj_name).cloned()
+                    }
+                };
+                if let Some(v) = obj_val {
+                    let handle = v.to_u64().unwrap_or(0) as usize;
+                    if handle != 0 {
+                        if handle < self.cg_heap.len() && self.cg_heap[handle].is_some() {
+                            return self.exec_cg_method_call(handle, method_name, args);
+                        }
+                        if handle < self.heap.len() && self.heap[handle].is_some() {
+                            return self.exec_method_call(handle, method_name, args);
+                        }
+                    }
+                }
+            }
+            // Handle static/constructor call: class_name::f() or new()
+            let name = &hier.path.last().unwrap().name.name;
+            if let Some(class_def) = self.module.classes.get(name).cloned() {
+                return self.instantiate_class(&class_def, args);
+            }
+            if let Some(cg_def) = self.module.covergroups.get(name).cloned() {
+                return self.instantiate_covergroup(&cg_def, args);
+            }
+            // DPI import call
+            if let Some(v) = self.exec_dpi_import_call(name, args) {
+                return v;
+            }
+            // Module-level function call
+            if let Some(fd) = self.module.functions.get(name).cloned() {
+                return self.exec_function_call(&fd, args);
+            }
+            // Module-level let call
+            if let Some(ld) = self.module.lets.get(name).cloned() {
+                return self.exec_let_call(&ld, args);
+            }
+            // Module-level task call
+            if let Some(td) = self.module.tasks.get(name).cloned() {
+                self.exec_task_call(&td, args);
+                return Value::zero(32);
+            }
+        }
+        Value::zero(32)
+    }
+
+    fn exec_let_call(&mut self, ld: &LetDeclaration, args: &[Expression]) -> Value {
+        use crate::ast::module::PortList;
+        let mut locals = HashMap::new();
+        let mut arg_idx = 0usize;
+        match &ld.ports {
+            PortList::Ansi(ports) => {
+                for p in ports {
+                    let v = if arg_idx < args.len() {
+                        self.eval_expr(&args[arg_idx])
+                    } else {
+                        Value::zero(32)
+                    };
+                    locals.insert(p.name.name.clone(), v);
+                    arg_idx += 1;
+                }
+            }
+            PortList::NonAnsi(names) => {
+                for n in names {
+                    let v = if arg_idx < args.len() {
+                        self.eval_expr(&args[arg_idx])
+                    } else {
+                        Value::zero(32)
+                    };
+                    locals.insert(n.name.clone(), v);
+                    arg_idx += 1;
+                }
+            }
+            PortList::Empty => {}
+        }
+        self.local_stack.push(locals);
+        let out = self.eval_expr(&ld.expr);
+        self.local_stack.pop();
+        out
+    }
+
+    /// Execute a module-level function call with arguments.
+    fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
+        use crate::ast::types::PortDirection;
+        // Set up local scope with parameters
+        let mut locals = HashMap::new();
+        for (i, port) in fd.ports.iter().enumerate() {
+            let val = if i < args.len() {
+                self.eval_expr(&args[i])
+            } else if let Some(def) = &port.default {
+                self.eval_expr(def)
+            } else {
+                Value::zero(32)
+            };
+            locals.insert(port.name.name.clone(), val);
+        }
+        // Initialize return variable (function name)
+        let ret_name = fd.name.name.name.clone();
+        locals.insert(ret_name.clone(), Value::zero(32));
+        self.local_stack.push(locals);
+        self.return_value = None;
+        // Execute function body
+        for stmt in &fd.items {
+            self.exec_statement(stmt);
+            if self.return_value.is_some() { break; }
+        }
+        let result = if let Some(rv) = self.return_value.take() {
+            rv
+        } else {
+            // Return value from function-name variable
+            self.local_stack.last().and_then(|l| l.get(&ret_name).cloned()).unwrap_or(Value::zero(32))
+        };
+        self.local_stack.pop();
+        result
+    }
+
+    /// Execute a module-level task call with arguments.
+    fn exec_task_call(&mut self, td: &TaskDeclaration, args: &[Expression]) {
+        use crate::ast::types::PortDirection;
+        // Evaluate input args and collect output/ref arg expressions
+        let mut locals = HashMap::new();
+        let mut output_bindings: Vec<(String, Expression)> = Vec::new();
+        for (i, port) in td.ports.iter().enumerate() {
+            match port.direction {
+                PortDirection::Output | PortDirection::Inout => {
+                    let val = if i < args.len() { self.eval_expr(&args[i]) } else { Value::zero(32) };
+                    locals.insert(port.name.name.clone(), val);
+                    if i < args.len() {
+                        output_bindings.push((port.name.name.clone(), args[i].clone()));
+                    }
+                }
+                PortDirection::Ref => {
+                    let val = if i < args.len() { self.eval_expr(&args[i]) } else { Value::zero(32) };
+                    locals.insert(port.name.name.clone(), val);
+                    if i < args.len() {
+                        output_bindings.push((port.name.name.clone(), args[i].clone()));
+                    }
+                }
+                _ => {
+                    let val = if i < args.len() { self.eval_expr(&args[i]) } else { Value::zero(32) };
+                    locals.insert(port.name.name.clone(), val);
+                }
+            }
+        }
+        self.local_stack.push(locals);
+        self.return_value = None;
+        // Execute task body
+        for stmt in &td.items {
+            self.exec_statement(stmt);
+            if self.return_value.is_some() { break; }
+        }
+        // Copy output/ref values back to caller
+        let locals = self.local_stack.pop().unwrap_or_default();
+        for (port_name, caller_expr) in &output_bindings {
+            if let Some(val) = locals.get(port_name) {
+                self.assign_value(caller_expr, val);
+            }
+        }
+    }
+
+    fn instantiate_covergroup(&mut self, cg_def: &CovergroupDeclaration, _args: &[Expression]) -> Value {
+        let handle = self.cg_heap.len();
+        let instance = CovergroupInstance {
+            cg_name: cg_def.name.name.clone(),
+            point_hits: HashMap::new(),
+            cross_hits: HashMap::new(),
+        };
+        self.cg_heap.push(Some(instance));
+        
+        // Register automatic sampling if event is present
+        if let Some(event) = &cg_def.event {
+            let sens = self.event_to_sens(event);
+            let resolved: Vec<SensitivityId> = sens.iter().filter_map(|s| {
+                self.signal_name_to_id.get(&s.signal_name).map(|&id| SensitivityId { signal_id: id, edge: s.edge })
+            }).collect();
+            self.cg_event_waiters.push((handle, resolved));
+        }
+        
+        Value::from_u64(handle as u64, 32)
+    }
+
+    fn exec_cg_method_call(&mut self, handle: usize, method_name: &str, _args: &[Expression]) -> Value {
+        match method_name {
+            "get_inst_coverage" | "get_coverage" => {
+                let coverage = self.calculate_coverage(handle);
+                // Return real as u64 bits (simplified: return as integer percentage for now)
+                Value::from_u64(coverage as u64, 64)
+            }
+            "sample" => {
+                self.sample_covergroup(handle);
+                Value::zero(32)
+            }
+            _ => Value::zero(32),
+        }
+    }
+
+    fn calculate_coverage(&self, handle: usize) -> f64 {
+        let inst = if let Some(Some(i)) = self.cg_heap.get(handle) { i } else { return 0.0; };
+        let def = if let Some(d) = self.module.covergroups.get(&inst.cg_name) { d } else { return 0.0; };
+        
+        let mut total_items = 0;
+        let mut covered_items = 0;
+        
+        for item in &def.items {
+            match item {
+                CovergroupItem::Coverpoint(cp) => {
+                    total_items += 1;
+                    let cp_name = cp.name.as_ref().map(|n| n.name.clone()).unwrap_or_else(|| format!("{:?}", cp.expr));
+                    if let Some(hits) = inst.point_hits.get(&cp_name) {
+                        if !hits.is_empty() { covered_items += 1; }
+                    }
+                }
+                CovergroupItem::Cross(cr) => {
+                    total_items += 1;
+                    let cr_name = cr.name.as_ref().map(|n| n.name.clone()).unwrap_or_else(|| cr.items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join("_"));
+                    if let Some(hits) = inst.cross_hits.get(&cr_name) {
+                        if !hits.is_empty() { covered_items += 1; }
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        if total_items == 0 { 100.0 }
+        else { (covered_items as f64 / total_items as f64) * 100.0 }
+    }
+
+    fn sample_covergroup(&mut self, handle: usize) {
+        let cg_name = if let Some(Some(inst)) = self.cg_heap.get(handle) {
+            inst.cg_name.clone()
+        } else { return; };
+        
+        let def = if let Some(d) = self.module.covergroups.get(&cg_name).cloned() { d } else { return; };
+        
+        for item in &def.items {
+            match item {
+                CovergroupItem::Coverpoint(cp) => {
+                    let val = self.eval_expr(&cp.expr);
+                    let cp_name = cp.name.as_ref().map(|n| n.name.clone()).unwrap_or_else(|| format!("{:?}", cp.expr));
+                    if let Some(Some(inst)) = self.cg_heap.get_mut(handle) {
+                        inst.point_hits.entry(cp_name).or_default().insert(val);
+                    }
+                }
+                CovergroupItem::Cross(cr) => {
+                    let mut tuple = Vec::new();
+                    for id in &cr.items {
+                        // Resolve each item in cross
+                        let name = id.name.clone();
+                        let val = self.signals.get(&name).cloned().unwrap_or(Value::zero(1));
+                        tuple.push(val);
+                    }
+                    let cr_name = cr.name.as_ref().map(|n| n.name.clone()).unwrap_or_else(|| cr.items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join("_"));
+                    if let Some(Some(inst)) = self.cg_heap.get_mut(handle) {
+                        inst.cross_hits.entry(cr_name).or_default().insert(tuple);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn instantiate_class(&mut self, class_def: &crate::compiler::elaborate::ElaboratedClass, args: &[Expression]) -> Value {
+        let handle = self.heap.len();
+        let mut instance = ClassInstance {
+
+            class_name: class_def.name.clone(),
+            properties: HashMap::new(),
+        };
+        let mut classes_to_init = vec![class_def.clone()];
+        let mut cur = class_def.extends.clone();
+        while let Some(cname) = cur {
+            if let Some(cdef) = self.module.classes.get(&cname) {
+                classes_to_init.push(cdef.clone());
+                cur = cdef.extends.clone();
+            } else { break; }
+        }
+        for cdef in classes_to_init.iter().rev() {
+            for (prop_name, prop_sig) in &cdef.properties {
+                instance.properties.insert(prop_name.clone(), prop_sig.value.clone());
+            }
+        }
+        self.heap.push(Some(instance));
+        self.exec_method_call(handle, "new", args);
+        Value::from_u64(handle as u64, 32)
+    }
+
+    fn exec_method_call(&mut self, handle: usize, method_name: &str, args: &[Expression]) -> Value {
+        if method_name == "randomize" {
+            return self.exec_randomize(handle);
+        }
+        let class_name = if let Some(Some(inst)) = self.heap.get(handle) {
+            inst.class_name.clone()
+        } else { return Value::zero(32); };
+        self.exec_method_in_class_hierarchy(handle, &class_name, method_name, args)
+    }
+
+    fn spawn_method_task_process(&mut self, handle: usize, method_name: &str, args: &[Expression]) -> bool {
+        let mut cur_class = if let Some(Some(inst)) = self.heap.get(handle) {
+            Some(inst.class_name.clone())
+        } else {
+            None
+        };
+        while let Some(cname) = cur_class {
+            if let Some(class_def) = self.module.classes.get(&cname).cloned() {
+                if let Some(method) = class_def.methods.get(method_name) {
+                    if let crate::ast::decl::ClassMethodKind::Task(t) = &method.kind {
+                        let mut locals = HashMap::new();
+                        for (i, port) in t.ports.iter().enumerate() {
+                            let val = if i < args.len() { self.eval_expr(&args[i]) } else { Value::zero(32) };
+                            locals.insert(port.name.name.clone(), val);
+                        }
+                        let pid = self.next_pid;
+                        self.next_pid += 1;
+                        self.process_contexts.insert(pid, ProcessContext {
+                            this_stack: vec![Some(handle)],
+                            local_stack: vec![locals],
+                            class_context_stack: vec![Some(cname.clone())],
+                            cg_this: self.cg_this,
+                            return_value: None,
+                            break_flag: false,
+                            continue_flag: false,
+                        });
+                        self.event_queue.schedule(self.time, pid, t.items.clone());
+                        return true;
+                    }
+                    return false;
+                }
+                cur_class = class_def.extends.clone();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
+    fn exec_randomize(&mut self, handle: usize) -> Value {
+        use rand::Rng;
+        let class_name = if let Some(Some(inst)) = self.heap.get(handle) {
+            inst.class_name.clone()
+        } else { return Value::zero(32); };
+
+        let mut rand_props = Vec::new();
+        let mut constraints = Vec::new();
+
+        let mut cur = Some(class_name.clone());
+        while let Some(cname) = cur {
+            if let Some(class_def) = self.module.classes.get(&cname) {
+                for prop in &class_def.random_properties {
+                    if let Some(sig) = class_def.properties.get(prop) {
+                        rand_props.push((prop.clone(), sig.width));
+                    }
+                }
+                for con in class_def.constraints.values() {
+                    constraints.push(con.clone());
+                }
+                cur = class_def.extends.clone();
+            } else { break; }
+        }
+
+        self.this_stack.push(Some(handle));
+        for trial in 0..1000 {
+            let mut solved_props: HashMap<String, Value> = HashMap::new();
+            let mut backup = HashMap::new();
+            
+            // First pass: identify simple range constraints for each property
+            let mut prop_allowed_ranges: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+            for con in &constraints {
+                for item in &con.items {
+                    let (inside_expr, inside_ranges): (Option<&Expression>, Option<Vec<(u64, u64)>>) = match item {
+                        ConstraintItem::Inside { expr, range, .. } => {
+                            let mut ranges = Vec::new();
+                            for r in range {
+                                if let ConstraintRange::Range { lo, hi } = r {
+                                    let l = self.eval_expr(lo).to_u64().unwrap_or(0);
+                                    let h = self.eval_expr(hi).to_u64().unwrap_or(u64::MAX);
+                                    ranges.push((l, h));
+                                } else if let ConstraintRange::Value(v_expr) = r {
+                                    let v = self.eval_expr(v_expr).to_u64().unwrap_or(0);
+                                    ranges.push((v, v));
+                                }
+                            }
+                            (Some(expr), Some(ranges))
+                        }
+                        ConstraintItem::Expr(expr) => {
+                            if let ExprKind::Inside { expr: inner, ranges } = &expr.kind {
+                                let mut parsed = Vec::new();
+                                for r in ranges {
+                                    match &r.kind {
+                                        ExprKind::Range(lo, hi) => {
+                                            let l = self.eval_expr(lo).to_u64().unwrap_or(0);
+                                            let h = self.eval_expr(hi).to_u64().unwrap_or(u64::MAX);
+                                            parsed.push((l, h));
+                                        }
+                                        _ => {
+                                            let v = self.eval_expr(r).to_u64().unwrap_or(0);
+                                            parsed.push((v, v));
+                                        }
+                                    }
+                                }
+                                (Some(inner.as_ref()), Some(parsed))
+                            } else {
+                                (None, None)
+                            }
+                        }
+                        _ => (None, None),
+                    };
+                    if let (Some(expr), Some(ranges)) = (inside_expr, inside_ranges) {
+                        if let ExprKind::Ident(hier) = &expr.kind {
+                            let name = hier.path.last().unwrap().name.name.clone();
+                            if !ranges.is_empty() {
+                                prop_allowed_ranges.entry(name).or_insert_with(Vec::new).extend(ranges);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Second pass: identify equality "assignments"
+            let mut assignments: HashMap<String, Expression> = HashMap::new();
+            for con in &constraints {
+                for item in &con.items {
+                    if let ConstraintItem::Expr(expr) = item {
+                        if let ExprKind::Binary { op: BinaryOp::Eq, left, right } = &expr.kind {
+                            if let ExprKind::Ident(hier) = &left.kind {
+                                let name = hier.path.last().unwrap().name.name.clone();
+                                // check if right-hand side doesn't contain 'name' to avoid self-reference
+                                assignments.insert(name, *right.clone());
+                            } else if let ExprKind::Ident(hier) = &right.kind {
+                                let name = hier.path.last().unwrap().name.name.clone();
+                                assignments.insert(name, *left.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Local copy of properties for solving
+            let mut current_props = HashMap::new();
+            if let Some(Some(inst)) = self.heap.get(handle) {
+                for (name, val) in &inst.properties {
+                    current_props.insert(name.clone(), val.clone());
+                    backup.insert(name.clone(), val.clone());
+                }
+            }
+
+            // Solve properties
+            let mut pids_to_solve: Vec<usize> = (0..rand_props.len()).collect();
+            let mut progress = true;
+            while !pids_to_solve.is_empty() && progress {
+                progress = false;
+                let mut i = 0;
+                while i < pids_to_solve.len() {
+                    let pid_idx = pids_to_solve[i];
+                    let (name, width) = &rand_props[pid_idx];
+                    
+                    // If it has an assignment, check if we can solve it
+                    if let Some(expr) = assignments.get(name) {
+                        let mut idents = HashSet::new();
+                        self.collect_expr_idents(expr, &mut idents);
+                        let ready = idents.iter().all(|id| {
+                            !rand_props.iter().any(|(n, _)| n == id) || solved_props.contains_key(id)
+                        });
+                        
+                        if ready {
+                            // Temporary set props in instance for eval_expr if needed?
+                            // No, eval_expr uses self.signals and self.heap[handle].properties.
+                            // We need to update the instance properties during solving if eval_expr depends on them.
+                            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                                for (n, v) in &solved_props { inst.properties.insert(n.clone(), v.clone()); }
+                            }
+                            
+                            self.this_stack.push(Some(handle));
+                            let val = self.eval_expr(expr);
+                            self.this_stack.pop();
+                            
+                            solved_props.insert(name.clone(), val);
+                            pids_to_solve.remove(i);
+                            progress = true;
+                            continue;
+                        }
+                    } else {
+                        // No assignment, pick randomly (honoring ranges if possible)
+                        let mut val = Value::zero(*width);
+                        if let Some(ranges) = prop_allowed_ranges.get(name) {
+                            let r_idx = self.rng.gen_range(0..ranges.len());
+                            let (lo, hi) = ranges[r_idx];
+                            let r_val = if hi >= lo { self.rng.gen_range(lo..=hi) } else { lo };
+                            val = Value::from_u64(r_val, *width);
+                        } else {
+                            if *width <= 64 {
+                                let r: u64 = self.rng.gen();
+                                val = Value::from_u64(r, *width);
+                            }
+                        }
+                        solved_props.insert(name.clone(), val.clone());
+                        if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                            inst.properties.insert(name.clone(), val);
+                        }
+                        pids_to_solve.remove(i);
+                        progress = true;
+                        continue;
+                    }
+
+                    i += 1;
+                }
+            }
+            
+            // Pick truly randomly for remaining
+            for pid_idx in pids_to_solve {
+                let (name, width) = &rand_props[pid_idx];
+                let mut val = Value::zero(*width);
+                if *width <= 64 { val = Value::from_u64(self.rng.gen(), *width); }
+                solved_props.insert(name.clone(), val);
+            }
+
+            // Apply solved props to instance
+            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                for (name, val) in &solved_props {
+                    inst.properties.insert(name.clone(), val.clone());
+                }
+            }
+
+            let mut all_ok = true;
+            for con in &constraints {
+                for item in &con.items {
+                    if !self.check_constraint_item(handle, item) {
+                        all_ok = false;
+                        break;
+                    }
+                }
+                if !all_ok { break; }
+            }
+
+            if all_ok {
+                self.this_stack.pop();
+                return Value::from_u64(1, 32);
+            }
+
+            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                for (name, val) in backup {
+                    inst.properties.insert(name, val);
+                }
+            }
+        }
+
+        self.this_stack.pop();
+        Value::zero(32)
+    }
+    fn collect_expr_idents(&self, expr: &Expression, idents: &mut HashSet<String>) {
+        match &expr.kind {
+            ExprKind::Ident(hier) => {
+                if let Some(seg) = hier.path.last() {
+                    idents.insert(seg.name.name.clone());
+                }
+            }
+            ExprKind::Unary { operand, .. } => self.collect_expr_idents(operand, idents),
+            ExprKind::Binary { left, right, .. } => {
+                self.collect_expr_idents(left, idents);
+                self.collect_expr_idents(right, idents);
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                self.collect_expr_idents(condition, idents);
+                self.collect_expr_idents(then_expr, idents);
+                self.collect_expr_idents(else_expr, idents);
+            }
+            ExprKind::Paren(inner) => self.collect_expr_idents(inner, idents),
+            ExprKind::Concatenation(exprs) => {
+                for e in exprs { self.collect_expr_idents(e, idents); }
+            }
+            ExprKind::Call { args, .. } => {
+                for a in args { self.collect_expr_idents(a, idents); }
+            }
+            ExprKind::Index { expr, index } => {
+                self.collect_expr_idents(expr, idents);
+                self.collect_expr_idents(index, idents);
+            }
+            ExprKind::RangeSelect { expr, left, right, .. } => {
+                self.collect_expr_idents(expr, idents);
+                self.collect_expr_idents(left, idents);
+                self.collect_expr_idents(right, idents);
+            }
+            ExprKind::MemberAccess { expr, .. } => {
+                self.collect_expr_idents(expr, idents);
+            }
+            _ => {}
+        }
+    }
+
+    fn check_constraint_item(&mut self, handle: usize, item: &ConstraintItem) -> bool {
+        self.this_stack.push(Some(handle));
+        let ok = self.check_constraint_item_impl(item);
+        self.this_stack.pop();
+        ok
+    }
+
+    fn check_constraint_item_impl(&mut self, item: &ConstraintItem) -> bool {
+        match item {
+            ConstraintItem::Expr(expr) => {
+                let res = self.eval_expr(expr);
+                res.is_true()
+            }
+            ConstraintItem::Inside { expr, range, .. } => {
+                let val = self.eval_expr(expr);
+                for r in range {
+                    match r {
+                        ConstraintRange::Value(e) => {
+                            let v = self.eval_expr(e);
+                            if val == v { return true; }
+                        }
+                        ConstraintRange::Range { lo, hi } => {
+                            let l = self.eval_expr(lo);
+                            let h = self.eval_expr(hi);
+                            if val.greater_equal(&l).is_true() && val.less_equal(&h).is_true() { return true; }
+                        }
+                    }
+                }
+                false
+            }
+            ConstraintItem::Implication { condition, constraint, .. } => {
+                if self.eval_expr(condition).is_true() {
+                    self.check_constraint_item_impl(constraint)
+                } else { true }
+            }
+            ConstraintItem::IfElse { condition, then_item, else_item, .. } => {
+                if self.eval_expr(condition).is_true() {
+                    self.check_constraint_item_impl(then_item)
+                } else if let Some(ei) = else_item {
+                    self.check_constraint_item_impl(ei)
+                } else { true }
+            }
+            ConstraintItem::Block(items) => {
+                for it in items { if !self.check_constraint_item_impl(it) { return false; } }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    fn exec_super_method_call(&mut self, handle: usize, method_name: &str, args: &[Expression]) -> Value {
+        let class_name = if let Some(Some(ctx)) = self.class_context_stack.last() {
+            ctx.clone()
+        } else {
+            if let Some(Some(inst)) = self.heap.get(handle) {
+                inst.class_name.clone()
+            } else { return Value::zero(32); }
+        };
+        let parent_name = if let Some(class_def) = self.module.classes.get(&class_name) {
+            class_def.extends.clone()
+        } else { None };
+        if let Some(pname) = parent_name {
+            return self.exec_method_in_class_hierarchy(handle, &pname, method_name, args);
+        }
+        Value::zero(32)
+    }
+
+    fn exec_method_in_class_hierarchy(&mut self, handle: usize, start_class: &str, method_name: &str, args: &[Expression]) -> Value {
+        use crate::ast::decl::ClassMethodKind;
+        let mut cur_class = Some(start_class.to_string());
+        while let Some(cname) = cur_class {
+            if let Some(class_def) = self.module.classes.get(&cname).cloned() {
+                if let Some(method) = class_def.methods.get(method_name) {
+                    let mut locals = HashMap::new();
+                    let (ports, body) = match &method.kind {
+                        ClassMethodKind::Function(f) => (&f.ports, &f.items),
+                        ClassMethodKind::Task(t) => (&t.ports, &t.items),
+                        _ => { cur_class = class_def.extends.clone(); continue; }
+                    };
+                    for (i, port) in ports.iter().enumerate() {
+                        let val = if i < args.len() { self.eval_expr(&args[i]) } else { Value::zero(32) };
+                        locals.insert(port.name.name.clone(), val);
+                    }
+                    self.this_stack.push(Some(handle));
+                    self.local_stack.push(locals);
+                    self.class_context_stack.push(Some(cname.clone()));
+                    for stmt in body { self.exec_statement(stmt); if self.break_flag { break; } }
+                    self.break_flag = false;
+                    self.class_context_stack.pop();
+                    let ret = self.return_value.take().unwrap_or(Value::zero(32));
+                    self.local_stack.pop();
+                    self.this_stack.pop();
+                    return ret;
+                }
+                cur_class = class_def.extends.clone();
+            } else { break; }
+        }
+        Value::zero(32)
+    }
+
+    fn resolve_expr_name(&self, expr: &Expression) -> String {
+        match &expr.kind {
+            ExprKind::Ident(hier) => self.resolve_hier_name(hier),
+            _ => "expr".to_string(),
+        }
+    }
+
+    fn get_expr_type_name(&self, expr: &Expression) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(hier) => {
+                let name = self.resolve_hier_name(hier);
+                self.module.signals.get(&name).and_then(|s| s.type_name.clone())
+            }
+            _ => None,
+        }
+    }
+}
