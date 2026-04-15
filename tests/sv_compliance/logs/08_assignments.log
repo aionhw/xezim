@@ -1,0 +1,16 @@
+=== sisvsim ===
+File: ./tests/08_assignments.sv
+Max time: 100000
+------------------------------
+[PHASE] parse: 0.2ms
+[PHASE] elaborate: 0.1ms
+[OPT] clock generator: signal clk period 2 (always #1 pattern)
+[OPT] bytecode compiled: 0/0 edge blocks
+TEST_PASS
+[PROF] settle=3.3ms edges=3.4ms nba=1.8ms process=2.2ms snap=4.1ms sched=2.1ms
+[PHASE] simulate: 34.9ms (100005 iters, 0.35µs/iter)
+[PHASE] simulate: 35.9ms
+------------------------------
+Simulation finished at time 100000
+------------------------------
+Simulation finished at time 100000

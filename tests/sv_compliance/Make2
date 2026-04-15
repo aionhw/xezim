@@ -1,0 +1,51 @@
+# --- Variables ---
+# Use 'TEST' variable from command line, e.g., make run TEST=test_name
+TEST        ?= base_test
+VLIB        = vlib
+VMAP        = vmap
+VLOG        = vlog
+VSIM        = vsim
+WORK        = work
+LOG_DIR     = ./logs
+
+# List of all tests (used for the 'run_all' target)
+TEST_LIST   = test_read test_write test_reset test_idle
+
+# --- Compilation Flags ---
+VLOG_FLAGS  = -sv -work $(WORK) +acc
+VSIM_FLAGS  = -c -do "run -all; quit" -l $(LOG_DIR)/$(TEST).log
+
+# --- Targets ---
+
+.PHONY: help lib compile run run_all clean
+
+help:
+	@echo "Usage:"
+	@echo "  make run TEST=<test_name>  : Run a specific test"
+	@echo "  make run_all               : Run all tests in TEST_LIST"
+	@echo "  make clean                 : Remove simulation files"
+
+# 1. Create the Work Library
+lib:
+	@if [ ! -d $(WORK) ]; then $(VLIB) $(WORK); $(VMAP) work $(WORK); fi
+
+# 2. Compile Design and Testbench
+compile: lib
+	$(VLOG) $(VLOG_FLAGS) ./rtl/*.v
+	$(VLOG) $(VLOG_FLAGS) ./tb/top.sv
+
+# 3. Run a Single Test
+# Example: make run TEST=test_read
+run: compile
+	@mkdir -p $(LOG_DIR)
+	$(VSIM) $(VSIM_FLAGS) +UVM_TESTNAME=$(TEST) work.top
+
+# 4. Run All Tests
+run_all:
+	@for t in $(TEST_LIST); do \
+		$(MAKE) run TEST=$$t; \
+	done
+
+# 5. Cleanup
+clean:
+	rm -rf $(WORK) $(LOG_DIR) transcript vsim.wlf

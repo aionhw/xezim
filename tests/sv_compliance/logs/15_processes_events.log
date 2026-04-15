@@ -1,0 +1,15 @@
+=== sisvsim ===
+File: ./tests/15_processes_events.sv
+Max time: 100000
+------------------------------
+[PHASE] parse: 0.2ms
+[PHASE] elaborate: 0.1ms
+[OPT] bytecode compiled: 0/0 edge blocks
+TEST_PASS
+[PROF] settle=0.0ms edges=0.0ms nba=0.0ms process=0.0ms snap=0.0ms sched=0.0ms
+[PHASE] simulate: 0.0ms (1 iters, 29.12µs/iter)
+[PHASE] simulate: 0.6ms
+------------------------------
+Simulation finished at time 1
+------------------------------
+Simulation finished at time 1

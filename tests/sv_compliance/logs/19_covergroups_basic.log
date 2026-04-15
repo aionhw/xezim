@@ -1,0 +1,16 @@
+=== sisvsim ===
+File: ./tests/19_covergroups_basic.sv
+Max time: 100000
+------------------------------
+[PHASE] parse: 0.2ms
+[PHASE] elaborate: 0.1ms
+[OPT] clock generator: signal clk period 2 (always #1 pattern)
+[OPT] bytecode compiled: 0/0 edge blocks
+TEST_PASS
+[PROF] settle=3.5ms edges=110.7ms nba=1.9ms process=2.3ms snap=5.6ms sched=2.1ms
+[PHASE] simulate: 144.7ms (100010 iters, 1.45µs/iter)
+[PHASE] simulate: 145.5ms
+------------------------------
+Simulation finished at time 100000
+------------------------------
+Simulation finished at time 100000

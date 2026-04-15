@@ -1,0 +1,13 @@
+file,expected,topic,description
+neg01_duplicate_declaration.sv,compile_fail,duplicate declaration,same identifier declared twice in one scope
+neg02_undeclared_identifier.sv,compile_fail,undeclared identifier,assignment to missing signal
+neg03_const_write.sv,compile_fail,const write,illegal write to const variable
+neg04_nonconstant_generate_if.sv,compile_fail,generate constant expression,generate-if condition must be constant
+neg05_bad_package_import.sv,compile_fail,package import,import of missing package symbol
+neg06_bad_modport_drive.sv,compile_fail,modport direction,driving an input modport signal
+neg07_bad_clocking_direction.sv,compile_fail,clocking direction,driving a clocking input
+neg08_bad_constraint_reference.sv,compile_fail,constraint name resolution,constraint references undeclared symbol
+neg09_duplicate_port_name.sv,compile_fail,duplicate port name,same port identifier declared twice in one module header
+neg10_duplicate_enum_literal.sv,compile_fail,enum declaration,duplicate enum literal within a single enum typedef
+neg11_missing_named_port.sv,compile_fail,module instantiation,named port connection references a missing port
+neg12_duplicate_case_item.sv,compile_fail,unique case,duplicate unique case item for the same selector value

@@ -1,0 +1,1 @@
+`define INCLUDED_CONSTANT 99

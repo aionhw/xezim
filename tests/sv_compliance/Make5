@@ -1,0 +1,58 @@
+# --- Variables ---
+TEST        ?= 01_lexical_identifiers
+VLIB        = vlib
+VMAP        = vmap
+VLOG        = vlog
+VSIM        = vsim
+WORK        = work
+LOG_DIR     = ./logs
+TEST_DIR    = ./tests
+RTL_DIR     = ./rtl
+
+# Logic to transform "01_lexical_identifiers" into "test_lexical_identifiers"
+# 1. $(subst .sv,,$(TEST)) ensures we don't have the extension
+# 2. $(shell echo $(TEST) | sed 's/^[0-9]*_//') removes the "01_" prefix
+CLEAN_NAME  = $(shell echo $(TEST) | sed 's/^[0-9]*_//')
+TOP_NAME    = test_$(CLEAN_NAME)
+
+TEST_LIST   = 01_lexical_identifiers 02_preprocessor 03_literal_values \
+              04_data_types 05_aggregate_types 06_arrays \
+              07_operators_expressions 08_assignments 09_control_flow \
+              10_tasks_functions 11_modules_ports_params 12_generate \
+              13_packages_imports 14_interfaces_modports 15_processes_events \
+              16_classes_oop 17_randomization_constraints 18_assertions_basic \
+              19_covergroups_basic 20_clocking_blocks
+
+VLOG_FLAGS  = -sv -work $(WORK) +acc +incdir+$(TEST_DIR)
+VSIM_FLAGS  = -c -do "run -all; quit" -l $(LOG_DIR)/$(TEST).log
+
+.PHONY: help lib compile run run_all clean
+
+help:
+	@echo "Current Test: $(TEST)"
+	@echo "Inferred Top: $(TOP_NAME)"
+
+lib:
+	@if [ ! -d $(WORK) ]; then $(VLIB) $(WORK); $(VMAP) work $(WORK); fi
+
+compile: lib
+	@if [ -d $(RTL_DIR) ] && [ "$$(ls -A $(RTL_DIR)/*.v 2>/dev/null)" ]; then \
+		$(VLOG) $(VLOG_FLAGS) $(RTL_DIR)/*.v; \
+	fi
+	$(VLOG) $(VLOG_FLAGS) $(TEST_DIR)/$(TEST).sv
+
+run: compile
+	@mkdir -p $(LOG_DIR)
+	@echo "Simulating top module: $(TOP_NAME)"
+	$(VSIM) $(VSIM_FLAGS) work.$(TOP_NAME)
+
+run_all:
+	@mkdir -p $(LOG_DIR)
+	@for t in $(TEST_LIST); do \
+		echo "------------------------------------------------"; \
+		echo "Running Test: $$t"; \
+		$(MAKE) -f $(firstword $(MAKEFILE_LIST)) run TEST=$$t || exit 1; \
+	done
+
+clean:
+	rm -rf $(WORK) $(LOG_DIR) transcript vsim.wlf

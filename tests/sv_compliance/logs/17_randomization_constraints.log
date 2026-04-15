@@ -1,0 +1,15 @@
+=== sisvsim ===
+File: ./tests/17_randomization_constraints.sv
+Max time: 100000
+------------------------------
+[PHASE] parse: 0.2ms
+[PHASE] elaborate: 0.1ms
+[OPT] bytecode compiled: 0/0 edge blocks
+TEST_PASS
+[PROF] settle=0.0ms edges=0.0ms nba=0.0ms process=0.1ms snap=0.0ms sched=0.0ms
+[PHASE] simulate: 0.1ms (1 iters, 143.34µs/iter)
+[PHASE] simulate: 1.1ms
+------------------------------
+Simulation finished at time 0
+------------------------------
+Simulation finished at time 0

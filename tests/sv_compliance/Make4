@@ -1,0 +1,52 @@
+# --- Variables ---
+TEST        ?= 01_lexical_identifiers
+VLIB        = vlib
+VMAP        = vmap
+VLOG        = vlog
+VSIM        = vsim
+WORK        = work
+LOG_DIR     = ./logs
+TEST_DIR    = ./tests
+RTL_DIR     = ./rtl
+
+# Test List
+TEST_LIST   = 01_lexical_identifiers 02_preprocessor 03_literal_values \
+              04_data_types 05_aggregate_types 06_arrays \
+              07_operators_expressions 08_assignments 09_control_flow \
+              10_tasks_functions 11_modules_ports_params 12_generate \
+              13_packages_imports 14_interfaces_modports 15_processes_events \
+              16_classes_oop 17_randomization_constraints 18_assertions_basic \
+              19_covergroups_basic 20_clocking_blocks
+
+VLOG_FLAGS  = -sv -work $(WORK) +acc +incdir+$(TEST_DIR)
+VSIM_FLAGS  = -c -do "run -all; quit" -l $(LOG_DIR)/$(TEST).log
+
+.PHONY: help lib compile run run_all clean
+
+# 1. Prepare Library
+lib:
+	@if [ ! -d $(WORK) ]; then $(VLIB) $(WORK); $(VMAP) work $(WORK); fi
+
+# 2. Compile (Checks if RTL exists first)
+compile: lib
+	@if [ -d $(RTL_DIR) ] && [ "$$(ls -A $(RTL_DIR)/*.v 2>/dev/null)" ]; then \
+		$(VLOG) $(VLOG_FLAGS) $(RTL_DIR)/*.v; \
+	fi
+	$(VLOG) $(VLOG_FLAGS) $(TEST_DIR)/$(TEST).sv
+
+# 3. Run
+run: compile
+	@mkdir -p $(LOG_DIR)
+	$(VSIM) $(VSIM_FLAGS)
+
+# 4. Run All (Fixed recursion)
+run_all:
+	@mkdir -p $(LOG_DIR)
+	@for t in $(TEST_LIST); do \
+		echo "------------------------------------------------"; \
+		echo "Running Test: $$t"; \
+		$(MAKE) -f $(firstword $(MAKEFILE_LIST)) run TEST=$$t || exit 1; \
+	done
+
+clean:
+	rm -rf $(WORK) $(LOG_DIR) transcript vsim.wlf
