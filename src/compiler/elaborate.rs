@@ -143,8 +143,8 @@ pub struct ElaboratedModule {
     pub typedefs: HashMap<String, u32>,
     /// Array declarations: base_name -> (lo_index, hi_index, element_width)
     pub arrays: HashMap<String, (i64, i64, u32)>,
-    /// Associative arrays (string-keyed)
-    pub associative_arrays: HashSet<String>,
+    /// Associative arrays: name -> true if string-keyed
+    pub associative_arrays: HashMap<String, bool>,
     /// Class definitions: name -> elaborated class.
     pub classes: HashMap<String, ElaboratedClass>,
     /// Covergroup definitions: name -> AST declaration.
@@ -165,6 +165,16 @@ pub struct ElaboratedModule {
     pub clocking_signal_dirs: HashMap<String, HashMap<String, PortDirection>>,
     /// Specify path delays: destination signal name -> delay (time units).
     pub specify_delays: HashMap<String, u64>,
+    /// Associative array default values.
+    pub assoc_defaults: HashMap<String, Expression>,
+    /// Dynamic arrays / queues (size starts at 0, not pre-allocated range).
+    pub dynamic_arrays: HashSet<String>,
+    /// Arrays declared with descending range (e.g. [7:0])
+    pub descending_arrays: HashSet<String>,
+    /// Bounded queue max sizes: name -> max element count (i.e., $:N means N+1).
+    pub queue_max_sizes: HashMap<String, u32>,
+    /// 2D unpacked arrays: name -> ((dim1_lo,dim1_hi),(dim2_lo,dim2_hi),elem_width).
+    pub arrays_2d: HashMap<String, ((i64, i64), (i64, i64), u32)>,
 }
 
 impl ElaboratedModule {
@@ -179,7 +189,7 @@ impl ElaboratedModule {
             parameters: HashMap::new(),
             typedefs: HashMap::new(),
             arrays: HashMap::new(),
-            associative_arrays: HashSet::new(),
+            associative_arrays: HashMap::new(),
             classes: HashMap::new(),
             covergroups: HashMap::new(),
             functions: HashMap::new(),
@@ -190,6 +200,11 @@ impl ElaboratedModule {
             modport_views: HashMap::new(),
             clocking_signal_dirs: HashMap::new(),
             specify_delays: HashMap::new(),
+            assoc_defaults: HashMap::new(),
+            dynamic_arrays: HashSet::new(),
+            descending_arrays: HashSet::new(),
+            queue_max_sizes: HashMap::new(),
+            arrays_2d: HashMap::new(),
         }
     }
 }
@@ -743,14 +758,71 @@ pub fn elaborate_module_with_defs(
                     if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
                         return Err(format!("Duplicate declaration of '{}'", decl.name.name));
                     }
-                    if let Some(UnpackedDimension::Associative { .. }) = decl.dimensions.first() {
-                        elab.associative_arrays.insert(decl.name.name.clone());
+                    if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) = decl.dimensions.first() {
+                        let is_string_key = key_dt.as_ref().map_or(false, |dt| matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }));
+                        elab.associative_arrays.insert(decl.name.name.clone(), is_string_key);
+                        if let Some(init_expr) = &decl.init {
+                            if let ExprKind::AssignmentPattern(items) = &init_expr.kind {
+                                for item in items {
+                                    if let crate::ast::expr::AssignmentPatternItem::Default(def_expr) = item {
+                                        elab.assoc_defaults.insert(decl.name.name.clone(), def_expr.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let is_dynamic_dim = decl.dimensions.first().map_or(false, |d| matches!(d, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }));
+                    if is_dynamic_dim {
+                        elab.dynamic_arrays.insert(decl.name.name.clone());
+                    }
+                    if let Some(UnpackedDimension::Queue { max_size: Some(ms), .. }) = decl.dimensions.first() {
+                        let n = const_eval_i64_with_params(ms, Some(&elab.parameters)).unwrap_or(0);
+                        if n >= 0 { elab.queue_max_sizes.insert(decl.name.name.clone(), (n + 1) as u32); }
+                    }
+                    // Check for 2D unpacked array (e.g., mem [0:1023][0:3])
+                    if decl.dimensions.len() == 2 {
+                        let r1 = if let UnpackedDimension::Range { left, right, .. } = &decl.dimensions[0] {
+                            let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
+                            let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
+                            Some((l.min(r), l.max(r)))
+                        } else { None };
+                        let r2 = if let UnpackedDimension::Range { left, right, .. } = &decl.dimensions[1] {
+                            let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
+                            let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
+                            Some((l.min(r), l.max(r)))
+                        } else { None };
+                        if let (Some((lo1, hi1)), Some((lo2, hi2))) = (r1, r2) {
+                            elab.arrays_2d.insert(decl.name.name.clone(), ((lo1, hi1), (lo2, hi2), width));
+                            let is_real = is_type_real(&dd.data_type);
+                            for i in lo1..=hi1 {
+                                for j in lo2..=hi2 {
+                                    let elem_name = format!("{}[{}][{}]", decl.name.name, i, j);
+                                    let sig = Signal { is_const: dd.const_kw,
+                                        name: elem_name.clone(),
+                                        width,
+                                        is_signed,
+                                        is_real,
+                                        direction: None,
+                                        value: default_value_for_type(&dd.data_type, width),
+                                        type_name: get_type_name(&dd.data_type),
+                                    };
+                                    elab.signals.insert(elem_name, sig);
+                                }
+                            }
+                            continue;
+                        }
                     }
                     // Check for unpacked array dimensions (e.g., memory [0:255])
                     let array_range = extract_array_range(&decl.dimensions, &elab.parameters);
                     if let Some((lo, hi)) = array_range {
                         // Register this as an array for the simulator
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        // Track descending arrays (left > right in the declaration)
+                        if let Some(UnpackedDimension::Range { left, right, .. }) = decl.dimensions.first() {
+                            let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
+                            let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
+                            if l > r { elab.descending_arrays.insert(decl.name.name.clone()); }
+                        }
                         let is_real = is_type_real(&dd.data_type);
                         // Create individual element signals: name[lo], name[lo+1], ..., name[hi]
                         for idx in lo..=hi {
@@ -761,10 +833,46 @@ pub fn elaborate_module_with_defs(
                                 is_signed,
                                 is_real,
                                 direction: None,
-                                value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                                value: default_value_for_type(&dd.data_type, width),
                                 type_name: get_type_name(&dd.data_type),
                             };
                             elab.signals.insert(elem_name, sig);
+                        }
+                        if let Some(init_expr) = &decl.init {
+                            let init_items: Vec<&Expression> = match &init_expr.kind {
+                                ExprKind::AssignmentPattern(items) => items.iter().map(|i| i.expr()).collect(),
+                                ExprKind::Concatenation(exprs) => exprs.iter().collect(),
+                                _ => vec![],
+                            };
+                            if !init_items.is_empty() {
+                                let mut stmts: Vec<Statement> = Vec::new();
+                                for (i, item_expr) in init_items.iter().enumerate() {
+                                    let idx_i = lo + i as i64;
+                                    let lval = Expression::new(ExprKind::Index {
+                                        expr: Box::new(make_ident_expr(&decl.name.name)),
+                                        index: Box::new(Expression::new(ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { size: None, signed: false, base: crate::ast::expr::NumberBase::Decimal, value: idx_i.to_string(), cached_val: std::cell::Cell::new(None) }), Span::dummy())),
+                                    }, Span::dummy());
+                                    stmts.push(Statement::new(StatementKind::BlockingAssign {
+                                        lvalue: lval,
+                                        rvalue: (*item_expr).clone(),
+                                    }, Span::dummy()));
+                                }
+                                if is_dynamic_dim {
+                                    let size_name = format!("{}.size", decl.name.name);
+                                    let size_sig = Signal { is_const: false, name: size_name.clone(), width: 32, is_signed: false, is_real: false, direction: None, value: Value::from_u64(init_items.len() as u64, 32), type_name: None };
+                                    elab.signals.insert(size_name, size_sig);
+                                }
+                                elab.initial_blocks.push(InitialBlock {
+                                    stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()),
+                                });
+                            } else if !is_dynamic_dim {
+                                elab.initial_blocks.push(InitialBlock {
+                                    stmt: Statement::new(StatementKind::BlockingAssign {
+                                        lvalue: make_ident_expr(&decl.name.name),
+                                        rvalue: init_expr.clone(),
+                                    }, Span::dummy()),
+                                });
+                            }
                         }
                     } else {
                         let is_real = is_type_real(&dd.data_type);
@@ -776,9 +884,9 @@ pub fn elaborate_module_with_defs(
                                 if is_real { rv = Value::from_f64(rv.to_f64()); }
                                 (rv, None)
                             } else {
-                                (if is_real { Value::from_f64(0.0) } else { Value::new(w) }, Some(init_expr.clone()))
+                                (default_value_for_type(&dd.data_type, w), Some(init_expr.clone()))
                             }
-                        } else { (if is_real { Value::from_f64(0.0) } else { Value::new(w) }, None) };
+                        } else { (default_value_for_type(&dd.data_type, w), None) };
                         
                         let sig = Signal { is_const: dd.const_kw,
                             name: decl.name.name.clone(),
@@ -874,9 +982,75 @@ pub fn elaborate_module_with_defs(
                 process_typedef(td, &mut elab);
             }
             ModuleItem::FunctionDeclaration(fd) => {
+                if matches!(fd.return_type, DataType::Void(_)) {
+                    fn check_void_return(s: &crate::ast::stmt::Statement) -> Result<(), String> {
+                        use crate::ast::stmt::StatementKind as SK;
+                        match &s.kind {
+                            SK::Return(Some(_)) => Err("void function must not return a value".into()),
+                            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                                for st in stmts { check_void_return(st)?; }
+                                Ok(())
+                            }
+                            SK::If { then_stmt, else_stmt, .. } => {
+                                check_void_return(then_stmt)?;
+                                if let Some(eb) = else_stmt { check_void_return(eb)?; }
+                                Ok(())
+                            }
+                            SK::For { body, .. } | SK::While { body, .. } | SK::DoWhile { body, .. }
+                            | SK::Repeat { body, .. } | SK::Forever { body } | SK::Foreach { body, .. } => check_void_return(body),
+                            SK::TimingControl { stmt, .. } | SK::Wait { stmt, .. } => check_void_return(stmt),
+                            SK::Case { items, .. } => { for it in items { check_void_return(&it.stmt)?; } Ok(()) }
+                            _ => Ok(()),
+                        }
+                    }
+                    for it in &fd.items { check_void_return(it)?; }
+                }
+                fn check_fn_fork(s: &crate::ast::stmt::Statement) -> Result<(), String> {
+                    use crate::ast::stmt::StatementKind as SK;
+                    match &s.kind {
+                        SK::ParBlock { join_type, stmts, .. } => {
+                            if !matches!(join_type, crate::ast::stmt::JoinType::JoinNone) {
+                                return Err("only fork-join_none is permitted inside a function".into());
+                            }
+                            for st in stmts { check_fn_fork(st)?; }
+                            Ok(())
+                        }
+                        SK::SeqBlock { stmts, .. } => { for st in stmts { check_fn_fork(st)?; } Ok(()) }
+                        SK::If { then_stmt, else_stmt, .. } => {
+                            check_fn_fork(then_stmt)?;
+                            if let Some(eb) = else_stmt { check_fn_fork(eb)?; }
+                            Ok(())
+                        }
+                        SK::For { body, .. } | SK::While { body, .. } | SK::DoWhile { body, .. }
+                        | SK::Repeat { body, .. } | SK::Forever { body } | SK::Foreach { body, .. } => check_fn_fork(body),
+                        SK::TimingControl { stmt, .. } | SK::Wait { stmt, .. } => check_fn_fork(stmt),
+                        SK::Case { items, .. } => { for it in items { check_fn_fork(&it.stmt)?; } Ok(()) }
+                        _ => Ok(()),
+                    }
+                }
+                for it in &fd.items { check_fn_fork(it)?; }
                 elab.functions.insert(fd.name.name.name.clone(), fd.clone());
             }
             ModuleItem::TaskDeclaration(td) => {
+                fn check_no_return_in_fork(s: &crate::ast::stmt::Statement, in_fork: bool) -> Result<(), String> {
+                    use crate::ast::stmt::StatementKind as SK;
+                    match &s.kind {
+                        SK::Return(_) if in_fork => Err("illegal return from fork".into()),
+                        SK::ParBlock { stmts, .. } => { for st in stmts { check_no_return_in_fork(st, true)?; } Ok(()) }
+                        SK::SeqBlock { stmts, .. } => { for st in stmts { check_no_return_in_fork(st, in_fork)?; } Ok(()) }
+                        SK::If { then_stmt, else_stmt, .. } => {
+                            check_no_return_in_fork(then_stmt, in_fork)?;
+                            if let Some(eb) = else_stmt { check_no_return_in_fork(eb, in_fork)?; }
+                            Ok(())
+                        }
+                        SK::For { body, .. } | SK::While { body, .. } | SK::DoWhile { body, .. }
+                        | SK::Repeat { body, .. } | SK::Forever { body } | SK::Foreach { body, .. } => check_no_return_in_fork(body, in_fork),
+                        SK::TimingControl { stmt, .. } | SK::Wait { stmt, .. } => check_no_return_in_fork(stmt, in_fork),
+                        SK::Case { items, .. } => { for it in items { check_no_return_in_fork(&it.stmt, in_fork)?; } Ok(()) }
+                        _ => Ok(()),
+                    }
+                }
+                for it in &td.items { check_no_return_in_fork(it, false)?; }
                 elab.tasks.insert(td.name.name.name.clone(), td.clone());
             }
             ModuleItem::ContinuousAssign(ca) => {
@@ -1079,7 +1253,10 @@ fn validate_stmt_idents(stmt: &Statement, elab: &ElaboratedModule, locals: &mut 
         }
         StatementKind::Return(e) => { if let Some(expr) = e { validate_expr_idents(expr, elab, locals)?; } }
         StatementKind::VarDecl { declarators, .. } => {
-            for d in declarators { if let Some(init) = &d.init { validate_expr_idents(init, elab, locals)?; } }
+            for d in declarators {
+                if let Some(init) = &d.init { validate_expr_idents(init, elab, locals)?; }
+                locals.insert(d.name.name.clone());
+            }
         }
         _ => {}
     }
@@ -1098,7 +1275,8 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                 if !elab.signals.contains_key(name) && !elab.parameters.contains_key(name) &&
                    !elab.functions.contains_key(name) && !elab.tasks.contains_key(name) &&
                    !elab.dpi_imports.contains_key(name) &&
-                   !elab.arrays.contains_key(name) && !elab.associative_arrays.contains(name) &&
+                   !elab.arrays.contains_key(name) && !elab.associative_arrays.contains_key(name) &&
+                   !elab.arrays_2d.contains_key(name) &&
                    !elab.classes.contains_key(name) && !elab.typedefs.contains_key(name) &&
                    !elab.clocking_blocks.contains_key(name) && !elab.lets.contains_key(name) &&
                    !locals.contains(name) {
@@ -1140,6 +1318,12 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
             }
         }
         ExprKind::MemberAccess { expr, .. } => validate_expr_idents(expr, elab, locals)?,
+        ExprKind::WithClause { expr, filter } => {
+            validate_expr_idents(expr, elab, locals)?;
+            let mut with_locals = locals.clone();
+            with_locals.insert("item".to_string());
+            validate_expr_idents(filter, elab, &with_locals)?;
+        }
         _ => {}
     }
     Ok(())
@@ -1278,20 +1462,59 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
                         return Err(format!("Duplicate declaration of '{}'", decl.name.name));
                     }
-                    if let Some(UnpackedDimension::Associative { .. }) = decl.dimensions.first() {
-                        elab.associative_arrays.insert(decl.name.name.clone());
+                    if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) = decl.dimensions.first() {
+                        let is_string_key = key_dt.as_ref().map_or(false, |dt| matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }));
+                        elab.associative_arrays.insert(decl.name.name.clone(), is_string_key);
+                    }
+                    let is_dynamic_dim = decl.dimensions.first().map_or(false, |d| matches!(d, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }));
+                    if is_dynamic_dim {
+                        elab.dynamic_arrays.insert(decl.name.name.clone());
                     }
                     let array_range = extract_array_range(&decl.dimensions, &elab.parameters);
                     if let Some((lo, hi)) = array_range {
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        if let Some(UnpackedDimension::Range { left, right, .. }) = decl.dimensions.first() {
+                            let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
+                            let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
+                            if l > r { elab.descending_arrays.insert(decl.name.name.clone()); }
+                        }
                         for idx in lo..=hi {
                             let elem_name = format!("{}[{}]", decl.name.name, idx);
                             let sig = Signal { is_const: dd.const_kw,
                                 name: elem_name.clone(), width, is_signed, is_real, direction: None,
-                                value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                                value: default_value_for_type(&dd.data_type, width),
                                 type_name: get_type_name(&dd.data_type)
                             };
                             elab.signals.insert(elem_name, sig);
+                        }
+                        if let Some(init_expr) = &decl.init {
+                            let init_items: Vec<&Expression> = match &init_expr.kind {
+                                ExprKind::AssignmentPattern(items) => items.iter().map(|i| i.expr()).collect(),
+                                ExprKind::Concatenation(exprs) => exprs.iter().collect(),
+                                _ => vec![],
+                            };
+                            if !init_items.is_empty() {
+                                let mut stmts: Vec<Statement> = Vec::new();
+                                for (i, item_expr) in init_items.iter().enumerate() {
+                                    let idx_i = lo + i as i64;
+                                    let lval = Expression::new(ExprKind::Index {
+                                        expr: Box::new(make_ident_expr(&decl.name.name)),
+                                        index: Box::new(Expression::new(ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { size: None, signed: false, base: crate::ast::expr::NumberBase::Decimal, value: idx_i.to_string(), cached_val: std::cell::Cell::new(None) }), Span::dummy())),
+                                    }, Span::dummy());
+                                    stmts.push(Statement::new(StatementKind::BlockingAssign {
+                                        lvalue: lval,
+                                        rvalue: (*item_expr).clone(),
+                                    }, Span::dummy()));
+                                }
+                                if is_dynamic_dim {
+                                    let size_name = format!("{}.size", decl.name.name);
+                                    let size_sig = Signal { is_const: false, name: size_name.clone(), width: 32, is_signed: false, is_real: false, direction: None, value: Value::from_u64(init_items.len() as u64, 32), type_name: None };
+                                    elab.signals.insert(size_name, size_sig);
+                                }
+                                elab.initial_blocks.push(InitialBlock {
+                                    stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()),
+                                });
+                            }
                         }
                     } else {
                         let init_val = if let Some(init_expr) = &decl.init {
@@ -1299,10 +1522,8 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             if is_signed { rv.is_signed = true; }
                             if is_real { rv = Value::from_f64(rv.to_f64()); }
                             rv
-                        } else if is_real {
-                            Value::from_f64(0.0)
                         } else {
-                            Value::new(width)
+                            default_value_for_type(&dd.data_type, width)
                         };
                         let sig = Signal { is_const: dd.const_kw, name: decl.name.name.clone(), width, is_signed, is_real, direction: None, value: init_val, type_name: get_type_name(&dd.data_type) };
                         elab.signals.insert(decl.name.name.clone(), sig);
@@ -1397,9 +1618,75 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 }
             }
             ModuleItem::FunctionDeclaration(fd) => {
+                if matches!(fd.return_type, DataType::Void(_)) {
+                    fn check_void_return(s: &crate::ast::stmt::Statement) -> Result<(), String> {
+                        use crate::ast::stmt::StatementKind as SK;
+                        match &s.kind {
+                            SK::Return(Some(_)) => Err("void function must not return a value".into()),
+                            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                                for st in stmts { check_void_return(st)?; }
+                                Ok(())
+                            }
+                            SK::If { then_stmt, else_stmt, .. } => {
+                                check_void_return(then_stmt)?;
+                                if let Some(eb) = else_stmt { check_void_return(eb)?; }
+                                Ok(())
+                            }
+                            SK::For { body, .. } | SK::While { body, .. } | SK::DoWhile { body, .. }
+                            | SK::Repeat { body, .. } | SK::Forever { body } | SK::Foreach { body, .. } => check_void_return(body),
+                            SK::TimingControl { stmt, .. } | SK::Wait { stmt, .. } => check_void_return(stmt),
+                            SK::Case { items, .. } => { for it in items { check_void_return(&it.stmt)?; } Ok(()) }
+                            _ => Ok(()),
+                        }
+                    }
+                    for it in &fd.items { check_void_return(it)?; }
+                }
+                fn check_fn_fork(s: &crate::ast::stmt::Statement) -> Result<(), String> {
+                    use crate::ast::stmt::StatementKind as SK;
+                    match &s.kind {
+                        SK::ParBlock { join_type, stmts, .. } => {
+                            if !matches!(join_type, crate::ast::stmt::JoinType::JoinNone) {
+                                return Err("only fork-join_none is permitted inside a function".into());
+                            }
+                            for st in stmts { check_fn_fork(st)?; }
+                            Ok(())
+                        }
+                        SK::SeqBlock { stmts, .. } => { for st in stmts { check_fn_fork(st)?; } Ok(()) }
+                        SK::If { then_stmt, else_stmt, .. } => {
+                            check_fn_fork(then_stmt)?;
+                            if let Some(eb) = else_stmt { check_fn_fork(eb)?; }
+                            Ok(())
+                        }
+                        SK::For { body, .. } | SK::While { body, .. } | SK::DoWhile { body, .. }
+                        | SK::Repeat { body, .. } | SK::Forever { body } | SK::Foreach { body, .. } => check_fn_fork(body),
+                        SK::TimingControl { stmt, .. } | SK::Wait { stmt, .. } => check_fn_fork(stmt),
+                        SK::Case { items, .. } => { for it in items { check_fn_fork(&it.stmt)?; } Ok(()) }
+                        _ => Ok(()),
+                    }
+                }
+                for it in &fd.items { check_fn_fork(it)?; }
                 elab.functions.insert(fd.name.name.name.clone(), fd.clone());
             }
             ModuleItem::TaskDeclaration(td) => {
+                fn check_no_return_in_fork(s: &crate::ast::stmt::Statement, in_fork: bool) -> Result<(), String> {
+                    use crate::ast::stmt::StatementKind as SK;
+                    match &s.kind {
+                        SK::Return(_) if in_fork => Err("illegal return from fork".into()),
+                        SK::ParBlock { stmts, .. } => { for st in stmts { check_no_return_in_fork(st, true)?; } Ok(()) }
+                        SK::SeqBlock { stmts, .. } => { for st in stmts { check_no_return_in_fork(st, in_fork)?; } Ok(()) }
+                        SK::If { then_stmt, else_stmt, .. } => {
+                            check_no_return_in_fork(then_stmt, in_fork)?;
+                            if let Some(eb) = else_stmt { check_no_return_in_fork(eb, in_fork)?; }
+                            Ok(())
+                        }
+                        SK::For { body, .. } | SK::While { body, .. } | SK::DoWhile { body, .. }
+                        | SK::Repeat { body, .. } | SK::Forever { body } | SK::Foreach { body, .. } => check_no_return_in_fork(body, in_fork),
+                        SK::TimingControl { stmt, .. } | SK::Wait { stmt, .. } => check_no_return_in_fork(stmt, in_fork),
+                        SK::Case { items, .. } => { for it in items { check_no_return_in_fork(&it.stmt, in_fork)?; } Ok(()) }
+                        _ => Ok(()),
+                    }
+                }
+                for it in &td.items { check_no_return_in_fork(it, false)?; }
                 elab.tasks.insert(td.name.name.name.clone(), td.clone());
             }
             ModuleItem::ImportDeclaration(imp) => {
@@ -1563,6 +1850,7 @@ pub fn is_type_signed(dt: &DataType) -> bool {
         }
         DataType::Implicit { signing, .. } => matches!(signing, Some(Signing::Signed)),
         DataType::Real { .. } => true,
+        DataType::Struct(su) => matches!(su.signing, Some(Signing::Signed)),
         _ => false,
     }
 }
@@ -1571,7 +1859,24 @@ pub fn is_type_real(dt: &DataType) -> bool {
     matches!(dt, DataType::Real { .. })
 }
 
-fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<String, Value>>) -> Option<i64> {
+/// Returns the default value for a type: 0 for 2-state types, X for 4-state types.
+fn default_value_for_type(dt: &DataType, width: u32) -> Value {
+    if is_type_real(dt) { return Value::from_f64(0.0); }
+    if is_type_two_state(dt) { Value::zero(width) } else { Value::new(width) }
+}
+
+/// Returns true for 2-state types (bit, byte, shortint, int, longint) whose default is 0.
+pub fn is_type_two_state(dt: &DataType) -> bool {
+    match dt {
+        DataType::IntegerVector { kind, .. } => matches!(kind, IntegerVectorType::Bit),
+        DataType::IntegerAtom { kind, .. } => matches!(kind,
+            IntegerAtomType::Byte | IntegerAtomType::ShortInt | IntegerAtomType::Int | IntegerAtomType::LongInt),
+        DataType::Real { .. } => true,
+        _ => false,
+    }
+}
+
+pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<String, Value>>) -> Option<i64> {
     match &expr.kind {
         ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
             let r = match base { NumberBase::Binary => 2, NumberBase::Octal => 8, NumberBase::Hex => 16, NumberBase::Decimal => 10 };
@@ -1743,6 +2048,7 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 _ => v,
             }
         }
+        ExprKind::Dollar => Value::from_u64(u32::MAX as u64, 32),
         ExprKind::Paren(inner) => eval_const_expr_val(inner, params),
         ExprKind::SystemCall { name, args } if name == "$clog2" => {
             if let Some(arg) = args.first() {

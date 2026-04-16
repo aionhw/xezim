@@ -400,7 +400,16 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::Expr(e) => {
                 match &e.kind {
                     // Bare identifier as statement: side-effect-free read, compile as no-op.
-                    ExprKind::Ident(_) | ExprKind::Number(_) | ExprKind::Paren(_) => {
+                    // Exception: hier idents like q.delete, q.sort etc. have side effects.
+                    ExprKind::Ident(hier) if hier.path.len() == 1 => { return true; }
+                    ExprKind::Ident(hier) if hier.path.len() > 1 => {
+                        let mname = hier.path.last().unwrap().name.name.as_str();
+                        if matches!(mname, "delete" | "sort" | "rsort" | "reverse" | "unique" | "unique_index" | "pop_front" | "pop_back") {
+                            return self.emit_fallback(&Statement::new(stmt.kind.clone(), stmt.span));
+                        }
+                        return true;
+                    }
+                    ExprKind::Number(_) | ExprKind::Paren(_) => {
                         return true;
                     }
                     // Pre/post increment/decrement have side effects — compile them

@@ -661,7 +661,25 @@ impl Value {
         if self.is_real || other.is_real {
             return Value::from_u64((self.to_f64() == other.to_f64()) as u64, 1);
         }
-        if self.has_xz() || other.has_xz() { return Value::new(1); } // X
+        if self.has_xz() || other.has_xz() {
+            // IEEE 1800: == returns X only when ambiguous.
+            // If any position has both bits known and they differ -> 0.
+            let w = self.width.max(other.width) as usize;
+            let sign_a = self.is_signed && (self.width as usize) < w;
+            let sign_b = other.is_signed && (other.width as usize) < w;
+            let top_a = if self.width > 0 { self.get_bit((self.width - 1) as usize) } else { LogicBit::Zero };
+            let top_b = if other.width > 0 { other.get_bit((other.width - 1) as usize) } else { LogicBit::Zero };
+            for i in 0..w {
+                let a = if i < self.width as usize { self.get_bit(i) } else if sign_a { top_a } else { LogicBit::Zero };
+                let b = if i < other.width as usize { other.get_bit(i) } else if sign_b { top_b } else { LogicBit::Zero };
+                let a_known = matches!(a, LogicBit::Zero | LogicBit::One);
+                let b_known = matches!(b, LogicBit::Zero | LogicBit::One);
+                if a_known && b_known && a != b {
+                    return Value::from_u64(0, 1);
+                }
+            }
+            return Value::new(1);
+        }
         // IEEE 1800: if either operand is signed, sign-extend both to max width
         if (self.is_signed || other.is_signed) && self.width != other.width {
             let w = self.width.max(other.width);
@@ -674,18 +692,12 @@ impl Value {
     }
 
     pub fn is_not_equal(&self, other: &Value) -> Value {
-        if self.is_real || other.is_real {
-            return Value::from_u64((self.to_f64() != other.to_f64()) as u64, 1);
+        let eq = self.is_equal(other);
+        match eq.get_bit(0) {
+            LogicBit::Zero => Value::from_u64(1, 1),
+            LogicBit::One => Value::from_u64(0, 1),
+            _ => Value::new(1),
         }
-        if self.has_xz() || other.has_xz() { return Value::new(1); }
-        if (self.is_signed || other.is_signed) && self.width != other.width {
-            let w = self.width.max(other.width);
-            let a = self.resize(w).to_u64().unwrap_or(0);
-            let b = other.resize(w).to_u64().unwrap_or(0);
-            return Value::from_u64((a != b) as u64, 1);
-        }
-        let eq = self.to_u64().unwrap_or(0) != other.to_u64().unwrap_or(0);
-        Value::from_u64(eq as u64, 1)
     }
 
     pub fn case_eq(&self, other: &Value) -> Value {
@@ -1052,7 +1064,6 @@ impl Value {
             return String::new();
         }
         let mut out: Vec<u8> = Vec::new();
-        let mut started = false;
         for bi in (0..num_bytes).rev() {
             let mut byte = 0u8;
             for b in 0..8usize {
@@ -1064,24 +1075,11 @@ impl Value {
                     byte |= 1u8 << b;
                 }
             }
-            if !started {
-                if byte == 0 {
-                    continue;
-                }
-                started = true;
-            }
-            if started {
-                if byte == 0 {
-                    break;
-                }
+            if byte != 0 {
                 out.push(byte);
             }
         }
-        if !started {
-            String::new()
-        } else {
-            String::from_utf8_lossy(&out).to_string()
-        }
+        String::from_utf8_lossy(&out).to_string()
     }
 
     /// Hex string representation
