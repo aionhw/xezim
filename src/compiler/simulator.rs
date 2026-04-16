@@ -67,6 +67,9 @@ enum CombItem {
     ContAssign { lhs: Expression, rhs: Expression },
     /// Fast path: direct signal-to-signal copy (assign b = a) with pre-resolved IDs.
     DirectCopy { dst_id: usize, src_id: usize, width: u32 },
+    /// Bytecode-compiled cont_assign: RHS compiled to VM instructions,
+    /// result written to pre-resolved dst_id via BlockingAssign insn.
+    CompiledContAssign { compiled: super::bytecode::CompiledBlock },
     AlwaysBlock { stmt: Statement, is_always_comb: bool },
 }
 
@@ -483,6 +486,12 @@ pub struct Simulator {
     prof_insns_executed: u64,
     prof_fallback_insns: u64,
     prof_fallback_by_reason: HashMap<&'static str, (u64, u64)>,
+    prof_settle_dc_ns: u64,
+    prof_settle_ca_ns: u64,
+    prof_settle_ab_ns: u64,
+    prof_settle_dc_count: u64,
+    prof_settle_ca_count: u64,
+    prof_settle_ab_count: u64,
     /// Persistent buffers for settle_combinatorial (avoid repeated allocation)
     settle_triggered: Vec<bool>,
     settle_dirty_ids: Vec<usize>,
@@ -605,6 +614,8 @@ impl Simulator {
             prof_settle: 0, prof_edges: 0, prof_nba: 0, prof_process: 0, prof_snapshot: 0, prof_vcd: 0,
             prof_edge_detect: 0, prof_edge_exec: 0, prof_edges_fired: 0, prof_insns_executed: 0, prof_fallback_insns: 0,
             prof_fallback_by_reason: HashMap::new(),
+            prof_settle_dc_ns: 0, prof_settle_ca_ns: 0, prof_settle_ab_ns: 0,
+            prof_settle_dc_count: 0, prof_settle_ca_count: 0, prof_settle_ab_count: 0,
             t_prevclone: std::time::Duration::ZERO,
             t_process: std::time::Duration::ZERO,
             t_settle_total: std::time::Duration::ZERO,
@@ -1885,7 +1896,8 @@ impl Simulator {
                     e.1 += elapsed;
                 }
                 Insn::BlockingAssign(sig_id, val_reg, width) => {
-                    let val = self.vm_regs[*val_reg as usize].resize(*width);
+                    let mut val = self.vm_regs[*val_reg as usize].resize(*width);
+                    val.is_signed = self.signal_signed[*sig_id];
                     if self.signal_table[*sig_id] != val {
                         if !self.dirty_signals[*sig_id] {
                             self.dirty_signals[*sig_id] = true;
@@ -1915,6 +1927,9 @@ impl Simulator {
                 }
                 Insn::Move(d, s) => {
                     self.vm_regs[*d as usize] = self.vm_regs[*s as usize].clone();
+                }
+                Insn::SetSigned(reg) => {
+                    self.vm_regs[*reg as usize].is_signed = true;
                 }
                 Insn::Nop => {}
             }
@@ -1948,10 +1963,32 @@ impl Simulator {
                 } else { None }
             } else { None };
 
-            let item = direct_copy.unwrap_or_else(|| CombItem::ContAssign { lhs: ca.lhs.clone(), rhs: ca.rhs.clone() });
             let scope_hint = self
                 .infer_contassign_scope_hint(&ca.lhs, &ca.rhs)
                 .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads));
+
+            let item = if let Some(dc) = direct_copy {
+                dc
+            } else if wids.len() == 1 {
+                // Try bytecode-compiling the RHS for single-target cont_assigns
+                let (dst_id, _) = wids[0];
+                let width = self.signal_widths[dst_id];
+                let mut compiler = super::bytecode::BytecodeCompiler::new(
+                    &self.signal_name_to_id,
+                    &self.signal_signed,
+                    &self.signal_widths,
+                    &self.module.arrays,
+                    &self.widths,
+                );
+                compiler.set_scope_hint(scope_hint.clone());
+                if compiler.compile_cont_assign(&ca.rhs, dst_id, width) {
+                    CombItem::CompiledContAssign { compiled: compiler.finish() }
+                } else {
+                    CombItem::ContAssign { lhs: ca.lhs.clone(), rhs: ca.rhs.clone() }
+                }
+            } else {
+                CombItem::ContAssign { lhs: ca.lhs.clone(), rhs: ca.rhs.clone() }
+            };
 
             // Resolve reads, retrying with scope_hint prefix for bare local names.
             // Without this, references like `mem_valid` from a top-level cont_assign
@@ -2053,10 +2090,11 @@ impl Simulator {
         }
         self.comb_dep_by_id = dep_by_id;
         let dc_count = entries.iter().filter(|e| matches!(&e.item, CombItem::DirectCopy { .. })).count();
+        let cca_count = entries.iter().filter(|e| matches!(&e.item, CombItem::CompiledContAssign { .. })).count();
         let ca_count = entries.iter().filter(|e| matches!(&e.item, CombItem::ContAssign { .. })).count();
         let ab_count = entries.iter().filter(|e| matches!(&e.item, CombItem::AlwaysBlock { .. })).count();
         if dc_count > 0 {
-            sim_dbg_eprintln!("[OPT] comb entries: {} direct-copy, {} cont-assign, {} always-block", dc_count, ca_count, ab_count);
+            sim_dbg_eprintln!("[OPT] comb entries: {} direct-copy, {} compiled-ca, {} ast-ca, {} always-block", dc_count, cca_count, ca_count, ab_count);
             sim_dbg_eprintln!("[OPT] edge blocks: {}, event_waiters: {}", self.edge_blocks.len(), self.event_waiters.len());
         }
         self.comb_entries = entries;
@@ -2619,6 +2657,10 @@ impl Simulator {
             eprintln!("[PROF] fallback_reason {:>30}: count={:>8} total={:>8.1}ms avg={:>7.1}µs",
                 reason, count, *ns as f64 / 1e6, *ns as f64 / *count as f64 / 1e3);
         }
+        eprintln!("[PROF] settle_dc={:.1}ms({}) settle_ca={:.1}ms({}) settle_ab={:.1}ms({})",
+            self.prof_settle_dc_ns as f64/1e6, self.prof_settle_dc_count,
+            self.prof_settle_ca_ns as f64/1e6, self.prof_settle_ca_count,
+            self.prof_settle_ab_ns as f64/1e6, self.prof_settle_ab_count);
         eprintln!("[PROF] settle_calls={} settle_iters={} max_iters={} entry_evals={} unresolved_entries={}/{}",
             self.settle_calls, self.settle_iters, self.max_settle_iters, self.entry_evals,
             unresolved, self.comb_entries.len());
@@ -2680,8 +2722,7 @@ impl Simulator {
                 // Get destination signal name to determine block
                 let dst_name = match &entry.item {
                     CombItem::DirectCopy { dst_id, .. } => &self.id_to_name[*dst_id],
-                    CombItem::ContAssign {  .. } => {
-                        // Use first write signal
+                    CombItem::ContAssign {  .. } | CombItem::CompiledContAssign { .. } => {
                         if let Some((id, _)) = entry.write_signal_ids.first() {
                             &self.id_to_name[*id]
                         } else { continue; }
@@ -3408,6 +3449,7 @@ impl Simulator {
                 if self.activity_mon && !self.activity_counts.is_empty() {
                     self.activity_counts[eidx] += 1;
                 }
+                let t_entry = std::time::Instant::now();
                 match &entries[eidx].item {
                     CombItem::DirectCopy { dst_id, src_id, width } => {
                         let src_val = self.signal_table[*src_id].clone();
@@ -3423,6 +3465,19 @@ impl Simulator {
                                 self.table_modified = true;
                             }
                         }
+                        self.prof_settle_dc_ns += t_entry.elapsed().as_nanos() as u64;
+                        self.prof_settle_dc_count += 1;
+                    }
+                    CombItem::CompiledContAssign { compiled } => {
+                        let insns_ptr = compiled.instructions.as_ptr();
+                        let insns_len = compiled.instructions.len();
+                        if self.vm_regs.len() < compiled.num_regs as usize {
+                            self.vm_regs.resize(compiled.num_regs as usize, Value::zero(1));
+                        }
+                        let insns = unsafe { std::slice::from_raw_parts(insns_ptr, insns_len) };
+                        self.exec_insns(insns);
+                        self.prof_settle_dc_ns += t_entry.elapsed().as_nanos() as u64;
+                        self.prof_settle_dc_count += 1;
                     }
                     CombItem::ContAssign { lhs, rhs } => {
                         let saved_hint = self.name_resolve_hint.borrow().clone();
@@ -3468,6 +3523,8 @@ impl Simulator {
                             }
                         }
                         *self.name_resolve_hint.borrow_mut() = saved_hint;
+                        self.prof_settle_ca_ns += t_entry.elapsed().as_nanos() as u64;
+                        self.prof_settle_ca_count += 1;
                     }
                     CombItem::AlwaysBlock { stmt, .. } => {
                         let saved_hint = self.name_resolve_hint.borrow().clone();
@@ -3488,6 +3545,8 @@ impl Simulator {
                                 self.dirty_any = true;
                             }
                         }
+                        self.prof_settle_ab_ns += t_entry.elapsed().as_nanos() as u64;
+                        self.prof_settle_ab_count += 1;
                     }
                 }
             }

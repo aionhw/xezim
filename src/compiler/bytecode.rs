@@ -93,6 +93,7 @@ pub enum Insn {
     /// body as fast bytecode instead of falling back wholesale to AST.
     StmtFallback(Arc<Statement>, &'static str),
 
+    SetSigned(RegId),
     Nop,
 }
 
@@ -595,7 +596,7 @@ impl<'a> BytecodeCompiler<'a> {
                 match name.as_str() {
                     "$signed" => {
                         let r = self.compile_expr(args.first()?, 0)?;
-                        // Mark as signed - we'll handle this in the VM
+                        self.emit(Insn::SetSigned(r));
                         Some(r)
                     }
                     "$unsigned" => {
@@ -744,6 +745,52 @@ impl<'a> BytecodeCompiler<'a> {
                 'z' | 'Z' => Value::all_z(32),
                 _ => Value::new(32),
             }),
+        }
+    }
+
+    /// Compile a continuous assign: evaluate RHS, write to pre-resolved LHS.
+    /// Returns true if compiled successfully.
+    pub fn compile_cont_assign(&mut self, rhs: &Expression, dst_id: usize, width: u32) -> bool {
+        // Verilog context width = max(LHS width, max operand width in RHS).
+        // Using just the LHS width truncates intermediates when operands
+        // (e.g. 32-bit parameters) are wider than the target wire.
+        let ctx = width.max(self.expr_max_width(rhs));
+        if let Some(val_reg) = self.compile_expr(rhs, ctx) {
+            self.emit(Insn::Resize(val_reg, width));
+            self.emit(Insn::BlockingAssign(dst_id, val_reg, width));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expr_max_width(&self, expr: &Expression) -> u32 {
+        match &expr.kind {
+            ExprKind::Ident(hier) => {
+                self.lookup_signal_id(hier)
+                    .map(|id| self.signal_widths[id])
+                    .unwrap_or(0)
+            }
+            ExprKind::Number(n) => {
+                self.eval_number_static(n).map(|v| v.width).unwrap_or(32)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_max_width(left).max(self.expr_max_width(right))
+            }
+            ExprKind::Unary { operand, .. } => self.expr_max_width(operand),
+            ExprKind::Paren(inner) => self.expr_max_width(inner),
+            ExprKind::Call { args, .. } => {
+                args.iter().map(|a| self.expr_max_width(a)).max().unwrap_or(0)
+            }
+            ExprKind::Conditional { then_expr, else_expr, condition, .. } => {
+                self.expr_max_width(condition)
+                    .max(self.expr_max_width(then_expr))
+                    .max(self.expr_max_width(else_expr))
+            }
+            ExprKind::Concatenation(parts) => {
+                parts.iter().map(|p| self.expr_max_width(p)).sum()
+            }
+            _ => 0,
         }
     }
 
