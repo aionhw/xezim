@@ -91,7 +91,7 @@ pub enum Insn {
     /// Used for rare constructs (e.g. $display, complex LHS) so an edge
     /// block containing one unsupported stmt can still run most of its
     /// body as fast bytecode instead of falling back wholesale to AST.
-    StmtFallback(Arc<Statement>),
+    StmtFallback(Arc<Statement>, &'static str),
 
     Nop,
 }
@@ -117,6 +117,10 @@ pub struct BytecodeCompiler<'a> {
     /// failing compilation. Safe for edge blocks where the AST interpreter's
     /// statement path is the same one used by the non-compiled fallback.
     pub allow_ast_fallback: bool,
+    /// Hierarchical scope for resolving unqualified identifiers. An Ident
+    /// with a bare local name (`mem_valid`) is first tried verbatim, then
+    /// with this prefix applied (`testbench.mem_valid`).
+    pub scope_hint: Option<String>,
 }
 
 impl<'a> BytecodeCompiler<'a> {
@@ -137,6 +141,7 @@ impl<'a> BytecodeCompiler<'a> {
             widths,
             bail_reason: None,
             allow_ast_fallback: false,
+            scope_hint: None,
         }
     }
 
@@ -144,12 +149,41 @@ impl<'a> BytecodeCompiler<'a> {
         self.allow_ast_fallback = allow;
     }
 
+    pub fn set_scope_hint(&mut self, scope: Option<String>) {
+        self.scope_hint = scope;
+    }
+
     fn emit_fallback(&mut self, stmt: &Statement) -> bool {
         if self.allow_ast_fallback {
-            self.emit(Insn::StmtFallback(Arc::new(stmt.clone())));
+            let reason = self.bail_reason.unwrap_or_else(|| Self::stmt_kind_label(stmt));
+            self.emit(Insn::StmtFallback(Arc::new(stmt.clone()), reason));
             true
         } else {
             false
+        }
+    }
+
+    fn stmt_kind_label(stmt: &Statement) -> &'static str {
+        match &stmt.kind {
+            StatementKind::Null => "Stmt_Null",
+            StatementKind::NonblockingAssign { .. } => "Stmt_Nba",
+            StatementKind::BlockingAssign { .. } => "Stmt_Blk",
+            StatementKind::If { .. } => "Stmt_If",
+            StatementKind::Case { .. } => "Stmt_Case",
+            StatementKind::SeqBlock { .. } => "Stmt_SeqBlock",
+            StatementKind::ParBlock { .. } => "Stmt_ParBlock",
+            StatementKind::Expr(_) => "Stmt_Expr",
+            StatementKind::For { .. } => "Stmt_For",
+            StatementKind::Foreach { .. } => "Stmt_Foreach",
+            StatementKind::While { .. } => "Stmt_While",
+            StatementKind::DoWhile { .. } => "Stmt_DoWhile",
+            StatementKind::Repeat { .. } => "Stmt_Repeat",
+            StatementKind::Forever { .. } => "Stmt_Forever",
+            StatementKind::TimingControl { .. } => "Stmt_Timing",
+            StatementKind::Wait { .. } => "Stmt_Wait",
+            StatementKind::Assertion(_) => "Stmt_Assertion",
+            StatementKind::VarDecl { .. } => "Stmt_VarDecl",
+            _ => "Stmt_other",
         }
     }
 
@@ -182,9 +216,17 @@ impl<'a> BytecodeCompiler<'a> {
         if let Some(&id) = self.signal_name_to_id.get(&raw) {
             return Some(id);
         }
+        if let Some(scope) = &self.scope_hint {
+            let qualified = format!("{}.{}", scope, raw);
+            if let Some(&id) = self.signal_name_to_id.get(&qualified) {
+                return Some(id);
+            }
+        }
         if hier.path.len() == 1 {
             let leaf = &hier.path[0].name.name;
-            return self.signal_name_to_id.get(leaf).copied();
+            if let Some(&id) = self.signal_name_to_id.get(leaf) {
+                return Some(id);
+            }
         }
         None
     }
@@ -193,6 +235,12 @@ impl<'a> BytecodeCompiler<'a> {
         let raw = Self::hier_raw_name(hier);
         if self.arrays.contains_key(&raw) {
             return Some(raw);
+        }
+        if let Some(scope) = &self.scope_hint {
+            let qualified = format!("{}.{}", scope, raw);
+            if self.arrays.contains_key(&qualified) {
+                return Some(qualified);
+            }
         }
         if hier.path.len() == 1 {
             let leaf = &hier.path[0].name.name;
@@ -209,13 +257,18 @@ impl<'a> BytecodeCompiler<'a> {
     pub fn compile_stmt(&mut self, stmt: &Statement) -> bool {
         let start = self.insns.len();
         let start_reg = self.next_reg;
+        let saved_reason = self.bail_reason;
+        self.bail_reason = None;
         if self.compile_stmt_strict(stmt) {
+            self.bail_reason = saved_reason;
             return true;
         }
         if self.allow_ast_fallback {
+            let reason = self.bail_reason.unwrap_or_else(|| Self::stmt_kind_label(stmt));
             self.insns.truncate(start);
             self.next_reg = start_reg;
-            self.emit(Insn::StmtFallback(Arc::new(stmt.clone())));
+            self.emit(Insn::StmtFallback(Arc::new(stmt.clone()), reason));
+            self.bail_reason = saved_reason;
             return true;
         }
         false

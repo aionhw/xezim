@@ -477,6 +477,12 @@ pub struct Simulator {
     prof_process: u64,
     prof_snapshot: u64,
     prof_vcd: u64,
+    prof_edge_detect: u64,
+    prof_edge_exec: u64,
+    prof_edges_fired: u64,
+    prof_insns_executed: u64,
+    prof_fallback_insns: u64,
+    prof_fallback_by_reason: HashMap<&'static str, (u64, u64)>,
     /// Persistent buffers for settle_combinatorial (avoid repeated allocation)
     settle_triggered: Vec<bool>,
     settle_dirty_ids: Vec<usize>,
@@ -597,6 +603,8 @@ impl Simulator {
             settle_calls: 0, settle_triggered: Vec::new(), settle_dirty_ids: Vec::new(),
             settle_prev_values: Vec::new(), settle_triggered_list: Vec::new(), loop_iters: 0,
             prof_settle: 0, prof_edges: 0, prof_nba: 0, prof_process: 0, prof_snapshot: 0, prof_vcd: 0,
+            prof_edge_detect: 0, prof_edge_exec: 0, prof_edges_fired: 0, prof_insns_executed: 0, prof_fallback_insns: 0,
+            prof_fallback_by_reason: HashMap::new(),
             t_prevclone: std::time::Duration::ZERO,
             t_process: std::time::Duration::ZERO,
             t_settle_total: std::time::Duration::ZERO,
@@ -1709,6 +1717,12 @@ impl Simulator {
         let mut bc_count = 0;
         let mut max_regs: u16 = 0;
         for block in &self.edge_blocks {
+            // Derive a scope hint from the block's first sensitivity signal —
+            // unqualified idents inside the block are resolved under this
+            // parent module scope.
+            let scope_hint = block.resolved_sensitivities.first()
+                .and_then(|sid| self.id_to_name.get(sid.signal_id))
+                .and_then(|full| full.rsplit_once('.').map(|(p, _)| p.to_string()));
             let mut compiler = BytecodeCompiler::new(
                 &self.signal_name_to_id,
                 &self.signal_signed,
@@ -1717,6 +1731,7 @@ impl Simulator {
                 &self.widths,
             );
             compiler.set_ast_fallback(true);
+            compiler.set_scope_hint(scope_hint);
             if compiler.compile_stmt(&block.stmt) {
                 let cb = compiler.finish();
                 if cb.num_regs > max_regs { max_regs = cb.num_regs; }
@@ -1755,7 +1770,9 @@ impl Simulator {
         use super::bytecode::Insn;
         let mut pc: usize = 0;
         let len = insns.len();
+        let mut local_count: u64 = 0;
         while pc < len {
+            local_count += 1;
             match &insns[pc] {
                 Insn::LoadConst(dest, val) => {
                     self.vm_regs[*dest as usize] = val.clone();
@@ -1856,9 +1873,16 @@ impl Simulator {
                     new_val.set_bit(idx, bit);
                     self.nba_fast.push(NbaFast { signal_id: id, value: new_val });
                 }
-                Insn::StmtFallback(stmt) => {
+                Insn::StmtFallback(stmt, reason) => {
                     let s = stmt.clone();
+                    self.prof_fallback_insns += 1;
+                    let r = *reason;
+                    let t0 = std::time::Instant::now();
                     self.exec_statement(&s);
+                    let elapsed = t0.elapsed().as_nanos() as u64;
+                    let e = self.prof_fallback_by_reason.entry(r).or_insert((0u64, 0u64));
+                    e.0 += 1;
+                    e.1 += elapsed;
                 }
                 Insn::BlockingAssign(sig_id, val_reg, width) => {
                     let val = self.vm_regs[*val_reg as usize].resize(*width);
@@ -1896,6 +1920,7 @@ impl Simulator {
             }
             pc += 1;
         }
+        self.prof_insns_executed += local_count;
     }
 
     fn build_comb_entries(&mut self) {
@@ -2582,6 +2607,18 @@ impl Simulator {
             t_settle as f64/1e6, t_edges as f64/1e6, t_nba as f64/1e6,
             t_process as f64/1e6, t_snap as f64/1e6, t_sched as f64/1e6);
         let unresolved = self.comb_entries.iter().filter(|e| e.has_unresolved_reads).count();
+        eprintln!("[PROF] edge_detect={:.1}ms edge_exec={:.1}ms edges_fired={} insns={} ns_per_insn={:.1} fallbacks={}",
+            self.prof_edge_detect as f64/1e6, self.prof_edge_exec as f64/1e6, self.prof_edges_fired,
+            self.prof_insns_executed,
+            if self.prof_insns_executed > 0 { self.prof_edge_exec as f64 / self.prof_insns_executed as f64 } else { 0.0 },
+            self.prof_fallback_insns);
+        let mut reasons: Vec<(&'static str, u64, u64)> = self.prof_fallback_by_reason.iter()
+            .map(|(k, v)| (*k, v.0, v.1)).collect();
+        reasons.sort_by_key(|(_, _, ns)| std::cmp::Reverse(*ns));
+        for (reason, count, ns) in reasons.iter().take(15) {
+            eprintln!("[PROF] fallback_reason {:>30}: count={:>8} total={:>8.1}ms avg={:>7.1}µs",
+                reason, count, *ns as f64 / 1e6, *ns as f64 / *count as f64 / 1e3);
+        }
         eprintln!("[PROF] settle_calls={} settle_iters={} max_iters={} entry_evals={} unresolved_entries={}/{}",
             self.settle_calls, self.settle_iters, self.max_settle_iters, self.entry_evals,
             unresolved, self.comb_entries.len());
@@ -3220,12 +3257,15 @@ impl Simulator {
         let blocks = std::mem::take(&mut self.edge_blocks);
         self.in_edge_block = true;
         for (block_idx, block) in blocks.iter().enumerate() {
+            let t0 = std::time::Instant::now();
             let mut trigger = false;
             for sid in &block.resolved_sensitivities {
                 trigger = self.check_edge_id(sid.signal_id, sid.edge);
                 if trigger { break; }
             }
+            self.prof_edge_detect += t0.elapsed().as_nanos() as u64;
             if trigger {
+                self.prof_edges_fired += 1;
                 let saved_hint = self.name_resolve_hint.borrow().clone();
                 if let Some(first) = block.resolved_sensitivities.first() {
                     if let Some(full) = self.id_to_name.get(first.signal_id) {
@@ -3234,11 +3274,13 @@ impl Simulator {
                         }
                     }
                 }
+                let t1 = std::time::Instant::now();
                 // Try bytecode VM first (flat instruction array, cache-friendly)
                 if !self.exec_bytecode(block_idx) {
                     // Fallback: AST interpreter
                     self.exec_statement(&block.stmt);
                 }
+                self.prof_edge_exec += t1.elapsed().as_nanos() as u64;
                 *self.name_resolve_hint.borrow_mut() = saved_hint;
             }
         }
