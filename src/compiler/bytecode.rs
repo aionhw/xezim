@@ -77,6 +77,10 @@ pub enum Insn {
     NbaAssignBitDyn(usize, RegId, RegId), // (signal_id, idx_reg, value_reg)
     /// Blocking assign: signal_table[id] = reg.
     BlockingAssign(usize, RegId, u32), // (signal_id, value_reg, width)
+    /// Blocking range assign: signal_table[id][hi:lo] = reg (read-modify-write).
+    BlockingAssignRange(usize, u32, u32, RegId), // (signal_id, hi, lo, value_reg)
+    /// Blocking bit assign: signal_table[id][idx_reg] = reg[0] (read-modify-write).
+    BlockingAssignBitDyn(usize, RegId, RegId), // (signal_id, idx_reg, value_reg)
 
     /// Load array element: dest = signal_table[array_base + eval(index_reg)]
     LoadArrayElem(RegId, String, RegId), // (dest, array_name, index_reg)
@@ -230,6 +234,14 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         None
+    }
+
+    fn expr_to_signal_id(&self, expr: &Expression) -> Option<usize> {
+        match &expr.kind {
+            ExprKind::Ident(hier) => self.lookup_signal_id(hier),
+            ExprKind::Paren(inner) => self.expr_to_signal_id(inner),
+            _ => None,
+        }
     }
 
     fn lookup_array_name(&self, hier: &HierarchicalIdentifier) -> Option<String> {
@@ -386,6 +398,48 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // Bail out on anything else (timing controls, loops, system tasks, etc.)
             StatementKind::Expr(e) => {
+                match &e.kind {
+                    // Bare identifier as statement: side-effect-free read, compile as no-op.
+                    ExprKind::Ident(_) | ExprKind::Number(_) | ExprKind::Paren(_) => {
+                        return true;
+                    }
+                    // Pre/post increment/decrement have side effects — compile them
+                    ExprKind::Unary { op: UnaryOp::PreIncr, operand } |
+                    ExprKind::Unary { op: UnaryOp::PostIncr, operand } => {
+                        if let Some(sig_id) = self.expr_to_signal_id(operand) {
+                            let r = self.alloc_reg();
+                            self.emit(Insn::LoadSignal(r, sig_id));
+                            let one = self.alloc_reg();
+                            let w = self.signal_widths[sig_id];
+                            self.emit(Insn::LoadConst(one, Value::from_u64(1, w)));
+                            let result = self.alloc_reg();
+                            self.emit(Insn::Add(result, r, one));
+                            self.emit(Insn::Resize(result, w));
+                            self.emit(Insn::BlockingAssign(sig_id, result, w));
+                            return true;
+                        }
+                        self.bail("Expr_PreIncr");
+                        return self.emit_fallback(stmt);
+                    }
+                    ExprKind::Unary { op: UnaryOp::PreDecr, operand } |
+                    ExprKind::Unary { op: UnaryOp::PostDecr, operand } => {
+                        if let Some(sig_id) = self.expr_to_signal_id(operand) {
+                            let r = self.alloc_reg();
+                            self.emit(Insn::LoadSignal(r, sig_id));
+                            let one = self.alloc_reg();
+                            let w = self.signal_widths[sig_id];
+                            self.emit(Insn::LoadConst(one, Value::from_u64(1, w)));
+                            let result = self.alloc_reg();
+                            self.emit(Insn::Sub(result, r, one));
+                            self.emit(Insn::Resize(result, w));
+                            self.emit(Insn::BlockingAssign(sig_id, result, w));
+                            return true;
+                        }
+                        self.bail("Expr_PreDecr");
+                        return self.emit_fallback(stmt);
+                    }
+                    _ => {}
+                }
                 let n: &'static str = match &e.kind {
                     ExprKind::SystemCall { name, .. } => match name.as_str() {
                         "$display" => "Expr_display",
@@ -397,24 +451,14 @@ impl<'a> BytecodeCompiler<'a> {
                         _ => "Expr_syscall_other",
                     },
                     ExprKind::Call { .. } => "Expr_Call",
-                    ExprKind::Unary { op, .. } => match op {
-                        UnaryOp::PreIncr => "Expr_PreIncr",
-                        UnaryOp::PreDecr => "Expr_PreDecr",
-                        UnaryOp::PostIncr => "Expr_PostIncr",
-                        UnaryOp::PostDecr => "Expr_PostDecr",
-                        _ => "Expr_UnaryOther",
-                    },
                     ExprKind::Binary { .. } => "Expr_Binary",
-                    ExprKind::Ident(_) => "Expr_Ident",
-                    ExprKind::Number(_) => "Expr_Number",
-                    ExprKind::Paren(_) => "Expr_Paren",
-                    ExprKind::Index { .. } => "Expr_Index",
-                    ExprKind::RangeSelect { .. } => "Expr_RangeSelect",
-                    ExprKind::Conditional { .. } => "Expr_Conditional",
                     ExprKind::Concatenation(_) => "Expr_Concat",
                     ExprKind::Replication { .. } => "Expr_Replication",
                     ExprKind::MemberAccess { .. } => "Expr_MemberAccess",
                     ExprKind::AssignmentPattern(_) => "Expr_AsgnPat",
+                    ExprKind::Index { .. } => "Expr_Index",
+                    ExprKind::RangeSelect { .. } => "Expr_RangeSelect",
+                    ExprKind::Conditional { .. } => "Expr_Conditional",
                     _ => "Expr_other",
                 };
                 self.bail(n);
@@ -476,11 +520,24 @@ impl<'a> BytecodeCompiler<'a> {
                 match op {
                     UnaryOp::Plus => return Some(src),
                     UnaryOp::Minus => self.emit(Insn::Negate(dest, src)),
+                    UnaryOp::Plus => self.emit(Insn::Move(dest, src)),
                     UnaryOp::LogNot => self.emit(Insn::LogNot(dest, src)),
                     UnaryOp::BitNot => self.emit(Insn::BitNot(dest, src)),
                     UnaryOp::BitAnd => self.emit(Insn::ReduceAnd(dest, src)),
+                    UnaryOp::BitNand => {
+                        self.emit(Insn::ReduceAnd(dest, src));
+                        self.emit(Insn::LogNot(dest, dest));
+                    }
                     UnaryOp::BitOr => self.emit(Insn::ReduceOr(dest, src)),
+                    UnaryOp::BitNor => {
+                        self.emit(Insn::ReduceOr(dest, src));
+                        self.emit(Insn::LogNot(dest, dest));
+                    }
                     UnaryOp::BitXor => self.emit(Insn::ReduceXor(dest, src)),
+                    UnaryOp::BitXnor => {
+                        self.emit(Insn::ReduceXor(dest, src));
+                        self.emit(Insn::LogNot(dest, dest));
+                    }
                     _ => { self.bail("UnaryOp_other"); return None; }
                 }
                 Some(dest)
@@ -667,7 +724,32 @@ impl<'a> BytecodeCompiler<'a> {
                 self.bail("nba_range_unresolved");
                 false
             }
-            ExprKind::Concatenation(_) => { self.bail("nba_concat"); false }
+            ExprKind::Concatenation(parts) => {
+                // {a, b, c} <= value: split value into per-part bit ranges and NBA each part.
+                // Concatenation is MSB-first: parts[0] is the highest bits.
+                let mut part_widths = Vec::with_capacity(parts.len());
+                for p in parts {
+                    let w = self.infer_lhs_width(p);
+                    part_widths.push(w);
+                }
+                let mut bit_offset: u32 = 0;
+                for (i, p) in parts.iter().enumerate().rev() {
+                    let pw = part_widths[i];
+                    let lo_reg = self.alloc_reg();
+                    self.emit(Insn::LoadConst(lo_reg, Value::from_u64(bit_offset as u64, 32)));
+                    let hi_val = bit_offset + pw - 1;
+                    let hi_reg = self.alloc_reg();
+                    self.emit(Insn::LoadConst(hi_reg, Value::from_u64(hi_val as u64, 32)));
+                    let part_reg = self.alloc_reg();
+                    self.emit(Insn::RangeSelect(part_reg, val_reg, hi_reg, lo_reg));
+                    self.emit(Insn::Resize(part_reg, pw));
+                    if !self.compile_nba_target(p, part_reg, pw) {
+                        return false;
+                    }
+                    bit_offset += pw;
+                }
+                true
+            }
             ExprKind::MemberAccess { .. } => { self.bail("nba_member_access"); false }
             _ => { self.bail("nba_other"); false }
         }
@@ -679,9 +761,92 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(id) = self.lookup_signal_id(hier) {
                     self.emit(Insn::BlockingAssign(id, val_reg, width));
                     true
-                } else { false }
+                } else {
+                    self.bail("blocking_target");
+                    false
+                }
             }
-            _ => false,
+            ExprKind::Index { expr, index } => {
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if let Some(name) = self.lookup_array_name(hier) {
+                        if let Some(idx_reg) = self.compile_expr(index, 0) {
+                            let elem_name_reg = self.alloc_reg();
+                            let _ = elem_name_reg;
+                            // For blocking array assign, we need to compute the element name
+                            // and do a blocking assign. Use the same pattern as NbaAssignArray
+                            // but with a blocking write.
+                            // BlockingAssignArray doesn't exist yet — fall back.
+                            let _ = idx_reg;
+                            self.bail("blocking_array");
+                            return false;
+                        }
+                    }
+                    if let Some(id) = self.lookup_signal_id(hier) {
+                        if let Some(idx_reg) = self.compile_expr(index, 0) {
+                            self.emit(Insn::BlockingAssignBitDyn(id, idx_reg, val_reg));
+                            return true;
+                        }
+                    }
+                }
+                self.bail("blocking_target");
+                false
+            }
+            ExprKind::RangeSelect { expr, left, right, kind } => {
+                if *kind != RangeKind::Constant {
+                    self.bail("blocking_range_nonconst");
+                    return false;
+                }
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if let Some(id) = self.lookup_signal_id(hier) {
+                        if let (Some(hi), Some(lo)) = (self.eval_const_expr(left), self.eval_const_expr(right)) {
+                            // Blocking range assign: read current, modify range, write back
+                            let cur = self.alloc_reg();
+                            self.emit(Insn::LoadSignal(cur, id));
+                            let w = self.signal_widths[id];
+                            let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
+                            let range_w = high - low + 1;
+                            let resized = self.alloc_reg();
+                            self.emit(Insn::Move(resized, val_reg));
+                            self.emit(Insn::Resize(resized, range_w));
+                            // Build new value: splice resized into cur[high:low]
+                            // We need a SpliceBits instruction or do it manually.
+                            // Use BlockingAssignRange instruction.
+                            self.emit(Insn::BlockingAssignRange(id, hi, lo, resized));
+                            return true;
+                        }
+                    }
+                }
+                self.bail("blocking_target");
+                false
+            }
+            ExprKind::Concatenation(parts) => {
+                let mut part_widths = Vec::with_capacity(parts.len());
+                for p in parts {
+                    let w = self.infer_lhs_width(p);
+                    part_widths.push(w);
+                }
+                let mut bit_offset: u32 = 0;
+                for (i, p) in parts.iter().enumerate().rev() {
+                    let pw = part_widths[i];
+                    let lo_reg = self.alloc_reg();
+                    self.emit(Insn::LoadConst(lo_reg, Value::from_u64(bit_offset as u64, 32)));
+                    let hi_val = bit_offset + pw - 1;
+                    let hi_reg = self.alloc_reg();
+                    self.emit(Insn::LoadConst(hi_reg, Value::from_u64(hi_val as u64, 32)));
+                    let part_reg = self.alloc_reg();
+                    self.emit(Insn::RangeSelect(part_reg, val_reg, hi_reg, lo_reg));
+                    self.emit(Insn::Resize(part_reg, pw));
+                    if !self.compile_blocking_target(p, part_reg, pw) {
+                        return false;
+                    }
+                    bit_offset += pw;
+                }
+                true
+            }
+            _ => {
+                self.bail("blocking_target");
+                false
+            }
         }
     }
 

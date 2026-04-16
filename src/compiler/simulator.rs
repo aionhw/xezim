@@ -433,6 +433,8 @@ pub struct Simulator {
     /// Bytecode-compiled edge blocks (for blocks that compiled successfully).
     /// Index matches edge_blocks. None = fallback to AST interpreter.
     compiled_edge_blocks: Vec<Option<super::bytecode::CompiledBlock>>,
+    /// True for blocks eligible for parallel execution (no StmtFallback).
+    edge_block_parallel: Vec<bool>,
     /// VM register file (reusable across executions to avoid allocation).
     vm_regs: Vec<Value>,
     /// Built-in clock generators (optimized always #N clk = ~clk)
@@ -589,7 +591,7 @@ impl Simulator {
             return_value: None,
             rng: rand::rngs::StdRng::from_entropy(),
             settling: false, in_edge_block: false,
-            nba_queue: Vec::new(), nba_fast: Vec::new(), edge_blocks: Vec::new(), compiled_edge_blocks: Vec::new(), vm_regs: Vec::new(), clock_generators: Vec::new(),
+            nba_queue: Vec::new(), nba_fast: Vec::new(), edge_blocks: Vec::new(), compiled_edge_blocks: Vec::new(), edge_block_parallel: Vec::new(), vm_regs: Vec::new(), clock_generators: Vec::new(),
             event_queue: TimingWheel::new(), next_pid: 0, current_pid: 0,
             break_flag: false, continue_flag: false,
             event_waiters: Vec::new(),
@@ -1756,6 +1758,159 @@ impl Simulator {
         // Pre-allocate register file for the largest compiled block
         self.vm_regs = vec![Value::zero(1); max_regs as usize];
         sim_dbg_eprintln!("[OPT] bytecode compiled: {}/{} edge blocks", bc_count, self.edge_blocks.len());
+        // Classify blocks for parallel execution: blocks with StmtFallback or
+        // BlockingAssign/BlockingAssignRange/BlockingAssignBitDyn must run
+        // sequentially — fallbacks need &mut self, blocking assigns mutate
+        // signal_table which would race with parallel reads.
+        let mut pure_count = 0;
+        self.edge_block_parallel.clear();
+        for cb in &self.compiled_edge_blocks {
+            let is_pure = if let Some(cb) = cb {
+                !cb.instructions.iter().any(|insn| matches!(insn,
+                    super::bytecode::Insn::StmtFallback(..) |
+                    super::bytecode::Insn::BlockingAssign(..) |
+                    super::bytecode::Insn::BlockingAssignRange(..) |
+                    super::bytecode::Insn::BlockingAssignBitDyn(..)
+                ))
+            } else {
+                false
+            };
+            if is_pure { pure_count += 1; }
+            self.edge_block_parallel.push(is_pure);
+        }
+        sim_dbg_eprintln!("[OPT] parallel-eligible edge blocks: {}/{}", pure_count, self.compiled_edge_blocks.len());
+    }
+
+    /// Execute bytecode instructions in isolation (no &mut self).
+    /// Returns NBA entries produced. Used for parallel edge block execution.
+    fn exec_insns_isolated(
+        insns: &[super::bytecode::Insn],
+        signal_table: &[Value],
+        signal_signed: &[bool],
+        signal_name_to_id: &HashMap<String, usize>,
+        vm_regs: &mut Vec<Value>,
+    ) -> Vec<NbaFast> {
+        use super::bytecode::Insn;
+        let mut nba_out: Vec<NbaFast> = Vec::new();
+        let mut pc: usize = 0;
+        let len = insns.len();
+        while pc < len {
+            match &insns[pc] {
+                Insn::LoadConst(dest, val) => { vm_regs[*dest as usize] = val.clone(); }
+                Insn::LoadSignal(dest, sig_id) => { vm_regs[*dest as usize] = signal_table[*sig_id].clone(); }
+                Insn::LoadSignalSigned(dest, sig_id) => {
+                    let mut v = signal_table[*sig_id].clone();
+                    v.is_signed = true;
+                    vm_regs[*dest as usize] = v;
+                }
+                Insn::Resize(reg, width) => {
+                    let r = *reg as usize;
+                    if vm_regs[r].width != *width {
+                        let resized = vm_regs[r].resize(*width);
+                        vm_regs[r] = resized;
+                    }
+                }
+                Insn::Add(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].add(&vm_regs[*r as usize]); }
+                Insn::Sub(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].sub(&vm_regs[*r as usize]); }
+                Insn::Mul(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].mul(&vm_regs[*r as usize]); }
+                Insn::Div(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].div(&vm_regs[*r as usize]); }
+                Insn::Mod(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].modulo(&vm_regs[*r as usize]); }
+                Insn::BitAnd(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].bitwise_and(&vm_regs[*r as usize]); }
+                Insn::BitOr(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].bitwise_or(&vm_regs[*r as usize]); }
+                Insn::BitXor(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].bitwise_xor(&vm_regs[*r as usize]); }
+                Insn::BitXnor(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].bitwise_xor(&vm_regs[*r as usize]).bitwise_not(); }
+                Insn::LogAnd(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].logic_and(&vm_regs[*r as usize]); }
+                Insn::LogOr(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].logic_or(&vm_regs[*r as usize]); }
+                Insn::Eq(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].is_equal(&vm_regs[*r as usize]); }
+                Insn::Neq(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].is_not_equal(&vm_regs[*r as usize]); }
+                Insn::CaseEq(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].case_eq(&vm_regs[*r as usize]); }
+                Insn::Lt(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].less_than(&vm_regs[*r as usize]); }
+                Insn::Leq(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].less_equal(&vm_regs[*r as usize]); }
+                Insn::Gt(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].greater_than(&vm_regs[*r as usize]); }
+                Insn::Geq(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].greater_equal(&vm_regs[*r as usize]); }
+                Insn::Shl(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].shift_left(&vm_regs[*r as usize]); }
+                Insn::Shr(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].shift_right(&vm_regs[*r as usize]); }
+                Insn::AShr(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].arith_shift_right(&vm_regs[*r as usize]); }
+                Insn::BitNot(d, s) => { vm_regs[*d as usize] = vm_regs[*s as usize].bitwise_not(); }
+                Insn::LogNot(d, s) => { vm_regs[*d as usize] = vm_regs[*s as usize].logic_not(); }
+                Insn::Negate(d, s) => {
+                    let w = vm_regs[*s as usize].width;
+                    let mut r = Value::zero(w).sub(&vm_regs[*s as usize]).resize(w);
+                    r.is_signed = true;
+                    vm_regs[*d as usize] = r;
+                }
+                Insn::ReduceAnd(d, s) => { vm_regs[*d as usize] = vm_regs[*s as usize].reduce_and(); }
+                Insn::ReduceOr(d, s) => { vm_regs[*d as usize] = vm_regs[*s as usize].reduce_or(); }
+                Insn::ReduceXor(d, s) => { vm_regs[*d as usize] = vm_regs[*s as usize].reduce_xor(); }
+                Insn::BitSelect(d, base, idx) => {
+                    let i = vm_regs[*idx as usize].to_u64().unwrap_or(0) as usize;
+                    vm_regs[*d as usize] = vm_regs[*base as usize].bit_select(i);
+                }
+                Insn::RangeSelect(d, base, l, r) => {
+                    let li = vm_regs[*l as usize].to_u64().unwrap_or(0) as usize;
+                    let ri = vm_regs[*r as usize].to_u64().unwrap_or(0) as usize;
+                    vm_regs[*d as usize] = vm_regs[*base as usize].range_select(li, ri);
+                }
+                Insn::Concat(d, part_regs) => {
+                    let parts: Vec<Value> = part_regs.iter()
+                        .map(|r| vm_regs[*r as usize].clone())
+                        .collect();
+                    vm_regs[*d as usize] = Value::concat(&parts);
+                }
+                Insn::BranchIfFalse(reg, target) => {
+                    if !vm_regs[*reg as usize].is_true() { pc = *target as usize; continue; }
+                }
+                Insn::Jump(target) => { pc = *target as usize; continue; }
+                Insn::NbaAssign(sig_id, val_reg, width) => {
+                    let val = vm_regs[*val_reg as usize].resize(*width);
+                    nba_out.push(NbaFast { signal_id: *sig_id, value: val });
+                }
+                Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
+                    let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
+                    let w = high - low + 1;
+                    let val = vm_regs[*val_reg as usize].resize(w);
+                    let mut new_val = signal_table[*sig_id].clone();
+                    for bit_pos in low..=high {
+                        new_val.set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
+                    }
+                    nba_out.push(NbaFast { signal_id: *sig_id, value: new_val });
+                }
+                Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
+                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
+                    let bit = vm_regs[*val_reg as usize].get_bit(0);
+                    let mut new_val = signal_table[*sig_id].clone();
+                    new_val.set_bit(idx, bit);
+                    nba_out.push(NbaFast { signal_id: *sig_id, value: new_val });
+                }
+                Insn::LoadArrayElem(dest, array_name, idx_reg) => {
+                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0);
+                    let elem_name = format!("{}[{}]", array_name, idx);
+                    if let Some(&eid) = signal_name_to_id.get(&elem_name) {
+                        vm_regs[*dest as usize] = signal_table[eid].clone();
+                    } else {
+                        vm_regs[*dest as usize] = Value::new(1);
+                    }
+                }
+                Insn::NbaAssignArray(array_name, idx_reg, val_reg, width) => {
+                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0);
+                    let elem_name = format!("{}[{}]", array_name, idx);
+                    if let Some(&eid) = signal_name_to_id.get(&elem_name) {
+                        let val = vm_regs[*val_reg as usize].resize(*width);
+                        nba_out.push(NbaFast { signal_id: eid, value: val });
+                    }
+                }
+                Insn::Move(d, s) => { vm_regs[*d as usize] = vm_regs[*s as usize].clone(); }
+                Insn::SetSigned(reg) => { vm_regs[*reg as usize].is_signed = true; }
+                // These should never appear in parallel-eligible blocks
+                Insn::StmtFallback(..) | Insn::BlockingAssign(..) |
+                Insn::BlockingAssignRange(..) | Insn::BlockingAssignBitDyn(..) => {
+                    unreachable!("parallel block should not contain fallback/blocking instructions");
+                }
+                Insn::Nop => {}
+            }
+            pc += 1;
+        }
+        nba_out
     }
 
     /// Execute a compiled bytecode block. Returns true if executed successfully.
@@ -1908,6 +2063,46 @@ impl Simulator {
                         self.table_modified = true;
                     }
                 }
+                Insn::BlockingAssignBitDyn(sig_id, idx_reg, val_reg) => {
+                    let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
+                    let bit = self.vm_regs[*val_reg as usize].get_bit(0);
+                    let id = *sig_id;
+                    let mut new_val = self.signal_table[id].clone();
+                    if idx < new_val.width as usize {
+                        new_val.set_bit(idx, bit);
+                        new_val.is_signed = self.signal_signed[id];
+                        if self.signal_table[id] != new_val {
+                            if !self.dirty_signals[id] {
+                                self.dirty_signals[id] = true;
+                                self.dirty_list.push(id);
+                            }
+                            self.dirty_any = true;
+                            self.signal_table[id] = new_val;
+                            self.table_modified = true;
+                        }
+                    }
+                }
+                Insn::BlockingAssignRange(sig_id, hi, lo, val_reg) => {
+                    let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
+                    let w = high - low + 1;
+                    let val = self.vm_regs[*val_reg as usize].resize(w);
+                    let id = *sig_id;
+                    let mut new_val = self.signal_table[id].clone();
+                    for bit_pos in low..=high {
+                        let src_bit = val.get_bit((bit_pos - low) as usize);
+                        new_val.set_bit(bit_pos as usize, src_bit);
+                    }
+                    new_val.is_signed = self.signal_signed[id];
+                    if self.signal_table[id] != new_val {
+                        if !self.dirty_signals[id] {
+                            self.dirty_signals[id] = true;
+                            self.dirty_list.push(id);
+                        }
+                        self.dirty_any = true;
+                        self.signal_table[id] = new_val;
+                        self.table_modified = true;
+                    }
+                }
                 Insn::LoadArrayElem(dest, array_name, idx_reg) => {
                     let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0);
                     let elem_name = format!("{}[{}]", array_name, idx);
@@ -1947,10 +2142,6 @@ impl Simulator {
             let mut writes = HashSet::new();
             Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
             Self::collect_lhs_writes(&ca.lhs, &self.module, &mut writes);
-            let wids: Vec<(usize, String)> = writes.iter()
-                .filter_map(|w| self.signal_name_to_id.get(w).map(|&id| (id, w.clone())))
-                .collect();
-
             // Detect identity assigns: assign dst = src (simple signal-to-signal copy)
             let direct_copy = if let (ExprKind::Ident(lhs_hier), ExprKind::Ident(rhs_hier)) = (&ca.lhs.kind, &ca.rhs.kind) {
                 let dst_name = Self::resolve_hier_name_static(lhs_hier, &self.module);
@@ -1966,6 +2157,18 @@ impl Simulator {
             let scope_hint = self
                 .infer_contassign_scope_hint(&ca.lhs, &ca.rhs)
                 .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads));
+
+            // Resolve write targets, retrying with scope_hint for bare names
+            let wids: Vec<(usize, String)> = writes.iter()
+                .filter_map(|w| {
+                    if let Some(&id) = self.signal_name_to_id.get(w) { return Some((id, w.clone())); }
+                    if let Some(scope) = &scope_hint {
+                        let qualified = format!("{}.{}", scope, w);
+                        if let Some(&id) = self.signal_name_to_id.get(&qualified) { return Some((id, qualified)); }
+                    }
+                    None
+                })
+                .collect();
 
             let item = if let Some(dc) = direct_copy {
                 dc
@@ -3297,33 +3500,125 @@ impl Simulator {
     fn check_edges(&mut self) {
         let blocks = std::mem::take(&mut self.edge_blocks);
         self.in_edge_block = true;
+
+        // Phase 1: detect which blocks trigger
+        let t0 = std::time::Instant::now();
+        let mut triggered: Vec<usize> = Vec::new();
         for (block_idx, block) in blocks.iter().enumerate() {
-            let t0 = std::time::Instant::now();
-            let mut trigger = false;
             for sid in &block.resolved_sensitivities {
-                trigger = self.check_edge_id(sid.signal_id, sid.edge);
-                if trigger { break; }
+                if self.check_edge_id(sid.signal_id, sid.edge) {
+                    triggered.push(block_idx);
+                    break;
+                }
             }
-            self.prof_edge_detect += t0.elapsed().as_nanos() as u64;
-            if trigger {
-                self.prof_edges_fired += 1;
+        }
+        self.prof_edge_detect += t0.elapsed().as_nanos() as u64;
+        self.prof_edges_fired += triggered.len() as u64;
+
+        if !triggered.is_empty() {
+            let t1 = std::time::Instant::now();
+
+            // Separate into parallel-eligible and sequential blocks
+            let mut parallel_blocks: Vec<usize> = Vec::new();
+            let mut sequential_blocks: Vec<usize> = Vec::new();
+            for &bi in &triggered {
+                if bi < self.edge_block_parallel.len() && self.edge_block_parallel[bi] {
+                    parallel_blocks.push(bi);
+                } else {
+                    sequential_blocks.push(bi);
+                }
+            }
+
+            // Phase 2a: execute parallel-eligible blocks with thread::scope
+            // Only parallelize when total instruction count justifies threading
+            // overhead (~5µs per spawn). Threshold: 10k+ total instructions.
+            let parallel_insn_count: usize = parallel_blocks.iter()
+                .filter_map(|&bi| self.compiled_edge_blocks[bi].as_ref().map(|cb| cb.instructions.len()))
+                .sum();
+            if parallel_blocks.len() >= 2 && parallel_insn_count >= 10_000 {
+                let signal_table = &self.signal_table;
+                let signal_signed = &self.signal_signed;
+                let signal_name_to_id = &self.signal_name_to_id;
+
+                // Pre-extract instruction slices as raw pointers to avoid
+                // sending non-Sync CompiledBlock (contains StmtFallback with
+                // Cell fields) across threads. We only access parallel-eligible
+                // blocks which are guaranteed to have no StmtFallback insns.
+                struct BlockSlice { ptr: *const super::bytecode::Insn, len: usize, num_regs: usize }
+                unsafe impl Send for BlockSlice {}
+                unsafe impl Sync for BlockSlice {}
+
+                let block_slices: Vec<(usize, BlockSlice)> = parallel_blocks.iter()
+                    .filter_map(|&bi| {
+                        self.compiled_edge_blocks[bi].as_ref().map(|cb| (bi, BlockSlice {
+                            ptr: cb.instructions.as_ptr(),
+                            len: cb.instructions.len(),
+                            num_regs: cb.num_regs as usize,
+                        }))
+                    })
+                    .collect();
+
+                let num_threads = std::thread::available_parallelism()
+                    .map(|n| n.get().min(block_slices.len()).min(8))
+                    .unwrap_or(2);
+                let chunk_size = (block_slices.len() + num_threads - 1) / num_threads;
+
+                let mut all_nba: Vec<Vec<NbaFast>> = Vec::new();
+                std::thread::scope(|s| {
+                    let mut handles = Vec::new();
+                    for chunk in block_slices.chunks(chunk_size) {
+                        let handle = s.spawn(move || {
+                            let mut thread_nba: Vec<NbaFast> = Vec::new();
+                            let max_regs = chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
+                            let mut vm_regs = vec![Value::zero(1); max_regs];
+                            for (_, bs) in chunk {
+                                if vm_regs.len() < bs.num_regs {
+                                    vm_regs.resize(bs.num_regs, Value::zero(1));
+                                }
+                                let insns = unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
+                                let mut nba = Self::exec_insns_isolated(
+                                    insns, signal_table, signal_signed,
+                                    signal_name_to_id, &mut vm_regs,
+                                );
+                                thread_nba.append(&mut nba);
+                            }
+                            thread_nba
+                        });
+                        handles.push(handle);
+                    }
+                    for h in handles {
+                        if let Ok(nba) = h.join() {
+                            all_nba.push(nba);
+                        }
+                    }
+                });
+                for nba_batch in all_nba {
+                    self.nba_fast.extend(nba_batch);
+                }
+            } else {
+                // Too few blocks for threading overhead to pay off
+                for &bi in &parallel_blocks {
+                    self.exec_bytecode(bi);
+                }
+            }
+
+            // Phase 2b: execute sequential blocks on main thread
+            for &bi in &sequential_blocks {
                 let saved_hint = self.name_resolve_hint.borrow().clone();
-                if let Some(first) = block.resolved_sensitivities.first() {
+                if let Some(first) = blocks[bi].resolved_sensitivities.first() {
                     if let Some(full) = self.id_to_name.get(first.signal_id) {
                         if let Some((parent, _)) = full.rsplit_once('.') {
                             *self.name_resolve_hint.borrow_mut() = Some(parent.to_string());
                         }
                     }
                 }
-                let t1 = std::time::Instant::now();
-                // Try bytecode VM first (flat instruction array, cache-friendly)
-                if !self.exec_bytecode(block_idx) {
-                    // Fallback: AST interpreter
-                    self.exec_statement(&block.stmt);
+                if !self.exec_bytecode(bi) {
+                    self.exec_statement(&blocks[bi].stmt);
                 }
-                self.prof_edge_exec += t1.elapsed().as_nanos() as u64;
                 *self.name_resolve_hint.borrow_mut() = saved_hint;
             }
+
+            self.prof_edge_exec += t1.elapsed().as_nanos() as u64;
         }
 
         // Trigger covergroup sampling
