@@ -1013,6 +1013,7 @@ pub fn elaborate_module_with_defs(
                         //   struct { bit [3:0] lo = c; ... } p1;
                         // Packed structs forbid member defaults (IEEE 7.2.2).
                         if let DataType::Struct(su) = &dd.data_type {
+                            let is_union = matches!(su.kind, StructUnionKind::Union);
                             if su.packed {
                                 for member in &su.members {
                                     for mdecl in &member.declarators {
@@ -1024,8 +1025,9 @@ pub fn elaborate_module_with_defs(
                                         }
                                     }
                                 }
-                                // Build bit-field layout: first-declared member is MSB.
-                                // Walk members in reverse, accumulating lsb offset.
+                                // Build bit-field layout.
+                                // For unions, all members overlap at offset 0.
+                                // For structs, first-declared member is MSB.
                                 let mut flat: Vec<(String, u32)> = Vec::new();
                                 for member in &su.members {
                                     let mw = resolve_type_width(&member.data_type, Some(&elab.parameters), Some(&elab.typedefs));
@@ -1034,10 +1036,26 @@ pub fn elaborate_module_with_defs(
                                     }
                                 }
                                 let mut fields: Vec<(String, u32, u32)> = Vec::new();
-                                let mut offset: u32 = 0;
-                                for (mname, mw) in flat.iter().rev() {
-                                    fields.push((mname.clone(), offset, *mw));
-                                    offset += mw;
+                                if is_union {
+                                    for (mname, mw) in &flat {
+                                        fields.push((mname.clone(), 0, *mw));
+                                    }
+                                } else {
+                                    let mut offset: u32 = 0;
+                                    for (mname, mw) in flat.iter().rev() {
+                                        fields.push((mname.clone(), offset, *mw));
+                                        offset += mw;
+                                    }
+                                }
+                                elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                            } else if is_union {
+                                // Unpacked union: members overlap at bit 0 of the container.
+                                let mut fields: Vec<(String, u32, u32)> = Vec::new();
+                                for member in &su.members {
+                                    let mw = resolve_type_width(&member.data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                                    for mdecl in &member.declarators {
+                                        fields.push((mdecl.name.name.clone(), 0, mw));
+                                    }
                                 }
                                 elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
                             }
@@ -2033,12 +2051,17 @@ pub fn resolve_type_width(
             }
         }
         DataType::Struct(s) => {
+            let is_union = matches!(s.kind, StructUnionKind::Union);
             let mut total = 0u32;
+            let mut max_w = 0u32;
             for member in &s.members {
                 let mw = resolve_type_width(&member.data_type, params, typedefs);
                 total += mw * member.declarators.len() as u32;
+                for _ in &member.declarators {
+                    if mw > max_w { max_w = mw; }
+                }
             }
-            total
+            if is_union { max_w } else { total }
         }
         DataType::Void(_) => 0,
         _ => 32,
