@@ -391,6 +391,42 @@ fn main() {
         }
     }
 
+    // Fast path: if the only source file is a sisvsim compiled artifact, load
+    // it and jump straight to simulation (skip parse + elaborate).
+    if source_files.len() == 1 && mode == Mode::Simulate {
+        let sf = &source_files[0];
+        if let Ok(head) = std::fs::read(sf).as_ref().map(|v| v.iter().take(8).copied().collect::<Vec<u8>>()) {
+            if head.len() == 8 && &head[..] == sisvsim::SISVSIM_BYTECODE_MAGIC {
+                match sisvsim::read_compiled(sf) {
+                    Ok(Some(elab)) => {
+                        println!("=== sisvsim ===");
+                        println!("Loaded compiled: {}", sf);
+                        println!("Max time: {}", max_time);
+                        println!("------------------------------");
+                        sisvsim::compiler::simulator::set_sim_debug(sim_debug);
+                        sisvsim::compiler::simulator::set_dpi_libs(&dpi_libs);
+                        let mut sim = sisvsim::compiler::Simulator::new(elab, max_time);
+                        if let Some(limit) = settle_limit { sim.settle_limit = limit; }
+                        sim.activity_mon = activity_mon;
+                        sim.aitrace_mode = aitrace;
+                        sim.set_plusargs(&plusargs);
+                        sim.set_threads(threads);
+                        sim.run();
+                        println!("------------------------------");
+                        println!("Simulation finished at time {}", sim.time);
+                        if sim.finished { println!("($finish called)"); }
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("Error loading compiled artifact '{}': {}", sf, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    }
+
     let mut sources: Vec<String> = Vec::new();
     let mut file_labels: Vec<String> = Vec::new();
     for sf in &source_files {
@@ -464,7 +500,15 @@ fn main() {
         if total_err > 0 { std::process::exit(1); }
 
         match sisvsim::parse_and_elaborate_multi(&sources, top_module.as_deref(), &include_dirs, &source_files, &defines) {
-            Ok(_) => { println!("Elaboration successful"); }
+            Ok((_defs, elab)) => {
+                println!("Elaboration successful");
+                if let Some(ref out) = _output_file {
+                    match sisvsim::write_compiled(&elab, out) {
+                        Ok(()) => println!("Wrote compiled artifact to {}", out),
+                        Err(e) => { eprintln!("Error writing '{}': {}", out, e); std::process::exit(1); }
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("Elaboration error: {}", e);
                 std::process::exit(1);

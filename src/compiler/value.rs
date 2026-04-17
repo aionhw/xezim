@@ -5,9 +5,10 @@
 //! avoiding heap allocation entirely. Wider values fall back to Vec<LogicBit>.
 
 use std::fmt;
+use serde::{Serialize, Deserialize};
 
 /// A single 4-state logic bit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LogicBit {
     Zero,
     One,
@@ -47,7 +48,7 @@ impl fmt::Display for LogicBit {
 }
 
 /// Storage for value bits. Values ≤64 bits use inline u64 pair.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum ValueStorage {
     /// Packed: val_bits holds 0/1, xz_bits marks X/Z.
     /// bit i: val=bit i of val_bits, xz=bit i of xz_bits
@@ -58,7 +59,7 @@ enum ValueStorage {
 }
 
 /// An arbitrary-width 4-state logic value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Value {
     storage: ValueStorage,
     pub width: u32,

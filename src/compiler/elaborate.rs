@@ -12,7 +12,7 @@ use crate::ast::stmt::*;
 use super::value::Value;
 
 /// A resolved signal in the simulation model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Signal {
     pub name: String,
     pub width: u32,
@@ -26,27 +26,27 @@ pub struct Signal {
 }
 
 /// A continuous assignment: assign lhs = rhs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ContinuousAssignment {
     pub lhs: Expression,
     pub rhs: Expression,
 }
 
 /// An always block for combinatorial logic.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AlwaysBlock {
     pub kind: AlwaysKind,
     pub stmt: Statement,
 }
 
 /// An initial block for testbench.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InitialBlock {
     pub stmt: Statement,
 }
 
 /// Elaborated class definition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ElaboratedClass {
     pub name: String,
     pub extends: Option<String>,
@@ -62,7 +62,7 @@ pub struct ElaboratedClass {
 }
 
 /// DPI import metadata used by the simulator for foreign-call dispatch.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DpiImportSpec {
     pub c_name: String,
     pub property: Option<DPIProperty>,
@@ -143,7 +143,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
 }
 
 /// Elaborated module ready for simulation.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ElaboratedModule {
     pub name: String,
     pub signals: HashMap<String, Signal>,

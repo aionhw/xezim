@@ -36,6 +36,30 @@ pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, Stri
     simulate_multi(&[source.to_string()], max_time, None, &[], &[], None, false, None, None, &[], false, &[], 1)
 }
 
+/// Magic bytes identifying a sisvsim compiled artifact.
+pub const SISVSIM_BYTECODE_MAGIC: &[u8; 8] = b"SISVSIM\x01";
+
+/// Serialize a compiled ElaboratedModule to a file.
+pub fn write_compiled(elab: &compiler::elaborate::ElaboratedModule, path: &str) -> Result<(), String> {
+    let bytes = bincode::serialize(elab).map_err(|e| format!("serialize: {}", e))?;
+    let mut out = Vec::with_capacity(bytes.len() + 8);
+    out.extend_from_slice(SISVSIM_BYTECODE_MAGIC);
+    out.extend_from_slice(&bytes);
+    std::fs::write(path, &out).map_err(|e| format!("write '{}': {}", path, e))
+}
+
+/// Read a compiled artifact from a file. Returns Ok(Some(elab)) if the file is
+/// a valid artifact, Ok(None) if it lacks the magic header, Err on I/O or
+/// deserialization failure.
+pub fn read_compiled(path: &str) -> Result<Option<compiler::elaborate::ElaboratedModule>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read '{}': {}", path, e))?;
+    if bytes.len() < 8 || &bytes[..8] != SISVSIM_BYTECODE_MAGIC {
+        return Ok(None);
+    }
+    let elab = bincode::deserialize(&bytes[8..]).map_err(|e| format!("deserialize: {}", e))?;
+    Ok(Some(elab))
+}
+
 #[derive(Debug, Clone)]
 pub enum SourceDefinition {
     Module(ast::module::ModuleDeclaration),

@@ -7,11 +7,13 @@ description = "SystemVerilog simulator targeting IEEE 1800-2017/2023"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-ahash = "0.8"
+ahash = { version = "0.8", features = ["serde"] }
 rand = "0.8"
 sv-parser = { path = "sv-parser" }
 libloading = "0.8"
 libffi = "3"
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
 
 [[bin]]
 name = "sisvsim"
