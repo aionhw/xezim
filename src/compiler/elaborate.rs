@@ -426,8 +426,10 @@ fn validate_class_constraint_expr(expr: &Expression, allowed: &HashSet<String>) 
             validate_class_constraint_expr(hi, allowed)?;
         }
         ExprKind::Paren(inner) => validate_class_constraint_expr(inner, allowed)?,
-        ExprKind::Call { func, args } => {
-            validate_class_constraint_expr(func, allowed)?;
+        ExprKind::Call { func: _, args } => {
+            // Don't validate the callee identifier: it resolves to a function/method
+            // (including class methods, package functions, built-ins) that may not be
+            // in the property-name allowed set.
             for a in args {
                 validate_class_constraint_expr(a, allowed)?;
             }
@@ -469,9 +471,15 @@ fn validate_constraint_item_names(item: &ConstraintItem, allowed: &HashSet<Strin
                 validate_constraint_item_names(ei, allowed)?;
             }
         }
-        ConstraintItem::Foreach { array, item, .. } => {
+        ConstraintItem::Foreach { array, vars, item, .. } => {
             validate_class_constraint_expr(array, allowed)?;
-            validate_constraint_item_names(item, allowed)?;
+            let mut inner = allowed.clone();
+            for v in vars {
+                if let Some(id) = v {
+                    inner.insert(id.name.clone());
+                }
+            }
+            validate_constraint_item_names(item, &inner)?;
         }
         ConstraintItem::Soft(inner) => validate_constraint_item_names(inner, allowed)?,
         ConstraintItem::Block(items) => {
@@ -495,15 +503,79 @@ fn validate_constraint_item_names(item: &ConstraintItem, allowed: &HashSet<Strin
     Ok(())
 }
 
-fn validate_class_constraints(c: &ClassDeclaration) -> Result<(), String> {
-    let mut allowed = HashSet::new();
+fn collect_class_member_names(
+    c: &ClassDeclaration,
+    all_defs: Option<&HashMap<String, Definition>>,
+    allowed: &mut HashSet<String>,
+    seen: &mut HashSet<String>,
+) {
+    if !seen.insert(c.name.name.clone()) {
+        return;
+    }
     for item in &c.items {
-        if let ClassItem::Property(p) = item {
-            for d in &p.declarators {
-                allowed.insert(d.name.name.clone());
+        match item {
+            ClassItem::Property(p) => {
+                for d in &p.declarators {
+                    allowed.insert(d.name.name.clone());
+                }
+            }
+            ClassItem::Parameter(pd) => match &pd.kind {
+                ParameterKind::Data { assignments, .. } => {
+                    for a in assignments {
+                        allowed.insert(a.name.name.clone());
+                    }
+                }
+                ParameterKind::Type { assignments } => {
+                    for a in assignments {
+                        allowed.insert(a.name.name.clone());
+                    }
+                }
+            },
+            ClassItem::Method(m) => {
+                let name = match &m.kind {
+                    ClassMethodKind::Function(f) => &f.name.name.name,
+                    ClassMethodKind::Task(t) => &t.name.name.name,
+                    ClassMethodKind::PureVirtual(f) => &f.name.name.name,
+                    ClassMethodKind::Extern(f) => &f.name.name.name,
+                };
+                allowed.insert(name.clone());
+            }
+            ClassItem::Typedef(td) => {
+                allowed.insert(td.name.name.clone());
+            }
+            _ => {}
+        }
+    }
+    for p in &c.params {
+        match &p.kind {
+            ParameterKind::Data { assignments, .. } => {
+                for a in assignments {
+                    allowed.insert(a.name.name.clone());
+                }
+            }
+            ParameterKind::Type { assignments } => {
+                for a in assignments {
+                    allowed.insert(a.name.name.clone());
+                }
             }
         }
     }
+    if let Some(ext) = &c.extends {
+        if let Some(defs) = all_defs {
+            if let Some(Definition::Class(parent)) = defs.get(&ext.name.name) {
+                collect_class_member_names(parent, all_defs, allowed, seen);
+            }
+        }
+    }
+}
+
+fn validate_class_constraints(
+    c: &ClassDeclaration,
+    all_defs: Option<&HashMap<String, Definition>>,
+) -> Result<(), String> {
+    let mut allowed = HashSet::new();
+    let mut seen = HashSet::new();
+    collect_class_member_names(c, all_defs, &mut allowed, &mut seen);
     for item in &c.items {
         if let ClassItem::Constraint(con) = item {
             for it in &con.items {
@@ -529,7 +601,7 @@ pub fn elaborate_module_with_defs(
             match def {
                 Definition::Typedef(td) => { process_typedef(td, &mut elab); }
                 Definition::Class(c) => {
-                    validate_class_constraints(c)?;
+                    validate_class_constraints(c, Some(defs))?;
                     elab.classes.insert(c.name.name.clone(), elaborate_class(c));
                 }
                 Definition::Covergroup(cg) => { elab.covergroups.insert(cg.name.name.clone(), (*cg).clone()); }
@@ -678,7 +750,7 @@ pub fn elaborate_module_with_defs(
                     }
                 }
                 crate::ast::decl::PackageItem::Class(c) => {
-                    validate_class_constraints(c)?;
+                    validate_class_constraints(c, all_defs)?;
                     elab.classes.insert(c.name.name.clone(), elaborate_class(c));
                 }
                 crate::ast::decl::PackageItem::Let(l) => {
@@ -1106,7 +1178,7 @@ pub fn elaborate_module_with_defs(
                 elab.clocking_blocks.insert(cd.name.name.clone(), cd.clone());
             }
             ModuleItem::ClassDeclaration(cd) => {
-                validate_class_constraints(cd)?;
+                validate_class_constraints(cd, all_defs)?;
                 elab.classes.insert(cd.name.name.clone(), elaborate_class(cd));
             }
             ModuleItem::LetDeclaration(ld) => {
@@ -1629,7 +1701,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
             }
 
             ModuleItem::ClassDeclaration(cd) => {
-                validate_class_constraints(cd)?;
+                validate_class_constraints(cd, all_defs)?;
                 elab.classes.insert(cd.name.name.clone(), elaborate_class(cd));
             }
             ModuleItem::ClockingDeclaration(cd) => {
