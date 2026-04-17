@@ -141,6 +141,7 @@ pub struct ElaboratedModule {
     pub parameters: HashMap<String, Value>,
     /// Typedef name -> width mapping for user-defined types.
     pub typedefs: HashMap<String, u32>,
+    pub typedef_types: HashMap<String, DataType>,
     /// Array declarations: base_name -> (lo_index, hi_index, element_width)
     pub arrays: HashMap<String, (i64, i64, u32)>,
     /// Associative arrays: name -> true if string-keyed
@@ -194,6 +195,7 @@ impl ElaboratedModule {
             initial_blocks: Vec::new(),
             parameters: HashMap::new(),
             typedefs: HashMap::new(),
+            typedef_types: HashMap::new(),
             arrays: HashMap::new(),
             associative_arrays: HashMap::new(),
             classes: HashMap::new(),
@@ -353,6 +355,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
         // Non-enum typedef: resolve width from the underlying type
         let w = resolve_type_width(&td.data_type, Some(&elab.parameters), Some(&elab.typedefs));
         elab.typedefs.insert(td.name.name.clone(), w);
+        elab.typedef_types.insert(td.name.name.clone(), td.data_type.clone());
     }
 }
 
@@ -1012,7 +1015,10 @@ pub fn elaborate_module_with_defs(
                         // Unpacked-struct member default initializers:
                         //   struct { bit [3:0] lo = c; ... } p1;
                         // Packed structs forbid member defaults (IEEE 7.2.2).
-                        if let DataType::Struct(su) = &dd.data_type {
+                        let dt_resolved: &DataType = if let DataType::TypeReference { name, .. } = &dd.data_type {
+                            elab.typedef_types.get(&name.name.name).unwrap_or(&dd.data_type)
+                        } else { &dd.data_type };
+                        if let DataType::Struct(su) = dt_resolved {
                             let is_union = matches!(su.kind, StructUnionKind::Union);
                             if su.packed {
                                 for member in &su.members {
