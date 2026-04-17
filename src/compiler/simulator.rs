@@ -5723,12 +5723,10 @@ impl Simulator {
                         self.fast_signal_write(&sig_name, new_val);
                     }
                 }
-                // Trigger immediate combinatorial settlement and edge checks
+                // Settle combinatorial logic but defer edge-triggered blocks
+                // (always @(e)) to the main event loop so the triggering
+                // process sees pre-event state until its next delay/wait.
                 self.settle_combinatorial();
-                self.check_edges();
-                // Consume the edge so the outer main-loop check_edges at the
-                // same timestep doesn't re-fire edge_blocks on the same event.
-                self.snapshot_edge_signals();
             }
             StatementKind::Coverpoint { .. } | StatementKind::Cross { .. } => {}
         }
