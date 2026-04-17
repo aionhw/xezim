@@ -442,6 +442,9 @@ pub struct Simulator {
     event_queue: TimingWheel,
     next_pid: usize,
     current_pid: usize,
+    /// Value that `$` resolves to in the current evaluation scope
+    /// (e.g. queue upper bound during `q[a:$]`). Stack of overrides.
+    dollar_bound: Vec<i64>,
     break_flag: bool,
     continue_flag: bool,
     /// Processes waiting for signal edge events (@(posedge clk), etc.)
@@ -597,6 +600,7 @@ impl Simulator {
             settling: false, in_edge_block: false,
             nba_queue: Vec::new(), nba_fast: Vec::new(), edge_blocks: Vec::new(), compiled_edge_blocks: Vec::new(), edge_block_parallel: Vec::new(), vm_regs: Vec::new(), clock_generators: Vec::new(),
             event_queue: TimingWheel::new(), next_pid: 0, current_pid: 0,
+            dollar_bound: Vec::new(),
             break_flag: false, continue_flag: false,
             event_waiters: Vec::new(),
             cg_event_waiters: Vec::new(),
@@ -4393,7 +4397,11 @@ impl Simulator {
                     let name = self.resolve_hier_name(hier);
                     if self.module.arrays.contains_key(&name) || self.is_associative_array(&name) {
                         // Array element access: look up signal "name[idx]"
+                        if self.module.dynamic_arrays.contains(&name) {
+                            self.dollar_bound.push((self.get_queue_size(&name) as i64) - 1);
+                        }
                         let idx_val = self.eval_expr(index);
+                        if self.module.dynamic_arrays.contains(&name) { self.dollar_bound.pop(); }
                         let idx_str = if self.is_associative_array(&name) {
                             self.assoc_key_str(&name, &idx_val)
                         } else {
@@ -4430,10 +4438,10 @@ impl Simulator {
                         } else {
                             arr_hi
                         };
-                        let l = if matches!(left.kind, ExprKind::Dollar) { upper_bound }
-                                else { self.eval_expr(left).to_u64().unwrap_or(0) as i64 };
-                        let r = if matches!(right.kind, ExprKind::Dollar) { upper_bound }
-                                else { self.eval_expr(right).to_u64().unwrap_or(0) as i64 };
+                        self.dollar_bound.push(upper_bound);
+                        let l = self.eval_expr(left).to_i64().unwrap_or(0);
+                        let r = self.eval_expr(right).to_i64().unwrap_or(0);
+                        self.dollar_bound.pop();
                         let (lo, hi) = match kind {
                             RangeKind::Constant => (l.min(r), l.max(r)),
                             RangeKind::IndexedUp => (l, l + r - 1),
@@ -4767,7 +4775,15 @@ impl Simulator {
                 }
             }
             ExprKind::Call { func, args } => self.eval_call(func, args),
-            ExprKind::Dollar => Value::from_u64(u64::MAX, 32),
+            ExprKind::Dollar => {
+                if let Some(&b) = self.dollar_bound.last() {
+                    let mut v = Value::from_u64(b as u64, 32);
+                    v.is_signed = true;
+                    v
+                } else {
+                    Value::from_u64(u64::MAX, 32)
+                }
+            }
             ExprKind::Null => Value::zero(32),
             ExprKind::Empty => Value::zero(1),
             ExprKind::WithClause { expr, filter } => {
@@ -5008,6 +5024,47 @@ impl Simulator {
                 if let ExprKind::Ident(lhier) = &lvalue.kind {
                     let lname = self.resolve_hier_name(lhier);
                     if self.module.arrays.contains_key(&lname) {
+                        // Queue/array slice assignment: lq = rq[a:b]
+                        if let ExprKind::RangeSelect { expr: rbase, left, right, .. } = &rvalue.kind {
+                            if let ExprKind::Ident(rhier) = &rbase.kind {
+                                let rname = self.resolve_hier_name(rhier);
+                                if self.module.arrays.contains_key(&rname) {
+                                    let (r_lo_a, r_hi_a, _) = self.module.arrays[&rname];
+                                    let r_is_dyn = self.module.dynamic_arrays.contains(&rname);
+                                    let r_upper: i64 = if r_is_dyn {
+                                        (self.get_queue_size(&rname) as i64) - 1
+                                    } else { r_hi_a };
+                                    self.dollar_bound.push(r_upper);
+                                    let l = self.eval_expr(left).to_i64().unwrap_or(0);
+                                    let r = self.eval_expr(right).to_i64().unwrap_or(0);
+                                    self.dollar_bound.pop();
+                                    // Per IEEE 7.10.1: if l > r the slice is empty.
+                                    let results: Vec<Value> = if l > r {
+                                        Vec::new()
+                                    } else {
+                                        let lo = l.max(r_lo_a);
+                                        let hi = r.min(r_upper);
+                                        if hi < lo { Vec::new() } else {
+                                            (lo..=hi).map(|idx| {
+                                                self.get_signal_value_by_name(&format!("{}[{}]", rname, idx))
+                                                    .unwrap_or(Value::zero(32))
+                                            }).collect()
+                                        }
+                                    };
+                                    let (l_lo, l_hi, _) = self.module.arrays[&lname];
+                                    for (i, v) in results.iter().enumerate() {
+                                        let idx = l_lo + i as i64;
+                                        if idx > l_hi { break; }
+                                        self.set_signal_value_by_name(&format!("{}[{}]", lname, idx), v.clone());
+                                    }
+                                    if self.module.dynamic_arrays.contains(&lname) {
+                                        self.set_queue_size(&lname, results.len() as u64);
+                                    }
+                                    if !self.in_edge_block { self.settle_combinatorial(); }
+                                    return;
+                                }
+                            }
+                        }
                         if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
                             let (lo, hi, _w) = self.module.arrays[&lname];
                             let descending = self.module.descending_arrays.contains(&lname);
@@ -5034,6 +5091,35 @@ impl Simulator {
                                             }
                                         }
                                         continue;
+                                    }
+                                }
+                                // Slice of a queue: q[a:b]
+                                if let ExprKind::RangeSelect { expr: rbase, left, right, .. } = &expr.kind {
+                                    if let ExprKind::Ident(rhier) = &rbase.kind {
+                                        let rname = self.resolve_hier_name(rhier);
+                                        if self.module.arrays.contains_key(&rname) {
+                                            let (r_lo_a, r_hi_a, _) = self.module.arrays[&rname];
+                                            let r_is_dyn = self.module.dynamic_arrays.contains(&rname);
+                                            let r_upper: i64 = if r_is_dyn {
+                                                (self.get_queue_size(&rname) as i64) - 1
+                                            } else { r_hi_a };
+                                            self.dollar_bound.push(r_upper);
+                                            let l = self.eval_expr(left).to_i64().unwrap_or(0);
+                                            let r = self.eval_expr(right).to_i64().unwrap_or(0);
+                                            self.dollar_bound.pop();
+                                            if l <= r {
+                                                let lo = l.max(r_lo_a);
+                                                let hi = r.min(r_upper);
+                                                if hi >= lo {
+                                                    for idx in lo..=hi {
+                                                        if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", rname, idx)) {
+                                                            all_vals.push(v);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            continue;
+                                        }
                                     }
                                 }
                                 all_vals.push(self.eval_expr(expr));
