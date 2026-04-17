@@ -1005,6 +1005,64 @@ pub fn elaborate_module_with_defs(
                                 }, decl.name.span),
                             });
                         }
+                        // Unpacked-struct member default initializers:
+                        //   struct { bit [3:0] lo = c; ... } p1;
+                        // Packed structs forbid member defaults (IEEE 7.2.2).
+                        if let DataType::Struct(su) = &dd.data_type {
+                            if su.packed {
+                                for member in &su.members {
+                                    for mdecl in &member.declarators {
+                                        if mdecl.init.is_some() {
+                                            return Err(format!(
+                                                "Packed struct member '{}.{}' cannot have a default value (IEEE 7.2.2)",
+                                                decl.name.name, mdecl.name.name
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            if !su.packed {
+                                // Pre-register member signals with their declared widths,
+                                // so later assignments from wider rvalues don't widen them.
+                                for member in &su.members {
+                                    let mw = resolve_type_width(&member.data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                                    let ms = is_type_signed(&member.data_type);
+                                    for mdecl in &member.declarators {
+                                        let sname = format!("{}.{}", decl.name.name, mdecl.name.name);
+                                        elab.signals.entry(sname.clone()).or_insert(Signal {
+                                            is_const: false,
+                                            name: sname,
+                                            width: mw,
+                                            is_signed: ms,
+                                            is_real: false,
+                                            direction: None,
+                                            value: Value::new(mw),
+                                            type_name: None,
+                                        });
+                                    }
+                                }
+                                let mut stmts: Vec<Statement> = Vec::new();
+                                for member in &su.members {
+                                    for mdecl in &member.declarators {
+                                        if let Some(init) = &mdecl.init {
+                                            let lval = Expression::new(ExprKind::MemberAccess {
+                                                expr: Box::new(make_ident_expr(&decl.name.name)),
+                                                member: mdecl.name.clone(),
+                                            }, Span::dummy());
+                                            stmts.push(Statement::new(StatementKind::BlockingAssign {
+                                                lvalue: lval,
+                                                rvalue: init.clone(),
+                                            }, Span::dummy()));
+                                        }
+                                    }
+                                }
+                                if !stmts.is_empty() {
+                                    elab.initial_blocks.push(InitialBlock {
+                                        stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()),
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
