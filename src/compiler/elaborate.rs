@@ -2060,14 +2060,21 @@ pub fn resolve_type_width(
             let is_union = matches!(s.kind, StructUnionKind::Union);
             let mut total = 0u32;
             let mut max_w = 0u32;
+            let mut member_count = 0u32;
             for member in &s.members {
                 let mw = resolve_type_width(&member.data_type, params, typedefs);
                 total += mw * member.declarators.len() as u32;
                 for _ in &member.declarators {
                     if mw > max_w { max_w = mw; }
+                    member_count += 1;
                 }
             }
-            if is_union { max_w } else { total }
+            if is_union {
+                if s.tagged {
+                    let tag_w = (member_count.max(2) - 1).next_power_of_two().trailing_zeros().max(1);
+                    max_w + tag_w
+                } else { max_w }
+            } else { total }
         }
         DataType::Void(_) => 0,
         _ => 32,
