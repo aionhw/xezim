@@ -1018,6 +1018,47 @@ pub fn elaborate_module_with_defs(
                         let dt_resolved: &DataType = if let DataType::TypeReference { name, .. } = &dd.data_type {
                             elab.typedef_types.get(&name.name.name).unwrap_or(&dd.data_type)
                         } else { &dd.data_type };
+                        // Recursively flatten nested struct/union members so multi-segment
+                        // paths like u.s.a resolve via a single packed_struct_fields lookup.
+                        fn flatten_subfields(dt: &DataType, params: &HashMap<String, Value>, typedefs: &HashMap<String, u32>, typedef_types: &HashMap<String, DataType>) -> Option<Vec<(String, u32, u32)>> {
+                            let resolved = if let DataType::TypeReference { name, .. } = dt {
+                                typedef_types.get(&name.name.name).unwrap_or(dt)
+                            } else { dt };
+                            if let DataType::Struct(su) = resolved {
+                                let is_union = matches!(su.kind, StructUnionKind::Union);
+                                let mut raw: Vec<(String, u32, DataType)> = Vec::new();
+                                for member in &su.members {
+                                    let mw = resolve_type_width(&member.data_type, Some(params), Some(typedefs));
+                                    for mdecl in &member.declarators {
+                                        raw.push((mdecl.name.name.clone(), mw, member.data_type.clone()));
+                                    }
+                                }
+                                let mut out: Vec<(String, u32, u32)> = Vec::new();
+                                if is_union {
+                                    for (mn, mw, mdt) in &raw {
+                                        out.push((mn.clone(), 0, *mw));
+                                        if let Some(subs) = flatten_subfields(mdt, params, typedefs, typedef_types) {
+                                            for (sn, so, sw) in subs { out.push((format!("{}.{}", mn, sn), so, sw)); }
+                                        }
+                                    }
+                                } else {
+                                    let mut offset: u32 = 0;
+                                    for (mn, mw, mdt) in raw.iter().rev() {
+                                        out.push((mn.clone(), offset, *mw));
+                                        if let Some(subs) = flatten_subfields(mdt, params, typedefs, typedef_types) {
+                                            for (sn, so, sw) in subs { out.push((format!("{}.{}", mn, sn), offset + so, sw)); }
+                                        }
+                                        offset += mw;
+                                    }
+                                }
+                                Some(out)
+                            } else { None }
+                        }
+                        if let Some(fields) = flatten_subfields(dt_resolved, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
+                            if !fields.is_empty() {
+                                elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                            }
+                        }
                         if let DataType::Struct(su) = dt_resolved {
                             let is_union = matches!(su.kind, StructUnionKind::Union);
                             if su.packed {
@@ -1031,39 +1072,7 @@ pub fn elaborate_module_with_defs(
                                         }
                                     }
                                 }
-                                // Build bit-field layout.
-                                // For unions, all members overlap at offset 0.
-                                // For structs, first-declared member is MSB.
-                                let mut flat: Vec<(String, u32)> = Vec::new();
-                                for member in &su.members {
-                                    let mw = resolve_type_width(&member.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                                    for mdecl in &member.declarators {
-                                        flat.push((mdecl.name.name.clone(), mw));
-                                    }
-                                }
-                                let mut fields: Vec<(String, u32, u32)> = Vec::new();
-                                if is_union {
-                                    for (mname, mw) in &flat {
-                                        fields.push((mname.clone(), 0, *mw));
-                                    }
-                                } else {
-                                    let mut offset: u32 = 0;
-                                    for (mname, mw) in flat.iter().rev() {
-                                        fields.push((mname.clone(), offset, *mw));
-                                        offset += mw;
-                                    }
-                                }
-                                elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
-                            } else if is_union {
-                                // Unpacked union: members overlap at bit 0 of the container.
-                                let mut fields: Vec<(String, u32, u32)> = Vec::new();
-                                for member in &su.members {
-                                    let mw = resolve_type_width(&member.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                                    for mdecl in &member.declarators {
-                                        fields.push((mdecl.name.name.clone(), 0, mw));
-                                    }
-                                }
-                                elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                                // packed_struct_fields already populated by flatten_subfields above.
                             }
                             if !su.packed {
                                 // Pre-register member signals with their declared widths,
@@ -2314,6 +2323,23 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             let c = eval_const_expr_val(condition, params);
             if c.is_true() { eval_const_expr_val(then_expr, params) }
             else { eval_const_expr_val(else_expr, params) }
+        }
+        ExprKind::Concatenation(parts) => {
+            let mut r = Value::zero(0);
+            for p in parts.iter().rev() {
+                r = eval_const_expr_val(p, params).concat_with(&r);
+            }
+            r
+        }
+        ExprKind::Replication { count, exprs } => {
+            let n = eval_const_expr_val(count, params).to_u64().unwrap_or(1) as usize;
+            let mut inner = Value::zero(0);
+            for p in exprs.iter().rev() {
+                inner = eval_const_expr_val(p, params).concat_with(&inner);
+            }
+            let mut r = Value::zero(0);
+            for _ in 0..n { r = inner.clone().concat_with(&r); }
+            r
         }
         _ => Value::zero(32),
     };

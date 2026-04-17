@@ -3900,10 +3900,10 @@ impl Simulator {
                     }
                 } else if hier.path.len() > 1 {
                     let obj_name = &hier.path[0].name.name;
-                    if hier.path.len() == 2 {
-                        let mname = hier.path[1].name.name.as_str();
+                    {
+                        let sub = hier.path[1..].iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
                         if let Some(fields) = self.module.packed_struct_fields.get(obj_name).cloned() {
-                            if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| m == mname).cloned() {
+                            if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| m == &sub).cloned() {
                                 if let Some(cur_sig) = self.get_signal_value_by_name(obj_name) {
                                     let total_w = cur_sig.width;
                                     let mut cur = cur_sig.resize(total_w);
@@ -3923,7 +3923,7 @@ impl Simulator {
                     let obj_val = if let Some(locals) = self.local_stack.last() {
                         locals.get(obj_name).cloned()
                     } else {
-                        self.signals.get(obj_name).cloned()
+                        self.get_signal_value_by_name(obj_name)
                     };
                     if let Some(v) = obj_val {
                         let mut cur_handle = v.to_u64().unwrap_or(0) as usize;
@@ -4256,16 +4256,18 @@ impl Simulator {
                         if let Some(val) = locals.get(&dotted) { return val.clone(); }
                     }
                     let obj_name = &hier.path[0].name.name;
-                    if hier.path.len() == 2 {
-                        let mname = hier.path[1].name.name.as_str();
-                        eprintln!("DBG Ident path2 obj={} mname={} pkeys={:?}", obj_name, mname, self.module.packed_struct_fields.keys().collect::<Vec<_>>());
+                    {
+                        let sub = hier.path[1..].iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
                         if let Some(fields) = self.module.packed_struct_fields.get(obj_name).cloned() {
-                            if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| m == mname).cloned() {
+                            if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| m == &sub).cloned() {
                                 if let Some(sig) = self.get_signal_value_by_name(obj_name) {
                                     return sig.range_select((off + w - 1) as usize, off as usize);
                                 }
                             }
                         }
+                    }
+                    if hier.path.len() == 2 {
+                        let mname = hier.path[1].name.name.as_str();
                         if self.is_associative_array(obj_name) {
                             if mname == "size" || mname == "num" {
                                 let prefix = format!("{}[", obj_name);
@@ -4300,7 +4302,7 @@ impl Simulator {
                     let val = if let Some(locals) = self.local_stack.last() {
                         locals.get(obj_name).cloned()
                     } else {
-                        self.signals.get(obj_name).cloned()
+                        self.get_signal_value_by_name(obj_name)
                     };
                     if let Some(v) = val {
                         let mut cur_handle = v.to_u64().unwrap_or(0) as usize;
@@ -4415,6 +4417,44 @@ impl Simulator {
                 else if c.is_true() { self.eval_expr_ctx(then_expr, ctx_width) } else { self.eval_expr_ctx(else_expr, ctx_width) }
             }
             ExprKind::Concatenation(parts) => { let mut r = Value::zero(0); for p in parts.iter().rev() { r = self.eval_expr(p).concat_with(&r); } r }
+            ExprKind::StreamOp { left_to_right, slice_size, exprs } => {
+                // Concat in source order: MSB = first expr. Build by concatenating from LSB (last expr).
+                let mut concat = Value::zero(0);
+                for p in exprs.iter().rev() { concat = self.eval_expr(p).concat_with(&concat); }
+                let total_w = concat.width as usize;
+                if !*left_to_right {
+                    concat
+                } else {
+                    let slice = slice_size.as_ref().map(|e| self.eval_expr(e).to_u64().unwrap_or(1) as usize).unwrap_or(1).max(1);
+                    // Reverse successive slice-sized chunks starting from the MSB side.
+                    let mut out = Value::zero(total_w as u32);
+                    let full_chunks = total_w / slice;
+                    let remainder = total_w - full_chunks * slice;
+                    // Original bits [total_w-1 .. 0], where bit (total_w-1) is MSB.
+                    // Source chunk k (0-indexed from MSB): bits [total_w-1-k*slice .. total_w-k*slice-slice].
+                    // With left_to_right streaming, chunk order is preserved but bits *within* each chunk stay ordered.
+                    // Actually `{<<slice {x}}` emits slice-sized groups MSB-first from x with each group's bits in LSB-first order inside the stream... The classic interpretation: slice the source into slice-sized chunks from LSB, then reverse the chunk order.
+                    // Standard behavior: output = reverse the order of slice-sized chunks of the source.
+                    for k in 0..full_chunks {
+                        for b in 0..slice {
+                            let src_bit = k * slice + b;
+                            let dst_bit = (full_chunks - 1 - k) * slice + b + remainder;
+                            if src_bit < total_w && dst_bit < total_w {
+                                out.set_bit(dst_bit, concat.get_bit(src_bit));
+                            }
+                        }
+                    }
+                    // Leftover bits at the top of the source (fewer than slice) go to the LSB of output.
+                    for b in 0..remainder {
+                        let src_bit = full_chunks * slice + b;
+                        let dst_bit = b;
+                        if src_bit < total_w {
+                            out.set_bit(dst_bit, concat.get_bit(src_bit));
+                        }
+                    }
+                    out
+                }
+            }
             ExprKind::Replication { count, exprs } => {
                 let n = self.eval_expr(count).to_u64().unwrap_or(1);
                 let mut inner = Value::zero(0); for e in exprs.iter().rev() { inner = self.eval_expr(e).concat_with(&inner); }
@@ -7454,6 +7494,77 @@ impl Simulator {
     fn exec_method_call(&mut self, handle: usize, method_name: &str, args: &[Expression]) -> Value {
         if method_name == "randomize" {
             return self.exec_randomize(handle);
+        }
+        // Built-in mailbox / semaphore methods
+        if self.mailboxes.contains_key(&handle) {
+            match method_name {
+                "put" => {
+                    if let Some(arg) = args.first() {
+                        let v = self.eval_expr(arg);
+                        self.mailboxes.get_mut(&handle).unwrap().push_back(v);
+                    }
+                    return Value::zero(32);
+                }
+                "get" | "peek" => {
+                    let val = if method_name == "get" {
+                        self.mailboxes.get_mut(&handle).and_then(|q| q.pop_front())
+                    } else {
+                        self.mailboxes.get(&handle).and_then(|q| q.front().cloned())
+                    };
+                    if let (Some(v), Some(arg)) = (val, args.first()) {
+                        let w = self.infer_lhs_width(arg);
+                        self.assign_value(arg, &v.resize(w));
+                    }
+                    return Value::zero(32);
+                }
+                "try_put" => {
+                    if let Some(arg) = args.first() {
+                        let v = self.eval_expr(arg);
+                        self.mailboxes.get_mut(&handle).unwrap().push_back(v);
+                    }
+                    return Value::from_u64(1, 32);
+                }
+                "try_get" | "try_peek" => {
+                    let val = if method_name == "try_get" {
+                        self.mailboxes.get_mut(&handle).and_then(|q| q.pop_front())
+                    } else {
+                        self.mailboxes.get(&handle).and_then(|q| q.front().cloned())
+                    };
+                    if let (Some(v), Some(arg)) = (val, args.first()) {
+                        let w = self.infer_lhs_width(arg);
+                        self.assign_value(arg, &v.resize(w));
+                        return Value::from_u64(1, 32);
+                    }
+                    return Value::zero(32);
+                }
+                "num" => {
+                    let n = self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
+                    return Value::from_u64(n as u64, 32);
+                }
+                _ => {}
+            }
+        }
+        if self.semaphores.contains_key(&handle) {
+            match method_name {
+                "put" => {
+                    let n = args.first().map(|a| self.eval_expr(a).to_u64().unwrap_or(1)).unwrap_or(1) as i64;
+                    *self.semaphores.get_mut(&handle).unwrap() += n;
+                    return Value::zero(32);
+                }
+                "get" => {
+                    let n = args.first().map(|a| self.eval_expr(a).to_u64().unwrap_or(1)).unwrap_or(1) as i64;
+                    let count = self.semaphores.get_mut(&handle).unwrap();
+                    if *count >= n { *count -= n; }
+                    return Value::zero(32);
+                }
+                "try_get" => {
+                    let n = args.first().map(|a| self.eval_expr(a).to_u64().unwrap_or(1)).unwrap_or(1) as i64;
+                    let count = self.semaphores.get_mut(&handle).unwrap();
+                    if *count >= n { *count -= n; return Value::from_u64(1, 32); }
+                    return Value::zero(32);
+                }
+                _ => {}
+            }
         }
         let class_name = if let Some(Some(inst)) = self.heap.get(handle) {
             inst.class_name.clone()
