@@ -449,6 +449,7 @@ pub struct Simulator {
     dollar_bound: Vec<i64>,
     break_flag: bool,
     continue_flag: bool,
+    rs_return_flag: bool,
     /// Processes waiting for signal edge events (@(posedge clk), etc.)
     event_waiters: Vec<EventWaiter>,
     /// Covergroups waiting for sampling events
@@ -603,7 +604,7 @@ impl Simulator {
             nba_queue: Vec::new(), nba_fast: Vec::new(), edge_blocks: Vec::new(), compiled_edge_blocks: Vec::new(), edge_block_parallel: Vec::new(), vm_regs: Vec::new(), clock_generators: Vec::new(),
             event_queue: TimingWheel::new(), next_pid: 0, current_pid: 0,
             dollar_bound: Vec::new(),
-            break_flag: false, continue_flag: false,
+            break_flag: false, continue_flag: false, rs_return_flag: false,
             event_waiters: Vec::new(),
             cg_event_waiters: Vec::new(),
             event_waiters_swap: Vec::new(),
@@ -5789,6 +5790,22 @@ impl Simulator {
                 self.break_flag = true;
             }
             StatementKind::Disable(_) | StatementKind::WaitFork => {}
+            StatementKind::RsReturn => {
+                self.rs_return_flag = true;
+                self.break_flag = true;
+            }
+            StatementKind::RsAction { body } => {
+                let prev = self.rs_return_flag;
+                self.rs_return_flag = false;
+                self.exec_statement(body);
+                let triggered = self.rs_return_flag;
+                self.rs_return_flag = prev;
+                if triggered {
+                    // Consume the break we raised for our RsReturn so the
+                    // enclosing sequence continues with the next production.
+                    self.break_flag = false;
+                }
+            }
             StatementKind::Wait { condition, stmt } => { if self.eval_expr(condition).is_true() { self.exec_statement(stmt); } }
             StatementKind::Assertion(a) => {
                 if !self.eval_expr(&a.expr).is_true() { if let Some(ea) = &a.else_action { self.exec_statement(ea); } }
