@@ -59,6 +59,22 @@ pub struct ElaboratedClass {
     /// Class parameters with default values, in declaration order.
     /// `(name, default_value_expr)`.
     pub param_defaults: Vec<(String, Option<crate::ast::expr::Expression>)>,
+    /// `interface class` declaration — cannot be instantiated.
+    #[serde(default)]
+    pub is_interface: bool,
+    /// Abstract (virtual) class — declared with `virtual class`. Cannot be instantiated
+    /// directly.
+    #[serde(default)]
+    pub is_virtual: bool,
+    /// Has at least one `pure virtual` method prototype.
+    #[serde(default)]
+    pub has_pure_virtual: bool,
+    /// Names listed in the `implements` clause.
+    #[serde(default)]
+    pub implements: Vec<String>,
+    /// Names of type parameters declared on the class.
+    #[serde(default)]
+    pub type_param_names: Vec<String>,
 }
 
 /// DPI import metadata used by the simulator for foreign-call dispatch.
@@ -131,6 +147,14 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
             }
         }
     }
+    let has_pure_virtual = c.items.iter().any(|it|
+        matches!(it, ClassItem::Method(m) if matches!(m.kind, ClassMethodKind::PureVirtual(_))));
+    let mut type_param_names = Vec::new();
+    for p in &c.params {
+        if let crate::ast::decl::ParameterKind::Type { assignments } = &p.kind {
+            for a in assignments { type_param_names.push(a.name.name.clone()); }
+        }
+    }
     ElaboratedClass {
         name: c.name.name.clone(),
         extends: c.extends.as_ref().map(|e| e.name.name.clone()),
@@ -139,6 +163,11 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         random_properties,
         constraints,
         param_defaults,
+        is_interface: c.is_interface,
+        is_virtual: c.virtual_kw,
+        has_pure_virtual,
+        implements: c.implements.iter().map(|i| i.name.clone()).collect(),
+        type_param_names,
     }
 }
 
@@ -1457,7 +1486,116 @@ pub fn elaborate_module_with_defs(
     // nor mix continuous and procedural drivers.
     validate_driver_conflicts(&elab)?;
 
+    // IEEE 1800-2017 §8.21/§8.26: class instantiation legality.
+    validate_class_usage(&elab)?;
+
     Ok(elab)
+}
+
+fn expr_is_new(expr: &Expression) -> bool {
+    match &expr.kind {
+        ExprKind::Ident(hier) => hier.path.len() == 1 && hier.path[0].name.name == "new",
+        ExprKind::Call { func, .. } => {
+            if let ExprKind::Ident(hier) = &func.kind {
+                return hier.path.len() == 1 && hier.path[0].name.name == "new";
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn check_new_assignment(lvalue: &Expression, rvalue: &Expression, elab: &ElaboratedModule) -> Result<(), String> {
+    if !expr_is_new(rvalue) { return Ok(()); }
+    let name = match simple_lhs_name(lvalue) { Some(n) => n, None => return Ok(()) };
+    let type_name = elab.signals.get(&name).and_then(|s| s.type_name.clone());
+    if let Some(tn) = type_name {
+        if let Some(cls) = elab.classes.get(&tn) {
+            if cls.is_interface {
+                return Err(format!("Cannot instantiate interface class '{}'", tn));
+            }
+            if cls.is_virtual || cls.has_pure_virtual {
+                return Err(format!("Cannot instantiate abstract class '{}'", tn));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn walk_stmt_for_class_new(stmt: &Statement, elab: &ElaboratedModule) -> Result<(), String> {
+    match &stmt.kind {
+        StatementKind::BlockingAssign { lvalue, rvalue } | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+            check_new_assignment(lvalue, rvalue, elab)?;
+        }
+        StatementKind::If { then_stmt, else_stmt, .. } => {
+            walk_stmt_for_class_new(then_stmt, elab)?;
+            if let Some(eb) = else_stmt { walk_stmt_for_class_new(eb, elab)?; }
+        }
+        StatementKind::Case { items, .. } => { for it in items { walk_stmt_for_class_new(&it.stmt, elab)?; } }
+        StatementKind::For { body, .. } | StatementKind::Foreach { body, .. } |
+        StatementKind::While { body, .. } | StatementKind::DoWhile { body, .. } |
+        StatementKind::Repeat { body, .. } | StatementKind::Forever { body } => walk_stmt_for_class_new(body, elab)?,
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            for s in stmts { walk_stmt_for_class_new(s, elab)?; }
+        }
+        StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => walk_stmt_for_class_new(stmt, elab)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn data_type_kind_name(dt: &DataType) -> String {
+    match dt {
+        DataType::Void(_) => "void".to_string(),
+        DataType::IntegerAtom { kind, signing, .. } => format!("atom:{:?}:{:?}", kind, signing),
+        DataType::IntegerVector { kind, signing, dimensions, .. } => format!("vec:{:?}:{:?}:{}", kind, signing, dimensions.len()),
+        DataType::Real { kind, .. } => format!("real:{:?}", kind),
+        DataType::Simple { kind, .. } => format!("simple:{:?}", kind),
+        DataType::TypeReference { name, .. } => format!("tref:{}", name.name.name),
+        DataType::Interface { name, .. } => format!("iface:{}", name.name),
+        DataType::Struct(_) => "struct".to_string(),
+        DataType::Enum(_) => "enum".to_string(),
+        DataType::Implicit { .. } => "implicit".to_string(),
+    }
+}
+
+fn validate_class_usage(elab: &ElaboratedModule) -> Result<(), String> {
+    // §8.26.4: `implements T` where T is a class type parameter is illegal.
+    for cls in elab.classes.values() {
+        for imp in &cls.implements {
+            if cls.type_param_names.iter().any(|n| n == imp) {
+                return Err(format!("Class '{}' cannot implement type parameter '{}'", cls.name, imp));
+            }
+        }
+    }
+    // §8.26.6.1: multiple interface-class implementations that declare the same
+    // method name with conflicting return types cannot be satisfied by a
+    // single concrete method.
+    for cls in elab.classes.values() {
+        if cls.implements.len() < 2 { continue; }
+        let mut seen: HashMap<String, String> = HashMap::new();
+        for iname in &cls.implements {
+            let iface = match elab.classes.get(iname) { Some(c) => c, None => continue };
+            for (mname, m) in &iface.methods {
+                let ret = match &m.kind {
+                    ClassMethodKind::Function(f) | ClassMethodKind::PureVirtual(f) | ClassMethodKind::Extern(f) =>
+                        data_type_kind_name(&f.return_type),
+                    ClassMethodKind::Task(_) => "task".to_string(),
+                };
+                match seen.get(mname) {
+                    Some(prev) if prev != &ret => {
+                        return Err(format!("Class '{}' has conflicting return types for inherited method '{}'", cls.name, mname));
+                    }
+                    None => { seen.insert(mname.clone(), ret); }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // §8.21/§8.26.5: reject instantiating an abstract or interface class.
+    for ib in &elab.initial_blocks { walk_stmt_for_class_new(&ib.stmt, elab)?; }
+    for ab in &elab.always_blocks { walk_stmt_for_class_new(&ab.stmt, elab)?; }
+    Ok(())
 }
 
 fn simple_lhs_name(expr: &Expression) -> Option<String> {
