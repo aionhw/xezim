@@ -2773,6 +2773,8 @@ impl Simulator {
             let has_clocks = !self.clock_generators.is_empty();
 
             if !has_timed && !has_waiters && !has_clocks && self.delayed_updates.is_empty() { break; }
+            // Deadlock: only waiters remain but nothing can ever wake them.
+            if has_waiters && !has_timed && !has_clocks && self.delayed_updates.is_empty() { break; }
 
             // Determine next time: minimum of event queue, clock generators, and delayed updates
             let next_eq_time = self.event_queue.next_time();
