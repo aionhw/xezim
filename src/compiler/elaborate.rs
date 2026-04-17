@@ -203,6 +203,10 @@ pub struct ElaboratedModule {
     /// Parameter init expressions that couldn't be evaluated at elaboration time
     /// (e.g. contain function calls). Simulator re-evaluates these during init.
     pub deferred_param_exprs: Vec<(String, Expression)>,
+    /// Names declared as nets (wire, supply0/1, tri, etc). Variables are everything else.
+    /// Used to enforce §6.5 driver-conflict rules only against variables.
+    #[serde(default)]
+    pub nets: HashSet<String>,
 }
 
 impl ElaboratedModule {
@@ -240,6 +244,7 @@ impl ElaboratedModule {
             class_type_args: HashMap::new(),
             arrays_nd: HashMap::new(),
             deferred_param_exprs: Vec::new(),
+            nets: HashSet::new(),
         }
     }
 }
@@ -870,6 +875,7 @@ pub fn elaborate_module_with_defs(
                         type_name: get_type_name(&nd.data_type),
                     };
                     elab.signals.insert(decl.name.name.clone(), sig);
+                    elab.nets.insert(decl.name.name.clone());
                     // Wire with initializer → continuous assign (not constant eval)
                     if let Some(init_expr) = &decl.init {
                         elab.continuous_assigns.push(ContinuousAssignment {
@@ -1442,8 +1448,83 @@ pub fn elaborate_module_with_defs(
     // Validate that all identifiers in procedural blocks are declared.
     for ib in &elab.initial_blocks { validate_stmt_idents(&ib.stmt, &elab, &mut HashSet::new())?; }
     for ab in &elab.always_blocks { validate_stmt_idents(&ab.stmt, &elab, &mut HashSet::new())?; }
+    for ca in &elab.continuous_assigns {
+        validate_expr_idents(&ca.lhs, &elab, &HashSet::new())?;
+        validate_expr_idents(&ca.rhs, &elab, &HashSet::new())?;
+    }
+
+    // IEEE 1800-2017 §6.5: a variable cannot have multiple continuous drivers,
+    // nor mix continuous and procedural drivers.
+    validate_driver_conflicts(&elab)?;
 
     Ok(elab)
+}
+
+fn simple_lhs_name(expr: &Expression) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Ident(hier) if hier.path.len() == 1 && hier.path[0].selects.is_empty() => {
+            Some(hier.path[0].name.name.clone())
+        }
+        ExprKind::Paren(inner) => simple_lhs_name(inner),
+        _ => None,
+    }
+}
+
+fn collect_written_idents(stmt: &Statement, out: &mut HashSet<String>) {
+    match &stmt.kind {
+        StatementKind::BlockingAssign { lvalue, .. } | StatementKind::NonblockingAssign { lvalue, .. } => {
+            if let Some(n) = simple_lhs_name(lvalue) { out.insert(n); }
+        }
+        StatementKind::If { then_stmt, else_stmt, .. } => {
+            collect_written_idents(then_stmt, out);
+            if let Some(eb) = else_stmt { collect_written_idents(eb, out); }
+        }
+        StatementKind::Case { items, .. } => {
+            for item in items { collect_written_idents(&item.stmt, out); }
+        }
+        StatementKind::For { body, init, .. } => {
+            for fi in init { if let ForInit::Assign { lvalue, .. } = fi {
+                if let Some(n) = simple_lhs_name(lvalue) { out.insert(n); }
+            }}
+            collect_written_idents(body, out);
+        }
+        StatementKind::Foreach { body, .. } => collect_written_idents(body, out),
+        StatementKind::While { body, .. } | StatementKind::DoWhile { body, .. } => collect_written_idents(body, out),
+        StatementKind::Repeat { body, .. } => collect_written_idents(body, out),
+        StatementKind::Forever { body } => collect_written_idents(body, out),
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            for s in stmts { collect_written_idents(s, out); }
+        }
+        StatementKind::TimingControl { stmt, .. } => collect_written_idents(stmt, out),
+        StatementKind::Wait { stmt, .. } => collect_written_idents(stmt, out),
+        _ => {}
+    }
+}
+
+fn validate_driver_conflicts(elab: &ElaboratedModule) -> Result<(), String> {
+    let mut ca_lhs: HashMap<String, u32> = HashMap::new();
+    for ca in &elab.continuous_assigns {
+        if let Some(n) = simple_lhs_name(&ca.lhs) {
+            if elab.signals.contains_key(&n) && !elab.nets.contains(&n) {
+                let c = ca_lhs.entry(n.clone()).or_insert(0);
+                *c += 1;
+                if *c == 2 {
+                    return Err(format!("Variable '{}' has multiple continuous drivers", n));
+                }
+            }
+        }
+    }
+    let mut proc_written: HashSet<String> = HashSet::new();
+    for ab in &elab.always_blocks { collect_written_idents(&ab.stmt, &mut proc_written); }
+    for ib in &elab.initial_blocks { collect_written_idents(&ib.stmt, &mut proc_written); }
+    for ca in &elab.continuous_assigns {
+        if let Some(n) = simple_lhs_name(&ca.lhs) {
+            if proc_written.contains(&n) && elab.signals.contains_key(&n) && !elab.nets.contains(&n) {
+                return Err(format!("Variable '{}' has both continuous and procedural drivers", n));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_stmt_idents(stmt: &Statement, elab: &ElaboratedModule, locals: &mut HashSet<String>) -> Result<(), String> {
@@ -1604,10 +1685,37 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
             for e in exprs { validate_expr_idents(e, elab, locals)?; }
         }
         ExprKind::Index { expr, index } => {
+            if let ExprKind::Ident(hier) = &expr.kind {
+                if hier.path.len() == 1 {
+                    if let Some(sig) = elab.signals.get(&hier.path[0].name.name) {
+                        if sig.is_real {
+                            return Err(format!("Bit-select of real variable '{}' is not allowed", sig.name));
+                        }
+                    }
+                }
+            }
+            if let ExprKind::Ident(hier) = &index.kind {
+                if hier.path.len() == 1 {
+                    if let Some(sig) = elab.signals.get(&hier.path[0].name.name) {
+                        if sig.is_real {
+                            return Err(format!("Real variable '{}' cannot be used as bit-select index", sig.name));
+                        }
+                    }
+                }
+            }
             validate_expr_idents(expr, elab, locals)?;
             validate_expr_idents(index, elab, locals)?;
         }
         ExprKind::RangeSelect { expr, left, right, .. } => {
+            if let ExprKind::Ident(hier) = &expr.kind {
+                if hier.path.len() == 1 {
+                    if let Some(sig) = elab.signals.get(&hier.path[0].name.name) {
+                        if sig.is_real {
+                            return Err(format!("Part-select of real variable '{}' is not allowed", sig.name));
+                        }
+                    }
+                }
+            }
             validate_expr_idents(expr, elab, locals)?;
             validate_expr_idents(left, elab, locals)?;
             validate_expr_idents(right, elab, locals)?;
@@ -1659,7 +1767,22 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
 
 fn validate_event_idents(ev: &EventControl, elab: &ElaboratedModule, locals: &HashSet<String>) -> Result<(), String> {
     match ev {
-        EventControl::EventExpr(exprs) => { for ee in exprs { validate_expr_idents(&ee.expr, elab, locals)?; } }
+        EventControl::EventExpr(exprs) => {
+            for ee in exprs {
+                if ee.edge.is_some() {
+                    if let ExprKind::Ident(hier) = &ee.expr.kind {
+                        if hier.path.len() == 1 {
+                            if let Some(sig) = elab.signals.get(&hier.path[0].name.name) {
+                                if sig.is_real {
+                                    return Err(format!("Edge event on real variable '{}' is not allowed", sig.name));
+                                }
+                            }
+                        }
+                    }
+                }
+                validate_expr_idents(&ee.expr, elab, locals)?;
+            }
+        }
         EventControl::Identifier(id) => {
             if !elab.signals.contains_key(&id.name) && !elab.parameters.contains_key(&id.name)
                 && !elab.sequences.contains(&id.name) && !locals.contains(&id.name)
@@ -1686,10 +1809,11 @@ fn create_implicit_nets(elab: &mut ElaboratedModule) {
     for name in implicit_names {
         if !elab.signals.contains_key(&name) && !elab.parameters.contains_key(&name) {
             elab.signals.insert(name.clone(), Signal { is_const: false,
-                name, width: 1, is_signed: false,
+                name: name.clone(), width: 1, is_signed: false,
                 direction: None, value: Value::new(1),
                 is_real: false, type_name: None,
             });
+            elab.nets.insert(name);
         }
     }
 }
