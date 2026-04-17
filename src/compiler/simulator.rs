@@ -4471,6 +4471,11 @@ impl Simulator {
                 l.concat_with(&h) // Dummy representation
             }
             ExprKind::Paren(inner) => self.eval_expr_ctx(inner, ctx_width),
+            ExprKind::AssignExpr { lvalue, rvalue } => {
+                let v = self.eval_expr(rvalue);
+                self.assign_value(lvalue, &v);
+                v
+            }
             ExprKind::SystemCall { name, args } => match name.as_str() {
                 "$clog2" => { let v = args.first().map(|a| self.eval_expr(a).to_u64().unwrap_or(0)).unwrap_or(0); Value::from_u64(if v <= 1 { 1 } else { 64 - (v-1).leading_zeros() } as u64, 32) }
                 "$bits" => {
@@ -5108,7 +5113,7 @@ impl Simulator {
             }
             StatementKind::While { condition, body } => { let mut i = 0; loop { if i > 10000 || self.finished { break; } i += 1; if !self.eval_expr(condition).is_true() { break; } self.break_flag = false; self.exec_statement(body); if self.break_flag { self.break_flag = false; break; } } }
             StatementKind::DoWhile { body, condition } => { let mut i = 0; loop { if i > 10000 || self.finished { break; } i += 1; self.break_flag = false; self.exec_statement(body); if self.break_flag { self.break_flag = false; break; } if !self.eval_expr(condition).is_true() { break; } } }
-            StatementKind::Repeat { count, body } => { let n = self.eval_expr(count).to_u64().unwrap_or(0); for _ in 0..n.min(10000) { if self.finished { break; } self.exec_statement(body); } }
+            StatementKind::Repeat { count, body } => { let n = self.eval_expr(count).to_u64().unwrap_or(0); for _ in 0..n.min(10000) { if self.finished { break; } self.break_flag = false; self.continue_flag = false; self.exec_statement(body); if self.break_flag { self.break_flag = false; break; } self.continue_flag = false; } }
             StatementKind::Forever { body } => { let mut i = 0; loop { if i > 100000 || self.finished || self.time > self.max_time { break; } i += 1; self.exec_statement(body); } }
             StatementKind::SeqBlock { stmts, .. } => { for s in stmts { if self.finished || self.break_flag || self.continue_flag { break; } self.exec_statement(s); } }
             StatementKind::ParBlock { stmts, join_type, .. } => {
@@ -5663,7 +5668,7 @@ impl Simulator {
             _ => {}
         }
     }
-    fn infer_width(&mut self, expr: &Expression) -> u32 { match &expr.kind { ExprKind::Ident(h) => { let n = self.resolve_hier_name(h); self.widths.get(&n).copied().unwrap_or(1) } ExprKind::Number(NumberLiteral::Integer { size, .. }) => size.unwrap_or(32), ExprKind::Concatenation(p) => { let mut total = 0; for x in p { total += self.infer_width(x); } total } _ => self.eval_expr(expr).width } }
+    fn infer_width(&mut self, expr: &Expression) -> u32 { match &expr.kind { ExprKind::Ident(h) => { let n = self.resolve_hier_name(h); self.widths.get(&n).copied().unwrap_or(1) } ExprKind::Number(NumberLiteral::Integer { size, .. }) => size.unwrap_or(32), ExprKind::Concatenation(p) => { let mut total = 0; for x in p { total += self.infer_width(x); } total } ExprKind::Paren(inner) => self.infer_width(inner), ExprKind::AssignExpr { lvalue, .. } => self.infer_width(lvalue), ExprKind::Binary { left, right, .. } => self.infer_width(left).max(self.infer_width(right)), ExprKind::Unary { operand, .. } => self.infer_width(operand), ExprKind::Conditional { then_expr, else_expr, .. } => self.infer_width(then_expr).max(self.infer_width(else_expr)), _ => self.eval_expr(expr).width } }
     fn infer_lhs_width(&mut self, expr: &Expression) -> u32 {
         match &expr.kind {
             ExprKind::Concatenation(p) => { let mut total = 0; for x in p { total += self.infer_lhs_width(x); } total }
@@ -6638,6 +6643,17 @@ impl Simulator {
                 if let Some(res) = self.eval_builtin_method(&name, mname, args) {
                     return res;
                 }
+                // Package scope resolution: `pkg::func(args)`. Only when LHS is an
+                // explicitly known package name — not a class, signal, or handle.
+                if hier.path.len() == 1 && self.module.packages.contains(&name) {
+                    if let Some(fd) = self.module.functions.get(mname).cloned() {
+                        return self.exec_function_call(&fd, args);
+                    }
+                    if let Some(td) = self.module.tasks.get(mname).cloned() {
+                        self.exec_task_call(&td, args);
+                        return Value::zero(32);
+                    }
+                }
             }
 
             if mname == "put" {
@@ -7018,6 +7034,9 @@ impl Simulator {
             self.local_stack.last().and_then(|l| l.get(&ret_name).cloned()).unwrap_or(Value::zero(32))
         };
         self.local_stack.pop();
+        // `return` set break_flag to short-circuit the function body — clear it
+        // so the caller's enclosing loop/block isn't terminated.
+        self.break_flag = false;
         result
     }
 
@@ -7098,6 +7117,7 @@ impl Simulator {
             for k in keys { self.signals.remove(&k); }
             self.module.associative_arrays.remove(param_name);
         }
+        self.break_flag = false;
     }
 
     fn instantiate_covergroup(&mut self, cg_def: &CovergroupDeclaration, _args: &[Expression]) -> Value {

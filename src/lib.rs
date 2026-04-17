@@ -155,6 +155,8 @@ fn parse_and_elaborate(
     let mut top_module = None;
     let mut top_level_imports = Vec::new();
     let mut top_level_lets = Vec::new();
+    let mut top_level_functions: Vec<ast::decl::FunctionDeclaration> = Vec::new();
+    let mut top_level_tasks: Vec<ast::decl::TaskDeclaration> = Vec::new();
     for desc in all_descriptions {
         match desc {
             ast::Description::Module(m) => {
@@ -197,7 +199,27 @@ fn parse_and_elaborate(
             ast::Description::PackageItem(ast::decl::PackageItem::Let(l)) => {
                 top_level_lets.push(l.clone());
             }
+            ast::Description::PackageItem(ast::decl::PackageItem::Function(f)) => {
+                top_level_functions.push(f.clone());
+            }
+            ast::Description::PackageItem(ast::decl::PackageItem::Task(t)) => {
+                top_level_tasks.push(t.clone());
+            }
             _ => {}
+        }
+    }
+    // Inject $unit-scope functions and tasks into every module definition so
+    // they're resolvable from inside an instance.
+    if !top_level_functions.is_empty() || !top_level_tasks.is_empty() {
+        for def in definitions.values_mut() {
+            if let SourceDefinition::Module(m) = def {
+                for f in top_level_functions.iter().rev() {
+                    m.items.insert(0, ast::decl::ModuleItem::FunctionDeclaration(f.clone()));
+                }
+                for t in top_level_tasks.iter().rev() {
+                    m.items.insert(0, ast::decl::ModuleItem::TaskDeclaration(t.clone()));
+                }
+            }
         }
     }
     if !include_dirs.is_empty() { resolve_library_modules(&mut definitions, include_dirs)?; }
