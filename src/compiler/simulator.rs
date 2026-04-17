@@ -5532,6 +5532,9 @@ impl Simulator {
                 // Trigger immediate combinatorial settlement and edge checks
                 self.settle_combinatorial();
                 self.check_edges();
+                // Consume the edge so the outer main-loop check_edges at the
+                // same timestep doesn't re-fire edge_blocks on the same event.
+                self.snapshot_edge_signals();
             }
             StatementKind::Coverpoint { .. } | StatementKind::Cross { .. } => {}
         }
@@ -6492,6 +6495,15 @@ impl Simulator {
     }
 
     fn eval_builtin_method(&mut self, obj_name: &str, mname: &str, args: &[Expression]) -> Option<Value> {
+        // If obj_name is a mailbox/semaphore handle variable, don't treat it as an array.
+        if matches!(mname, "num" | "put" | "get" | "peek" | "try_put" | "try_get" | "try_peek") {
+            if let Some(handle_val) = self.get_signal_value_by_name(obj_name) {
+                let handle = handle_val.to_u64().unwrap_or(0) as usize;
+                if self.mailboxes.contains_key(&handle) || self.semaphores.contains_key(&handle) {
+                    return None;
+                }
+            }
+        }
         if mname == "size" || mname == "len" {
             if let Some(v) = self.signals.get(&format!("{}.size", obj_name)) {
                 return Some(v.clone());
@@ -7305,7 +7317,32 @@ impl Simulator {
         let mut locals = HashMap::new();
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
         let mut assoc_params: Vec<(String, String)> = Vec::new(); // (param_name, caller_array_name)
+        let mut array_params: Vec<String> = Vec::new(); // param names with unpacked Range dim
         for (i, port) in td.ports.iter().enumerate() {
+            // Unpacked array parameter (e.g. `int a [2:0]`): copy caller's
+            // array elements into `param[idx]` signals so `a[0]` resolves.
+            if let Some(crate::ast::types::UnpackedDimension::Range { left, right, .. }) = port.dimensions.first() {
+                if i < args.len() {
+                    if let ExprKind::Ident(hier) = &args[i].kind {
+                        let caller_name = self.resolve_hier_name(hier);
+                        let param_name = port.name.name.clone();
+                        let l = super::elaborate::const_eval_i64_with_params(left, None).unwrap_or(0);
+                        let r = super::elaborate::const_eval_i64_with_params(right, None).unwrap_or(0);
+                        let (lo, hi) = (l.min(r), l.max(r));
+                        for idx in lo..=hi {
+                            let caller_elem = format!("{}[{}]", caller_name, idx);
+                            let param_elem = format!("{}[{}]", param_name, idx);
+                            if let Some(v) = self.get_signal_value_by_name(&caller_elem) {
+                                self.signals.insert(param_elem, v);
+                            }
+                        }
+                        let w = self.module.arrays.get(&caller_name).map(|t| t.2).unwrap_or(32);
+                        self.module.arrays.insert(param_name.clone(), (lo, hi, w));
+                        array_params.push(param_name);
+                        continue;
+                    }
+                }
+            }
             let is_assoc = port.dimensions.iter().any(|d| matches!(d, crate::ast::types::UnpackedDimension::Associative { .. }));
             if is_assoc && i < args.len() {
                 if let ExprKind::Ident(hier) = &args[i].kind {
@@ -7374,6 +7411,13 @@ impl Simulator {
             let keys: Vec<String> = self.signals.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
             for k in keys { self.signals.remove(&k); }
             self.module.associative_arrays.remove(param_name);
+        }
+        // Clean up unpacked-array params
+        for param_name in &array_params {
+            let prefix = format!("{}[", param_name);
+            let keys: Vec<String> = self.signals.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+            for k in keys { self.signals.remove(&k); }
+            self.module.arrays.remove(param_name);
         }
         self.break_flag = false;
     }
