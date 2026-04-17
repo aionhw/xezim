@@ -385,6 +385,8 @@ pub struct Simulator {
     pub finished: bool,
     pub monitor: Option<(String, Vec<Expression>)>,
     pub monitor_prev: HashMap<String, Value>,
+    /// Active tag for a tagged union variable: signal name → tag name.
+    pub active_union_tag: HashMap<String, String>,
     pub max_time: u64,
     /// Maximum iterations for combinatorial settling per cycle.
     pub settle_limit: u32,
@@ -577,7 +579,7 @@ impl Simulator {
             signals, widths, signed_signals, real_signals,
             signal_table, signal_name_to_id, id_to_name: sig_names_sorted, signal_widths: signal_widths_vec, signal_signed: signal_signed_vec, signal_real: signal_real_vec,
             time: 0, output: Vec::new(), capture_output: true, finished: false,
-            monitor: None, monitor_prev: HashMap::new(),
+            monitor: None, monitor_prev: HashMap::new(), active_union_tag: HashMap::new(),
             max_time, settle_limit: 100,
             sdf_annotation: None, sdf_delays: vec![0u64; num_signals], delayed_updates: Vec::new(), module,
             dpi_libraries: Vec::new(),
@@ -2816,17 +2818,30 @@ impl Simulator {
                 // Fire clock generators at current time (O(1) toggle, no AST)
                 self.fire_clock_generators();
 
-                // Process timed events from queue
+                // Process timed events from queue. Pop one at a time and
+                // re-insert the rest so that a task-internal `#delay` (which
+                // recursively drains the queue via `run_events_until`) can
+                // still observe other processes scheduled at this tick.
                 let _t = std::time::Instant::now();
-                let processes = self.event_queue.remove(self.time);
+                let mut batch = self.event_queue.remove(self.time);
                 t_sched += _t.elapsed().as_nanos() as u64;
                 let _t = std::time::Instant::now();
-                for (pid, stmts) in processes {
+                while !batch.is_empty() {
                     if self.finished { break; }
+                    let (pid, stmts) = batch.remove(0);
+                    let t_now = self.time;
+                    for (p, s) in batch.drain(..) {
+                        self.event_queue.schedule(t_now, p, s);
+                    }
                     self.run_scheduled_process(pid, &stmts);
-                    // If it finished (not suspended), check join waiters
                     if !self.is_pid_suspended(pid) {
                         self.child_finished(pid);
+                    }
+                    // Refresh batch with anything newly scheduled at current time.
+                    if self.event_queue.next_time() == Some(self.time) {
+                        batch = self.event_queue.remove(self.time);
+                    } else {
+                        batch.clear();
                     }
                 }
                 t_process += _t.elapsed().as_nanos() as u64;
@@ -3066,6 +3081,29 @@ impl Simulator {
         } else {
             self.process_contexts.insert(pid, ctx);
         }
+    }
+
+    /// Drain events in the scheduler whose fire time is at or before `target`.
+    /// Used when a task-internal `#delay` needs to yield the simulator so
+    /// concurrent processes can advance while this task sleeps.
+    fn run_events_until(&mut self, target: u64) {
+        let saved_pid = self.current_pid;
+        let saved_break = self.break_flag;
+        loop {
+            let next = self.event_queue.next_time();
+            let nt = match next { Some(t) if t <= target => t, _ => break };
+            if nt > self.time { self.time = nt; }
+            let processes = self.event_queue.remove(self.time);
+            for (pid, stmts) in processes {
+                if self.finished { break; }
+                self.run_scheduled_process(pid, &stmts);
+                if !self.is_pid_suspended(pid) { self.child_finished(pid); }
+            }
+            if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() { self.apply_nba(); }
+            if self.dirty_any { self.settle_combinatorial(); }
+        }
+        self.current_pid = saved_pid;
+        self.break_flag = saved_break;
     }
 
     fn run_scheduled_process(&mut self, pid: usize, stmts: &[Statement]) {
@@ -5068,6 +5106,22 @@ impl Simulator {
             StatementKind::Null => {}
             StatementKind::Expr(expr) => self.exec_expr_stmt(expr),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
+                // Tagged union assignment: un = tagged Name (inner);
+                if let ExprKind::Tagged { tag, inner } = &rvalue.kind {
+                    if let ExprKind::Ident(lh) = &lvalue.kind {
+                        let lname = self.resolve_hier_name(lh);
+                        self.active_union_tag.insert(lname.clone(), tag.name.clone());
+                        if let Some(inner_expr) = inner {
+                            let v = self.eval_expr(inner_expr);
+                            self.set_signal_value_by_name(&lname, v);
+                        } else {
+                            let w = self.widths.get(&lname).copied().unwrap_or(1);
+                            self.set_signal_value_by_name(&lname, Value::zero(w));
+                        }
+                        if !self.in_edge_block { self.settle_combinatorial(); }
+                        return;
+                    }
+                }
                 // Slice assignment for N-dimensional unpacked arrays where LHS
                 // and RHS both supply fewer indices than dimensions:
                 //   B[i][j] = A[p][q];   // with A, B both 3D ⇒ copy inner dim
@@ -5698,7 +5752,12 @@ impl Simulator {
                     TimingControl::Delay(d) => {
                         let delay = self.eval_expr(d).to_u64().unwrap_or(0);
                         self.apply_nba(); self.settle_combinatorial(); self.snapshot_edge_signals();
-                        self.time += delay;
+                        let target = self.time + delay;
+                        // Run scheduled continuations (other processes) whose fire
+                        // time falls inside this delay window so concurrent blocks
+                        // can advance while we're sleeping inside a task.
+                        self.run_events_until(target);
+                        if self.time < target { self.time = target; }
                         self.settle_combinatorial(); self.check_monitor();
                     }
                     TimingControl::Event(e) => {
@@ -6014,6 +6073,19 @@ impl Simulator {
                 if let Some(&spec) = chars.peek() { chars.next(); match spec {
                     '%' => result.push('%'),
                     't' | 'T' => { if ai < args.len() { if let ExprKind::SystemCall { name, .. } = &args[ai].kind { if name == "$time" { let s = format!("{}", self.time); result.push_str(&pad_string(&s, pad_width, zero_pad)); ai += 1; continue; } } let s = self.eval_expr(&args[ai]).to_dec_string(); result.push_str(&pad_string(&s, pad_width, zero_pad)); ai += 1; } }
+                    'p' | 'P' => { if ai < args.len() {
+                        let arg = &args[ai]; ai += 1;
+                        if let ExprKind::Ident(h) = &arg.kind {
+                            let name = self.resolve_hier_name(h);
+                            if let Some(tag) = self.active_union_tag.get(&name).cloned() {
+                                let v = self.eval_expr(arg);
+                                result.push_str(&format!("'{{{}:{}}}", tag, v.to_dec_string()));
+                                continue;
+                            }
+                        }
+                        let v = self.eval_expr(arg);
+                        result.push_str(&v.to_dec_string());
+                    } }
                     _ => { if ai < args.len() { let v = self.eval_expr(&args[ai]); ai += 1; match spec {
                         'd' | 'D' => { let s = v.to_dec_string(); result.push_str(&pad_string(&s, pad_width, zero_pad)); }
                         'b' | 'B' => { let s = v.to_bin_string(); result.push_str(&pad_string(&s, pad_width, zero_pad)); }
