@@ -2,14 +2,20 @@ use std::env;
 use std::path::Path;
 
 fn print_usage() {
-    eprintln!("Usage: sisvsim [options] <source_files> [plusargs]");
+    eprintln!("Usage: sisvsim [mode] [options] <source_files> [plusargs]");
+    eprintln!("Modes (pick one; default is 'simulate'):");
+    eprintln!("  --parse          Lex + parse only, report diagnostics");
+    eprintln!("  --compile        Parse + elaborate, report diagnostics (no simulation)");
+    eprintln!("  --simulate       Parse + elaborate + simulate (default)");
     eprintln!("Options:");
     eprintln!("  -v               Verbose output");
     eprintln!("  -V               Print version and exit");
     eprintln!("  -I <dir>         Add directory to include search path");
     eprintln!("  -D <name>[=val]  Define a macro");
     eprintln!("  -s <topmodule>   Specify the top-level module to elaborate");
-    eprintln!("  --no-sim         Parse and elaborate only, do not run simulation");
+    eprintln!("  --no-sim         Alias for --compile (deprecated)");
+    eprintln!("  --dump-tokens    With --parse, print the token stream");
+    eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!("  --max-time <n>   Set maximum simulation time (default: 100000)");
     eprintln!("  --sim_debug      Enable simulator [DEBUG]/[OPT] output");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
@@ -206,7 +212,10 @@ fn main() {
     let mut max_time: u64 = 100_000;
     let mut dump_tokens = false;
     let mut dump_ast = false;
-    let mut no_sim = false;
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mode { Parse, Compile, Simulate }
+    let mut mode: Mode = Mode::Simulate;
+    let mut mode_explicit = false;
     let mut verbose = false;
     let mut _output_file: Option<String> = None;
     let mut lib_dirs: Vec<String> = Vec::new();
@@ -304,9 +313,26 @@ fn main() {
             }
             "-v" => { verbose = true; }
             "-V" => { print_version(); std::process::exit(0); }
-            "--no-sim" => { no_sim = true; }
-            "--dump-tokens" => { dump_tokens = true; no_sim = true; }
-            "--dump-ast" => { dump_ast = true; no_sim = true; }
+            "--parse" => {
+                if mode_explicit && mode != Mode::Parse {
+                    eprintln!("Error: --parse conflicts with previously set mode"); std::process::exit(1);
+                }
+                mode = Mode::Parse; mode_explicit = true;
+            }
+            "--compile" | "--no-sim" => {
+                if mode_explicit && mode != Mode::Compile {
+                    eprintln!("Error: --compile conflicts with previously set mode"); std::process::exit(1);
+                }
+                mode = Mode::Compile; mode_explicit = true;
+            }
+            "--simulate" => {
+                if mode_explicit && mode != Mode::Simulate {
+                    eprintln!("Error: --simulate conflicts with previously set mode"); std::process::exit(1);
+                }
+                mode = Mode::Simulate; mode_explicit = true;
+            }
+            "--dump-tokens" => { dump_tokens = true; if !mode_explicit { mode = Mode::Parse; } }
+            "--dump-ast" => { dump_ast = true; if !mode_explicit { mode = Mode::Parse; } }
             "--max-time" => {
                 i += 1;
                 if i < args.len() {
@@ -385,39 +411,45 @@ fn main() {
         }
     }
 
-    if dump_tokens {
-        for (i, (label, source)) in file_labels.iter().zip(sources.iter()).enumerate() {
-            println!("=== Tokens: {} ===", label);
-            let tokens = sisvsim::tokenize_file(source, None);
-            for tok in &tokens {
-                println!("{:?} '{}' @ {}..{}", tok.kind, tok.text, tok.span.start, tok.span.end);
+    if mode == Mode::Parse {
+        if dump_tokens {
+            for (_i, (label, source)) in file_labels.iter().zip(sources.iter()).enumerate() {
+                println!("=== Tokens: {} ===", label);
+                let tokens = sisvsim::tokenize_file(source, None);
+                for tok in &tokens {
+                    println!("{:?} '{}' @ {}..{}", tok.kind, tok.text, tok.span.start, tok.span.end);
+                }
             }
         }
-        return;
-    }
-
-    if dump_ast {
+        let mut total_desc = 0;
+        let mut total_err = 0;
+        let mut total_warn = 0;
         for (label, source) in file_labels.iter().zip(sources.iter()) {
-            println!("=== AST: {} ===", label);
-            match sisvsim::parse_str(source) {
-                Ok(result) => {
-                    println!("{:#?}", result.source);
-                }
-                Err(diags) => {
-                    for diag in &diags { eprintln!("{}", diag); }
-                    std::process::exit(1);
-                }
+            let result = sv_parser::parse(source);
+            for err in &result.errors {
+                let (line, col) = byte_to_line_col(&result.source_text, err.span.start);
+                eprintln!("[{}] {}:{}: error: {}", label, line, col, err.message);
+            }
+            total_desc += result.source.descriptions.len();
+            total_err += result.errors.len();
+            total_warn += result.warnings.len();
+            if dump_ast {
+                println!("=== AST: {} ===", label);
+                println!("{:#?}", result.source);
             }
         }
+        println!("Parsed {} file(s): {} descriptions, {} errors, {} warnings",
+            sources.len(), total_desc, total_err, total_warn);
+        if total_err > 0 { std::process::exit(1); }
         return;
     }
 
-    if no_sim {
+    if mode == Mode::Compile {
         let mut total_desc = 0;
         let mut total_err = 0;
         let mut total_warn = 0;
 
-        for (i, (label, source)) in file_labels.iter().zip(sources.iter()).enumerate() {
+        for (label, source) in file_labels.iter().zip(sources.iter()) {
             let result = sv_parser::parse(source);
             for err in &result.errors {
                 let (line, col) = byte_to_line_col(&result.source_text, err.span.start);
@@ -434,7 +466,7 @@ fn main() {
         match sisvsim::parse_and_elaborate_multi(&sources, top_module.as_deref(), &include_dirs, &source_files, &defines) {
             Ok(_) => { println!("Elaboration successful"); }
             Err(e) => {
-                eprintln!("Simulation error: {}", e);
+                eprintln!("Elaboration error: {}", e);
                 std::process::exit(1);
             }
         }
