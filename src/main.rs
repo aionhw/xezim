@@ -510,7 +510,7 @@ fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("Elaboration error: {}", e);
+                eprintln!("Simulation error: {}", e);
                 std::process::exit(1);
             }
         }
