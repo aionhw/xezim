@@ -4244,7 +4244,7 @@ impl Simulator {
                         if mname == "pop_back" && self.module.arrays.contains_key(obj_name) {
                             return self.eval_builtin_method(obj_name, "pop_back", &[]).unwrap_or(Value::zero(32));
                         }
-                        if matches!(mname, "sort" | "rsort" | "reverse" | "sum" | "product" | "min" | "max" | "unique" | "unique_index" | "find" | "find_first" | "find_last" | "find_index" | "find_first_index" | "find_last_index") && self.module.arrays.contains_key(obj_name) {
+                        if matches!(mname, "sort" | "rsort" | "reverse" | "sum" | "product" | "min" | "max" | "unique" | "unique_index" | "find" | "find_first" | "find_last" | "find_index" | "find_first_index" | "find_last_index" | "and" | "or" | "xor") && self.module.arrays.contains_key(obj_name) {
                             return self.eval_builtin_method(obj_name, mname, &[]).unwrap_or(Value::zero(32));
                         }
                     }
@@ -4592,35 +4592,68 @@ impl Simulator {
                         Value::from_u64(v.width as u64, 32)
                     } else { Value::zero(32) }
                 }
-                "$dimensions" => Value::from_u64(1, 32),
-                "$left" | "$high" => {
+                "$dimensions" | "$unpacked_dimensions" => {
                     if let Some(arg) = args.first() {
                         if let ExprKind::Ident(hier) = &arg.kind {
-                            let name = self.resolve_hier_name(hier);
-                            if let Some(&id) = self.signal_name_to_id.get(&name) {
-                                return Value::from_u64(self.signal_widths[id] as u64 - 1, 32);
+                            let aname = self.resolve_hier_name(hier);
+                            let has_unpacked = self.module.arrays.contains_key(&aname);
+                            let packed_w = if has_unpacked {
+                                self.module.arrays[&aname].2
+                            } else if let Some(&id) = self.signal_name_to_id.get(&aname) {
+                                self.signal_widths[id]
+                            } else { 0 };
+                            if name == "$unpacked_dimensions" {
+                                return Value::from_u64(if has_unpacked { 1 } else { 0 }, 32);
                             }
+                            let packed_dim: u64 = if packed_w > 1 { 1 } else { 0 };
+                            let unpacked_dim: u64 = if has_unpacked { 1 } else { 0 };
+                            let total = packed_dim + unpacked_dim;
+                            return Value::from_u64(total.max(1), 32);
                         }
-                        let v = self.eval_expr(arg);
-                        Value::from_u64(v.width as u64 - 1, 32)
-                    } else { Value::zero(32) }
+                    }
+                    Value::from_u64(1, 32)
                 }
-                "$right" | "$low" => Value::from_u64(0, 32),
-                "$increment" => Value::from_u64(1, 32),
-                "$size" => {
+                sn @ ("$left" | "$high" | "$right" | "$low" | "$size" | "$increment") => {
+                    let sn = sn.to_string();
+                    let dim = args.get(1).map(|a| self.eval_expr(a).to_u64().unwrap_or(1)).unwrap_or(1) as usize;
                     if let Some(arg) = args.first() {
                         if let ExprKind::Ident(hier) = &arg.kind {
-                            let name = self.resolve_hier_name(hier);
-                            if let Some(&id) = self.signal_name_to_id.get(&name) {
-                                return Value::from_u64(self.signal_widths[id] as u64, 32);
-                            }
-                            if let Some((lo, hi, _)) = self.module.arrays.get(&name) {
-                                return Value::from_u64((hi - lo + 1) as u64, 32);
-                            }
+                            let aname = self.resolve_hier_name(hier);
+                            let unpacked = self.module.arrays.get(&aname).cloned();
+                            let packed_w = if let Some((_,_,w)) = unpacked { w }
+                                else if let Some(&id) = self.signal_name_to_id.get(&aname) {
+                                    self.signal_widths[id]
+                                } else { 0 };
+                            let (lo, hi, descending) = if unpacked.is_some() && dim == 1 {
+                                let (l, h, _) = unpacked.unwrap();
+                                let desc = self.module.descending_arrays.contains(&aname);
+                                (l, h, desc)
+                            } else {
+                                (0i64, packed_w as i64 - 1, true)
+                            };
+                            let left = if descending { hi } else { lo };
+                            let right = if descending { lo } else { hi };
+                            let size = (hi - lo + 1).max(0) as u64;
+                            let result = match sn.as_str() {
+                                "$left" => left as u64,
+                                "$right" => right as u64,
+                                "$high" => hi as u64,
+                                "$low" => lo as u64,
+                                "$size" => size,
+                                "$increment" => if descending { 1 } else { 0u64.wrapping_sub(1) },
+                                _ => 0,
+                            };
+                            return Value::from_u64(result, 32);
                         }
                         let v = self.eval_expr(arg);
-                        Value::from_u64(v.width as u64, 32)
-                    } else { Value::zero(32) }
+                        match sn.as_str() {
+                            "$left" | "$high" => return Value::from_u64(v.width as u64 - 1, 32),
+                            "$size" => return Value::from_u64(v.width as u64, 32),
+                            "$increment" => return Value::from_u64(1, 32),
+                            _ => return Value::zero(32),
+                        }
+                    }
+                    Value::zero(32)
                 }
                 "$typename" => {
                     if let Some(arg) = args.first() {
@@ -6545,6 +6578,23 @@ impl Simulator {
                 }
             }
             return Some(Value::from_u64(total, 32));
+        }
+        if matches!(mname, "and" | "or" | "xor") {
+            let cur_size = self.get_queue_size(obj_name) as usize;
+            let mut acc: Option<u64> = None;
+            for i in 0..cur_size {
+                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
+                    let x = v.to_u64().unwrap_or(0);
+                    acc = Some(match (acc, mname) {
+                        (None, _) => x,
+                        (Some(a), "and") => a & x,
+                        (Some(a), "or")  => a | x,
+                        (Some(a), "xor") => a ^ x,
+                        (Some(a), _) => a,
+                    });
+                }
+            }
+            return Some(Value::from_u64(acc.unwrap_or(0), 32));
         }
         if mname == "min" {
             let cur_size = self.get_queue_size(obj_name) as usize;
