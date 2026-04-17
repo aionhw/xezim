@@ -178,6 +178,9 @@ pub struct ElaboratedModule {
     pub packages: HashSet<String>,
     /// Names of declared sequences and properties (so `@name` event control resolves).
     pub sequences: HashSet<String>,
+    /// Packed struct bit-field layout: container_name -> Vec<(member_name, lsb_offset, width)>.
+    /// Members are stored by bit offset so MemberAccess can slice the container.
+    pub packed_struct_fields: HashMap<String, Vec<(String, u32, u32)>>,
 }
 
 impl ElaboratedModule {
@@ -210,6 +213,7 @@ impl ElaboratedModule {
             arrays_2d: HashMap::new(),
             packages: HashSet::new(),
             sequences: HashSet::new(),
+            packed_struct_fields: HashMap::new(),
         }
     }
 }
@@ -1020,6 +1024,22 @@ pub fn elaborate_module_with_defs(
                                         }
                                     }
                                 }
+                                // Build bit-field layout: first-declared member is MSB.
+                                // Walk members in reverse, accumulating lsb offset.
+                                let mut flat: Vec<(String, u32)> = Vec::new();
+                                for member in &su.members {
+                                    let mw = resolve_type_width(&member.data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                                    for mdecl in &member.declarators {
+                                        flat.push((mdecl.name.name.clone(), mw));
+                                    }
+                                }
+                                let mut fields: Vec<(String, u32, u32)> = Vec::new();
+                                let mut offset: u32 = 0;
+                                for (mname, mw) in flat.iter().rev() {
+                                    fields.push((mname.clone(), offset, *mw));
+                                    offset += mw;
+                                }
+                                elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
                             }
                             if !su.packed {
                                 // Pre-register member signals with their declared widths,

@@ -3900,6 +3900,26 @@ impl Simulator {
                     }
                 } else if hier.path.len() > 1 {
                     let obj_name = &hier.path[0].name.name;
+                    if hier.path.len() == 2 {
+                        let mname = hier.path[1].name.name.as_str();
+                        if let Some(fields) = self.module.packed_struct_fields.get(obj_name).cloned() {
+                            if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| m == mname).cloned() {
+                                if let Some(cur_sig) = self.get_signal_value_by_name(obj_name) {
+                                    let total_w = cur_sig.width;
+                                    let mut cur = cur_sig.resize(total_w);
+                                    let piece = val.resize(w);
+                                    for i in 0..w {
+                                        let bit = piece.get_bit(i as usize);
+                                        cur.set_bit((off + i) as usize, bit);
+                                    }
+                                    let prev = self.get_signal_value_by_name(obj_name);
+                                    let changed = prev.as_ref() != Some(&cur);
+                                    self.set_signal_value_by_name(obj_name, cur);
+                                    return changed;
+                                }
+                            }
+                        }
+                    }
                     let obj_val = if let Some(locals) = self.local_stack.last() {
                         locals.get(obj_name).cloned()
                     } else {
@@ -4162,6 +4182,26 @@ impl Simulator {
                 changed
             }
             ExprKind::MemberAccess { expr, member } => {
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    let name = self.resolve_hier_name(hier);
+                    if let Some(fields) = self.module.packed_struct_fields.get(&name).cloned() {
+                        if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| m == &member.name).cloned() {
+                            if let Some(cur_sig) = self.get_signal_value_by_name(&name) {
+                                let total_w = cur_sig.width;
+                                let mut cur = cur_sig.resize(total_w);
+                                let piece = val.resize(w);
+                                for i in 0..w {
+                                    let bit = piece.get_bit(i as usize);
+                                    cur.set_bit((off + i) as usize, bit);
+                                }
+                                let prev = self.get_signal_value_by_name(&name);
+                                let changed = prev.as_ref() != Some(&cur);
+                                self.set_signal_value_by_name(&name, cur);
+                                return changed;
+                            }
+                        }
+                    }
+                }
                 let base = self.eval_expr(expr);
                 let handle = base.to_u64().unwrap_or(0) as usize;
                 if handle != 0 && handle < self.heap.len() {
@@ -4218,6 +4258,14 @@ impl Simulator {
                     let obj_name = &hier.path[0].name.name;
                     if hier.path.len() == 2 {
                         let mname = hier.path[1].name.name.as_str();
+                        eprintln!("DBG Ident path2 obj={} mname={} pkeys={:?}", obj_name, mname, self.module.packed_struct_fields.keys().collect::<Vec<_>>());
+                        if let Some(fields) = self.module.packed_struct_fields.get(obj_name).cloned() {
+                            if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| m == mname).cloned() {
+                                if let Some(sig) = self.get_signal_value_by_name(obj_name) {
+                                    return sig.range_select((off + w - 1) as usize, off as usize);
+                                }
+                            }
+                        }
                         if self.is_associative_array(obj_name) {
                             if mname == "size" || mname == "num" {
                                 let prefix = format!("{}[", obj_name);
@@ -4777,6 +4825,13 @@ impl Simulator {
                 }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
+                    if let Some(fields) = self.module.packed_struct_fields.get(&name).cloned() {
+                        if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| m == &member.name).cloned() {
+                            if let Some(sig) = self.get_signal_value_by_name(&name) {
+                                return sig.range_select((off + w - 1) as usize, off as usize);
+                            }
+                        }
+                    }
                     if self.is_associative_array(&name) {
                         let mname = member.name.as_str();
                         if mname == "size" || mname == "num" {
