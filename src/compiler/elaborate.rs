@@ -175,6 +175,7 @@ pub struct ElaboratedModule {
     pub queue_max_sizes: HashMap<String, u32>,
     /// 2D unpacked arrays: name -> ((dim1_lo,dim1_hi),(dim2_lo,dim2_hi),elem_width).
     pub arrays_2d: HashMap<String, ((i64, i64), (i64, i64), u32)>,
+    pub packages: HashSet<String>,
 }
 
 impl ElaboratedModule {
@@ -205,6 +206,7 @@ impl ElaboratedModule {
             descending_arrays: HashSet::new(),
             queue_max_sizes: HashMap::new(),
             arrays_2d: HashMap::new(),
+            packages: HashSet::new(),
         }
     }
 }
@@ -531,6 +533,24 @@ pub fn elaborate_module_with_defs(
                     elab.classes.insert(c.name.name.clone(), elaborate_class(c));
                 }
                 Definition::Covergroup(cg) => { elab.covergroups.insert(cg.name.name.clone(), (*cg).clone()); }
+                Definition::Package(p) => {
+                    elab.packages.insert(p.name.name.clone());
+                    // Hoist package functions/tasks for `pkg::f(...)` resolution.
+                    // Skip framework packages with very large APIs.
+                    if p.name.name != "uvm_pkg" {
+                        for item in &p.items {
+                            match item {
+                                crate::ast::decl::PackageItem::Function(f) => {
+                                    elab.functions.entry(f.name.name.name.clone()).or_insert_with(|| f.clone());
+                                }
+                                crate::ast::decl::PackageItem::Task(t) => {
+                                    elab.tasks.entry(t.name.name.name.clone()).or_insert_with(|| t.clone());
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1317,7 +1337,19 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                 for a in args { validate_expr_idents(a, elab, locals)?; }
             }
         }
-        ExprKind::MemberAccess { expr, .. } => validate_expr_idents(expr, elab, locals)?,
+        ExprKind::MemberAccess { expr, .. } => {
+            // Skip validation when LHS is a bare ident matching a known package name
+            // (e.g. `pkg::name`); those are scope refs, not value lookups.
+            if let ExprKind::Ident(hier) = &expr.kind {
+                if hier.path.len() == 1 && elab.packages.contains(&hier.path[0].name.name) {
+                    // skip
+                } else {
+                    validate_expr_idents(expr, elab, locals)?;
+                }
+            } else {
+                validate_expr_idents(expr, elab, locals)?;
+            }
+        }
         ExprKind::WithClause { expr, filter } => {
             validate_expr_idents(expr, elab, locals)?;
             let mut with_locals = locals.clone();
@@ -2089,6 +2121,7 @@ pub fn inline_instantiations(
             Definition::Class(c) => { elab.classes.insert(name.clone(), elaborate_class(c)); }
             Definition::Covergroup(cg) => { elab.covergroups.insert(name.clone(), (*cg).clone()); }
             Definition::Package(p) => {
+                elab.packages.insert(name.clone());
                 for item in &p.items {
                     match item {
                         crate::ast::decl::PackageItem::Class(c) => {
