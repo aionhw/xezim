@@ -198,6 +198,8 @@ pub struct ElaboratedModule {
     /// Class-typed signal parameter overrides captured from `Type #(args) name;`
     /// declarations. Signal name -> positional type_args expressions.
     pub class_type_args: HashMap<String, Vec<Expression>>,
+    /// N-dimensional unpacked array shapes (N >= 3): name → Vec of (lo, hi) per dim.
+    pub arrays_nd: HashMap<String, (Vec<(i64, i64)>, u32)>,
     /// Parameter init expressions that couldn't be evaluated at elaboration time
     /// (e.g. contain function calls). Simulator re-evaluates these during init.
     pub deferred_param_exprs: Vec<(String, Expression)>,
@@ -236,6 +238,7 @@ impl ElaboratedModule {
             sequences: HashSet::new(),
             packed_struct_fields: HashMap::new(),
             class_type_args: HashMap::new(),
+            arrays_nd: HashMap::new(),
             deferred_param_exprs: Vec::new(),
         }
     }
@@ -955,6 +958,50 @@ pub fn elaborate_module_with_defs(
                             continue;
                         }
                     }
+                    // Check for N-dimensional unpacked array (N >= 3)
+                    if decl.dimensions.len() >= 3
+                        && decl.dimensions.iter().all(|d| matches!(d, UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. }))
+                    {
+                        let mut shape: Vec<(i64, i64)> = Vec::new();
+                        for d in &decl.dimensions {
+                            match d {
+                                UnpackedDimension::Range { left, right, .. } => {
+                                    let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
+                                    let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
+                                    shape.push((l.min(r), l.max(r)));
+                                }
+                                UnpackedDimension::Expression { expr, .. } => {
+                                    let n = const_eval_i64_with_params(expr, Some(&elab.parameters)).unwrap_or(0);
+                                    shape.push((0, (n - 1).max(0)));
+                                }
+                                _ => {}
+                            }
+                        }
+                        elab.arrays_nd.insert(decl.name.name.clone(), (shape.clone(), width));
+                        let is_real = is_type_real(&dd.data_type);
+                        fn enumerate(dims: &[(i64, i64)], prefix: String, out: &mut Vec<String>) {
+                            if dims.is_empty() { out.push(prefix); return; }
+                            let (lo, hi) = dims[0];
+                            for i in lo..=hi {
+                                enumerate(&dims[1..], format!("{}[{}]", prefix, i), out);
+                            }
+                        }
+                        let mut names = Vec::new();
+                        enumerate(&shape, decl.name.name.clone(), &mut names);
+                        for elem_name in names {
+                            let sig = Signal { is_const: dd.const_kw,
+                                name: elem_name.clone(),
+                                width,
+                                is_signed,
+                                is_real,
+                                direction: None,
+                                value: default_value_for_type(&dd.data_type, width),
+                                type_name: get_type_name(&dd.data_type),
+                            };
+                            elab.signals.insert(elem_name, sig);
+                        }
+                        continue;
+                    }
                     // Check for unpacked array dimensions (e.g., memory [0:255])
                     let array_range = extract_array_range(&decl.dimensions, &elab.parameters);
                     if let Some((lo, hi)) = array_range {
@@ -1536,7 +1583,7 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                    !elab.functions.contains_key(name) && !elab.tasks.contains_key(name) &&
                    !elab.dpi_imports.contains_key(name) &&
                    !elab.arrays.contains_key(name) && !elab.associative_arrays.contains_key(name) &&
-                   !elab.arrays_2d.contains_key(name) &&
+                   !elab.arrays_2d.contains_key(name) && !elab.arrays_nd.contains_key(name) &&
                    !elab.classes.contains_key(name) && !elab.typedefs.contains_key(name) &&
                    !elab.clocking_blocks.contains_key(name) && !elab.lets.contains_key(name) &&
                    !elab.sequences.contains(name) &&

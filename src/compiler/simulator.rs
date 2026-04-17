@@ -4030,6 +4030,45 @@ impl Simulator {
                 changed
             }
             ExprKind::Index { expr, index } => {
+                // N-dimensional (N >= 3) unpacked array element assignment
+                {
+                    let mut cur = expr.as_ref();
+                    let mut rev_idxs: Vec<&Expression> = vec![index.as_ref()];
+                    while let ExprKind::Index { expr: inner_e, index: inner_i } = &cur.kind {
+                        rev_idxs.push(inner_i.as_ref());
+                        cur = inner_e.as_ref();
+                    }
+                    if let ExprKind::Ident(hier) = &cur.kind {
+                        let base_name = self.resolve_hier_name(hier);
+                        if let Some((shape, _w)) = self.module.arrays_nd.get(&base_name).cloned() {
+                            if rev_idxs.len() == shape.len() {
+                                let mut name = base_name.clone();
+                                for i in (0..rev_idxs.len()).rev() {
+                                    let v = self.eval_expr(rev_idxs[i]).to_u64().unwrap_or(0) as i64;
+                                    name = format!("{}[{}]", name, v);
+                                }
+                                if let Some(&id) = self.signal_name_to_id.get(&name) {
+                                    let width = self.signal_widths[id];
+                                    let resized = val.resize(width);
+                                    let changed = self.signal_table[id] != resized;
+                                    if changed {
+                                        if !self.dirty_signals[id] { self.dirty_signals[id] = true; self.dirty_list.push(id); }
+                                        self.dirty_any = true;
+                                        self.signal_table[id] = resized;
+                                        self.table_modified = true;
+                                    }
+                                    return changed;
+                                }
+                                let changed = self.signals.get(&name).map_or(true, |p| *p != *val);
+                                if changed {
+                                    self.signals.insert(name.clone(), val.clone());
+                                    self.mark_dirty(&name);
+                                }
+                                return changed;
+                            }
+                        }
+                    }
+                }
                 // 2D array element assignment: mem[i][j] = val
                 if let ExprKind::Index { expr: inner_expr, index: inner_idx } = &expr.kind {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
@@ -4500,6 +4539,34 @@ impl Simulator {
                 let mut r = Value::zero(0); for _ in 0..n { r = inner.concat_with(&r); } r
             }
             ExprKind::Index { expr, index } => {
+                // N-dimensional (N >= 3) unpacked array element access
+                {
+                    let mut cur = expr.as_ref();
+                    let mut rev_idxs: Vec<&Expression> = vec![index.as_ref()];
+                    while let ExprKind::Index { expr: inner_e, index: inner_i } = &cur.kind {
+                        rev_idxs.push(inner_i.as_ref());
+                        cur = inner_e.as_ref();
+                    }
+                    if let ExprKind::Ident(hier) = &cur.kind {
+                        let base_name = self.resolve_hier_name(hier);
+                        if let Some((shape, w)) = self.module.arrays_nd.get(&base_name).cloned() {
+                            if rev_idxs.len() == shape.len() {
+                                let mut name = base_name.clone();
+                                for i in (0..rev_idxs.len()).rev() {
+                                    let v = self.eval_expr(rev_idxs[i]).to_u64().unwrap_or(0) as i64;
+                                    name = format!("{}[{}]", name, v);
+                                }
+                                if let Some(&eid) = self.signal_name_to_id.get(&name) {
+                                    let mut v = self.signal_table[eid].clone();
+                                    if self.signal_signed[eid] { v.is_signed = true; }
+                                    return v;
+                                }
+                                if let Some(sv) = self.signals.get(&name) { return sv.clone(); }
+                                return Value::new(w);
+                            }
+                        }
+                    }
+                }
                 // 2D array element access: mem[i][j]
                 if let ExprKind::Index { expr: inner_expr, index: inner_idx } = &expr.kind {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
@@ -5001,6 +5068,66 @@ impl Simulator {
             StatementKind::Null => {}
             StatementKind::Expr(expr) => self.exec_expr_stmt(expr),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
+                // Slice assignment for N-dimensional unpacked arrays where LHS
+                // and RHS both supply fewer indices than dimensions:
+                //   B[i][j] = A[p][q];   // with A, B both 3D ⇒ copy inner dim
+                {
+                    fn unwrap_nd<'a>(e: &'a Expression) -> (&'a Expression, Vec<&'a Expression>) {
+                        let mut cur = e;
+                        let mut rev_idxs: Vec<&Expression> = Vec::new();
+                        while let ExprKind::Index { expr: inner_e, index: inner_i } = &cur.kind {
+                            rev_idxs.push(inner_i.as_ref());
+                            cur = inner_e.as_ref();
+                        }
+                        (cur, rev_idxs)
+                    }
+                    let (lbase, lrev) = unwrap_nd(lvalue);
+                    let (rbase, rrev) = unwrap_nd(rvalue);
+                    if let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lbase.kind, &rbase.kind) {
+                        let lname = self.resolve_hier_name(lh);
+                        let rname = self.resolve_hier_name(rh);
+                        let lshape = self.module.arrays_nd.get(&lname).cloned();
+                        let rshape = self.module.arrays_nd.get(&rname).cloned();
+                        if let (Some((ls, _)), Some((rs, _))) = (lshape, rshape) {
+                            if ls.len() == rs.len()
+                                && lrev.len() < ls.len()
+                                && lrev.len() == rrev.len()
+                            {
+                                let given = lrev.len();
+                                let mut l_prefix = lname.clone();
+                                let mut r_prefix = rname.clone();
+                                for i in (0..given).rev() {
+                                    let lv = self.eval_expr(lrev[i]).to_u64().unwrap_or(0) as i64;
+                                    let rv = self.eval_expr(rrev[i]).to_u64().unwrap_or(0) as i64;
+                                    l_prefix = format!("{}[{}]", l_prefix, lv);
+                                    r_prefix = format!("{}[{}]", r_prefix, rv);
+                                }
+                                let remaining: Vec<(i64, i64)> = ls[given..].iter().copied().collect();
+                                let rem_r: Vec<(i64, i64)> = rs[given..].iter().copied().collect();
+                                if remaining == rem_r {
+                                    fn enum_idx(dims: &[(i64, i64)], lp: String, rp: String,
+                                                out: &mut Vec<(String, String)>) {
+                                        if dims.is_empty() { out.push((lp, rp)); return; }
+                                        let (lo, hi) = dims[0];
+                                        for i in lo..=hi {
+                                            enum_idx(&dims[1..],
+                                                format!("{}[{}]", lp, i),
+                                                format!("{}[{}]", rp, i), out);
+                                        }
+                                    }
+                                    let mut pairs = Vec::new();
+                                    enum_idx(&remaining, l_prefix, r_prefix, &mut pairs);
+                                    for (lp, rp) in pairs {
+                                        let v = self.get_signal_value_by_name(&rp).unwrap_or(Value::zero(1));
+                                        self.set_signal_value_by_name(&lp, v);
+                                    }
+                                    if !self.in_edge_block { self.settle_combinatorial(); }
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
                 // Handle LHS streaming concat: {<<slice {a, b, c, ...}} = rhs;
                 // Handle RHS streaming concat to a dynamic array/queue target:
                 //   queue_of_packed = {<<slice {a, b, c, ...}};
