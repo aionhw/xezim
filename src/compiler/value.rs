@@ -1033,13 +1033,15 @@ impl Value {
         if self.has_unknown() {
             return "x".to_string();
         }
-        if self.is_signed {
-            if let Some(v) = self.to_i64() {
+        if self.width <= 64 {
+            if self.is_signed {
+                if let Some(v) = self.to_i64() {
+                    return format!("{}", v);
+                }
+            }
+            if let Some(v) = self.to_u64() {
                 return format!("{}", v);
             }
-        }
-        if let Some(v) = self.to_u64() {
-            return format!("{}", v);
         }
         // Wide value: compute from bits
         let mut result = 0u128;
@@ -1154,10 +1156,26 @@ impl Value {
         } else {
             // Pure numeric
             if let Ok(v) = u64::from_str_radix(&s, radix) {
-                Self::from_u64(v, width)
-            } else {
-                Self::zero(width)
+                return Self::from_u64(v, width);
             }
+            // Wide value: parse digit-by-digit for radices that are powers of 2.
+            let bits_per_digit = match radix { 2 => 1, 8 => 3, 16 => 4, _ => 0 };
+            if bits_per_digit == 0 {
+                // Decimal wide number not supported here; fall back to zero.
+                return Self::zero(width);
+            }
+            let mut val = Self::zero(width);
+            for (i, ch) in s.chars().rev().enumerate() {
+                let bit_pos = i * bits_per_digit;
+                if let Some(digit) = ch.to_digit(radix) {
+                    for b in 0..bits_per_digit {
+                        if bit_pos + b < width as usize {
+                            val.set_bit(bit_pos + b, if (digit >> b) & 1 == 1 { LogicBit::One } else { LogicBit::Zero });
+                        }
+                    }
+                }
+            }
+            val
         }
     }
 

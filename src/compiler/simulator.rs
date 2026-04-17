@@ -4422,7 +4422,7 @@ impl Simulator {
                 let mut concat = Value::zero(0);
                 for p in exprs.iter().rev() { concat = self.eval_expr(p).concat_with(&concat); }
                 let total_w = concat.width as usize;
-                if !*left_to_right {
+                let streamed = if !*left_to_right {
                     concat
                 } else {
                     let slice = slice_size.as_ref().map(|e| self.eval_expr(e).to_u64().unwrap_or(1) as usize).unwrap_or(1).max(1);
@@ -4453,6 +4453,19 @@ impl Simulator {
                         }
                     }
                     out
+                };
+                // When RHS stream is assigned/evaluated in a wider context,
+                // pad on the LSB side (stream sits at the MSB of the target).
+                if ctx_width > streamed.width {
+                    let target_w = ctx_width as usize;
+                    let mut padded = Value::zero(ctx_width);
+                    let shift = target_w - streamed.width as usize;
+                    for b in 0..streamed.width as usize {
+                        padded.set_bit(b + shift, streamed.get_bit(b));
+                    }
+                    padded
+                } else {
+                    streamed
                 }
             }
             ExprKind::Replication { count, exprs } => {
@@ -5484,7 +5497,7 @@ impl Simulator {
                                     }
                                 }
                             }
-                            produced.unwrap_or_else(|| self.eval_expr(init_expr).resize(w))
+                            produced.unwrap_or_else(|| self.eval_expr_ctx(init_expr, w).resize(w))
                         } else {
                             default_v.clone()
                         };
