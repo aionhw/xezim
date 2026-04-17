@@ -1536,6 +1536,15 @@ impl Simulator {
     }
 
     pub fn run(&mut self) {
+        // Evaluate parameter expressions whose initializers contained function
+        // calls and were deferred by the elaborator.
+        let deferred: Vec<(String, Expression)> = self.module.deferred_param_exprs.clone();
+        for (pname, expr) in deferred {
+            let v = self.eval_expr(&expr);
+            let w = self.widths.get(&pname).copied().unwrap_or(v.width);
+            let rv = v.resize(w);
+            self.set_signal_value_by_name(&pname, rv);
+        }
         self.classify_always_blocks();
         self.compile_edge_blocks();
         self.build_comb_entries();
@@ -4420,7 +4429,24 @@ impl Simulator {
             ExprKind::StreamOp { left_to_right, slice_size, exprs } => {
                 // Concat in source order: MSB = first expr. Build by concatenating from LSB (last expr).
                 let mut concat = Value::zero(0);
-                for p in exprs.iter().rev() { concat = self.eval_expr(p).concat_with(&concat); }
+                for p in exprs.iter().rev() {
+                    // Special case: dynamic array/queue ident → concat all elements, idx0 at MSB.
+                    let piece = if let ExprKind::Ident(h) = &p.kind {
+                        let n = self.resolve_hier_name(h);
+                        if self.module.arrays.contains_key(&n) {
+                            let ew = self.widths.get(&format!("{}[0]", n)).copied()
+                                .unwrap_or_else(|| self.module.arrays.get(&n).map(|t| t.2).unwrap_or(8)).max(1);
+                            let sz = self.get_queue_size(&n) as usize;
+                            let mut acc = Value::zero(0);
+                            for i in 0..sz {
+                                let ev = self.get_signal_value_by_name(&format!("{}[{}]", n, i)).unwrap_or(Value::zero(ew));
+                                acc = acc.concat_with(&ev);
+                            }
+                            acc
+                        } else { self.eval_expr(p) }
+                    } else { self.eval_expr(p) };
+                    concat = piece.concat_with(&concat);
+                }
                 let total_w = concat.width as usize;
                 let streamed = if !*left_to_right {
                     concat
@@ -4975,6 +5001,142 @@ impl Simulator {
             StatementKind::Null => {}
             StatementKind::Expr(expr) => self.exec_expr_stmt(expr),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
+                // Handle LHS streaming concat: {<<slice {a, b, c, ...}} = rhs;
+                // Handle RHS streaming concat to a dynamic array/queue target:
+                //   queue_of_packed = {<<slice {a, b, c, ...}};
+                // Distribute the streamed bits element-by-element (MSB first).
+                if let ExprKind::StreamOp { .. } = &rvalue.kind {
+                    if let ExprKind::Ident(lh) = &lvalue.kind {
+                        let lname = self.resolve_hier_name(lh);
+                        if self.module.arrays.contains_key(&lname) {
+                            let elem_w = self.widths.get(&format!("{}[0]", lname)).copied()
+                                .unwrap_or_else(|| self.module.arrays.get(&lname).map(|t| t.2).unwrap_or(8)).max(1);
+                            // Evaluate stream raw (no pad) by using ctx 0.
+                            let sv = self.eval_expr_ctx(rvalue, 0);
+                            let total = sv.width as usize;
+                            let n_elems = (total + elem_w as usize - 1) / elem_w as usize;
+                            self.set_queue_size(&lname, n_elems as u64);
+                            for k in 0..n_elems {
+                                let hi = total.saturating_sub(k * elem_w as usize).saturating_sub(1);
+                                let lo_raw = total.saturating_sub((k + 1) * elem_w as usize);
+                                let lo = lo_raw;
+                                let piece = if hi >= lo { sv.range_select(hi, lo) } else { Value::zero(elem_w) };
+                                self.signals.insert(format!("{}[{}]", lname, k), piece.clone());
+                                self.widths.insert(format!("{}[{}]", lname, k), elem_w);
+                            }
+                            if !self.in_edge_block { self.settle_combinatorial(); }
+                            return;
+                        }
+                    }
+                }
+                if let ExprKind::StreamOp { left_to_right, slice_size, exprs } = &lvalue.kind {
+                    // Gather RHS bits: if it's a dynamic array/queue of a packed
+                    // element type, concatenate elements with index 0 at the MSB.
+                    let rhs_val = if let ExprKind::Ident(rhier) = &rvalue.kind {
+                        let rname = self.resolve_hier_name(rhier);
+                        if self.module.arrays.contains_key(&rname) || self.module.dynamic_arrays.contains(&rname) {
+                            let n = self.get_queue_size(&rname) as usize;
+                            let elem_w = self.widths.get(&format!("{}[0]", rname)).copied()
+                                .unwrap_or_else(|| self.module.arrays.get(&rname).map(|t| t.2).unwrap_or(8));
+                            let total_w = (n as u32) * elem_w;
+                            let mut packed = Value::zero(total_w);
+                            for i in 0..n {
+                                let ev = self.get_signal_value_by_name(&format!("{}[{}]", rname, i))
+                                    .unwrap_or(Value::zero(elem_w));
+                                // pack at position [total_w-1-i*elem_w .. total_w-(i+1)*elem_w]
+                                let dst_base = total_w as usize - (i + 1) * elem_w as usize;
+                                for b in 0..elem_w as usize {
+                                    packed.set_bit(dst_base + b, ev.get_bit(b));
+                                }
+                            }
+                            packed
+                        } else {
+                            self.eval_expr(rvalue)
+                        }
+                    } else {
+                        self.eval_expr(rvalue)
+                    };
+                    // Apply inverse stream op on rhs_val: the stream op is its own inverse
+                    // per slice, so we re-apply it to obtain the "ordered" bits.
+                    let total_w = rhs_val.width as usize;
+                    let ordered = if !*left_to_right {
+                        rhs_val
+                    } else {
+                        let slice = slice_size.as_ref().map(|e| self.eval_expr(e).to_u64().unwrap_or(1) as usize).unwrap_or(1).max(1);
+                        let mut out = Value::zero(total_w as u32);
+                        let full_chunks = total_w / slice;
+                        let remainder = total_w - full_chunks * slice;
+                        for k in 0..full_chunks {
+                            for b in 0..slice {
+                                let src_bit = k * slice + b;
+                                let dst_bit = (full_chunks - 1 - k) * slice + b + remainder;
+                                if src_bit < total_w && dst_bit < total_w {
+                                    out.set_bit(dst_bit, rhs_val.get_bit(src_bit));
+                                }
+                            }
+                        }
+                        for b in 0..remainder {
+                            let src_bit = full_chunks * slice + b;
+                            let dst_bit = b;
+                            if src_bit < total_w {
+                                out.set_bit(dst_bit, rhs_val.get_bit(src_bit));
+                            }
+                        }
+                        out
+                    };
+                    // Distribute `ordered` MSB-first to each target in source order.
+                    let total = ordered.width as usize;
+                    // Compute fixed-width targets; last target may be dynamic (remainder).
+                    let mut fixed_ws: Vec<u32> = Vec::new();
+                    let mut dyn_last: Option<String> = None;
+                    let mut dyn_last_elem_w: u32 = 8;
+                    for (i, e) in exprs.iter().enumerate() {
+                        let is_last = i == exprs.len() - 1;
+                        if is_last {
+                            if let ExprKind::Ident(h) = &e.kind {
+                                let n = self.resolve_hier_name(h);
+                                if self.module.dynamic_arrays.contains(&n) || self.module.arrays.contains_key(&n) {
+                                    let ew = self.widths.get(&format!("{}[0]", n)).copied()
+                                        .unwrap_or_else(|| self.module.arrays.get(&n).map(|t| t.2).unwrap_or(8));
+                                    dyn_last = Some(n);
+                                    dyn_last_elem_w = ew;
+                                    continue;
+                                }
+                            }
+                        }
+                        fixed_ws.push(self.infer_lhs_width(e));
+                    }
+                    let fixed_total: u32 = fixed_ws.iter().sum();
+                    let mut msb = total; // bit position just above the MSB
+                    for (i, e) in exprs.iter().enumerate() {
+                        let is_last = i == exprs.len() - 1;
+                        if is_last && dyn_last.is_some() {
+                            let remaining = (total as u32).saturating_sub(fixed_total);
+                            let elem_w = dyn_last_elem_w.max(1);
+                            let n_elems = (remaining / elem_w) as usize;
+                            let dname = dyn_last.clone().unwrap();
+                            self.set_queue_size(&dname, n_elems as u64);
+                            for k in 0..n_elems {
+                                let hi = msb.saturating_sub(k * elem_w as usize).saturating_sub(1);
+                                let lo = msb.saturating_sub((k + 1) * elem_w as usize);
+                                if hi >= lo {
+                                    let slice_v = ordered.range_select(hi, lo);
+                                    self.set_signal_value_by_name(&format!("{}[{}]", dname, k), slice_v);
+                                }
+                            }
+                        } else {
+                            let w = self.infer_lhs_width(e) as usize;
+                            if w == 0 { continue; }
+                            let hi = msb.saturating_sub(1);
+                            let lo = msb.saturating_sub(w);
+                            let slice_v = if hi >= lo { ordered.range_select(hi, lo) } else { Value::zero(w as u32) };
+                            self.assign_value(e, &slice_v);
+                            msb = lo;
+                        }
+                    }
+                    if !self.in_edge_block { self.settle_combinatorial(); }
+                    return;
+                }
                 // Handle array locator methods with `with` clause: qs = arr.find with (filter)
                 if let ExprKind::WithClause { expr: wexpr, filter } = &rvalue.kind {
                     if let ExprKind::MemberAccess { expr: arr_expr, member } = &wexpr.kind {
@@ -5077,6 +5239,25 @@ impl Simulator {
                     }
                 }
                 let w = self.infer_lhs_width(lvalue);
+                // Handle bare `x = new;` (no parens) as class instantiation
+                let bare_new = if let ExprKind::Ident(hier) = &rvalue.kind {
+                    hier.path.len() == 1 && hier.path[0].name.name == "new"
+                } else { false };
+                if bare_new {
+                    let type_name = self.get_expr_type_name(lvalue);
+                    if let Some(tname) = type_name {
+                        if let Some(class_def) = self.module.classes.get(&tname).cloned() {
+                            let lname_opt = if let ExprKind::Ident(lh) = &lvalue.kind {
+                                Some(self.resolve_hier_name(lh))
+                            } else { None };
+                            let ta_cloned = lname_opt.as_ref().and_then(|n| self.module.class_type_args.get(n).cloned());
+                            let handle = self.instantiate_class_with_type_args(&class_def, &[], ta_cloned.as_deref());
+                            self.assign_value(lvalue, &handle.resize(w));
+                            if !self.in_edge_block { self.settle_combinatorial(); }
+                            return;
+                        }
+                    }
+                }
                 let val = if let ExprKind::Call { func, args } = &rvalue.kind {
                     if let ExprKind::Ident(hier) = &func.kind {
                         let method_name = hier.path.last().unwrap().name.name.as_str();
@@ -5095,7 +5276,11 @@ impl Simulator {
                                     self.mailboxes.insert(handle, std::collections::VecDeque::new());
                                     Value::from_u64(handle as u64, 32)
                                 } else if let Some(class_def) = self.module.classes.get(&tname).cloned() {
-                                    self.instantiate_class(&class_def, args)
+                                    let lname_opt = if let ExprKind::Ident(lh) = &lvalue.kind {
+                                        Some(self.resolve_hier_name(lh))
+                                    } else { None };
+                                    let ta_cloned = lname_opt.as_ref().and_then(|n| self.module.class_type_args.get(n).cloned());
+                                    self.instantiate_class_with_type_args(&class_def, args, ta_cloned.as_deref())
                                 } else if let Some(cg_def) = self.module.covergroups.get(&tname).cloned() {
                                     self.instantiate_covergroup(&cg_def, args)
                                 } else {
@@ -5450,6 +5635,15 @@ impl Simulator {
                                 let n = super::elaborate::const_eval_i64_with_params(expr, None).unwrap_or(0);
                                 if n > 0 { range = Some((0, n - 1)); }
                             }
+                            UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. } => {
+                                // Register as dynamic array / queue (initially empty).
+                                let name = d.name.name.clone();
+                                self.module.arrays.insert(name.clone(), (0, -1, w));
+                                self.module.dynamic_arrays.insert(name.clone());
+                                self.widths.insert(name.clone(), w);
+                                self.set_queue_size(&name, 0);
+                                continue;
+                            }
                             _ => {}
                         }
                     }
@@ -5563,7 +5757,11 @@ impl Simulator {
                             let type_name = self.get_expr_type_name(left);
                             if let Some(tname) = type_name {
                                 if let Some(class_def) = self.module.classes.get(&tname).cloned() {
-                                    self.instantiate_class(&class_def, args)
+                                    let lname_opt = if let ExprKind::Ident(lh) = &left.kind {
+                                        Some(self.resolve_hier_name(lh))
+                                    } else { None };
+                                    let ta_cloned = lname_opt.as_ref().and_then(|n| self.module.class_type_args.get(n).cloned());
+                                    self.instantiate_class_with_type_args(&class_def, args, ta_cloned.as_deref())
                                 } else if let Some(cg_def) = self.module.covergroups.get(&tname).cloned() {
                                     self.instantiate_covergroup(&cg_def, args)
                                 } else { self.eval_expr(right) }
@@ -7524,6 +7722,15 @@ impl Simulator {
     }
 
     fn instantiate_class(&mut self, class_def: &crate::compiler::elaborate::ElaboratedClass, args: &[Expression]) -> Value {
+        self.instantiate_class_with_type_args(class_def, args, None)
+    }
+
+    fn instantiate_class_with_type_args(
+        &mut self,
+        class_def: &crate::compiler::elaborate::ElaboratedClass,
+        args: &[Expression],
+        type_args: Option<&[Expression]>,
+    ) -> Value {
         let handle = self.heap.len();
         let mut instance = ClassInstance {
 
@@ -7541,6 +7748,20 @@ impl Simulator {
         for cdef in classes_to_init.iter().rev() {
             for (prop_name, prop_sig) in &cdef.properties {
                 instance.properties.insert(prop_name.clone(), prop_sig.value.clone());
+            }
+            // Bind class parameters: each param gets its default value, then
+            // any positional type_args (on the leaf class only) override.
+            let is_leaf = cdef.name == class_def.name;
+            for (i, (pname, pdefault)) in cdef.param_defaults.iter().enumerate() {
+                let expr_opt: Option<Expression> = if is_leaf {
+                    type_args.and_then(|ta| ta.get(i).cloned()).or_else(|| pdefault.clone())
+                } else {
+                    pdefault.clone()
+                };
+                if let Some(e) = expr_opt {
+                    let v = self.eval_expr(&e);
+                    instance.properties.insert(pname.clone(), v);
+                }
             }
         }
         self.heap.push(Some(instance));
