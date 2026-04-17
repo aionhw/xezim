@@ -176,6 +176,8 @@ pub struct ElaboratedModule {
     /// 2D unpacked arrays: name -> ((dim1_lo,dim1_hi),(dim2_lo,dim2_hi),elem_width).
     pub arrays_2d: HashMap<String, ((i64, i64), (i64, i64), u32)>,
     pub packages: HashSet<String>,
+    /// Names of declared sequences and properties (so `@name` event control resolves).
+    pub sequences: HashSet<String>,
 }
 
 impl ElaboratedModule {
@@ -207,6 +209,7 @@ impl ElaboratedModule {
             queue_max_sizes: HashMap::new(),
             arrays_2d: HashMap::new(),
             packages: HashSet::new(),
+            sequences: HashSet::new(),
         }
     }
 }
@@ -1184,6 +1187,12 @@ pub fn elaborate_module_with_defs(
             ModuleItem::LetDeclaration(ld) => {
                 elab.lets.insert(ld.name.name.clone(), ld.clone());
             }
+            ModuleItem::SequenceDeclaration(sd) => {
+                elab.sequences.insert(sd.name.name.clone());
+            }
+            ModuleItem::PropertyDeclaration(pd) => {
+                elab.sequences.insert(pd.name.name.clone());
+            }
             ModuleItem::SpecifyBlock(sb) => {
                 for p in &sb.paths {
                     let d = eval_const_expr(&p.delay, &elab.parameters);
@@ -1371,6 +1380,7 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                    !elab.arrays_2d.contains_key(name) &&
                    !elab.classes.contains_key(name) && !elab.typedefs.contains_key(name) &&
                    !elab.clocking_blocks.contains_key(name) && !elab.lets.contains_key(name) &&
+                   !elab.sequences.contains(name) &&
                    !locals.contains(name) {
                    return Err(format!("Undeclared identifier '{}'", name));
                 }            }
@@ -1402,9 +1412,17 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
             for a in args { validate_expr_idents(a, elab, locals)?; }
         }
         ExprKind::SystemCall { name, args } => {
-            // $dumpvars/$dumpfile args can be scope references (module/instance names),
-            // not regular signals — skip validation for these system calls.
-            let skip = matches!(name.as_str(), "$dumpvars" | "$dumpfile");
+            // Args can be scope/module/instance references (not value lookups)
+            // for dump/coverage/scope-info system tasks.
+            let skip = matches!(
+                name.as_str(),
+                "$dumpvars" | "$dumpfile" | "$dumpports" | "$dumpportsoff"
+                    | "$dumpportson" | "$dumpportsflush" | "$dumpportsall"
+                    | "$dumpportslimit" | "$printtimescale" | "$timeformat"
+                    | "$coverage_control" | "$coverage_get" | "$coverage_get_max"
+                    | "$coverage_merge" | "$coverage_save" | "$get_coverage"
+                    | "$set_coverage_db_name" | "$load_coverage_db"
+            );
             if !skip {
                 for a in args { validate_expr_idents(a, elab, locals)?; }
             }
@@ -1437,7 +1455,9 @@ fn validate_event_idents(ev: &EventControl, elab: &ElaboratedModule, locals: &Ha
     match ev {
         EventControl::EventExpr(exprs) => { for ee in exprs { validate_expr_idents(&ee.expr, elab, locals)?; } }
         EventControl::Identifier(id) => {
-            if !elab.signals.contains_key(&id.name) && !elab.parameters.contains_key(&id.name) && !locals.contains(&id.name) {
+            if !elab.signals.contains_key(&id.name) && !elab.parameters.contains_key(&id.name)
+                && !elab.sequences.contains(&id.name) && !locals.contains(&id.name)
+            {
                 return Err(format!("Undeclared identifier '{}'", id.name));
             }
         }
@@ -1714,6 +1734,12 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
             }
             ModuleItem::LetDeclaration(ld) => {
                 elab.lets.insert(ld.name.name.clone(), ld.clone());
+            }
+            ModuleItem::SequenceDeclaration(sd) => {
+                elab.sequences.insert(sd.name.name.clone());
+            }
+            ModuleItem::PropertyDeclaration(pd) => {
+                elab.sequences.insert(pd.name.name.clone());
             }
             ModuleItem::SpecifyBlock(sb) => {
                 for p in &sb.paths {
