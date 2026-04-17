@@ -56,6 +56,9 @@ pub struct ElaboratedClass {
     pub random_properties: HashSet<String>,
     /// Constraints: name -> constraint declaration.
     pub constraints: HashMap<String, ClassConstraint>,
+    /// Class parameters with default values, in declaration order.
+    /// `(name, default_value_expr)`.
+    pub param_defaults: Vec<(String, Option<crate::ast::expr::Expression>)>,
 }
 
 /// DPI import metadata used by the simulator for foreign-call dispatch.
@@ -119,6 +122,15 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
             _ => {}
         }
     }
+    // Collect class parameters (name + optional default expression).
+    let mut param_defaults: Vec<(String, Option<crate::ast::expr::Expression>)> = Vec::new();
+    for p in &c.params {
+        if let crate::ast::decl::ParameterKind::Data { assignments, .. } = &p.kind {
+            for a in assignments {
+                param_defaults.push((a.name.name.clone(), a.init.clone()));
+            }
+        }
+    }
     ElaboratedClass {
         name: c.name.name.clone(),
         extends: c.extends.as_ref().map(|e| e.name.name.clone()),
@@ -126,6 +138,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         methods,
         random_properties,
         constraints,
+        param_defaults,
     }
 }
 
@@ -182,6 +195,12 @@ pub struct ElaboratedModule {
     /// Packed struct bit-field layout: container_name -> Vec<(member_name, lsb_offset, width)>.
     /// Members are stored by bit offset so MemberAccess can slice the container.
     pub packed_struct_fields: HashMap<String, Vec<(String, u32, u32)>>,
+    /// Class-typed signal parameter overrides captured from `Type #(args) name;`
+    /// declarations. Signal name -> positional type_args expressions.
+    pub class_type_args: HashMap<String, Vec<Expression>>,
+    /// Parameter init expressions that couldn't be evaluated at elaboration time
+    /// (e.g. contain function calls). Simulator re-evaluates these during init.
+    pub deferred_param_exprs: Vec<(String, Expression)>,
 }
 
 impl ElaboratedModule {
@@ -216,7 +235,22 @@ impl ElaboratedModule {
             packages: HashSet::new(),
             sequences: HashSet::new(),
             packed_struct_fields: HashMap::new(),
+            class_type_args: HashMap::new(),
+            deferred_param_exprs: Vec::new(),
         }
+    }
+}
+
+fn expr_has_call(expr: &Expression) -> bool {
+    use crate::ast::expr::ExprKind;
+    match &expr.kind {
+        ExprKind::Call { .. } => true,
+        ExprKind::Binary { left, right, .. } => expr_has_call(left) || expr_has_call(right),
+        ExprKind::Unary { operand, .. } => expr_has_call(operand),
+        ExprKind::Paren(e) => expr_has_call(e),
+        ExprKind::Conditional { condition, then_expr, else_expr } =>
+            expr_has_call(condition) || expr_has_call(then_expr) || expr_has_call(else_expr),
+        _ => false,
     }
 }
 
@@ -855,6 +889,13 @@ pub fn elaborate_module_with_defs(
                     }
                     _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                 };
+                if let DataType::TypeReference { type_args, .. } = &dd.data_type {
+                    if !type_args.is_empty() {
+                        for decl in &dd.declarators {
+                            elab.class_type_args.insert(decl.name.name.clone(), type_args.clone());
+                        }
+                    }
+                }
                 let is_signed = is_type_signed(&dd.data_type);
                 for decl in &dd.declarators {
                     if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
@@ -1154,9 +1195,16 @@ pub fn elaborate_module_with_defs(
                         let mut val = if elab.parameters.contains_key(&assign.name.name) {
                             elab.parameters.get(&assign.name.name).cloned().unwrap_or(Value::zero(current_width))
                         } else if let Some(init) = &assign.init {
-                            let mut v = eval_const_expr_val(init, &elab.parameters).resize(current_width);
-                            if current_signed { v.is_signed = true; }
-                            v
+                            if expr_has_call(init) {
+                                elab.deferred_param_exprs.push((assign.name.name.clone(), init.clone()));
+                                let mut v = Value::zero(current_width);
+                                if current_signed { v.is_signed = true; }
+                                v
+                            } else {
+                                let mut v = eval_const_expr_val(init, &elab.parameters).resize(current_width);
+                                if current_signed { v.is_signed = true; }
+                                v
+                            }
                         } else {
                             let mut v = Value::zero(current_width);
                             if current_signed { v.is_signed = true; }
@@ -1691,6 +1739,13 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     }
                     _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                 };
+                if let DataType::TypeReference { type_args, .. } = &dd.data_type {
+                    if !type_args.is_empty() {
+                        for decl in &dd.declarators {
+                            elab.class_type_args.insert(decl.name.name.clone(), type_args.clone());
+                        }
+                    }
+                }
                 let is_signed = is_type_signed(&dd.data_type);
                 let is_real = is_type_real(&dd.data_type);
                 for decl in &dd.declarators {
