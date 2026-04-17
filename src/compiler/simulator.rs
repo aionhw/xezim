@@ -4422,13 +4422,25 @@ impl Simulator {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
                     if let Some(&(arr_lo, arr_hi, elem_w)) = self.module.arrays.get(&name) {
-                        let l = self.eval_expr(left).to_u64().unwrap_or(0) as i64;
-                        let r = self.eval_expr(right).to_u64().unwrap_or(0) as i64;
+                        let is_dyn = self.module.dynamic_arrays.contains(&name);
+                        let upper_bound: i64 = if is_dyn {
+                            (self.get_queue_size(&name) as i64) - 1
+                        } else {
+                            arr_hi
+                        };
+                        let l = if matches!(left.kind, ExprKind::Dollar) { upper_bound }
+                                else { self.eval_expr(left).to_u64().unwrap_or(0) as i64 };
+                        let r = if matches!(right.kind, ExprKind::Dollar) { upper_bound }
+                                else { self.eval_expr(right).to_u64().unwrap_or(0) as i64 };
                         let (lo, hi) = match kind {
                             RangeKind::Constant => (l.min(r), l.max(r)),
                             RangeKind::IndexedUp => (l, l + r - 1),
                             RangeKind::IndexedDown => (l - r + 1, l),
                         };
+                        if hi < lo { return Value::zero(0); }
+                        let lo = lo.max(arr_lo);
+                        let hi = hi.min(if is_dyn { upper_bound } else { arr_hi });
+                        if hi < lo { return Value::zero(0); }
                         let count = (hi - lo + 1) as usize;
                         let total_w = count as u32 * elem_w;
                         let mut acc = Value::zero(total_w);
