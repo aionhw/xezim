@@ -1895,7 +1895,7 @@ impl Simulator {
                 }
                 Insn::Jump(target) => { pc = *target as usize; continue; }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
-                    let val = vm_regs[*val_reg as usize].resize(*width);
+                    let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
                     nba_out.push(NbaFast { signal_id: *sig_id, value: val });
                 }
                 Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
@@ -2061,7 +2061,7 @@ impl Simulator {
                     continue;
                 }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
-                    let val = self.vm_regs[*val_reg as usize].resize(*width);
+                    let val = self.vm_regs[*val_reg as usize].resize_for_assign(*width);
                     self.nba_fast.push(NbaFast { signal_id: *sig_id, value: val });
                 }
                 Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
@@ -5707,13 +5707,12 @@ impl Simulator {
                 if d == 0 {
                     let id_opt = self.resolve_nba_target(lvalue);
                     if let Some(id) = id_opt {
-                        self.nba_fast.push(NbaFast { signal_id: id, value: val.resize(w) });
+                        self.nba_fast.push(NbaFast { signal_id: id, value: val.resize_for_assign(w) });
                     } else {
-                        self.nba_queue.push(NbaEntry { lhs: Some(lvalue.clone()), value: val.resize(w), resolved_id: None });
+                        self.nba_queue.push(NbaEntry { lhs: Some(lvalue.clone()), value: val.resize_for_assign(w), resolved_id: None });
                     }
                 } else {
-                    // Schedule delayed NBA - simplified
-                    self.nba_queue.push(NbaEntry { lhs: Some(lvalue.clone()), value: val.resize(w), resolved_id: None });
+                    self.nba_queue.push(NbaEntry { lhs: Some(lvalue.clone()), value: val.resize_for_assign(w), resolved_id: None });
                 }
             }
             StatementKind::If { condition, then_stmt, else_stmt, .. } => {

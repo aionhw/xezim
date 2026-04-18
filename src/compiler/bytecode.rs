@@ -300,9 +300,9 @@ impl<'a> BytecodeCompiler<'a> {
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
                 if let Some(val_reg) = self.compile_expr(rvalue, width) {
-                    if width > 0 {
-                        self.emit(Insn::Resize(val_reg, width));
-                    }
+                    // Note: NbaAssign itself performs §10.7 assignment-padding resize,
+                    // so we don't emit a generic (zero-extending) Resize here — that
+                    // would strip X/Z from the MSB before the assignment could X/Z-extend.
                     if self.compile_nba_target(lvalue, val_reg, width) {
                         return true;
                     }

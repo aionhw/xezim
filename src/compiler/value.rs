@@ -364,6 +364,46 @@ impl Value {
         r
     }
 
+    /// IEEE 1800-2017 §10.7 assignment-padding resize. When widening, if the MSB
+    /// of the source is X or Z the extension bits are X or Z respectively;
+    /// otherwise behaves like `resize` (zero- or sign-extension). Used when padding
+    /// a nonblocking/blocking assignment RHS to the LHS width.
+    pub fn resize_for_assign(&self, target: u32) -> Value {
+        if target == self.width || self.width == 0 || self.is_real {
+            return self.resize(target);
+        }
+        if target < self.width {
+            return self.resize(target);
+        }
+        let msb = self.get_bit(self.width.saturating_sub(1) as usize);
+        if msb != LogicBit::X && msb != LogicBit::Z {
+            return self.resize(target);
+        }
+        // X/Z extend
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } if target <= 64 => {
+                let mask = Self::mask(target);
+                let ext_mask = mask & !Self::mask(self.width);
+                let (new_val, new_xz) = if msb == LogicBit::Z {
+                    (*val_bits | ext_mask, *xz_bits | ext_mask)
+                } else {
+                    (*val_bits, *xz_bits | ext_mask)
+                };
+                Value {
+                    storage: ValueStorage::Inline { val_bits: new_val, xz_bits: new_xz },
+                    width: target, is_signed: self.is_signed, is_real: false,
+                }
+            }
+            _ => {
+                let mut result = self.resize(target);
+                for i in self.width as usize..target as usize {
+                    result.set_bit(i, msb);
+                }
+                result
+            }
+        }
+    }
+
     pub fn add(&self, other: &Value) -> Value {
         if self.is_real || other.is_real {
             return Value::from_f64(self.to_f64() + other.to_f64());
