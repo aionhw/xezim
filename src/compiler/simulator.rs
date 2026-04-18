@@ -1883,6 +1883,16 @@ impl Simulator {
                 Insn::BranchIfFalse(reg, target) => {
                     if !vm_regs[*reg as usize].is_true() { pc = *target as usize; continue; }
                 }
+                Insn::Select(dest, cond, then_r, else_r) => {
+                    let v = if vm_regs[*cond as usize].has_unknown() {
+                        vm_regs[*then_r as usize].merge_unknown(&vm_regs[*else_r as usize])
+                    } else if vm_regs[*cond as usize].is_true() {
+                        vm_regs[*then_r as usize].clone()
+                    } else {
+                        vm_regs[*else_r as usize].clone()
+                    };
+                    vm_regs[*dest as usize] = v;
+                }
                 Insn::Jump(target) => { pc = *target as usize; continue; }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let val = vm_regs[*val_reg as usize].resize(*width);
@@ -2033,6 +2043,18 @@ impl Simulator {
                         pc = *target as usize;
                         continue;
                     }
+                }
+                Insn::Select(dest, cond, then_r, else_r) => {
+                    let v = if self.vm_regs[*cond as usize].has_unknown() {
+                        let t = self.vm_regs[*then_r as usize].clone();
+                        let e = self.vm_regs[*else_r as usize].clone();
+                        t.merge_unknown(&e)
+                    } else if self.vm_regs[*cond as usize].is_true() {
+                        self.vm_regs[*then_r as usize].clone()
+                    } else {
+                        self.vm_regs[*else_r as usize].clone()
+                    };
+                    self.vm_regs[*dest as usize] = v;
                 }
                 Insn::Jump(target) => {
                     pc = *target as usize;
@@ -4500,7 +4522,13 @@ impl Simulator {
             }
             ExprKind::Conditional { condition, then_expr, else_expr } => {
                 let c = self.eval_expr(condition);
-                if c.has_unknown() { let t = self.eval_expr_ctx(then_expr, ctx_width); let e = self.eval_expr_ctx(else_expr, ctx_width); if t == e { t } else { Value::new(t.width.max(e.width)) } }
+                if c.has_unknown() {
+                    // IEEE 1800 §11.4.11 Table 11-21: per-bit merge — bit is known
+                    // only where both branches agree; otherwise X.
+                    let t = self.eval_expr_ctx(then_expr, ctx_width);
+                    let e = self.eval_expr_ctx(else_expr, ctx_width);
+                    t.merge_unknown(&e)
+                }
                 else if c.is_true() { self.eval_expr_ctx(then_expr, ctx_width) } else { self.eval_expr_ctx(else_expr, ctx_width) }
             }
             ExprKind::Concatenation(parts) => { let mut r = Value::zero(0); for p in parts.iter().rev() { r = self.eval_expr(p).concat_with(&r); } r }

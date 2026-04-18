@@ -558,6 +558,47 @@ impl Value {
         result
     }
 
+    /// Per-bit merge following IEEE 1800 §11.4.11 Table 11-21: a bit is known
+    /// only where `self` and `other` agree; every other bit becomes X. Used by
+    /// the `?:` operator when the condition is X/Z: both branches are evaluated
+    /// and combined bitwise.
+    pub fn merge_unknown(&self, other: &Value) -> Value {
+        let w = self.width.max(other.width);
+        match (&self.storage, &other.storage) {
+            (ValueStorage::Inline { val_bits: av, xz_bits: ax },
+             ValueStorage::Inline { val_bits: bv, xz_bits: bx }) if w <= 64 => {
+                let mask = Self::mask(w);
+                let ax = *ax & mask;
+                let bx = *bx & mask;
+                let av = *av & mask;
+                let bv = *bv & mask;
+                // Bit is known iff both sides are known and equal.
+                let both_known = !ax & !bx & mask;
+                let agree = both_known & !(av ^ bv);
+                let xz_bits = mask & !agree;
+                let val_bits = av & agree;
+                Value {
+                    storage: ValueStorage::Inline { val_bits, xz_bits },
+                    width: w, is_signed: self.is_signed && other.is_signed, is_real: false,
+                }
+            }
+            _ => {
+                let mut result = Value::new(w);
+                for i in 0..w as usize {
+                    let a = if i < self.width as usize { self.get_bit(i) } else { LogicBit::Zero };
+                    let b = if i < other.width as usize { other.get_bit(i) } else { LogicBit::Zero };
+                    let bit = match (a, b) {
+                        (LogicBit::Zero, LogicBit::Zero) => LogicBit::Zero,
+                        (LogicBit::One, LogicBit::One) => LogicBit::One,
+                        _ => LogicBit::X,
+                    };
+                    result.set_bit(i, bit);
+                }
+                result
+            }
+        }
+    }
+
     // === Shifts ===
 
     pub fn shift_left(&self, amount: &Value) -> Value {
