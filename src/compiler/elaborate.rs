@@ -75,6 +75,9 @@ pub struct ElaboratedClass {
     /// Names of type parameters declared on the class.
     #[serde(default)]
     pub type_param_names: Vec<String>,
+    /// Typedef names declared in the class body.
+    #[serde(default)]
+    pub typedef_names: Vec<String>,
 }
 
 /// DPI import metadata used by the simulator for foreign-call dispatch.
@@ -168,6 +171,10 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         has_pure_virtual,
         implements: c.implements.iter().map(|i| i.name.clone()).collect(),
         type_param_names,
+        typedef_names: c.items.iter().filter_map(|it| match it {
+            ClassItem::Typedef(td) => Some(td.name.name.clone()),
+            _ => None,
+        }).collect(),
     }
 }
 
@@ -1595,6 +1602,53 @@ fn validate_class_usage(elab: &ElaboratedModule) -> Result<(), String> {
     // §8.21/§8.26.5: reject instantiating an abstract or interface class.
     for ib in &elab.initial_blocks { walk_stmt_for_class_new(&ib.stmt, elab)?; }
     for ab in &elab.always_blocks { walk_stmt_for_class_new(&ab.stmt, elab)?; }
+
+    // §8.26.3: typedefs declared in an interface class are NOT inherited by
+    // classes that implement it. Flag a method signature that references a
+    // bare typedef that only exists inside an implemented interface class.
+    for cls in elab.classes.values() {
+        if cls.implements.is_empty() { continue; }
+        // Gather typedef names contributed only by implemented interfaces.
+        let mut iface_only_typedefs: HashSet<String> = HashSet::new();
+        for iname in &cls.implements {
+            if let Some(iface) = elab.classes.get(iname) {
+                for t in &iface.typedef_names { iface_only_typedefs.insert(t.clone()); }
+            }
+        }
+        // Remove anything the class itself (or its extends chain) defines,
+        // plus names reachable through module-level typedefs.
+        for t in &cls.typedef_names { iface_only_typedefs.remove(t); }
+        let mut cur = cls.extends.clone();
+        let mut guard = 0;
+        while let Some(base) = cur {
+            guard += 1; if guard > 32 { break; }
+            if let Some(b) = elab.classes.get(&base) {
+                for t in &b.typedef_names { iface_only_typedefs.remove(t); }
+                cur = b.extends.clone();
+            } else { break; }
+        }
+        for t in elab.typedefs.keys() { iface_only_typedefs.remove(t); }
+        if iface_only_typedefs.is_empty() { continue; }
+        for m in cls.methods.values() {
+            let func = match &m.kind {
+                ClassMethodKind::Function(f) | ClassMethodKind::PureVirtual(f) | ClassMethodKind::Extern(f) => Some(f),
+                _ => None,
+            };
+            if let Some(f) = func {
+                for p in &f.ports {
+                    if let DataType::TypeReference { name, .. } = &p.data_type {
+                        if name.scope.is_some() { continue; }
+                        if iface_only_typedefs.contains(&name.name.name) {
+                            return Err(format!(
+                                "Class '{}' method '{}' references type '{}' — typedefs from implemented interfaces are not inherited",
+                                cls.name, f.name.name.name, name.name.name));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
