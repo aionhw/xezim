@@ -886,9 +886,17 @@ impl<'a> BytecodeCompiler<'a> {
                     if let Some((_, _, elem_w)) = self.arrays.get(&raw) {
                         return *elem_w;
                     }
-                    self.widths.get(&raw).copied().unwrap_or(32)
+                    // Not an array — it's a bit-select on a packed signal; width = 1.
+                    1
                 } else { 32 }
             }
+            ExprKind::RangeSelect { left, right, .. } => {
+                if let (Some(l), Some(r)) = (self.eval_const_expr(left), self.eval_const_expr(right)) {
+                    let (hi, lo) = if l >= r { (l, r) } else { (r, l) };
+                    hi - lo + 1
+                } else { 32 }
+            }
+            ExprKind::Concatenation(parts) => parts.iter().map(|p| self.infer_lhs_width(p)).sum(),
             _ => 32,
         }
     }
