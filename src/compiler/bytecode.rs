@@ -65,6 +65,11 @@ pub enum Insn {
 
     /// Conditional branch: if reg is false, jump to target instruction index.
     BranchIfFalse(RegId, u32),       // (cond_reg, jump_target)
+    /// 4-state select: dest = cond ? then_reg : else_reg, with per-bit X merge
+    /// (IEEE 1800 §11.4.11 Table 11-21) when cond has unknown bits. Both
+    /// branches are always evaluated (no short-circuit) — used for `?:` so
+    /// X conditions don't silently fall through to the false branch.
+    Select(RegId, RegId, RegId, RegId), // (dest, cond, then, else)
     /// Unconditional jump.
     Jump(u32),
 
@@ -599,20 +604,13 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(dest)
             }
             ExprKind::Conditional { condition, then_expr, else_expr } => {
+                // Evaluate both branches unconditionally so Select can do a
+                // per-bit merge when the condition has X/Z (IEEE 1800 §11.4.11).
                 let cond = self.compile_expr(condition, 0)?;
-                let dest = self.alloc_reg();
-                let branch_idx = self.insns.len();
-                self.emit(Insn::BranchIfFalse(cond, 0)); // placeholder
                 let then_reg = self.compile_expr(then_expr, ctx_width)?;
-                self.emit(Insn::Move(dest, then_reg));
-                let jump_idx = self.insns.len();
-                self.emit(Insn::Jump(0)); // placeholder
-                let else_start = self.insns.len() as u32;
-                self.insns[branch_idx] = Insn::BranchIfFalse(cond, else_start);
                 let else_reg = self.compile_expr(else_expr, ctx_width)?;
-                self.emit(Insn::Move(dest, else_reg));
-                let end = self.insns.len() as u32;
-                self.insns[jump_idx] = Insn::Jump(end);
+                let dest = self.alloc_reg();
+                self.emit(Insn::Select(dest, cond, then_reg, else_reg));
                 Some(dest)
             }
             ExprKind::Paren(inner) => self.compile_expr(inner, ctx_width),
