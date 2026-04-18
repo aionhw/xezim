@@ -1910,18 +1910,22 @@ impl Simulator {
                     let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
                     let w = high - low + 1;
                     let val = vm_regs[*val_reg as usize].resize(w);
-                    let mut new_val = signal_table[*sig_id].clone();
+                    let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
+                    let mut new_val = if let Some(i) = existing { nba_out[i].value.clone() } else { signal_table[*sig_id].clone() };
                     for bit_pos in low..=high {
                         new_val.set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
                     }
-                    nba_out.push(NbaFast { signal_id: *sig_id, value: new_val });
+                    if let Some(i) = existing { nba_out[i].value = new_val; }
+                    else { nba_out.push(NbaFast { signal_id: *sig_id, value: new_val }); }
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
                     let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
                     let bit = vm_regs[*val_reg as usize].get_bit(0);
-                    let mut new_val = signal_table[*sig_id].clone();
+                    let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
+                    let mut new_val = if let Some(i) = existing { nba_out[i].value.clone() } else { signal_table[*sig_id].clone() };
                     new_val.set_bit(idx, bit);
-                    nba_out.push(NbaFast { signal_id: *sig_id, value: new_val });
+                    if let Some(i) = existing { nba_out[i].value = new_val; }
+                    else { nba_out.push(NbaFast { signal_id: *sig_id, value: new_val }); }
                 }
                 Insn::LoadArrayElem(dest, array_name, idx_reg) => {
                     let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0);
@@ -2077,20 +2081,24 @@ impl Simulator {
                     let w = high - low + 1;
                     let val = self.vm_regs[*val_reg as usize].resize(w);
                     let id = *sig_id;
-                    let mut new_val = self.signal_table[id].clone();
+                    let existing = self.nba_fast.iter().rposition(|n| n.signal_id == id);
+                    let mut new_val = if let Some(i) = existing { self.nba_fast[i].value.clone() } else { self.signal_table[id].clone() };
                     for bit_pos in low..=high {
                         let src_bit = val.get_bit((bit_pos - low) as usize);
                         new_val.set_bit(bit_pos as usize, src_bit);
                     }
-                    self.nba_fast.push(NbaFast { signal_id: id, value: new_val });
+                    if let Some(i) = existing { self.nba_fast[i].value = new_val; }
+                    else { self.nba_fast.push(NbaFast { signal_id: id, value: new_val }); }
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
                     let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
                     let bit = self.vm_regs[*val_reg as usize].get_bit(0);
                     let id = *sig_id;
-                    let mut new_val = self.signal_table[id].clone();
+                    let existing = self.nba_fast.iter().rposition(|n| n.signal_id == id);
+                    let mut new_val = if let Some(i) = existing { self.nba_fast[i].value.clone() } else { self.signal_table[id].clone() };
                     new_val.set_bit(idx, bit);
-                    self.nba_fast.push(NbaFast { signal_id: id, value: new_val });
+                    if let Some(i) = existing { self.nba_fast[i].value = new_val; }
+                    else { self.nba_fast.push(NbaFast { signal_id: id, value: new_val }); }
                 }
                 Insn::StmtFallback(stmt, reason) => {
                     let s = stmt.clone();
