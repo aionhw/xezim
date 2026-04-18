@@ -3465,6 +3465,10 @@ impl Simulator {
             if self.nba_fast[i].value.width != width {
                 self.nba_fast[i].value = self.nba_fast[i].value.resize(width);
             }
+            // Force the stored Value's is_signed to match the signal's declared signedness,
+            // so that a signed RHS (e.g. `$signed(...)`) doesn't corrupt later reads that
+            // rely on the signal's declared unsigned type for zero-extension.
+            self.nba_fast[i].value.is_signed = self.signal_signed[id];
             if self.signal_table[id] != self.nba_fast[i].value {
                 if !self.dirty_signals[id] { self.dirty_signals[id] = true; self.dirty_list.push(id); }
                 self.dirty_any = true;
