@@ -571,7 +571,15 @@ impl Simulator {
             signal_real_vec.push(real_signals.contains(name));
         }
         let num_signals = sig_names_sorted.len();
-        let prev_table = signal_table.clone();
+        // prev_table represents "before time 0" state. Per IEEE 1800, variable
+        // initializers `reg x = <v>;` are equivalent to initial-block assignments,
+        // so X→<v> at t=0 must generate an edge event for @(posedge x) etc.
+        // Initialize prev_table to all-X so the first check_edges at t=0 detects
+        // these initializer-driven transitions.
+        let mut prev_table = Vec::with_capacity(num_signals);
+        for id in 0..num_signals {
+            prev_table.push(Value::new(signal_widths_vec[id]));
+        }
         let mut sim = Self {
             prev_signals: HashMap::new(),
             prev_table,
@@ -2829,7 +2837,13 @@ impl Simulator {
 
             {
                 let _t = std::time::Instant::now();
-                self.snapshot_edge_signals();
+                // Skip the initial snapshot on the very first iteration. prev_table
+                // is pre-initialized to all-X so that initializer-driven X→value
+                // transitions at t=0 (e.g. `reg clk = 1;`) are detected as edges
+                // by the first check_edges call, matching IEEE 1800 semantics.
+                if iters > 1 {
+                    self.snapshot_edge_signals();
+                }
                 t_snap += _t.elapsed().as_nanos() as u64;
 
                 // Apply SDF/specify delayed updates that have matured.
