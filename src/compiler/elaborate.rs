@@ -54,6 +54,9 @@ pub struct ElaboratedClass {
     pub methods: HashMap<String, ClassMethod>,
     /// Properties marked as 'rand' or 'randc'.
     pub random_properties: HashSet<String>,
+    /// Properties marked specifically as 'randc' (cyclic random).
+    #[serde(default)]
+    pub randc_properties: HashSet<String>,
     /// Constraints: name -> constraint declaration.
     pub constraints: HashMap<String, ClassConstraint>,
     /// Class parameters with default values, in declaration order.
@@ -92,6 +95,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut properties = HashMap::new();
     let mut methods = HashMap::new();
     let mut random_properties = HashSet::new();
+    let mut randc_properties = HashSet::new();
     let mut constraints = HashMap::new();
     for item in &c.items {
         match item {
@@ -99,6 +103,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                 let width = resolve_type_width(&p.data_type, None, None);
                 let is_signed = is_type_signed(&p.data_type);
                 let is_rand = p.qualifiers.contains(&ClassQualifier::Rand) || p.qualifiers.contains(&ClassQualifier::Randc);
+                let is_randc = p.qualifiers.contains(&ClassQualifier::Randc);
                 let is_const = p.qualifiers.contains(&ClassQualifier::Const);
                 let is_real = is_type_real(&p.data_type);
                 for decl in &p.declarators {
@@ -123,6 +128,9 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                     });
                     if is_rand {
                         random_properties.insert(decl.name.name.clone());
+                    }
+                    if is_randc {
+                        randc_properties.insert(decl.name.name.clone());
                     }
                 }
             }
@@ -164,6 +172,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         properties,
         methods,
         random_properties,
+        randc_properties,
         constraints,
         param_defaults,
         is_interface: c.is_interface,
@@ -243,6 +252,9 @@ pub struct ElaboratedModule {
     /// Used to enforce §6.5 driver-conflict rules only against variables.
     #[serde(default)]
     pub nets: HashSet<String>,
+    /// Out-of-class constraint definitions: `(class_name, constraint_name)`.
+    #[serde(default)]
+    pub out_of_class_constraints: HashSet<(String, String)>,
 }
 
 impl ElaboratedModule {
@@ -281,6 +293,7 @@ impl ElaboratedModule {
             arrays_nd: HashMap::new(),
             deferred_param_exprs: Vec::new(),
             nets: HashSet::new(),
+            out_of_class_constraints: HashSet::new(),
         }
     }
 }
@@ -1473,6 +1486,9 @@ pub fn elaborate_module_with_defs(
             ModuleItem::DPIImport(di) => {
                 register_dpi_import(di, &mut elab)?;
             }
+            ModuleItem::OutOfClassConstraint { class_name, constraint_name } => {
+                elab.out_of_class_constraints.insert((class_name.clone(), constraint_name.clone()));
+            }
             _ => {}
         }
     }
@@ -1649,7 +1665,157 @@ fn validate_class_usage(elab: &ElaboratedModule) -> Result<(), String> {
         }
     }
 
+    // §18.6.3, §18.8, §18.9: `randomize`, `rand_mode`, and `constraint_mode`
+    // are built-in methods and cannot be overridden by a user class.
+    const RESERVED_METHODS: &[&str] = &["randomize", "rand_mode", "constraint_mode"];
+    for cls in elab.classes.values() {
+        for reserved in RESERVED_METHODS {
+            if cls.methods.contains_key(*reserved) {
+                return Err(format!(
+                    "Class '{}' cannot override built-in method '{}'", cls.name, reserved));
+            }
+        }
+    }
+
+    // §18.5.1: `extern constraint c;` must be accompanied by an out-of-class
+    // definition `constraint ClassName::c { ... }`.
+    for cls in elab.classes.values() {
+        for (cname, con) in &cls.constraints {
+            if con.is_extern && !con.has_body {
+                let defined = elab.out_of_class_constraints
+                    .contains(&(cls.name.clone(), cname.clone()));
+                if !defined {
+                    return Err(format!(
+                        "Class '{}' declares extern constraint '{}' with no external definition",
+                        cls.name, cname));
+                }
+            }
+        }
+    }
+
+    // §18.5.4, §18.5.10, §18.5.14: randc variables cannot appear in dist
+    // expressions, solve..before lists, or soft constraints.
+    for cls in elab.classes.values() {
+        for con in cls.constraints.values() {
+            for item in &con.items {
+                check_randc_restrictions(item, &cls.randc_properties, &cls.name)?;
+            }
+        }
+    }
+
     Ok(())
+}
+
+fn check_randc_restrictions(item: &ConstraintItem, randc: &HashSet<String>, cls: &str) -> Result<(), String> {
+    if randc.is_empty() { return Ok(()); }
+    match item {
+        ConstraintItem::Inside { expr, is_dist: true, .. } => {
+            if let Some(n) = simple_expr_name(expr) {
+                if randc.contains(&n) {
+                    return Err(format!(
+                        "Class '{}': dist constraint cannot be applied to randc variable '{}'", cls, n));
+                }
+            }
+        }
+        ConstraintItem::Solve { before, after, .. } => {
+            for id in before.iter().chain(after.iter()) {
+                if randc.contains(&id.name) {
+                    return Err(format!(
+                        "Class '{}': randc variable '{}' cannot appear in solve..before", cls, id.name));
+                }
+            }
+        }
+        ConstraintItem::Soft(inner) => {
+            collect_soft_randc(inner, randc, cls)?;
+        }
+        ConstraintItem::Block(items) => {
+            for i in items { check_randc_restrictions(i, randc, cls)?; }
+        }
+        ConstraintItem::Implication { constraint, .. } => {
+            check_randc_restrictions(constraint, randc, cls)?;
+        }
+        ConstraintItem::IfElse { then_item, else_item, .. } => {
+            check_randc_restrictions(then_item, randc, cls)?;
+            if let Some(e) = else_item { check_randc_restrictions(e, randc, cls)?; }
+        }
+        ConstraintItem::Foreach { item, .. } => {
+            check_randc_restrictions(item, randc, cls)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collect_soft_randc(item: &ConstraintItem, randc: &HashSet<String>, cls: &str) -> Result<(), String> {
+    // Any randc variable referenced inside a soft constraint is illegal.
+    let mut names: HashSet<String> = HashSet::new();
+    collect_constraint_idents(item, &mut names);
+    for n in &names {
+        if randc.contains(n) {
+            return Err(format!(
+                "Class '{}': soft constraint cannot reference randc variable '{}'", cls, n));
+        }
+    }
+    Ok(())
+}
+
+fn collect_constraint_idents(item: &ConstraintItem, out: &mut HashSet<String>) {
+    match item {
+        ConstraintItem::Expr(e) => collect_expr_idents(e, out),
+        ConstraintItem::Inside { expr, range, .. } => {
+            collect_expr_idents(expr, out);
+            for r in range {
+                match r {
+                    ConstraintRange::Value(v) => collect_expr_idents(v, out),
+                    ConstraintRange::Range { lo, hi } => {
+                        collect_expr_idents(lo, out); collect_expr_idents(hi, out);
+                    }
+                }
+            }
+        }
+        ConstraintItem::Implication { condition, constraint, .. } => {
+            collect_expr_idents(condition, out);
+            collect_constraint_idents(constraint, out);
+        }
+        ConstraintItem::IfElse { condition, then_item, else_item, .. } => {
+            collect_expr_idents(condition, out);
+            collect_constraint_idents(then_item, out);
+            if let Some(e) = else_item { collect_constraint_idents(e, out); }
+        }
+        ConstraintItem::Foreach { item, .. } => collect_constraint_idents(item, out),
+        ConstraintItem::Soft(inner) => collect_constraint_idents(inner, out),
+        ConstraintItem::Block(items) => for i in items { collect_constraint_idents(i, out); },
+        ConstraintItem::Solve { .. } => {}
+    }
+}
+
+fn collect_expr_idents(expr: &Expression, out: &mut HashSet<String>) {
+    use crate::ast::expr::ExprKind;
+    match &expr.kind {
+        ExprKind::Ident(h) => {
+            if let Some(s) = h.path.first() { out.insert(s.name.name.clone()); }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_expr_idents(left, out); collect_expr_idents(right, out);
+        }
+        ExprKind::Unary { operand, .. } => collect_expr_idents(operand, out),
+        ExprKind::Paren(e) => collect_expr_idents(e, out),
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            collect_expr_idents(condition, out);
+            collect_expr_idents(then_expr, out);
+            collect_expr_idents(else_expr, out);
+        }
+        _ => {}
+    }
+}
+
+fn simple_expr_name(expr: &Expression) -> Option<String> {
+    use crate::ast::expr::ExprKind;
+    match &expr.kind {
+        ExprKind::Ident(h) if h.path.len() == 1 => Some(h.path[0].name.name.clone()),
+        ExprKind::Paren(e) => simple_expr_name(e),
+        _ => None,
+    }
 }
 
 fn simple_lhs_name(expr: &Expression) -> Option<String> {
