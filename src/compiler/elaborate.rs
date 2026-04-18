@@ -2872,6 +2872,11 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 BinaryOp::ShiftRight => l.shift_right(&r),
                 BinaryOp::BitOr => l.bitwise_or(&r),
                 BinaryOp::BitAnd => l.bitwise_and(&r),
+                BinaryOp::BitXor => l.bitwise_xor(&r),
+                BinaryOp::BitXnor => l.bitwise_xor(&r).bitwise_not(),
+                BinaryOp::LogOr => l.logic_or(&r),
+                BinaryOp::LogAnd => l.logic_and(&r),
+                BinaryOp::ArithShiftRight => l.arith_shift_right(&r),
                 _ => Value::zero(32),
             }
         }
@@ -3159,6 +3164,25 @@ fn inline_module_items(
                     _ => {}
                 }
 
+                // Local names of the CURRENT (parent) module — bare names of
+                // signals declared in this scope. Used when rewriting port
+                // connection parent expressions so bare identifiers get
+                // prefixed with the current scope. Without this, a port
+                // connection like `.mrd(mrd)` inside wrapper would be stored
+                // in port_map as a bare `mrd`, and later substitutions into
+                // the sub-module would insert a bare (unresolvable) name.
+                let parent_local_names: std::collections::HashSet<String> = elab.signals.keys()
+                    .filter_map(|s| {
+                        if prefix.is_empty() {
+                            if !s.contains('.') { Some(s.clone()) } else { None }
+                        } else {
+                            s.strip_prefix(prefix).and_then(|rest| {
+                                if !rest.is_empty() && !rest.contains('.') { Some(rest.to_string()) } else { None }
+                            })
+                        }
+                    })
+                    .collect();
+
                 if !hi.connections.is_empty() {
                     match &hi.connections[0] { // Simplification: check if first is wildcard
                         PortConnection::Wildcard => {
@@ -3183,7 +3207,7 @@ fn inline_module_items(
                                 match conn {
                                     PortConnection::Named { name, expr } => {
                                         if let Some(e) = expr {
-                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::new(), &elab.signals.keys().cloned().collect(), interface_map);
+                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::new(), &parent_local_names, interface_map);
                                             if sub_interface_ports.contains(&name.name) {
                                                 if let ExprKind::Ident(hier) = &rewritten_e.kind {
                                                     let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
@@ -3196,7 +3220,7 @@ fn inline_module_items(
                                     }
                                     PortConnection::Ordered(expr) => {
                                         if let Some(e) = expr {
-                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::new(), &elab.signals.keys().cloned().collect(), interface_map);
+                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::new(), &parent_local_names, interface_map);
                                             if let Some(port) = sub_mod.ports().get(i) {
                                                 let port_name = port.name();
                                                 if sub_interface_ports.contains(port_name) {

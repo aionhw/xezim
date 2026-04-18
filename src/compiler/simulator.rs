@@ -6165,6 +6165,7 @@ impl Simulator {
                         'g' | 'G' => { let s = format!("{:?}", v.to_f64()); result.push_str(&pad_string(&s, pad_width, zero_pad)); }
                         'e' | 'E' => { let s = format!("{:.6e}", v.to_f64()); result.push_str(&pad_string(&s, pad_width, zero_pad)); }
                         's' | 'S' => { if let ExprKind::StringLiteral(s) = &args[ai-1].kind { result.push_str(s); } else { let s = v.to_sv_string(); result.push_str(&pad_string(&s, pad_width, zero_pad)); } }
+                        'c' | 'C' => { let b = (v.to_u64().unwrap_or(0) & 0xff) as u8; result.push(b as char); }
                         'm' | 'M' => { result.push_str(&self.module.name); ai -= 1; }
                         _ => { result.push('%'); result.push_str(&width_str); result.push(spec); ai -= 1; }
                     }}}
@@ -6441,10 +6442,13 @@ impl Simulator {
                 }
                 self.widths.get(leaf).copied().unwrap_or(32)
             }
-            ExprKind::RangeSelect { left, right, .. } => {
+            ExprKind::RangeSelect { left, right, kind, .. } => {
                 let l = self.eval_expr(left).to_u64().unwrap_or(0);
                 let r = self.eval_expr(right).to_u64().unwrap_or(0);
-                if l >= r { (l-r+1) as u32 } else { (r-l+1) as u32 }
+                match kind {
+                    RangeKind::IndexedUp | RangeKind::IndexedDown => r as u32,
+                    RangeKind::Constant => if l >= r { (l-r+1) as u32 } else { (r-l+1) as u32 },
+                }
             }
             ExprKind::Index { expr: e, index: _ } => {
                 if let ExprKind::Ident(h) = &e.kind {

@@ -742,6 +742,12 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Concatenation(parts) => {
                 // {a, b, c} <= value: split value into per-part bit ranges and NBA each part.
                 // Concatenation is MSB-first: parts[0] is the highest bits.
+                // The RHS may be narrower than the concat width (e.g. $signed of a
+                // 12-bit expression assigned to a 32-bit concat LHS). Widen first
+                // so the per-part RangeSelects see properly sign/zero-extended bits.
+                if width > 0 {
+                    self.emit(Insn::Resize(val_reg, width));
+                }
                 let mut part_widths = Vec::with_capacity(parts.len());
                 for p in parts {
                     let w = self.infer_lhs_width(p);
@@ -890,11 +896,18 @@ impl<'a> BytecodeCompiler<'a> {
                     1
                 } else { 32 }
             }
-            ExprKind::RangeSelect { left, right, .. } => {
-                if let (Some(l), Some(r)) = (self.eval_const_expr(left), self.eval_const_expr(right)) {
-                    let (hi, lo) = if l >= r { (l, r) } else { (r, l) };
-                    hi - lo + 1
-                } else { 32 }
+            ExprKind::RangeSelect { left, right, kind, .. } => {
+                match kind {
+                    RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                        self.eval_const_expr(right).unwrap_or(32)
+                    }
+                    RangeKind::Constant => {
+                        if let (Some(l), Some(r)) = (self.eval_const_expr(left), self.eval_const_expr(right)) {
+                            let (hi, lo) = if l >= r { (l, r) } else { (r, l) };
+                            hi - lo + 1
+                        } else { 32 }
+                    }
+                }
             }
             ExprKind::Concatenation(parts) => parts.iter().map(|p| self.infer_lhs_width(p)).sum(),
             _ => 32,
