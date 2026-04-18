@@ -6242,6 +6242,43 @@ impl Simulator {
             }
         }
 
+        // Multi-segment suffix fallback: for paths like "uut.picorv32_core.cpu_state",
+        // look for keys ending with ".uut.picorv32_core.cpu_state", preferring the one
+        // closest (by common-prefix) to the current scope hint.
+        if hier.path.len() > 1 {
+            let suffix = format!(".{}", raw);
+            let candidates: Vec<&String> = self.signal_name_to_id.keys()
+                .filter(|k| k.ends_with(&suffix) || k.as_str() == raw)
+                .collect();
+            if !candidates.is_empty() {
+                let hint_owned = self.name_resolve_hint.borrow().clone().unwrap_or_default();
+                let mut best: Option<&String> = None;
+                let mut best_score: isize = -1;
+                for key in candidates {
+                    let key_parent = parent_of(key);
+                    let score = common_prefix_len(&hint_owned, key_parent) as isize;
+                    match best {
+                        None => { best = Some(key); best_score = score; }
+                        Some(prev) => {
+                            let prefer = if score != best_score {
+                                score > best_score
+                            } else {
+                                let kd = key.split('.').count();
+                                let pd = prev.split('.').count();
+                                kd < pd || (kd == pd && key.len() < prev.len())
+                            };
+                            if prefer { best = Some(key); best_score = score; }
+                        }
+                    }
+                }
+                if let Some(k) = best {
+                    let parent = parent_of(k).to_string();
+                    *self.name_resolve_hint.borrow_mut() = Some(parent);
+                    return k.clone();
+                }
+            }
+        }
+
         if self.signal_name_to_id.contains_key(&leaf) {
             return leaf;
         }
