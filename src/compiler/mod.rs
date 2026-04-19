@@ -10,6 +10,7 @@ pub mod bytecode;
 pub mod sdf;
 pub mod native_codegen;
 pub mod vcd_sink;
+pub mod stdout_sink;
 
 pub use value::Value;
 pub use elaborate::{elaborate_module, ElaboratedModule};

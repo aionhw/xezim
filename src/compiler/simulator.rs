@@ -71,6 +71,9 @@ enum CombItem {
     /// result written to pre-resolved dst_id via BlockingAssign insn.
     CompiledContAssign { compiled: super::bytecode::CompiledBlock },
     AlwaysBlock { stmt: Statement, is_always_comb: bool },
+    /// Bytecode-compiled comb always block. Skips the AST interpreter per
+    /// settle iteration — dominant hot path in RTL-heavy designs.
+    CompiledAlwaysBlock { compiled: super::bytecode::CompiledBlock, is_always_comb: bool },
 }
 
 #[derive(Clone)]
@@ -437,6 +440,13 @@ pub struct Simulator {
     compiled_edge_blocks: Vec<Option<super::bytecode::CompiledBlock>>,
     /// True for blocks eligible for parallel execution (no StmtFallback).
     edge_block_parallel: Vec<bool>,
+    /// Per-edge-block: cached scope hint (parent module name from first
+    /// sensitivity signal) so sequential-exec path can skip per-call rsplit.
+    edge_block_scope: Vec<Option<String>>,
+    /// Per-edge-block: true if block contains StmtFallback insns (and thus
+    /// needs `name_resolve_hint` to be set for AST-exec). When false, the
+    /// save/restore clone of the RefCell string can be skipped.
+    edge_block_needs_hint: Vec<bool>,
     /// VM register file (reusable across executions to avoid allocation).
     vm_regs: Vec<Value>,
     /// Built-in clock generators (optimized always #N clk = ~clk)
@@ -466,6 +476,9 @@ pub struct Simulator {
     /// Worker-thread count. >=2 routes VCD/AITRACE dumps through a
     /// background writer thread (see vcd_sink::VcdSink).
     threads: usize,
+    /// Buffered stdout sink for $display/$write. Lazily initialized on first
+    /// write so threaded mode can be enabled by `set_threads` beforehand.
+    stdout_sink: Option<super::stdout_sink::StdoutSink>,
     /// AITRACE mode: when true, $dumpfile/$dumpvars emit AITRACE-T instead of VCD
     pub aitrace_mode: bool,
     /// Pre-computed combinatorial entries with sensitivity sets.
@@ -490,6 +503,9 @@ pub struct Simulator {
     prof_vcd: u64,
     prof_edge_detect: u64,
     prof_edge_exec: u64,
+    prof_edge_waiters: u64,
+    prof_edge_cg: u64,
+    prof_waiter_iters: u64,
     prof_edges_fired: u64,
     prof_insns_executed: u64,
     prof_fallback_insns: u64,
@@ -609,7 +625,7 @@ impl Simulator {
             return_value: None,
             rng: rand::rngs::StdRng::from_entropy(),
             settling: false, in_edge_block: false,
-            nba_queue: Vec::new(), nba_fast: Vec::new(), edge_blocks: Vec::new(), compiled_edge_blocks: Vec::new(), edge_block_parallel: Vec::new(), vm_regs: Vec::new(), clock_generators: Vec::new(),
+            nba_queue: Vec::new(), nba_fast: Vec::new(), edge_blocks: Vec::new(), compiled_edge_blocks: Vec::new(), edge_block_parallel: Vec::new(), edge_block_scope: Vec::new(), edge_block_needs_hint: Vec::new(), vm_regs: Vec::new(), clock_generators: Vec::new(),
             event_queue: TimingWheel::new(), next_pid: 0, current_pid: 0,
             dollar_bound: Vec::new(),
             break_flag: false, continue_flag: false, rs_return_flag: false,
@@ -623,6 +639,7 @@ impl Simulator {
             vcd_last_time: u64::MAX,
             vcd_prev_signals: HashMap::new(),
             threads: 1,
+            stdout_sink: None,
             aitrace_mode: false,
             comb_entries: Vec::new(),
             comb_dep_by_id: Vec::new(),
@@ -633,7 +650,7 @@ impl Simulator {
             settle_calls: 0, settle_triggered: Vec::new(), settle_dirty_ids: Vec::new(),
             settle_prev_values: Vec::new(), settle_triggered_list: Vec::new(), loop_iters: 0,
             prof_settle: 0, prof_edges: 0, prof_nba: 0, prof_process: 0, prof_snapshot: 0, prof_vcd: 0,
-            prof_edge_detect: 0, prof_edge_exec: 0, prof_edges_fired: 0, prof_insns_executed: 0, prof_fallback_insns: 0,
+            prof_edge_detect: 0, prof_edge_exec: 0, prof_edge_waiters: 0, prof_edge_cg: 0, prof_waiter_iters: 0, prof_edges_fired: 0, prof_insns_executed: 0, prof_fallback_insns: 0,
             prof_fallback_by_reason: HashMap::new(),
             prof_settle_dc_ns: 0, prof_settle_ca_ns: 0, prof_settle_ab_ns: 0,
             prof_settle_dc_count: 0, prof_settle_ca_count: 0, prof_settle_ab_count: 0,
@@ -669,6 +686,34 @@ impl Simulator {
     /// VCD/AITRACE writer thread; `n == 1` keeps the dump path inline.
     pub fn set_threads(&mut self, n: usize) {
         self.threads = n.max(1);
+    }
+
+    #[inline]
+    fn stdout_write(&mut self, s: &str) {
+        let sink = self.stdout_sink.get_or_insert_with(|| {
+            if self.threads >= 2 {
+                super::stdout_sink::StdoutSink::threaded()
+            } else {
+                super::stdout_sink::StdoutSink::inline()
+            }
+        });
+        sink.write_str(s);
+    }
+
+    #[inline]
+    fn stdout_writeln(&mut self, s: &str) {
+        let sink = self.stdout_sink.get_or_insert_with(|| {
+            if self.threads >= 2 {
+                super::stdout_sink::StdoutSink::threaded()
+            } else {
+                super::stdout_sink::StdoutSink::inline()
+            }
+        });
+        sink.writeln_str(s);
+    }
+
+    pub fn flush_stdout(&mut self) {
+        if let Some(s) = self.stdout_sink.as_mut() { s.flush(); }
     }
 
     #[inline]
@@ -1776,6 +1821,8 @@ impl Simulator {
             );
             compiler.set_ast_fallback(true);
             compiler.set_scope_hint(scope_hint);
+            compiler.set_tasks(&self.module.tasks);
+            compiler.set_params(&self.module.parameters);
             if compiler.compile_stmt(&block.stmt) {
                 let cb = compiler.finish();
                 if cb.num_regs > max_regs { max_regs = cb.num_regs; }
@@ -1795,19 +1842,30 @@ impl Simulator {
         // signal_table which would race with parallel reads.
         let mut pure_count = 0;
         self.edge_block_parallel.clear();
-        for cb in &self.compiled_edge_blocks {
-            let is_pure = if let Some(cb) = cb {
+        self.edge_block_scope.clear();
+        self.edge_block_needs_hint.clear();
+        for (idx, cb) in self.compiled_edge_blocks.iter().enumerate() {
+            let has_fallback = cb.as_ref().map_or(false, |cb|
+                cb.instructions.iter().any(|insn| matches!(insn, super::bytecode::Insn::StmtFallback(..)))
+            );
+            let is_pure = cb.as_ref().map_or(false, |cb|
                 !cb.instructions.iter().any(|insn| matches!(insn,
                     super::bytecode::Insn::StmtFallback(..) |
                     super::bytecode::Insn::BlockingAssign(..) |
                     super::bytecode::Insn::BlockingAssignRange(..) |
+                    super::bytecode::Insn::BlockingAssignRangeDyn(..) |
                     super::bytecode::Insn::BlockingAssignBitDyn(..)
                 ))
-            } else {
-                false
-            };
+            );
             if is_pure { pure_count += 1; }
             self.edge_block_parallel.push(is_pure);
+            // Non-compiled blocks (AST-only) always need hint.
+            self.edge_block_needs_hint.push(has_fallback || cb.is_none());
+            let scope = self.edge_blocks.get(idx)
+                .and_then(|b| b.resolved_sensitivities.first())
+                .and_then(|sid| self.id_to_name.get(sid.signal_id))
+                .and_then(|full| full.rsplit_once('.').map(|(p, _)| p.to_string()));
+            self.edge_block_scope.push(scope);
         }
         sim_dbg_eprintln!("[OPT] parallel-eligible edge blocks: {}/{}", pure_count, self.compiled_edge_blocks.len());
     }
@@ -1948,7 +2006,8 @@ impl Simulator {
                 Insn::SetSigned(reg) => { vm_regs[*reg as usize].is_signed = true; }
                 // These should never appear in parallel-eligible blocks
                 Insn::StmtFallback(..) | Insn::BlockingAssign(..) |
-                Insn::BlockingAssignRange(..) | Insn::BlockingAssignBitDyn(..) => {
+                Insn::BlockingAssignRange(..) | Insn::BlockingAssignRangeDyn(..) |
+                Insn::BlockingAssignBitDyn(..) => {
                     unreachable!("parallel block should not contain fallback/blocking instructions");
                 }
                 Insn::Nop => {}
@@ -2164,6 +2223,29 @@ impl Simulator {
                         self.table_modified = true;
                     }
                 }
+                Insn::BlockingAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
+                    let hi = self.vm_regs[*hi_reg as usize].to_u64().unwrap_or(0) as u32;
+                    let lo = self.vm_regs[*lo_reg as usize].to_u64().unwrap_or(0) as u32;
+                    let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
+                    let w = high - low + 1;
+                    let val = self.vm_regs[*val_reg as usize].resize(w);
+                    let id = *sig_id;
+                    let mut new_val = self.signal_table[id].clone();
+                    for bit_pos in low..=high {
+                        let src_bit = val.get_bit((bit_pos - low) as usize);
+                        new_val.set_bit(bit_pos as usize, src_bit);
+                    }
+                    new_val.is_signed = self.signal_signed[id];
+                    if self.signal_table[id] != new_val {
+                        if !self.dirty_signals[id] {
+                            self.dirty_signals[id] = true;
+                            self.dirty_list.push(id);
+                        }
+                        self.dirty_any = true;
+                        self.signal_table[id] = new_val;
+                        self.table_modified = true;
+                    }
+                }
                 Insn::LoadArrayElem(dest, array_name, idx_reg) => {
                     let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0);
                     let elem_name = format!("{}[{}]", array_name, idx);
@@ -2245,6 +2327,7 @@ impl Simulator {
                     &self.widths,
                 );
                 compiler.set_scope_hint(scope_hint.clone());
+                compiler.set_params(&self.module.parameters);
                 if compiler.compile_cont_assign(&ca.rhs, dst_id, width) {
                     CombItem::CompiledContAssign { compiled: compiler.finish() }
                 } else {
@@ -2329,9 +2412,35 @@ impl Simulator {
                 // and can produce infinite settle loops when the block itself
                 // writes temporary variables (loop indices, scratch regs).
                 let has_unresolved_reads = false;
+                let scope_hint = self.infer_scope_from_rw_sets(&writes, &reads);
+                // Try bytecode-compiling the comb always block. On success
+                // the settle path skips exec_statement entirely and runs
+                // the flat Insn stream via exec_insns.
+                let item = {
+                    let mut compiler = super::bytecode::BytecodeCompiler::new(
+                        &self.signal_name_to_id,
+                        &self.signal_signed,
+                        &self.signal_widths,
+                        &self.module.arrays,
+                        &self.widths,
+                    );
+                    compiler.set_scope_hint(scope_hint.clone());
+                    compiler.set_tasks(&self.module.tasks);
+                    compiler.set_params(&self.module.parameters);
+                    // Enable AST fallback so partially-unsupported constructs
+                    // compile to StmtFallback insns instead of failing the
+                    // whole block. Simple parts still benefit from bytecode
+                    // signal-ID pre-resolution.
+                    compiler.set_ast_fallback(true);
+                    if compiler.compile_stmt(&ab.stmt) {
+                        CombItem::CompiledAlwaysBlock { compiled: compiler.finish(), is_always_comb }
+                    } else {
+                        CombItem::AlwaysBlock { stmt: ab.stmt.clone(), is_always_comb }
+                    }
+                };
                 entries.push(CombEntry {
-                    item: CombItem::AlwaysBlock { stmt: ab.stmt.clone(), is_always_comb },
-                    scope_hint: self.infer_scope_from_rw_sets(&writes, &reads),
+                    item,
+                    scope_hint,
                     read_signals: reads,
                     write_signals: writes,
                     read_signal_ids: rids,
@@ -2342,8 +2451,86 @@ impl Simulator {
         }
 
 
-        // Build reverse dependency index by signal ID
+        // Topologically reorder `entries` so that writers come before readers
+        // where possible. This collapses feedforward chains to 1 settle iter.
+        // Cycles are broken arbitrarily; feedback still needs multi-iter.
         let num_signals = self.signal_table.len();
+        {
+            let n = entries.len();
+            let mut writers_by_sig: Vec<Vec<usize>> = vec![Vec::new(); num_signals];
+            for (idx, entry) in entries.iter().enumerate() {
+                for (sig_id, _) in &entry.write_signal_ids {
+                    if *sig_id < num_signals {
+                        writers_by_sig[*sig_id].push(idx);
+                    }
+                }
+            }
+            // Build forward graph: for each entry B, predecessors = writers of its read signals.
+            let mut indeg = vec![0usize; n];
+            let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+            // Use a temporary visited matrix row-by-row to avoid double-counting edges.
+            let mut seen_pred: Vec<u32> = vec![u32::MAX; n];
+            for b in 0..n {
+                for &sid in &entries[b].read_signal_ids {
+                    if sid >= num_signals { continue; }
+                    for &a in &writers_by_sig[sid] {
+                        if a == b { continue; }
+                        if seen_pred[a] == b as u32 { continue; }
+                        seen_pred[a] = b as u32;
+                        succs[a].push(b);
+                        indeg[b] += 1;
+                    }
+                }
+            }
+            // Kahn's: pick zero-indegree, remove. If cycle, pick lowest indegree.
+            let mut new_order: Vec<usize> = Vec::with_capacity(n);
+            let mut ready: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
+            while new_order.len() < n {
+                if let Some(a) = ready.pop() {
+                    new_order.push(a);
+                    for &b in &succs[a] {
+                        indeg[b] -= 1;
+                        if indeg[b] == 0 { ready.push(b); }
+                    }
+                } else {
+                    // Cycle: pick any remaining node with min indegree.
+                    let mut best = usize::MAX; let mut best_d = usize::MAX;
+                    for i in 0..n {
+                        if indeg[i] != usize::MAX && indeg[i] < best_d && !new_order.contains(&i) {
+                            // Skip entries already emitted — use sentinel.
+                        }
+                    }
+                    // Linear scan using a placed[] bitmap (avoid O(n^2) contains).
+                    let mut placed = vec![false; n];
+                    for &x in &new_order { placed[x] = true; }
+                    for i in 0..n {
+                        if !placed[i] && indeg[i] < best_d {
+                            best_d = indeg[i]; best = i;
+                        }
+                    }
+                    if best == usize::MAX { break; }
+                    new_order.push(best);
+                    indeg[best] = 0;
+                    for &b in &succs[best] {
+                        if indeg[b] > 0 { indeg[b] -= 1; }
+                        if indeg[b] == 0 { ready.push(b); }
+                    }
+                }
+            }
+            // Apply permutation if we got a full order.
+            if new_order.len() == n {
+                let mut permuted: Vec<CombEntry> = Vec::with_capacity(n);
+                // Take entries out via swap_remove would mangle indices; rebuild by index.
+                // Use an Option<CombEntry> trick.
+                let mut slots: Vec<Option<CombEntry>> = entries.into_iter().map(Some).collect();
+                for &i in &new_order {
+                    permuted.push(slots[i].take().unwrap());
+                }
+                entries = permuted;
+            }
+        }
+
+        // Build reverse dependency index by signal ID using final entry order.
         let mut dep_by_id: Vec<Vec<usize>> = vec![Vec::new(); num_signals];
         for (idx, entry) in entries.iter().enumerate() {
             for &sig_id in &entry.read_signal_ids {
@@ -2930,6 +3117,8 @@ impl Simulator {
             t_settle as f64/1e6, t_edges as f64/1e6, t_nba as f64/1e6,
             t_process as f64/1e6, t_snap as f64/1e6, t_sched as f64/1e6);
         let unresolved = self.comb_entries.iter().filter(|e| e.has_unresolved_reads).count();
+        eprintln!("[PROF] edge_waiters={:.1}ms edge_cg={:.1}ms waiter_iters={}",
+            self.prof_edge_waiters as f64/1e6, self.prof_edge_cg as f64/1e6, self.prof_waiter_iters);
         eprintln!("[PROF] edge_detect={:.1}ms edge_exec={:.1}ms edges_fired={} insns={} ns_per_insn={:.1} fallbacks={}",
             self.prof_edge_detect as f64/1e6, self.prof_edge_exec as f64/1e6, self.prof_edges_fired,
             self.prof_insns_executed,
@@ -3012,7 +3201,7 @@ impl Simulator {
                             &self.id_to_name[*id]
                         } else { continue; }
                     }
-                    CombItem::AlwaysBlock { .. } => {
+                    CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. } => {
                         if let Some((id, _)) = entry.write_signal_ids.first() {
                             &self.id_to_name[*id]
                         } else { continue; }
@@ -3481,26 +3670,26 @@ impl Simulator {
     }
 
     fn apply_nba(&mut self) {
-        for i in 0..self.nba_fast.len() {
-            let id = self.nba_fast[i].signal_id;
+        // Take ownership so we can move values directly into signal_table
+        // without the zero-placeholder swap dance.
+        let mut nba = std::mem::take(&mut self.nba_fast);
+        for entry in nba.drain(..) {
+            let id = entry.signal_id;
             let width = self.signal_widths[id];
-            if self.nba_fast[i].value.width != width {
-                self.nba_fast[i].value = self.nba_fast[i].value.resize(width);
-            }
-            // Force the stored Value's is_signed to match the signal's declared signedness,
-            // so that a signed RHS (e.g. `$signed(...)`) doesn't corrupt later reads that
-            // rely on the signal's declared unsigned type for zero-extension.
-            self.nba_fast[i].value.is_signed = self.signal_signed[id];
-            if self.signal_table[id] != self.nba_fast[i].value {
+            let signed = self.signal_signed[id];
+            let mut val = entry.value;
+            if val.width != width { val = val.resize(width); }
+            // Force declared signedness so a signed RHS (e.g. `$signed(...)`)
+            // doesn't corrupt later reads relying on zero-extension.
+            if val.is_signed != signed { val.is_signed = signed; }
+            if self.signal_table[id] != val {
                 if !self.dirty_signals[id] { self.dirty_signals[id] = true; self.dirty_list.push(id); }
                 self.dirty_any = true;
-                let mut val = Value::zero(1);
-                std::mem::swap(&mut val, &mut self.nba_fast[i].value);
                 self.signal_table[id] = val;
                 self.table_modified = true;
             }
         }
-        self.nba_fast.clear();
+        self.nba_fast = nba;
         for i in 0..self.nba_queue.len() {
             if let Some(ref lhs) = self.nba_queue[i].lhs {
                 let lhs = lhs.clone();
@@ -3711,26 +3900,32 @@ impl Simulator {
                 }
             }
 
-            // Phase 2b: execute sequential blocks on main thread
+            // Phase 2b: execute sequential blocks on main thread.
+            // Skip the name_resolve_hint save/restore for blocks that have
+            // no StmtFallback insns (common case: 99%+ of edges don't fall
+            // back to AST exec, since bytecode pre-resolves signal IDs).
             for &bi in &sequential_blocks {
-                let saved_hint = self.name_resolve_hint.borrow().clone();
-                if let Some(first) = blocks[bi].resolved_sensitivities.first() {
-                    if let Some(full) = self.id_to_name.get(first.signal_id) {
-                        if let Some((parent, _)) = full.rsplit_once('.') {
-                            *self.name_resolve_hint.borrow_mut() = Some(parent.to_string());
-                        }
+                let needs_hint = bi < self.edge_block_needs_hint.len()
+                    && self.edge_block_needs_hint[bi];
+                if needs_hint {
+                    let saved_hint = self.name_resolve_hint.borrow().clone();
+                    if let Some(scope) = self.edge_block_scope.get(bi).and_then(|s| s.as_ref()) {
+                        *self.name_resolve_hint.borrow_mut() = Some(scope.clone());
                     }
+                    if !self.exec_bytecode(bi) {
+                        self.exec_statement(&blocks[bi].stmt);
+                    }
+                    *self.name_resolve_hint.borrow_mut() = saved_hint;
+                } else {
+                    self.exec_bytecode(bi);
                 }
-                if !self.exec_bytecode(bi) {
-                    self.exec_statement(&blocks[bi].stmt);
-                }
-                *self.name_resolve_hint.borrow_mut() = saved_hint;
             }
 
             self.prof_edge_exec += t1.elapsed().as_nanos() as u64;
         }
 
         // Trigger covergroup sampling
+        let _t_cg = std::time::Instant::now();
         for i in 0..self.cg_event_waiters.len() {
             let handle = self.cg_event_waiters[i].0;
             let mut triggered = false;
@@ -3746,8 +3941,12 @@ impl Simulator {
             }
         }
 
+        self.prof_edge_cg += _t_cg.elapsed().as_nanos() as u64;
+
         // Wake up event_waiters whose sensitivity conditions are met
+        let _t_w = std::time::Instant::now();
         let waiters = std::mem::take(&mut self.event_waiters);
+        self.prof_waiter_iters += waiters.len() as u64;
         self.event_waiters_swap.clear();
         for waiter in waiters {
             if waiter.registered_time == self.time {
@@ -3767,6 +3966,7 @@ impl Simulator {
             }
         }
         std::mem::swap(&mut self.event_waiters, &mut self.event_waiters_swap);
+        self.prof_edge_waiters += _t_w.elapsed().as_nanos() as u64;
         self.edge_blocks = blocks;
         self.in_edge_block = false;
     }
@@ -3788,30 +3988,18 @@ impl Simulator {
 
         let mut total_iters = 0u64;
         let limit = self.settle_limit as u64;
-        for iteration in 0..limit {
-            if !self.dirty_any && iteration > 0 { break; }
-            total_iters += 1;
 
-            // Collect dirty signal IDs from dirty_list (O(num_dirty) instead of O(num_signals))
-            self.settle_dirty_ids.clear();
-            for &id in &self.dirty_list {
-                if self.dirty_signals[id] {
-                    self.settle_dirty_ids.push(id);
-                    self.dirty_signals[id] = false;
-                }
-            }
-            self.dirty_list.clear();
-            self.dirty_any = false;
-
-            // Build triggered set using reverse dependency index
-            // Clear only entries that were triggered last iteration
-            for &eidx in &self.settle_triggered_list {
-                self.settle_triggered[eidx] = false;
-            }
-            self.settle_triggered_list.clear();
-            for &sig_id in &self.settle_dirty_ids {
-                if sig_id < dep_by_id.len() {
-                    for &eidx in &dep_by_id[sig_id] {
+        // One-time seed: consume the initial dirty set, mark dependents.
+        // settle_triggered acts as persistent "needs evaluation" across passes.
+        for &eidx in &self.settle_triggered_list {
+            self.settle_triggered[eidx] = false;
+        }
+        self.settle_triggered_list.clear();
+        for &id in &self.dirty_list {
+            if self.dirty_signals[id] {
+                self.dirty_signals[id] = false;
+                if id < dep_by_id.len() {
+                    for &eidx in &dep_by_id[id] {
                         if !self.settle_triggered[eidx] {
                             self.settle_triggered[eidx] = true;
                             self.settle_triggered_list.push(eidx);
@@ -3819,41 +4007,62 @@ impl Simulator {
                     }
                 }
             }
+        }
+        self.dirty_list.clear();
+        self.dirty_any = false;
 
-            // Conservatively refresh entries whose read dependencies could not
-            // be fully resolved during comb graph construction.
-            for eidx in 0..num_entries {
-                if !self.settle_triggered[eidx] && entries[eidx].has_unresolved_reads {
-                    self.settle_triggered[eidx] = true;
-                    self.settle_triggered_list.push(eidx);
-                }
+        // Unresolved entries always re-eval.
+        for eidx in 0..num_entries {
+            if !self.settle_triggered[eidx] && entries[eidx].has_unresolved_reads {
+                self.settle_triggered[eidx] = true;
+                self.settle_triggered_list.push(eidx);
             }
-
-            // Evaluate triggered entries directly from the triggered list.
-            // On iteration 0: also include entries with empty read sets and time-0 always_comb.
-            if iteration == 0 {
-                // First iteration: add special-case entries that fire unconditionally
-                for eidx in 0..num_entries {
-                    if !self.settle_triggered[eidx] {
-                        if entries[eidx].read_signal_ids.is_empty()
-                            || (self.time == 0 && matches!(&entries[eidx].item, CombItem::AlwaysBlock { is_always_comb: true, .. }))
-                        {
-                            self.settle_triggered[eidx] = true;
-                            self.settle_triggered_list.push(eidx);
-                        }
+        }
+        // Time-0 / empty-read-set fire unconditionally once.
+        if self.time == 0 || true {
+            for eidx in 0..num_entries {
+                if !self.settle_triggered[eidx] {
+                    if entries[eidx].read_signal_ids.is_empty()
+                        || (self.time == 0 && matches!(&entries[eidx].item,
+                            CombItem::AlwaysBlock { is_always_comb: true, .. }
+                            | CombItem::CompiledAlwaysBlock { is_always_comb: true, .. }))
+                    {
+                        self.settle_triggered[eidx] = true;
+                        self.settle_triggered_list.push(eidx);
                     }
                 }
             }
+        }
 
-            for tidx in 0..self.settle_triggered_list.len() {
-                let eidx = self.settle_triggered_list[tidx];
-                let scope_hint = entries[eidx].scope_hint.clone();
+        // Chaotic-iteration loop: scan entries in topo order, evaluating
+        // any that are flagged. Newly-dirty writes propagate to dependents
+        // via settle_triggered — those at higher eidx evaluate in the same
+        // scan (feedforward in 1 pass); lower eidx get picked up next scan.
+        for iteration in 0..limit {
+            total_iters += 1;
+            let mut evaluated_any = false;
+
+            // Hot loop: >90% of iterations hit DC / CompiledContAssign /
+            // CompiledAlwaysBlock — avoid scope_hint.clone() and Instant::now()
+            // on those paths. Only the AST fallback arms pay that cost.
+            //
+            // Worklist + topo scan: iterate by eidx (entries are topo-sorted).
+            // When an entry writes a signal, its dependents at higher eidx are
+            // marked triggered and visited later in THIS pass — feedforward
+            // chains collapse to 1 outer iter. Back-edges fall to next iter.
+            for eidx in 0..num_entries {
+                if !self.settle_triggered[eidx] { continue; }
+                // Consume the trigger now. If any signal is written AGAIN
+                // later this scan (or next), the entry is re-triggered by
+                // the worklist propagation below.
+                self.settle_triggered[eidx] = false;
+                evaluated_any = true;
+                let dirty_before = self.dirty_list.len();
 
                 self.entry_evals += 1;
-                if self.activity_mon && !self.activity_counts.is_empty() {
-                    self.activity_counts[eidx] += 1;
+                if self.activity_mon {
+                    if let Some(slot) = self.activity_counts.get_mut(eidx) { *slot += 1; }
                 }
-                let t_entry = std::time::Instant::now();
                 match &entries[eidx].item {
                     CombItem::DirectCopy { dst_id, src_id, width } => {
                         let src_val = self.signal_table[*src_id].clone();
@@ -3861,7 +4070,6 @@ impl Simulator {
                         if self.signal_table[*dst_id] != resized {
                             let delay = self.sdf_delays[*dst_id];
                             if delay > 0 && self.time > 0 {
-                                // SDF: schedule delayed update (inertial delay model)
                                 self.schedule_delayed(*dst_id, resized);
                             } else {
                                 self.mark_dirty_id(*dst_id);
@@ -3869,21 +4077,21 @@ impl Simulator {
                                 self.table_modified = true;
                             }
                         }
-                        self.prof_settle_dc_ns += t_entry.elapsed().as_nanos() as u64;
                         self.prof_settle_dc_count += 1;
                     }
                     CombItem::CompiledContAssign { compiled } => {
-                        let insns_ptr = compiled.instructions.as_ptr();
-                        let insns_len = compiled.instructions.len();
                         if self.vm_regs.len() < compiled.num_regs as usize {
                             self.vm_regs.resize(compiled.num_regs as usize, Value::zero(1));
                         }
-                        let insns = unsafe { std::slice::from_raw_parts(insns_ptr, insns_len) };
+                        let insns = unsafe {
+                            std::slice::from_raw_parts(compiled.instructions.as_ptr(), compiled.instructions.len())
+                        };
                         self.exec_insns(insns);
-                        self.prof_settle_dc_ns += t_entry.elapsed().as_nanos() as u64;
                         self.prof_settle_dc_count += 1;
                     }
                     CombItem::ContAssign { lhs, rhs } => {
+                        let scope_hint = entries[eidx].scope_hint.clone();
+                        let t_entry = std::time::Instant::now();
                         let saved_hint = self.name_resolve_hint.borrow().clone();
                         if let Some(hint) = &scope_hint {
                             *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
@@ -3931,6 +4139,8 @@ impl Simulator {
                         self.prof_settle_ca_count += 1;
                     }
                     CombItem::AlwaysBlock { stmt, .. } => {
+                        let scope_hint = entries[eidx].scope_hint.clone();
+                        let t_entry = std::time::Instant::now();
                         let saved_hint = self.name_resolve_hint.borrow().clone();
                         if let Some(hint) = &scope_hint {
                             *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
@@ -3952,10 +4162,51 @@ impl Simulator {
                         self.prof_settle_ab_ns += t_entry.elapsed().as_nanos() as u64;
                         self.prof_settle_ab_count += 1;
                     }
+                    CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                        // Bytecode path: BlockingAssign/NbaAssign insns mark
+                        // dirty automatically; no pre/post value snapshot needed.
+                        if self.vm_regs.len() < compiled.num_regs as usize {
+                            self.vm_regs.resize(compiled.num_regs as usize, Value::zero(1));
+                        }
+                        let insns = unsafe {
+                            std::slice::from_raw_parts(compiled.instructions.as_ptr(), compiled.instructions.len())
+                        };
+                        self.exec_insns(insns);
+                        self.prof_settle_ab_count += 1;
+                    }
+                }
+
+                // Worklist propagation: any signals newly dirtied by this
+                // entry's evaluation trigger their dependents, which are
+                // appended to `settle_triggered_list` if not already fired.
+                // Topo-ordered entries → most dependents sit at higher tidx
+                // and will be reached before the outer iter boundary.
+                let dirty_after = self.dirty_list.len();
+                if dirty_after > dirty_before {
+                    for di in dirty_before..dirty_after {
+                        let sig_id = self.dirty_list[di];
+                        // Consume the dirty flag — we're propagating it now.
+                        // If the signal gets dirtied again later, it'll be
+                        // re-pushed to dirty_list with a fresh flag.
+                        self.dirty_signals[sig_id] = false;
+                        if sig_id < dep_by_id.len() {
+                            for &dep_eidx in &dep_by_id[sig_id] {
+                                if !self.settle_triggered[dep_eidx] {
+                                    self.settle_triggered[dep_eidx] = true;
+                                    self.settle_triggered_list.push(dep_eidx);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
-            if !self.dirty_any { break; }
+            // After one full topo scan: if no entry was evaluated, fixpoint.
+            if !evaluated_any { break; }
+            // Reset dirty bookkeeping for the next scan. (We already consumed
+            // the per-signal flags via the propagation loop; clear the list.)
+            self.dirty_list.clear();
+            self.dirty_any = false;
         }
 
         self.comb_entries = entries;
@@ -6038,8 +6289,8 @@ impl Simulator {
 
     fn exec_system_task(&mut self, name: &str, args: &[Expression]) {
         match name {
-            "$display" | "$displayb" | "$displayh" | "$displayo" => { let m = self.format_args(args, name); self.record_output(m.clone()); println!("{}", m); }
-            "$write" | "$writeb" | "$writeh" | "$writeo" => { let m = self.format_args(args, name); self.record_output(m.clone()); print!("{}", m); }
+            "$display" | "$displayb" | "$displayh" | "$displayo" => { let m = self.format_args(args, name); self.record_output(m.clone()); self.stdout_writeln(&m); }
+            "$write" | "$writeb" | "$writeh" | "$writeo" => { let m = self.format_args(args, name); self.record_output(m.clone()); self.stdout_write(&m); }
             "$monitor" | "$monitorb" | "$monitorh" | "$monitoro" => { self.monitor = Some((name.to_string(), args.to_vec())); self.check_monitor(); }
             "$monitoroff" => { self.monitor = None; }
             "$finish" | "$stop" => { self.finished = true; }
@@ -6182,7 +6433,7 @@ impl Simulator {
             let m = self.format_args(&args, &tn);
             let mut changed = self.monitor_prev.is_empty();
             for (n, v) in &self.signals { if let Some(p) = self.monitor_prev.get(n) { if p != v { changed = true; break; } } }
-            if changed { self.record_output(m.clone()); println!("{}", m); self.monitor_prev = self.signals.clone(); }
+            if changed { self.record_output(m.clone()); self.stdout_writeln(&m); self.monitor_prev = self.signals.clone(); }
         }
     }
 
