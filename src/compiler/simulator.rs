@@ -1848,13 +1848,25 @@ impl Simulator {
             let has_fallback = cb.as_ref().map_or(false, |cb|
                 cb.instructions.iter().any(|insn| matches!(insn, super::bytecode::Insn::StmtFallback(..)))
             );
+            // NbaAssignBitDyn and NbaAssignRange read signal_table.clone() in
+            // the parallel path and produce a full-register NbaFast entry with
+            // only the addressed sub-range modified. When multiple parallel
+            // blocks each write different sub-ranges of the same register
+            // (e.g. yosys-synthesized per-bit FFs: `cpu_state[0] <= _00014_;`
+            // in one always block, `cpu_state[1] <= _00015_;` in another),
+            // merging their entries preserves only the last one — bits
+            // written by earlier blocks revert to the snapshot value.
+            // The sequential path merges correctly via nba_fast.rposition,
+            // so keep these on the sequential path.
             let is_pure = cb.as_ref().map_or(false, |cb|
                 !cb.instructions.iter().any(|insn| matches!(insn,
                     super::bytecode::Insn::StmtFallback(..) |
                     super::bytecode::Insn::BlockingAssign(..) |
                     super::bytecode::Insn::BlockingAssignRange(..) |
                     super::bytecode::Insn::BlockingAssignRangeDyn(..) |
-                    super::bytecode::Insn::BlockingAssignBitDyn(..)
+                    super::bytecode::Insn::BlockingAssignBitDyn(..) |
+                    super::bytecode::Insn::NbaAssignBitDyn(..) |
+                    super::bytecode::Insn::NbaAssignRange(..)
                 ))
             );
             if is_pure { pure_count += 1; }
@@ -2313,9 +2325,17 @@ impl Simulator {
                 })
                 .collect();
 
+            // Only take the compiled whole-signal write path when the LHS is
+            // a bare identifier. BitSelect/PartSelect/Concat LHS must route
+            // through assign_value (via CombItem::ContAssign) so that only
+            // the addressed sub-range is updated — otherwise per-bit
+            // continuous assigns like `assign d[0] = expr;` would clobber
+            // the entire vector wire. Yosys gate-level netlists emit many
+            // such per-bit assigns.
+            let lhs_is_bare_ident = matches!(ca.lhs.kind, ExprKind::Ident(_));
             let item = if let Some(dc) = direct_copy {
                 dc
-            } else if wids.len() == 1 {
+            } else if wids.len() == 1 && lhs_is_bare_ident {
                 // Try bytecode-compiling the RHS for single-target cont_assigns
                 let (dst_id, _) = wids[0];
                 let width = self.signal_widths[dst_id];
