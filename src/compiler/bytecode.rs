@@ -3,10 +3,13 @@
 //! that can be executed without pointer-chasing through Box<Expression> trees.
 
 use super::value::Value;
+use crate::ast::decl::TaskDeclaration;
 use crate::ast::expr::*;
 use crate::ast::stmt::*;
 use std::sync::Arc;
 use ahash::AHashMap as HashMap;
+
+const MAX_INLINE_DEPTH: usize = 8;
 
 /// A register in the bytecode VM. Registers hold Values.
 type RegId = u16;
@@ -84,6 +87,8 @@ pub enum Insn {
     BlockingAssign(usize, RegId, u32), // (signal_id, value_reg, width)
     /// Blocking range assign: signal_table[id][hi:lo] = reg (read-modify-write).
     BlockingAssignRange(usize, u32, u32, RegId), // (signal_id, hi, lo, value_reg)
+    /// Blocking range assign with dynamic hi/lo (for `[idx +: W]` / `[idx -: W]`).
+    BlockingAssignRangeDyn(usize, RegId, RegId, RegId), // (signal_id, hi_reg, lo_reg, value_reg)
     /// Blocking bit assign: signal_table[id][idx_reg] = reg[0] (read-modify-write).
     BlockingAssignBitDyn(usize, RegId, RegId), // (signal_id, idx_reg, value_reg)
 
@@ -131,6 +136,18 @@ pub struct BytecodeCompiler<'a> {
     /// with a bare local name (`mem_valid`) is first tried verbatim, then
     /// with this prefix applied (`testbench.mem_valid`).
     pub scope_hint: Option<String>,
+    /// User-task table for inlining zero-arg, non-blocking task bodies.
+    /// Task-enable (`task_name;`) statements that resolve here get their
+    /// bodies compiled in place instead of emitting a single StmtFallback
+    /// for the whole call — lets the inner simple assigns compile cleanly
+    /// and narrows the fallback to just the inner $write/$display.
+    tasks: Option<&'a HashMap<String, TaskDeclaration>>,
+    inlining_stack: Vec<String>,
+    pub tasks_inlined: u32,
+    /// Elaborated module parameters — used by `eval_const_expr` so that
+    /// bytecode compilation can fold module params (e.g. `CARRY_CHAIN`) into
+    /// the compile-time widths of `+:` / `-:` range selects.
+    params: Option<&'a HashMap<String, Value>>,
 }
 
 impl<'a> BytecodeCompiler<'a> {
@@ -152,7 +169,15 @@ impl<'a> BytecodeCompiler<'a> {
             bail_reason: None,
             allow_ast_fallback: false,
             scope_hint: None,
+            tasks: None,
+            inlining_stack: Vec::new(),
+            tasks_inlined: 0,
+            params: None,
         }
+    }
+
+    pub fn set_params(&mut self, params: &'a HashMap<String, Value>) {
+        self.params = Some(params);
     }
 
     pub fn set_ast_fallback(&mut self, allow: bool) {
@@ -161,6 +186,68 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_scope_hint(&mut self, scope: Option<String>) {
         self.scope_hint = scope;
+    }
+
+    pub fn set_tasks(&mut self, tasks: &'a HashMap<String, TaskDeclaration>) {
+        self.tasks = Some(tasks);
+    }
+
+    fn stmt_has_break_or_continue(stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::Break | StatementKind::Continue => true,
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().any(Self::stmt_has_break_or_continue)
+            }
+            StatementKind::If { then_stmt, else_stmt, .. } => {
+                Self::stmt_has_break_or_continue(then_stmt)
+                    || else_stmt.as_ref().map_or(false, |e| Self::stmt_has_break_or_continue(e))
+            }
+            StatementKind::Case { items, .. } => {
+                items.iter().any(|it| Self::stmt_has_break_or_continue(&it.stmt))
+            }
+            // Don't descend into nested loops — break/continue there target the
+            // inner loop, not the enclosing one.
+            _ => false,
+        }
+    }
+
+    fn stmt_is_blocking(stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::TimingControl { .. } => true,
+            StatementKind::Wait { .. } => true,
+            StatementKind::Forever { .. } => true,
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().any(Self::stmt_is_blocking)
+            }
+            StatementKind::If { then_stmt, else_stmt, .. } => {
+                Self::stmt_is_blocking(then_stmt)
+                    || else_stmt.as_ref().map_or(false, |e| Self::stmt_is_blocking(e))
+            }
+            StatementKind::For { body, .. } | StatementKind::While { body, .. } => {
+                Self::stmt_is_blocking(body)
+            }
+            _ => false,
+        }
+    }
+
+    /// Try to inline a zero-arg, non-blocking user task's body at this
+    /// call site. Returns true if successfully inlined.
+    fn try_inline_task(&mut self, task_name: &str) -> bool {
+        if self.inlining_stack.len() >= MAX_INLINE_DEPTH { return false; }
+        if self.inlining_stack.iter().any(|n| n == task_name) { return false; }
+        let tasks = match self.tasks { Some(t) => t, None => return false };
+        let td = match tasks.get(task_name) { Some(t) => t, None => return false };
+        if !td.ports.is_empty() { return false; }
+        if td.items.iter().any(Self::stmt_is_blocking) { return false; }
+        let body: Vec<Statement> = td.items.clone();
+        self.inlining_stack.push(task_name.to_string());
+        let mut ok = true;
+        for s in &body {
+            if !self.compile_stmt(s) { ok = false; break; }
+        }
+        self.inlining_stack.pop();
+        if ok { self.tasks_inlined += 1; }
+        ok
     }
 
     fn emit_fallback(&mut self, stmt: &Statement) -> bool {
@@ -410,6 +497,8 @@ impl<'a> BytecodeCompiler<'a> {
                     // dispatch must happen in the AST interpreter's `exec_expr_stmt`.
                     ExprKind::Ident(hier) if hier.path.len() == 1 => {
                         if self.lookup_signal_id(hier).is_some() { return true; }
+                        let name = hier.path[0].name.name.clone();
+                        if self.try_inline_task(&name) { return true; }
                         self.bail("Expr_TaskEnable");
                         return self.emit_fallback(stmt);
                     }
@@ -419,6 +508,8 @@ impl<'a> BytecodeCompiler<'a> {
                             return self.emit_fallback(&Statement::new(stmt.kind.clone(), stmt.span));
                         }
                         if self.lookup_signal_id(hier).is_some() { return true; }
+                        let leaf = hier.path.last().unwrap().name.name.clone();
+                        if self.try_inline_task(&leaf) { return true; }
                         self.bail("Expr_TaskEnable");
                         return self.emit_fallback(stmt);
                     }
@@ -485,6 +576,67 @@ impl<'a> BytecodeCompiler<'a> {
                 };
                 self.bail(n);
                 self.emit_fallback(stmt)
+            }
+            StatementKind::For { init, condition, step, body } => {
+                // break/continue inside a compiled loop body would set the AST
+                // interpreter's break_flag which the bytecode VM never reads —
+                // bail so the whole For falls back to the AST path.
+                if Self::stmt_has_break_or_continue(body) {
+                    self.bail("For_break_continue");
+                    return false;
+                }
+                for fi in init {
+                    match fi {
+                        ForInit::Assign { lvalue, rvalue } => {
+                            let width = self.infer_lhs_width(lvalue);
+                            let val_reg = match self.compile_expr(rvalue, width) {
+                                Some(r) => r,
+                                None => { self.bail("For_init_rvalue"); return false; }
+                            };
+                            if width > 0 { self.emit(Insn::Resize(val_reg, width)); }
+                            if !self.compile_blocking_target(lvalue, val_reg, width) {
+                                self.bail("For_init_target"); return false;
+                            }
+                        }
+                        ForInit::VarDecl { .. } => {
+                            self.bail("For_init_vardecl"); return false;
+                        }
+                    }
+                }
+                let loop_start = self.insns.len() as u32;
+                let cond_branch_idx = if let Some(c) = condition {
+                    let cond_reg = match self.compile_expr(c, 0) {
+                        Some(r) => r,
+                        None => { self.bail("For_condition"); return false; }
+                    };
+                    let idx = self.insns.len();
+                    self.emit(Insn::BranchIfFalse(cond_reg, 0));
+                    Some(idx)
+                } else { None };
+                if !self.compile_stmt(body) { return false; }
+                for s in step {
+                    if let ExprKind::Binary { op: BinaryOp::Assign, left, right } = &s.kind {
+                        let width = self.infer_lhs_width(left);
+                        let val_reg = match self.compile_expr(right, width) {
+                            Some(r) => r,
+                            None => { self.bail("For_step_rvalue"); return false; }
+                        };
+                        if width > 0 { self.emit(Insn::Resize(val_reg, width)); }
+                        if !self.compile_blocking_target(left, val_reg, width) {
+                            self.bail("For_step_target"); return false;
+                        }
+                    } else {
+                        self.bail("For_step_other"); return false;
+                    }
+                }
+                self.emit(Insn::Jump(loop_start));
+                let end = self.insns.len() as u32;
+                if let Some(idx) = cond_branch_idx {
+                    if let Insn::BranchIfFalse(reg, _) = self.insns[idx] {
+                        self.insns[idx] = Insn::BranchIfFalse(reg, end);
+                    }
+                }
+                true
             }
             other => {
                 let name: &'static str = match other {
@@ -632,13 +784,43 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(dest)
             }
             ExprKind::RangeSelect { expr, left, right, kind, .. } => {
-                if *kind != RangeKind::Constant { self.bail("RangeSelect_nonconst"); return None; }
-                let base = self.compile_expr(expr, 0)?;
-                let l = self.compile_expr(left, 0)?;
-                let r = self.compile_expr(right, 0)?;
-                let dest = self.alloc_reg();
-                self.emit(Insn::RangeSelect(dest, base, l, r));
-                Some(dest)
+                match kind {
+                    RangeKind::Constant => {
+                        let base = self.compile_expr(expr, 0)?;
+                        let l = self.compile_expr(left, 0)?;
+                        let r = self.compile_expr(right, 0)?;
+                        let dest = self.alloc_reg();
+                        self.emit(Insn::RangeSelect(dest, base, l, r));
+                        Some(dest)
+                    }
+                    RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                        // `sig[idx +: W]` / `sig[idx -: W]` — W must be constant.
+                        // Emit idx register, then compute hi/lo via Add/Sub with a
+                        // const (W-1), and reuse existing RangeSelect insn.
+                        let width = match self.eval_const_expr(right) {
+                            Some(w) if w > 0 => w,
+                            _ => { self.bail("RangeSelect_width_nonconst"); return None; }
+                        };
+                        let base = self.compile_expr(expr, 0)?;
+                        let idx = self.compile_expr(left, 0)?;
+                        let dest = self.alloc_reg();
+                        if width == 1 {
+                            self.emit(Insn::RangeSelect(dest, base, idx, idx));
+                        } else {
+                            let delta = self.alloc_reg();
+                            self.emit(Insn::LoadConst(delta, Value::from_u64((width - 1) as u64, 32)));
+                            let other = self.alloc_reg();
+                            if *kind == RangeKind::IndexedUp {
+                                self.emit(Insn::Add(other, idx, delta));
+                                self.emit(Insn::RangeSelect(dest, base, other, idx));
+                            } else {
+                                self.emit(Insn::Sub(other, idx, delta));
+                                self.emit(Insn::RangeSelect(dest, base, idx, other));
+                            }
+                        }
+                        Some(dest)
+                    }
+                }
             }
             ExprKind::Replication { count, exprs } => {
                 let n = self.eval_const_expr(count)?;
@@ -813,27 +995,48 @@ impl<'a> BytecodeCompiler<'a> {
                 false
             }
             ExprKind::RangeSelect { expr, left, right, kind } => {
-                if *kind != RangeKind::Constant {
-                    self.bail("blocking_range_nonconst");
-                    return false;
-                }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(id) = self.lookup_signal_id(hier) {
-                        if let (Some(hi), Some(lo)) = (self.eval_const_expr(left), self.eval_const_expr(right)) {
-                            // Blocking range assign: read current, modify range, write back
-                            let cur = self.alloc_reg();
-                            self.emit(Insn::LoadSignal(cur, id));
-                            let w = self.signal_widths[id];
-                            let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
-                            let range_w = high - low + 1;
-                            let resized = self.alloc_reg();
-                            self.emit(Insn::Move(resized, val_reg));
-                            self.emit(Insn::Resize(resized, range_w));
-                            // Build new value: splice resized into cur[high:low]
-                            // We need a SpliceBits instruction or do it manually.
-                            // Use BlockingAssignRange instruction.
-                            self.emit(Insn::BlockingAssignRange(id, hi, lo, resized));
-                            return true;
+                        match kind {
+                            RangeKind::Constant => {
+                                if let (Some(hi), Some(lo)) = (self.eval_const_expr(left), self.eval_const_expr(right)) {
+                                    let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
+                                    let range_w = high - low + 1;
+                                    let resized = self.alloc_reg();
+                                    self.emit(Insn::Move(resized, val_reg));
+                                    self.emit(Insn::Resize(resized, range_w));
+                                    self.emit(Insn::BlockingAssignRange(id, hi, lo, resized));
+                                    return true;
+                                }
+                            }
+                            RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                                let width = match self.eval_const_expr(right) {
+                                    Some(w) if w > 0 => w,
+                                    _ => { self.bail("blocking_range_width_nonconst"); return false; }
+                                };
+                                let resized = self.alloc_reg();
+                                self.emit(Insn::Move(resized, val_reg));
+                                self.emit(Insn::Resize(resized, width));
+                                let Some(idx) = self.compile_expr(left, 0) else {
+                                    self.bail("blocking_range_base"); return false;
+                                };
+                                let (hi_reg, lo_reg) = if width == 1 {
+                                    (idx, idx)
+                                } else {
+                                    let delta = self.alloc_reg();
+                                    self.emit(Insn::LoadConst(delta, Value::from_u64((width - 1) as u64, 32)));
+                                    let other = self.alloc_reg();
+                                    if *kind == RangeKind::IndexedUp {
+                                        self.emit(Insn::Add(other, idx, delta));
+                                        (other, idx)
+                                    } else {
+                                        self.emit(Insn::Sub(other, idx, delta));
+                                        (idx, other)
+                                    }
+                                };
+                                self.emit(Insn::BlockingAssignRangeDyn(id, hi_reg, lo_reg, resized));
+                                return true;
+                            }
                         }
                     }
                 }
@@ -918,6 +1121,21 @@ impl<'a> BytecodeCompiler<'a> {
         match &e.kind {
             ExprKind::Number(n) => self.eval_number_static(n)?.to_u64().map(|v| v as u32),
             ExprKind::Paren(inner) => self.eval_const_expr(inner),
+            ExprKind::Ident(hier) => {
+                let params = self.params?;
+                let raw = Self::hier_raw_name(hier);
+                if let Some(v) = params.get(&raw) { return v.to_u64().map(|u| u as u32); }
+                if let Some(scope) = &self.scope_hint {
+                    let q = format!("{}.{}", scope, raw);
+                    if let Some(v) = params.get(&q) { return v.to_u64().map(|u| u as u32); }
+                }
+                if hier.path.len() == 1 {
+                    if let Some(v) = params.get(&hier.path[0].name.name) {
+                        return v.to_u64().map(|u| u as u32);
+                    }
+                }
+                None
+            }
             _ => None,
         }
     }

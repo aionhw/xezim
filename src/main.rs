@@ -19,6 +19,9 @@ fn print_usage() {
     eprintln!("  --max-time <n>   Set maximum simulation time (default: 100000)");
     eprintln!("  --sim_debug      Enable simulator [DEBUG]/[OPT] output");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
+    eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
+    eprintln!("                   n>=2 offloads VCD/AITRACE dumping and stdout");
+    eprintln!("                   writes to background threads.");
     eprintln!("Compatibility:");
     eprintln!("  -Ifoo, -DNAME=V  Accepted");
     eprintln!("  +incdir+dir1+dir2 / +define+FOO=1+BAR Accepted");
