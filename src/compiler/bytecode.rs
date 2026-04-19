@@ -1074,6 +1074,8 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    pub fn infer_lhs_width_pub(&self, lhs: &Expression) -> u32 { self.infer_lhs_width(lhs) }
+
     fn infer_lhs_width(&self, lhs: &Expression) -> u32 {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
@@ -1178,6 +1180,23 @@ impl<'a> BytecodeCompiler<'a> {
             self.emit(Insn::Resize(val_reg, width));
             self.emit(Insn::BlockingAssign(dst_id, val_reg, width));
             true
+        } else {
+            false
+        }
+    }
+
+    /// Compile a continuous assign with bit-select, part-select, or concat LHS:
+    /// `assign d[i] = rhs`, `assign d[hi:lo] = rhs`, `assign {a,b} = rhs`.
+    /// Reuses compile_blocking_target which emits BlockingAssignBitDyn /
+    /// BlockingAssignRange / concat-split insns — same sub-range semantics
+    /// as the interpreted assign_value path, but at bytecode speed.
+    /// Yosys gate-level netlists emit hundreds of per-bit assigns that used
+    /// to fall through to the interpreter on every settle iteration.
+    pub fn compile_cont_assign_lhs(&mut self, lhs: &Expression, rhs: &Expression, lhs_width: u32) -> bool {
+        let ctx = lhs_width.max(self.expr_max_width(rhs));
+        if let Some(val_reg) = self.compile_expr(rhs, ctx) {
+            self.emit(Insn::Resize(val_reg, lhs_width));
+            self.compile_blocking_target(lhs, val_reg, lhs_width)
         } else {
             false
         }

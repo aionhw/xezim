@@ -2325,18 +2325,16 @@ impl Simulator {
                 })
                 .collect();
 
-            // Only take the compiled whole-signal write path when the LHS is
-            // a bare identifier. BitSelect/PartSelect/Concat LHS must route
-            // through assign_value (via CombItem::ContAssign) so that only
-            // the addressed sub-range is updated — otherwise per-bit
-            // continuous assigns like `assign d[0] = expr;` would clobber
-            // the entire vector wire. Yosys gate-level netlists emit many
-            // such per-bit assigns.
+            // For bare-identifier LHS, compile the RHS and use BlockingAssign
+            // (whole-signal write). For BitSelect/PartSelect/Concat LHS, use
+            // compile_cont_assign_lhs which routes through compile_blocking_target
+            // so only the addressed sub-range is updated — essential for yosys
+            // gate-level netlists whose per-bit assigns `assign d[0] = expr;`
+            // would otherwise clobber the whole vector wire.
             let lhs_is_bare_ident = matches!(ca.lhs.kind, ExprKind::Ident(_));
             let item = if let Some(dc) = direct_copy {
                 dc
             } else if wids.len() == 1 && lhs_is_bare_ident {
-                // Try bytecode-compiling the RHS for single-target cont_assigns
                 let (dst_id, _) = wids[0];
                 let width = self.signal_widths[dst_id];
                 let mut compiler = super::bytecode::BytecodeCompiler::new(
@@ -2349,6 +2347,24 @@ impl Simulator {
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
                 if compiler.compile_cont_assign(&ca.rhs, dst_id, width) {
+                    CombItem::CompiledContAssign { compiled: compiler.finish() }
+                } else {
+                    CombItem::ContAssign { lhs: ca.lhs.clone(), rhs: ca.rhs.clone() }
+                }
+            } else if !lhs_is_bare_ident {
+                // Sub-range LHS: try bytecode compile so bit/range writes run
+                // at VM speed instead of through the interpreted assign_value.
+                let mut compiler = super::bytecode::BytecodeCompiler::new(
+                    &self.signal_name_to_id,
+                    &self.signal_signed,
+                    &self.signal_widths,
+                    &self.module.arrays,
+                    &self.widths,
+                );
+                compiler.set_scope_hint(scope_hint.clone());
+                compiler.set_params(&self.module.parameters);
+                let lhs_w = compiler.infer_lhs_width_pub(&ca.lhs);
+                if lhs_w > 0 && compiler.compile_cont_assign_lhs(&ca.lhs, &ca.rhs, lhs_w) {
                     CombItem::CompiledContAssign { compiled: compiler.finish() }
                 } else {
                     CombItem::ContAssign { lhs: ca.lhs.clone(), rhs: ca.rhs.clone() }
