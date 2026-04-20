@@ -3,7 +3,7 @@
 
 pub mod compiler;
 
-pub use sv_parser::parser;
+pub use sv_parser::parse;
 pub use sv_parser::lexer;
 pub use sv_parser::preprocessor;
 pub use sv_parser::diagnostics;
@@ -114,7 +114,7 @@ pub fn parse_and_elaborate_multi(
         let preprocessed = pp.preprocess_file(source, source_path.as_deref());
         
         let tokens = lexer::Lexer::new(&preprocessed).tokenize();
-        let mut parser = parser::Parser::new(tokens);
+        let mut parser = parse::Parser::new(tokens);
         let source_ast = parser.parse_source_text();
         let diags = parser.diagnostics().to_vec();
 
