@@ -3043,6 +3043,17 @@ impl Simulator {
             }
             ExprKind::Index { expr: base, index } => {
                 let hier = if let ExprKind::Ident(h) = &base.kind { h } else { return None; };
+                // Reject array element access (e.g. `reg mem [3:0]; mem[0]`) —
+                // this is NOT a bit-select on a packed vector. Treating it as
+                // such would read bit 0 of the whole-array signal storage
+                // instead of element 0.
+                let name = Self::resolve_hier_name_static(hier, &self.module);
+                if self.module.arrays.contains_key(&name) { return None; }
+                if let Some(scope) = scope_hint {
+                    if self.module.arrays.contains_key(&format!("{}.{}", scope, name)) {
+                        return None;
+                    }
+                }
                 let id = self.resolve_ident_id(hier, scope_hint)?;
                 let bit = Self::try_const_u64(index)?;
                 if (bit as u32) < self.signal_widths[id] {
