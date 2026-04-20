@@ -43,7 +43,7 @@ impl StdoutSink {
     pub fn threaded() -> Self {
         let (tx, rx) = mpsc::channel::<Msg>();
         let handle = std::thread::Builder::new()
-            .name("sisvsim-stdout".to_string())
+            .name("xezim-stdout".to_string())
             .spawn(move || {
                 // Do NOT hold an exclusive `stdout.lock()` on the worker —
                 // it would deadlock anything on the main thread that
@@ -59,7 +59,7 @@ impl StdoutSink {
                 }
                 let _ = w.flush();
             })
-            .expect("spawn sisvsim-stdout writer thread");
+            .expect("spawn xezim-stdout writer thread");
         StdoutSink {
             mode: Mode::Threaded {
                 buf: Vec::with_capacity(BUF_CAPACITY),

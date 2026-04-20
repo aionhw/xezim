@@ -1,5 +1,5 @@
 
-use sisvsim::simulate;
+use xezim::simulate;
 
 #[test]
 fn test_repro_import_wildcard() {

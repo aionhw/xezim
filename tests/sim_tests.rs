@@ -1,19 +1,19 @@
 //! Simulation tests for the SystemVerilog compiler/simulator.
 
-use sisvsim::{simulate, simulate_multi};
-use sisvsim::compiler::Value;
+use xezim::{simulate, simulate_multi};
+use xezim::compiler::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn sim_ok(src: &str) -> sisvsim::compiler::Simulator {
+fn sim_ok(src: &str) -> xezim::compiler::Simulator {
     match simulate(src, 100_000) {
         Ok(sim) => sim,
         Err(e) => panic!("Simulation failed: {}", e),
     }
 }
 
-fn sim_ok_plusargs(src: &str, plusargs: &[&str]) -> sisvsim::compiler::Simulator {
+fn sim_ok_plusargs(src: &str, plusargs: &[&str]) -> xezim::compiler::Simulator {
     let source = src.to_string();
     let plusargs_vec: Vec<String> = plusargs.iter().map(|s| (*s).to_string()).collect();
     match simulate_multi(
@@ -42,7 +42,7 @@ fn temp_file_path(tag: &str) -> PathBuf {
         .unwrap_or_default()
         .as_nanos();
     let mut p = std::env::temp_dir();
-    p.push(format!("sisvsim_{}_{}_{}", tag, std::process::id(), nanos));
+    p.push(format!("xezim_{}_{}_{}", tag, std::process::id(), nanos));
     p
 }
 

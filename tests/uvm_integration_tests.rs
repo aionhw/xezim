@@ -1,4 +1,4 @@
-use sisvsim::*;
+use xezim::*;
 use std::fs;
 
 #[test]

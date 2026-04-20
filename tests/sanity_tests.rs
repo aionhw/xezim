@@ -1,5 +1,5 @@
-use sisvsim::*;
-use sisvsim::ast::*;
+use xezim::*;
+use xezim::ast::*;
 use sv_parser::{tokenize, parse};
 
 #[test]

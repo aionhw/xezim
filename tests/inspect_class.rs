@@ -1,5 +1,5 @@
-use sisvsim::*;
-use sisvsim::ast::*;
+use xezim::*;
+use xezim::ast::*;
 
 #[test]
 fn test_class_items() {

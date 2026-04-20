@@ -1,14 +1,14 @@
 //! SV LRM compliance tests (unit tests for compiler components).
-use sisvsim::*;
-use sisvsim::ast::*;
-use sisvsim::ast::module::*;
-use sisvsim::ast::decl::*;
-use sisvsim::ast::types::*;
-use sisvsim::ast::expr::*;
-use sisvsim::ast::stmt::*;
+use xezim::*;
+use xezim::ast::*;
+use xezim::ast::module::*;
+use xezim::ast::decl::*;
+use xezim::ast::types::*;
+use xezim::ast::expr::*;
+use xezim::ast::stmt::*;
 
 fn parse_ok(source: &str) -> ParseResult {
-    let result = sisvsim::parse_str(source);
+    let result = xezim::parse_str(source);
     match result {
         Ok(res) => {
             if !res.errors.is_empty() {

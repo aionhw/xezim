@@ -2,7 +2,7 @@ use std::env;
 use std::path::Path;
 
 fn print_usage() {
-    eprintln!("Usage: sisvsim [mode] [options] <source_files> [plusargs]");
+    eprintln!("Usage: xezim [mode] [options] <source_files> [plusargs]");
     eprintln!("Modes (pick one; default is 'simulate'):");
     eprintln!("  --parse          Lex + parse only, report diagnostics");
     eprintln!("  --compile        Parse + elaborate, report diagnostics (no simulation)");
@@ -30,7 +30,7 @@ fn print_usage() {
 }
 
 fn print_version() {
-    println!("sisvsim version 0.1.0");
+    println!("xezim version 0.1.0");
 }
 
 fn push_define_token(tok: &str, defines: &mut Vec<(String, Option<String>)>) {
@@ -226,7 +226,7 @@ fn main() {
     let mut settle_limit: Option<u32> = None;
     let mut activity_mon = false;
     let mut sdf_file: Option<String> = None;
-    let mut sdf_select: Option<sisvsim::compiler::sdf::DelaySelect> = None;
+    let mut sdf_select: Option<xezim::compiler::sdf::DelaySelect> = None;
     let mut aitrace = false;
     let mut sim_debug = false;
     let mut dpi_libs: Vec<String> = Vec::new();
@@ -353,9 +353,9 @@ fn main() {
                 i += 1;
                 if i < args.len() { sdf_file = Some(args[i].clone()); }
             }
-            "--sdf-min" => { sdf_select = Some(sisvsim::compiler::sdf::DelaySelect::Min); }
-            "--sdf-typ" => { sdf_select = Some(sisvsim::compiler::sdf::DelaySelect::Typ); }
-            "--sdf-max" => { sdf_select = Some(sisvsim::compiler::sdf::DelaySelect::Max); }
+            "--sdf-min" => { sdf_select = Some(xezim::compiler::sdf::DelaySelect::Min); }
+            "--sdf-typ" => { sdf_select = Some(xezim::compiler::sdf::DelaySelect::Typ); }
+            "--sdf-max" => { sdf_select = Some(xezim::compiler::sdf::DelaySelect::Max); }
             "--aitrace" => { aitrace = true; }
             "--sim_debug" => { sim_debug = true; }
             "--threads" => {
@@ -388,27 +388,27 @@ fn main() {
     }
 
     if let Some(ref path) = log_file {
-        if let Err(e) = sisvsim::set_log_file(path) {
+        if let Err(e) = xezim::set_log_file(path) {
             eprintln!("Error: cannot open log file '{}': {}", path, e);
             std::process::exit(1);
         }
     }
 
-    // Fast path: if the only source file is a sisvsim compiled artifact, load
+    // Fast path: if the only source file is a xezim compiled artifact, load
     // it and jump straight to simulation (skip parse + elaborate).
     if source_files.len() == 1 && mode == Mode::Simulate {
         let sf = &source_files[0];
         if let Ok(head) = std::fs::read(sf).as_ref().map(|v| v.iter().take(8).copied().collect::<Vec<u8>>()) {
-            if head.len() == 8 && &head[..] == sisvsim::SISVSIM_BYTECODE_MAGIC {
-                match sisvsim::read_compiled(sf) {
+            if head.len() == 8 && &head[..] == xezim::XEZIM_BYTECODE_MAGIC {
+                match xezim::read_compiled(sf) {
                     Ok(Some(elab)) => {
-                        println!("=== sisvsim ===");
+                        println!("=== xezim ===");
                         println!("Loaded compiled: {}", sf);
                         println!("Max time: {}", max_time);
                         println!("------------------------------");
-                        sisvsim::compiler::simulator::set_sim_debug(sim_debug);
-                        sisvsim::compiler::simulator::set_dpi_libs(&dpi_libs);
-                        let mut sim = sisvsim::compiler::Simulator::new(elab, max_time);
+                        xezim::compiler::simulator::set_sim_debug(sim_debug);
+                        xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
+                        let mut sim = xezim::compiler::Simulator::new(elab, max_time);
                         if let Some(limit) = settle_limit { sim.settle_limit = limit; }
                         sim.activity_mon = activity_mon;
                         sim.aitrace_mode = aitrace;
@@ -454,7 +454,7 @@ fn main() {
         if dump_tokens {
             for (_i, (label, source)) in file_labels.iter().zip(sources.iter()).enumerate() {
                 println!("=== Tokens: {} ===", label);
-                let tokens = sisvsim::tokenize_file(source, None);
+                let tokens = xezim::tokenize_file(source, None);
                 for tok in &tokens {
                     println!("{:?} '{}' @ {}..{}", tok.kind, tok.text, tok.span.start, tok.span.end);
                 }
@@ -502,11 +502,11 @@ fn main() {
             sources.len(), total_desc, total_err, total_warn);
         if total_err > 0 { std::process::exit(1); }
 
-        match sisvsim::parse_and_elaborate_multi(&sources, top_module.as_deref(), &include_dirs, &source_files, &defines) {
+        match xezim::parse_and_elaborate_multi(&sources, top_module.as_deref(), &include_dirs, &source_files, &defines) {
             Ok((_defs, elab)) => {
                 println!("Elaboration successful");
                 if let Some(ref out) = _output_file {
-                    match sisvsim::write_compiled(&elab, out) {
+                    match xezim::write_compiled(&elab, out) {
                         Ok(()) => println!("Wrote compiled artifact to {}", out),
                         Err(e) => { eprintln!("Error writing '{}': {}", out, e); std::process::exit(1); }
                     }
@@ -520,13 +520,13 @@ fn main() {
         return;
     }
 
-    println!("=== sisvsim ===");
+    println!("=== xezim ===");
     println!("Max time: {}", max_time);
     println!("------------------------------");
-    sisvsim::compiler::simulator::set_sim_debug(sim_debug);
-    sisvsim::compiler::simulator::set_dpi_libs(&dpi_libs);
+    xezim::compiler::simulator::set_sim_debug(sim_debug);
+    xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
 
-    match sisvsim::simulate_multi(&sources, max_time, top_module.as_deref(), &include_dirs, &source_files, settle_limit, activity_mon, sdf_file.as_deref(), sdf_select, &defines, aitrace, &plusargs, threads) {
+    match xezim::simulate_multi(&sources, max_time, top_module.as_deref(), &include_dirs, &source_files, settle_limit, activity_mon, sdf_file.as_deref(), sdf_select, &defines, aitrace, &plusargs, threads) {
         Ok(sim) => {
             println!("------------------------------");
             println!("Simulation finished at time {}", sim.time);

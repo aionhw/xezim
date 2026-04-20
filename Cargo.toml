@@ -1,5 +1,5 @@
 [package]
-name = "sisvsim"
+name = "xezim"
 version = "0.1.2"
 edition = "2021"
 rust-version = "1.75"
@@ -16,11 +16,11 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
 
 [[bin]]
-name = "sisvsim"
+name = "xezim"
 path = "src/main.rs"
 
 [lib]
-name = "sisvsim"
+name = "xezim"
 path = "src/lib.rs"
 
 [profile.release]

@@ -65,7 +65,7 @@ impl VcdSink {
     pub fn threaded(file: File) -> Self {
         let (tx, rx) = mpsc::channel::<WorkerMsg>();
         let handle = std::thread::Builder::new()
-            .name("sisvsim-vcd".to_string())
+            .name("xezim-vcd".to_string())
             .spawn(move || {
                 let mut w = BufWriter::with_capacity(256 * 1024, file);
                 while let Ok(msg) = rx.recv() {
@@ -86,7 +86,7 @@ impl VcdSink {
                 }
                 let _ = w.flush();
             })
-            .expect("spawn sisvsim-vcd writer thread");
+            .expect("spawn xezim-vcd writer thread");
         VcdSink {
             mode: Mode::Threaded {
                 buf: Vec::with_capacity(CHUNK_CAPACITY),

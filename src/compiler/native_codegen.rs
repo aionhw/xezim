@@ -1,4 +1,4 @@
-//! Native code generator for sisvsim.
+//! Native code generator for xezim.
 //!
 //! Compiles an elaborated gate-level design into a standalone Rust source file,
 //! which is then compiled to a native binary. The generated binary reproduces

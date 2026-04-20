@@ -1,6 +1,6 @@
 # --- Variables ---
 TEST        ?= 01_lexical_identifiers
-SISVSIM     = ../target/release/sisvsim
+XEZIM     = ../target/release/xezim
 LOG_DIR     = ./logs
 TEST_DIR    = ./tests
 RTL_DIR     = ./rtl
@@ -27,11 +27,11 @@ help:
 	@echo "  make run_all          : Run all 20 tests"
 
 # 1. Run a single test
-# We pass the RTL files (if they exist) and the specific test file to sisvsim
+# We pass the RTL files (if they exist) and the specific test file to xezim
 run:
 	@mkdir -p $(LOG_DIR)
 	@echo "Running simulation for $(TEST)..."
-	$(SISVSIM) $(SIS_FLAGS) $(wildcard $(RTL_DIR)/*.v) $(TEST_DIR)/$(TEST).sv
+	$(XEZIM) $(SIS_FLAGS) $(wildcard $(RTL_DIR)/*.v) $(TEST_DIR)/$(TEST).sv
 
 # 2. Run all tests in the list
 run_all:

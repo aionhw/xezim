@@ -11,10 +11,10 @@ fn run_prtest(filename: &str) {
     let test_file = test_dir.join(filename);
     assert!(test_file.exists(), "Test file not found: {}", test_file.display());
     
-    let output = Command::new(env!("CARGO_BIN_EXE_sisvsim"))
+    let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .arg(test_file.to_str().unwrap())
         .output()
-        .expect("Failed to execute sisvsim");
+        .expect("Failed to execute xezim");
     
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

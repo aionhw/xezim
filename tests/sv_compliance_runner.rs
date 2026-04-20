@@ -15,10 +15,10 @@ fn run_positive_compliance_test(subdir: &str, filename: &str) {
     let test_file = compliance_root().join(subdir).join(filename);
     assert!(test_file.exists(), "Test file not found: {}", test_file.display());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_sisvsim"))
+    let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .arg(test_file.to_str().unwrap())
         .output()
-        .expect("Failed to execute sisvsim");
+        .expect("Failed to execute xezim");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -57,11 +57,11 @@ fn run_negative_compliance_test(filename: &str) {
     let test_file = compliance_root().join("tests_negative").join(filename);
     assert!(test_file.exists(), "Test file not found: {}", test_file.display());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_sisvsim"))
+    let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .arg("--no-sim")
         .arg(test_file.to_str().unwrap())
         .output()
-        .expect("Failed to execute sisvsim");
+        .expect("Failed to execute xezim");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
