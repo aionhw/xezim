@@ -74,6 +74,27 @@ enum CombItem {
     /// Bytecode-compiled comb always block. Skips the AST interpreter per
     /// settle iteration — dominant hot path in RTL-heavy designs.
     CompiledAlwaysBlock { compiled: super::bytecode::CompiledBlock, is_always_comb: bool },
+    /// Fused 1-bit gate: recognizes yosys-generated patterns
+    /// `assign d[i] = a op b`, `assign d[i] = ~a`, `assign d[i] = s ? t : e`.
+    /// Skips bytecode VM entirely — reads operand bits from signal_table,
+    /// computes 4-state logic, writes single bit back.
+    FusedGate { op: FusedGate },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BitRef { sig_id: u32, bit: u32 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GateBin { And, Or, Xor }
+
+#[derive(Clone, Copy, Debug)]
+enum FusedGate {
+    /// dst = src, or dst = ~src when invert
+    Buf1 { dst: BitRef, src: BitRef, invert: bool },
+    /// dst = a op b, or dst = ~(a op b) when invert
+    Bin2 { dst: BitRef, a: BitRef, b: BitRef, op: GateBin, invert: bool },
+    /// dst = s ? t : e
+    Mux2 { dst: BitRef, s: BitRef, t: BitRef, e: BitRef },
 }
 
 #[derive(Clone)]
@@ -2332,7 +2353,13 @@ impl Simulator {
             // gate-level netlists whose per-bit assigns `assign d[0] = expr;`
             // would otherwise clobber the whole vector wire.
             let lhs_is_bare_ident = matches!(ca.lhs.kind, ExprKind::Ident(_));
-            let item = if let Some(dc) = direct_copy {
+            // Try fused-gate fast path first: recognizes yosys patterns like
+            // `assign d[0] = a & b` or `assign d[0] = ~(a & b)` — executes
+            // without VM dispatch, just bit reads + 4-state combinator + set_bit.
+            let fused = self.try_build_fused_gate(&ca.lhs, &ca.rhs, scope_hint.as_deref());
+            let item = if let Some(op) = fused {
+                CombItem::FusedGate { op }
+            } else if let Some(dc) = direct_copy {
                 dc
             } else if wids.len() == 1 && lhs_is_bare_ident {
                 let (dst_id, _) = wids[0];
@@ -2580,8 +2607,9 @@ impl Simulator {
         let cca_count = entries.iter().filter(|e| matches!(&e.item, CombItem::CompiledContAssign { .. })).count();
         let ca_count = entries.iter().filter(|e| matches!(&e.item, CombItem::ContAssign { .. })).count();
         let ab_count = entries.iter().filter(|e| matches!(&e.item, CombItem::AlwaysBlock { .. })).count();
-        if dc_count > 0 {
-            sim_dbg_eprintln!("[OPT] comb entries: {} direct-copy, {} compiled-ca, {} ast-ca, {} always-block", dc_count, cca_count, ca_count, ab_count);
+        let fg_count = entries.iter().filter(|e| matches!(&e.item, CombItem::FusedGate { .. })).count();
+        if dc_count > 0 || fg_count > 0 {
+            sim_dbg_eprintln!("[OPT] comb entries: {} direct-copy, {} compiled-ca, {} ast-ca, {} always-block, {} fused-gate", dc_count, cca_count, ca_count, ab_count, fg_count);
             sim_dbg_eprintln!("[OPT] edge blocks: {}, event_waiters: {}", self.edge_blocks.len(), self.event_waiters.len());
         }
         self.comb_entries = entries;
@@ -2977,6 +3005,109 @@ impl Simulator {
         raw.to_string()
     }
 
+    /// Resolve a hier ident to its signal_id, retrying with scope_hint prefix
+    /// for bare names. Returns None if unresolved.
+    fn resolve_ident_id(&self, hier: &HierarchicalIdentifier, scope_hint: Option<&str>) -> Option<usize> {
+        let name = Self::resolve_hier_name_static(hier, &self.module);
+        if let Some(&id) = self.signal_name_to_id.get(&name) { return Some(id); }
+        if let Some(scope) = scope_hint {
+            let qualified = format!("{}.{}", scope, name);
+            if let Some(&id) = self.signal_name_to_id.get(&qualified) { return Some(id); }
+        }
+        None
+    }
+
+    /// Try to evaluate `expr` as a constant non-negative u64 (for bit-select indices).
+    fn try_const_u64(expr: &Expression) -> Option<u64> {
+        match &expr.kind {
+            ExprKind::Paren(inner) => Self::try_const_u64(inner),
+            ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
+                let r = match base { NumberBase::Binary => 2, NumberBase::Octal => 8, NumberBase::Hex => 16, NumberBase::Decimal => 10 };
+                let cleaned: String = value.chars().filter(|c| *c != '_').collect();
+                u64::from_str_radix(&cleaned, r).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to resolve `expr` to a single-bit reference (sig_id, bit_index).
+    /// Handles bare identifiers (1-bit signals) and constant-index bit-selects.
+    fn try_resolve_bit_ref(&self, expr: &Expression, scope_hint: Option<&str>) -> Option<BitRef> {
+        match &expr.kind {
+            ExprKind::Paren(inner) => self.try_resolve_bit_ref(inner, scope_hint),
+            ExprKind::Ident(hier) => {
+                let id = self.resolve_ident_id(hier, scope_hint)?;
+                if self.signal_widths[id] == 1 {
+                    Some(BitRef { sig_id: id as u32, bit: 0 })
+                } else { None }
+            }
+            ExprKind::Index { expr: base, index } => {
+                let hier = if let ExprKind::Ident(h) = &base.kind { h } else { return None; };
+                let id = self.resolve_ident_id(hier, scope_hint)?;
+                let bit = Self::try_const_u64(index)?;
+                if (bit as u32) < self.signal_widths[id] {
+                    Some(BitRef { sig_id: id as u32, bit: bit as u32 })
+                } else { None }
+            }
+            _ => None,
+        }
+    }
+
+    /// Attempt to recognize a yosys-style gate pattern and return a fused op.
+    /// Only fires when LHS and all RHS leaves are single-bit refs with no SDF delay.
+    fn try_build_fused_gate(&self, lhs: &Expression, rhs: &Expression, scope_hint: Option<&str>) -> Option<FusedGate> {
+        let dst = self.try_resolve_bit_ref(lhs, scope_hint)?;
+        if self.sdf_delays[dst.sig_id as usize] != 0 { return None; }
+        // Strip outer parens on rhs
+        fn unparen(e: &Expression) -> &Expression {
+            if let ExprKind::Paren(inner) = &e.kind { unparen(inner) } else { e }
+        }
+        let r = unparen(rhs);
+        // 1) Conditional (mux): s ? t : e
+        if let ExprKind::Conditional { condition, then_expr, else_expr } = &r.kind {
+            let s = self.try_resolve_bit_ref(condition, scope_hint)?;
+            let t = self.try_resolve_bit_ref(then_expr, scope_hint)?;
+            let e = self.try_resolve_bit_ref(else_expr, scope_hint)?;
+            return Some(FusedGate::Mux2 { dst, s, t, e });
+        }
+        // 2) Unary BitNot: ~X where X is leaf or binary
+        if let ExprKind::Unary { op: UnaryOp::BitNot, operand } = &r.kind {
+            let inner = unparen(operand);
+            if let ExprKind::Binary { op, left, right } = &inner.kind {
+                let gop = match op {
+                    BinaryOp::BitAnd => GateBin::And,
+                    BinaryOp::BitOr => GateBin::Or,
+                    BinaryOp::BitXor => GateBin::Xor,
+                    _ => return None,
+                };
+                let a = self.try_resolve_bit_ref(left, scope_hint)?;
+                let b = self.try_resolve_bit_ref(right, scope_hint)?;
+                return Some(FusedGate::Bin2 { dst, a, b, op: gop, invert: true });
+            }
+            let src = self.try_resolve_bit_ref(operand, scope_hint)?;
+            return Some(FusedGate::Buf1 { dst, src, invert: true });
+        }
+        // 3) Binary: a & b, a | b, a ^ b
+        if let ExprKind::Binary { op, left, right } = &r.kind {
+            let gop = match op {
+                BinaryOp::BitAnd => Some(GateBin::And),
+                BinaryOp::BitOr => Some(GateBin::Or),
+                BinaryOp::BitXor => Some(GateBin::Xor),
+                _ => None,
+            };
+            if let Some(gop) = gop {
+                let a = self.try_resolve_bit_ref(left, scope_hint)?;
+                let b = self.try_resolve_bit_ref(right, scope_hint)?;
+                return Some(FusedGate::Bin2 { dst, a, b, op: gop, invert: false });
+            }
+        }
+        // 4) Simple buf: leaf
+        if let Some(src) = self.try_resolve_bit_ref(r, scope_hint) {
+            return Some(FusedGate::Buf1 { dst, src, invert: false });
+        }
+        None
+    }
+
     fn extract_sensitivity(&self, stmt: &Statement) -> Option<(Vec<Sensitivity>, Statement)> {
         match &stmt.kind {
             StatementKind::TimingControl { control, stmt: body } => {
@@ -3232,6 +3363,14 @@ impl Simulator {
                 // Get destination signal name to determine block
                 let dst_name = match &entry.item {
                     CombItem::DirectCopy { dst_id, .. } => &self.id_to_name[*dst_id],
+                    CombItem::FusedGate { op } => {
+                        let id = match op {
+                            FusedGate::Buf1 { dst, .. }
+                            | FusedGate::Bin2 { dst, .. }
+                            | FusedGate::Mux2 { dst, .. } => dst.sig_id as usize,
+                        };
+                        &self.id_to_name[id]
+                    }
                     CombItem::ContAssign {  .. } | CombItem::CompiledContAssign { .. } => {
                         if let Some((id, _)) = entry.write_signal_ids.first() {
                             &self.id_to_name[*id]
@@ -4209,6 +4348,11 @@ impl Simulator {
                         };
                         self.exec_insns(insns);
                         self.prof_settle_ab_count += 1;
+                    }
+                    CombItem::FusedGate { op } => {
+                        let op = *op;
+                        self.exec_fused_gate(op);
+                        self.prof_settle_dc_count += 1;
                     }
                 }
 
@@ -6621,6 +6765,78 @@ impl Simulator {
             if let Some(val) = self.signals.get(name) {
                 self.signal_table[id] = val.clone();
             }
+        }
+    }
+
+    /// Execute a fused 1-bit gate. Reads operand bits from signal_table,
+    /// computes 4-state result, writes single bit back if changed.
+    #[inline]
+    fn exec_fused_gate(&mut self, op: FusedGate) {
+        #[inline(always)]
+        fn and4(a: LogicBit, b: LogicBit) -> LogicBit {
+            use LogicBit::*;
+            if matches!(a, Zero) || matches!(b, Zero) { return Zero; }
+            if matches!(a, One) && matches!(b, One) { return One; }
+            X
+        }
+        #[inline(always)]
+        fn or4(a: LogicBit, b: LogicBit) -> LogicBit {
+            use LogicBit::*;
+            if matches!(a, One) || matches!(b, One) { return One; }
+            if matches!(a, Zero) && matches!(b, Zero) { return Zero; }
+            X
+        }
+        #[inline(always)]
+        fn xor4(a: LogicBit, b: LogicBit) -> LogicBit {
+            use LogicBit::*;
+            match (a, b) {
+                (Zero, Zero) | (One, One) => Zero,
+                (Zero, One) | (One, Zero) => One,
+                _ => X,
+            }
+        }
+        #[inline(always)]
+        fn not4(a: LogicBit) -> LogicBit {
+            use LogicBit::*;
+            match a { Zero => One, One => Zero, _ => X }
+        }
+        let (dst, new_bit) = match op {
+            FusedGate::Buf1 { dst, src, invert } => {
+                let s = self.signal_table[src.sig_id as usize].get_bit(src.bit as usize);
+                let v = if invert { not4(s) } else {
+                    // Z treated as X when used as a wire value
+                    match s { LogicBit::Z => LogicBit::X, other => other }
+                };
+                (dst, v)
+            }
+            FusedGate::Bin2 { dst, a, b, op: gop, invert } => {
+                let va = self.signal_table[a.sig_id as usize].get_bit(a.bit as usize);
+                let vb = self.signal_table[b.sig_id as usize].get_bit(b.bit as usize);
+                let r = match gop {
+                    GateBin::And => and4(va, vb),
+                    GateBin::Or => or4(va, vb),
+                    GateBin::Xor => xor4(va, vb),
+                };
+                (dst, if invert { not4(r) } else { r })
+            }
+            FusedGate::Mux2 { dst, s, t, e } => {
+                let vs = self.signal_table[s.sig_id as usize].get_bit(s.bit as usize);
+                let vt = self.signal_table[t.sig_id as usize].get_bit(t.bit as usize);
+                let ve = self.signal_table[e.sig_id as usize].get_bit(e.bit as usize);
+                let v = match vs {
+                    LogicBit::Zero => ve,
+                    LogicBit::One => vt,
+                    _ => if vt == ve { vt } else { LogicBit::X },
+                };
+                (dst, v)
+            }
+        };
+        let id = dst.sig_id as usize;
+        let cur = self.signal_table[id].get_bit(dst.bit as usize);
+        if cur != new_bit {
+            self.signal_table[id].set_bit(dst.bit as usize, new_bit);
+            self.table_modified = true;
+            self.mark_dirty_id(id);
         }
     }
 
