@@ -865,6 +865,19 @@ pub fn elaborate_module_with_defs(
         }
     }
 
+    // Pre-pass: collect user-defined nettype names so variables declared with
+    // those types can be classified as nets (§6.6.7 — nettype resolution permits
+    // multiple continuous drivers). Also register each nettype's width as a
+    // typedef so TypeReference lookups resolve correctly.
+    let mut user_nettypes: HashSet<String> = HashSet::new();
+    for item in module.items() {
+        if let ModuleItem::NettypeDeclaration(nd) = item {
+            user_nettypes.insert(nd.name.name.clone());
+            let w = resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
+            elab.typedefs.insert(nd.name.name.clone(), w);
+        }
+    }
+
     for item in module.items() {
         match item {
             ModuleItem::PortDeclaration(pd) => {
@@ -935,6 +948,14 @@ pub fn elaborate_module_with_defs(
                 }
             }
             ModuleItem::DataDeclaration(dd) => {
+                // User-defined nettype → classify as net (allow multiple continuous drivers).
+                if let DataType::TypeReference { name, .. } = &dd.data_type {
+                    if user_nettypes.contains(&name.name.name) {
+                        for decl in &dd.declarators {
+                            elab.nets.insert(decl.name.name.clone());
+                        }
+                    }
+                }
                 let data_modport_view = match &dd.data_type {
                     DataType::Interface { name, modport: Some(mp), .. } => {
                         resolve_interface_modport_view(&name.name, &mp.name, all_defs)
@@ -1490,6 +1511,49 @@ pub fn elaborate_module_with_defs(
                 elab.out_of_class_constraints.insert((class_name.clone(), constraint_name.clone()));
             }
             _ => {}
+        }
+    }
+
+    // User-defined nettype driver resolution: collapse multiple continuous
+    // drivers on a nettype variable into a single OR-combined assign. This
+    // approximates the common `resolve_or` resolver; other resolvers are not
+    // modeled, so last-driver-wins behavior applies via the final `|` fold.
+    {
+        let mut nettype_vars: HashSet<String> = HashSet::new();
+        for (name, sig) in &elab.signals {
+            if let Some(tn) = &sig.type_name {
+                if user_nettypes.contains(tn) { nettype_vars.insert(name.clone()); }
+            }
+        }
+        if !nettype_vars.is_empty() {
+            let mut grouped: HashMap<String, Vec<Expression>> = HashMap::new();
+            let mut kept: Vec<ContinuousAssignment> = Vec::new();
+            for ca in elab.continuous_assigns.drain(..) {
+                if let Some(n) = simple_lhs_name(&ca.lhs) {
+                    if nettype_vars.contains(&n) {
+                        grouped.entry(n).or_default().push(ca.rhs);
+                        continue;
+                    }
+                }
+                kept.push(ca);
+            }
+            for (name, rhses) in grouped {
+                let mut iter = rhses.into_iter();
+                let mut acc = iter.next().unwrap();
+                for rhs in iter {
+                    let span = acc.span;
+                    acc = Expression {
+                        kind: ExprKind::Binary {
+                            op: crate::ast::expr::BinaryOp::BitOr,
+                            left: Box::new(acc),
+                            right: Box::new(rhs),
+                        },
+                        span,
+                    };
+                }
+                kept.push(ContinuousAssignment { lhs: make_ident_expr(&name), rhs: acc });
+            }
+            elab.continuous_assigns = kept;
         }
     }
 

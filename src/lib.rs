@@ -181,6 +181,7 @@ fn parse_and_elaborate(
     let mut top_level_lets = Vec::new();
     let mut top_level_functions: Vec<ast::decl::FunctionDeclaration> = Vec::new();
     let mut top_level_tasks: Vec<ast::decl::TaskDeclaration> = Vec::new();
+    let mut top_level_nettypes: Vec<ast::decl::NettypeDeclaration> = Vec::new();
     for desc in all_descriptions {
         match desc {
             ast::Description::Module(m) => {
@@ -229,12 +230,15 @@ fn parse_and_elaborate(
             ast::Description::PackageItem(ast::decl::PackageItem::Task(t)) => {
                 top_level_tasks.push(t.clone());
             }
+            ast::Description::PackageItem(ast::decl::PackageItem::Nettype(n)) => {
+                top_level_nettypes.push(n.clone());
+            }
             _ => {}
         }
     }
     // Inject $unit-scope functions and tasks into every module definition so
     // they're resolvable from inside an instance.
-    if !top_level_functions.is_empty() || !top_level_tasks.is_empty() {
+    if !top_level_functions.is_empty() || !top_level_tasks.is_empty() || !top_level_nettypes.is_empty() {
         for def in definitions.values_mut() {
             if let SourceDefinition::Module(m) = def {
                 for f in top_level_functions.iter().rev() {
@@ -242,6 +246,9 @@ fn parse_and_elaborate(
                 }
                 for t in top_level_tasks.iter().rev() {
                     m.items.insert(0, ast::decl::ModuleItem::TaskDeclaration(t.clone()));
+                }
+                for n in top_level_nettypes.iter().rev() {
+                    m.items.insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
                 }
             }
         }

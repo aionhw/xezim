@@ -1624,8 +1624,10 @@ impl Simulator {
         }
         self.classify_always_blocks();
         self.compile_edge_blocks();
-        self.build_comb_entries();
-        // Apply SDF delays: map signal names → signal IDs
+        // Apply SDF / specify delays BEFORE building comb entries — the fused-gate
+        // fast path bails out on signals with nonzero delay, so the delay must be
+        // visible at build time or cont_assigns to delayed signals will be fused
+        // and bypass `schedule_delayed`.
         if let Some(ref ann) = self.sdf_annotation {
             let mut count = 0;
             for (sig_name, &delay) in &ann.signal_delays {
@@ -1636,12 +1638,12 @@ impl Simulator {
             }
             eprintln!("[SDF] annotated {} signals with delays", count);
         }
-        // Apply `specify` path delays as destination signal inertial delays.
         for (sig_name, &delay) in &self.module.specify_delays {
             if let Some(&id) = self.signal_name_to_id.get(sig_name) {
                 self.sdf_delays[id] = self.sdf_delays[id].max(delay);
             }
         }
+        self.build_comb_entries();
         if self.activity_mon {
             self.activity_counts = vec![0u64; self.comb_entries.len()];
         }
