@@ -38,36 +38,37 @@ Current capabilities include:
 
 # Project Structure
 
+xezim is split across three sibling repos:
+
+```
+../xezim-core/   — shared library: parser, elaboration, value, SDF, VCD sink
+../xezim/        — bytecode interpreter (this repo, binary: xezim)
+../xezim-b/      — native compiler (binary: xezim-b) — emits a standalone executable
+```
+
+This repo:
+
 ```
 .
 ├── src/
 │   ├── compiler/
 │   │   ├── simulator.rs   — event-driven simulator + bytecode VM
 │   │   ├── bytecode.rs    — bytecode compiler for cont_assigns and always blocks
-│   │   ├── elaborate.rs   — module elaboration & hierarchy
-│   │   └── value.rs       — 4-state (0/1/X/Z) Value type
-│   ├── lib.rs
+│   │   └── mod.rs         — re-exports value/elaborate/sdf from xezim-core
+│   ├── lib.rs             — wraps xezim_core::parse_and_elaborate_multi + Simulator
 │   └── main.rs            — CLI entry point (binary: xezim)
-│
-├── xezim-parser/          — SystemVerilog parser (git submodule)
 ├── tests/                 — Rust integration tests + SV compliance suite
 ├── examples/
-└── Cargo.toml             — package: xezim
+└── Cargo.toml             — depends on xezim-core (path = ../xezim-core)
 ```
 
 ### Components
 
-**Parser**
+**Parser & elaboration** — live in `xezim-core`; consumed by both `xezim` and `xezim-b`.
 
-Reads SystemVerilog source and builds the AST.
+**Simulator** — event-driven VM over a bytecode lowering of cont_assigns and always blocks.
 
-**Elaboration**
-
-Resolves module hierarchy, signals, and connections.
-
-**Simulator**
-
-Evaluates expressions and propagates signal changes across the design.
+**Native compiler** (`xezim-b`) — AOT-lowers an elaborated design to Rust and links a standalone binary.
 
 ---
 
@@ -86,13 +87,12 @@ These tests help verify correctness against real-world Verilog/SystemVerilog edg
 
 Install Rust: https://www.rust-lang.org/tools/install
 
-Clone with submodules (parser lives in `xezim-parser`):
+Clone `xezim-core` alongside this repo (path dep, no submodules):
 
 ```bash
-git clone --recursive <repo-url> xezim
+git clone git@github.com:<you>/xezim-core.git
+git clone git@github.com:<you>/xezim.git
 cd xezim
-# or, if already cloned:
-git submodule update --init
 ```
 
 Build the simulator:
