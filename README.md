@@ -43,7 +43,6 @@ xezim is split across three sibling repos:
 ```
 ../xezim-core/   — shared library: parser, elaboration, value, SDF, VCD sink
 ../xezim/        — bytecode interpreter (this repo, binary: xezim)
-../xezim-b/      — native compiler (binary: xezim-b) — emits a standalone executable
 ```
 
 This repo:
