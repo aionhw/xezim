@@ -4207,7 +4207,7 @@ impl Simulator {
             }
         }
         // Time-0 / empty-read-set fire unconditionally once.
-        if self.time == 0 || true {
+        if self.time == 0 {
             for eidx in 0..num_entries {
                 if !self.settle_triggered[eidx] {
                     if entries[eidx].read_signal_ids.is_empty()
