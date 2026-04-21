@@ -3,13 +3,14 @@ name = "xezim"
 version = "0.1.2"
 edition = "2021"
 rust-version = "1.75"
-description = "SystemVerilog simulator targeting IEEE 1800-2017/2023"
+description = "SystemVerilog bytecode interpreter (IEEE 1800-2017/2023). For native compilation, see xezim-b."
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 ahash = { version = "0.8", features = ["serde"] }
 rand = "0.8"
-sv-parser = { path = "xezim-parser" }
+xezim-core = { path = "../xezim-core" }
+sv-parser = { path = "../xezim-core/xezim-parser" }
 libloading = "0.8"
 libffi = "3"
 serde = { version = "1", features = ["derive"] }
