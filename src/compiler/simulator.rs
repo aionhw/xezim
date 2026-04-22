@@ -2582,8 +2582,22 @@ impl Simulator {
                     }
                 }
             }
-            // Apply permutation if we got a full order.
-            if new_order.len() == n {
+            // Apply permutation only if we got a real full permutation.
+            let valid_permutation = if new_order.len() == n {
+                let mut seen = vec![false; n];
+                let mut ok = true;
+                for &i in &new_order {
+                    if i >= n || seen[i] {
+                        ok = false;
+                        break;
+                    }
+                    seen[i] = true;
+                }
+                ok
+            } else {
+                false
+            };
+            if valid_permutation {
                 let mut permuted: Vec<CombEntry> = Vec::with_capacity(n);
                 // Take entries out via swap_remove would mangle indices; rebuild by index.
                 // Use an Option<CombEntry> trick.
@@ -2592,6 +2606,12 @@ impl Simulator {
                     permuted.push(slots[i].take().unwrap());
                 }
                 entries = permuted;
+            } else if !new_order.is_empty() && n > 0 {
+                eprintln!(
+                    "[xezim][comb] skipping invalid reorder permutation: len={} entries={}",
+                    new_order.len(),
+                    n
+                );
             }
         }
 

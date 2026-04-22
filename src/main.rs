@@ -76,6 +76,32 @@ fn resolve_rel(base: &Path, p: &str) -> String {
     }
 }
 
+fn preprocess_sources(
+    sources: &[String],
+    source_files: &[String],
+    include_dirs: &[String],
+    defines: &[(String, Option<String>)],
+) -> Result<Vec<String>, String> {
+    let mut pp = xezim::preprocessor::Preprocessor::new();
+    for dir in include_dirs {
+        pp.add_include_dir(std::path::PathBuf::from(dir));
+    }
+    for (name, val) in defines {
+        pp.define(name.clone(), xezim::preprocessor::MacroDef {
+            name: name.clone(),
+            params: None,
+            body: val.clone().unwrap_or_default(),
+        });
+    }
+
+    let mut preprocessed = Vec::with_capacity(sources.len());
+    for (i, source) in sources.iter().enumerate() {
+        let source_path = source_files.get(i).map(|p| std::path::PathBuf::from(p));
+        preprocessed.push(pp.preprocess_file(source, source_path.as_deref()));
+    }
+    Ok(preprocessed)
+}
+
 fn split_filelist_line(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -120,10 +146,23 @@ fn process_command_file(
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Cannot read command file '{}': {}", path, e))?;
     let base = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+    let mut in_block_comment = false;
 
     for raw in content.lines() {
         let mut line = raw.trim();
         if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
+            continue;
+        }
+        if in_block_comment {
+            if let Some((_prefix, _)) = line.split_once("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if line.starts_with("/*") {
+            if !line.contains("*/") {
+                in_block_comment = true;
+            }
             continue;
         }
         if let Some((prefix, _)) = line.split_once("//") {
@@ -450,9 +489,17 @@ fn main() {
         }
     }
 
+    let preprocessed_sources = match preprocess_sources(&sources, &source_files, &include_dirs, &defines) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: preprocessing failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     if mode == Mode::Parse {
         if dump_tokens {
-            for (_i, (label, source)) in file_labels.iter().zip(sources.iter()).enumerate() {
+            for (_i, (label, source)) in file_labels.iter().zip(preprocessed_sources.iter()).enumerate() {
                 println!("=== Tokens: {} ===", label);
                 let tokens = xezim::tokenize_file(source, None);
                 for tok in &tokens {
@@ -463,22 +510,25 @@ fn main() {
         let mut total_desc = 0;
         let mut total_err = 0;
         let mut total_warn = 0;
-        for (label, source) in file_labels.iter().zip(sources.iter()) {
-            let result = sv_parser::parse(source);
-            for err in &result.errors {
-                let (line, col) = byte_to_line_col(&result.source_text, err.span.start);
+        for (label, source) in file_labels.iter().zip(preprocessed_sources.iter()) {
+            let tokens = xezim::lexer::Lexer::new(source).tokenize();
+            let mut parser = sv_parser::parse::Parser::new(tokens);
+            let source_ast = parser.parse_source_text();
+            let diags = parser.diagnostics().to_vec();
+            for err in diags.iter().filter(|d| d.severity == xezim::diagnostics::Severity::Error) {
+                let (line, col) = byte_to_line_col(source, err.span.start);
                 eprintln!("[{}] {}:{}: error: {}", label, line, col, err.message);
             }
-            total_desc += result.source.descriptions.len();
-            total_err += result.errors.len();
-            total_warn += result.warnings.len();
+            total_desc += source_ast.descriptions.len();
+            total_err += diags.iter().filter(|d| d.severity == xezim::diagnostics::Severity::Error).count();
+            total_warn += diags.iter().filter(|d| d.severity == xezim::diagnostics::Severity::Warning).count();
             if dump_ast {
                 println!("=== AST: {} ===", label);
-                println!("{:#?}", result.source);
+                println!("{:#?}", source_ast);
             }
         }
         println!("Parsed {} file(s): {} descriptions, {} errors, {} warnings",
-            sources.len(), total_desc, total_err, total_warn);
+            preprocessed_sources.len(), total_desc, total_err, total_warn);
         if total_err > 0 { std::process::exit(1); }
         return;
     }
@@ -488,18 +538,21 @@ fn main() {
         let mut total_err = 0;
         let mut total_warn = 0;
 
-        for (label, source) in file_labels.iter().zip(sources.iter()) {
-            let result = sv_parser::parse(source);
-            for err in &result.errors {
-                let (line, col) = byte_to_line_col(&result.source_text, err.span.start);
+        for (label, source) in file_labels.iter().zip(preprocessed_sources.iter()) {
+            let tokens = xezim::lexer::Lexer::new(source).tokenize();
+            let mut parser = sv_parser::parse::Parser::new(tokens);
+            let source_ast = parser.parse_source_text();
+            let diags = parser.diagnostics().to_vec();
+            for err in diags.iter().filter(|d| d.severity == xezim::diagnostics::Severity::Error) {
+                let (line, col) = byte_to_line_col(source, err.span.start);
                 eprintln!("[{}] {}:{}: error: {}", label, line, col, err.message);
             }
-            total_desc += result.source.descriptions.len();
-            total_err += result.errors.len();
-            total_warn += result.warnings.len();
+            total_desc += source_ast.descriptions.len();
+            total_err += diags.iter().filter(|d| d.severity == xezim::diagnostics::Severity::Error).count();
+            total_warn += diags.iter().filter(|d| d.severity == xezim::diagnostics::Severity::Warning).count();
         }
         println!("Parsed {} file(s): {} descriptions, {} errors, {} warnings",
-            sources.len(), total_desc, total_err, total_warn);
+            preprocessed_sources.len(), total_desc, total_err, total_warn);
         if total_err > 0 { std::process::exit(1); }
 
         match xezim::parse_and_elaborate_multi(&sources, top_module.as_deref(), &include_dirs, &source_files, &defines) {
