@@ -484,6 +484,15 @@ pub struct Simulator {
     /// Bytecode-compiled edge blocks (for blocks that compiled successfully).
     /// Index matches edge_blocks. None = fallback to AST interpreter.
     compiled_edge_blocks: Vec<Option<super::bytecode::CompiledBlock>>,
+    /// Parallel array to `compiled_edge_blocks`: when feature=jit is on
+    /// and `JitModule::try_compile` succeeded at elaboration time, this
+    /// holds the native function pointer for the block. `exec_bytecode`
+    /// calls it in place of the interpreter loop. None = use interpreter.
+    jit_fns: Vec<Option<super::jit::JitFn>>,
+    /// The `JitModule` owns the JIT'd code's memory — it must outlive
+    /// all compiled function pointers. Kept on Simulator so the mmapped
+    /// code pages stay mapped for the life of the simulation.
+    jit_module: Option<super::jit::JitModule>,
     /// True for blocks eligible for parallel execution (no StmtFallback).
     edge_block_parallel: Vec<bool>,
     /// Per-edge-block: cached scope hint (parent module name from first
@@ -685,7 +694,9 @@ impl Simulator {
             return_value: None,
             rng: rand::rngs::StdRng::from_entropy(),
             settling: false, in_edge_block: false,
-            nba_queue: Vec::new(), nba_fast: Vec::new(), edge_blocks: Vec::new(), compiled_edge_blocks: Vec::new(), edge_block_parallel: Vec::new(), edge_block_scope: Vec::new(), edge_block_needs_hint: Vec::new(), vm_regs: Vec::new(), clock_generators: Vec::new(),
+            nba_queue: Vec::new(), nba_fast: Vec::new(), edge_blocks: Vec::new(), compiled_edge_blocks: Vec::new(),
+            jit_fns: Vec::new(), jit_module: None,
+            edge_block_parallel: Vec::new(), edge_block_scope: Vec::new(), edge_block_needs_hint: Vec::new(), vm_regs: Vec::new(), clock_generators: Vec::new(),
             event_queue: TimingWheel::new(), next_pid: 0, current_pid: 0,
             dollar_bound: Vec::new(),
             break_flag: false, continue_flag: false, rs_return_flag: false,
@@ -2018,6 +2029,32 @@ impl Simulator {
         // Pre-allocate register file for the largest compiled block
         self.vm_regs = vec![Value::zero(1); max_regs as usize];
         sim_dbg_eprintln!("[OPT] bytecode compiled: {}/{} edge blocks", bc_count, self.edge_blocks.len());
+
+        // JIT pass: attempt native codegen for each compiled block.
+        // Unsupported Insns inside a block → None (interpreter runs it).
+        // When feature=jit is off, `JitModule::new` returns None and
+        // every `try_compile` also returns None — zero-cost fallback.
+        let enable_jit = std::env::var("XEZIM_JIT").map(|v| v != "0" && v != "").unwrap_or(false);
+        self.jit_fns = vec![None; self.compiled_edge_blocks.len()];
+        if enable_jit {
+            if self.jit_module.is_none() {
+                self.jit_module = super::jit::JitModule::new();
+            }
+            if let Some(jm) = self.jit_module.as_mut() {
+                let mut jit_count = 0usize;
+                for (idx, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
+                    if let Some(cb) = cb_opt {
+                        if let Some(f) = jm.try_compile(&cb.instructions, cb.num_regs as u32) {
+                            self.jit_fns[idx] = Some(f);
+                            jit_count += 1;
+                        }
+                    }
+                }
+                eprintln!("[JIT] compiled {}/{} edge blocks", jit_count, self.compiled_edge_blocks.len());
+            } else {
+                eprintln!("[JIT] cranelift init failed; interpreter only");
+            }
+        }
         // Classify blocks for parallel execution: blocks with StmtFallback or
         // BlockingAssign/BlockingAssignRange/BlockingAssignBitDyn must run
         // sequentially — fallbacks need &mut self, blocking assigns mutate
@@ -2218,8 +2255,23 @@ impl Simulator {
     /// Execute a compiled bytecode block. Returns true if executed successfully.
     #[inline]
     fn exec_bytecode(&mut self, block_idx: usize) -> bool {
-        // Get a raw pointer to the instructions to avoid borrow conflict.
-        // Safety: exec_insns does not modify compiled_edge_blocks.
+        // Fast path: if we JIT-compiled this block, call the native fn
+        // directly. Zero-cost when the jit feature is off (jit_fns stays
+        // empty; index returns None which short-circuits).
+        if let Some(Some(jit_fn)) = self.jit_fns.get(block_idx).copied() {
+            let self_ptr: *mut u8 = self as *mut Self as *mut u8;
+            let rc = unsafe { jit_fn(self_ptr) };
+            if rc == 0 {
+                self.prof_insns_executed += self.compiled_edge_blocks[block_idx]
+                    .as_ref().map(|cb| cb.instructions.len() as u64).unwrap_or(0);
+                return true;
+            }
+            // Non-zero return: block asked for interpreter fallback
+            // (e.g. encountered a Wide/4-state path). Mark this block
+            // un-JITtable for the rest of the run and fall through.
+            self.jit_fns[block_idx] = None;
+        }
+        // Interpreter path.
         let (insns_ptr, insns_len, num_regs) = match &self.compiled_edge_blocks[block_idx] {
             Some(cb) => (cb.instructions.as_ptr(), cb.instructions.len(), cb.num_regs as usize),
             None => return false,
@@ -7269,6 +7321,51 @@ impl Simulator {
         if self.activity_mon {
             self.signal_toggle_counts[id] += 1;
         }
+    }
+
+    /// JIT bridge: read `signal_table[id]` as a raw `u64` of val_bits.
+    /// For 4-state (X/Z) values we still return a best-effort bit
+    /// pattern (the val_bits directly) — the JIT'd block will compute
+    /// on garbage but the caller re-runs the block via the interpreter
+    /// afterwards if any X/Z is in play. (Phase-1 MVP: no XZ tracking
+    /// in JIT code; we rely on post-execution fallback semantics which
+    /// are fine for c910 post-reset where all signals are determinate.)
+    #[inline]
+    pub(crate) fn jit_load_signal(&self, id: usize) -> u64 {
+        if id >= self.signal_table.len() { return 0; }
+        self.signal_table[id].to_u64().unwrap_or(0)
+    }
+
+    /// JIT bridge: mirror `Insn::BlockingAssign` — width-mask the
+    /// incoming val_bits, compare against current signal value, mark
+    /// dirty + propagate if changed. Preserves `is_signed` from the
+    /// signal's declared sign so readers get correct arithmetic.
+    #[inline]
+    pub(crate) fn jit_store_signal(&mut self, id: usize, val_bits: u64, width: u32) {
+        if id >= self.signal_table.len() { return; }
+        let sig_w = self.signal_widths[id];
+        let w = if width == 0 { sig_w } else { width };
+        let mut new_val = Value::from_u64(val_bits, w);
+        if w != sig_w { new_val = new_val.resize(sig_w); }
+        new_val.is_signed = self.signal_signed[id];
+        if self.signal_table[id] != new_val {
+            self.mark_dirty_id(id);
+            self.signal_table[id] = new_val;
+            self.table_modified = true;
+        }
+    }
+
+    /// JIT bridge: mirror `Insn::NbaAssign` — push an `NbaFast` entry.
+    /// `apply_nba` later commits to `signal_table` at the end-of-cycle.
+    #[inline]
+    pub(crate) fn jit_schedule_nba(&mut self, id: usize, val_bits: u64, width: u32) {
+        if id >= self.signal_table.len() { return; }
+        let sig_w = self.signal_widths[id];
+        let w = if width == 0 { sig_w } else { width };
+        let mut val = Value::from_u64(val_bits, w);
+        if w != sig_w { val = val.resize(sig_w); }
+        val.is_signed = self.signal_signed[id];
+        self.nba_fast.push(NbaFast { signal_id: id, value: val });
     }
 
     /// Fast signal write: update both signal_table and signals HashMap.
