@@ -5,6 +5,7 @@
 //! paths keep resolving.
 
 pub mod bytecode;
+pub mod jit;
 pub mod simulator;
 
 pub use xezim_core::value;

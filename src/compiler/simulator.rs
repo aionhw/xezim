@@ -2181,6 +2181,9 @@ impl Simulator {
                     else { nba_out.push(NbaFast { signal_id: *sig_id, value: new_val }); }
                 }
                 Insn::LoadArrayElem(dest, array_name, idx_reg) => {
+                    // Isolated/parallel path has no mutable access to the
+                    // array_elem_ids cache, so keep the format-based lookup
+                    // here. Sequential path (exec_insns) uses the cache.
                     let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0);
                     let elem_name = format!("{}[{}]", array_name, idx);
                     if let Some(&eid) = signal_name_to_id.get(&elem_name) {
@@ -2464,6 +2467,13 @@ impl Simulator {
                     }
                 }
                 Insn::LoadArrayElem(dest, array_name, idx_reg) => {
+                    // Direct format+lookup here (not the get_array_elem_id
+                    // eager cache). For sparse VM access patterns like
+                    // per-cycle instruction fetches, the cache's O(N)
+                    // populate cost on first touch dominates when only a
+                    // few elements of a large memory are ever read in the
+                    // hot loop. Eager cache is only a win in dense sweeps
+                    // (memory wipe), which hits via assign_value, not here.
                     let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0);
                     let elem_name = format!("{}[{}]", array_name, idx);
                     if let Some(&eid) = self.signal_name_to_id.get(&elem_name) {
