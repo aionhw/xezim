@@ -81,6 +81,12 @@ pub enum Insn {
     /// Non-blocking partial assign: signal_table[id][hi:lo] <= reg.
     /// Read-modify-write at exec time using current signal value as base.
     NbaAssignRange(usize, u32, u32, RegId), // (signal_id, hi, lo, value_reg)
+    /// NBA partial assign with dynamic hi/lo (mirrors `BlockingAssignRangeDyn`):
+    /// signal_table[id][hi_reg:lo_reg] <= reg. Lets us compile NBAs with
+    /// run-time bit ranges (e.g. `q[idx +: W]`, `q[j:j-W+1]`) instead of
+    /// falling back to the AST interpreter — critical on CPUs like c910
+    /// where these patterns fire millions of times per simulation.
+    NbaAssignRangeDyn(usize, RegId, RegId, RegId), // (signal_id, hi_reg, lo_reg, value_reg)
     /// Non-blocking bit assign: signal_table[id][bit_idx_reg] <= reg.
     NbaAssignBitDyn(usize, RegId, RegId), // (signal_id, idx_reg, value_reg)
     /// Blocking assign: signal_table[id] = reg.
@@ -911,8 +917,20 @@ impl<'a> BytecodeCompiler<'a> {
                 if *kind != RangeKind::Constant { self.bail("nba_range_nonconst"); return false; }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(id) = self.lookup_signal_id(hier) {
+                        // Fast path: compile-time constant range.
                         if let (Some(hi), Some(lo)) = (self.eval_const_expr(left), self.eval_const_expr(right)) {
                             self.emit(Insn::NbaAssignRange(id, hi, lo, val_reg));
+                            let _ = width;
+                            return true;
+                        }
+                        // Dynamic range: compile left/right as expressions.
+                        // Avoids the AST-interpreter fallback for patterns
+                        // like `q[idx+:W]` or `q[j:j-W+1]` that fire
+                        // millions of times per c910 run.
+                        if let (Some(hi_reg), Some(lo_reg)) =
+                            (self.compile_expr(left, 0), self.compile_expr(right, 0))
+                        {
+                            self.emit(Insn::NbaAssignRangeDyn(id, hi_reg, lo_reg, val_reg));
                             let _ = width;
                             return true;
                         }

@@ -194,13 +194,24 @@ struct TimingWheel {
     bitmap: [u64; BITMAP_WORDS], // occupancy bitmap: bit set = slot non-empty
     overflow: BTreeMap<u64, EventList>, // far-future events
     current_time: u64,           // last known simulation time
+    /// Multiset of pids currently scheduled somewhere in the wheel or
+    /// overflow. Lets `has_pid` return O(1) instead of scanning all 256
+    /// slots (and all overflow) on every `is_pid_suspended` check —
+    /// which fires on every run_scheduled_process call (~115K times on c910).
+    /// Count-based rather than set-based because the same pid can have
+    /// multiple scheduled events at different times.
+    pid_counts: std::collections::HashMap<usize, u32>,
 }
 
 impl TimingWheel {
     fn new() -> Self {
         let mut wheel = Vec::with_capacity(WHEEL_SIZE);
         for _ in 0..WHEEL_SIZE { wheel.push(Vec::new()); }
-        TimingWheel { wheel, bitmap: [0u64; BITMAP_WORDS], overflow: BTreeMap::new(), current_time: 0 }
+        TimingWheel {
+            wheel, bitmap: [0u64; BITMAP_WORDS],
+            overflow: BTreeMap::new(), current_time: 0,
+            pid_counts: std::collections::HashMap::new(),
+        }
     }
 
     #[inline(always)]
@@ -221,6 +232,7 @@ impl TimingWheel {
     /// Schedule an event at the given time.
     fn schedule(&mut self, time: u64, pid: usize, stmts: Vec<Statement>) {
         sim_dbg_eprintln!("[DEBUG] scheduling process {} at time {}", pid, time);
+        *self.pid_counts.entry(pid).or_insert(0) += 1;
         if time < self.current_time + WHEEL_SIZE as u64 {
             let s = Self::slot(time);
             self.wheel[s].push((pid, stmts));
@@ -297,18 +309,20 @@ impl TimingWheel {
         if !events.is_empty() {
             // Only clear bitmap if slot is truly empty
             self.bitmap_clear(s);
+            // Decrement pid_counts for each removed event.
+            for (p, _) in &events {
+                if let Some(c) = self.pid_counts.get_mut(p) {
+                    *c = c.saturating_sub(1);
+                    if *c == 0 { self.pid_counts.remove(p); }
+                }
+            }
         }
         events
     }
 
+    /// O(1) check: is any event scheduled for this pid anywhere in the queue?
     fn has_pid(&self, pid: usize) -> bool {
-        for list in &self.wheel {
-            for (p, _) in list { if *p == pid { return true; } }
-        }
-        for list in self.overflow.values() {
-            for (p, _) in list { if *p == pid { return true; } }
-        }
-        false
+        self.pid_counts.contains_key(&pid)
     }
 }
 
@@ -388,6 +402,12 @@ pub struct Simulator {
     signal_table: Vec<Value>,
     /// Map signal name → signal_id for fast lookup.
     signal_name_to_id: HashMap<String, usize>,
+    /// Lazy per-array element-ID cache: array_name → Vec where index is the
+    /// element index and the value is the flat signal_id (None if missing).
+    /// Populated on first miss in the hot write/read path; avoids per-access
+    /// `format!("{}[{}]", name, i)` + HashMap lookup on tight loops like
+    /// memory wipe/load in testbenches.
+    array_elem_ids: HashMap<String, Vec<i64>>,
     id_to_name: Vec<String>,
     /// Map signal_id → width (for fast width lookup).
     signal_widths: Vec<u32>,
@@ -403,6 +423,11 @@ pub struct Simulator {
     edge_signal_names: HashSet<String>,
     /// Edge sensitivity resolved to signal IDs.
     edge_signal_ids: Vec<usize>,
+    /// Reverse index signal_id → [(edge_block_idx, edge_kind)] built once after
+    /// edge_blocks are classified. Lets `check_edges` iterate edge-sensitive
+    /// signals (typically ~100s on c910: clk, rst_b, a few enables) instead
+    /// of all edge_blocks (10K+), yielding 50-100× faster edge detection.
+    edge_blocks_by_sig: Vec<Vec<(usize, EdgeKind)>>,
     pub time: u64,
     pub output: Vec<SimOutput>,
     capture_output: bool,
@@ -504,6 +529,19 @@ pub struct Simulator {
     pub aitrace_mode: bool,
     /// Pre-computed combinatorial entries with sensitivity sets.
     comb_entries: Vec<CombEntry>,
+    /// Precomputed indices of comb_entries with has_unresolved_reads=true.
+    /// Built once alongside comb_entries; scanning this short list every
+    /// settle call is vastly cheaper than iterating all num_entries bits
+    /// (can be ~500K on designs like c910).
+    comb_unresolved_idx: Vec<usize>,
+    /// Precomputed indices of comb_entries that should fire unconditionally
+    /// at time=0: entries with empty read_signal_ids, or always_comb blocks.
+    /// Avoids an O(num_entries) scan on every settle call while time=0.
+    comb_time0_idx: Vec<usize>,
+    /// Latches once `comb_time0_idx` has been seeded into settle_triggered.
+    /// Every subsequent settle call at time=0 can skip the re-seed; the
+    /// worklist and dirty propagation already keep things moving.
+    comb_time0_fired: bool,
     /// Reverse index: signal_id → list of comb_entry indices that read this signal.
     comb_dep_by_id: Vec<Vec<usize>>,
     /// Bitvec: dirty_signals[signal_id] = true if signal changed since last settle.
@@ -622,8 +660,9 @@ impl Simulator {
             prev_table,
             edge_signal_names: HashSet::new(),
             edge_signal_ids: Vec::new(),
+            edge_blocks_by_sig: Vec::new(),
             signals, widths, signed_signals, real_signals,
-            signal_table, signal_name_to_id, id_to_name: sig_names_sorted, signal_widths: signal_widths_vec, signal_signed: signal_signed_vec, signal_real: signal_real_vec,
+            signal_table, signal_name_to_id, array_elem_ids: HashMap::new(), id_to_name: sig_names_sorted, signal_widths: signal_widths_vec, signal_signed: signal_signed_vec, signal_real: signal_real_vec,
             time: 0, output: Vec::new(), capture_output: true, finished: false,
             monitor: None, monitor_prev: HashMap::new(), active_union_tag: HashMap::new(),
             max_time, settle_limit: 100,
@@ -663,6 +702,9 @@ impl Simulator {
             stdout_sink: None,
             aitrace_mode: false,
             comb_entries: Vec::new(),
+            comb_unresolved_idx: Vec::new(),
+            comb_time0_idx: Vec::new(),
+            comb_time0_fired: false,
             comb_dep_by_id: Vec::new(),
             dirty_signals: vec![false; num_signals],
             dirty_list: Vec::with_capacity(num_signals),
@@ -1659,6 +1701,15 @@ impl Simulator {
         // Also collect from event waiters that are registered at time 0
         self.edge_signal_ids.sort_unstable();
         self.edge_signal_ids.dedup();
+        // Build reverse index: signal_id -> [(edge_block_idx, edge_kind)].
+        self.edge_blocks_by_sig = vec![Vec::new(); self.signal_table.len()];
+        for (block_idx, block) in self.edge_blocks.iter().enumerate() {
+            for sid in &block.resolved_sensitivities {
+                if sid.signal_id < self.edge_blocks_by_sig.len() {
+                    self.edge_blocks_by_sig[sid.signal_id].push((block_idx, sid.edge));
+                }
+            }
+        }
         // IEEE 1800: at time 0, always_comb blocks execute unconditionally.
         // always @* blocks do NOT execute at time 0 unless inputs change.
         // Mark all signals dirty so continuous assigns and always_comb run.
@@ -1672,11 +1723,119 @@ impl Simulator {
                 StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
                 _ => vec![ib.stmt.clone()],
             };
+            // Clock-generator fast path:
+            //     initial begin VAR = CONST; forever #d VAR = ~VAR; end
+            // Otherwise each half-period would schedule a new process
+            // (~2.5ms per toggle on c910). Detect this pattern, apply
+            // the seed assignment immediately, and register a ClockGen
+            // so `fire_clock_generators` can toggle the signal O(1).
+            if let Some(cg) = self.try_extract_initial_clock_gen(&stmts) {
+                self.clock_generators.push(cg);
+                continue;
+            }
             let pid = self.next_pid; self.next_pid += 1;
             self.event_queue.schedule(0, pid, stmts);
         }
         self.event_loop();
         if self.aitrace_mode { self.aitrace_finish(); } else { self.vcd_finish(); }
+    }
+
+    /// Detect `initial begin VAR = CONST; forever #d VAR = ~VAR; end`
+    /// and turn it into a ClockGen. Applies the seed assignment in-place
+    /// so subsequent edge detection sees the right starting value, then
+    /// returns a ClockGen to push onto `clock_generators`. Returns None
+    /// if the initial block's shape doesn't match.
+    fn try_extract_initial_clock_gen(&mut self, stmts: &[Statement]) -> Option<ClockGen> {
+        if stmts.len() != 2 { return None; }
+        // Stmt 0: BlockingAssign(VAR, CONST)
+        let (seed_lhs_name, seed_val) = match &stmts[0].kind {
+            StatementKind::BlockingAssign { lvalue, rvalue } => {
+                let n = match &lvalue.kind {
+                    ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str())?,
+                    _ => return None,
+                };
+                // RHS must be a compile-time constant (plain integer,
+                // Paren-wrapped, or parameter reference).
+                let v = self.eval_expr(rvalue);
+                // Reject X/Z seeds; we need a determinate start value.
+                if v.has_xz() { return None; }
+                (n, v)
+            }
+            _ => return None,
+        };
+        // Stmt 1: Forever containing #d VAR = ~VAR
+        let (half_period, tog_name) = match &stmts[1].kind {
+            StatementKind::Forever { body } => {
+                let inner = match &body.kind {
+                    StatementKind::SeqBlock { stmts: s, .. } if s.len() == 1 => &s[0],
+                    StatementKind::SeqBlock { .. } => return None,
+                    _ => &**body,
+                };
+                // inner must be TimingControl::Delay(d) with BlockingAssign body
+                let (d_expr, assign_body) = match &inner.kind {
+                    StatementKind::TimingControl { control: TimingControl::Delay(d), stmt } => (d, stmt.as_ref()),
+                    _ => return None,
+                };
+                // Evaluate the delay expression at extraction time. Handles
+                // Paren-wrapped integers, parameter references, and
+                // `CLK_PERIOD/2`-style constant folding without having to
+                // teach the matcher every AST shape.
+                let delay = self.eval_expr(d_expr).to_u64()?;
+                // assign_body (or inner SeqBlock): BA VAR = ~VAR
+                let ba_target = match &assign_body.kind {
+                    StatementKind::BlockingAssign { lvalue, rvalue } => (lvalue, rvalue),
+                    StatementKind::SeqBlock { stmts: s, .. } if s.len() == 1 => {
+                        match &s[0].kind {
+                            StatementKind::BlockingAssign { lvalue, rvalue } => (lvalue, rvalue),
+                            _ => return None,
+                        }
+                    }
+                    _ => return None,
+                };
+                let (lhs, rhs) = ba_target;
+                let ln = match &lhs.kind {
+                    ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str())?,
+                    _ => return None,
+                };
+                // rhs must be ~LHS or !LHS
+                let rn = match &rhs.kind {
+                    ExprKind::Unary { op: UnaryOp::BitNot, operand } |
+                    ExprKind::Unary { op: UnaryOp::LogNot, operand } => {
+                        match &operand.kind {
+                            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str())?,
+                            _ => return None,
+                        }
+                    }
+                    _ => return None,
+                };
+                if ln != rn { return None; }
+                (delay, ln)
+            }
+            _ => return None,
+        };
+        if seed_lhs_name != tog_name { return None; }
+        // Resolve signal_id. Use the (hopefully cached) resolve_hier_name
+        // via signal_name_to_id directly on the leaf name — initial
+        // clock blocks almost always use unqualified names in the tb.
+        let sid = if let Some(&id) = self.signal_name_to_id.get(tog_name) {
+            id
+        } else {
+            // Suffix match
+            let suffix = format!(".{}", tog_name);
+            let found = self.signal_name_to_id.iter()
+                .find(|(k, _)| k.ends_with(&suffix))
+                .map(|(_, &v)| v)?;
+            found
+        };
+        // Apply seed: sets signal_table[sid] + marks dirty so settle sees it.
+        let width = self.signal_widths[sid];
+        let seed = seed_val.resize(width);
+        if self.signal_table[sid] != seed {
+            self.signal_table[sid] = seed;
+            self.mark_dirty_id(sid);
+            self.table_modified = true;
+        }
+        Some(ClockGen { signal_id: sid, half_period, next_toggle_time: half_period })
     }
 
     /// Try to detect `always #N var = ~var` pattern and extract as a ClockGen.
@@ -1889,7 +2048,8 @@ impl Simulator {
                     super::bytecode::Insn::BlockingAssignRangeDyn(..) |
                     super::bytecode::Insn::BlockingAssignBitDyn(..) |
                     super::bytecode::Insn::NbaAssignBitDyn(..) |
-                    super::bytecode::Insn::NbaAssignRange(..)
+                    super::bytecode::Insn::NbaAssignRange(..) |
+                    super::bytecode::Insn::NbaAssignRangeDyn(..)
                 ))
             );
             if is_pure { pure_count += 1; }
@@ -2042,8 +2202,8 @@ impl Simulator {
                 // These should never appear in parallel-eligible blocks
                 Insn::StmtFallback(..) | Insn::BlockingAssign(..) |
                 Insn::BlockingAssignRange(..) | Insn::BlockingAssignRangeDyn(..) |
-                Insn::BlockingAssignBitDyn(..) => {
-                    unreachable!("parallel block should not contain fallback/blocking instructions");
+                Insn::BlockingAssignBitDyn(..) | Insn::NbaAssignRangeDyn(..) => {
+                    unreachable!("parallel block should not contain fallback/blocking/NbaRangeDyn instructions");
                 }
                 Insn::Nop => {}
             }
@@ -2080,15 +2240,20 @@ impl Simulator {
             local_count += 1;
             match &insns[pc] {
                 Insn::LoadConst(dest, val) => {
-                    self.vm_regs[*dest as usize] = val.clone();
+                    // Reuse vm_regs[dest]'s buffer via copy_from — no alloc.
+                    self.vm_regs[*dest as usize].copy_from(val);
                 }
                 Insn::LoadSignal(dest, sig_id) => {
-                    self.vm_regs[*dest as usize] = self.signal_table[*sig_id].clone();
+                    let d = *dest as usize;
+                    let s = *sig_id;
+                    // Reuse vm_regs[d]'s buffer; disjoint fields of self.
+                    self.vm_regs[d].copy_from(&self.signal_table[s]);
                 }
                 Insn::LoadSignalSigned(dest, sig_id) => {
-                    let mut v = self.signal_table[*sig_id].clone();
-                    v.is_signed = true;
-                    self.vm_regs[*dest as usize] = v;
+                    let d = *dest as usize;
+                    let s = *sig_id;
+                    self.vm_regs[d].copy_from(&self.signal_table[s]);
+                    self.vm_regs[d].is_signed = true;
                 }
                 Insn::Resize(reg, width) => {
                     let r = *reg as usize;
@@ -2178,6 +2343,23 @@ impl Simulator {
                     let existing = self.nba_fast.iter().rposition(|n| n.signal_id == id);
                     let mut new_val = if let Some(i) = existing { self.nba_fast[i].value.clone() } else { self.signal_table[id].clone() };
                     for bit_pos in low..=high {
+                        let src_bit = val.get_bit((bit_pos - low) as usize);
+                        new_val.set_bit(bit_pos as usize, src_bit);
+                    }
+                    if let Some(i) = existing { self.nba_fast[i].value = new_val; }
+                    else { self.nba_fast.push(NbaFast { signal_id: id, value: new_val }); }
+                }
+                Insn::NbaAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
+                    let hi_u = self.vm_regs[*hi_reg as usize].to_u64().unwrap_or(0) as u32;
+                    let lo_u = self.vm_regs[*lo_reg as usize].to_u64().unwrap_or(0) as u32;
+                    let (low, high) = if hi_u >= lo_u { (lo_u, hi_u) } else { (hi_u, lo_u) };
+                    let w = high - low + 1;
+                    let val = self.vm_regs[*val_reg as usize].resize(w);
+                    let id = *sig_id;
+                    let existing = self.nba_fast.iter().rposition(|n| n.signal_id == id);
+                    let mut new_val = if let Some(i) = existing { self.nba_fast[i].value.clone() } else { self.signal_table[id].clone() };
+                    let sig_w = self.signal_widths[id];
+                    for bit_pos in low..=high.min(sig_w.saturating_sub(1)) {
                         let src_bit = val.get_bit((bit_pos - low) as usize);
                         new_val.set_bit(bit_pos as usize, src_bit);
                     }
@@ -2299,7 +2481,19 @@ impl Simulator {
                     }
                 }
                 Insn::Move(d, s) => {
-                    self.vm_regs[*d as usize] = self.vm_regs[*s as usize].clone();
+                    let d = *d as usize;
+                    let s = *s as usize;
+                    if d != s {
+                        // Split-borrow so we can copy_from in place without cloning.
+                        let (lo, hi) = if d < s {
+                            let (a, b) = self.vm_regs.split_at_mut(s);
+                            (&mut a[d], &b[0])
+                        } else {
+                            let (a, b) = self.vm_regs.split_at_mut(d);
+                            (&mut b[0], &a[s])
+                        };
+                        lo.copy_from(hi);
+                    }
                 }
                 Insn::SetSigned(reg) => {
                     self.vm_regs[*reg as usize].is_signed = true;
@@ -2549,34 +2743,33 @@ impl Simulator {
             }
             // Kahn's: pick zero-indegree, remove. If cycle, pick lowest indegree.
             let mut new_order: Vec<usize> = Vec::with_capacity(n);
+            let mut placed = vec![false; n];
             let mut ready: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
             while new_order.len() < n {
                 if let Some(a) = ready.pop() {
+                    if placed[a] { continue; }
+                    placed[a] = true;
                     new_order.push(a);
                     for &b in &succs[a] {
-                        indeg[b] -= 1;
+                        if placed[b] { continue; }
+                        if indeg[b] > 0 { indeg[b] -= 1; }
                         if indeg[b] == 0 { ready.push(b); }
                     }
                 } else {
                     // Cycle: pick any remaining node with min indegree.
-                    let mut best = usize::MAX; let mut best_d = usize::MAX;
-                    for i in 0..n {
-                        if indeg[i] != usize::MAX && indeg[i] < best_d && !new_order.contains(&i) {
-                            // Skip entries already emitted — use sentinel.
-                        }
-                    }
-                    // Linear scan using a placed[] bitmap (avoid O(n^2) contains).
-                    let mut placed = vec![false; n];
-                    for &x in &new_order { placed[x] = true; }
+                    let mut best = usize::MAX;
+                    let mut best_d = usize::MAX;
                     for i in 0..n {
                         if !placed[i] && indeg[i] < best_d {
                             best_d = indeg[i]; best = i;
                         }
                     }
                     if best == usize::MAX { break; }
+                    placed[best] = true;
                     new_order.push(best);
                     indeg[best] = 0;
                     for &b in &succs[best] {
+                        if placed[b] { continue; }
                         if indeg[b] > 0 { indeg[b] -= 1; }
                         if indeg[b] == 0 { ready.push(b); }
                     }
@@ -2634,6 +2827,17 @@ impl Simulator {
             sim_dbg_eprintln!("[OPT] comb entries: {} direct-copy, {} compiled-ca, {} ast-ca, {} always-block, {} fused-gate", dc_count, cca_count, ca_count, ab_count, fg_count);
             sim_dbg_eprintln!("[OPT] edge blocks: {}, event_waiters: {}", self.edge_blocks.len(), self.event_waiters.len());
         }
+        self.comb_unresolved_idx = entries.iter().enumerate()
+            .filter_map(|(i, e)| if e.has_unresolved_reads { Some(i) } else { None })
+            .collect();
+        self.comb_time0_idx = entries.iter().enumerate()
+            .filter_map(|(i, e)| {
+                let always_comb = matches!(&e.item,
+                    CombItem::AlwaysBlock { is_always_comb: true, .. }
+                    | CombItem::CompiledAlwaysBlock { is_always_comb: true, .. });
+                if e.read_signal_ids.is_empty() || always_comb { Some(i) } else { None }
+            })
+            .collect();
         self.comb_entries = entries;
     }
 
@@ -3232,28 +3436,17 @@ impl Simulator {
 
             {
                 let _t = std::time::Instant::now();
-                // Skip the initial snapshot on the very first iteration. prev_table
-                // is pre-initialized to all-X so that initializer-driven X→value
-                // transitions at t=0 (e.g. `reg clk = 1;`) are detected as edges
-                // by the first check_edges call, matching IEEE 1800 semantics.
                 if iters > 1 {
                     self.snapshot_edge_signals();
                 }
                 t_snap += _t.elapsed().as_nanos() as u64;
 
-                // Apply SDF/specify delayed updates that have matured.
-                // Snapshot must happen first so edge detection can observe the change.
                 if self.apply_delayed_updates() {
                     self.settle_combinatorial();
                 }
 
-                // Fire clock generators at current time (O(1) toggle, no AST)
                 self.fire_clock_generators();
 
-                // Process timed events from queue. Pop one at a time and
-                // re-insert the rest so that a task-internal `#delay` (which
-                // recursively drains the queue via `run_events_until`) can
-                // still observe other processes scheduled at this tick.
                 let _t = std::time::Instant::now();
                 let mut batch = self.event_queue.remove(self.time);
                 t_sched += _t.elapsed().as_nanos() as u64;
@@ -3269,7 +3462,6 @@ impl Simulator {
                     if !self.is_pid_suspended(pid) {
                         self.child_finished(pid);
                     }
-                    // Refresh batch with anything newly scheduled at current time.
                     if self.event_queue.next_time() == Some(self.time) {
                         batch = self.event_queue.remove(self.time);
                     } else {
@@ -3278,7 +3470,6 @@ impl Simulator {
                 }
                 t_process += _t.elapsed().as_nanos() as u64;
 
-                // First NBA + settle pass
                 let _t = std::time::Instant::now();
                 if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() {
                     self.apply_nba();
@@ -3292,7 +3483,6 @@ impl Simulator {
                 let _t = std::time::Instant::now();
                 self.check_edges();
                 t_edges += _t.elapsed().as_nanos() as u64;
-                // Second NBA + settle pass (from edge-triggered blocks)
                 if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() {
                     let _t2 = std::time::Instant::now();
                     self.apply_nba();
@@ -3303,9 +3493,15 @@ impl Simulator {
                         t_settle += _t2.elapsed().as_nanos() as u64;
                     }
                 }
-                let _t = std::time::Instant::now();
-                self.snapshot_edge_signals();
-                t_snap += _t.elapsed().as_nanos() as u64;
+                // (Deleted) The end-of-iter snapshot_edge_signals was
+                // redundant: the early snapshot at the top of the next iter
+                // (line ~3283) captures the same signal_table values because
+                // nothing between the two snapshots mutates signals. At iter
+                // 1, prev_table is pre-seeded to all-X by Simulator::new, so
+                // that iteration's check_edges works without an early
+                // snapshot. From iter 2 onward, the early snapshot provides
+                // the correct pre-state. Removing the second snapshot cuts
+                // ~half the `snap` phase cost.
 
                 self.check_monitor();
                 if self.aitrace_mode { self.aitrace_write_changes(); } else { self.vcd_write_changes(); }
@@ -3549,6 +3745,28 @@ impl Simulator {
     }
 
     fn run_scheduled_process(&mut self, pid: usize, stmts: &[Statement]) {
+        // Fast path: if we have no saved process context for this pid AND
+        // the caller's execution context is empty, skip the full snapshot /
+        // restore dance. Forever-loop bodies like `jclk = ~jclk` that run
+        // with no locals don't need context bookkeeping; each call paid
+        // several `Vec<HashMap<String, Value>>`-level clones for nothing.
+        let saved_ctx_needed = !self.this_stack.is_empty()
+            || !self.local_stack.is_empty()
+            || !self.class_context_stack.is_empty();
+        let has_pid_ctx = self.process_contexts.contains_key(&pid);
+        if !saved_ctx_needed && !has_pid_ctx {
+            self.run_process_stmts(pid, stmts);
+            if self.is_pid_suspended(pid) {
+                // Only snapshot if actually suspended and has state worth saving.
+                if !self.this_stack.is_empty()
+                    || !self.local_stack.is_empty()
+                    || !self.class_context_stack.is_empty()
+                {
+                    self.process_contexts.insert(pid, self.snapshot_process_context());
+                }
+            }
+            return;
+        }
         let saved = self.snapshot_process_context();
         let ctx = self.process_contexts.remove(&pid).unwrap_or_default();
         self.restore_process_context(ctx);
@@ -4007,17 +4225,44 @@ impl Simulator {
         let blocks = std::mem::take(&mut self.edge_blocks);
         self.in_edge_block = true;
 
-        // Phase 1: detect which blocks trigger
+        // Phase 1: detect which blocks trigger.
+        //
+        // Inverted iteration: walk the (usually small) list of edge-sensitive
+        // signal IDs, compute whether each fired an edge this tick, then
+        // dispatch to the blocks sensitive to that signal via
+        // `edge_blocks_by_sig`. For c910 this turns ~20,000 check_edge_id
+        // calls per tick (10k blocks × 2 sensitivities) into ~200
+        // (one per unique clk/rst/enable signal).
         let t0 = std::time::Instant::now();
-        let mut triggered: Vec<usize> = Vec::new();
-        for (block_idx, block) in blocks.iter().enumerate() {
-            for sid in &block.resolved_sensitivities {
-                if self.check_edge_id(sid.signal_id, sid.edge) {
-                    triggered.push(block_idx);
-                    break;
-                }
+        let mut triggered_bitmap = vec![false; blocks.len()];
+        for &sid in &self.edge_signal_ids {
+            if sid >= self.edge_blocks_by_sig.len() { continue; }
+            let nblks = self.edge_blocks_by_sig[sid].len();
+            if nblks == 0 { continue; }
+            // Compute edge-fired booleans once for this signal.
+            let cur = &self.signal_table[sid];
+            let prev = &self.prev_table[sid];
+            let cb = cur.bits_first();
+            let pb = prev.bits_first();
+            let fires_pos = pb != LogicBit::One && cb == LogicBit::One;
+            let fires_neg = pb != LogicBit::Zero && cb == LogicBit::Zero;
+            let fires_any = *cur != *prev;
+            if !fires_pos && !fires_neg && !fires_any { continue; }
+            // Fan out to all blocks sensitive to this signal.
+            for i in 0..nblks {
+                let (block_idx, edge) = self.edge_blocks_by_sig[sid][i];
+                if block_idx >= triggered_bitmap.len() || triggered_bitmap[block_idx] { continue; }
+                let fired = match edge {
+                    EdgeKind::Posedge => fires_pos,
+                    EdgeKind::Negedge => fires_neg,
+                    EdgeKind::AnyEdge => fires_any,
+                };
+                if fired { triggered_bitmap[block_idx] = true; }
             }
         }
+        let triggered: Vec<usize> = triggered_bitmap.iter().enumerate()
+            .filter_map(|(i, &t)| if t { Some(i) } else { None })
+            .collect();
         self.prof_edge_detect += t0.elapsed().as_nanos() as u64;
         self.prof_edges_fired += triggered.len() as u64;
 
@@ -4219,49 +4464,53 @@ impl Simulator {
         self.dirty_list.clear();
         self.dirty_any = false;
 
-        // Unresolved entries always re-eval.
-        for eidx in 0..num_entries {
-            if !self.settle_triggered[eidx] && entries[eidx].has_unresolved_reads {
+        // Unresolved entries always re-eval. Iterate the precomputed
+        // index list instead of scanning `0..num_entries` (can be ~500K
+        // and is called on every BlockingAssign).
+        for &eidx in self.comb_unresolved_idx.iter() {
+            if eidx < num_entries && !self.settle_triggered[eidx] {
                 self.settle_triggered[eidx] = true;
                 self.settle_triggered_list.push(eidx);
             }
         }
-        // Time-0 / empty-read-set fire unconditionally once.
-        if self.time == 0 {
-            for eidx in 0..num_entries {
-                if !self.settle_triggered[eidx] {
-                    if entries[eidx].read_signal_ids.is_empty()
-                        || (self.time == 0 && matches!(&entries[eidx].item,
-                            CombItem::AlwaysBlock { is_always_comb: true, .. }
-                            | CombItem::CompiledAlwaysBlock { is_always_comb: true, .. }))
-                    {
-                        self.settle_triggered[eidx] = true;
-                        self.settle_triggered_list.push(eidx);
-                    }
+        // Time-0 / empty-read-set fire unconditionally — but only the FIRST
+        // settle call at time=0 needs to seed them. Subsequent settle calls
+        // at the same (or later) time rely on dirty propagation through the
+        // worklist. The prior O(num_entries) scan per call was ~500μs on
+        // c910 and dominated per-assign cost during memory-init loops.
+        if self.time == 0 && !self.comb_time0_fired {
+            for &eidx in self.comb_time0_idx.iter() {
+                if eidx < num_entries && !self.settle_triggered[eidx] {
+                    self.settle_triggered[eidx] = true;
+                    self.settle_triggered_list.push(eidx);
                 }
             }
+            self.comb_time0_fired = true;
         }
 
-        // Chaotic-iteration loop: scan entries in topo order, evaluating
-        // any that are flagged. Newly-dirty writes propagate to dependents
-        // via settle_triggered — those at higher eidx evaluate in the same
-        // scan (feedforward in 1 pass); lower eidx get picked up next scan.
+        // Chaotic-iteration loop: drain a sorted worklist of triggered
+        // entries each pass. New triggers added during a pass (via worklist
+        // propagation below) land in `settle_triggered_list` for the next
+        // pass. Sorting per pass keeps entries processed in topo order
+        // (small k since only triggered entries appear), which is dramatically
+        // faster than a 0..num_entries linear scan when num_entries is large
+        // (e.g. ~467K on c910) but the triggered set is small.
+        let mut cur_list: Vec<usize> = Vec::new();
         for iteration in 0..limit {
             total_iters += 1;
             let mut evaluated_any = false;
 
+            // Take the current worklist and sort by eidx (topo order).
+            std::mem::swap(&mut cur_list, &mut self.settle_triggered_list);
+            cur_list.sort_unstable();
+
             // Hot loop: >90% of iterations hit DC / CompiledContAssign /
             // CompiledAlwaysBlock — avoid scope_hint.clone() and Instant::now()
             // on those paths. Only the AST fallback arms pay that cost.
-            //
-            // Worklist + topo scan: iterate by eidx (entries are topo-sorted).
-            // When an entry writes a signal, its dependents at higher eidx are
-            // marked triggered and visited later in THIS pass — feedforward
-            // chains collapse to 1 outer iter. Back-edges fall to next iter.
-            for eidx in 0..num_entries {
+            for &eidx in &cur_list {
                 if !self.settle_triggered[eidx] { continue; }
                 // Consume the trigger now. If any signal is written AGAIN
-                // later this scan (or next), the entry is re-triggered by
+                // later this pass (or next), the entry is re-triggered by
                 // the worklist propagation below.
                 self.settle_triggered[eidx] = false;
                 evaluated_any = true;
@@ -4420,6 +4669,8 @@ impl Simulator {
             // the per-signal flags via the propagation loop; clear the list.)
             self.dirty_list.clear();
             self.dirty_any = false;
+            // Prepare cur_list for next pass reuse (it'll be swapped in).
+            cur_list.clear();
         }
 
         self.comb_entries = entries;
@@ -4435,6 +4686,35 @@ impl Simulator {
         self.settling = false;
     }
 
+    /// Look up flat signal_id for array element `name[idx]` via a lazy per-array
+    /// cache. First call per array populates the cache by iterating
+    /// signal_name_to_id for all elements (one-time O(N) over the array size);
+    /// subsequent calls are O(1) table indexing. Avoids the `format!()` +
+    /// HashMap lookup that dominates tight memory-init loops (e.g. 1.4M writes
+    /// in the c910 testbench `ram0.mem[i] = 0` wipe).
+    fn get_array_elem_id(&mut self, name: &str, idx: i64) -> Option<usize> {
+        let (arr_lo, arr_hi) = match self.module.arrays.get(name) {
+            Some(&(lo, hi, _)) => (lo, hi),
+            None => return None,
+        };
+        if idx < arr_lo || idx > arr_hi { return None; }
+        let offset = (idx - arr_lo) as usize;
+        if !self.array_elem_ids.contains_key(name) {
+            let size = (arr_hi - arr_lo + 1) as usize;
+            let mut v = vec![-1i64; size];
+            for i in 0..size {
+                let elem_idx = arr_lo + i as i64;
+                let elem_name = format!("{}[{}]", name, elem_idx);
+                if let Some(&id) = self.signal_name_to_id.get(&elem_name) {
+                    v[i] = id as i64;
+                }
+            }
+            self.array_elem_ids.insert(name.to_string(), v);
+        }
+        let v = self.array_elem_ids.get(name).unwrap();
+        let id = v[offset];
+        if id < 0 { None } else { Some(id as usize) }
+    }
 
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
         match &lhs.kind {
@@ -4734,37 +5014,58 @@ impl Simulator {
                         return changed;
                     }
                 }
-                // Resolve the target signal name (handles both ident and array index)
-                let target_name = match &expr.kind {
-                    ExprKind::Ident(hier) => Some(self.resolve_hier_name(hier)),
+                // Fast path: resolve target signal_id directly (avoids format!
+                // + HashMap lookup on every call for tight memory-init loops).
+                let target_id: Option<usize> = match &expr.kind {
+                    ExprKind::Ident(hier) => {
+                        if let Some(id) = hier.cached_signal_id.get() {
+                            Some(id)
+                        } else {
+                            let name = self.resolve_hier_name(hier);
+                            if let Some(&id) = self.signal_name_to_id.get(&name) {
+                                hier.cached_signal_id.set(Some(id));
+                                Some(id)
+                            } else { None }
+                        }
+                    }
                     ExprKind::Index { expr: arr_expr, index } => {
                         if let ExprKind::Ident(hier) = &arr_expr.kind {
                             let name = self.resolve_hier_name(hier);
                             if self.module.arrays.contains_key(&name) {
-                                let idx = self.eval_expr(index).to_u64().unwrap_or(0);
-                                Some(format!("{}[{}]", name, idx))
+                                let idx = self.eval_expr(index).to_u64().unwrap_or(0) as i64;
+                                self.get_array_elem_id(&name, idx)
                             } else { None }
                         } else { None }
                     }
                     _ => None,
                 };
-                if let Some(name) = target_name {
-                    if let Some(&id) = self.signal_name_to_id.get(&name) {
-                        let width = self.signal_widths[id] as usize;
-                        let mut changed = false;
-                        for i in lsb..=msb.min(width.saturating_sub(1)) {
-                            let nb = val.get_bit(i - lsb);
-                            if self.signal_table[id].get_bit(i) != nb {
-                                self.signal_table[id].set_bit(i, nb);
-                                changed = true;
-                            }
-                        }
+                if let Some(id) = target_id {
+                    let width = self.signal_widths[id] as usize;
+                    // Whole-word fast path: if the range covers the whole
+                    // signal, skip the per-bit loop.
+                    if lsb == 0 && msb + 1 >= width {
+                        let resized = val.resize(width as u32);
+                        let changed = self.signal_table[id] != resized;
                         if changed {
+                            self.mark_dirty_id(id);
+                            self.signal_table[id] = resized;
                             self.table_modified = true;
-                            self.mark_dirty(&name);
                         }
                         return changed;
                     }
+                    let mut changed = false;
+                    for i in lsb..=msb.min(width.saturating_sub(1)) {
+                        let nb = val.get_bit(i - lsb);
+                        if self.signal_table[id].get_bit(i) != nb {
+                            self.signal_table[id].set_bit(i, nb);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.table_modified = true;
+                        self.mark_dirty_id(id);
+                    }
+                    return changed;
                 }
                 false
             }
@@ -6217,9 +6518,11 @@ impl Simulator {
                     ForInit::VarDecl { data_type, name, init: e } => { let v = self.eval_expr(e); let w = super::elaborate::resolve_type_width(data_type, Some(&self.signals), Some(&self.module.typedefs)); self.widths.insert(name.name.clone(), w); self.signals.insert(name.name.clone(), v.resize(w)); }
                     ForInit::Assign { lvalue, rvalue } => { let v = self.eval_expr(rvalue); self.assign_value(lvalue, &v); }
                 }}
-                let mut iters = 0;
+                let loop_limit: u64 = std::env::var("XEZIM_LOOP_LIMIT").ok()
+                    .and_then(|s| s.parse().ok()).unwrap_or(10_000_000);
+                let mut iters: u64 = 0;
                 loop {
-                    if iters > 10000 || self.finished { break; } iters += 1;
+                    if iters > loop_limit || self.finished { break; } iters += 1;
                     if let Some(c) = condition { if !self.eval_expr(c).is_true() { break; } }
                     self.break_flag = false; self.continue_flag = false; self.exec_statement(body);
                     if self.break_flag { self.break_flag = false; break; } self.continue_flag = false;
@@ -6236,8 +6539,8 @@ impl Simulator {
                     }
                 }
             }
-            StatementKind::While { condition, body } => { let mut i = 0; loop { if i > 10000 || self.finished { break; } i += 1; if !self.eval_expr(condition).is_true() { break; } self.break_flag = false; self.exec_statement(body); if self.break_flag { self.break_flag = false; break; } } }
-            StatementKind::DoWhile { body, condition } => { let mut i = 0; loop { if i > 10000 || self.finished { break; } i += 1; self.break_flag = false; self.exec_statement(body); if self.break_flag { self.break_flag = false; break; } if !self.eval_expr(condition).is_true() { break; } } }
+            StatementKind::While { condition, body } => { let loop_limit: u64 = std::env::var("XEZIM_LOOP_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000_000); let mut i: u64 = 0; loop { if i > loop_limit || self.finished { break; } i += 1; if !self.eval_expr(condition).is_true() { break; } self.break_flag = false; self.exec_statement(body); if self.break_flag { self.break_flag = false; break; } } }
+            StatementKind::DoWhile { body, condition } => { let loop_limit: u64 = std::env::var("XEZIM_LOOP_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000_000); let mut i: u64 = 0; loop { if i > loop_limit || self.finished { break; } i += 1; self.break_flag = false; self.exec_statement(body); if self.break_flag { self.break_flag = false; break; } if !self.eval_expr(condition).is_true() { break; } } }
             StatementKind::Repeat { count, body } => { let n = self.eval_expr(count).to_u64().unwrap_or(0); for _ in 0..n.min(10000) { if self.finished { break; } self.break_flag = false; self.continue_flag = false; self.exec_statement(body); if self.break_flag { self.break_flag = false; break; } self.continue_flag = false; } }
             StatementKind::Forever { body } => { let mut i = 0; loop { if i > 100000 || self.finished || self.time > self.max_time { break; } i += 1; self.exec_statement(body); } }
             StatementKind::SeqBlock { stmts, .. } => { for s in stmts { if self.finished || self.break_flag || self.continue_flag { break; } self.exec_statement(s); } }
@@ -6651,6 +6954,26 @@ impl Simulator {
     }
 
     fn resolve_hier_name(&self, hier: &HierarchicalIdentifier) -> String {
+        // Per-hier cache: first call resolves and memoizes the result on the
+        // AST node; every subsequent call on the same node returns in O(1)
+        // without HashMap lookups, path-join allocation, or hint bookkeeping.
+        // This is the dominant win for tight loops like `ram0.mem[i][7:0] = 0`
+        // where the same hier objects are re-visited thousands of times.
+        // The hint side-effect is deliberately skipped on the cached path:
+        // hints only steer the suffix-scan fallback for ambiguous
+        // unqualified names, and a resolved (cached) name no longer needs
+        // that guidance.
+        if let Some(cached) = hier.cached_resolved_name.get() {
+            return cached.clone();
+        }
+        let resolved = self.resolve_hier_name_uncached(hier);
+        // OnceCell::set returns Err if already set (race) — ignore; value
+        // would be identical anyway.
+        let _ = hier.cached_resolved_name.set(resolved.clone());
+        resolved
+    }
+
+    fn resolve_hier_name_uncached(&self, hier: &HierarchicalIdentifier) -> String {
         let common_prefix_len = |a: &str, b: &str| -> usize {
             let mut n = 0usize;
             for (sa, sb) in a.split('.').zip(b.split('.')) {
@@ -6669,6 +6992,36 @@ impl Simulator {
                 *self.name_resolve_hint.borrow_mut() = Some(parent);
             }
             return raw;
+        }
+        // Fast paths to avoid the O(N) suffix scan below. Critical for tight
+        // memory-init loops (e.g. c910 testbench wipe).
+        //
+        // 1) raw is a known array / queue / assoc / dynamic array name.
+        // 2) raw starts with the top testbench module's name (e.g. `tb.`),
+        //    but arrays/signals are keyed without that prefix. Try stripping
+        //    the first segment and re-checking.
+        let check_known_or_signal = |name: &str, this: &Self| -> bool {
+            this.module.arrays.contains_key(name)
+                || this.module.arrays_2d.contains_key(name)
+                || this.module.arrays_nd.contains_key(name)
+                || this.module.dynamic_arrays.contains(name)
+        };
+        if check_known_or_signal(&raw, self) {
+            if raw.contains('.') {
+                let parent = parent_of(&raw).to_string();
+                *self.name_resolve_hint.borrow_mut() = Some(parent);
+            }
+            return raw;
+        }
+        if let Some((_head, rest)) = raw.split_once('.') {
+            if self.signal_name_to_id.contains_key(rest) || check_known_or_signal(rest, self) {
+                let out = rest.to_string();
+                if out.contains('.') {
+                    let parent = parent_of(&out).to_string();
+                    *self.name_resolve_hint.borrow_mut() = Some(parent);
+                }
+                return out;
+            }
         }
         let leaf = hier.path.last().map(|s| s.name.name.clone()).unwrap_or_default();
         if leaf.is_empty() {
