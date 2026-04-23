@@ -7368,6 +7368,43 @@ impl Simulator {
         self.nba_fast.push(NbaFast { signal_id: id, value: val });
     }
 
+    /// JIT bridge: mirror `Insn::NbaAssignRange` / `NbaAssignRangeDyn`
+    /// — read-modify-write bits `[hi:lo]` of the target signal (or
+    /// the latest in-flight NbaFast entry) with `val_bits` occupying
+    /// the low `(hi-lo+1)` bits.
+    #[inline]
+    pub(crate) fn jit_schedule_nba_range(
+        &mut self,
+        id: usize,
+        hi: u32,
+        lo: u32,
+        val_bits: u64,
+    ) {
+        if id >= self.signal_table.len() { return; }
+        let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
+        let w = high - low + 1;
+        let val = Value::from_u64(val_bits, w);
+        // Compose onto latest nba_fast entry if any, else onto
+        // signal_table's current value — exactly matches the
+        // interpreter's NbaAssignRange read-modify-write pattern.
+        let existing = self.nba_fast.iter().rposition(|n| n.signal_id == id);
+        let mut new_val = if let Some(i) = existing {
+            self.nba_fast[i].value.clone()
+        } else {
+            self.signal_table[id].clone()
+        };
+        let sig_w = self.signal_widths[id];
+        for bit_pos in low..=high.min(sig_w.saturating_sub(1)) {
+            let src_bit = val.get_bit((bit_pos - low) as usize);
+            new_val.set_bit(bit_pos as usize, src_bit);
+        }
+        if let Some(i) = existing {
+            self.nba_fast[i].value = new_val;
+        } else {
+            self.nba_fast.push(NbaFast { signal_id: id, value: new_val });
+        }
+    }
+
     /// Fast signal write: update both signal_table and signals HashMap.
     #[inline]
     fn fast_signal_write(&mut self, name: &str, val: Value) -> bool {

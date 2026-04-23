@@ -103,6 +103,22 @@ pub unsafe extern "C" fn xezim_jit_schedule_nba(
     sim.jit_schedule_nba(id as usize, val_bits, width);
 }
 
+/// Schedule a non-blocking assign to a bit-range: merges `val_bits`
+/// at bits `[hi:lo]` into the current signal value (or in-flight NBA
+/// entry) and pushes to `nba_fast`. Mirrors `Insn::NbaAssignRange` +
+/// `Insn::NbaAssignRangeDyn`.
+#[no_mangle]
+pub unsafe extern "C" fn xezim_jit_schedule_nba_range(
+    sim: *mut u8,
+    id: u32,
+    hi: u32,
+    lo: u32,
+    val_bits: u64,
+) {
+    let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
+    sim.jit_schedule_nba_range(id as usize, hi, lo, val_bits);
+}
+
 /// Stubs when the feature is disabled — everything is None / no-op so
 /// `exec_bytecode` always falls through to the interpreter.
 #[cfg(not(feature = "jit"))]
@@ -120,7 +136,7 @@ mod stub {
 #[cfg(feature = "jit")]
 mod enabled {
     use super::super::bytecode::Insn;
-    use super::{JitFn, xezim_jit_load_signal, xezim_jit_store_signal, xezim_jit_schedule_nba};
+    use super::{JitFn, xezim_jit_load_signal, xezim_jit_store_signal, xezim_jit_schedule_nba, xezim_jit_schedule_nba_range};
     use cranelift::prelude::*;
     use cranelift::codegen::ir::{StackSlot, FuncRef};
     use cranelift_jit::{JITBuilder, JITModule as ClJitModule};
@@ -143,6 +159,7 @@ mod enabled {
             builder.symbol("xezim_jit_load_signal", xezim_jit_load_signal as *const u8);
             builder.symbol("xezim_jit_store_signal", xezim_jit_store_signal as *const u8);
             builder.symbol("xezim_jit_schedule_nba", xezim_jit_schedule_nba as *const u8);
+            builder.symbol("xezim_jit_schedule_nba_range", xezim_jit_schedule_nba_range as *const u8);
             Some(Self { module: ClJitModule::new(builder), next_id: 0 })
         }
 
@@ -172,6 +189,15 @@ mod enabled {
             store_sig.params.push(AbiParam::new(types::I32));    // width
 
             let nba_sig = store_sig.clone();
+
+            // nba_range: (sim, id, hi, lo, val_bits) — 5 args.
+            let mut nba_range_sig = self.module.make_signature();
+            nba_range_sig.params.push(AbiParam::new(pointer_type));
+            nba_range_sig.params.push(AbiParam::new(types::I32));
+            nba_range_sig.params.push(AbiParam::new(types::I32));
+            nba_range_sig.params.push(AbiParam::new(types::I32));
+            nba_range_sig.params.push(AbiParam::new(types::I64));
+
             let load_id: FuncId = self.module
                 .declare_function("xezim_jit_load_signal", Linkage::Import, &load_sig)
                 .map_err(|_| ())?;
@@ -180,6 +206,9 @@ mod enabled {
                 .map_err(|_| ())?;
             let nba_id: FuncId = self.module
                 .declare_function("xezim_jit_schedule_nba", Linkage::Import, &nba_sig)
+                .map_err(|_| ())?;
+            let nba_range_id: FuncId = self.module
+                .declare_function("xezim_jit_schedule_nba_range", Linkage::Import, &nba_range_sig)
                 .map_err(|_| ())?;
 
             // Function signature: extern "C" fn(sim: *mut u8) -> u32
@@ -239,6 +268,7 @@ mod enabled {
             let load_ref = self.module.declare_func_in_func(load_id, &mut builder.func);
             let store_ref = self.module.declare_func_in_func(store_id, &mut builder.func);
             let nba_ref = self.module.declare_func_in_func(nba_id, &mut builder.func);
+            let nba_range_ref = self.module.declare_func_in_func(nba_range_id, &mut builder.func);
 
             let resolve_target = |t: usize, pc_to_block: &Vec<Option<cranelift::codegen::ir::Block>>|
                 -> cranelift::codegen::ir::Block
@@ -281,7 +311,7 @@ mod enabled {
                         live = false;
                     }
                     other => {
-                        emit_insn(&mut builder, other, sim_ptr, &reg_slots, load_ref, store_ref, nba_ref)?;
+                        emit_insn(&mut builder, other, sim_ptr, &reg_slots, load_ref, store_ref, nba_ref, nba_range_ref)?;
                     }
                 }
             }
@@ -318,6 +348,7 @@ mod enabled {
         load_ref: FuncRef,
         store_ref: FuncRef,
         nba_ref: FuncRef,
+        _nba_range_ref: FuncRef,
     ) -> Result<(), ()> {
         use Insn::*;
         match insn {
@@ -367,6 +398,13 @@ mod enabled {
                 let w = builder.ins().iconst(types::I32, *width as i64);
                 builder.ins().call(nba_ref, &[sim_ptr, id, v, w]);
             }
+            // NbaAssignRange / NbaAssignRangeDyn intentionally NOT
+            // covered: enabling them caused c910 to regress from 9m30s
+            // → 12m40s. Hypothesis: 2-state bridge-computed values
+            // diverge from the interpreter's 4-state behavior during
+            // reset, and the cascaded-wrong results push settle through
+            // 80s of extra propagation. Re-enable once the JIT has
+            // correct X/Z handling (needs the 4-state codegen path).
             Resize(reg, width) => {
                 // Mask the value to the target width. Loads from stack,
                 // applies mask, stores back. Emulates Value::resize for
@@ -377,6 +415,38 @@ mod enabled {
                 let mc = builder.ins().iconst(types::I64, mask as i64);
                 let masked = builder.ins().band(v, mc);
                 builder.ins().stack_store(masked, regs[*reg as usize], 0);
+            }
+            BitSelect(dest, base, idx) => {
+                // dest = (base >> idx) & 1
+                let b = builder.ins().stack_load(types::I64, regs[*base as usize], 0);
+                let i = builder.ins().stack_load(types::I64, regs[*idx as usize], 0);
+                let shifted = builder.ins().ushr(b, i);
+                let one = builder.ins().iconst(types::I64, 1);
+                let result = builder.ins().band(shifted, one);
+                builder.ins().stack_store(result, regs[*dest as usize], 0);
+            }
+            RangeSelect(dest, base, left_r, right_r) => {
+                // dest = (base >> min(l,r)) & ((1 << (|l-r|+1)) - 1)
+                // Computed via `(~0u64) >> (64 - width)` which safely
+                // gives u64::MAX at width=64 thanks to x86/riscv's
+                // shift-amount-masked-to-low-bits semantics (which is
+                // also what cranelift's ushr lowers to).
+                let b = builder.ins().stack_load(types::I64, regs[*base as usize], 0);
+                let l = builder.ins().stack_load(types::I64, regs[*left_r as usize], 0);
+                let r = builder.ins().stack_load(types::I64, regs[*right_r as usize], 0);
+                let le = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, l, r);
+                let lsb = builder.ins().select(le, l, r);
+                let msb = builder.ins().select(le, r, l);
+                let shifted = builder.ins().ushr(b, lsb);
+                let one = builder.ins().iconst(types::I64, 1);
+                let diff = builder.ins().isub(msb, lsb);
+                let width = builder.ins().iadd(diff, one);
+                let sixty_four = builder.ins().iconst(types::I64, 64);
+                let shift_amt = builder.ins().isub(sixty_four, width);
+                let all_ones = builder.ins().iconst(types::I64, -1);
+                let mask = builder.ins().ushr(all_ones, shift_amt);
+                let result = builder.ins().band(shifted, mask);
+                builder.ins().stack_store(result, regs[*dest as usize], 0);
             }
             _ => return Err(()),
         }
@@ -424,6 +494,7 @@ mod enabled {
             | Eq(..) | Neq(..) | Lt(..) | Leq(..) | Gt(..) | Geq(..)
             | Shl(..) | Shr(..)
             | Resize(..)
+            | BitSelect(..) | RangeSelect(..)
             | BranchIfFalse(..) | Jump(..)
             | Nop
         )
