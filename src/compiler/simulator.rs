@@ -7039,6 +7039,14 @@ impl Simulator {
                     self.eval_expr(expr);
                 }
             }
+            ExprKind::AssignExpr { lvalue, rvalue } => {
+                // Simple direct assign — the for-loop step produces this
+                // after xezim-core 8b9c88c, and it's a tight inner-loop
+                // stmt in memory-init patterns. Skip the eval_expr
+                // dispatch overhead of the `_` fallback.
+                let val = self.eval_expr(rvalue);
+                self.assign_value(lvalue, &val);
+            }
             ExprKind::Binary { op: BinaryOp::Assign, left, right } => {
                 let val = if let ExprKind::Call { func, args } = &right.kind {
                     if let ExprKind::Ident(hier) = &func.kind {
@@ -7621,8 +7629,11 @@ impl Simulator {
             resized.is_signed = self.signal_signed[id];
             let changed = self.signal_table[id] != resized;
             if changed {
-                self.signal_table[id] = resized;                self.table_modified = true;
-                self.mark_dirty(name);
+                self.signal_table[id] = resized;
+                self.table_modified = true;
+                // Avoid a second signal_name_to_id lookup via mark_dirty(name)
+                // — we already resolved id above.
+                self.mark_dirty_id(id);
             }
             changed
         } else {
