@@ -2218,7 +2218,7 @@ impl Simulator {
         let len = insns.len();
         while pc < len {
             match &insns[pc] {
-                Insn::LoadConst(dest, val) => { vm_regs[*dest as usize] = val.clone(); }
+                Insn::LoadConst(dest, val) => { vm_regs[*dest as usize] = (**val).clone(); }
                 Insn::LoadSignal(dest, sig_id) => { vm_regs[*dest as usize] = signal_table[*sig_id].clone(); }
                 Insn::LoadSignalSigned(dest, sig_id) => {
                     let mut v = signal_table[*sig_id].clone();
@@ -2397,7 +2397,7 @@ impl Simulator {
             match &insns[pc] {
                 Insn::LoadConst(dest, val) => {
                     // Reuse vm_regs[dest]'s buffer via copy_from — no alloc.
-                    self.vm_regs[*dest as usize].copy_from(val);
+                    self.vm_regs[*dest as usize].copy_from(val.as_ref());
                 }
                 Insn::LoadSignal(dest, sig_id) => {
                     let d = *dest as usize;
