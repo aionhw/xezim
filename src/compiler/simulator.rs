@@ -102,14 +102,9 @@ struct CombEntry {
     item: CombItem,
     /// Preferred hierarchical scope for resolving unqualified identifiers.
     scope_hint: Option<String>,
-    /// Set of signal names this block reads. If ANY of these changed,
-    /// the block needs re-evaluation.
-    read_signals: HashSet<String>,
-    /// Set of signal names this block writes (for change tracking).
-    write_signals: HashSet<String>,
-    /// Pre-resolved signal IDs for read_signals (for fast dependency lookup).
+    /// Pre-resolved signal IDs for reads (for fast dependency lookup).
     read_signal_ids: Vec<usize>,
-    /// Pre-resolved (signal_id, signal_name) pairs for write_signals.
+    /// Pre-resolved (signal_id, signal_name) pairs for writes.
     write_signal_ids: Vec<(usize, String)>,
     /// True when dependency extraction could not resolve all read signals.
     /// Such entries are conservatively re-evaluated each settle pass.
@@ -1734,11 +1729,15 @@ impl Simulator {
         for i in 0..self.dirty_signals.len() { self.dirty_signals[i] = true; self.dirty_list.push(i); }
         self.dirty_any = true;
         self.settle_combinatorial();
-        let initial_blocks = self.module.initial_blocks.clone();
-        for ib in &initial_blocks {
-            let stmts = match &ib.stmt.kind {
-                StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
-                _ => vec![ib.stmt.clone()],
+        // Consume initial_blocks: after scheduling they're no longer needed,
+        // so take ownership (drops the Vec when this scope ends) instead of
+        // cloning — saves significant memory on large testbenches with
+        // memory-init initial blocks holding tens of thousands of statements.
+        let initial_blocks = std::mem::take(&mut self.module.initial_blocks);
+        for ib in initial_blocks {
+            let stmts = match ib.stmt.kind {
+                StatementKind::SeqBlock { stmts, .. } => stmts,
+                other => vec![Statement::new(other, ib.stmt.span)],
             };
             // Clock-generator fast path:
             //     initial begin VAR = CONST; forever #d VAR = ~VAR; end
@@ -1937,9 +1936,12 @@ impl Simulator {
     }
 
     fn classify_always_blocks(&mut self) {
-        let blocks = self.module.always_blocks.clone();
+        // Take ownership — the remaining-only subset is written back at the
+        // end. Avoids a full clone of every always-block AST (significant on
+        // c910-scale designs with 20K+ blocks).
+        let blocks = std::mem::take(&mut self.module.always_blocks);
         let mut remaining = Vec::new();
-        for (_idx, ab) in blocks.iter().enumerate() {
+        for ab in blocks.into_iter() {
             // Check for edge-sensitive: always_ff @(posedge ...) or always @(posedge ...)
             if let Some((sens, body)) = self.extract_sensitivity(&ab.stmt) {
                 if !sens.is_empty() {
@@ -1991,7 +1993,7 @@ impl Simulator {
                     continue;
                 }
             }
-            remaining.push(ab.clone());
+            remaining.push(ab);
         }
         self.module.always_blocks = remaining;
     }
@@ -2705,8 +2707,6 @@ impl Simulator {
             entries.push(CombEntry {
                 item,
                 scope_hint,
-                read_signals: reads,
-                write_signals: writes,
                 read_signal_ids: rids,
                 write_signal_ids: wids,
                 has_unresolved_reads,
@@ -2768,8 +2768,6 @@ impl Simulator {
                 entries.push(CombEntry {
                     item,
                     scope_hint,
-                    read_signals: reads,
-                    write_signals: writes,
                     read_signal_ids: rids,
                     write_signal_ids: wids,
                     has_unresolved_reads,
@@ -2907,6 +2905,13 @@ impl Simulator {
             })
             .collect();
         self.comb_entries = entries;
+        // Drop AST storage for items we've consumed into comb_entries.
+        // continuous_assigns live on in CombItem::ContAssign (fallback) or
+        // as DirectCopy / FusedGate / CompiledContAssign; the source Vec in
+        // the module is no longer read. Same for combinational always blocks
+        // — edge-sensitive ones were moved into self.edge_blocks earlier.
+        self.module.continuous_assigns = Vec::new();
+        self.module.always_blocks = Vec::new();
     }
 
     fn collect_leaf_idents(expr: &Expression, out: &mut HashSet<String>) {
