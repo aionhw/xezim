@@ -1800,15 +1800,21 @@ impl Simulator {
         // Also collect from event waiters that are registered at time 0
         self.edge_signal_ids.sort_unstable();
         self.edge_signal_ids.dedup();
-        // Build reverse index: signal_id -> [(edge_block_idx, edge_kind)].
-        self.edge_blocks_by_sig = vec![Vec::new(); self.signal_table.len()];
+        // Build reverse index parallel to `edge_signal_ids` (position-indexed,
+        // not signal_id-indexed). Dense signal_id indexing would allocate one
+        // empty Vec per signal — on c910-scale designs with ~585K signals and
+        // only a few thousand edge-sensitive ones, the dense layout wasted
+        // ~14 MB on empty Vec stubs. Walk blocks once into a temp HashMap,
+        // then materialize in edge_signal_ids order.
+        let mut by_sid: HashMap<usize, Vec<(usize, EdgeKind)>> = HashMap::new();
         for (block_idx, block) in self.edge_blocks.iter().enumerate() {
             for sid in &block.resolved_sensitivities {
-                if sid.signal_id < self.edge_blocks_by_sig.len() {
-                    self.edge_blocks_by_sig[sid.signal_id].push((block_idx, sid.edge));
-                }
+                by_sid.entry(sid.signal_id).or_default().push((block_idx, sid.edge));
             }
         }
+        self.edge_blocks_by_sig = self.edge_signal_ids.iter()
+            .map(|sid| by_sid.remove(sid).unwrap_or_default())
+            .collect();
         // IEEE 1800: at time 0, always_comb blocks execute unconditionally.
         // always @* blocks do NOT execute at time 0 unless inputs change.
         // Mark all signals dirty so continuous assigns and always_comb run.
@@ -4468,10 +4474,12 @@ impl Simulator {
         // (one per unique clk/rst/enable signal).
         let t0 = std::time::Instant::now();
         let mut triggered_bitmap = vec![false; blocks.len()];
-        for &sid in &self.edge_signal_ids {
-            if sid >= self.edge_blocks_by_sig.len() { continue; }
-            let nblks = self.edge_blocks_by_sig[sid].len();
-            if nblks == 0 { continue; }
+        // edge_blocks_by_sig is parallel to edge_signal_ids (position-indexed).
+        for (pos, &sid) in self.edge_signal_ids.iter().enumerate() {
+            let entry = match self.edge_blocks_by_sig.get(pos) {
+                Some(e) if !e.is_empty() => e,
+                _ => continue,
+            };
             // Compute edge-fired booleans once for this signal using SoA
             // u64 pairs; falls back to full Value compare for wide signals.
             let (cur_v, cur_x) = self.signal_table[sid].raw_bits();
@@ -4492,8 +4500,7 @@ impl Simulator {
             };
             if !fires_pos && !fires_neg && !fires_any { continue; }
             // Fan out to all blocks sensitive to this signal.
-            for i in 0..nblks {
-                let (block_idx, edge) = self.edge_blocks_by_sig[sid][i];
+            for &(block_idx, edge) in entry {
                 if block_idx >= triggered_bitmap.len() || triggered_bitmap[block_idx] { continue; }
                 let fired = match edge {
                     EdgeKind::Posedge => fires_pos,
