@@ -626,18 +626,24 @@ impl<'a> BytecodeCompiler<'a> {
                 } else { None };
                 if !self.compile_stmt(body) { return false; }
                 for s in step {
-                    if let ExprKind::Binary { op: BinaryOp::Assign, left, right } = &s.kind {
-                        let width = self.infer_lhs_width(left);
-                        let val_reg = match self.compile_expr(right, width) {
-                            Some(r) => r,
-                            None => { self.bail("For_step_rvalue"); return false; }
-                        };
-                        if width > 0 { self.emit(Insn::Resize(val_reg, width)); }
-                        if !self.compile_blocking_target(left, val_reg, width) {
-                            self.bail("For_step_target"); return false;
-                        }
-                    } else {
-                        self.bail("For_step_other"); return false;
+                    // For-loop step can be either the legacy `Binary{Assign,…}`
+                    // shape or the newer `AssignExpr { lvalue, rvalue }` emitted
+                    // by the parser for `i = i+1` / `i += 2` / etc. after
+                    // xezim-core 8b9c88c (ibex parsing). Both collapse to a
+                    // blocking assign.
+                    let (lhs, rhs) = match &s.kind {
+                        ExprKind::Binary { op: BinaryOp::Assign, left, right } => (&**left, &**right),
+                        ExprKind::AssignExpr { lvalue, rvalue } => (&**lvalue, &**rvalue),
+                        _ => { self.bail("For_step_other"); return false; }
+                    };
+                    let width = self.infer_lhs_width(lhs);
+                    let val_reg = match self.compile_expr(rhs, width) {
+                        Some(r) => r,
+                        None => { self.bail("For_step_rvalue"); return false; }
+                    };
+                    if width > 0 { self.emit(Insn::Resize(val_reg, width)); }
+                    if !self.compile_blocking_target(lhs, val_reg, width) {
+                        self.bail("For_step_target"); return false;
                     }
                 }
                 self.emit(Insn::Jump(loop_start));
