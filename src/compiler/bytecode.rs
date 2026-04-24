@@ -133,7 +133,7 @@ pub struct CompiledBlock {
 pub struct BytecodeCompiler<'a> {
     insns: Vec<Insn>,
     next_reg: RegId,
-    signal_name_to_id: &'a HashMap<Arc<String>, usize>,
+    signal_name_to_id: &'a HashMap<Arc<str>, usize>,
     signal_signed: &'a [bool],
     signal_widths: &'a [u32],
     arrays: &'a HashMap<String, (i64, i64, u32)>,
@@ -163,7 +163,7 @@ pub struct BytecodeCompiler<'a> {
 
 impl<'a> BytecodeCompiler<'a> {
     pub fn new(
-        signal_name_to_id: &'a HashMap<Arc<String>, usize>,
+        signal_name_to_id: &'a HashMap<Arc<str>, usize>,
         signal_signed: &'a [bool],
         signal_widths: &'a [u32],
         arrays: &'a HashMap<String, (i64, i64, u32)>,
@@ -321,18 +321,18 @@ impl<'a> BytecodeCompiler<'a> {
 
     fn lookup_signal_id(&self, hier: &HierarchicalIdentifier) -> Option<usize> {
         let raw = Self::hier_raw_name(hier);
-        if let Some(&id) = self.signal_name_to_id.get(&raw) {
+        if let Some(&id) = self.signal_name_to_id.get(raw.as_str()) {
             return Some(id);
         }
         if let Some(scope) = &self.scope_hint {
             let qualified = format!("{}.{}", scope, raw);
-            if let Some(&id) = self.signal_name_to_id.get(&qualified) {
+            if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
                 return Some(id);
             }
         }
         if hier.path.len() == 1 {
             let leaf = &hier.path[0].name.name;
-            if let Some(&id) = self.signal_name_to_id.get(leaf) {
+            if let Some(&id) = self.signal_name_to_id.get(leaf.as_str()) {
                 return Some(id);
             }
         }
