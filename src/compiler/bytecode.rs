@@ -19,8 +19,12 @@ type RegId = u16;
 /// enabling the VM to iterate a flat Vec<Insn> with predictable memory access.
 #[derive(Debug, Clone)]
 pub enum Insn {
-    /// Load a constant value into a register.
-    LoadConst(RegId, Value),
+    /// Load a constant value into a register. `Box<Value>` keeps the
+    /// variant small (8 B instead of 32 B for the inline Value) — LoadConst
+    /// isn't on the hot dispatch path so the extra indirection is cheap
+    /// and the 24 B saving compounds with the u32 signal_id fields below
+    /// to shrink `Insn` from 40 B to 32 B.
+    LoadConst(RegId, Box<Value>),
     /// Load a signal from signal_table[signal_id] into a register.
     LoadSignal(RegId, usize),      // (dest_reg, signal_id)
     /// Load a signal and mark it as signed.
@@ -99,9 +103,10 @@ pub enum Insn {
     BlockingAssignBitDyn(usize, RegId, RegId), // (signal_id, idx_reg, value_reg)
 
     /// Load array element: dest = signal_table[array_base + eval(index_reg)]
-    LoadArrayElem(RegId, String, RegId), // (dest, array_name, index_reg)
+    /// `Box<String>` keeps the variant at 16 B instead of 32 B.
+    LoadArrayElem(RegId, Box<String>, RegId), // (dest, array_name, index_reg)
     /// NBA assign to array element.
-    NbaAssignArray(String, RegId, RegId, u32), // (array_name, index_reg, value_reg, width)
+    NbaAssignArray(Box<String>, RegId, RegId, u32), // (array_name, index_reg, value_reg, width)
 
     /// Marks end of a compiled block (no-op, helps debugging).
     /// Copy src register to dest register.
@@ -530,7 +535,7 @@ impl<'a> BytecodeCompiler<'a> {
                             self.emit(Insn::LoadSignal(r, sig_id));
                             let one = self.alloc_reg();
                             let w = self.signal_widths[sig_id];
-                            self.emit(Insn::LoadConst(one, Value::from_u64(1, w)));
+                            self.emit(Insn::LoadConst(one, Box::new(Value::from_u64(1, w))));
                             let result = self.alloc_reg();
                             self.emit(Insn::Add(result, r, one));
                             self.emit(Insn::Resize(result, w));
@@ -547,7 +552,7 @@ impl<'a> BytecodeCompiler<'a> {
                             self.emit(Insn::LoadSignal(r, sig_id));
                             let one = self.alloc_reg();
                             let w = self.signal_widths[sig_id];
-                            self.emit(Insn::LoadConst(one, Value::from_u64(1, w)));
+                            self.emit(Insn::LoadConst(one, Box::new(Value::from_u64(1, w))));
                             let result = self.alloc_reg();
                             self.emit(Insn::Sub(result, r, one));
                             self.emit(Insn::Resize(result, w));
@@ -681,7 +686,7 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Number(num) => {
                 let val = self.eval_number_static(num)?;
                 let r = self.alloc_reg();
-                self.emit(Insn::LoadConst(r, val));
+                self.emit(Insn::LoadConst(r, Box::new(val)));
                 Some(r)
             }
             ExprKind::Ident(hier) => {
@@ -778,7 +783,7 @@ impl<'a> BytecodeCompiler<'a> {
                     if let Some(name) = self.lookup_array_name(hier) {
                         let idx_reg = self.compile_expr(index, 0)?;
                         let dest = self.alloc_reg();
-                        self.emit(Insn::LoadArrayElem(dest, name, idx_reg));
+                        self.emit(Insn::LoadArrayElem(dest, Box::new(name), idx_reg));
                         return Some(dest);
                     }
                 }
@@ -814,7 +819,7 @@ impl<'a> BytecodeCompiler<'a> {
                             self.emit(Insn::RangeSelect(dest, base, idx, idx));
                         } else {
                             let delta = self.alloc_reg();
-                            self.emit(Insn::LoadConst(delta, Value::from_u64((width - 1) as u64, 32)));
+                            self.emit(Insn::LoadConst(delta, Box::new(Value::from_u64((width - 1) as u64, 32))));
                             let other = self.alloc_reg();
                             if *kind == RangeKind::IndexedUp {
                                 self.emit(Insn::Add(other, idx, delta));
@@ -899,7 +904,7 @@ impl<'a> BytecodeCompiler<'a> {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            self.emit(Insn::NbaAssignArray(name, idx_reg, val_reg, width));
+                            self.emit(Insn::NbaAssignArray(Box::new(name), idx_reg, val_reg, width));
                             return true;
                         }
                     }
@@ -957,10 +962,10 @@ impl<'a> BytecodeCompiler<'a> {
                 for (i, p) in parts.iter().enumerate().rev() {
                     let pw = part_widths[i];
                     let lo_reg = self.alloc_reg();
-                    self.emit(Insn::LoadConst(lo_reg, Value::from_u64(bit_offset as u64, 32)));
+                    self.emit(Insn::LoadConst(lo_reg, Box::new(Value::from_u64(bit_offset as u64, 32))));
                     let hi_val = bit_offset + pw - 1;
                     let hi_reg = self.alloc_reg();
-                    self.emit(Insn::LoadConst(hi_reg, Value::from_u64(hi_val as u64, 32)));
+                    self.emit(Insn::LoadConst(hi_reg, Box::new(Value::from_u64(hi_val as u64, 32))));
                     let part_reg = self.alloc_reg();
                     self.emit(Insn::RangeSelect(part_reg, val_reg, hi_reg, lo_reg));
                     self.emit(Insn::Resize(part_reg, pw));
@@ -1042,7 +1047,7 @@ impl<'a> BytecodeCompiler<'a> {
                                     (idx, idx)
                                 } else {
                                     let delta = self.alloc_reg();
-                                    self.emit(Insn::LoadConst(delta, Value::from_u64((width - 1) as u64, 32)));
+                                    self.emit(Insn::LoadConst(delta, Box::new(Value::from_u64((width - 1) as u64, 32))));
                                     let other = self.alloc_reg();
                                     if *kind == RangeKind::IndexedUp {
                                         self.emit(Insn::Add(other, idx, delta));
@@ -1071,10 +1076,10 @@ impl<'a> BytecodeCompiler<'a> {
                 for (i, p) in parts.iter().enumerate().rev() {
                     let pw = part_widths[i];
                     let lo_reg = self.alloc_reg();
-                    self.emit(Insn::LoadConst(lo_reg, Value::from_u64(bit_offset as u64, 32)));
+                    self.emit(Insn::LoadConst(lo_reg, Box::new(Value::from_u64(bit_offset as u64, 32))));
                     let hi_val = bit_offset + pw - 1;
                     let hi_reg = self.alloc_reg();
-                    self.emit(Insn::LoadConst(hi_reg, Value::from_u64(hi_val as u64, 32)));
+                    self.emit(Insn::LoadConst(hi_reg, Box::new(Value::from_u64(hi_val as u64, 32))));
                     let part_reg = self.alloc_reg();
                     self.emit(Insn::RangeSelect(part_reg, val_reg, hi_reg, lo_reg));
                     self.emit(Insn::Resize(part_reg, pw));
