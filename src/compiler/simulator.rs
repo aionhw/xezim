@@ -637,7 +637,8 @@ impl Simulator {
             widths.insert(name.clone(), val.width);
             sim_dbg_eprintln!("[DEBUG] Simulator::new parameter {} = {} (signed={})", name, val.to_dec_string(), val.is_signed);
         }
-        // Build fast signal table (Vec-based, indexed by signal_id)
+        // Build fast signal table (Vec-based, indexed by signal_id).
+        // Phase 1: non-array signals go through the legacy HashMaps above.
         let mut sig_names_sorted: Vec<String> = signals.keys().cloned().collect();
         sig_names_sorted.sort();
         let mut signal_name_to_id = HashMap::new();
@@ -652,6 +653,67 @@ impl Simulator {
             signal_widths_vec.push(widths.get(name).copied().unwrap_or(1));
             signal_signed_vec.push(signed_signals.contains(name));
             signal_real_vec.push(real_signals.contains(name));
+        }
+        // Phase 2: synthesize per-element entries for unpacked arrays.
+        // Elaborate skips the per-element Signal inserts (memory-as-array
+        // fix) because every element shares the same width/signed/real
+        // attributes — we rebuild them here from the compact arrays
+        // metadata, writing directly into signal_table + signal_name_to_id
+        // + the parallel Vecs. The legacy `signals` / `widths` /
+        // `signed_signals` / `real_signals` HashMaps are left empty for
+        // array elements; all hot-path and fallback accesses go through
+        // signal_name_to_id first, so the HashMap miss on fallback paths
+        // is harmless. Saves hundreds of MB of HashMap entries on designs
+        // with large testbench memories.
+        let mut push_elem = |name: String, w: u32,
+                             sig_table: &mut Vec<Value>,
+                             widths_vec: &mut Vec<u32>,
+                             signed_vec: &mut Vec<bool>,
+                             real_vec: &mut Vec<bool>,
+                             name_to_id: &mut HashMap<String, usize>,
+                             names: &mut Vec<String>| {
+            let id = sig_table.len();
+            name_to_id.insert(name.clone(), id);
+            names.push(name);
+            sig_table.push(Value::new(w));
+            widths_vec.push(w);
+            signed_vec.push(false);
+            real_vec.push(false);
+        };
+        for (base, &(lo, hi, w)) in &module.arrays {
+            for idx in lo..=hi {
+                push_elem(format!("{}[{}]", base, idx), w,
+                    &mut signal_table, &mut signal_widths_vec,
+                    &mut signal_signed_vec, &mut signal_real_vec,
+                    &mut signal_name_to_id, &mut sig_names_sorted);
+            }
+        }
+        for (base, &((lo1, hi1), (lo2, hi2), w)) in &module.arrays_2d {
+            for i in lo1..=hi1 {
+                for j in lo2..=hi2 {
+                    push_elem(format!("{}[{}][{}]", base, i, j), w,
+                        &mut signal_table, &mut signal_widths_vec,
+                        &mut signal_signed_vec, &mut signal_real_vec,
+                        &mut signal_name_to_id, &mut sig_names_sorted);
+                }
+            }
+        }
+        for (base, (shape, w)) in &module.arrays_nd {
+            fn enumerate(dims: &[(i64, i64)], prefix: String, out: &mut Vec<String>) {
+                if dims.is_empty() { out.push(prefix); return; }
+                let (lo, hi) = dims[0];
+                for i in lo..=hi {
+                    enumerate(&dims[1..], format!("{}[{}]", prefix, i), out);
+                }
+            }
+            let mut names = Vec::new();
+            enumerate(shape, base.clone(), &mut names);
+            for name in names {
+                push_elem(name, *w,
+                    &mut signal_table, &mut signal_widths_vec,
+                    &mut signal_signed_vec, &mut signal_real_vec,
+                    &mut signal_name_to_id, &mut sig_names_sorted);
+            }
         }
         let num_signals = sig_names_sorted.len();
         // prev_table represents "before time 0" state. Per IEEE 1800, variable
