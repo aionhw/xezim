@@ -3628,8 +3628,24 @@ impl Simulator {
         let mut t_snap: u64 = 0;
         let mut t_sched: u64 = 0;
         let cascade_limit = self.cascade_limit;
+        // Optional periodic progress log — set XEZIM_PROGRESS=<seconds> to
+        // emit `[PROGRESS]` lines showing sim_time + wall + iters every N
+        // seconds. Useful for investigating long-running designs like c910
+        // where $display output is sparse.
+        let progress_interval = std::env::var("XEZIM_PROGRESS")
+            .ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let mut next_progress = if progress_interval > 0 {
+            std::time::Duration::from_secs(progress_interval)
+        } else { std::time::Duration::MAX };
         while !self.finished && iters < max_iters {
             iters += 1;
+            if progress_interval > 0 && sim_start.elapsed() >= next_progress {
+                eprintln!("[PROGRESS] wall={:.1}s sim_time={} iters={} edges_fired={} nba_q={} waiters={}",
+                    sim_start.elapsed().as_secs_f64(), self.time, iters,
+                    self.prof_edges_fired, self.nba_fast.len() + self.nba_queue.len(),
+                    self.event_waiters.len());
+                next_progress += std::time::Duration::from_secs(progress_interval);
+            }
 
             let has_timed = !self.event_queue.is_empty();
             let has_waiters = !self.event_waiters.is_empty();
