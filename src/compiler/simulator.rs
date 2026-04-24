@@ -16,7 +16,7 @@ use std::ffi::{CStr, CString};
 use std::io::Write;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use crate::ast::expr::*;
 use crate::ast::stmt::*;
 use crate::ast::decl::{AlwaysKind, ConstraintItem, ConstraintRange, CovergroupDeclaration, CovergroupItem, FunctionDeclaration, LetDeclaration, TaskDeclaration};
@@ -395,15 +395,18 @@ pub struct Simulator {
     pub signals: HashMap<String, Value>,
     /// Fast signal table: indexed by signal_id for O(1) access.
     signal_table: Vec<Value>,
-    /// Map signal name → signal_id for fast lookup.
-    signal_name_to_id: HashMap<String, usize>,
+    /// Map signal name → signal_id for fast lookup. `Arc<String>` keys are
+    /// shared with `id_to_name` so each signal name lives on the heap once
+    /// instead of twice. `Arc<String>: Borrow<String>` keeps existing
+    /// `.get(&String)` lookup sites working unchanged.
+    signal_name_to_id: HashMap<Arc<String>, usize>,
     /// Lazy per-array element-ID cache: array_name → Vec where index is the
     /// element index and the value is the flat signal_id (None if missing).
     /// Populated on first miss in the hot write/read path; avoids per-access
     /// `format!("{}[{}]", name, i)` + HashMap lookup on tight loops like
     /// memory wipe/load in testbenches.
     array_elem_ids: HashMap<String, Vec<i64>>,
-    id_to_name: Vec<String>,
+    id_to_name: Vec<Arc<String>>,
     /// Map signal_id → width (for fast width lookup).
     signal_widths: Vec<u32>,
     /// Set of signal IDs that are signed.
@@ -641,13 +644,16 @@ impl Simulator {
         // Phase 1: non-array signals go through the legacy HashMaps above.
         let mut sig_names_sorted: Vec<String> = signals.keys().cloned().collect();
         sig_names_sorted.sort();
-        let mut signal_name_to_id = HashMap::new();
+        let mut signal_name_to_id: HashMap<Arc<String>, usize> = HashMap::new();
+        let mut id_to_name: Vec<Arc<String>> = Vec::with_capacity(sig_names_sorted.len());
         let mut signal_table = Vec::with_capacity(sig_names_sorted.len());
         let mut signal_widths_vec = Vec::with_capacity(sig_names_sorted.len());
         let mut signal_signed_vec = Vec::with_capacity(sig_names_sorted.len());
         let mut signal_real_vec = Vec::with_capacity(sig_names_sorted.len());
         for (id, name) in sig_names_sorted.iter().enumerate() {
-            signal_name_to_id.insert(name.clone(), id);
+            let arc_name = Arc::new(name.clone());
+            signal_name_to_id.insert(arc_name.clone(), id);
+            id_to_name.push(arc_name);
             let val = signals[name].clone();
             signal_table.push(val.clone());
             signal_widths_vec.push(widths.get(name).copied().unwrap_or(1));
@@ -670,11 +676,12 @@ impl Simulator {
                              widths_vec: &mut Vec<u32>,
                              signed_vec: &mut Vec<bool>,
                              real_vec: &mut Vec<bool>,
-                             name_to_id: &mut HashMap<String, usize>,
-                             names: &mut Vec<String>| {
+                             name_to_id: &mut HashMap<Arc<String>, usize>,
+                             names: &mut Vec<Arc<String>>| {
             let id = sig_table.len();
-            name_to_id.insert(name.clone(), id);
-            names.push(name);
+            let arc = Arc::new(name);
+            name_to_id.insert(arc.clone(), id);
+            names.push(arc);
             sig_table.push(Value::new(w));
             widths_vec.push(w);
             signed_vec.push(false);
@@ -685,7 +692,7 @@ impl Simulator {
                 push_elem(format!("{}[{}]", base, idx), w,
                     &mut signal_table, &mut signal_widths_vec,
                     &mut signal_signed_vec, &mut signal_real_vec,
-                    &mut signal_name_to_id, &mut sig_names_sorted);
+                    &mut signal_name_to_id, &mut id_to_name);
             }
         }
         for (base, &((lo1, hi1), (lo2, hi2), w)) in &module.arrays_2d {
@@ -694,7 +701,7 @@ impl Simulator {
                     push_elem(format!("{}[{}][{}]", base, i, j), w,
                         &mut signal_table, &mut signal_widths_vec,
                         &mut signal_signed_vec, &mut signal_real_vec,
-                        &mut signal_name_to_id, &mut sig_names_sorted);
+                        &mut signal_name_to_id, &mut id_to_name);
                 }
             }
         }
@@ -712,10 +719,10 @@ impl Simulator {
                 push_elem(name, *w,
                     &mut signal_table, &mut signal_widths_vec,
                     &mut signal_signed_vec, &mut signal_real_vec,
-                    &mut signal_name_to_id, &mut sig_names_sorted);
+                    &mut signal_name_to_id, &mut id_to_name);
             }
         }
-        let num_signals = sig_names_sorted.len();
+        let num_signals = id_to_name.len();
         // prev_table represents "before time 0" state. Per IEEE 1800, variable
         // initializers `reg x = <v>;` are equivalent to initial-block assignments,
         // so X→<v> at t=0 must generate an edge event for @(posedge x) etc.
@@ -732,7 +739,7 @@ impl Simulator {
             edge_signal_ids: Vec::new(),
             edge_blocks_by_sig: Vec::new(),
             signals, widths, signed_signals, real_signals,
-            signal_table, signal_name_to_id, array_elem_ids: HashMap::new(), id_to_name: sig_names_sorted, signal_widths: signal_widths_vec, signal_signed: signal_signed_vec, signal_real: signal_real_vec,
+            signal_table, signal_name_to_id, array_elem_ids: HashMap::new(), id_to_name, signal_widths: signal_widths_vec, signal_signed: signal_signed_vec, signal_real: signal_real_vec,
             time: 0, output: Vec::new(), capture_output: true, finished: false,
             monitor: None, monitor_prev: HashMap::new(), active_union_tag: HashMap::new(),
             max_time, settle_limit: 100,
@@ -1895,7 +1902,7 @@ impl Simulator {
         // Resolve signal_id. Use the (hopefully cached) resolve_hier_name
         // via signal_name_to_id directly on the leaf name — initial
         // clock blocks almost always use unqualified names in the tb.
-        let sid = if let Some(&id) = self.signal_name_to_id.get(tog_name) {
+        let sid = if let Some(&id) = self.signal_name_to_id.get(&tog_name.to_string()) {
             id
         } else {
             // Suffix match
@@ -1935,7 +1942,7 @@ impl Simulator {
             ExprKind::Ident(hier) => hier.path.last().map(|s| s.name.name.as_str()),
             _ => None,
         }?;
-        let &signal_id = self.signal_name_to_id.get(lhs_name)?;
+        let &signal_id = self.signal_name_to_id.get(&lhs_name.to_string())?;
 
         // RHS must be ~LHS or !LHS
         match &rhs.kind {
@@ -2178,7 +2185,7 @@ impl Simulator {
         insns: &[super::bytecode::Insn],
         signal_table: &[Value],
         signal_signed: &[bool],
-        signal_name_to_id: &HashMap<String, usize>,
+        signal_name_to_id: &HashMap<Arc<String>, usize>,
         vm_regs: &mut Vec<Value>,
     ) -> Vec<NbaFast> {
         use super::bytecode::Insn;
@@ -3824,8 +3831,8 @@ impl Simulator {
                 let block = block_prefix(name);
                 *block_toggles.entry(block.clone()).or_insert(0) += count;
                 *block_sig_count.entry(block.clone()).or_insert(0) += 1;
-                let top = block_top_signal.entry(block).or_insert((name.clone(), 0));
-                if count > top.1 { *top = (name.clone(), count); }
+                let top = block_top_signal.entry(block).or_insert((name.to_string(), 0));
+                if count > top.1 { *top = (name.to_string(), count); }
             }
 
             let mut sorted: Vec<_> = block_toggles.into_iter().collect();
@@ -4358,7 +4365,7 @@ impl Simulator {
             }
             // Fallback for legacy single-segment names.
             let leaf = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-            self.signal_name_to_id.get(leaf).copied()
+            self.signal_name_to_id.get(&leaf.to_string()).copied()
         } else { None }
     }
 
@@ -7194,7 +7201,7 @@ impl Simulator {
             return raw;
         }
         if let Some((_head, rest)) = raw.split_once('.') {
-            if self.signal_name_to_id.contains_key(rest) || check_known_or_signal(rest, self) {
+            if self.signal_name_to_id.contains_key(&rest.to_string()) || check_known_or_signal(rest, self) {
                 let out = rest.to_string();
                 if out.contains('.') {
                     let parent = parent_of(&out).to_string();
@@ -7212,7 +7219,7 @@ impl Simulator {
         // choose a suffix match guided by the most recent hierarchical hint.
         if hier.path.len() == 1 {
             let suffix = format!(".{}", leaf);
-            let candidates: Vec<&String> = self.signal_name_to_id.keys().filter(|k| k.ends_with(&suffix)).collect();
+            let candidates: Vec<&String> = self.signal_name_to_id.keys().map(|k| k.as_ref()).filter(|k: &&String| k.ends_with(&suffix)).collect();
             if !candidates.is_empty() {
                 let hint_owned = self.name_resolve_hint.borrow().clone().unwrap_or_default();
                 let mut best: Option<&String> = None;
@@ -7254,7 +7261,8 @@ impl Simulator {
         if hier.path.len() > 1 {
             let suffix = format!(".{}", raw);
             let candidates: Vec<&String> = self.signal_name_to_id.keys()
-                .filter(|k| k.ends_with(&suffix) || k.as_str() == raw)
+                .map(|k| k.as_ref())
+                .filter(|k: &&String| k.ends_with(&suffix) || k.as_str() == raw)
                 .collect();
             if !candidates.is_empty() {
                 let hint_owned = self.name_resolve_hint.borrow().clone().unwrap_or_default();
@@ -7327,7 +7335,7 @@ impl Simulator {
     /// Sync a signal from the HashMap to the signal_table (after in-place mutation).
     #[inline]
     fn sync_signal_to_table(&mut self, name: &str) {
-        if let Some(&id) = self.signal_name_to_id.get(name) {
+        if let Some(&id) = self.signal_name_to_id.get(&name.to_string()) {
             if let Some(val) = self.signals.get(name) {
                 self.signal_table[id] = val.clone();
             }
@@ -7411,7 +7419,7 @@ impl Simulator {
     fn sync_table_to_hashmap(&mut self) {
         if !self.table_modified { return; }
         for (id, name) in self.id_to_name.iter().enumerate() {
-            self.signals.insert(name.clone(), self.signal_table[id].clone());
+            self.signals.insert((**name).clone(), self.signal_table[id].clone());
         }
         self.table_modified = false;
     }
@@ -7419,7 +7427,7 @@ impl Simulator {
     /// Mark a signal as dirty by name (for settle_combinatorial)
     #[inline]
     fn mark_dirty(&mut self, name: &str) {
-        if let Some(&id) = self.signal_name_to_id.get(name) {
+        if let Some(&id) = self.signal_name_to_id.get(&name.to_string()) {
             if !self.dirty_signals[id] {
                 self.dirty_signals[id] = true;
                 self.dirty_list.push(id);
@@ -7526,7 +7534,7 @@ impl Simulator {
     /// Fast signal write: update both signal_table and signals HashMap.
     #[inline]
     fn fast_signal_write(&mut self, name: &str, val: Value) -> bool {
-        if let Some(&id) = self.signal_name_to_id.get(name) {
+        if let Some(&id) = self.signal_name_to_id.get(&name.to_string()) {
             let width = self.signal_widths[id];
             let mut resized = val.resize(width);
             resized.is_signed = self.signal_signed[id];
@@ -7587,7 +7595,7 @@ impl Simulator {
                     return w;
                 }
                 let leaf = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                if let Some(&id) = self.signal_name_to_id.get(leaf) {
+                if let Some(&id) = self.signal_name_to_id.get(&leaf.to_string()) {
                     h.cached_signal_id.set(Some(id));
                     return self.signal_widths[id];
                 }
@@ -7779,15 +7787,16 @@ impl Simulator {
         // Collect changes using signal_table (no HashMap sync needed)
         let mut changes: Vec<(String, Value)> = Vec::new();
         for (id, name) in self.id_to_name.iter().enumerate() {
-            if let Some(vcd_id) = self.vcd_id_map.get(name) {
+            let name_str: &String = &*name;
+            if let Some(vcd_id) = self.vcd_id_map.get(name_str) {
                 let val = &self.signal_table[id];
-                let changed = match self.vcd_prev_signals.get(name) {
+                let changed = match self.vcd_prev_signals.get(name_str) {
                     Some(prev) => prev != val,
                     None => true,
                 };
                 if changed {
                     changes.push((vcd_id.clone(), val.clone()));
-                    self.vcd_prev_signals.insert(name.clone(), val.clone());
+                    self.vcd_prev_signals.insert(name_str.clone(), val.clone());
                 }
             }
         }
@@ -8040,9 +8049,10 @@ impl Simulator {
         // Collect changes
         let mut changes: Vec<(String, String)> = Vec::new(); // (signal_id, formatted_value)
         for (id, name) in self.id_to_name.iter().enumerate() {
-            if let Some(sid) = self.vcd_id_map.get(name) {
+            let name_str: &String = &*name;
+            if let Some(sid) = self.vcd_id_map.get(name_str) {
                 let val = &self.signal_table[id];
-                let changed = match self.vcd_prev_signals.get(name) {
+                let changed = match self.vcd_prev_signals.get(name_str) {
                     Some(prev) => prev != val,
                     None => true,
                 };
@@ -8079,7 +8089,7 @@ impl Simulator {
 
         // Update previous snapshot
         for (id, name) in self.id_to_name.iter().enumerate() {
-            self.vcd_prev_signals.insert(name.clone(), self.signal_table[id].clone());
+            self.vcd_prev_signals.insert((**name).clone(), self.signal_table[id].clone());
         }
     }
 
@@ -8110,7 +8120,7 @@ impl Simulator {
     }
 
     fn get_signal_value_by_name(&self, name: &str) -> Option<Value> {
-        if let Some(&id) = self.signal_name_to_id.get(name) {
+        if let Some(&id) = self.signal_name_to_id.get(&name.to_string()) {
             let mut v = self.signal_table[id].clone();
             if self.signal_signed[id] { v.is_signed = true; }
             Some(v)
@@ -8120,7 +8130,7 @@ impl Simulator {
     }
 
     fn set_signal_value_by_name(&mut self, name: &str, val: Value) {
-        if let Some(&id) = self.signal_name_to_id.get(name) {
+        if let Some(&id) = self.signal_name_to_id.get(&name.to_string()) {
             let w = self.signal_widths[id];
             let resized = val.resize(w);
             if self.signal_table[id] != resized {

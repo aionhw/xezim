@@ -128,7 +128,7 @@ pub struct CompiledBlock {
 pub struct BytecodeCompiler<'a> {
     insns: Vec<Insn>,
     next_reg: RegId,
-    signal_name_to_id: &'a HashMap<String, usize>,
+    signal_name_to_id: &'a HashMap<Arc<String>, usize>,
     signal_signed: &'a [bool],
     signal_widths: &'a [u32],
     arrays: &'a HashMap<String, (i64, i64, u32)>,
@@ -158,7 +158,7 @@ pub struct BytecodeCompiler<'a> {
 
 impl<'a> BytecodeCompiler<'a> {
     pub fn new(
-        signal_name_to_id: &'a HashMap<String, usize>,
+        signal_name_to_id: &'a HashMap<Arc<String>, usize>,
         signal_signed: &'a [bool],
         signal_widths: &'a [u32],
         arrays: &'a HashMap<String, (i64, i64, u32)>,
