@@ -417,7 +417,17 @@ pub struct Simulator {
     pub real_signals: HashSet<String>,
     prev_signals: HashMap<String, Value>,
     /// Fast prev signal table for edge detection (indexed by signal_id).
-    prev_table: Vec<Value>,
+    /// SoA storage for "previous-iter" edge-detection state (A3 from the
+    /// compression analysis). Replaces `prev_table: Vec<Value>` for signals
+    /// with width ≤ 64 — which is ~95% of typical designs — at half the
+    /// per-signal footprint (16 B vs 32 B) and with direct u64 compare
+    /// in the check_edges hot path. Wide signals (> 64 bits) fall back to
+    /// `prev_wide` below.
+    prev_val: Vec<u64>,
+    prev_xz: Vec<u64>,
+    /// Fallback for signals wider than 64 bits where the inline u64 pair
+    /// above can't represent the full state.
+    prev_wide: HashMap<usize, Value>,
     edge_signal_names: HashSet<String>,
     /// Edge sensitivity resolved to signal IDs.
     edge_signal_ids: Vec<usize>,
@@ -723,18 +733,26 @@ impl Simulator {
             }
         }
         let num_signals = id_to_name.len();
-        // prev_table represents "before time 0" state. Per IEEE 1800, variable
-        // initializers `reg x = <v>;` are equivalent to initial-block assignments,
-        // so X→<v> at t=0 must generate an edge event for @(posedge x) etc.
-        // Initialize prev_table to all-X so the first check_edges at t=0 detects
-        // these initializer-driven transitions.
-        let mut prev_table = Vec::with_capacity(num_signals);
+        // prev_{val,xz} represent "before time 0" state. Per IEEE 1800,
+        // variable initializers `reg x = <v>;` are equivalent to
+        // initial-block assignments, so X→<v> at t=0 must generate an edge
+        // event for @(posedge x) etc. Initialize to all-X (val=0,
+        // xz=mask(width)) so the first check_edges at t=0 detects these
+        // initializer-driven transitions.
+        let mut prev_val: Vec<u64> = vec![0u64; num_signals];
+        let mut prev_xz: Vec<u64> = vec![0u64; num_signals];
+        let mut prev_wide: HashMap<usize, Value> = HashMap::new();
         for id in 0..num_signals {
-            prev_table.push(Value::new(signal_widths_vec[id]));
+            let w = signal_widths_vec[id];
+            let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            prev_xz[id] = mask;
+            if w > 64 {
+                prev_wide.insert(id, Value::new(w));
+            }
         }
         let mut sim = Self {
             prev_signals: HashMap::new(),
-            prev_table,
+            prev_val, prev_xz, prev_wide,
             edge_signal_names: HashSet::new(),
             edge_signal_ids: Vec::new(),
             edge_blocks_by_sig: Vec::new(),
@@ -4369,42 +4387,70 @@ impl Simulator {
         } else { None }
     }
 
-    /// Snapshot only edge-sensitive signals + event_waiter signals into prev_signals.
+    /// Snapshot only edge-sensitive signals + event_waiter signals into
+    /// the prev_val/prev_xz parallel arrays (A3 from the compression
+    /// analysis). Wide signals (> 64 bits) also update `prev_wide`.
     fn snapshot_edge_signals(&mut self) {
+        #[inline]
+        fn snap_one(
+            id: usize,
+            signal_table: &[Value],
+            signal_widths: &[u32],
+            prev_val: &mut [u64],
+            prev_xz: &mut [u64],
+            prev_wide: &mut HashMap<usize, Value>,
+        ) {
+            let (v, x) = signal_table[id].raw_bits();
+            prev_val[id] = v;
+            prev_xz[id] = x;
+            if signal_widths[id] > 64 {
+                if let Some(p) = prev_wide.get_mut(&id) {
+                    p.copy_from(&signal_table[id]);
+                }
+            }
+        }
         for &id in &self.edge_signal_ids {
-            self.prev_table[id].copy_from(&self.signal_table[id]);
+            snap_one(id, &self.signal_table, &self.signal_widths,
+                &mut self.prev_val, &mut self.prev_xz, &mut self.prev_wide);
         }
         for i in 0..self.event_waiters.len() {
             for j in 0..self.event_waiters[i].resolved_sensitivities.len() {
                 let sid = self.event_waiters[i].resolved_sensitivities[j].signal_id;
-                self.prev_table[sid].copy_from(&self.signal_table[sid]);
+                snap_one(sid, &self.signal_table, &self.signal_widths,
+                    &mut self.prev_val, &mut self.prev_xz, &mut self.prev_wide);
             }
         }
         for i in 0..self.cg_event_waiters.len() {
             for j in 0..self.cg_event_waiters[i].1.len() {
                 let sid = self.cg_event_waiters[i].1[j].signal_id;
-                self.prev_table[sid].copy_from(&self.signal_table[sid]);
+                snap_one(sid, &self.signal_table, &self.signal_widths,
+                    &mut self.prev_val, &mut self.prev_xz, &mut self.prev_wide);
             }
         }
     }
 
-    /// Check edge: compare signal_table[id] vs prev_table[id]
+    /// Check edge: compare signal_table[id] vs (prev_val[id], prev_xz[id]).
     #[inline]
     fn check_edge_id(&self, id: usize, edge: EdgeKind) -> bool {
-        let cur = &self.signal_table[id];
-        let prev = &self.prev_table[id];
+        let (cur_v, cur_x) = self.signal_table[id].raw_bits();
+        let prev_v = self.prev_val[id];
+        let prev_x = self.prev_xz[id];
+        // LogicBit at bit 0: One iff v&1==1 && x&1==0; Zero iff v&1==0 && x&1==0.
+        let cb_one  = (cur_v & 1) == 1 && (cur_x & 1) == 0;
+        let cb_zero = (cur_v & 1) == 0 && (cur_x & 1) == 0;
+        let pb_one  = (prev_v & 1) == 1 && (prev_x & 1) == 0;
+        let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
         match edge {
-            EdgeKind::Posedge => {
-                let cb = cur.bits_first();
-                let pb = prev.bits_first();
-                pb != LogicBit::One && cb == LogicBit::One
+            EdgeKind::Posedge => !pb_one && cb_one,
+            EdgeKind::Negedge => !pb_zero && cb_zero,
+            EdgeKind::AnyEdge => {
+                if self.signal_widths[id] > 64 {
+                    if let Some(p) = self.prev_wide.get(&id) {
+                        return self.signal_table[id] != *p;
+                    }
+                }
+                cur_v != prev_v || cur_x != prev_x
             }
-            EdgeKind::Negedge => {
-                let cb = cur.bits_first();
-                let pb = prev.bits_first();
-                pb != LogicBit::Zero && cb == LogicBit::Zero
-            }
-            EdgeKind::AnyEdge => *cur != *prev,
         }
     }
 
@@ -4426,14 +4472,24 @@ impl Simulator {
             if sid >= self.edge_blocks_by_sig.len() { continue; }
             let nblks = self.edge_blocks_by_sig[sid].len();
             if nblks == 0 { continue; }
-            // Compute edge-fired booleans once for this signal.
-            let cur = &self.signal_table[sid];
-            let prev = &self.prev_table[sid];
-            let cb = cur.bits_first();
-            let pb = prev.bits_first();
-            let fires_pos = pb != LogicBit::One && cb == LogicBit::One;
-            let fires_neg = pb != LogicBit::Zero && cb == LogicBit::Zero;
-            let fires_any = *cur != *prev;
+            // Compute edge-fired booleans once for this signal using SoA
+            // u64 pairs; falls back to full Value compare for wide signals.
+            let (cur_v, cur_x) = self.signal_table[sid].raw_bits();
+            let prev_v = self.prev_val[sid];
+            let prev_x = self.prev_xz[sid];
+            let cb_one  = (cur_v & 1) == 1 && (cur_x & 1) == 0;
+            let cb_zero = (cur_v & 1) == 0 && (cur_x & 1) == 0;
+            let pb_one  = (prev_v & 1) == 1 && (prev_x & 1) == 0;
+            let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
+            let fires_pos = !pb_one && cb_one;
+            let fires_neg = !pb_zero && cb_zero;
+            let fires_any = if self.signal_widths[sid] > 64 {
+                self.prev_wide.get(&sid)
+                    .map_or(cur_v != prev_v || cur_x != prev_x,
+                        |p| self.signal_table[sid] != *p)
+            } else {
+                cur_v != prev_v || cur_x != prev_x
+            };
             if !fires_pos && !fires_neg && !fires_any { continue; }
             // Fan out to all blocks sensitive to this signal.
             for i in 0..nblks {
