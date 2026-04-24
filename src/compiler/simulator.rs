@@ -439,6 +439,10 @@ pub struct Simulator {
     pub max_time: u64,
     /// Maximum iterations for combinatorial settling per cycle.
     pub settle_limit: u32,
+    /// Maximum snapshot→apply_nba→settle→check_edges rounds per event-loop
+    /// iter (see drain_edge_cascade). Cached at sim init; override via
+    /// XEZIM_CASCADE_LIMIT env var.
+    cascade_limit: u32,
     /// SDF delay annotation (None if no SDF loaded).
     pub sdf_annotation: Option<super::sdf::SdfAnnotation>,
     /// Per-signal delay in sim ticks (0 = no delay). Indexed by signal_id.
@@ -675,6 +679,8 @@ impl Simulator {
             time: 0, output: Vec::new(), capture_output: true, finished: false,
             monitor: None, monitor_prev: HashMap::new(), active_union_tag: HashMap::new(),
             max_time, settle_limit: 100,
+            cascade_limit: std::env::var("XEZIM_CASCADE_LIMIT")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(8),
             sdf_annotation: None, sdf_delays: vec![0u64; num_signals], delayed_updates: Vec::new(), module,
             dpi_libraries: Vec::new(),
             dpi_bindings: HashMap::new(),
@@ -3462,6 +3468,55 @@ impl Simulator {
         EventWaiter { pid, sensitivities: sens, resolved_sensitivities: resolved, continuation, registered_time: self.time }
     }
 
+    /// Drain pending NBAs and repeatedly snapshot → apply_nba → settle →
+    /// check_edges until a round produces neither new edges nor new NBAs.
+    ///
+    /// Needed when a signal transition commits via NBA whose settled effect
+    /// triggers further edge-sensitive blocks. The canonical case is the c910
+    /// reset chain: async_cpurst_b negedge fires the sync-chain FF → queues
+    /// `cpurst_3ff <= 0` NBA → settle propagates cpurst_b X→0 → every
+    /// sub-module's local cpurst_b port (driven by a port-connection cont-
+    /// assign) transitions X→0 → their async-reset FFs must fire within the
+    /// same iter, otherwise the next iter's snapshot captures prev=0 and the
+    /// X→0 edge is lost forever (FF stays X, instructions never retire).
+    ///
+    /// `cascade_limit` bounds the loop at well-behaved designs; a legitimate
+    /// design requiring more than this suggests a combinational loop through
+    /// the sync chain that the user needs to address.
+    ///
+    /// Returns (t_snap, t_nba, t_settle, t_edges) deltas in ns for profiling;
+    /// callers that don't need them can ignore the return value.
+    fn drain_edge_cascade(&mut self, cascade_limit: u32) -> (u64, u64, u64, u64) {
+        let (mut t_snap, mut t_nba, mut t_settle, mut t_edges) = (0u64, 0u64, 0u64, 0u64);
+        let mut cascade_iter = 0u32;
+        while cascade_iter < cascade_limit {
+            if self.nba_fast.is_empty() && self.nba_queue.is_empty() { break; }
+            let t0 = std::time::Instant::now();
+            self.snapshot_edge_signals();
+            t_snap += t0.elapsed().as_nanos() as u64;
+            let t0 = std::time::Instant::now();
+            self.apply_nba();
+            t_nba += t0.elapsed().as_nanos() as u64;
+            if self.dirty_any {
+                let t0 = std::time::Instant::now();
+                self.settle_combinatorial();
+                t_settle += t0.elapsed().as_nanos() as u64;
+            }
+            let t0 = std::time::Instant::now();
+            let edges_before = self.prof_edges_fired;
+            self.check_edges();
+            t_edges += t0.elapsed().as_nanos() as u64;
+            if self.prof_edges_fired == edges_before
+                && self.nba_fast.is_empty()
+                && self.nba_queue.is_empty()
+            {
+                break;
+            }
+            cascade_iter += 1;
+        }
+        (t_snap, t_nba, t_settle, t_edges)
+    }
+
     fn event_loop(&mut self) {
         let sim_start = std::time::Instant::now();
         let mut iters: u64 = 0;
@@ -3472,6 +3527,7 @@ impl Simulator {
         let mut t_process: u64 = 0;
         let mut t_snap: u64 = 0;
         let mut t_sched: u64 = 0;
+        let cascade_limit = self.cascade_limit;
         while !self.finished && iters < max_iters {
             iters += 1;
 
@@ -3545,16 +3601,11 @@ impl Simulator {
                 let _t = std::time::Instant::now();
                 self.check_edges();
                 t_edges += _t.elapsed().as_nanos() as u64;
-                if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() {
-                    let _t2 = std::time::Instant::now();
-                    self.apply_nba();
-                    t_nba += _t2.elapsed().as_nanos() as u64;
-                    if self.dirty_any {
-                        let _t2 = std::time::Instant::now();
-                        self.settle_combinatorial();
-                        t_settle += _t2.elapsed().as_nanos() as u64;
-                    }
-                }
+                // Cascade: edge-sensitive blocks fired by check_edges may have
+                // pushed NBAs whose settled effect triggers further edges.
+                // Drain them within this iter — see drain_edge_cascade.
+                let (ds, dn, dse, de) = self.drain_edge_cascade(cascade_limit);
+                t_snap += ds; t_nba += dn; t_settle += dse; t_edges += de;
                 // (Deleted) The end-of-iter snapshot_edge_signals was
                 // redundant: the early snapshot at the top of the next iter
                 // (line ~3283) captures the same signal_table values because
@@ -6657,10 +6708,10 @@ impl Simulator {
                 }
                 self.exec_statement(stmt);
                 // After body executes, check for edges (e.g., clk toggled)
+                // and drain any cascade — see drain_edge_cascade.
                 self.settle_combinatorial();
                 self.check_edges();
-                self.apply_nba();
-                self.settle_combinatorial();
+                let _ = self.drain_edge_cascade(self.cascade_limit);
                 self.prev_signals = self.signals.clone();  // rare path - full clone OK
             }
             StatementKind::Break => { self.break_flag = true; }
