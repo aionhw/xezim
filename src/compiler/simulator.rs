@@ -5716,9 +5716,45 @@ impl Simulator {
                 }
             }
             ExprKind::Replication { count, exprs } => {
-                let n = self.eval_expr(count).to_u64().unwrap_or(1);
-                let mut inner = Value::zero(0); for e in exprs.iter().rev() { inner = self.eval_expr(e).concat_with(&inner); }
-                let mut r = Value::zero(0); for _ in 0..n { r = inner.concat_with(&r); } r
+                // Replication evaluation. Two correctness/perf fixes vs. the
+                // old `for _ in 0..n { r = inner.concat_with(&r); }` loop:
+                //
+                // 1) **O(n × inner.width) instead of O(n²)**: pre-allocate
+                //    the result `Value::zero(n × inner.width)` and copy
+                //    `inner` into each slot at offset `k × inner.width`.
+                //    Mirrors iverilog's `of_REPLICATE` (`vvp_vector4_t res
+                //    (val.size() * rept, BIT4_X); for (idx) res.set_vec
+                //    (idx * val.size(), val);`). The old loop allocated a
+                //    growing `Value` each iteration and copied the
+                //    accumulator — quadratic in `n`.
+                //
+                // 2) **Clamp the count**. `to_u64()` on a Value with X bits
+                //    returns the masked value, which can be u64::MAX for
+                //    pathological signals; the resulting `Value::zero(huge)`
+                //    + `for _ in 0..huge` would either OOM or run forever.
+                //    IEEE 1800 says replication with X count is undefined;
+                //    treat anything above MAX_REPL as 0 and let downstream
+                //    resize handle it.
+                const MAX_REPL: u64 = 1 << 20;
+                let count_val = self.eval_expr(count);
+                let n_raw = count_val.to_u64().unwrap_or(1);
+                let n = if n_raw > MAX_REPL { 0 } else { n_raw };
+                let mut inner = Value::zero(0);
+                for e in exprs.iter().rev() {
+                    inner = self.eval_expr(e).concat_with(&inner);
+                }
+                let inner_w = inner.width as usize;
+                let total_w = (inner_w as u64).saturating_mul(n) as u32;
+                let mut r = Value::zero(total_w);
+                if inner_w > 0 {
+                    for k in 0..n as usize {
+                        let off = k * inner_w;
+                        for i in 0..inner_w {
+                            r.set_bit(off + i, inner.get_bit(i));
+                        }
+                    }
+                }
+                r
             }
             ExprKind::Index { expr, index } => {
                 // N-dimensional (N >= 3) unpacked array element access
