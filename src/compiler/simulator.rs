@@ -407,6 +407,14 @@ pub struct Simulator {
     /// `format!("{}[{}]", name, i)` + HashMap lookup on tight loops like
     /// memory wipe/load in testbenches.
     array_elem_ids: HashMap<String, Vec<i64>>,
+    /// Reverse index: leaf-name (last `.`-segment of a signal's full path) →
+    /// signal_ids that share that leaf. Built once for the "real" signal set
+    /// (excludes per-element array IDs which all end with `]`). Keeps the
+    /// `path.len()==1 && bare leaf` resolution path O(1) instead of an
+    /// O(N) scan over signal_name_to_id, which on c910 scales to 35M entries
+    /// and was the dominant cost (575s) of time-0 settle for testbench-probe
+    /// continuous assigns like `assign x = bare_leaf;`.
+    leaf_name_to_ids: HashMap<Arc<str>, Vec<usize>>,
     id_to_name: Vec<Arc<str>>,
     /// Map signal_id → width (for fast width lookup).
     signal_widths: Vec<u32>,
@@ -656,6 +664,7 @@ impl Simulator {
         let mut sig_names_sorted: Vec<String> = signals.keys().cloned().collect();
         sig_names_sorted.sort();
         let mut signal_name_to_id: HashMap<Arc<str>, usize> = HashMap::new();
+        let mut leaf_name_to_ids: HashMap<Arc<str>, Vec<usize>> = HashMap::new();
         let mut id_to_name: Vec<Arc<str>> = Vec::with_capacity(sig_names_sorted.len());
         let mut signal_table = Vec::with_capacity(sig_names_sorted.len());
         let mut signal_widths_vec = Vec::with_capacity(sig_names_sorted.len());
@@ -664,6 +673,14 @@ impl Simulator {
         for (id, name) in sig_names_sorted.iter().enumerate() {
             let arc_name: Arc<str> = Arc::from(name.as_str());
             signal_name_to_id.insert(arc_name.clone(), id);
+            // Build leaf-name reverse index (skip array-element style names
+            // ending with `]`, which are added below and don't participate
+            // in bare-leaf lookups).
+            let leaf = name.rsplit_once('.').map(|(_, l)| l).unwrap_or(name.as_str());
+            if !leaf.is_empty() && !leaf.ends_with(']') {
+                let arc_leaf: Arc<str> = Arc::from(leaf);
+                leaf_name_to_ids.entry(arc_leaf).or_default().push(id);
+            }
             id_to_name.push(arc_name);
             let val = signals[name].clone();
             signal_table.push(val.clone());
@@ -758,7 +775,7 @@ impl Simulator {
             edge_signal_ids: Vec::new(),
             edge_blocks_by_sig: Vec::new(),
             signals, widths, signed_signals, real_signals,
-            signal_table, signal_name_to_id, array_elem_ids: HashMap::new(), id_to_name, signal_widths: signal_widths_vec, signal_signed: signal_signed_vec, signal_real: signal_real_vec,
+            signal_table, signal_name_to_id, array_elem_ids: HashMap::new(), leaf_name_to_ids, id_to_name, signal_widths: signal_widths_vec, signal_signed: signal_signed_vec, signal_real: signal_real_vec,
             time: 0, output: Vec::new(), capture_output: true, finished: false,
             monitor: None, monitor_prev: HashMap::new(), active_union_tag: HashMap::new(),
             max_time, settle_limit: 100,
@@ -1822,7 +1839,41 @@ impl Simulator {
         self.dirty_list.clear();
         for i in 0..self.dirty_signals.len() { self.dirty_signals[i] = true; self.dirty_list.push(i); }
         self.dirty_any = true;
+        let t_settle0 = std::time::Instant::now();
+        let entries_before = self.entry_evals;
+        let iters_before = self.settle_iters;
+        let dc_ns_before = self.prof_settle_dc_ns;
+        let dc_count_before = self.prof_settle_dc_count;
+        let ca_ns_before = self.prof_settle_ca_ns;
+        let ca_count_before = self.prof_settle_ca_count;
+        let ab_ns_before = self.prof_settle_ab_ns;
+        let ab_count_before = self.prof_settle_ab_count;
         self.settle_combinatorial();
+        let dt = t_settle0.elapsed();
+        if dt.as_millis() > 100 {
+            eprintln!("[PHASE] time-0 settle: {:.1}ms ({} entry_evals, {} settle_iters, {} comb_entries, {} signals)",
+                dt.as_secs_f64() * 1000.0,
+                self.entry_evals - entries_before,
+                self.settle_iters - iters_before,
+                self.comb_entries.len(),
+                self.signal_table.len());
+            eprintln!("[PHASE] time-0 settle breakdown: DC {:.1}ms/{} ({:.1}µs), CA {:.1}ms/{} ({:.1}µs), AB {:.1}ms/{} ({:.1}µs)",
+                (self.prof_settle_dc_ns - dc_ns_before) as f64 / 1e6,
+                self.prof_settle_dc_count - dc_count_before,
+                if self.prof_settle_dc_count > dc_count_before {
+                    (self.prof_settle_dc_ns - dc_ns_before) as f64 / (self.prof_settle_dc_count - dc_count_before) as f64 / 1e3
+                } else { 0.0 },
+                (self.prof_settle_ca_ns - ca_ns_before) as f64 / 1e6,
+                self.prof_settle_ca_count - ca_count_before,
+                if self.prof_settle_ca_count > ca_count_before {
+                    (self.prof_settle_ca_ns - ca_ns_before) as f64 / (self.prof_settle_ca_count - ca_count_before) as f64 / 1e3
+                } else { 0.0 },
+                (self.prof_settle_ab_ns - ab_ns_before) as f64 / 1e6,
+                self.prof_settle_ab_count - ab_count_before,
+                if self.prof_settle_ab_count > ab_count_before {
+                    (self.prof_settle_ab_ns - ab_ns_before) as f64 / (self.prof_settle_ab_count - ab_count_before) as f64 / 1e3
+                } else { 0.0 });
+        }
         // Consume initial_blocks: after scheduling they're no longer needed,
         // so take ownership (drops the Vec when this scope ends) instead of
         // cloning — saves significant memory on large testbenches with
@@ -5093,8 +5144,13 @@ impl Simulator {
                     }
                     return changed;
                 }
-                // Fallback (slow path): allocate name, sync HashMap
-                self.sync_table_to_hashmap();
+                // Fallback: signal not in signal_name_to_id (truly unknown,
+                // e.g. testbench probe wires that didn't elaborate). Write
+                // directly into the legacy `signals` HashMap without first
+                // forcing a 35M-entry sync from signal_table — sync was the
+                // dominant cost (20s × ~40 calls = 14 minutes) of c910 time-0
+                // settle. We only write here, never read from self.signals
+                // before this path, so the sync was unnecessary.
                 let width = self.widths.get(&name).copied().unwrap_or(val.width);
                 let is_real = self.real_signals.contains(&name);
                 let mut resized = if is_real {
@@ -5718,10 +5774,10 @@ impl Simulator {
                     if self.module.arrays.contains_key(&name) || self.is_associative_array(&name) {
                         // Array element access: look up signal "name[idx]"
                         if self.module.dynamic_arrays.contains(&name) {
-                            self.dollar_bound.push((self.get_queue_size(&name) as i64) - 1);
+                            self.scriptllar_bound.push((self.get_queue_size(&name) as i64) - 1);
                         }
                         let idx_val = self.eval_expr(index);
-                        if self.module.dynamic_arrays.contains(&name) { self.dollar_bound.pop(); }
+                        if self.module.dynamic_arrays.contains(&name) { self.scriptllar_bound.pop(); }
                         let idx_str = if self.is_associative_array(&name) {
                             self.assoc_key_str(&name, &idx_val)
                         } else {
@@ -5758,10 +5814,10 @@ impl Simulator {
                         } else {
                             arr_hi
                         };
-                        self.dollar_bound.push(upper_bound);
+                        self.scriptllar_bound.push(upper_bound);
                         let l = self.eval_expr(left).to_i64().unwrap_or(0);
                         let r = self.eval_expr(right).to_i64().unwrap_or(0);
-                        self.dollar_bound.pop();
+                        self.scriptllar_bound.pop();
                         let (lo, hi) = match kind {
                             RangeKind::Constant => (l.min(r), l.max(r)),
                             RangeKind::IndexedUp => (l, l + r - 1),
@@ -6136,7 +6192,7 @@ impl Simulator {
             }
             ExprKind::Call { func, args } => self.eval_call(func, args),
             ExprKind::Dollar => {
-                if let Some(&b) = self.dollar_bound.last() {
+                if let Some(&b) = self.scriptllar_bound.last() {
                     let mut v = Value::from_u64(b as u64, 32);
                     v.is_signed = true;
                     v
@@ -6629,10 +6685,10 @@ impl Simulator {
                                     let r_upper: i64 = if r_is_dyn {
                                         (self.get_queue_size(&rname) as i64) - 1
                                     } else { r_hi_a };
-                                    self.dollar_bound.push(r_upper);
+                                    self.scriptllar_bound.push(r_upper);
                                     let l = self.eval_expr(left).to_i64().unwrap_or(0);
                                     let r = self.eval_expr(right).to_i64().unwrap_or(0);
-                                    self.dollar_bound.pop();
+                                    self.scriptllar_bound.pop();
                                     // Per IEEE 7.10.1: if l > r the slice is empty.
                                     let results: Vec<Value> = if l > r {
                                         Vec::new()
@@ -6698,10 +6754,10 @@ impl Simulator {
                                             let r_upper: i64 = if r_is_dyn {
                                                 (self.get_queue_size(&rname) as i64) - 1
                                             } else { r_hi_a };
-                                            self.dollar_bound.push(r_upper);
+                                            self.scriptllar_bound.push(r_upper);
                                             let l = self.eval_expr(left).to_i64().unwrap_or(0);
                                             let r = self.eval_expr(right).to_i64().unwrap_or(0);
-                                            self.dollar_bound.pop();
+                                            self.scriptllar_bound.pop();
                                             if l <= r {
                                                 let lo = l.max(r_lo_a);
                                                 let hi = r.min(r_upper);
@@ -7306,9 +7362,21 @@ impl Simulator {
 
         // Heuristic fallback for unresolved single-segment names:
         // choose a suffix match guided by the most recent hierarchical hint.
-        if hier.path.len() == 1 {
-            let suffix = format!(".{}", leaf);
-            let candidates: Vec<&str> = self.signal_name_to_id.keys().map(|k| k.as_ref()).filter(|k: &&str| k.ends_with(&suffix)).collect();
+        // Skip the O(N) suffix scan if the "leaf" already contains dots —
+        // that means the parser flattened a deep hier path into one segment
+        // (testbench probes like `assign x = x_soc.x_cpu_sub_system_axi.....fifo_full`),
+        // and no key in signal_name_to_id can end with `.<full_dotted_path>`
+        // since the table is keyed by the full path itself, not nested deeper.
+        // On c910, this scan over 35.7M signals dominated time-0 settle
+        // (575s / 11K probes).
+        if hier.path.len() == 1 && !leaf.contains('.') {
+            // Use leaf-name reverse index — O(1) instead of O(N) scan.
+            let candidates: Vec<&str> = self.leaf_name_to_ids
+                .get(leaf.as_str())
+                .map(|ids| ids.iter()
+                    .filter_map(|&id| self.id_to_name.get(id).map(|n| n.as_ref()))
+                    .collect())
+                .unwrap_or_default();
             if !candidates.is_empty() {
                 let hint_owned = self.name_resolve_hint.borrow().clone().unwrap_or_default();
                 let mut best: Option<&str> = None;
@@ -7347,12 +7415,20 @@ impl Simulator {
         // Multi-segment suffix fallback: for paths like "uut.picorv32_core.cpu_state",
         // look for keys ending with ".uut.picorv32_core.cpu_state", preferring the one
         // closest (by common-prefix) to the current scope hint.
+        // Use leaf_name_to_ids index to narrow candidates to signals whose
+        // last `.`-segment matches the leaf — turns the O(N) scan over
+        // 35M signals into O(M) where M is the number of signals sharing
+        // that leaf name (usually small).
         if hier.path.len() > 1 {
             let suffix = format!(".{}", raw);
-            let candidates: Vec<&str> = self.signal_name_to_id.keys()
-                .map(|k| k.as_ref())
-                .filter(|k: &&str| k.ends_with(&suffix) || *k == raw.as_str())
-                .collect();
+            let candidates: Vec<&str> = if let Some(ids) = self.leaf_name_to_ids.get(leaf.as_str()) {
+                ids.iter()
+                    .filter_map(|&id| self.id_to_name.get(id).map(|n| n.as_ref()))
+                    .filter(|k: &&str| k.ends_with(&suffix) || *k == raw.as_str())
+                    .collect()
+            } else {
+                Vec::new()
+            };
             if !candidates.is_empty() {
                 let hint_owned = self.name_resolve_hint.borrow().clone().unwrap_or_default();
                 let mut best: Option<&str> = None;

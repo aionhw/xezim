@@ -6,9 +6,9 @@ module top;
   initial begin
     pass = 1'b1;
 
-    // Neither no_dir or no_dir2 should exist and vsim should be a file.
+    // Neither no_dir or no_dir2 should exist and SIM should be a file.
     // The ivltests directory should exist.
-    $readmempath("/no_dir:no_dir2:vsim:ivltests");
+    $readmempath("/no_dir:no_dir2:SIM:ivltests");
 
     $readmemh("pr2509349.txt", mem);
 

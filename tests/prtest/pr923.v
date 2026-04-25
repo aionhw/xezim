@@ -27,7 +27,7 @@ $Name:  $
 
 
 
-Model Technology ModelSim SE vsim 5.7c Simulator 2003.03 Mar 13 2003
+Model Technology ModelSim SE SIM 5.7c Simulator 2003.03 Mar 13 2003
 
 #                    0 p1=x p2=StX
 #                    5 p1=1 p2=StX

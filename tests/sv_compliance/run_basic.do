@@ -1,4 +1,4 @@
-source [file join [file dirname [file normalize [info script]]] questa_common.do]
+source [file join [file dirname [file normalize [info script]]] xxxyyy_common.script]
 set run_time 20us
 if {[info exists ::env(RUN_TIME)]} {
     set run_time $::env(RUN_TIME)

@@ -1,4 +1,4 @@
-# Common Tcl helpers for the SystemVerilog compliance suite on Questa/ModelSim.
+# Common Tcl helpers for the SystemVerilog compliance suite on xxxyyy/ModelSim.
 
 set ::QSUITE_DO_DIR [file dirname [file normalize [info script]]]
 set ::QSUITE_ROOT   [file dirname $::QSUITE_DO_DIR]
@@ -152,15 +152,15 @@ proc qsuite_run_positive_test {file_path {run_time 20us}} {
 
     qsuite_banner "Running $file_name (top=$top_name, time=$run_time)"
 
-    set vlog_cmd [list vlog -sv -l $compile_log -work $lib_name "+incdir+$::QSUITE_COMMON" $file_path]
-    if {[catch {eval $vlog_cmd} msg]} {
+    set COMPILE_cmd [list COMPILE -sv -l $compile_log -work $lib_name "+incdir+$::QSUITE_COMMON" $file_path]
+    if {[catch {eval $COMPILE_cmd} msg]} {
         qsuite_warn "[FAIL] compile failed for $file_name"
         qsuite_warn "       see $compile_log"
         return 1
     }
 
-    set vsim_cmd [list vsim -c -onfinish stop -l $run_log ${lib_name}.${top_name}]
-    if {[catch {eval $vsim_cmd} msg]} {
+    set SIM_cmd [list SIM -c -onfinish stop -l $run_log ${lib_name}.${top_name}]
+    if {[catch {eval $SIM_cmd} msg]} {
         qsuite_warn "[FAIL] elaboration failed for $file_name"
         qsuite_warn "       see $run_log"
         return 1
@@ -206,8 +206,8 @@ proc qsuite_run_negative_test {file_path} {
 
     qsuite_banner "Compiling negative test $file_name (expect fail)"
 
-    set vlog_cmd [list vlog -sv -l $compile_log -work $lib_name "+incdir+$::QSUITE_COMMON" $file_path]
-    if {[catch {eval $vlog_cmd} msg]} {
+    set COMPILE_cmd [list COMPILE -sv -l $compile_log -work $lib_name "+incdir+$::QSUITE_COMMON" $file_path]
+    if {[catch {eval $COMPILE_cmd} msg]} {
         qsuite_note "[PASS] $file_name compile failed as expected"
         return 0
     }

@@ -118,8 +118,8 @@ Current negative tests cover:
 - This package was organized and reviewed here, but it was **not simulator-validated in-container** because no SystemVerilog simulator is installed.
 
 
-## Questa / ModelSim
-A `Makefile` is included for Mentor QuestaSim / ModelSim style flows.
+## xxxyyy / ModelSim
+A `Makefile` is included for Mentor xxxyyy / ModelSim style flows.
 
 Examples:
 ```bash
@@ -134,6 +134,6 @@ make compilefail-neg01_duplicate_declaration
 
 Notes:
 - Positive tests compile into isolated libraries under `sim/libs/` and run one-by-one.
-- Negative tests are expected to fail during `vlog` compile.
+- Negative tests are expected to fail during `COMPILE` compile.
 - Because some tests have free-running clocks and do not call `$finish`, the Makefile runs each simulation for a bounded `RUN_TIME` and then checks the transcript for `TEST_PASS`.
 - Override runtime if needed, for example `make positive RUN_TIME=100us`.
