@@ -147,6 +147,13 @@ pub struct BytecodeCompiler<'a> {
     /// with a bare local name (`mem_valid`) is first tried verbatim, then
     /// with this prefix applied (`testbench.mem_valid`).
     pub scope_hint: Option<String>,
+    /// Per-for-loop leaf-name → signal_id override. Set by `compile_stmt`'s
+    /// For arm before compiling condition/step expressions, cleared after.
+    /// Re-routes bare-ident lookups for the loop variable so that the step
+    /// `i = i+1` writes to the same signal as the init `i = 0`, even when
+    /// the elaborator only scope-qualified init's lvalue (see compile_for
+    /// for the full c910 hang context).
+    pub for_loop_var_ids: std::collections::HashMap<String, usize>,
     /// User-task table for inlining zero-arg, non-blocking task bodies.
     /// Task-enable (`task_name;`) statements that resolve here get their
     /// bodies compiled in place instead of emitting a single StmtFallback
@@ -180,6 +187,7 @@ impl<'a> BytecodeCompiler<'a> {
             bail_reason: None,
             allow_ast_fallback: false,
             scope_hint: None,
+            for_loop_var_ids: std::collections::HashMap::new(),
             tasks: None,
             inlining_stack: Vec::new(),
             tasks_inlined: 0,
@@ -321,6 +329,13 @@ impl<'a> BytecodeCompiler<'a> {
 
     fn lookup_signal_id(&self, hier: &HierarchicalIdentifier) -> Option<usize> {
         let raw = Self::hier_raw_name(hier);
+        // Targeted override for for-loop variables — see for_loop_var_ids
+        // doc + compile_for's comment for the c910 motivation.
+        if !self.for_loop_var_ids.is_empty() && hier.path.len() == 1 && !raw.contains('.') {
+            if let Some(&id) = self.for_loop_var_ids.get(&raw) {
+                return Some(id);
+            }
+        }
         if let Some(&id) = self.signal_name_to_id.get(raw.as_str()) {
             return Some(id);
         }
@@ -596,6 +611,11 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("For_break_continue");
                     return false;
                 }
+                // Save outer for-loop overrides so nested loops don't leak.
+                let saved_for_vars = std::mem::take(&mut self.for_loop_var_ids);
+                // Inherit the outer overrides too — a nested loop's body
+                // can still reference the outer counter.
+                self.for_loop_var_ids = saved_for_vars.clone();
                 for fi in init {
                     match fi {
                         ForInit::Assign { lvalue, rvalue } => {
@@ -608,8 +628,45 @@ impl<'a> BytecodeCompiler<'a> {
                             if !self.compile_blocking_target(lvalue, val_reg, width) {
                                 self.bail("For_init_target"); return false;
                             }
+                            // Capture init's lvalue signal_id keyed by leaf
+                            // name. The for-loop's step / body expressions
+                            // often re-parse bare-ident references that the
+                            // elaborator did not scope-qualify (only init's
+                            // lvalue gets qualified through an elaboration
+                            // path). Without this, a bare `i` in step
+                            // `i = i+1` collides with an unrelated top-level
+                            // signal of the same name and resolves to the
+                            // wrong signal_id. On c910 the always-block
+                            // counter was clobbering the testbench's
+                            // top-level `integer i` (signal_id 9), and the
+                            // actual counter never advanced — the loop ran
+                            // forever (10M+ insns per call, hung the sim
+                            // in iter 1 of the event loop).
+                            // Capture init's resolved signal_id keyed by the
+                            // *leaf* of the lvalue's hier path. The
+                            // elaborator may have rewritten init's lvalue
+                            // from bare `i` to a multi-segment `module.i`
+                            // form (which is why init resolves correctly
+                            // to the module-local id), while leaving the
+                            // for-step's bare `i` untouched. Capturing by
+                            // leaf bridges that asymmetry: bare `i` in step
+                            // gets re-routed to init's resolved id.
+                            if let ExprKind::Ident(hier) = &lvalue.kind {
+                                let leaf = if hier.path.len() == 1 && hier.path[0].name.name.contains('.') {
+                                    // Parser flattened a hier path into one segment with dots.
+                                    hier.path[0].name.name.rsplit('.').next().unwrap_or("").to_string()
+                                } else {
+                                    hier.path.last().map(|s| s.name.name.clone()).unwrap_or_default()
+                                };
+                                if !leaf.is_empty() && !leaf.contains('.') {
+                                    if let Some(id) = self.lookup_signal_id(hier) {
+                                        self.for_loop_var_ids.insert(leaf, id);
+                                    }
+                                }
+                            }
                         }
                         ForInit::VarDecl { .. } => {
+                            self.for_loop_var_ids = saved_for_vars;
                             self.bail("For_init_vardecl"); return false;
                         }
                     }
@@ -653,6 +710,8 @@ impl<'a> BytecodeCompiler<'a> {
                         self.insns[idx] = Insn::BranchIfFalse(reg, end);
                     }
                 }
+                // Restore outer for-loop's override map.
+                self.for_loop_var_ids = saved_for_vars;
                 true
             }
             other => {
