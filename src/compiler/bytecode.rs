@@ -47,6 +47,8 @@ pub enum Insn {
     Eq(RegId, RegId, RegId),
     Neq(RegId, RegId, RegId),
     CaseEq(RegId, RegId, RegId),
+    CasezEq(RegId, RegId, RegId),
+    CasexEq(RegId, RegId, RegId),
     Lt(RegId, RegId, RegId),
     Leq(RegId, RegId, RegId),
     Gt(RegId, RegId, RegId),
@@ -496,7 +498,7 @@ impl<'a> BytecodeCompiler<'a> {
                     false
                 }
             }
-            StatementKind::Case { expr, items, .. } => {
+            StatementKind::Case { kind, expr, items, .. } => {
                 if let Some(val_reg) = self.compile_expr(expr, 0) {
                     let mut end_jumps: Vec<usize> = Vec::new();
                     let mut default_item: Option<&Statement> = None;
@@ -505,11 +507,16 @@ impl<'a> BytecodeCompiler<'a> {
                             default_item = Some(&item.stmt);
                             continue;
                         }
-                        // Compile pattern match: val === pattern
+                        // Compile pattern match: val === pattern (or casez/casex
+                        // wildcard match per CaseKind).
                         for pat in &item.patterns {
                             if let Some(pat_reg) = self.compile_expr(pat, 0) {
                                 let cmp_reg = self.alloc_reg();
-                                self.emit(Insn::CaseEq(cmp_reg, val_reg, pat_reg));
+                                self.emit(match kind {
+                                    crate::ast::stmt::CaseKind::Casez => Insn::CasezEq(cmp_reg, val_reg, pat_reg),
+                                    crate::ast::stmt::CaseKind::Casex => Insn::CasexEq(cmp_reg, val_reg, pat_reg),
+                                    _ => Insn::CaseEq(cmp_reg, val_reg, pat_reg),
+                                });
                                 let branch_idx = self.insns.len();
                                 self.emit(Insn::BranchIfFalse(cmp_reg, 0));
                                 if !self.compile_stmt(&item.stmt) { return false; }

@@ -107,8 +107,12 @@ module top;
   );
 
   always @(posedge clk) begin
-    if (cyc >= 15 && cyc <= 30)
+    if (cyc >= 15 && cyc <= 30) begin
       $strobe("REPLAY cyc=%0d inst=%h alu=%b spec=%b expt_inv=%b mad=%b lsu=%b cp0=%b br=%b 32bit=%b",
         cyc, inst, alu_sel, special_sel, expt_inv, mad_sel, lsu_sel, cp0_sel, branch_sel, inst_32bit);
+      $strobe("PROBE cyc=%0d ill16=%b ill32=%b ill=%b dop=%b dfunc3=%b dinst=%h rd16=%b",
+        cyc, udut.decd_ill_expt16, udut.decd_ill_expt32, udut.decd_ill_expt,
+        udut.decd_op[4:0], udut.decd_func3[2:0], udut.decd_inst, udut.rd_16[4:0]);
+    end
   end
 endmodule

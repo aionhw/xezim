@@ -2477,6 +2477,8 @@ impl Simulator {
                 Insn::Eq(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].is_equal(&vm_regs[*r as usize]); }
                 Insn::Neq(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].is_not_equal(&vm_regs[*r as usize]); }
                 Insn::CaseEq(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].case_eq(&vm_regs[*r as usize]); }
+                Insn::CasezEq(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].casez_eq(&vm_regs[*r as usize]); }
+                Insn::CasexEq(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].casex_eq(&vm_regs[*r as usize]); }
                 Insn::Lt(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].less_than(&vm_regs[*r as usize]); }
                 Insn::Leq(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].less_equal(&vm_regs[*r as usize]); }
                 Insn::Gt(d, l, r) => { vm_regs[*d as usize] = vm_regs[*l as usize].greater_than(&vm_regs[*r as usize]); }
@@ -2686,6 +2688,8 @@ impl Simulator {
                 Insn::Eq(d, l, r) => { self.vm_regs[*d as usize] = self.vm_regs[*l as usize].is_equal(&self.vm_regs[*r as usize]); }
                 Insn::Neq(d, l, r) => { self.vm_regs[*d as usize] = self.vm_regs[*l as usize].is_not_equal(&self.vm_regs[*r as usize]); }
                 Insn::CaseEq(d, l, r) => { self.vm_regs[*d as usize] = self.vm_regs[*l as usize].case_eq(&self.vm_regs[*r as usize]); }
+                Insn::CasezEq(d, l, r) => { self.vm_regs[*d as usize] = self.vm_regs[*l as usize].casez_eq(&self.vm_regs[*r as usize]); }
+                Insn::CasexEq(d, l, r) => { self.vm_regs[*d as usize] = self.vm_regs[*l as usize].casex_eq(&self.vm_regs[*r as usize]); }
                 Insn::Lt(d, l, r) => { self.vm_regs[*d as usize] = self.vm_regs[*l as usize].less_than(&self.vm_regs[*r as usize]); }
                 Insn::Leq(d, l, r) => { self.vm_regs[*d as usize] = self.vm_regs[*l as usize].less_equal(&self.vm_regs[*r as usize]); }
                 Insn::Gt(d, l, r) => { self.vm_regs[*d as usize] = self.vm_regs[*l as usize].greater_than(&self.vm_regs[*r as usize]); }
@@ -3995,6 +3999,21 @@ impl Simulator {
                 break;
             }
             cascade_iter += 1;
+        }
+        // Final propagation pass: level-sensitive always blocks fired by the
+        // last check_edges may have done blocking-writes to regs that feed
+        // downstream cont-assigns (e.g. cr_iu_decd's ill_expt16 always block
+        // → decd_ill_expt → decd_special_sel chain). Without this final
+        // settle, those cont-assign dependents stay stale until the next
+        // clock tick — symptom: e902 part6 decoder outputs lag iverilog by
+        // one cycle on inst-class transitions. settle alone is sufficient
+        // (no further check_edges); the always-block sens lists read from
+        // signals already captured in the loop's last snapshot, so they
+        // wouldn't re-trigger anyway.
+        if self.dirty_any {
+            let t0 = std::time::Instant::now();
+            self.settle_combinatorial();
+            t_settle += t0.elapsed().as_nanos() as u64;
         }
         (t_snap, t_nba, t_settle, t_edges)
     }
@@ -7316,10 +7335,21 @@ impl Simulator {
                 if self.eval_expr(condition).is_true() { self.exec_statement(then_stmt); }
                 else if let Some(el) = else_stmt { self.exec_statement(el); }
             }
-            StatementKind::Case { expr, items, .. } => {
+            StatementKind::Case { kind, expr, items, .. } => {
                 let val = self.eval_expr(expr); let mut matched = false;
-                for (_iidx, item) in items.iter().enumerate() { if item.is_default { continue; } for pat in &item.patterns { if val.case_eq(&self.eval_expr(pat)).is_true() {
-                    self.exec_statement(&item.stmt); matched = true; break; } } if matched { break; } }
+                for (_iidx, item) in items.iter().enumerate() {
+                    if item.is_default { continue; }
+                    for pat in &item.patterns {
+                        let pv = self.eval_expr(pat);
+                        let eq = match kind {
+                            CaseKind::Casez => val.casez_eq(&pv),
+                            CaseKind::Casex => val.casex_eq(&pv),
+                            _ => val.case_eq(&pv),
+                        };
+                        if eq.is_true() { self.exec_statement(&item.stmt); matched = true; break; }
+                    }
+                    if matched { break; }
+                }
                 if !matched { for item in items { if item.is_default {
                     self.exec_statement(&item.stmt); break; } } }
             }
