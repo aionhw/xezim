@@ -2584,15 +2584,28 @@ impl Simulator {
         if let Some(Some(jit_fn)) = self.jit_fns.get(block_idx).copied() {
             let self_ptr: *mut u8 = self as *mut Self as *mut u8;
             let rc = unsafe { jit_fn(self_ptr) };
-            if rc == 0 {
-                self.prof_insns_executed += self.compiled_edge_blocks[block_idx]
-                    .as_ref().map(|cb| cb.instructions.len() as u64).unwrap_or(0);
-                return true;
+            match rc {
+                0 => {
+                    // Success — JIT executed the entire block.
+                    self.prof_insns_executed += self.compiled_edge_blocks[block_idx]
+                        .as_ref().map(|cb| cb.instructions.len() as u64).unwrap_or(0);
+                    return true;
+                }
+                1 => {
+                    // Transient fallback: pre-check found X/Z on at least
+                    // one input. JIT bailed BEFORE executing any side-
+                    // effecting Insn — fall through to the interpreter
+                    // for THIS execution but keep the JIT armed for next
+                    // time (X/Z usually clears post-reset). Path B from
+                    // the JIT roadmap.
+                }
+                _ => {
+                    // Permanent fallback (rc >= 2): block hit a runtime
+                    // condition the JIT can't recover from. Disable JIT
+                    // for this block for the rest of the run.
+                    self.jit_fns[block_idx] = None;
+                }
             }
-            // Non-zero return: block asked for interpreter fallback
-            // (e.g. encountered a Wide/4-state path). Mark this block
-            // un-JITtable for the rest of the run and fall through.
-            self.jit_fns[block_idx] = None;
         }
         // Interpreter path.
         let (insns_ptr, insns_len, num_regs) = match &self.compiled_edge_blocks[block_idx] {
@@ -7972,6 +7985,35 @@ impl Simulator {
     pub(crate) fn jit_load_signal(&self, id: usize) -> u64 {
         if id >= self.signal_table.len() { return 0; }
         self.signal_table[id].to_u64().unwrap_or(0)
+    }
+
+    /// JIT bridge: Path B X/Z pre-check. Returns true if ANY signal in
+    /// `ids` currently has X or Z bits set (i.e. its raw_bits xz part
+    /// is non-zero). Called from the JIT-emitted prelude. When true,
+    /// the JIT bails (returns 1) without writing anything, and the
+    /// dispatch in `exec_bytecode` runs the interpreter for that
+    /// execution while keeping the JIT armed for next time.
+    pub(crate) fn jit_inputs_have_xz(&self, ids: &[u32]) -> bool {
+        for &id in ids {
+            let i = id as usize;
+            if i >= self.signal_table.len() { continue; }
+            let (_v, x) = self.signal_table[i].raw_bits();
+            if x != 0 {
+                return true;
+            }
+            // Wide signals: raw_bits truncates at 64 bits. Check the
+            // tail explicitly so we don't miss X/Z above bit 63.
+            if self.signal_widths[i] > 64 {
+                let val = &self.signal_table[i];
+                for bit in 64..val.width as usize {
+                    match val.get_bit(bit) {
+                        LogicBit::X | LogicBit::Z => return true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// JIT bridge: mirror `Insn::BlockingAssign` — width-mask the

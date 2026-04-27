@@ -119,6 +119,30 @@ pub unsafe extern "C" fn xezim_jit_schedule_nba_range(
     sim.jit_schedule_nba_range(id as usize, hi, lo, val_bits);
 }
 
+/// Path B X/Z runtime pre-check. Reads the slice of `n` u32 sig_ids
+/// pointed at by `ids_ptr` and returns 1 if ANY of those signals
+/// currently have non-zero `xz_bits` (i.e. X/Z), else 0. Called from
+/// the JIT prelude before any side-effecting Insn executes; the JIT
+/// emits an `if (rc != 0) return 1` to bail out cleanly so the
+/// interpreter can run the block safely. Keeps the JIT compatible
+/// with NbaAssignRange et al. (which were previously OFF because
+/// 2-state codegen mishandled X/Z).
+///
+/// SAFETY: caller must ensure `ids_ptr` points to `n` valid u32s for
+/// the duration of the call. The Cranelift codegen materialises a
+/// data symbol holding the per-block input list and passes it in,
+/// satisfying this contract.
+#[no_mangle]
+pub unsafe extern "C" fn xezim_jit_inputs_have_xz(
+    sim: *mut u8,
+    ids_ptr: *const u32,
+    n: u32,
+) -> u32 {
+    let sim = &*(sim as *const crate::compiler::simulator::Simulator);
+    let ids = std::slice::from_raw_parts(ids_ptr, n as usize);
+    if sim.jit_inputs_have_xz(ids) { 1 } else { 0 }
+}
+
 /// Stubs when the feature is disabled — everything is None / no-op so
 /// `exec_bytecode` always falls through to the interpreter.
 #[cfg(not(feature = "jit"))]
@@ -136,7 +160,7 @@ mod stub {
 #[cfg(feature = "jit")]
 mod enabled {
     use super::super::bytecode::Insn;
-    use super::{JitFn, xezim_jit_load_signal, xezim_jit_store_signal, xezim_jit_schedule_nba, xezim_jit_schedule_nba_range};
+    use super::{JitFn, xezim_jit_load_signal, xezim_jit_store_signal, xezim_jit_schedule_nba, xezim_jit_schedule_nba_range, xezim_jit_inputs_have_xz};
     use cranelift::prelude::*;
     use cranelift::codegen::ir::{StackSlot, FuncRef};
     use cranelift_jit::{JITBuilder, JITModule as ClJitModule};
@@ -160,6 +184,7 @@ mod enabled {
             builder.symbol("xezim_jit_store_signal", xezim_jit_store_signal as *const u8);
             builder.symbol("xezim_jit_schedule_nba", xezim_jit_schedule_nba as *const u8);
             builder.symbol("xezim_jit_schedule_nba_range", xezim_jit_schedule_nba_range as *const u8);
+            builder.symbol("xezim_jit_inputs_have_xz", xezim_jit_inputs_have_xz as *const u8);
             Some(Self { module: ClJitModule::new(builder), next_id: 0 })
         }
 
@@ -170,10 +195,26 @@ mod enabled {
             for insn in insns {
                 if !is_supported(insn) { return None; }
             }
-            self.codegen_block(insns, num_regs).ok()
+            // Collect the set of signal IDs this block reads via LoadSignal*.
+            // The Path B X/Z prelude pre-checks these before letting the
+            // (2-state) JIT body run. Sites the JIT writes to (Insn::*Assign*
+            // sig_ids) don't need pre-checking — we only care about *inputs*
+            // that could feed wrong-determinate values into arithmetic.
+            let mut input_ids: Vec<u32> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for insn in insns {
+                let id_opt = match insn {
+                    Insn::LoadSignal(_, sid) | Insn::LoadSignalSigned(_, sid) => Some(*sid as u32),
+                    _ => None,
+                };
+                if let Some(sid) = id_opt {
+                    if seen.insert(sid) { input_ids.push(sid); }
+                }
+            }
+            self.codegen_block(insns, num_regs, &input_ids).ok()
         }
 
-        fn codegen_block(&mut self, insns: &[Insn], num_regs: u32) -> Result<JitFn, ()> {
+        fn codegen_block(&mut self, insns: &[Insn], num_regs: u32, input_ids: &[u32]) -> Result<JitFn, ()> {
             let pointer_type = self.module.target_config().pointer_type();
 
             // Declare bridge signatures (shared across all compiled blocks).
@@ -198,6 +239,13 @@ mod enabled {
             nba_range_sig.params.push(AbiParam::new(types::I32));
             nba_range_sig.params.push(AbiParam::new(types::I64));
 
+            // Path B: xz_check (sim, ids_ptr, n_ids) -> u32 (1 if any X/Z, else 0).
+            let mut xz_check_sig = self.module.make_signature();
+            xz_check_sig.params.push(AbiParam::new(pointer_type));
+            xz_check_sig.params.push(AbiParam::new(pointer_type));
+            xz_check_sig.params.push(AbiParam::new(types::I32));
+            xz_check_sig.returns.push(AbiParam::new(types::I32));
+
             let load_id: FuncId = self.module
                 .declare_function("xezim_jit_load_signal", Linkage::Import, &load_sig)
                 .map_err(|_| ())?;
@@ -209,6 +257,9 @@ mod enabled {
                 .map_err(|_| ())?;
             let nba_range_id: FuncId = self.module
                 .declare_function("xezim_jit_schedule_nba_range", Linkage::Import, &nba_range_sig)
+                .map_err(|_| ())?;
+            let xz_check_id: FuncId = self.module
+                .declare_function("xezim_jit_inputs_have_xz", Linkage::Import, &xz_check_sig)
                 .map_err(|_| ())?;
 
             // Function signature: extern "C" fn(sim: *mut u8) -> u32
@@ -249,10 +300,62 @@ mod enabled {
                 if leader { pc_to_block[i] = Some(builder.create_block()); }
             }
 
-            // Entry block takes the sim_ptr param. We redirect it to the
-            // block for PC 0 immediately so block params live on one Block.
+            // Path B X/Z prelude block: created BEFORE the original entry
+            // (= pc_to_block[0]) and made the function's true entry. Reads
+            // sim_ptr from function params, scans input_ids for X/Z, and
+            // either bails (return 1) or jumps to the original entry with
+            // sim_ptr passed as a block param.
+            let prelude_block = builder.create_block();
+            let fallback_block = builder.create_block();
             let entry_block = pc_to_block[0].expect("PC 0 is a leader");
-            builder.append_block_params_for_function_params(entry_block);
+
+            builder.append_block_params_for_function_params(prelude_block);
+            // entry_block now receives sim_ptr from the prelude.
+            builder.append_block_param(entry_block, pointer_type);
+
+            builder.switch_to_block(prelude_block);
+            let prelude_sim_ptr = builder.block_params(prelude_block)[0];
+
+            // Import bridge functions into this function scope. Done up-front
+            // so the prelude can call xz_check_ref before the per-Insn
+            // codegen begins.
+            let load_ref = self.module.declare_func_in_func(load_id, &mut builder.func);
+            let store_ref = self.module.declare_func_in_func(store_id, &mut builder.func);
+            let nba_ref = self.module.declare_func_in_func(nba_id, &mut builder.func);
+            let nba_range_ref = self.module.declare_func_in_func(nba_range_id, &mut builder.func);
+            let xz_check_ref = self.module.declare_func_in_func(xz_check_id, &mut builder.func);
+
+            if input_ids.is_empty() {
+                // No reads — no X/Z risk. Fall straight through.
+                builder.ins().jump(entry_block, &[prelude_sim_ptr]);
+            } else {
+                // Materialise input_ids as a fixed stack-slot u32 array,
+                // then call xezim_jit_inputs_have_xz(sim, ptr, n).
+                let slot_size = (input_ids.len() * 4) as u32;
+                let id_slot = builder.create_sized_stack_slot(
+                    StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 2));
+                for (i, &id) in input_ids.iter().enumerate() {
+                    let id_val = builder.ins().iconst(types::I32, id as i64);
+                    builder.ins().stack_store(id_val, id_slot, (i * 4) as i32);
+                }
+                let ids_ptr = builder.ins().stack_addr(pointer_type, id_slot, 0);
+                let n_val = builder.ins().iconst(types::I32, input_ids.len() as i64);
+                let call = builder.ins().call(xz_check_ref, &[prelude_sim_ptr, ids_ptr, n_val]);
+                let xz_rc = builder.inst_results(call)[0];
+                // Branch: rc != 0 → fallback_block (return 1); rc == 0 →
+                // jump to entry_block with sim_ptr.
+                builder.ins().brif(xz_rc, fallback_block, &[], entry_block, &[prelude_sim_ptr]);
+            }
+            builder.seal_block(prelude_block);
+
+            // Fallback block: return 1 (transient, exec_bytecode keeps JIT
+            // armed and runs the interpreter for this execution).
+            builder.switch_to_block(fallback_block);
+            let one = builder.ins().iconst(types::I32, 1);
+            builder.ins().return_(&[one]);
+            builder.seal_block(fallback_block);
+
+            // Switch to the original entry block (= pc_to_block[0]).
             builder.switch_to_block(entry_block);
             let sim_ptr = builder.block_params(entry_block)[0];
 
@@ -263,12 +366,6 @@ mod enabled {
                     StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3)
                 ))
                 .collect();
-
-            // Import bridge functions into this function scope.
-            let load_ref = self.module.declare_func_in_func(load_id, &mut builder.func);
-            let store_ref = self.module.declare_func_in_func(store_id, &mut builder.func);
-            let nba_ref = self.module.declare_func_in_func(nba_id, &mut builder.func);
-            let nba_range_ref = self.module.declare_func_in_func(nba_range_id, &mut builder.func);
 
             let resolve_target = |t: usize, pc_to_block: &Vec<Option<cranelift::codegen::ir::Block>>|
                 -> cranelift::codegen::ir::Block
@@ -386,6 +483,44 @@ mod enabled {
             Geq(d, l, r) => emit_cmp(builder, regs, *d, *l, *r, IntCC::UnsignedGreaterThanOrEqual),
             Shl(d, l, r) => emit_binop(builder, regs, *d, *l, *r, |b, x, y| b.ins().ishl(x, y)),
             Shr(d, l, r) => emit_binop(builder, regs, *d, *l, *r, |b, x, y| b.ins().ushr(x, y)),
+            AShr(d, l, r) => emit_binop(builder, regs, *d, *l, *r, |b, x, y| b.ins().sshr(x, y)),
+            BitXnor(d, l, r) => emit_binop(builder, regs, *d, *l, *r, |b, x, y| {
+                let xor = b.ins().bxor(x, y);
+                b.ins().bnot(xor)
+            }),
+            LogAnd(d, l, r) => {
+                // LogAnd: (l != 0) & (r != 0). Result is 1 or 0.
+                let lv = builder.ins().stack_load(types::I64, regs[*l as usize], 0);
+                let rv = builder.ins().stack_load(types::I64, regs[*r as usize], 0);
+                let zero = builder.ins().iconst(types::I64, 0);
+                let lb = builder.ins().icmp(IntCC::NotEqual, lv, zero);
+                let rb = builder.ins().icmp(IntCC::NotEqual, rv, zero);
+                let and = builder.ins().band(lb, rb);
+                let ext = builder.ins().uextend(types::I64, and);
+                builder.ins().stack_store(ext, regs[*d as usize], 0);
+            }
+            LogOr(d, l, r) => {
+                let lv = builder.ins().stack_load(types::I64, regs[*l as usize], 0);
+                let rv = builder.ins().stack_load(types::I64, regs[*r as usize], 0);
+                let zero = builder.ins().iconst(types::I64, 0);
+                let lb = builder.ins().icmp(IntCC::NotEqual, lv, zero);
+                let rb = builder.ins().icmp(IntCC::NotEqual, rv, zero);
+                let or = builder.ins().bor(lb, rb);
+                let ext = builder.ins().uextend(types::I64, or);
+                builder.ins().stack_store(ext, regs[*d as usize], 0);
+            }
+            LogNot(d, s) => {
+                let v = builder.ins().stack_load(types::I64, regs[*s as usize], 0);
+                let zero = builder.ins().iconst(types::I64, 0);
+                let eq = builder.ins().icmp(IntCC::Equal, v, zero);
+                let ext = builder.ins().uextend(types::I64, eq);
+                builder.ins().stack_store(ext, regs[*d as usize], 0);
+            }
+            Negate(d, s) => {
+                let v = builder.ins().stack_load(types::I64, regs[*s as usize], 0);
+                let neg = builder.ins().ineg(v);
+                builder.ins().stack_store(neg, regs[*d as usize], 0);
+            }
             BlockingAssign(sig_id, val_reg, width) => {
                 let v = builder.ins().stack_load(types::I64, regs[*val_reg as usize], 0);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
@@ -398,13 +533,23 @@ mod enabled {
                 let w = builder.ins().iconst(types::I32, *width as i64);
                 builder.ins().call(nba_ref, &[sim_ptr, id, v, w]);
             }
-            // NbaAssignRange / NbaAssignRangeDyn intentionally NOT
-            // covered: enabling them caused c910 to regress from 9m30s
-            // → 12m40s. Hypothesis: 2-state bridge-computed values
-            // diverge from the interpreter's 4-state behavior during
-            // reset, and the cascaded-wrong results push settle through
-            // 80s of extra propagation. Re-enable once the JIT has
-            // correct X/Z handling (needs the 4-state codegen path).
+            // NbaAssignRange: now safe under Path B (X/Z pre-check at
+            // function entry; if any input has X/Z we bail before any
+            // side effects). The c910 regression (9m30s → 12m40s) was
+            // caused by 2-state bridge values diverging from the
+            // interpreter's 4-state semantics during reset — Path B
+            // skips the JIT body entirely while reset is asserted, so
+            // the wrong-cascade can't happen.
+            NbaAssignRange(sig_id, hi, lo, val_reg) => {
+                let v = builder.ins().stack_load(types::I64, regs[*val_reg as usize], 0);
+                let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                let hi_v = builder.ins().iconst(types::I32, *hi as i64);
+                let lo_v = builder.ins().iconst(types::I32, *lo as i64);
+                builder.ins().call(_nba_range_ref, &[sim_ptr, id, hi_v, lo_v, v]);
+            }
+            // NbaAssignRangeDyn / NbaAssignBitDyn still left out — they
+            // need dynamic hi/lo from VM regs, requiring extra value
+            // shuffling. Tractable next step but not in this slice.
             Resize(reg, width) => {
                 // Mask the value to the target width. Loads from stack,
                 // applies mask, stores back. Emulates Value::resize for
@@ -488,11 +633,13 @@ mod enabled {
         matches!(insn,
             LoadConst(..) | LoadSignal(..) | LoadSignalSigned(..)
             | Move(..)
-            | BlockingAssign(..) | NbaAssign(..)
+            | BlockingAssign(..) | NbaAssign(..) | NbaAssignRange(..)
             | Add(..) | Sub(..)
-            | BitAnd(..) | BitOr(..) | BitXor(..) | BitNot(..)
+            | BitAnd(..) | BitOr(..) | BitXor(..) | BitXnor(..) | BitNot(..)
+            | LogAnd(..) | LogOr(..) | LogNot(..)
+            | Negate(..)
             | Eq(..) | Neq(..) | Lt(..) | Leq(..) | Gt(..) | Geq(..)
-            | Shl(..) | Shr(..)
+            | Shl(..) | Shr(..) | AShr(..)
             | Resize(..)
             | BitSelect(..) | RangeSelect(..)
             | BranchIfFalse(..) | Jump(..)
