@@ -10,10 +10,12 @@ use xezim_core::value::Value;
 fn insn_size_fits_cache_line() {
     let sz = std::mem::size_of::<Insn>();
     eprintln!("size_of Insn = {}", sz);
-    // Post-B1+B2 with LoadConst/LoadArrayElem/NbaAssignArray boxed, the
-    // enum sits at 32 B. Going back to 40 B is a hot-path footprint
-    // regression — investigate which variant got fat.
-    assert!(sz <= 32, "Insn enum grew to {} B (max-variant needs a Box?)", sz);
+    // After boxing Concat's Vec and StmtFallback's payload (in
+    // addition to the prior LoadConst/LoadArrayElem/NbaAssignArray
+    // boxes), the enum sits at 24 B. Going back to 32 B is a 33%
+    // bytecode-footprint regression on dense designs — investigate
+    // which variant got fat.
+    assert!(sz <= 24, "Insn enum grew to {} B (max-variant needs a Box?)", sz);
 }
 
 #[test]

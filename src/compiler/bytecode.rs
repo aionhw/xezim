@@ -67,8 +67,12 @@ pub enum Insn {
     BitSelect(RegId, RegId, RegId), // (dest, base, index)
     /// Range select: dest = src[left:right]
     RangeSelect(RegId, RegId, RegId, RegId), // (dest, base, left, right)
-    /// Concatenation: dest = {parts...}, part register IDs stored in the Vec.
-    Concat(RegId, Vec<RegId>),
+    /// Concatenation: dest = {parts...}, part register IDs stored in
+    /// the boxed Vec. The `Box` keeps the variant at 16 B (Box ptr only)
+    /// instead of inlining a 24 B Vec header — Concat is rare on the
+    /// hot path so the extra indirection is cheap, and shrinking this
+    /// variant lets the whole `Insn` enum drop from 32 B to 24 B.
+    Concat(RegId, Box<Vec<RegId>>),
 
     /// Conditional branch: if reg is false, jump to target instruction index.
     BranchIfFalse(RegId, u32),       // (cond_reg, jump_target)
@@ -116,7 +120,10 @@ pub enum Insn {
     /// Used for rare constructs (e.g. $display, complex LHS) so an edge
     /// block containing one unsupported stmt can still run most of its
     /// body as fast bytecode instead of falling back wholesale to AST.
-    StmtFallback(Arc<Statement>, &'static str),
+    /// Boxed payload keeps the variant at 8 B (Box ptr) instead of
+    /// 24 B (Arc + fat-ptr str). StmtFallback is the AST-interpreter
+    /// escape hatch — its dispatch cost dwarfs an extra deref.
+    StmtFallback(Box<(Arc<Statement>, &'static str)>),
 
     SetSigned(RegId),
     Nop,
@@ -272,7 +279,7 @@ impl<'a> BytecodeCompiler<'a> {
     fn emit_fallback(&mut self, stmt: &Statement) -> bool {
         if self.allow_ast_fallback {
             let reason = self.bail_reason.unwrap_or_else(|| Self::stmt_kind_label(stmt));
-            self.emit(Insn::StmtFallback(Arc::new(stmt.clone()), reason));
+            self.emit(Insn::StmtFallback(Box::new((Arc::new(stmt.clone()), reason))));
             true
         } else {
             false
@@ -398,7 +405,7 @@ impl<'a> BytecodeCompiler<'a> {
             let reason = self.bail_reason.unwrap_or_else(|| Self::stmt_kind_label(stmt));
             self.insns.truncate(start);
             self.next_reg = start_reg;
-            self.emit(Insn::StmtFallback(Arc::new(stmt.clone()), reason));
+            self.emit(Insn::StmtFallback(Box::new((Arc::new(stmt.clone()), reason))));
             self.bail_reason = saved_reason;
             return true;
         }
@@ -909,7 +916,7 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 }
                 let dest = self.alloc_reg();
-                self.emit(Insn::Concat(dest, regs));
+                self.emit(Insn::Concat(dest, Box::new(regs)));
                 Some(dest)
             }
             ExprKind::Concatenation(parts) => {
@@ -919,7 +926,7 @@ impl<'a> BytecodeCompiler<'a> {
                     regs.push(r);
                 }
                 let dest = self.alloc_reg();
-                self.emit(Insn::Concat(dest, regs));
+                self.emit(Insn::Concat(dest, Box::new(regs)));
                 Some(dest)
             }
             ExprKind::SystemCall { name, args } => {

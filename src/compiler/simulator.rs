@@ -2638,10 +2638,10 @@ impl Simulator {
                         self.nba_fast.push(NbaFast { signal_id: id, value: new_val });
                     }
                 }
-                Insn::StmtFallback(stmt, reason) => {
-                    let s = stmt.clone();
+                Insn::StmtFallback(payload) => {
+                    let s = payload.0.clone();
                     self.prof_fallback_insns += 1;
-                    let r = *reason;
+                    let r = payload.1;
                     let t0 = std::time::Instant::now();
                     self.exec_statement(&s);
                     let elapsed = t0.elapsed().as_nanos() as u64;
