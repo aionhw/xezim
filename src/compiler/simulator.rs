@@ -104,8 +104,12 @@ struct CombEntry {
     scope_hint: Option<String>,
     /// Pre-resolved signal IDs for reads (for fast dependency lookup).
     read_signal_ids: Vec<usize>,
-    /// Pre-resolved (signal_id, signal_name) pairs for writes.
-    write_signal_ids: Vec<(usize, String)>,
+    /// Pre-resolved signal IDs for writes. The original layout
+    /// stored a `(usize, String)` tuple but every read site
+    /// destructures the String with `_` — name was dead weight.
+    /// At c910 scale (~467K entries × ~5 writes each) the dropped
+    /// String per write reclaims tens of MB.
+    write_signal_ids: Vec<usize>,
     /// True when dependency extraction could not resolve all read signals.
     /// Such entries are conservatively re-evaluated each settle pass.
     has_unresolved_reads: bool,
@@ -2853,12 +2857,12 @@ impl Simulator {
                 .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads));
 
             // Resolve write targets, retrying with scope_hint for bare names
-            let wids: Vec<(usize, String)> = writes.iter()
+            let wids: Vec<usize> = writes.iter()
                 .filter_map(|w| {
-                    if let Some(&id) = self.signal_name_to_id.get(w.as_str()) { return Some((id, w.clone())); }
+                    if let Some(&id) = self.signal_name_to_id.get(w.as_str()) { return Some(id); }
                     if let Some(scope) = &scope_hint {
                         let qualified = format!("{}.{}", scope, w);
-                        if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) { return Some((id, qualified)); }
+                        if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) { return Some(id); }
                     }
                     None
                 })
@@ -2880,7 +2884,7 @@ impl Simulator {
             } else if let Some(dc) = direct_copy {
                 dc
             } else if wids.len() == 1 && lhs_is_bare_ident {
-                let (dst_id, _) = wids[0];
+                let dst_id = wids[0];
                 let width = self.signal_widths[dst_id];
                 let mut compiler = super::bytecode::BytecodeCompiler::new(
                     &self.signal_name_to_id,
@@ -2972,8 +2976,8 @@ impl Simulator {
                 let mut reads = HashSet::new();
                 let mut writes = HashSet::new();
                 Self::collect_stmt_reads(&ab.stmt, &self.module, &mut reads, &mut writes);
-                let wids: Vec<(usize, String)> = writes.iter()
-                    .filter_map(|w| self.signal_name_to_id.get(w.as_str()).map(|&id| (id, w.clone())))
+                let wids: Vec<usize> = writes.iter()
+                    .filter_map(|w| self.signal_name_to_id.get(w.as_str()).copied())
                     .collect();
                 // For comb-sensitivity purposes, exclude signals that are written by
                 // this block. Loop variables and local temps are written-then-read
@@ -3036,9 +3040,9 @@ impl Simulator {
             let n = entries.len();
             let mut writers_by_sig: Vec<Vec<usize>> = vec![Vec::new(); num_signals];
             for (idx, entry) in entries.iter().enumerate() {
-                for (sig_id, _) in &entry.write_signal_ids {
-                    if *sig_id < num_signals {
-                        writers_by_sig[*sig_id].push(idx);
+                for &sig_id in &entry.write_signal_ids {
+                    if sig_id < num_signals {
+                        writers_by_sig[sig_id].push(idx);
                     }
                 }
             }
@@ -4008,13 +4012,13 @@ impl Simulator {
                         &self.id_to_name[id]
                     }
                     CombItem::ContAssign {  .. } | CombItem::CompiledContAssign { .. } => {
-                        if let Some((id, _)) = entry.write_signal_ids.first() {
-                            &self.id_to_name[*id]
+                        if let Some(&id) = entry.write_signal_ids.first() {
+                            &self.id_to_name[id]
                         } else { continue; }
                     }
                     CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. } => {
-                        if let Some((id, _)) = entry.write_signal_ids.first() {
-                            &self.id_to_name[*id]
+                        if let Some(&id) = entry.write_signal_ids.first() {
+                            &self.id_to_name[id]
                         } else { continue; }
                     }
                 };
@@ -5065,8 +5069,8 @@ impl Simulator {
                         }
                         let write_ids = &entries[eidx].write_signal_ids;
                         self.settle_prev_values.clear();
-                        for (id, _name) in write_ids {
-                            self.settle_prev_values.push((*id, self.signal_table[*id].clone()));
+                        for &id in write_ids {
+                            self.settle_prev_values.push((id, self.signal_table[id].clone()));
                         }
                         self.exec_statement(stmt);
                         *self.name_resolve_hint.borrow_mut() = saved_hint;
