@@ -7382,7 +7382,10 @@ impl Simulator {
                 match control {
                     TimingControl::Delay(d) => {
                         let delay = self.eval_expr(d).to_u64().unwrap_or(0);
-                        self.apply_nba(); self.settle_combinatorial(); self.snapshot_edge_signals();
+                        self.apply_nba(); self.settle_combinatorial();
+                        self.check_edges();
+                        let _ = self.drain_edge_cascade(self.cascade_limit);
+                        self.snapshot_edge_signals();
                         let target = self.time + delay;
                         // Run scheduled continuations (other processes) whose fire
                         // time falls inside this delay window so concurrent blocks
