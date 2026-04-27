@@ -5115,16 +5115,47 @@ impl Simulator {
                 }
                 match &entries[eidx].item {
                     CombItem::DirectCopy { dst_id, src_id, width } => {
-                        let src_val = self.signal_table[*src_id].clone();
-                        let resized = if src_val.width != *width { src_val.resize(*width) } else { src_val };
-                        if self.signal_table[*dst_id] != resized {
-                            let delay = self.sdf_delays[*dst_id];
-                            if delay > 0 && self.time > 0 {
-                                self.schedule_delayed(*dst_id, resized);
-                            } else {
+                        // Inline fast path. On gate-level netlists (e.g. yosys
+                        // synth.v output) DirectCopy fires hundreds of millions
+                        // of times — picorv32 test_synth measured 1.17B
+                        // entry_evals dominated by DirectCopy. The slow path
+                        // below clones a `Value`, runs PartialEq, and assigns —
+                        // ~50ns/call. The fast path reads raw u64 bits via the
+                        // inlined `raw_bits()` and mutates the destination in
+                        // place via `set_inline_bits`, skipping the clone +
+                        // enum-match comparison entirely. Falls back to the
+                        // slow path for SDF-delayed targets, width mismatches
+                        // (need a true resize), or Wide values.
+                        let dst_w = self.signal_widths[*dst_id];
+                        let mut handled = false;
+                        if *width <= 64 && dst_w == *width
+                            && self.sdf_delays[*dst_id] == 0
+                        {
+                            let (sv, sx) = self.signal_table[*src_id].raw_bits();
+                            let (dv, dx) = self.signal_table[*dst_id].raw_bits();
+                            if sv == dv && sx == dx {
+                                // Already equal; no work, no dirty mark.
+                                handled = true;
+                            } else if self.signal_table[*dst_id].set_inline_bits(sv, sx) {
                                 self.mark_dirty_id(*dst_id);
-                                self.signal_table[*dst_id] = resized;
                                 self.table_modified = true;
+                                handled = true;
+                            }
+                            // If set_inline_bits returned false (Wide storage),
+                            // fall through to the slow path.
+                        }
+                        if !handled {
+                            let src_val = self.signal_table[*src_id].clone();
+                            let resized = if src_val.width != *width { src_val.resize(*width) } else { src_val };
+                            if self.signal_table[*dst_id] != resized {
+                                let delay = self.sdf_delays[*dst_id];
+                                if delay > 0 && self.time > 0 {
+                                    self.schedule_delayed(*dst_id, resized);
+                                } else {
+                                    self.mark_dirty_id(*dst_id);
+                                    self.signal_table[*dst_id] = resized;
+                                    self.table_modified = true;
+                                }
                             }
                         }
                         self.prof_settle_dc_count += 1;
@@ -7869,6 +7900,7 @@ impl Simulator {
 
     /// Execute a fused 1-bit gate. Reads operand bits from signal_table,
     /// computes 4-state result, writes single bit back if changed.
+    #[inline]
     #[inline]
     fn exec_fused_gate(&mut self, op: FusedGate) {
         #[inline(always)]
