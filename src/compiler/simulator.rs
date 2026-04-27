@@ -421,6 +421,13 @@ pub struct Simulator {
     /// Set of signal IDs that are signed.
     signal_signed: Vec<bool>,
     signal_real: Vec<bool>,
+    /// Sparse: signal_id → declared user type name (e.g. class/struct
+    /// type for `MyClass h;`). Only populated for signals where the
+    /// elaborator recorded a non-None `type_name` on the source
+    /// `Signal` struct — most regular bit/logic signals have None
+    /// here. Populated once at construction so `module.signals` can
+    /// be freed afterwards.
+    signal_type_names: HashMap<usize, String>,
     pub widths: HashMap<String, u32>,
     pub signed_signals: HashSet<String>,
     pub real_signals: HashSet<String>,
@@ -697,6 +704,7 @@ impl Simulator {
         let mut signal_widths_vec: Vec<u32> = Vec::with_capacity(n);
         let mut signal_signed_vec: Vec<bool> = Vec::with_capacity(n);
         let mut signal_real_vec: Vec<bool> = Vec::with_capacity(n);
+        let mut signal_type_names: HashMap<usize, String> = HashMap::new();
         // Drain `names` so each String moves into the Arc allocation
         // and is freed promptly, instead of being kept alongside the
         // Arc<str> copies until the end of construction.
@@ -723,6 +731,9 @@ impl Simulator {
                 signal_widths_vec.push(sig.width);
                 signal_signed_vec.push(sig.is_signed);
                 signal_real_vec.push(sig.is_real);
+                if let Some(ref tn) = sig.type_name {
+                    signal_type_names.insert(id, tn.clone());
+                }
             } else if let Some(val) = module.parameters.get(&name) {
                 sim_dbg_eprintln!("[DEBUG] Simulator::new parameter {} = {} (signed={})", name, val.to_dec_string(), val.is_signed);
                 signal_table.push(val.clone());
@@ -817,13 +828,23 @@ impl Simulator {
                 prev_wide.insert(id, Value::new(w));
             }
         }
+        // Free `module.signals` now that the indexed signal_table /
+        // signal_widths / signal_signed / signal_real / signal_type_names
+        // have absorbed everything we need. On c910 this releases the
+        // ~110 MB of `Signal` structs (name + Value + bools + type_name)
+        // plus their HashMap overhead. `module.parameters` is kept
+        // because `resolve_type_width` still resolves dimension
+        // expressions against it at runtime (per step-2's caller fix).
+        let mut module = module;
+        module.signals = HashMap::new();
+
         let mut sim = Self {
             prev_val, prev_xz, prev_wide,
             edge_signal_names: HashSet::new(),
             edge_signal_ids: Vec::new(),
             edge_blocks_by_sig: Vec::new(),
             signals, widths, signed_signals, real_signals,
-            signal_table, signal_name_to_id, array_elem_ids: HashMap::new(), leaf_name_to_ids, id_to_name, signal_widths: signal_widths_vec, signal_signed: signal_signed_vec, signal_real: signal_real_vec,
+            signal_table, signal_name_to_id, array_elem_ids: HashMap::new(), leaf_name_to_ids, id_to_name, signal_widths: signal_widths_vec, signal_signed: signal_signed_vec, signal_real: signal_real_vec, signal_type_names,
             time: 0, output: Vec::new(), capture_output: true, finished: false,
             monitor: None, monitor_prev: HashMap::new(), active_union_tag: HashMap::new(),
             max_time, settle_limit: 100,
@@ -3551,11 +3572,8 @@ impl Simulator {
     }
 
     /// Static version of resolve_hier_name (doesn't need &self).
-    fn resolve_hier_name_static(hier: &HierarchicalIdentifier, module: &ElaboratedModule) -> String {
-        let raw = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
-        // Check if signal exists; if not and has a prefix, try alternatives
-        if module.signals.contains_key(&raw) { return raw.to_string(); }
-        raw.to_string()
+    fn resolve_hier_name_static(hier: &HierarchicalIdentifier, _module: &ElaboratedModule) -> String {
+        hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".")
     }
 
     /// Resolve a hier ident to its signal_id, retrying with scope_hint prefix
@@ -10124,7 +10142,8 @@ impl Simulator {
         match &expr.kind {
             ExprKind::Ident(hier) => {
                 let name = self.resolve_hier_name(hier);
-                self.module.signals.get(&name).and_then(|s| s.type_name.clone())
+                self.signal_name_to_id.get(name.as_str())
+                    .and_then(|id| self.signal_type_names.get(id).cloned())
             }
             _ => None,
         }
