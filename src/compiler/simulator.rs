@@ -4924,7 +4924,11 @@ impl Simulator {
             let parallel_insn_count: usize = parallel_blocks.iter()
                 .filter_map(|&bi| self.compiled_edge_blocks[bi].as_ref().map(|cb| cb.instructions.len()))
                 .sum();
-            if parallel_blocks.len() >= 2 && parallel_insn_count >= 10_000 {
+            // XEZIM_NO_PARALLEL=1 disables the parallel edge-block path —
+            // useful for ruling out thread-isolation race conditions when
+            // bisecting a CPU-stall on a deep design.
+            let parallel_disabled = std::env::var("XEZIM_NO_PARALLEL").ok().as_deref() == Some("1");
+            if !parallel_disabled && parallel_blocks.len() >= 2 && parallel_insn_count >= 10_000 {
                 let signal_table = &self.signal_table;
                 let signal_signed = &self.signal_signed;
                 let signal_name_to_id = &self.signal_name_to_id;
