@@ -3887,16 +3887,43 @@ impl Simulator {
     }
 
     fn event_to_sens(&self, event: &EventControl) -> Vec<Sensitivity> {
+        // Walk past Paren / RangeSelect / BitSelect / Concatenation wrappers
+        // to find the underlying Ident(s). For E902 etc. that use
+        // `always @(sig[5:0] or other)` the sensitivity expression is a
+        // RangeSelect of an Ident; the previous code only matched bare
+        // Ident and silently dropped the rest, leaving the always-block
+        // never re-triggered when `sig` changed (the E902 hello-test
+        // root-cause stall in cr_ifu_ibuf's pop0_shift_vld decoder).
+        fn collect_ident_names<'a>(e: &'a Expression, out: &mut Vec<&'a HierarchicalIdentifier>) {
+            match &e.kind {
+                ExprKind::Ident(h) => out.push(h),
+                ExprKind::Paren(inner) => collect_ident_names(inner, out),
+                ExprKind::RangeSelect { expr, .. } => collect_ident_names(expr, out),
+                ExprKind::Index { expr, .. } => collect_ident_names(expr, out),
+                ExprKind::Concatenation(parts) => {
+                    for p in parts { collect_ident_names(p, out); }
+                }
+                _ => {}
+            }
+        }
         match event {
-            EventControl::EventExpr(exprs) => exprs.iter().filter_map(|ee| {
-                let sig = match &ee.expr.kind { ExprKind::Ident(h) => Some(self.resolve_hier_name(h)), _ => None }?;
-                let edge = match ee.edge {
-                    Some(Edge::Posedge) => EdgeKind::Posedge,
-                    Some(Edge::Negedge) => EdgeKind::Negedge,
-                    _ => EdgeKind::AnyEdge,
-                };
-                Some(Sensitivity { signal_name: sig, edge })
-            }).collect(),
+            EventControl::EventExpr(exprs) => {
+                let mut out: Vec<Sensitivity> = Vec::with_capacity(exprs.len());
+                for ee in exprs {
+                    let edge = match ee.edge {
+                        Some(Edge::Posedge) => EdgeKind::Posedge,
+                        Some(Edge::Negedge) => EdgeKind::Negedge,
+                        _ => EdgeKind::AnyEdge,
+                    };
+                    let mut idents = Vec::new();
+                    collect_ident_names(&ee.expr, &mut idents);
+                    for h in idents {
+                        let sig = self.resolve_hier_name(h);
+                        out.push(Sensitivity { signal_name: sig, edge });
+                    }
+                }
+                out
+            }
             EventControl::Identifier(id) => vec![Sensitivity { signal_name: id.name.clone(), edge: EdgeKind::AnyEdge }],
             EventControl::HierIdentifier(expr) => {
                 if let ExprKind::Ident(h) = &expr.kind {
