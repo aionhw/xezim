@@ -424,7 +424,6 @@ pub struct Simulator {
     pub widths: HashMap<String, u32>,
     pub signed_signals: HashSet<String>,
     pub real_signals: HashSet<String>,
-    prev_signals: HashMap<String, Value>,
     /// Fast prev signal table for edge detection (indexed by signal_id).
     /// SoA storage for "previous-iter" edge-detection state (A3 from the
     /// compression analysis). Replaces `prev_table: Vec<Value>` for signals
@@ -650,36 +649,51 @@ pub struct Simulator {
 
 impl Simulator {
     pub fn new(module: ElaboratedModule, max_time: u64) -> Self {
-        let mut signals = HashMap::new();
-        let mut widths = HashMap::new();
-        let mut signed_signals = HashSet::new();
-        let mut real_signals = HashSet::new();
+        // Static signals + parameters live exclusively in the indexed
+        // signal_table / signal_name_to_id / parallel Vecs below. The
+        // legacy `signals`/`widths`/`signed_signals`/`real_signals`
+        // HashMaps stay empty after construction and are used only as an
+        // overflow store for *dynamically* created entries (queue
+        // elements, foreach loop vars, in-process var decls, $cast
+        // targets). Eliminating the bulk-populate saves ~150–250 MB on
+        // c910-scale designs (585K signals × 2 stores × name + Value
+        // duplication).
+        let signals: HashMap<String, Value> = HashMap::new();
+        let widths: HashMap<String, u32> = HashMap::new();
+        let signed_signals: HashSet<String> = HashSet::new();
+        let real_signals: HashSet<String> = HashSet::new();
+
+        // Materialize one entry per static signal/parameter, then sort
+        // by name for deterministic id assignment (matches the prior
+        // sig_names_sorted ordering).
+        let mut all_static: Vec<(String, Value, u32, bool, bool)> =
+            Vec::with_capacity(module.signals.len() + module.parameters.len());
         for (name, sig) in &module.signals {
             let mut val = sig.value.clone();
-            if sig.is_signed { val.is_signed = true; signed_signals.insert(name.clone()); }
-            if sig.is_real { val.is_real = true; real_signals.insert(name.clone()); }
-            signals.insert(name.clone(), val.clone());
-            widths.insert(name.clone(), sig.width);
+            if sig.is_signed { val.is_signed = true; }
+            if sig.is_real { val.is_real = true; }
             sim_dbg_eprintln!("[DEBUG] Simulator::new signal {} = {} (signed={})", name, val.to_dec_string(), sig.is_signed);
+            all_static.push((name.clone(), val, sig.width, sig.is_signed, sig.is_real));
         }
         for (name, val) in &module.parameters {
-            if val.is_signed { signed_signals.insert(name.clone()); }
-            signals.insert(name.clone(), val.clone());
-            widths.insert(name.clone(), val.width);
             sim_dbg_eprintln!("[DEBUG] Simulator::new parameter {} = {} (signed={})", name, val.to_dec_string(), val.is_signed);
+            // Parameters duplicating a signal name are skipped — the
+            // signal entry already covers it. Otherwise dedup by sort+
+            // dedup_by below would be ambiguous.
+            all_static.push((name.clone(), val.clone(), val.width, val.is_signed, false));
         }
-        // Build fast signal table (Vec-based, indexed by signal_id).
-        // Phase 1: non-array signals go through the legacy HashMaps above.
-        let mut sig_names_sorted: Vec<String> = signals.keys().cloned().collect();
-        sig_names_sorted.sort();
-        let mut signal_name_to_id: HashMap<Arc<str>, usize> = HashMap::new();
+        all_static.sort_by(|a, b| a.0.cmp(&b.0));
+        all_static.dedup_by(|a, b| a.0 == b.0);
+
+        let n = all_static.len();
+        let mut signal_name_to_id: HashMap<Arc<str>, usize> = HashMap::with_capacity(n);
         let mut leaf_name_to_ids: HashMap<Arc<str>, Vec<usize>> = HashMap::new();
-        let mut id_to_name: Vec<Arc<str>> = Vec::with_capacity(sig_names_sorted.len());
-        let mut signal_table = Vec::with_capacity(sig_names_sorted.len());
-        let mut signal_widths_vec = Vec::with_capacity(sig_names_sorted.len());
-        let mut signal_signed_vec = Vec::with_capacity(sig_names_sorted.len());
-        let mut signal_real_vec = Vec::with_capacity(sig_names_sorted.len());
-        for (id, name) in sig_names_sorted.iter().enumerate() {
+        let mut id_to_name: Vec<Arc<str>> = Vec::with_capacity(n);
+        let mut signal_table: Vec<Value> = Vec::with_capacity(n);
+        let mut signal_widths_vec: Vec<u32> = Vec::with_capacity(n);
+        let mut signal_signed_vec: Vec<bool> = Vec::with_capacity(n);
+        let mut signal_real_vec: Vec<bool> = Vec::with_capacity(n);
+        for (id, (name, val, w, is_signed, is_real)) in all_static.into_iter().enumerate() {
             let arc_name: Arc<str> = Arc::from(name.as_str());
             signal_name_to_id.insert(arc_name.clone(), id);
             // Build leaf-name reverse index (skip array-element style names
@@ -691,11 +705,10 @@ impl Simulator {
                 leaf_name_to_ids.entry(arc_leaf).or_default().push(id);
             }
             id_to_name.push(arc_name);
-            let val = signals[name].clone();
-            signal_table.push(val.clone());
-            signal_widths_vec.push(widths.get(name).copied().unwrap_or(1));
-            signal_signed_vec.push(signed_signals.contains(name));
-            signal_real_vec.push(real_signals.contains(name));
+            signal_table.push(val);
+            signal_widths_vec.push(w);
+            signal_signed_vec.push(is_signed);
+            signal_real_vec.push(is_real);
         }
         // Phase 2: synthesize per-element entries for unpacked arrays.
         // Elaborate skips the per-element Signal inserts (memory-as-array
@@ -778,7 +791,6 @@ impl Simulator {
             }
         }
         let mut sim = Self {
-            prev_signals: HashMap::new(),
             prev_val, prev_xz, prev_wide,
             edge_signal_names: HashSet::new(),
             edge_signal_ids: Vec::new(),
@@ -6939,7 +6951,7 @@ impl Simulator {
             }
             StatementKind::For { init, condition, step, body } => {
                 for fi in init { match fi {
-                    ForInit::VarDecl { data_type, name, init: e } => { let v = self.eval_expr(e); let w = super::elaborate::resolve_type_width(data_type, Some(&self.signals), Some(&self.module.typedefs)); self.widths.insert(name.name.clone(), w); self.signals.insert(name.name.clone(), v.resize(w)); }
+                    ForInit::VarDecl { data_type, name, init: e } => { let v = self.eval_expr(e); let w = super::elaborate::resolve_type_width(data_type, Some(&self.module.parameters), Some(&self.module.typedefs)); self.widths.insert(name.name.clone(), w); self.signals.insert(name.name.clone(), v.resize(w)); }
                     ForInit::Assign { lvalue, rvalue } => { let v = self.eval_expr(rvalue); self.assign_value(lvalue, &v); }
                 }}
                 let loop_limit: u64 = std::env::var("XEZIM_LOOP_LIMIT").ok()
@@ -7023,7 +7035,6 @@ impl Simulator {
                 self.settle_combinatorial();
                 self.check_edges();
                 let _ = self.drain_edge_cascade(self.cascade_limit);
-                self.prev_signals = self.signals.clone();  // rare path - full clone OK
             }
             StatementKind::Break => { self.break_flag = true; }
             StatementKind::Continue => { self.continue_flag = true; }
@@ -7062,7 +7073,7 @@ impl Simulator {
                 }
             }
             StatementKind::VarDecl { data_type, declarators, .. } => {
-                let w = super::elaborate::resolve_type_width(data_type, Some(&self.signals), Some(&self.module.typedefs));
+                let w = super::elaborate::resolve_type_width(data_type, Some(&self.module.parameters), Some(&self.module.typedefs));
                 let two_state = super::elaborate::is_type_two_state(data_type);
                 let default_v = if two_state { Value::zero(w) } else { Value::new(w) };
                 for d in declarators {
