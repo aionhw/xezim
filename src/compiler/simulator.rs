@@ -672,29 +672,24 @@ impl Simulator {
         let signed_signals: HashSet<String> = HashSet::new();
         let real_signals: HashSet<String> = HashSet::new();
 
-        // Materialize one entry per static signal/parameter, then sort
-        // by name for deterministic id assignment (matches the prior
-        // sig_names_sorted ordering).
-        let mut all_static: Vec<(String, Value, u32, bool, bool)> =
+        // Collect just *names* from the two source maps and sort them
+        // for deterministic id assignment. We avoid an intermediate
+        // `Vec<(name, Value, …)>` because cloning each Value into that
+        // Vec would peak-spike RSS by exactly the amount we just saved
+        // by skipping the legacy bulk-populate.
+        let mut names: Vec<String> =
             Vec::with_capacity(module.signals.len() + module.parameters.len());
-        for (name, sig) in &module.signals {
-            let mut val = sig.value.clone();
-            if sig.is_signed { val.is_signed = true; }
-            if sig.is_real { val.is_real = true; }
-            sim_dbg_eprintln!("[DEBUG] Simulator::new signal {} = {} (signed={})", name, val.to_dec_string(), sig.is_signed);
-            all_static.push((name.clone(), val, sig.width, sig.is_signed, sig.is_real));
+        for name in module.signals.keys() {
+            names.push(name.clone());
         }
-        for (name, val) in &module.parameters {
-            sim_dbg_eprintln!("[DEBUG] Simulator::new parameter {} = {} (signed={})", name, val.to_dec_string(), val.is_signed);
-            // Parameters duplicating a signal name are skipped — the
-            // signal entry already covers it. Otherwise dedup by sort+
-            // dedup_by below would be ambiguous.
-            all_static.push((name.clone(), val.clone(), val.width, val.is_signed, false));
+        for name in module.parameters.keys() {
+            // Parameter and signal can share a name — dedup after sort.
+            names.push(name.clone());
         }
-        all_static.sort_by(|a, b| a.0.cmp(&b.0));
-        all_static.dedup_by(|a, b| a.0 == b.0);
+        names.sort();
+        names.dedup();
 
-        let n = all_static.len();
+        let n = names.len();
         let mut signal_name_to_id: HashMap<Arc<str>, usize> = HashMap::with_capacity(n);
         let mut leaf_name_to_ids: HashMap<Arc<str>, Vec<usize>> = HashMap::new();
         let mut id_to_name: Vec<Arc<str>> = Vec::with_capacity(n);
@@ -702,7 +697,10 @@ impl Simulator {
         let mut signal_widths_vec: Vec<u32> = Vec::with_capacity(n);
         let mut signal_signed_vec: Vec<bool> = Vec::with_capacity(n);
         let mut signal_real_vec: Vec<bool> = Vec::with_capacity(n);
-        for (id, (name, val, w, is_signed, is_real)) in all_static.into_iter().enumerate() {
+        // Drain `names` so each String moves into the Arc allocation
+        // and is freed promptly, instead of being kept alongside the
+        // Arc<str> copies until the end of construction.
+        for (id, name) in names.drain(..).enumerate() {
             let arc_name: Arc<str> = Arc::from(name.as_str());
             signal_name_to_id.insert(arc_name.clone(), id);
             // Build leaf-name reverse index (skip array-element style names
@@ -714,10 +712,30 @@ impl Simulator {
                 leaf_name_to_ids.entry(arc_leaf).or_default().push(id);
             }
             id_to_name.push(arc_name);
-            signal_table.push(val);
-            signal_widths_vec.push(w);
-            signal_signed_vec.push(is_signed);
-            signal_real_vec.push(is_real);
+            // Fetch value/metadata directly from the source map. The
+            // signal entry takes precedence over a same-named parameter.
+            if let Some(sig) = module.signals.get(&name) {
+                let mut val = sig.value.clone();
+                if sig.is_signed { val.is_signed = true; }
+                if sig.is_real { val.is_real = true; }
+                sim_dbg_eprintln!("[DEBUG] Simulator::new signal {} = {} (signed={})", name, val.to_dec_string(), sig.is_signed);
+                signal_table.push(val);
+                signal_widths_vec.push(sig.width);
+                signal_signed_vec.push(sig.is_signed);
+                signal_real_vec.push(sig.is_real);
+            } else if let Some(val) = module.parameters.get(&name) {
+                sim_dbg_eprintln!("[DEBUG] Simulator::new parameter {} = {} (signed={})", name, val.to_dec_string(), val.is_signed);
+                signal_table.push(val.clone());
+                signal_widths_vec.push(val.width);
+                signal_signed_vec.push(val.is_signed);
+                signal_real_vec.push(false);
+            } else {
+                // Should not happen — name came from one of the two maps.
+                signal_table.push(Value::new(1));
+                signal_widths_vec.push(1);
+                signal_signed_vec.push(false);
+                signal_real_vec.push(false);
+            }
         }
         // Phase 2: synthesize per-element entries for unpacked arrays.
         // Elaborate skips the per-element Signal inserts (memory-as-array
