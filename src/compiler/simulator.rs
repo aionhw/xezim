@@ -136,8 +136,11 @@ struct NbaFast { signal_id: usize, value: Value }
 
 #[derive(Debug, Clone)]
 struct EdgeSensitiveBlock {
-    sensitivities: Vec<Sensitivity>,
-    /// Pre-resolved signal IDs for O(1) edge checking (populated during classify)
+    /// Pre-resolved signal IDs for O(1) edge checking. The unresolved
+    /// `Vec<Sensitivity>` (with String name) used to live here too —
+    /// dropped, since the only consumer (the init pass collecting
+    /// edge_signal_ids/names) was rewritten to use this resolved
+    /// list + id_to_name.
     resolved_sensitivities: Vec<SensitivityId>,
     stmt: Statement,
     kind: AlwaysKind,
@@ -156,8 +159,9 @@ enum EdgeKind { Posedge, Negedge, AnyEdge }
 #[derive(Debug, Clone)]
 struct EventWaiter {
     pid: usize,
-    sensitivities: Vec<Sensitivity>,
-    /// Pre-resolved signal IDs for O(1) edge checking
+    /// Pre-resolved signal IDs for O(1) edge checking. The unresolved
+    /// `Vec<Sensitivity>` mirror was set at construction but never
+    /// consulted afterwards — dropped.
     resolved_sensitivities: Vec<SensitivityId>,
     continuation: Vec<Statement>,
     registered_time: u64,
@@ -1880,12 +1884,16 @@ impl Simulator {
         if self.activity_mon {
             self.activity_counts = vec![0u64; self.comb_entries.len()];
         }
-        // Collect all edge-sensitive signal names for targeted prev snapshots
+        // Collect all edge-sensitive signal names for targeted prev
+        // snapshots. We work off `resolved_sensitivities` (populated
+        // during classify_always_blocks) and recover names from
+        // `id_to_name` — the unresolved `Sensitivity` mirror is gone.
         for block in &self.edge_blocks {
-            for sens in &block.sensitivities {
-                self.edge_signal_names.insert(sens.signal_name.clone());
-                if let Some(&id) = self.signal_name_to_id.get(sens.signal_name.as_str()) {
-                    self.edge_signal_ids.push(id);
+            for sens in &block.resolved_sensitivities {
+                if sens.signal_id < self.id_to_name.len() {
+                    let name: &str = &self.id_to_name[sens.signal_id];
+                    self.edge_signal_names.insert(name.to_string());
+                    self.edge_signal_ids.push(sens.signal_id);
                 }
             }
         }
@@ -2168,7 +2176,6 @@ impl Simulator {
                         self.signal_name_to_id.get(s.signal_name.as_str()).map(|&id| SensitivityId { signal_id: id, edge: s.edge })
                     }).collect();
                     self.edge_blocks.push(EdgeSensitiveBlock {
-                        sensitivities: sens,
                         resolved_sensitivities: resolved,
                         stmt: body,
                         kind: ab.kind,
@@ -3747,7 +3754,9 @@ impl Simulator {
         let resolved: Vec<SensitivityId> = sens.iter().filter_map(|s| {
             self.signal_name_to_id.get(s.signal_name.as_str()).map(|&id| SensitivityId { signal_id: id, edge: s.edge })
         }).collect();
-        EventWaiter { pid, sensitivities: sens, resolved_sensitivities: resolved, continuation, registered_time: self.time }
+        // `sens` (Vec<Sensitivity>) is consumed for resolution and dropped;
+        // EventWaiter only carries the resolved IDs from here on.
+        EventWaiter { pid, resolved_sensitivities: resolved, continuation, registered_time: self.time }
     }
 
     /// Drain pending NBAs and repeatedly snapshot → apply_nba → settle →
