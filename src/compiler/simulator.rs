@@ -1786,7 +1786,7 @@ impl Simulator {
         let deferred: Vec<(String, Expression)> = self.module.deferred_param_exprs.clone();
         for (pname, expr) in deferred {
             let v = self.eval_expr(&expr);
-            let w = self.widths.get(&pname).copied().unwrap_or(v.width);
+            let w = self.lookup_signal_width(&pname).unwrap_or(v.width);
             let rv = v.resize(w);
             self.set_signal_value_by_name(&pname, rv);
         }
@@ -5712,7 +5712,7 @@ impl Simulator {
                     let piece = if let ExprKind::Ident(h) = &p.kind {
                         let n = self.resolve_hier_name(h);
                         if self.module.arrays.contains_key(&n) {
-                            let ew = self.widths.get(&format!("{}[0]", n)).copied()
+                            let ew = self.lookup_signal_width(&format!("{}[0]", n))
                                 .unwrap_or_else(|| self.module.arrays.get(&n).map(|t| t.2).unwrap_or(8)).max(1);
                             let sz = self.get_queue_size(&n) as usize;
                             let mut acc = Value::zero(0);
@@ -6267,8 +6267,8 @@ impl Simulator {
                             return Value::zero(32);
                         }
                         let qualified = format!("{}.{}", name, mname);
-                        if let Some(v) = self.signals.get(&qualified) {
-                            return v.clone();
+                        if let Some(v) = self.lookup_signal_value(&qualified) {
+                            return v;
                         }
                         return Value::zero(32);
                     }
@@ -6352,7 +6352,7 @@ impl Simulator {
                             let v = self.eval_expr(inner_expr);
                             self.set_signal_value_by_name(&lname, v);
                         } else {
-                            let w = self.widths.get(&lname).copied().unwrap_or(1);
+                            let w = self.lookup_signal_width(&lname).unwrap_or(1);
                             self.set_signal_value_by_name(&lname, Value::zero(w));
                         }
                         if !self.in_edge_block { self.settle_combinatorial(); }
@@ -6427,7 +6427,7 @@ impl Simulator {
                     if let ExprKind::Ident(lh) = &lvalue.kind {
                         let lname = self.resolve_hier_name(lh);
                         if self.module.arrays.contains_key(&lname) {
-                            let elem_w = self.widths.get(&format!("{}[0]", lname)).copied()
+                            let elem_w = self.lookup_signal_width(&format!("{}[0]", lname))
                                 .unwrap_or_else(|| self.module.arrays.get(&lname).map(|t| t.2).unwrap_or(8)).max(1);
                             // Evaluate stream raw (no pad) by using ctx 0.
                             let sv = self.eval_expr_ctx(rvalue, 0);
@@ -6454,7 +6454,7 @@ impl Simulator {
                         let rname = self.resolve_hier_name(rhier);
                         if self.module.arrays.contains_key(&rname) || self.module.dynamic_arrays.contains(&rname) {
                             let n = self.get_queue_size(&rname) as usize;
-                            let elem_w = self.widths.get(&format!("{}[0]", rname)).copied()
+                            let elem_w = self.lookup_signal_width(&format!("{}[0]", rname))
                                 .unwrap_or_else(|| self.module.arrays.get(&rname).map(|t| t.2).unwrap_or(8));
                             let total_w = (n as u32) * elem_w;
                             let mut packed = Value::zero(total_w);
@@ -6514,7 +6514,7 @@ impl Simulator {
                             if let ExprKind::Ident(h) = &e.kind {
                                 let n = self.resolve_hier_name(h);
                                 if self.module.dynamic_arrays.contains(&n) || self.module.arrays.contains_key(&n) {
-                                    let ew = self.widths.get(&format!("{}[0]", n)).copied()
+                                    let ew = self.lookup_signal_width(&format!("{}[0]", n))
                                         .unwrap_or_else(|| self.module.arrays.get(&n).map(|t| t.2).unwrap_or(8));
                                     dyn_last = Some(n);
                                     dyn_last_elem_w = ew;
@@ -6956,7 +6956,7 @@ impl Simulator {
             StatementKind::Foreach { array, vars, body } => {
                 if let ExprKind::Ident(hier) = &array.kind {
                     let name = self.resolve_hier_name(hier);
-                    let size = self.widths.get(&name).copied().unwrap_or(1) as u64;
+                    let size = self.lookup_signal_width(&name).unwrap_or(1) as u64;
                     if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
                         self.widths.insert(var.name.clone(), 32);
                         for i in 0..size { if self.finished { break; } self.signals.insert(var.name.clone(), Value::from_u64(i, 32)); self.exec_statement(body); }
@@ -7825,6 +7825,55 @@ impl Simulator {
         }
     }
 
+    /// Look up a signal value by name. Consults the indexed signal_table
+    /// first (zero-clone branch returns from a Vec read), falling back to
+    /// the legacy `signals` HashMap for dynamically created entries
+    /// (queue elems, foreach loop vars, in-process var decls, etc.).
+    /// This is the single read path that lets us drop the dual-store of
+    /// static signals without breaking the fallback callers.
+    #[inline]
+    fn lookup_signal_value(&self, name: &str) -> Option<Value> {
+        if let Some(&id) = self.signal_name_to_id.get(name) {
+            return Some(self.signal_table[id].clone());
+        }
+        self.signals.get(name).cloned()
+    }
+
+    /// True if the named signal exists in either the indexed table or
+    /// the dynamic-overflow HashMap. Use in place of
+    /// `self.signals.contains_key(name)`.
+    #[inline]
+    fn has_signal(&self, name: &str) -> bool {
+        self.signal_name_to_id.contains_key(name) || self.signals.contains_key(name)
+    }
+
+    /// Look up declared width by signal name.
+    #[inline]
+    fn lookup_signal_width(&self, name: &str) -> Option<u32> {
+        if let Some(&id) = self.signal_name_to_id.get(name) {
+            return Some(self.signal_widths[id]);
+        }
+        self.widths.get(name).copied()
+    }
+
+    /// Whether the named signal is signed.
+    #[inline]
+    fn lookup_signal_signed(&self, name: &str) -> bool {
+        if let Some(&id) = self.signal_name_to_id.get(name) {
+            return self.signal_signed[id];
+        }
+        self.signed_signals.contains(name)
+    }
+
+    /// Whether the named signal is real (`real`/`shortreal`).
+    #[inline]
+    fn lookup_signal_real(&self, name: &str) -> bool {
+        if let Some(&id) = self.signal_name_to_id.get(name) {
+            return self.signal_real[id];
+        }
+        self.real_signals.contains(name)
+    }
+
     /// Extract all signal names referenced in an expression (for wait statement).
     fn extract_signal_names(&self, expr: &Expression) -> Vec<String> {
         let mut names = Vec::new();
@@ -7842,7 +7891,7 @@ impl Simulator {
             _ => {}
         }
     }
-    fn infer_width(&mut self, expr: &Expression) -> u32 { match &expr.kind { ExprKind::Ident(h) => { let n = self.resolve_hier_name(h); self.widths.get(&n).copied().unwrap_or(1) } ExprKind::Number(NumberLiteral::Integer { size, .. }) => size.unwrap_or(32), ExprKind::Concatenation(p) => { let mut total = 0; for x in p { total += self.infer_width(x); } total } ExprKind::Paren(inner) => self.infer_width(inner), ExprKind::AssignExpr { lvalue, .. } => self.infer_width(lvalue), ExprKind::Binary { left, right, .. } => self.infer_width(left).max(self.infer_width(right)), ExprKind::Unary { operand, .. } => self.infer_width(operand), ExprKind::Conditional { then_expr, else_expr, .. } => self.infer_width(then_expr).max(self.infer_width(else_expr)), _ => self.eval_expr(expr).width } }
+    fn infer_width(&mut self, expr: &Expression) -> u32 { match &expr.kind { ExprKind::Ident(h) => { let n = self.resolve_hier_name(h); self.lookup_signal_width(&n).unwrap_or(1) } ExprKind::Number(NumberLiteral::Integer { size, .. }) => size.unwrap_or(32), ExprKind::Concatenation(p) => { let mut total = 0; for x in p { total += self.infer_width(x); } total } ExprKind::Paren(inner) => self.infer_width(inner), ExprKind::AssignExpr { lvalue, .. } => self.infer_width(lvalue), ExprKind::Binary { left, right, .. } => self.infer_width(left).max(self.infer_width(right)), ExprKind::Unary { operand, .. } => self.infer_width(operand), ExprKind::Conditional { then_expr, else_expr, .. } => self.infer_width(then_expr).max(self.infer_width(else_expr)), _ => self.eval_expr(expr).width } }
     fn infer_lhs_width(&mut self, expr: &Expression) -> u32 {
         match &expr.kind {
             ExprKind::Concatenation(p) => { let mut total = 0; for x in p { total += self.infer_lhs_width(x); } total }
@@ -7887,8 +7936,23 @@ impl Simulator {
             _ => self.infer_width(expr)
         }
     }
-    pub fn get_signal(&self, name: &str) -> Option<&Value> { self.signals.get(name) }
-    pub fn set_signal(&mut self, name: &str, val: Value) { if let Some(w) = self.widths.get(name) { self.signals.insert(name.to_string(), val.resize(*w)); } else { self.widths.insert(name.to_string(), val.width); self.signals.insert(name.to_string(), val); } }
+    pub fn get_signal(&self, name: &str) -> Option<&Value> {
+        if let Some(&id) = self.signal_name_to_id.get(name) {
+            return Some(&self.signal_table[id]);
+        }
+        self.signals.get(name)
+    }
+    pub fn set_signal(&mut self, name: &str, val: Value) {
+        if let Some(&id) = self.signal_name_to_id.get(name) {
+            let w = self.signal_widths[id];
+            self.signal_table[id] = val.resize(w);
+            self.table_modified = true;
+            self.mark_dirty_id(id);
+            return;
+        }
+        if let Some(w) = self.widths.get(name) { self.signals.insert(name.to_string(), val.resize(*w)); }
+        else { self.widths.insert(name.to_string(), val.width); self.signals.insert(name.to_string(), val); }
+    }
 
     // ═══════════════════════════════════════════════════════════════
     // VCD dump support ($dumpfile / $dumpvars)
@@ -7953,7 +8017,7 @@ impl Simulator {
 
         let mut root = ScopeNode::new();
         for name in &sig_names {
-            let width = self.widths.get(name).copied().unwrap_or(1);
+            let width = self.lookup_signal_width(name).unwrap_or(1);
             let id = id_map[name].clone();
             // Split into hierarchy parts
             let parts: Vec<&str> = name.split('.').collect();
@@ -8002,7 +8066,7 @@ impl Simulator {
         // Write initial values
         let _ = writeln!(w, "$dumpvars");
         for name in &sig_names {
-            let val = self.signals.get(name).cloned().unwrap_or_else(|| Value::new(1));
+            let val = self.lookup_signal_value(name).unwrap_or_else(|| Value::new(1));
             let id = &id_map[name];
             Self::vcd_write_value(&mut w, &val, id);
         }
@@ -8215,8 +8279,8 @@ impl Simulator {
                 ("m0".to_string(), name.clone())
             };
 
-            let width = self.widths.get(name).copied().unwrap_or(1);
-            let is_signed = self.signed_signals.contains(name);
+            let width = self.lookup_signal_width(name).unwrap_or(1);
+            let is_signed = self.lookup_signal_signed(name);
             let type_str = if width == 1 {
                 "bit".to_string()
             } else if is_signed {
@@ -8256,7 +8320,7 @@ impl Simulator {
         let mut snap_parts: Vec<String> = Vec::new();
         for name in &sig_names {
             let sid = &id_map[name];
-            let val = self.signals.get(name).cloned().unwrap_or_else(|| Value::new(1));
+            let val = self.lookup_signal_value(name).unwrap_or_else(|| Value::new(1));
             snap_parts.push(format!("{}={}", sid, Self::aitrace_format_value(&val)));
         }
         // Write snapshot in chunks to avoid excessively long lines
@@ -9445,7 +9509,7 @@ impl Simulator {
                     for id in &cr.items {
                         // Resolve each item in cross
                         let name = id.name.clone();
-                        let val = self.signals.get(&name).cloned().unwrap_or(Value::zero(1));
+                        let val = self.lookup_signal_value(&name).unwrap_or(Value::zero(1));
                         tuple.push(val);
                     }
                     let cr_name = cr.name.as_ref().map(|n| n.name.clone()).unwrap_or_else(|| cr.items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join("_"));
