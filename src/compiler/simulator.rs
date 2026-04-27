@@ -494,6 +494,12 @@ pub struct Simulator {
     capture_output: bool,
     pub finished: bool,
     pub monitor: Option<(String, Vec<Expression>)>,
+    /// `$strobe` queue: formatted+printed at the end of the current
+    /// event-loop iteration, after `apply_nba` has committed scheduled
+    /// non-blocking writes. Each entry is `(task_name, args)` and is
+    /// re-evaluated at drain time so the printed values reflect the
+    /// post-NBA state per IEEE 1800 §15.3.4 (postponed region).
+    pending_strobes: Vec<(String, Vec<Expression>)>,
     pub monitor_prev: HashMap<String, Value>,
     /// Active tag for a tagged union variable: signal name → tag name.
     pub active_union_tag: HashMap<String, String>,
@@ -897,7 +903,7 @@ impl Simulator {
             signals, widths, signed_signals, real_signals,
             signal_table, signal_name_to_id, array_elem_ids: HashMap::new(), array_first_id, leaf_name_to_ids, id_to_name, signal_widths: signal_widths_vec, signal_signed: signal_signed_vec, signal_real: signal_real_vec, signal_type_names,
             time: 0, output: Vec::new(), capture_output: true, finished: false,
-            monitor: None, monitor_prev: HashMap::new(), active_union_tag: HashMap::new(),
+            monitor: None, monitor_prev: HashMap::new(), pending_strobes: Vec::new(), active_union_tag: HashMap::new(),
             max_time, settle_limit: 100,
             cascade_limit: std::env::var("XEZIM_CASCADE_LIMIT")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(8),
@@ -4125,6 +4131,7 @@ impl Simulator {
                 // ~half the `snap` phase cost.
 
                 self.check_monitor();
+                self.drain_pending_strobes();
                 if self.aitrace_mode { self.aitrace_write_changes(); } else { self.vcd_write_changes(); }
                 self.loop_iters += 1;
             }
@@ -7617,6 +7624,15 @@ impl Simulator {
         match name {
             "$display" | "$displayb" | "$displayh" | "$displayo" => { let m = self.format_args(args, name); self.record_output(m.clone()); self.stdout_writeln(&m); }
             "$write" | "$writeb" | "$writeh" | "$writeo" => { let m = self.format_args(args, name); self.record_output(m.clone()); self.stdout_write(&m); }
+            // $strobe queues for end-of-timestep playback (postponed
+            // region per IEEE 1800 §15.3.4) — formatted AFTER all NBAs
+            // in the current iter have applied, so it sees post-NBA
+            // values. Distinct from $display which formats immediately
+            // in the active region. Variants $strobeb/h/o select
+            // default radix exactly like $display variants.
+            "$strobe" | "$strobeb" | "$strobeh" | "$strobeo" => {
+                self.pending_strobes.push((name.to_string(), args.to_vec()));
+            }
             "$monitor" | "$monitorb" | "$monitorh" | "$monitoro" => { self.monitor = Some((name.to_string(), args.to_vec())); self.check_monitor(); }
             "$monitoroff" => { self.monitor = None; }
             "$finish" | "$stop" => { self.finished = true; }
@@ -7751,6 +7767,19 @@ impl Simulator {
             else { result.push(c); }
         }
         result
+    }
+
+    /// Format and emit each queued `$strobe` after NBAs have applied
+    /// (called once per event-loop iteration). Drains the queue so
+    /// future iters don't replay old strobes.
+    fn drain_pending_strobes(&mut self) {
+        if self.pending_strobes.is_empty() { return; }
+        let queued = std::mem::take(&mut self.pending_strobes);
+        for (name, args) in queued {
+            let m = self.format_args(&args, &name);
+            self.record_output(m.clone());
+            self.stdout_writeln(&m);
+        }
     }
 
     fn check_monitor(&mut self) {

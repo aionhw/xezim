@@ -3,18 +3,23 @@
 // residual E902 stall: iu_ifu_ex_stall stays 1 in xezim past cyc 24 while
 // iverilog has it 0, freezing the pipeline.
 //
-// Test: drive ifu_iu_ex_inst_vld + an OR-of-many-units stall, verify
-// retire pulses match a deterministic pattern.
+// Test discipline (same as part 2):
+//   - All regs initialised explicitly (no X starting state at t=0).
+//   - Reset is exercised through an explicit transition.
+//   - Stimulus changes on full-cycle (`#10`) boundaries so they don't
+//     collide with the active posedge.
+//   - Sampling via `$strobe` so NBA application order can't perturb
+//     the trace ordering.
 `timescale 1ns/100ps
 module top;
   reg clk = 0;
-  reg cpurst_b = 0;
+  reg cpurst_b = 1;
   always #5 clk = ~clk;
 
   reg ifu_iu_ex_inst_vld = 0;
   reg decd_xx_unit_special_sel = 1;
   reg ifu_iu_ex_rand_vld = 0;
-  reg [3:0] alu_busy = 0;     // simulating multi-unit stall sources
+  reg [3:0] alu_busy = 0;
   reg [3:0] mad_busy = 0;
   reg [3:0] lsu_busy = 0;
   reg special_stall_in = 0;
@@ -34,9 +39,6 @@ module top;
   wire iu_yy_xx_retire = rbus_cmplt;
   wire retire_split_inst_with_dbg_ack = 1'b0;
   wire iu_pad_inst_retire = iu_yy_xx_retire && !retire_split_inst_with_dbg_ack;
-
-  // Stall feedback: the IU asserts iu_ifu_ex_stall when ALL units busy
-  // (mirrors the real cr_iu_ctrl pattern that gates the IFU pipeline).
   wire iu_ifu_ex_stall = ctrl_internal_stall;
 
   reg [31:0] tcyc = 0;
@@ -44,20 +46,30 @@ module top;
   always @(posedge clk) begin
     tcyc <= tcyc + 1;
     if (iu_pad_inst_retire) retire_count <= retire_count + 1;
-    $display("CYC %0d ifu_vld=%b stall=%b internal_stall=%b retire=%b retire_total=%0d",
+    $strobe("CYC %0d ifu_vld=%b stall=%b internal_stall=%b retire=%b retire_total=%0d",
       tcyc, ifu_iu_ex_inst_vld, iu_ifu_ex_stall, ctrl_internal_stall,
       iu_pad_inst_retire, retire_count);
   end
 
   initial begin
-    cpurst_b = 0;
-    #20 cpurst_b = 1;
-    #5 ifu_iu_ex_inst_vld = 1;       // first instruction ready
-    #30 alu_busy = 4'b1000;          // unit busy → stall
-    #20 alu_busy = 0;                 // resume
-    #20 mad_busy = 4'b0001;
-    #20 mad_busy = 0;
-    #20 ifu_iu_ex_inst_vld = 0;       // no more instructions
+    // All stimulus changes happen at NEGEDGE clk times (t=10, 20, 30 ...)
+    // so they don't race with the active posedge in the same slot.
+    #20;                                   // t=20  negedge cyc 1
+    cpurst_b = 1'b0;                       // observed at cyc 2 posedge
+    #20;                                   // t=40
+    cpurst_b = 1'b1;                       // observed at cyc 4
+    #20;                                   // t=60  negedge cyc 5
+    ifu_iu_ex_inst_vld = 1'b1;             // observed at cyc 6
+    #30;                                   // t=90  negedge cyc 8
+    alu_busy = 4'b1000;                    // observed at cyc 9 (stall)
+    #20;                                   // t=110 negedge cyc 10
+    alu_busy = 0;                          // observed at cyc 11
+    #20;                                   // t=130 negedge cyc 12
+    mad_busy = 4'b0001;                    // observed at cyc 13
+    #20;                                   // t=150 negedge cyc 14
+    mad_busy = 0;                          // observed at cyc 15
+    #20;                                   // t=170 negedge cyc 16
+    ifu_iu_ex_inst_vld = 1'b0;             // observed at cyc 17
     #20 $finish;
   end
 endmodule
