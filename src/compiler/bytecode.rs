@@ -1327,7 +1327,13 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
-    pub fn finish(self) -> CompiledBlock {
+    pub fn finish(mut self) -> CompiledBlock {
+        // Trim unused capacity. `Vec::push` doubles the backing buffer
+        // when it overflows, so a freshly compiled block can sit on
+        // up to ~50% slack capacity. With ~100K CompiledBlocks on
+        // c910, that slack stacks into double-digit MB; one
+        // `shrink_to_fit` per finish reclaims it.
+        self.insns.shrink_to_fit();
         CompiledBlock {
             num_regs: self.next_reg,
             instructions: self.insns,
