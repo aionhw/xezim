@@ -2250,8 +2250,20 @@ impl Simulator {
             // Check for edge-sensitive: always_ff @(posedge ...) or always @(posedge ...)
             if let Some((sens, body)) = self.extract_sensitivity(&ab.stmt) {
                 if !sens.is_empty() {
+                    let top_prefix = format!("{}.", self.module.name);
                     let resolved: Vec<SensitivityId> = sens.iter().filter_map(|s| {
-                        self.signal_name_to_id.get(s.signal_name.as_str()).map(|&id| SensitivityId { signal_id: id, edge: s.edge })
+                        if let Some(&id) = self.signal_name_to_id.get(s.signal_name.as_str()) {
+                            return Some(SensitivityId { signal_id: id, edge: s.edge });
+                        }
+                        // Top-prefix strip fallback (`tb.x_soc.foo` →
+                        // `x_soc.foo`) — see the matching block in
+                        // build_comb_entries for rationale.
+                        if let Some(stripped) = s.signal_name.strip_prefix(&top_prefix) {
+                            if let Some(&id) = self.signal_name_to_id.get(stripped) {
+                                return Some(SensitivityId { signal_id: id, edge: s.edge });
+                            }
+                        }
+                        None
                     }).collect();
                     self.edge_blocks.push(EdgeSensitiveBlock {
                         resolved_sensitivities: resolved,
@@ -2328,6 +2340,7 @@ impl Simulator {
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
             compiler.set_params(&self.module.parameters);
+            compiler.top_module_name = Some(self.module.name.clone());
             if compiler.compile_stmt(&block.stmt) {
                 let cb = compiler.finish();
                 if cb.num_regs > max_regs { max_regs = cb.num_regs; }
@@ -3004,6 +3017,7 @@ impl Simulator {
                 );
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
+                compiler.top_module_name = Some(self.module.name.clone());
                 if compiler.compile_cont_assign(&ca.rhs, dst_id, width) {
                     CombItem::CompiledContAssign { compiled: compiler.finish() }
                 } else {
@@ -3021,6 +3035,7 @@ impl Simulator {
                 );
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
+                compiler.top_module_name = Some(self.module.name.clone());
                 let lhs_w = compiler.infer_lhs_width_pub(&ca.lhs);
                 if lhs_w > 0 && compiler.compile_cont_assign_lhs(&ca.lhs, &ca.rhs, lhs_w) {
                     CombItem::CompiledContAssign { compiled: compiler.finish() }
@@ -3038,6 +3053,13 @@ impl Simulator {
             // settle iteration.
             let mut rids: Vec<usize> = Vec::with_capacity(reads.len());
             let mut unresolved_count = 0usize;
+            // Top-module name (e.g. "tb") used to detect and strip
+            // top-prefixed cross-hierarchical references. Some E902 modules
+            // emit `tb.x_soc.biu_pad_hwdata`-style names through xezim's
+            // port-rewriting; the signal table stores top-level instances
+            // without the top-name prefix (`x_soc.biu_pad_hwdata`), so the
+            // lookup misses unless we strip "<top_name>." up front.
+            let top_prefix = format!("{}.", self.module.name);
             for r in &reads {
                 if let Some(&id) = self.signal_name_to_id.get(r.as_str()) {
                     rids.push(id);
@@ -3049,6 +3071,19 @@ impl Simulator {
                     if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
                         rids.push(id);
                         found = true;
+                    }
+                }
+                // Top-prefix strip fallback: `<top>.<rest>` → `<rest>`. Fixes
+                // E902 cross-hierarchical refs that prefix-rewriting in
+                // elaborate.rs left with the top-module name baked in,
+                // even though the simulator stores top-level instance
+                // signals without that prefix.
+                if !found {
+                    if let Some(stripped) = r.strip_prefix(&top_prefix) {
+                        if let Some(&id) = self.signal_name_to_id.get(stripped) {
+                            rids.push(id);
+                            found = true;
+                        }
                     }
                 }
                 if !found { unresolved_count += 1; }
@@ -3085,8 +3120,28 @@ impl Simulator {
                 let mut reads = HashSet::new();
                 let mut writes = HashSet::new();
                 Self::collect_stmt_reads(&ab.stmt, &self.module, &mut reads, &mut writes);
+                // Top-prefix-strip helper: `<top>.<rest>` → `<rest>`. Used
+                // to resolve hierarchical refs whose path includes the
+                // top-module name (e.g. `tb.x_soc.foo`) where the signal
+                // table stores top-level instance signals without that
+                // prefix (`x_soc.foo`). Same fix as the cont_assign read
+                // resolver above — without it, deeply-nested CPU
+                // always_ff blocks that observe cross-hierarchical
+                // signals via xezim's port-rewritten absolute paths
+                // never get the source signal in their dep graph and
+                // miss re-triggering. Symptom on E902: CPU stalls after
+                // 2 instructions because the bus-arbiter always_ff
+                // doesn't re-fire when its sensitivity inputs change.
+                let top_prefix = format!("{}.", self.module.name);
+                let resolve_one = |name: &str| -> Option<usize> {
+                    if let Some(&id) = self.signal_name_to_id.get(name) { return Some(id); }
+                    if let Some(stripped) = name.strip_prefix(&top_prefix) {
+                        if let Some(&id) = self.signal_name_to_id.get(stripped) { return Some(id); }
+                    }
+                    None
+                };
                 let wids: Vec<usize> = writes.iter()
-                    .filter_map(|w| self.signal_name_to_id.get(w.as_str()).copied())
+                    .filter_map(|w| resolve_one(w.as_str()))
                     .collect();
                 // For comb-sensitivity purposes, exclude signals that are written by
                 // this block. Loop variables and local temps are written-then-read
@@ -3095,7 +3150,7 @@ impl Simulator {
                 // always @* block).
                 let sens_reads: HashSet<String> = reads.difference(&writes).cloned().collect();
                 let rids: Vec<usize> = sens_reads.iter()
-                    .filter_map(|r| self.signal_name_to_id.get(r.as_str()).copied())
+                    .filter_map(|r| resolve_one(r.as_str()))
                     .collect();
                 // Unresolved reads in always @* are usually parameters, genvars,
                 // typedefs, or loop-local integer variables — none of which change
@@ -3119,6 +3174,7 @@ impl Simulator {
                     compiler.set_scope_hint(scope_hint.clone());
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_params(&self.module.parameters);
+                    compiler.top_module_name = Some(self.module.name.clone());
                     // Enable AST fallback so partially-unsupported constructs
                     // compile to StmtFallback insns instead of failing the
                     // whole block. Simple parts still benefit from bytecode

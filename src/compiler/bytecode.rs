@@ -173,6 +173,14 @@ pub struct BytecodeCompiler<'a> {
     /// bytecode compilation can fold module params (e.g. `CARRY_CHAIN`) into
     /// the compile-time widths of `+:` / `-:` range selects.
     params: Option<&'a HashMap<String, Value>>,
+    /// Top-module name (e.g. "tb"). When a hierarchical identifier reads a
+    /// signal whose absolute path is `<top>.<rest>` (e.g. xezim's
+    /// port-rewriting baked the top name into a cross-hierarchical
+    /// reference) the signal table actually stores the leaf as `<rest>`,
+    /// because top-level instances have no prefix in the elaborated map.
+    /// `lookup_signal_id` strips this prefix before re-trying the lookup
+    /// to recover from those baked-in absolute paths.
+    pub top_module_name: Option<String>,
 }
 
 impl<'a> BytecodeCompiler<'a> {
@@ -199,6 +207,7 @@ impl<'a> BytecodeCompiler<'a> {
             inlining_stack: Vec::new(),
             tasks_inlined: 0,
             params: None,
+            top_module_name: None,
         }
     }
 
@@ -356,6 +365,17 @@ impl<'a> BytecodeCompiler<'a> {
             let leaf = &hier.path[0].name.name;
             if let Some(&id) = self.signal_name_to_id.get(leaf.as_str()) {
                 return Some(id);
+            }
+        }
+        // Top-prefix strip: `<top>.<rest>` → `<rest>` for cross-hierarchical
+        // refs whose absolute path was baked in by xezim's port-rewriting
+        // (top-level instances have no prefix in signal_name_to_id).
+        if let Some(top) = &self.top_module_name {
+            let with_dot = format!("{}.", top);
+            if let Some(stripped) = raw.strip_prefix(&with_dot) {
+                if let Some(&id) = self.signal_name_to_id.get(stripped) {
+                    return Some(id);
+                }
             }
         }
         None
