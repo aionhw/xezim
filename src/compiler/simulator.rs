@@ -399,6 +399,26 @@ struct DpiLogicVecVal {
     bval: *mut u32,
 }
 
+/// Parse `<base>[<idx>]` and resolve via the compact 1D-array map.
+/// Free function so it can be shared between the `&self` resolver on
+/// Simulator and the `&[Value]`-borrowed `exec_insns_isolated` path that
+/// runs on separate threads.
+#[inline]
+fn resolve_array_elem_id(
+    name: &str,
+    array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
+) -> Option<usize> {
+    let bytes = name.as_bytes();
+    if bytes.last() != Some(&b']') { return None; }
+    let brack = name.rfind('[')?;
+    let base = &name[..brack];
+    let idx_str = &name[brack + 1..name.len() - 1];
+    let idx: i64 = idx_str.parse().ok()?;
+    let &(first_id, lo, hi) = array_first_id.get(base)?;
+    if idx < lo || idx > hi { return None; }
+    Some(first_id + (idx - lo) as usize)
+}
+
 pub struct Simulator {
     pub signals: HashMap<String, Value>,
     /// Fast signal table: indexed by signal_id for O(1) access.
@@ -415,6 +435,16 @@ pub struct Simulator {
     /// `format!("{}[{}]", name, i)` + HashMap lookup on tight loops like
     /// memory wipe/load in testbenches.
     array_elem_ids: HashMap<String, Vec<i64>>,
+    /// Compact resolver for 1D unpacked-array elements: `base_name` →
+    /// (`first_id`, `lo`, `hi`). The N elements of a 1D array occupy
+    /// contiguous signal_ids `first_id..=first_id + (hi-lo)`, so name-style
+    /// lookups like `"tb.foo.mem[5]"` can be resolved by parsing the suffix
+    /// and computing `first_id + (idx - lo)` instead of materialising
+    /// `signal_name_to_id` and `id_to_name` entries for every element.
+    /// On E902 this saves ~107 MB (~852K array cells; HashMap entries +
+    /// per-element Arc<str> strings) and on c910 / large-memory designs
+    /// scales linearly with memory depth.
+    array_first_id: HashMap<Arc<str>, (usize, i64, i64)>,
     /// Reverse index: leaf-name (last `.`-segment of a signal's full path) →
     /// signal_ids that share that leaf. Built once for the "real" signal set
     /// (excludes per-element array IDs which all end with `]`). Keeps the
@@ -783,7 +813,20 @@ impl Simulator {
             signed_vec.push(false);
             real_vec.push(false);
         };
+        // 1D unpacked arrays: track `(first_id, lo, hi)` per array in
+        // `array_first_id` for the bytecode hot path (LoadArrayElem /
+        // NbaAssignArray) which then resolves a cell to a signal_id via
+        // a single arithmetic op instead of `format!()` + HashMap lookup.
+        // Per-element entries are still pushed into `signal_name_to_id` /
+        // `id_to_name` so the slow ad-hoc paths (assign_value fallthrough,
+        // get_signal_value_by_name, $readmemh, VCD dump, etc.) keep
+        // working unchanged. The compact resolver is a *fast path*, not a
+        // replacement for the per-element entries.
+        let mut array_first_id: HashMap<Arc<str>, (usize, i64, i64)> =
+            HashMap::with_capacity(module.arrays.len());
         for (base, &(lo, hi, w)) in &module.arrays {
+            let first_id = signal_table.len();
+            array_first_id.insert(Arc::from(base.as_str()), (first_id, lo, hi));
             for idx in lo..=hi {
                 push_elem(format!("{}[{}]", base, idx), w,
                     &mut signal_table, &mut signal_widths_vec,
@@ -852,7 +895,7 @@ impl Simulator {
             edge_signal_ids: Vec::new(),
             edge_blocks_by_sig: Vec::new(),
             signals, widths, signed_signals, real_signals,
-            signal_table, signal_name_to_id, array_elem_ids: HashMap::new(), leaf_name_to_ids, id_to_name, signal_widths: signal_widths_vec, signal_signed: signal_signed_vec, signal_real: signal_real_vec, signal_type_names,
+            signal_table, signal_name_to_id, array_elem_ids: HashMap::new(), array_first_id, leaf_name_to_ids, id_to_name, signal_widths: signal_widths_vec, signal_signed: signal_signed_vec, signal_real: signal_real_vec, signal_type_names,
             time: 0, output: Vec::new(), capture_output: true, finished: false,
             monitor: None, monitor_prev: HashMap::new(), active_union_tag: HashMap::new(),
             max_time, settle_limit: 100,
@@ -1079,10 +1122,16 @@ impl Simulator {
         if path.is_empty() {
             return Value::zero(32);
         }
+        // IEEE 1800 §21.2.1: single-arg `$fopen(filename)` opens for
+        // WRITE (creates/truncates). The 2-arg form is the only way to
+        // ask for read. Defaulting to "r" silently broke designs that
+        // open log files via the single-arg form (e.g. E902 mnt.v's
+        // `$fopen("GPR.log")` which fails when the file is absent and
+        // triggers an immediate `$finish`).
         let mode = if args.len() >= 2 {
             self.system_string_arg(&args[1])
         } else {
-            "r".to_string()
+            "w".to_string()
         };
         let mut opts = OpenOptions::new();
         let has_plus = mode.contains('+');
@@ -1509,14 +1558,24 @@ impl Simulator {
             let name = self.resolve_hier_name(hier);
             if let Some((lo, hi, _elem_w)) = self.module.arrays.get(&name).copied() {
                 let mut out = Vec::new();
-                for idx in lo..=hi {
-                    let elem_name = format!("{}[{}]", name, idx);
-                    let vv = if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
-                        self.signal_table[id].clone()
-                    } else {
-                        self.signals.get(&elem_name).cloned().unwrap_or_else(|| Value::zero(32))
-                    };
-                    out.push(vv.to_i64().unwrap_or(0) as i32);
+                // Compact-resolver fast path: if the array is in
+                // array_first_id, walk the contiguous id range with no
+                // per-element name allocation.
+                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_str()) {
+                    for off in 0..=(hi - lo) as usize {
+                        let id = first_id + off;
+                        out.push(self.signal_table[id].to_i64().unwrap_or(0) as i32);
+                    }
+                } else {
+                    for idx in lo..=hi {
+                        let elem_name = format!("{}[{}]", name, idx);
+                        let vv = if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
+                            self.signal_table[id].clone()
+                        } else {
+                            self.signals.get(&elem_name).cloned().unwrap_or_else(|| Value::zero(32))
+                        };
+                        out.push(vv.to_i64().unwrap_or(0) as i32);
+                    }
                 }
                 return (Some(name), out);
             }
@@ -1529,6 +1588,22 @@ impl Simulator {
             let name = self.resolve_hier_name(hier);
             if let Some((lo, hi, elem_w)) = self.module.arrays.get(&name).copied() {
                 let mut k = 0usize;
+                // Compact-resolver fast path.
+                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_str()) {
+                    for off in 0..=(hi - lo) as usize {
+                        if k >= data.len() { break; }
+                        let id = first_id + off;
+                        let mut val = Value::from_u64(data[k] as u32 as u64, elem_w);
+                        val.is_signed = self.signal_signed[id];
+                        if self.signal_table[id] != val {
+                            self.mark_dirty_id(id);
+                            self.signal_table[id] = val;
+                            self.table_modified = true;
+                        }
+                        k += 1;
+                    }
+                    return;
+                }
                 for idx in lo..=hi {
                     if k >= data.len() { break; }
                     let elem_name = format!("{}[{}]", name, idx);
@@ -1961,6 +2036,9 @@ impl Simulator {
         // cloning — saves significant memory on large testbenches with
         // memory-init initial blocks holding tens of thousands of statements.
         let initial_blocks = std::mem::take(&mut self.module.initial_blocks);
+        if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
+            eprintln!("[xezim] {} initial blocks to schedule", initial_blocks.len());
+        }
         for ib in initial_blocks {
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
@@ -2343,6 +2421,7 @@ impl Simulator {
         signal_table: &[Value],
         signal_signed: &[bool],
         signal_name_to_id: &HashMap<Arc<str>, usize>,
+        array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
         vm_regs: &mut Vec<Value>,
     ) -> Vec<NbaFast> {
         use super::bytecode::Insn;
@@ -2452,21 +2531,31 @@ impl Simulator {
                     else { nba_out.push(NbaFast { signal_id: *sig_id, value: new_val }); }
                 }
                 Insn::LoadArrayElem(dest, array_name, idx_reg) => {
-                    // Isolated/parallel path has no mutable access to the
-                    // array_elem_ids cache, so keep the format-based lookup
-                    // here. Sequential path (exec_insns) uses the cache.
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0);
-                    let elem_name = format!("{}[{}]", array_name, idx);
-                    if let Some(&eid) = signal_name_to_id.get(elem_name.as_str()) {
+                    // Direct compute via array_first_id — no format!() / no
+                    // HashMap miss on cell access. Parallel-path equivalent
+                    // of the sequential array_elem_ids cache.
+                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    let id = array_first_id.get(array_name.as_str()).and_then(|&(first, lo, hi)| {
+                        if idx >= lo && idx <= hi { Some(first + (idx - lo) as usize) } else { None }
+                    }).or_else(|| {
+                        let elem_name = format!("{}[{}]", array_name, idx);
+                        signal_name_to_id.get(elem_name.as_str()).copied()
+                    });
+                    if let Some(eid) = id {
                         vm_regs[*dest as usize] = signal_table[eid].clone();
                     } else {
                         vm_regs[*dest as usize] = Value::new(1);
                     }
                 }
                 Insn::NbaAssignArray(array_name, idx_reg, val_reg, width) => {
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0);
-                    let elem_name = format!("{}[{}]", array_name, idx);
-                    if let Some(&eid) = signal_name_to_id.get(elem_name.as_str()) {
+                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    let id = array_first_id.get(array_name.as_str()).and_then(|&(first, lo, hi)| {
+                        if idx >= lo && idx <= hi { Some(first + (idx - lo) as usize) } else { None }
+                    }).or_else(|| {
+                        let elem_name = format!("{}[{}]", array_name, idx);
+                        signal_name_to_id.get(elem_name.as_str()).copied()
+                    });
+                    if let Some(eid) = id {
                         let val = vm_regs[*val_reg as usize].resize(*width);
                         nba_out.push(NbaFast { signal_id: eid, value: val });
                     }
@@ -3828,6 +3917,12 @@ impl Simulator {
         let mut next_progress = if progress_interval > 0 {
             std::time::Duration::from_secs(progress_interval)
         } else { std::time::Duration::MAX };
+        let trace_loop = std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1");
+        if trace_loop {
+            eprintln!("[xezim] event_loop start: finished={} eq.empty={} waiters={} clocks={}",
+                self.finished, self.event_queue.is_empty(),
+                self.event_waiters.len(), self.clock_generators.len());
+        }
         while !self.finished && iters < max_iters {
             iters += 1;
             if progress_interval > 0 && sim_start.elapsed() >= next_progress {
@@ -3876,12 +3971,22 @@ impl Simulator {
                 let mut batch = self.event_queue.remove(self.time);
                 t_sched += _t.elapsed().as_nanos() as u64;
                 let _t = std::time::Instant::now();
+                if trace_loop {
+                    eprintln!("[xezim] iter={} time={} batch.len={}", iters, self.time, batch.len());
+                }
                 while !batch.is_empty() {
                     if self.finished { break; }
                     let (pid, stmts) = batch.remove(0);
                     let t_now = self.time;
                     for (p, s) in batch.drain(..) {
                         self.event_queue.schedule(t_now, p, s);
+                    }
+                    if trace_loop {
+                        eprintln!("[xezim]   running pid={} stmts={}", pid, stmts.len());
+                        for (idx, s) in stmts.iter().enumerate() {
+                            eprintln!("[xezim]     stmt[{}]: {:?}", idx,
+                                std::mem::discriminant(&s.kind));
+                        }
                     }
                     self.run_scheduled_process(pid, &stmts);
                     if !self.is_pid_suspended(pid) {
@@ -4754,6 +4859,7 @@ impl Simulator {
                 let signal_table = &self.signal_table;
                 let signal_signed = &self.signal_signed;
                 let signal_name_to_id = &self.signal_name_to_id;
+                let array_first_id = &self.array_first_id;
 
                 // Pre-extract instruction slices as raw pointers to avoid
                 // sending non-Sync CompiledBlock (contains StmtFallback with
@@ -4793,7 +4899,7 @@ impl Simulator {
                                 let insns = unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
                                 let mut nba = Self::exec_insns_isolated(
                                     insns, signal_table, signal_signed,
-                                    signal_name_to_id, &mut vm_regs,
+                                    signal_name_to_id, array_first_id, &mut vm_regs,
                                 );
                                 thread_nba.append(&mut nba);
                             }
@@ -5164,13 +5270,32 @@ impl Simulator {
         self.settling = false;
     }
 
-    /// Look up flat signal_id for array element `name[idx]` via a lazy per-array
-    /// cache. First call per array populates the cache by iterating
-    /// signal_name_to_id for all elements (one-time O(N) over the array size);
-    /// subsequent calls are O(1) table indexing. Avoids the `format!()` +
-    /// HashMap lookup that dominates tight memory-init loops (e.g. 1.4M writes
-    /// in the c910 testbench `ram0.mem[i] = 0` wipe).
+    /// Resolve a fully-qualified signal name (possibly an array element
+    /// like `"tb.foo.mem[5]"`) to a signal_id. Tries the dense
+    /// `signal_name_to_id` HashMap first; if that misses and the name has
+    /// the form `<base>[<idx>]`, parses the suffix and uses
+    /// `array_first_id` to compute the id without ever materialising
+    /// per-element HashMap entries. Returns None if neither path resolves.
+    #[inline]
+    fn resolve_signal_id(&self, name: &str) -> Option<usize> {
+        if let Some(&id) = self.signal_name_to_id.get(name) { return Some(id); }
+        resolve_array_elem_id(name, &self.array_first_id)
+    }
+
+    /// Look up flat signal_id for array element `name[idx]`. With the
+    /// compact `array_first_id` resolver, 1D arrays compute the id directly
+    /// as `first_id + (idx - lo)` — no per-element HashMap entry is needed.
+    /// 2D/ND arrays still fall through to the legacy `array_elem_ids` cache
+    /// path which iterates signal_name_to_id; those arrays are small in
+    /// practice on real designs.
     fn get_array_elem_id(&mut self, name: &str, idx: i64) -> Option<usize> {
+        // Fast path: 1D array via compact resolver.
+        if let Some(&(first_id, lo, hi)) = self.array_first_id.get(name) {
+            if idx >= lo && idx <= hi {
+                return Some(first_id + (idx - lo) as usize);
+            }
+            return None;
+        }
         let (arr_lo, arr_hi) = match self.module.arrays.get(name) {
             Some(&(lo, hi, _)) => (lo, hi),
             None => return None,
@@ -5423,6 +5548,27 @@ impl Simulator {
 
                     // Check if this is an array element assignment
                     if self.module.arrays.contains_key(&name) || self.is_associative_array(&name) {
+                        // Compact-resolver fast path for 1D arrays: compute
+                        // signal_id directly without `format!()` + HashMap
+                        // lookup. Required for correctness now that 1D
+                        // array elements are no longer materialised as
+                        // per-element entries in signal_name_to_id.
+                        if let Some(&(first_id, lo, hi)) = self.array_first_id.get(name.as_str()) {
+                            let idx = idx_val.to_u64().unwrap_or(0) as i64;
+                            if idx >= lo && idx <= hi {
+                                let id = first_id + (idx - lo) as usize;
+                                let width = self.signal_widths[id];
+                                let resized = val.resize(width);
+                                let changed = self.signal_table[id] != resized;
+                                if changed {
+                                    if !self.dirty_signals[id] { self.dirty_signals[id] = true; self.dirty_list.push(id); }
+                                    self.dirty_any = true;
+                                    self.signal_table[id] = resized;
+                                    self.table_modified = true;
+                                }
+                                return changed;
+                            }
+                        }
                         let elem_name = format!("{}[{}]", name, idx_str);
                         if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
                             let width = self.signal_widths[id];
@@ -7913,6 +8059,22 @@ impl Simulator {
                 self.mark_dirty_id(id);
             }
             changed
+        } else if let Some(id) = resolve_array_elem_id(name, &self.array_first_id) {
+            // Array-element fast path. Required because per-element entries
+            // are no longer materialised in signal_name_to_id; without this,
+            // every $readmemh element falls into the slow path that runs
+            // sync_table_to_hashmap (O(num_signals) per call), which on E902
+            // ballooned simulation memory past 6 GB.
+            let width = self.signal_widths[id];
+            let mut resized = val.resize(width);
+            resized.is_signed = self.signal_signed[id];
+            let changed = self.signal_table[id] != resized;
+            if changed {
+                self.signal_table[id] = resized;
+                self.table_modified = true;
+                self.mark_dirty_id(id);
+            }
+            changed
         } else {
             // Fallback
             self.sync_table_to_hashmap();
@@ -8556,10 +8718,17 @@ impl Simulator {
         if let Some(&id) = self.signal_name_to_id.get(name) {
             let mut v = self.signal_table[id].clone();
             if self.signal_signed[id] { v.is_signed = true; }
-            Some(v)
-        } else {
-            self.signals.get(name).cloned()
+            return Some(v);
         }
+        // Array-element fallback: <base>[<idx>] resolves via the compact
+        // 1D-array resolver (signal_name_to_id no longer has per-element
+        // entries for 1D arrays).
+        if let Some(id) = resolve_array_elem_id(name, &self.array_first_id) {
+            let mut v = self.signal_table[id].clone();
+            if self.signal_signed[id] { v.is_signed = true; }
+            return Some(v);
+        }
+        self.signals.get(name).cloned()
     }
 
     fn set_signal_value_by_name(&mut self, name: &str, val: Value) {
@@ -8572,9 +8741,21 @@ impl Simulator {
                 self.signal_table[id] = resized;
                 self.table_modified = true;
             }
-        } else {
-            self.signals.insert(name.to_string(), val);
+            return;
         }
+        // Array-element fallback (1D compact resolver).
+        if let Some(id) = resolve_array_elem_id(name, &self.array_first_id) {
+            let w = self.signal_widths[id];
+            let resized = val.resize(w);
+            if self.signal_table[id] != resized {
+                if !self.dirty_signals[id] { self.dirty_signals[id] = true; self.dirty_list.push(id); }
+                self.dirty_any = true;
+                self.signal_table[id] = resized;
+                self.table_modified = true;
+            }
+            return;
+        }
+        self.signals.insert(name.to_string(), val);
     }
 
     fn get_queue_size(&self, obj_name: &str) -> u64 {
