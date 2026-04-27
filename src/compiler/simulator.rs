@@ -580,8 +580,17 @@ pub struct Simulator {
     /// Every subsequent settle call at time=0 can skip the re-seed; the
     /// worklist and dirty propagation already keep things moving.
     comb_time0_fired: bool,
-    /// Reverse index: signal_id → list of comb_entry indices that read this signal.
-    comb_dep_by_id: Vec<Vec<usize>>,
+    /// Reverse index: signal_id → list of comb_entry indices that read
+    /// this signal. CSR layout — `comb_dep_entries[comb_dep_offsets[id]
+    /// .. comb_dep_offsets[id+1]]` gives the dependents of signal `id`.
+    /// Compared to the prior `Vec<Vec<usize>>` this drops 24 B / signal
+    /// of empty-Vec-header overhead (≈14 MB on c910's 585K signals)
+    /// and packs the entry indices contiguously for better cache use
+    /// in `settle_combinatorial`'s hot loop. u32 is sufficient — both
+    /// signal_id and comb_entry index fit comfortably in 32 bits at
+    /// any practical design size.
+    comb_dep_offsets: Vec<u32>,
+    comb_dep_entries: Vec<u32>,
     /// Bitvec: dirty_signals[signal_id] = true if signal changed since last settle.
     dirty_signals: Vec<bool>,
     /// Explicit list of dirty signal IDs (maintained alongside dirty_signals bitvec)
@@ -843,7 +852,8 @@ impl Simulator {
             comb_unresolved_idx: Vec::new(),
             comb_time0_idx: Vec::new(),
             comb_time0_fired: false,
-            comb_dep_by_id: Vec::new(),
+            comb_dep_offsets: Vec::new(),
+            comb_dep_entries: Vec::new(),
             dirty_signals: vec![false; num_signals],
             dirty_list: Vec::with_capacity(num_signals),
             dirty_any: false,
@@ -3077,16 +3087,39 @@ impl Simulator {
             }
         }
 
-        // Build reverse dependency index by signal ID using final entry order.
-        let mut dep_by_id: Vec<Vec<usize>> = vec![Vec::new(); num_signals];
-        for (idx, entry) in entries.iter().enumerate() {
+        // Build reverse dependency index by signal ID using final entry
+        // order. CSR layout: counts → prefix-sum → fill, all in flat
+        // u32 Vecs. Avoids 585K × 24 B of empty Vec headers and 585K
+        // separate small allocations.
+        let mut counts: Vec<u32> = vec![0u32; num_signals + 1];
+        for entry in entries.iter() {
             for &sig_id in &entry.read_signal_ids {
                 if sig_id < num_signals {
-                    dep_by_id[sig_id].push(idx);
+                    counts[sig_id + 1] += 1;
                 }
             }
         }
-        self.comb_dep_by_id = dep_by_id;
+        // In-place prefix sum: counts[i] becomes start-offset for signal i.
+        let mut dep_offsets = counts;
+        for i in 1..dep_offsets.len() {
+            dep_offsets[i] += dep_offsets[i - 1];
+        }
+        let total = dep_offsets[num_signals] as usize;
+        let mut dep_entries: Vec<u32> = vec![0u32; total];
+        // `cursor[id]` tracks the next write position for signal `id`;
+        // initialized to the start-offset and bumped per insert.
+        let mut cursor: Vec<u32> = dep_offsets[..num_signals].to_vec();
+        for (idx, entry) in entries.iter().enumerate() {
+            for &sig_id in &entry.read_signal_ids {
+                if sig_id < num_signals {
+                    let pos = cursor[sig_id] as usize;
+                    dep_entries[pos] = idx as u32;
+                    cursor[sig_id] += 1;
+                }
+            }
+        }
+        self.comb_dep_offsets = dep_offsets;
+        self.comb_dep_entries = dep_entries;
         let dc_count = entries.iter().filter(|e| matches!(&e.item, CombItem::DirectCopy { .. })).count();
         let cca_count = entries.iter().filter(|e| matches!(&e.item, CombItem::CompiledContAssign { .. })).count();
         let ca_count = entries.iter().filter(|e| matches!(&e.item, CombItem::ContAssign { .. })).count();
@@ -4819,7 +4852,8 @@ impl Simulator {
         self.settle_calls += 1;
 
         let entries = std::mem::take(&mut self.comb_entries);
-        let dep_by_id = std::mem::take(&mut self.comb_dep_by_id);
+        let dep_offsets = std::mem::take(&mut self.comb_dep_offsets);
+        let dep_entries = std::mem::take(&mut self.comb_dep_entries);
         let num_entries = entries.len();
 
         // Resize persistent buffers if needed (only happens once)
@@ -4839,8 +4873,11 @@ impl Simulator {
         for &id in &self.dirty_list {
             if self.dirty_signals[id] {
                 self.dirty_signals[id] = false;
-                if id < dep_by_id.len() {
-                    for &eidx in &dep_by_id[id] {
+                if id + 1 < dep_offsets.len() {
+                    let lo = dep_offsets[id] as usize;
+                    let hi = dep_offsets[id + 1] as usize;
+                    for &eidx_u32 in &dep_entries[lo..hi] {
+                        let eidx = eidx_u32 as usize;
                         if !self.settle_triggered[eidx] {
                             self.settle_triggered[eidx] = true;
                             self.settle_triggered_list.push(eidx);
@@ -5039,8 +5076,11 @@ impl Simulator {
                         // If the signal gets dirtied again later, it'll be
                         // re-pushed to dirty_list with a fresh flag.
                         self.dirty_signals[sig_id] = false;
-                        if sig_id < dep_by_id.len() {
-                            for &dep_eidx in &dep_by_id[sig_id] {
+                        if sig_id + 1 < dep_offsets.len() {
+                            let lo = dep_offsets[sig_id] as usize;
+                            let hi = dep_offsets[sig_id + 1] as usize;
+                            for &dep_eidx_u32 in &dep_entries[lo..hi] {
+                                let dep_eidx = dep_eidx_u32 as usize;
                                 if !self.settle_triggered[dep_eidx] {
                                     self.settle_triggered[dep_eidx] = true;
                                     self.settle_triggered_list.push(dep_eidx);
@@ -5062,7 +5102,8 @@ impl Simulator {
         }
 
         self.comb_entries = entries;
-        self.comb_dep_by_id = dep_by_id;
+        self.comb_dep_offsets = dep_offsets;
+        self.comb_dep_entries = dep_entries;
         self.settle_iters += total_iters;
         if total_iters > self.max_settle_iters {
             if total_iters >= limit && self.dirty_any {
