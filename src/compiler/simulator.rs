@@ -2256,22 +2256,6 @@ impl Simulator {
             // Check for edge-sensitive: always_ff @(posedge ...) or always @(posedge ...)
             if let Some((sens, body)) = self.extract_sensitivity(&ab.stmt) {
                 if !sens.is_empty() {
-                    // If every entry is level-sensitive (no posedge/negedge),
-                    // the block is comb-equivalent — `always @(a or b[3:0])`
-                    // is the same as `always @*` for those reads. Route it
-                    // through build_comb_entries so the settle path picks
-                    // it up via signal-id sensitivity. Edge-block dispatch
-                    // (check_edges) misses re-firings when sensitivity
-                    // inputs are bit-slices of comb-driven wires deep in
-                    // the hierarchy, e.g. cr_iu_decd's decd_ill_expt32
-                    // decoder on `decd_inst[31:25] or decd_func3[2:0] ...`
-                    // never refires after t=0/100, leaving X-default arm
-                    // values latched and stalling the E902 IFU.
-                    let all_level = sens.iter().all(|s| s.edge == EdgeKind::AnyEdge);
-                    if all_level {
-                        remaining.push(AlwaysBlock { kind: ab.kind, stmt: body });
-                        continue;
-                    }
                     let top_prefix = format!("{}.", self.module.name);
                     let resolved: Vec<SensitivityId> = sens.iter().filter_map(|s| {
                         if let Some(&id) = self.signal_name_to_id.get(s.signal_name.as_str()) {
