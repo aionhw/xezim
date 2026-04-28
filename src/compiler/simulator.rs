@@ -803,6 +803,52 @@ impl Simulator {
         // signal_name_to_id first, so the HashMap miss on fallback paths
         // is harmless. Saves hundreds of MB of HashMap entries on designs
         // with large testbench memories.
+        // For very large arrays (e.g. testbench memory models with 2M
+        // elements per ram), skip per-element insertion into
+        // `signal_name_to_id` and `id_to_name`. The bytecode hot path
+        // (LoadArrayElem / NbaAssignArray) and `fast_signal_write` use
+        // the `array_first_id` fast-path resolver instead, so functional
+        // correctness is preserved while saving 70+ B per element ×
+        // millions of elements (3+ GB on c910). Threshold defaults to
+        // 1024 — small enough that E902/picorv32 (which have arrays of
+        // 64K element 32-bit ROM) drop their bloat too, but large enough
+        // that ordinary 16/32-entry register files keep their per-element
+        // names for VCD/probe convenience.
+        // Threshold above which 1D-array per-element entries are NOT
+        // registered in `signal_name_to_id` / `id_to_name`. Default
+        // 100,000 keeps E902-class memories (65,536 × 32-bit
+        // mem_inst_temp) named (so any legacy code path that goes
+        // through signal_name_to_id resolution still works) while
+        // still pruning c910-class testbench RAMs (16 × 2,097,152 =
+        // 33 M elements, ~3 GB savings on c910 hello).
+        let large_array_threshold: usize = std::env::var("XEZIM_LARGE_ARRAY_NAME_THRESHOLD")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(100_000);
+        // Shared placeholder Arc for unnamed array elements — reused
+        // across millions of array cells so id_to_name doesn't blow up
+        // with per-element heap allocations.
+        let unnamed_arc: Arc<str> = Arc::from("");
+        let mut push_elem_named = |name: String, w: u32,
+                             sig_table: &mut Vec<Value>,
+                             widths_vec: &mut Vec<u32>,
+                             signed_vec: &mut Vec<bool>,
+                             real_vec: &mut Vec<bool>,
+                             name_to_id: &mut HashMap<Arc<str>, usize>,
+                             names: &mut Vec<Arc<str>>,
+                             register_name: bool,
+                             placeholder: &Arc<str>| {
+            let id = sig_table.len();
+            if register_name {
+                let arc: Arc<str> = Arc::from(name.as_str());
+                name_to_id.insert(arc.clone(), id);
+                names.push(arc);
+            } else {
+                names.push(placeholder.clone());
+            }
+            sig_table.push(Value::new(w));
+            widths_vec.push(w);
+            signed_vec.push(false);
+            real_vec.push(false);
+        };
         let mut push_elem = |name: String, w: u32,
                              sig_table: &mut Vec<Value>,
                              widths_vec: &mut Vec<u32>,
@@ -810,14 +856,7 @@ impl Simulator {
                              real_vec: &mut Vec<bool>,
                              name_to_id: &mut HashMap<Arc<str>, usize>,
                              names: &mut Vec<Arc<str>>| {
-            let id = sig_table.len();
-            let arc: Arc<str> = Arc::from(name.as_str());
-            name_to_id.insert(arc.clone(), id);
-            names.push(arc);
-            sig_table.push(Value::new(w));
-            widths_vec.push(w);
-            signed_vec.push(false);
-            real_vec.push(false);
+            push_elem_named(name, w, sig_table, widths_vec, signed_vec, real_vec, name_to_id, names, true, &unnamed_arc);
         };
         // 1D unpacked arrays: track `(first_id, lo, hi)` per array in
         // `array_first_id` for the bytecode hot path (LoadArrayElem /
@@ -830,14 +869,23 @@ impl Simulator {
         // replacement for the per-element entries.
         let mut array_first_id: HashMap<Arc<str>, (usize, i64, i64)> =
             HashMap::with_capacity(module.arrays.len());
+        let _ = ("[ARR] arrays={} arrays_2d={} arrays_nd={} signals_pre={} names_pre={}",
+            module.arrays.len(), module.arrays_2d.len(), module.arrays_nd.len(),
+            module.signals.len(), n);
         for (base, &(lo, hi, w)) in &module.arrays {
             let first_id = signal_table.len();
             array_first_id.insert(Arc::from(base.as_str()), (first_id, lo, hi));
+            let count = (hi - lo + 1).max(0) as usize;
+            let register_names = count <= large_array_threshold;
+            if false && count >= 1000 {
+                let _ = (&base, count, register_names);
+            }
             for idx in lo..=hi {
-                push_elem(format!("{}[{}]", base, idx), w,
+                push_elem_named(format!("{}[{}]", base, idx), w,
                     &mut signal_table, &mut signal_widths_vec,
                     &mut signal_signed_vec, &mut signal_real_vec,
-                    &mut signal_name_to_id, &mut id_to_name);
+                    &mut signal_name_to_id, &mut id_to_name,
+                    register_names, &unnamed_arc);
             }
         }
         for (base, &((lo1, hi1), (lo2, hi2), w)) in &module.arrays_2d {
@@ -907,7 +955,10 @@ impl Simulator {
             max_time, settle_limit: 100,
             cascade_limit: std::env::var("XEZIM_CASCADE_LIMIT")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(8),
-            sdf_annotation: None, sdf_delays: vec![0u64; num_signals], delayed_updates: Vec::new(), module,
+            // sdf_delays: lazy — most designs don't have SDF annotations.
+            // First annotated signal triggers a resize-to-num_signals via
+            // the helper used by sdf and specify_delays paths.
+            sdf_annotation: None, sdf_delays: Vec::new(), delayed_updates: Vec::new(), module,
             dpi_libraries: Vec::new(),
             dpi_bindings: HashMap::new(),
             dpi_unsupported: HashSet::new(),
@@ -969,7 +1020,11 @@ impl Simulator {
             settle_iters: 0,
             max_settle_iters: 0,
             activity_counts: Vec::new(),
-            signal_toggle_counts: vec![0u64; num_signals],
+            // signal_toggle_counts: lazy-allocated when activity_mon is
+            // turned on by the caller (after Simulator::new returns).
+            // Saves 8 × num_signals bytes (288 MB on c910). Access is
+            // already gated by self.activity_mon.
+            signal_toggle_counts: Vec::new(),
             activity_mon: false,
             plusargs: Vec::new(),
             file_handles: HashMap::new(),
@@ -1946,6 +2001,13 @@ impl Simulator {
         // fast path bails out on signals with nonzero delay, so the delay must be
         // visible at build time or cont_assigns to delayed signals will be fused
         // and bypass `schedule_delayed`.
+        // Lazy-allocate sdf_delays only when there's an annotation or
+        // specify_delays — saves 8 × num_signals B (288 MB on c910)
+        // when neither is present (the common case).
+        let need_sdf = self.sdf_annotation.is_some() || !self.module.specify_delays.is_empty();
+        if need_sdf && self.sdf_delays.len() != self.signal_table.len() {
+            self.sdf_delays.resize(self.signal_table.len(), 0);
+        }
         if let Some(ref ann) = self.sdf_annotation {
             let mut count = 0;
             for (sig_name, &delay) in &ann.signal_delays {
@@ -3835,7 +3897,7 @@ impl Simulator {
     /// Only fires when LHS and all RHS leaves are single-bit refs with no SDF delay.
     fn try_build_fused_gate(&self, lhs: &Expression, rhs: &Expression, scope_hint: Option<&str>) -> Option<FusedGate> {
         let dst = self.try_resolve_bit_ref(lhs, scope_hint)?;
-        if self.sdf_delays[dst.sig_id as usize] != 0 { return None; }
+        if self.sdf_delays.get(dst.sig_id as usize).copied().unwrap_or(0) != 0 { return None; }
         // Strip outer parens on rhs
         fn unparen(e: &Expression) -> &Expression {
             if let ExprKind::Paren(inner) = &e.kind { unparen(inner) } else { e }
@@ -4823,7 +4885,7 @@ impl Simulator {
 
     /// Schedule a delayed signal update (inertial delay model).
     fn schedule_delayed(&mut self, id: usize, val: Value) {
-        let delay = self.sdf_delays[id];
+        let delay = self.sdf_delays.get(id).copied().unwrap_or(0);
         let target_time = self.time + delay;
         // Inertial delay: remove any pending update for this signal
         self.delayed_updates.retain(|(_, sid, _)| *sid != id);
@@ -5258,7 +5320,7 @@ impl Simulator {
                         let dst_w = self.signal_widths[*dst_id];
                         let mut handled = false;
                         if *width <= 64 && dst_w == *width
-                            && self.sdf_delays[*dst_id] == 0
+                            && self.sdf_delays.get(*dst_id).copied().unwrap_or(0) == 0
                         {
                             let (sv, sx) = self.signal_table[*src_id].raw_bits();
                             let (dv, dx) = self.signal_table[*dst_id].raw_bits();
@@ -5277,7 +5339,7 @@ impl Simulator {
                             let src_val = self.signal_table[*src_id].clone();
                             let resized = if src_val.width != *width { src_val.resize(*width) } else { src_val };
                             if self.signal_table[*dst_id] != resized {
-                                let delay = self.sdf_delays[*dst_id];
+                                let delay = self.sdf_delays.get(*dst_id).copied().unwrap_or(0);
                                 if delay > 0 && self.time > 0 {
                                     self.schedule_delayed(*dst_id, resized);
                                 } else {
@@ -5319,7 +5381,7 @@ impl Simulator {
                         let w = self.infer_lhs_width(lhs);
                         let val = self.eval_expr_ctx(rhs, w).resize(w);
                         // Check if the LHS target has an SDF delay
-                        let delay = lhs_id.map(|id| self.sdf_delays[id]).unwrap_or(0);
+                        let delay = lhs_id.and_then(|id| self.sdf_delays.get(id).copied()).unwrap_or(0);
                         if delay > 0 && self.time > 0 {
                             if let Some(id) = lhs_id {
                                 if self.signal_table[id] != val {
@@ -8180,6 +8242,9 @@ impl Simulator {
         }
         self.dirty_any = true;
         if self.activity_mon {
+            if self.signal_toggle_counts.len() != self.signal_table.len() {
+                self.signal_toggle_counts.resize(self.signal_table.len(), 0);
+            }
             self.signal_toggle_counts[id] += 1;
         }
     }

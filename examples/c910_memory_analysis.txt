@@ -1,0 +1,152 @@
+================================================================
+  xezim c910 hello memory footprint analysis
+  2026-04-27, max-time=1000 ns (100 clock cycles), VCD disabled
+================================================================
+
+Measurement (`/usr/bin/time -v xezim --simulate ... --max-time 1000`):
+
+  Maximum resident set size (kbytes): 10,184,088     (≈ 9.7 GB)
+  elaborate phase:                       8,267 ms
+  simulate phase:                      119,236 ms     (100 cycles, 119s wall)
+  ms / cycle:                          ~1,192 ms
+
+Elaborated state:
+  - num_signals:        36,017,656
+  - comb_entries:          510,051
+  - settle_calls:         2,112,027   (max_iters=30)
+  - settle_iters total:   2,118,745
+  - entry_evals total:    6,097,342
+
+----------------------------------------------------------------
+  Per-signal storage breakdown (xezim AoS, current HEAD)
+----------------------------------------------------------------
+
+Signal-count-proportional Vecs allocated in `Simulator`:
+
+  | data structure                            | size each | × 36M signals    |
+  |-------------------------------------------|-----------|------------------|
+  | signal_table:           Vec<Value>        | ~40 B     | ~1.44 GB         |
+  | id_to_name:             Vec<Arc<str>>     | ~16 B     | ~576 MB          |
+  | signal_widths:          Vec<u32>          | 4 B       | ~144 MB          |
+  | signal_signed:          Vec<bool>         | 1 B       | ~36 MB           |
+  | signal_real:            Vec<bool>         | 1 B       | ~36 MB           |
+  | prev_val:               Vec<u64>          | 8 B       | ~288 MB          |
+  | prev_xz:                Vec<u64>          | 8 B       | ~288 MB          |
+  | sdf_delays:             Vec<u64>          | 8 B       | ~288 MB          |
+  | dirty_signals:          Vec<bool>         | 1 B       | ~36 MB           |
+  | signal_toggle_counts:   Vec<u64>          | 8 B       | ~288 MB          |
+  | signal_name_to_id HashMap<Arc<str>,usize> | ~50 B/ent | ~1.8 GB          |
+  | writers_by_sig (build): Vec<Vec<usize>>   | 24 B      | ~864 MB (transient)|
+
+  per-signal subtotal:                                    ~6.1 GB
+
+Plus non-signal-count state:
+
+  - comb_entries (510K × ~200 B avg)                       ~100 MB
+  - bytecode regs/insns                                    ?
+  - module elaboration AST (preserved for AST-fallback)    ?
+  - edge_blocks + sensitivity tables                       ?
+  - HashMap overheads / fragmentation                      ~1-2 GB
+  - Allocator slack                                        ~1-2 GB
+
+  rough total:                                             ~9-10 GB ← matches measurement
+
+----------------------------------------------------------------
+  Why 36 M signals?
+----------------------------------------------------------------
+
+c910 has ~585 K source-level wire/reg signals per
+xezim_b_scaling memory note. The 36 M figure includes:
+  - 1D-array per-element expansion (`xezim_array_first_id` fix
+    creates one signal_id per array element). The c910 has many
+    big SRAMs:
+      RTL_MEM:  16 × 16384 entries (×16 banks) ≈ 4 M elements
+      SPSRAM:   65536 × 128, 8192 × 32, 4096 × 84, etc.
+    Each element is its own signal_id.
+  - Multiple instances of the core in the SoC (single in hello, but
+    surrounding fabric: ahb/apb/axi/uart/gpio etc.)
+  - Per-bit expansion is NOT done by xezim (signal_table stores
+    multi-bit values inline up to 64 bits).
+
+----------------------------------------------------------------
+  Comparison reference (xezim on smaller designs)
+----------------------------------------------------------------
+
+  | design          | max-time    | RSS   | signals  | wall    |
+  |-----------------|-------------|-------|----------|---------|
+  | E902 hello      | 100 µs      | 340 MB| ~200 K   | 7.3 s   |
+  | E902 cmark      | 200 ms      | 340 MB| ~200 K   | 374 s   |
+  | c910 hello      | 1 µs (100c) | 9.7 GB| 36 M     | 119 s   |
+  | c910 cmark      | 1 ms (50Kc) | 10.2 GB| 36 M    | 1662 s  |
+
+RSS scales with elaborated signal count, not simulation length —
+once allocated, sim only adds modest overhead (NBA queue, comb_settle
+worklist, edge tracking).
+
+Per-signal cost works out to ~270 B/signal in xezim. iverilog gets
+~50-100 B/signal because vvp packs bits more aggressively and shares
+common Value patterns.
+
+----------------------------------------------------------------
+  Performance bottleneck (separate from memory)
+----------------------------------------------------------------
+
+100 cycles took 119 s wall = 1.19 s/cycle. Compare:
+  - E902 hello: 5392 cycles in 7.3 s = ~1.4 ms/cycle    (~850× faster per cycle)
+  - E902 cmark: 511995 cycles in 374 s = ~0.73 ms/cycle (~1600× faster per cycle)
+
+Per-cycle slowdown on c910 is roughly proportional to elaborated
+comb_entry count: c910 has 510K comb entries vs E902 ~13K (ratio
+~38×). Plus c910 has bigger sensitivity fan-outs and longer cont-
+assign chains, which inflates settle iteration counts.
+
+----------------------------------------------------------------
+  Reduction strategies (in priority order)
+----------------------------------------------------------------
+
+A) Skip allocations for unused subsystems.
+   The c910 has 1024 instances of small fabric IP that hello_world
+   never exercises. Adding a build-time --whitelist or design-time
+   --max-sim-modules would prune them. For a hello/dhrystone-only
+   run the active subset is <200K signals.
+
+B) SoA storage (already in roadmap: xezim_soa_roadmap memory).
+   Replace signal_table: Vec<Value> with parallel u64 arrays for
+   val_bits + xz_bits + width — saves the 32-byte Value enum overhead.
+   Expected: ~3 GB → ~700 MB on c910, plus settle hot-path speedup.
+
+C) Drop unused bookkeeping.
+   - sdf_delays (288 MB) is only used when --sdf is set; gate with
+     Option<Vec<u64>>.
+   - signal_toggle_counts (288 MB) is profile-only; gate with feature
+     flag.
+   These two together save ~570 MB instantly, no semantic change.
+
+D) Compress 1D-array signal_ids.
+   For RAMs with millions of elements, allocate ONE signal_id per
+   array and dispatch reads/writes through the array_first_id
+   fast-path. Memory note xezim_array_first_id added a partial path
+   but still inserts per-element entries.
+
+E) Lazy elaboration.
+   Skip elaborating modules whose ports aren't transitively driven
+   by the testbench. For hello only the CPU + a few fabric blocks
+   are touched; the rest could be skipped.
+
+----------------------------------------------------------------
+  Next-step: incremental block measurement
+----------------------------------------------------------------
+
+To profile per-block contribution, build minimal test runs that
+include progressively more c910 modules (smallest first):
+
+  1. Just IFU + IDU + IU + LSU + RTU (the 5 pipeline stages)
+  2. + MMU + L2 cache (SRAMs come in here)
+  3. + BIU + AXI bus
+  4. + SoC fabric
+
+Each addition's RSS increment isolates which module contributes
+most to memory bloat. The biggest jump is expected at step 2 (cache
+RAMs are the size driver).
+
+EOF
