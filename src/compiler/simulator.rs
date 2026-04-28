@@ -3720,6 +3720,13 @@ impl Simulator {
                     } else {
                         reads.insert(name);
                     }
+                } else {
+                    // Non-Ident base (e.g. nested Index, RangeSelect from inlining
+                    // `.data(parent[hi:lo])` then sub-module reads `data[i]` →
+                    // expression becomes `parent[hi:lo][i]`). Without this recurse,
+                    // the underlying signal isn't registered as a dependency and
+                    // the comb-entry never re-evaluates when it changes.
+                    Self::collect_expr_reads(base, module, reads);
                 }
                 Self::collect_expr_reads(index, module, reads);
             }
@@ -3783,7 +3790,10 @@ impl Simulator {
                             }
                         }
                     }
-                    _ => {}
+                    // FIX: nested Index/RangeSelect (from inlining sliced port
+                    // connections) — recurse to find the underlying signal so
+                    // the write is correctly tracked.
+                    _ => Self::collect_lhs_writes(base, module, writes),
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
@@ -3866,10 +3876,15 @@ impl Simulator {
     /// Collect reads from index expressions on the LHS (e.g., array[idx] — idx is read).
     fn collect_lhs_index_reads(lhs: &Expression, module: &ElaboratedModule, reads: &mut HashSet<String>) {
         match &lhs.kind {
-            ExprKind::Index { index, .. } => { Self::collect_expr_reads(index, module, reads); }
-            ExprKind::RangeSelect { left, right, .. } => {
+            ExprKind::Index { expr: base, index } => {
+                Self::collect_expr_reads(index, module, reads);
+                // Recurse into base for nested LHS like arr[i][j] or sliced lhs.
+                Self::collect_lhs_index_reads(base, module, reads);
+            }
+            ExprKind::RangeSelect { expr: base, left, right, .. } => {
                 Self::collect_expr_reads(left, module, reads);
                 Self::collect_expr_reads(right, module, reads);
+                Self::collect_lhs_index_reads(base, module, reads);
             }
             _ => {}
         }
