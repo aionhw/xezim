@@ -7682,6 +7682,19 @@ impl Simulator {
             "$strobe" | "$strobeb" | "$strobeh" | "$strobeo" => {
                 self.pending_strobes.push((name.to_string(), args.to_vec()));
             }
+            // $value$plusargs and $test$plusargs return a bit but the
+            // common pattern `$value$plusargs("...", var);` calls them as
+            // statements (return value discarded). Without this arm the
+            // call falls through to `_ => {}` and the side-effect (writing
+            // to args[1]) is lost. E.g. rtlmeter Example test's
+            // `$value$plusargs("greeting=%s", str);` left str unchanged.
+            "$value$plusargs" => { let _ = self.eval_value_plusargs(args); }
+            "$test$plusargs" => {
+                if let Some(arg0) = args.first() {
+                    let pat = self.system_string_arg(arg0);
+                    let _ = self.test_plusarg(&pat);
+                }
+            }
             "$monitor" | "$monitorb" | "$monitorh" | "$monitoro" => { self.monitor = Some((name.to_string(), args.to_vec())); self.check_monitor(); }
             "$monitoroff" => { self.monitor = None; }
             "$finish" | "$stop" => { self.finished = true; }
