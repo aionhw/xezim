@@ -827,10 +827,36 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(dest)
             }
             ExprKind::Binary { op, left, right } => {
-                let l = self.compile_expr(left, ctx_width)?;
-                let r = self.compile_expr(right, ctx_width)?;
-                // Context width resizing for arithmetic
-                if ctx_width > 0 && matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul
+                // Verilog operand-width rules: comparison and logical ops
+                // (==, !=, <, <=, >, >=, &&, ||, ===, !==, case-eq) are
+                // self-determined — their operands' widths are max(L,R) of
+                // the operands themselves, NOT the surrounding context.
+                // Propagating the (often narrow, e.g. 1-bit LHS) ctx_width
+                // into them silently truncates wide sub-expressions like
+                // `(addr[31:20] & mask[11:0]) == base[11:0]` where the
+                // 12-bit BitAnd would get resized to 1 bit, producing
+                // wrong results on any high-order bits. (Bug seen on E902
+                // cr_bmu_dbus_if iahbl_hit cont-assign at cyc 14: addr
+                // 0x20000000 → 0x200, AND'd with 0xe00 should be 0x200,
+                // but resized to 1 bit gives 0, so == 0 returns 1 instead
+                // of 0.)
+                let is_self_determined = matches!(op,
+                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq
+                    | BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq
+                    | BinaryOp::LogAnd | BinaryOp::LogOr);
+                let sub_ctx = if is_self_determined {
+                    let lw = self.expr_max_width(left);
+                    let rw = self.expr_max_width(right);
+                    lw.max(rw)
+                } else {
+                    ctx_width
+                };
+                let l = self.compile_expr(left, sub_ctx)?;
+                let r = self.compile_expr(right, sub_ctx)?;
+                // Context width resizing for arithmetic / bitwise ops only.
+                // For self-determined comparisons we must NOT resize to
+                // ctx_width — that would clobber the operands.
+                if !is_self_determined && ctx_width > 0 && matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul
                     | BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::BitXnor) {
                     self.emit(Insn::Resize(l, ctx_width));
                     self.emit(Insn::Resize(r, ctx_width));
@@ -1349,6 +1375,24 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Concatenation(parts) => {
                 parts.iter().map(|p| self.expr_max_width(p)).sum()
+            }
+            ExprKind::RangeSelect { left, right, kind, .. } => {
+                match kind {
+                    RangeKind::Constant => {
+                        let l = self.eval_const_expr(left).unwrap_or(0) as i64;
+                        let r = self.eval_const_expr(right).unwrap_or(0) as i64;
+                        ((l - r).abs() as u32) + 1
+                    }
+                    RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                        self.eval_const_expr(right).unwrap_or(1) as u32
+                    }
+                }
+            }
+            ExprKind::Index { .. } => 1,
+            ExprKind::Replication { count, exprs } => {
+                let n = self.eval_const_expr(count).unwrap_or(0) as u32;
+                let inner: u32 = exprs.iter().map(|e| self.expr_max_width(e)).sum();
+                n * inner
             }
             _ => 0,
         }
