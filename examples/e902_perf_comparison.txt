@@ -1,0 +1,114 @@
+================================================================
+  E902 (XuanTie) — three-simulator performance comparison
+  2026-04-27, REMOTE2 on Windows, x86_64
+================================================================
+
+Simulators:
+  - iverilog 12.0  (vvp -N)
+  - xezim    HEAD  (release build, --simulate)
+  - xxxyyy    (SIM -c, vlib+COMPILE warmed; only `run -all` timed)
+
+All three reach byte-for-byte identical results on every test.
+xezim required 11 fix commits in this session to achieve correctness
+parity (see xezim_e902_passes.md memory note for the chain).
+
+----------------------------------------------------------------
+  Wall-clock timings (3 runs averaged where noted)
+----------------------------------------------------------------
+
+E902 hello (sim_time 53,925 ns / 5,392 cycles)
+                       real         mem peak
+  iverilog       :     5.41s ± 0.4   52 MB
+  xezim          :     7.26s ± 0.4   340 MB
+  xxxyyy      :    14.77s ± 0.2   n/a (Win)
+  (xxxyyy time excludes vlib + COMPILE cold compile)
+
+E902 memcpy (sim_time 240,995 ns / 24,099 cycles, 902 CPU cycles)
+                       real         mem peak
+  iverilog       :    22.44s ± 0.5   52 MB
+  xezim          :    21.35s ± 0.2   340 MB     ← xezim crosses iverilog
+  xxxyyy      :    15.96s ± 0.3   n/a
+
+E902 cmark (CoreMark, sim_time 5,119,955 ns / 511,995 cycles, 461,974 CPU cycles)
+                       real         mem peak
+  iverilog       :   421.41s        52 MB
+  xezim          :   373.60s        340 MB      ← xezim 11% faster than iverilog
+  xxxyyy      :    39.14s        n/a         ← commercial sim ~10× faster
+
+----------------------------------------------------------------
+  Test result parity (all PASS)
+----------------------------------------------------------------
+
+  | Test   | Output                                                          |
+  |--------|------------------------------------------------------------------|
+  | hello  | "Hello Friend!" + "TEST PASSED" at sim_time 53,925ns             |
+  | memcpy | "Memory copy for 1024 bytes cost 902 CPU cycles!" + TEST PASSED  |
+  | cmark  | "CoreMark 1.0 : 2.164624 (iterations/sec)/MHz" (461,974 cyc) +   |
+  |        | TEST PASSED at sim_time 5,119,955ns                              |
+
+----------------------------------------------------------------
+  Observations
+----------------------------------------------------------------
+
+  - iverilog is leanest in memory by ~7× and wins the short-run
+    hello test. Its event scheduler is interpretive bytecode, which
+    has lower constant overhead but scales linearly with simulation
+    length.
+
+  - xezim crosses iverilog around the memcpy size (~24K cycles) and
+    pulls ahead by cmark scale, ending ~11% faster than iverilog on
+    a 512K-cycle run. xezim's per-cycle cost is roughly flat (~0.7-
+    0.9 ms/cycle) while iverilog grows.
+
+  - xxxyyy's commercial event scheduler dominates at scale: ~10×
+    faster than xezim on cmark. That is the gap remaining for future
+    xezim optimization work (NBA scheduler, edge dispatch hot-paths,
+    bytecode -> cranelift JIT for hot blocks per JIT path B memory).
+
+  - Memory: xezim is constant ~340 MB regardless of test (per-signal
+    AoS storage dominates, scales with elaborated signal count, not
+    sim length). iverilog is constant ~52 MB. SoA roadmap (memory
+    note xezim_soa_roadmap) would close this.
+
+----------------------------------------------------------------
+  Reproducer commands
+----------------------------------------------------------------
+
+  # Stage hello/memcpy/cmark cases (case.pat from rtlmeter)
+  cd /tmp/xezim_e902_inc      # hello (case.pat = hello/case.pat)
+  cd /tmp/xezim_e902_memcpy   # memcpy
+  cd /tmp/xezim_e902_cmark    # cmark
+
+  # iverilog
+  iverilog -g2012 -DSIMULATION=1 -I incdir -s tb -f filelist.f -o /tmp/iv.vvp
+  vvp -N /tmp/iv.vvp [+iterations=1]
+
+  # xezim (release build)
+  /home/bondan/agent/claude/repo/xezim/target/release/xezim \
+    --simulate -I incdir -DSIMULATION=1 -s tb -f filelist.f \
+    --max-time 200000000 [+iterations=1]
+
+  # xxxyyy (Windows host via REMOTE)
+  /home/bondan/agent/claude/repo/xezim/examples/run_e902_xxxyyy.sh \
+    /tmp/xezim_e902_inc
+
+================================================================
+  Fix series shipped this session (xezim correctness on E902)
+================================================================
+
+  28731aa  xezim-core: parse `?` as wildcard in based-literals
+  13bae6d  xezim: $strobe (postponed-region) + harden e902 part2/3
+  b6d3c44  xezim: e902 part4 decoder probe (compressed-inst repro)
+  81b3232  xezim: fire edge events during inline Delay so task-scope
+           writes propagate
+  7708fb5  xezim: e902 part6 clocked decoder replay test
+  81a6453  xezim: dispatch CaseKind for casez/casex (AST + bytecode)
+  508fdd4  xezim: e902 part7 ifctrl replay test
+  ca8f1b8  xezim: route level-only `always @()` to comb-settle path
+  b3e2adf  xezim: xxxyyy runner script (3rd reference)
+  e5fcd99  xezim: bytecode self-determined operand widths (decisive)
+  5355ee4  xezim: $value$plusargs / $test$plusargs as statement
+
+================================================================
+  EOF
+================================================================
