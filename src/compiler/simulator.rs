@@ -3330,11 +3330,17 @@ impl Simulator {
         let num_signals = self.signal_table.len();
         {
             let n = entries.len();
-            let mut writers_by_sig: Vec<Vec<usize>> = vec![Vec::new(); num_signals];
+            // writers_by_sig was previously `Vec<Vec<usize>>` sized to
+            // num_signals — a HashMap is cheaper here because at most
+            // a few percent of signal_ids are ever written by a comb
+            // entry (most are pure inputs / clock / RAM cells).
+            // 36 M × 24 B Vec<usize> headers = 864 MB transient on c910;
+            // HashMap drops to a few hundred MB at most.
+            let mut writers_by_sig: HashMap<usize, Vec<usize>> = HashMap::new();
             for (idx, entry) in entries.iter().enumerate() {
                 for &sig_id in &entry.write_signal_ids {
                     if sig_id < num_signals {
-                        writers_by_sig[sig_id].push(idx);
+                        writers_by_sig.entry(sig_id).or_default().push(idx);
                     }
                 }
             }
@@ -3346,12 +3352,14 @@ impl Simulator {
             for b in 0..n {
                 for &sid in &entries[b].read_signal_ids {
                     if sid >= num_signals { continue; }
-                    for &a in &writers_by_sig[sid] {
-                        if a == b { continue; }
-                        if seen_pred[a] == b as u32 { continue; }
-                        seen_pred[a] = b as u32;
-                        succs[a].push(b);
-                        indeg[b] += 1;
+                    if let Some(writers) = writers_by_sig.get(&sid) {
+                        for &a in writers {
+                            if a == b { continue; }
+                            if seen_pred[a] == b as u32 { continue; }
+                            seen_pred[a] = b as u32;
+                            succs[a].push(b);
+                            indeg[b] += 1;
+                        }
                     }
                 }
             }

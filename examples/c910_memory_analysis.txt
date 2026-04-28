@@ -13,9 +13,10 @@ After 5 incremental optimisations:
   | + lazy sdf_delays                                | (same) | merged |
   | + skip id_to_name push for unnamed elements      | 6.17 GB|  524 MB|
   | + size prev_val/prev_xz to id_to_name.len()      | 5.90 GB|  269 MB|
+  | + writers_by_sig HashMap (was Vec<Vec> 864 MB)   | 5.12 GB|  779 MB|
   |                                                  |        |        |
-  | total saved                                      |        | 3.81 GB|
-  | total reduction                                  |        | 39%    |
+  | total saved                                      |        | 4.59 GB|
+  | total reduction                                  |        |   47%  |
 
 Wall:    ~119s → ~33s (the saved memory also avoided allocator pressure)
 Stages:  elaborate 8.3s → simulate 4s + ~25s of misc (settle iterating).
