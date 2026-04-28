@@ -707,7 +707,21 @@ pub struct Simulator {
     name_resolve_hint: RefCell<Option<String>>,
 }
 
+/// Empty static used as fallback name for unnamed array-element ids
+/// (large 1-D arrays have per-element entries skipped to save memory).
+static EMPTY_NAME: &str = "";
+
 impl Simulator {
+    /// Safe accessor for `id_to_name`. Large-array element ids may sit
+    /// past the end of `id_to_name` (we skip the per-element push to
+    /// save ~528 MB on c910). Returns "" for unnamed ids; callers that
+    /// need a synthesized "{base}[{idx}]" name should query
+    /// `array_first_id` and format themselves.
+    #[inline]
+    fn name_for_id(&self, id: usize) -> &str {
+        self.id_to_name.get(id).map(|a| a.as_ref()).unwrap_or(EMPTY_NAME)
+    }
+
     pub fn new(module: ElaboratedModule, max_time: u64) -> Self {
         // Static signals + parameters live exclusively in the indexed
         // signal_table / signal_name_to_id / parallel Vecs below. The
@@ -823,10 +837,14 @@ impl Simulator {
         // 33 M elements, ~3 GB savings on c910 hello).
         let large_array_threshold: usize = std::env::var("XEZIM_LARGE_ARRAY_NAME_THRESHOLD")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(100_000);
-        // Shared placeholder Arc for unnamed array elements — reused
-        // across millions of array cells so id_to_name doesn't blow up
-        // with per-element heap allocations.
-        let unnamed_arc: Arc<str> = Arc::from("");
+        // For unnamed (skipped-large-array) elements, we don't push to
+        // id_to_name at all. id_to_name ends up shorter than signal_table.
+        // Helpers like `name_for_id(id)` synthesize the name on demand
+        // from `array_first_id` for ids >= id_to_name.len().  Saves 16 B
+        // per skipped element (~528 MB on c910).  `unnamed_arc` is kept
+        // around as a stable shared Arc<""> for any remaining call sites
+        // that want a borrow without unwrapping; not used in the loop.
+        let _unnamed_arc: Arc<str> = Arc::from("");
         let mut push_elem_named = |name: String, w: u32,
                              sig_table: &mut Vec<Value>,
                              widths_vec: &mut Vec<u32>,
@@ -835,15 +853,15 @@ impl Simulator {
                              name_to_id: &mut HashMap<Arc<str>, usize>,
                              names: &mut Vec<Arc<str>>,
                              register_name: bool,
-                             placeholder: &Arc<str>| {
+                             _placeholder: &Arc<str>| {
             let id = sig_table.len();
             if register_name {
                 let arc: Arc<str> = Arc::from(name.as_str());
                 name_to_id.insert(arc.clone(), id);
                 names.push(arc);
-            } else {
-                names.push(placeholder.clone());
             }
+            // else: skip id_to_name push entirely — names Vec stays
+            // shorter than signal_table for unnamed array elements.
             sig_table.push(Value::new(w));
             widths_vec.push(w);
             signed_vec.push(false);
@@ -856,7 +874,7 @@ impl Simulator {
                              real_vec: &mut Vec<bool>,
                              name_to_id: &mut HashMap<Arc<str>, usize>,
                              names: &mut Vec<Arc<str>>| {
-            push_elem_named(name, w, sig_table, widths_vec, signed_vec, real_vec, name_to_id, names, true, &unnamed_arc);
+            push_elem_named(name, w, sig_table, widths_vec, signed_vec, real_vec, name_to_id, names, true, &_unnamed_arc);
         };
         // 1D unpacked arrays: track `(first_id, lo, hi)` per array in
         // `array_first_id` for the bytecode hot path (LoadArrayElem /
@@ -885,7 +903,7 @@ impl Simulator {
                     &mut signal_table, &mut signal_widths_vec,
                     &mut signal_signed_vec, &mut signal_real_vec,
                     &mut signal_name_to_id, &mut id_to_name,
-                    register_names, &unnamed_arc);
+                    register_names, &_unnamed_arc);
             }
         }
         for (base, &((lo1, hi1), (lo2, hi2), w)) in &module.arrays_2d {
@@ -915,17 +933,31 @@ impl Simulator {
                     &mut signal_name_to_id, &mut id_to_name);
             }
         }
-        let num_signals = id_to_name.len();
+        // num_signals = total signal_id count. id_to_name may be SHORTER
+        // (we skip pushing for unnamed large-array elements) but
+        // signal_table grows for every element, so use signal_table.len().
+        let num_signals = signal_table.len();
         // prev_{val,xz} represent "before time 0" state. Per IEEE 1800,
         // variable initializers `reg x = <v>;` are equivalent to
         // initial-block assignments, so X→<v> at t=0 must generate an edge
         // event for @(posedge x) etc. Initialize to all-X (val=0,
         // xz=mask(width)) so the first check_edges at t=0 detects these
         // initializer-driven transitions.
-        let mut prev_val: Vec<u64> = vec![0u64; num_signals];
-        let mut prev_xz: Vec<u64> = vec![0u64; num_signals];
+        // prev_val/prev_xz only need to cover NAMED signal_ids (i.e.
+        // those reachable via signal_name_to_id, which is the only
+        // sensitivity-registration path). Unnamed large-array elements
+        // never appear in edge_signal_ids or event_waiters'
+        // resolved_sensitivities (those are populated via name lookup),
+        // so allocating prev_{val,xz} to id_to_name.len() instead of
+        // signal_table.len() saves 16 B × num_skipped (~528 MB on
+        // c910 — 33 M skipped large-array elements). Reads / writes
+        // already go through `&mut self.prev_val/[id]` only for ids in
+        // edge_signal_ids or event_waiters, all bounded by id_to_name.len().
+        let named_count = id_to_name.len();
+        let mut prev_val: Vec<u64> = vec![0u64; named_count];
+        let mut prev_xz: Vec<u64> = vec![0u64; named_count];
         let mut prev_wide: HashMap<usize, Value> = HashMap::new();
-        for id in 0..num_signals {
+        for id in 0..named_count {
             let w = signal_widths_vec[id];
             let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
             prev_xz[id] = mask;
@@ -2031,14 +2063,21 @@ impl Simulator {
         // snapshots. We work off `resolved_sensitivities` (populated
         // during classify_always_blocks) and recover names from
         // `id_to_name` — the unresolved `Sensitivity` mirror is gone.
+        // Collect edge sensitivity ids; need to materialise names into a
+        // local Vec first so we can release the &self.id_to_name borrow
+        // before mutating self.edge_signal_names.
+        let mut edge_sens: Vec<(String, usize)> = Vec::new();
         for block in &self.edge_blocks {
             for sens in &block.resolved_sensitivities {
                 if sens.signal_id < self.id_to_name.len() {
-                    let name: &str = &self.id_to_name[sens.signal_id];
-                    self.edge_signal_names.insert(name.to_string());
-                    self.edge_signal_ids.push(sens.signal_id);
+                    edge_sens.push((self.name_for_id(sens.signal_id).to_string(),
+                                     sens.signal_id));
                 }
             }
+        }
+        for (name, sig_id) in edge_sens {
+            self.edge_signal_names.insert(name);
+            self.edge_signal_ids.push(sig_id);
         }
         // Also collect from event waiters that are registered at time 0
         self.edge_signal_ids.sort_unstable();
@@ -2370,7 +2409,7 @@ impl Simulator {
                     if delay_val > 0 {
                         if let Some(clock_gen) = self.try_extract_clock_gen(body, delay_val) {
                             sim_dbg_eprintln!("[OPT] clock generator: signal {} period {} (always #{} pattern)",
-                                self.id_to_name[clock_gen.signal_id], delay_val * 2, delay_val);
+                                self.name_for_id(clock_gen.signal_id), delay_val * 2, delay_val);
                             self.clock_generators.push(clock_gen);
                             continue;
                         }
@@ -4316,23 +4355,23 @@ impl Simulator {
                 let entry = &self.comb_entries[eidx];
                 // Get destination signal name to determine block
                 let dst_name = match &entry.item {
-                    CombItem::DirectCopy { dst_id, .. } => &self.id_to_name[*dst_id],
+                    CombItem::DirectCopy { dst_id, .. } => self.name_for_id(*dst_id),
                     CombItem::FusedGate { op } => {
                         let id = match op {
                             FusedGate::Buf1 { dst, .. }
                             | FusedGate::Bin2 { dst, .. }
                             | FusedGate::Mux2 { dst, .. } => dst.sig_id as usize,
                         };
-                        &self.id_to_name[id]
+                        self.name_for_id(id)
                     }
                     CombItem::ContAssign {  .. } | CombItem::CompiledContAssign { .. } => {
                         if let Some(&id) = entry.write_signal_ids.first() {
-                            &self.id_to_name[id]
+                            self.name_for_id(id)
                         } else { continue; }
                     }
                     CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. } => {
                         if let Some(&id) = entry.write_signal_ids.first() {
-                            &self.id_to_name[id]
+                            self.name_for_id(id)
                         } else { continue; }
                     }
                 };
@@ -4364,7 +4403,7 @@ impl Simulator {
             let mut block_top_signal: HashMap<String, (String, u64)> = HashMap::new();
             for (id, &count) in self.signal_toggle_counts.iter().enumerate() {
                 if count == 0 { continue; }
-                let name = &self.id_to_name[id];
+                let name = self.name_for_id(id);
                 if is_clock(name) { continue; }
                 let block = block_prefix(name);
                 *block_toggles.entry(block.clone()).or_insert(0) += count;

@@ -1,14 +1,24 @@
 ================================================================
   xezim c910 hello memory footprint analysis
-  2026-04-27, max-time=1000 ns (100 clock cycles), VCD disabled
+  2026-04-27/28, max-time=1000 ns (100 clock cycles), VCD disabled
 ================================================================
 
-Measurement (`/usr/bin/time -v xezim --simulate ... --max-time 1000`):
+After 5 incremental optimisations:
 
-  Maximum resident set size (kbytes): 10,184,088     (≈ 9.7 GB)
-  elaborate phase:                       8,267 ms
-  simulate phase:                      119,236 ms     (100 cycles, 119s wall)
-  ms / cycle:                          ~1,192 ms
+  | step                                             | RSS    | saved  |
+  |--------------------------------------------------|--------|--------|
+  | baseline                                         | 9.71 GB|        |
+  | + skip name registration for arrays > 100k elem  | 6.69 GB| 3.02 GB|
+  | + lazy signal_toggle_counts                      | (same) | merged |
+  | + lazy sdf_delays                                | (same) | merged |
+  | + skip id_to_name push for unnamed elements      | 6.17 GB|  524 MB|
+  | + size prev_val/prev_xz to id_to_name.len()      | 5.90 GB|  269 MB|
+  |                                                  |        |        |
+  | total saved                                      |        | 3.81 GB|
+  | total reduction                                  |        | 39%    |
+
+Wall:    ~119s → ~33s (the saved memory also avoided allocator pressure)
+Stages:  elaborate 8.3s → simulate 4s + ~25s of misc (settle iterating).
 
 Elaborated state:
   - num_signals:        36,017,656
