@@ -723,3 +723,117 @@ fn test_sim_negedge() {
     ");
     assert!(sim.output[0].message.contains("count=2"));
 }
+
+// Regression: bytecode `expr_max_width` for `RangeSelect{Constant}` returned 1
+// when slice bounds were parameter expressions like `[ENTRY_NUM-1:0]`, because
+// `eval_const_expr` only handled Number/Paren/Ident and bailed on Binary{Sub}.
+// The width-1 then flowed into Binary{BitAnd}'s ctx_width as Resize(_, 1),
+// truncating 8-bit slices to bit 0. So `|(a[N-1:0] & b[N-1:0])` evaluated as
+// `a[0] & b[0]`. Bug visible on c910 axi_fifo's pop_req. Fix: const-fold
+// Binary/Unary ops in eval_const_expr; expr_max_width falls back to base
+// signal width when bounds aren't const-evaluable.
+#[test]
+fn test_sim_param_slice_bitand_reduce_or() {
+    let sim = sim_ok("
+        module dut(
+            input  [7:0] a,
+            input  [7:0] b,
+            output       y
+        );
+            parameter ENTRY_NUM = 8;
+            assign y = |(a[ENTRY_NUM-1:0] & b[ENTRY_NUM-1:0]);
+        endmodule
+
+        module test;
+            reg [7:0] a, b;
+            wire y;
+            dut u(.a(a), .b(b), .y(y));
+            initial begin
+                a = 8'h01; b = 8'h01; #1; $display(\"y=%b\", y);
+                a = 8'h00; b = 8'h00; #1; $display(\"y=%b\", y);
+                a = 8'h02; b = 8'h02; #1; $display(\"y=%b\", y);
+                a = 8'h80; b = 8'h80; #1; $display(\"y=%b\", y);
+                a = 8'h02; b = 8'h04; #1; $display(\"y=%b\", y);
+                $finish;
+            end
+        endmodule
+    ");
+    assert!(sim.output[0].message.contains("y=1"), "bit 0 set: {}", sim.output[0].message);
+    assert!(sim.output[1].message.contains("y=0"), "all zero: {}", sim.output[1].message);
+    // Pre-fix bug: bit 1 set returned y=0 instead of 1.
+    assert!(sim.output[2].message.contains("y=1"), "bit 1 set: {}", sim.output[2].message);
+    // Pre-fix bug: bit 7 set returned y=0 instead of 1.
+    assert!(sim.output[3].message.contains("y=1"), "bit 7 set: {}", sim.output[3].message);
+    // Mismatched bits -> AND=0 -> y=0 (correctness check on the fix).
+    assert!(sim.output[4].message.contains("y=0"), "non-overlap: {}", sim.output[4].message);
+}
+
+// Regression: 3-operand bit-AND with parameter-bounded slices on all three
+// operands (the actual c910 axi_fifo shape:
+//   `assign pop_req = |(pop_ptr[N-1:0] & counter_done[N-1:0] & entry_vld[N-1:0])`).
+#[test]
+fn test_sim_param_slice_3way_reduce_or() {
+    let sim = sim_ok("
+        module dut(
+            input  [7:0] a, b, c,
+            output       y
+        );
+            parameter ENTRY_NUM = 8;
+            assign y = |(a[ENTRY_NUM-1:0] & b[ENTRY_NUM-1:0] & c[ENTRY_NUM-1:0]);
+        endmodule
+
+        module test;
+            reg [7:0] a, b, c;
+            wire y;
+            dut u(.a(a), .b(b), .c(c), .y(y));
+            initial begin
+                a = 8'h02; b = 8'hFF; c = 8'h02; #1; $display(\"y=%b\", y);
+                a = 8'h00; b = 8'hFF; c = 8'h00; #1; $display(\"y=%b\", y);
+                $finish;
+            end
+        endmodule
+    ");
+    assert!(sim.output[0].message.contains("y=1"), "3-way bit 1: {}", sim.output[0].message);
+    assert!(sim.output[1].message.contains("y=0"), "3-way zero: {}", sim.output[1].message);
+}
+
+// Regression: parameter arithmetic in slice bounds — `[N+1:N-1]`, `[N*2-1:0]`,
+// `[~N:0]`. eval_const_expr now folds Add/Sub/Mul/Div/Mod/Shift/BitAnd/BitOr/
+// BitXor + unary +/-/~. Each must compute the right slice width.
+#[test]
+fn test_sim_param_arith_slice_widths() {
+    let sim = sim_ok("
+        module dut(
+            input  [15:0] x,
+            output [3:0]  s_sub,    // x[N-1:N-4]   width 4
+            output [3:0]  s_add,    // x[N+3:N]     width 4
+            output [7:0]  s_mul     // x[2*N-1:N]   width 8
+        );
+            parameter N = 8;
+            assign s_sub = x[N-1:N-4];
+            assign s_add = x[N+3:N];
+            assign s_mul = x[2*N-1:N];
+        endmodule
+
+        module test;
+            reg  [15:0] x;
+            wire [3:0]  s_sub;
+            wire [3:0]  s_add;
+            wire [7:0]  s_mul;
+            dut u(.x(x), .s_sub(s_sub), .s_add(s_add), .s_mul(s_mul));
+            initial begin
+                x = 16'hABCD; #1;
+                $display(\"sub=%h add=%h mul=%h\", s_sub, s_add, s_mul);
+                $finish;
+            end
+        endmodule
+    ");
+    // x = 0xABCD = 1010_1011_1100_1101
+    //   N=8, x[7:4]   = 0xC (sub)
+    //   x[11:8]       = 0xB (add)
+    //   x[15:8]       = 0xAB (mul)
+    let m = &sim.output[0].message;
+    assert!(m.contains("sub=c"), "{}", m);
+    assert!(m.contains("add=b"), "{}", m);
+    assert!(m.contains("mul=ab"), "{}", m);
+}
