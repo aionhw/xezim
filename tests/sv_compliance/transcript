@@ -1,2 +1,2 @@
-# do do/run_test.do tests/01_lexical_identifiers.sv 20us
-# Cannot open macro file: do/run_test.do
+# do do/run_test.script tests/01_lexical_identifiers.sv 20us
+# Cannot open macro file: do/run_test.script
