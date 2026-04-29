@@ -723,6 +723,17 @@ impl Simulator {
     }
 
     pub fn new(module: ElaboratedModule, max_time: u64) -> Self {
+        // X-init coercion: when XEZIM_INIT_ZERO=1, signals matching one of
+        // XEZIM_INIT_ZERO_PATHS (comma-separated substring filters) start
+        // at 0 instead of X. Use this for designs where intentional `1'bx`
+        // defaults would lock the sim (c910 IFU pcfifo, etc.) without
+        // affecting testbench-internal regs that rely on X-init semantics.
+        let init_zero = std::env::var("XEZIM_INIT_ZERO").map(|v| v == "1").unwrap_or(false);
+        let init_zero_paths: Vec<String> = std::env::var("XEZIM_INIT_ZERO_PATHS")
+            .ok()
+            .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
+            .unwrap_or_default();
+
         // Static signals + parameters live exclusively in the indexed
         // signal_table / signal_name_to_id / parallel Vecs below. The
         // legacy `signals`/`widths`/`signed_signals`/`real_signals`
@@ -784,6 +795,19 @@ impl Simulator {
                 let mut val = sig.value.clone();
                 if sig.is_signed { val.is_signed = true; }
                 if sig.is_real { val.is_real = true; }
+                // XEZIM_INIT_ZERO=1: coerce all-X initial values to zero.
+                // Default (off) preserves Verilog 4-state semantics. Industry
+                // simulators offer the same knob (e.g. `+vcs+initreg=zero`).
+                // Needed for designs (like c910) that pump explicit `1'bx`
+                // through default arms and rely on hardware-side gating that
+                // doesn't model in 4-state RTL sim.
+                let path_match = init_zero_paths.is_empty()
+                    || init_zero_paths.iter().any(|p| name.contains(p.as_str()));
+                if init_zero && path_match && val.has_xz() {
+                    val = Value::zero(sig.width);
+                    if sig.is_signed { val.is_signed = true; }
+                    if sig.is_real { val.is_real = true; }
+                }
                 sim_dbg_eprintln!("[DEBUG] Simulator::new signal {} = {} (signed={})", name, val.to_dec_string(), sig.is_signed);
                 signal_table.push(val);
                 signal_widths_vec.push(sig.width);
