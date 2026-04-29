@@ -1286,6 +1286,40 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 None
             }
+            // Fold simple parameter arithmetic so slice bounds like
+            // `[ENTRY_NUM-1:0]` resolve. Without this, expr_max_width on a
+            // sliced range returned 1 (unwrap_or(0)), which then clobbered
+            // bit-AND operand widths down to 1 via ctx_width propagation,
+            // producing wrong results for `|(a[N-1:0] & b[N-1:0])`-shape
+            // expressions. (Bug seen on c910 axi_fifo pop_req.)
+            ExprKind::Binary { op, left, right } => {
+                let l = self.eval_const_expr(left)? as u64;
+                let r = self.eval_const_expr(right)? as u64;
+                let v: u64 = match op {
+                    BinaryOp::Add => l.wrapping_add(r),
+                    BinaryOp::Sub => l.wrapping_sub(r),
+                    BinaryOp::Mul => l.wrapping_mul(r),
+                    BinaryOp::Div => if r == 0 { return None } else { l / r },
+                    BinaryOp::Mod => if r == 0 { return None } else { l % r },
+                    BinaryOp::ShiftLeft => l.checked_shl(r as u32)?,
+                    BinaryOp::ShiftRight => l.checked_shr(r as u32)?,
+                    BinaryOp::BitAnd => l & r,
+                    BinaryOp::BitOr  => l | r,
+                    BinaryOp::BitXor => l ^ r,
+                    _ => return None,
+                };
+                Some(v as u32)
+            }
+            ExprKind::Unary { op, operand } => {
+                let v = self.eval_const_expr(operand)? as u64;
+                let r: u64 = match op {
+                    UnaryOp::Plus  => v,
+                    UnaryOp::Minus => 0u64.wrapping_sub(v),
+                    UnaryOp::BitNot => !v,
+                    _ => return None,
+                };
+                Some(r as u32)
+            }
             _ => None,
         }
     }
@@ -1376,15 +1410,21 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Concatenation(parts) => {
                 parts.iter().map(|p| self.expr_max_width(p)).sum()
             }
-            ExprKind::RangeSelect { left, right, kind, .. } => {
+            ExprKind::RangeSelect { expr: base, left, right, kind, .. } => {
                 match kind {
                     RangeKind::Constant => {
-                        let l = self.eval_const_expr(left).unwrap_or(0) as i64;
-                        let r = self.eval_const_expr(right).unwrap_or(0) as i64;
-                        ((l - r).abs() as u32) + 1
+                        if let (Some(l), Some(r)) = (self.eval_const_expr(left), self.eval_const_expr(right)) {
+                            ((l as i64 - r as i64).abs() as u32) + 1
+                        } else {
+                            // Fallback when bounds aren't const-evaluable:
+                            // use the base signal's full width. Returning a
+                            // tiny value here (the old `unwrap_or(0)` path)
+                            // truncated bit-AND operands via ctx_width.
+                            self.expr_max_width(base)
+                        }
                     }
                     RangeKind::IndexedUp | RangeKind::IndexedDown => {
-                        self.eval_const_expr(right).unwrap_or(1) as u32
+                        self.eval_const_expr(right).unwrap_or_else(|| self.expr_max_width(base)) as u32
                     }
                 }
             }
