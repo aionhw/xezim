@@ -6436,10 +6436,10 @@ impl Simulator {
                     if self.module.arrays.contains_key(&name) || self.is_associative_array(&name) {
                         // Array element access: look up signal "name[idx]"
                         if self.module.dynamic_arrays.contains(&name) {
-                            self.scriptllar_bound.push((self.get_queue_size(&name) as i64) - 1);
+                            self.dollar_bound.push((self.get_queue_size(&name) as i64) - 1);
                         }
                         let idx_val = self.eval_expr(index);
-                        if self.module.dynamic_arrays.contains(&name) { self.scriptllar_bound.pop(); }
+                        if self.module.dynamic_arrays.contains(&name) { self.dollar_bound.pop(); }
                         let idx_str = if self.is_associative_array(&name) {
                             self.assoc_key_str(&name, &idx_val)
                         } else {
@@ -6476,10 +6476,10 @@ impl Simulator {
                         } else {
                             arr_hi
                         };
-                        self.scriptllar_bound.push(upper_bound);
+                        self.dollar_bound.push(upper_bound);
                         let l = self.eval_expr(left).to_i64().unwrap_or(0);
                         let r = self.eval_expr(right).to_i64().unwrap_or(0);
-                        self.scriptllar_bound.pop();
+                        self.dollar_bound.pop();
                         let (lo, hi) = match kind {
                             RangeKind::Constant => (l.min(r), l.max(r)),
                             RangeKind::IndexedUp => (l, l + r - 1),
@@ -6854,7 +6854,7 @@ impl Simulator {
             }
             ExprKind::Call { func, args } => self.eval_call(func, args),
             ExprKind::Dollar => {
-                if let Some(&b) = self.scriptllar_bound.last() {
+                if let Some(&b) = self.dollar_bound.last() {
                     let mut v = Value::from_u64(b as u64, 32);
                     v.is_signed = true;
                     v
@@ -7347,10 +7347,10 @@ impl Simulator {
                                     let r_upper: i64 = if r_is_dyn {
                                         (self.get_queue_size(&rname) as i64) - 1
                                     } else { r_hi_a };
-                                    self.scriptllar_bound.push(r_upper);
+                                    self.dollar_bound.push(r_upper);
                                     let l = self.eval_expr(left).to_i64().unwrap_or(0);
                                     let r = self.eval_expr(right).to_i64().unwrap_or(0);
-                                    self.scriptllar_bound.pop();
+                                    self.dollar_bound.pop();
                                     // Per IEEE 7.10.1: if l > r the slice is empty.
                                     let results: Vec<Value> = if l > r {
                                         Vec::new()
@@ -7416,10 +7416,10 @@ impl Simulator {
                                             let r_upper: i64 = if r_is_dyn {
                                                 (self.get_queue_size(&rname) as i64) - 1
                                             } else { r_hi_a };
-                                            self.scriptllar_bound.push(r_upper);
+                                            self.dollar_bound.push(r_upper);
                                             let l = self.eval_expr(left).to_i64().unwrap_or(0);
                                             let r = self.eval_expr(right).to_i64().unwrap_or(0);
-                                            self.scriptllar_bound.pop();
+                                            self.dollar_bound.pop();
                                             if l <= r {
                                                 let lo = l.max(r_lo_a);
                                                 let hi = r.min(r_upper);
