@@ -1,6 +1,57 @@
 use std::env;
 use std::path::Path;
 
+/// Read a u64 from /proc/<pid|self>/status or /proc/meminfo by key (kB units).
+fn proc_kb(path: &str, key: &str) -> Option<u64> {
+    let s = std::fs::read_to_string(path).ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix(key) {
+            // expect "<key>: <num> kB"
+            return rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace())
+                .split_whitespace().next()
+                .and_then(|n| n.parse::<u64>().ok());
+        }
+    }
+    None
+}
+
+/// Spawn a watchdog that polls /proc/self/status every second. If RSS exceeds
+/// 3/4 of MemTotal, print a warning to stderr and kill the process. Disable by
+/// setting XEZIM_NO_MEM_WATCHDOG=1.
+fn spawn_memory_watchdog() {
+    if std::env::var("XEZIM_NO_MEM_WATCHDOG").ok().as_deref() == Some("1") {
+        return;
+    }
+    let total_kb = match proc_kb("/proc/meminfo", "MemTotal") {
+        Some(t) if t > 0 => t,
+        _ => return, // /proc unavailable (non-Linux); skip silently
+    };
+    let limit_kb = total_kb / 4 * 3;
+    std::thread::spawn(move || {
+        let pid = std::process::id();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if let Some(rss_kb) = proc_kb("/proc/self/status", "VmRSS") {
+                if rss_kb > limit_kb {
+                    eprintln!(
+                        "[xezim][mem-watchdog] RSS {} MiB exceeds 3/4 of system memory ({} MiB of {} MiB) — killing pid {} to prevent OOM. Set XEZIM_NO_MEM_WATCHDOG=1 to disable.",
+                        rss_kb / 1024,
+                        limit_kb / 1024,
+                        total_kb / 1024,
+                        pid,
+                    );
+                    // SIGKILL self — bypasses panic handlers, no Drop runs,
+                    // but ensures the process actually exits even if a thread
+                    // is stuck inside a long allocation.
+                    unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+                    // Fallback if libc isn't available somehow.
+                    std::process::exit(137);
+                }
+            }
+        }
+    });
+}
+
 fn print_usage() {
     eprintln!("Usage: xezim [mode] [options] <source_files> [plusargs]");
     eprintln!("Modes (pick one; default is 'simulate'):");
@@ -243,6 +294,8 @@ fn process_command_file(
 }
 
 fn main() {
+    spawn_memory_watchdog();
+
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         print_usage();
