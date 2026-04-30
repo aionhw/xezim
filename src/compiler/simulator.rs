@@ -2166,11 +2166,20 @@ impl Simulator {
         // so take ownership (drops the Vec when this scope ends) instead of
         // cloning — saves significant memory on large testbenches with
         // memory-init initial blocks holding tens of thousands of statements.
+        //
+        // #7 lazy-prefix path: also drain `pending_initial` one-at-a-time.
+        // A pending block is materialized just before scheduling and dropped
+        // after, so peak memory is at most one materialized InitialBlock.
+        let pending_initial = std::mem::take(&mut self.module.pending_initial);
         let initial_blocks = std::mem::take(&mut self.module.initial_blocks);
         if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
-            eprintln!("[xezim] {} initial blocks to schedule", initial_blocks.len());
+            eprintln!("[xezim] {} initial blocks to schedule ({} from pending lazy-prefix)",
+                initial_blocks.len() + pending_initial.len(), pending_initial.len());
         }
-        for ib in initial_blocks {
+        // Streaming chain: pending materializes one at a time, dropped after
+        // the loop body consumes its `stmt`. No intermediate Vec staging.
+        for ib in pending_initial.into_iter().map(|p| p.materialize())
+                  .chain(initial_blocks.into_iter()) {
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
                 other => vec![Statement::new(other, ib.stmt.span)],
@@ -2371,92 +2380,91 @@ impl Simulator {
         }
     }
 
+    /// Classify a single always-block: route to edge_blocks / clock_generators
+    /// / event_queue / clinic, returning Some(rest) if the block remained
+    /// "comb-equivalent" and should stay in `module.always_blocks`. Extracted
+    /// from `classify_always_blocks` so the lazy-prefix streaming path (#7)
+    /// can materialize one PendingAlways at a time and feed it through here
+    /// without staging the full materialized vec.
+    fn classify_one_always_block(&mut self, ab: AlwaysBlock) -> Option<AlwaysBlock> {
+        // (Body of the original `for ab in blocks.into_iter()` loop, with
+        // each `continue` rewritten as `return None` and each `remaining.push`
+        // rewritten as `return Some(...)`.)
+        if let Some((sens, body)) = self.extract_sensitivity(&ab.stmt) {
+            if !sens.is_empty() {
+                let all_level = sens.iter().all(|s| s.edge == EdgeKind::AnyEdge);
+                if all_level {
+                    return Some(AlwaysBlock { kind: ab.kind, stmt: body });
+                }
+                let top_prefix = format!("{}.", self.module.name);
+                let resolved: Vec<SensitivityId> = sens.iter().filter_map(|s| {
+                    if let Some(&id) = self.signal_name_to_id.get(s.signal_name.as_str()) {
+                        return Some(SensitivityId { signal_id: id, edge: s.edge });
+                    }
+                    if let Some(stripped) = s.signal_name.strip_prefix(&top_prefix) {
+                        if let Some(&id) = self.signal_name_to_id.get(stripped) {
+                            return Some(SensitivityId { signal_id: id, edge: s.edge });
+                        }
+                    }
+                    None
+                }).collect();
+                self.edge_blocks.push(EdgeSensitiveBlock {
+                    resolved_sensitivities: resolved,
+                    stmt: body,
+                    kind: ab.kind,
+                });
+                return None;
+            }
+            return Some(AlwaysBlock { kind: ab.kind, stmt: body });
+        }
+        if ab.kind == AlwaysKind::Always {
+            if let StatementKind::TimingControl { control: TimingControl::Delay(d), stmt: body } = &ab.stmt.kind {
+                let delay_val = self.eval_expr(d).to_u64().unwrap_or(0);
+                if delay_val > 0 {
+                    if let Some(clock_gen) = self.try_extract_clock_gen(body, delay_val) {
+                        sim_dbg_eprintln!("[OPT] clock generator: signal {} period {} (always #{} pattern)",
+                            self.name_for_id(clock_gen.signal_id), delay_val * 2, delay_val);
+                        self.clock_generators.push(clock_gen);
+                        return None;
+                    }
+                }
+                let forever_stmt = Statement::new(
+                    StatementKind::Forever { body: Box::new(ab.stmt.clone()) }, ab.stmt.span,
+                );
+                let pid = self.next_pid; self.next_pid += 1;
+                self.event_queue.schedule(0, pid, vec![forever_stmt]);
+                return None;
+            }
+            if self.stmt_is_blocking(&ab.stmt) {
+                let forever_stmt = Statement::new(
+                    StatementKind::Forever { body: Box::new(ab.stmt.clone()) }, ab.stmt.span,
+                );
+                let pid = self.next_pid; self.next_pid += 1;
+                self.event_queue.schedule(0, pid, vec![forever_stmt]);
+                return None;
+            }
+        }
+        Some(ab)
+    }
+
     fn classify_always_blocks(&mut self) {
         // Take ownership — the remaining-only subset is written back at the
         // end. Avoids a full clone of every always-block AST (significant on
         // c910-scale designs with 20K+ blocks).
+        //
+        // #7 lazy-prefix path: drain `module.pending_always` one at a time,
+        // materialize, feed through classify_one_always_block. Peak memory is
+        // the single materialized AlwaysBlock + bytecode-so-far, instead of
+        // the full Vec<AlwaysBlock> for every per-instance rewritten body.
+        let pending = std::mem::take(&mut self.module.pending_always);
         let blocks = std::mem::take(&mut self.module.always_blocks);
         let mut remaining = Vec::new();
+        for p in pending {
+            let ab = p.materialize();
+            if let Some(rest) = self.classify_one_always_block(ab) { remaining.push(rest); }
+        }
         for ab in blocks.into_iter() {
-            // Check for edge-sensitive: always_ff @(posedge ...) or always @(posedge ...)
-            if let Some((sens, body)) = self.extract_sensitivity(&ab.stmt) {
-                if !sens.is_empty() {
-                    // If every entry is level-sensitive (no posedge/negedge),
-                    // the block is comb-equivalent — `always @(a or b[3:0])`
-                    // is the same as `always @*` for those reads. Route it
-                    // through build_comb_entries so the settle path picks
-                    // it up via signal-id sensitivity. Edge-block dispatch
-                    // (check_edges) misses re-firings when sensitivity
-                    // inputs are bit-slices of comb-driven wires deep in
-                    // the hierarchy, e.g. cr_iu_decd's decd_ill_expt32
-                    // decoder on `decd_inst[31:25] or decd_func3[2:0] ...`
-                    // never refires after t=0/100, leaving X-default arm
-                    // values latched and stalling the E902 IFU.
-                    let all_level = sens.iter().all(|s| s.edge == EdgeKind::AnyEdge);
-                    if all_level {
-                        remaining.push(AlwaysBlock { kind: ab.kind, stmt: body });
-                        continue;
-                    }
-                    let top_prefix = format!("{}.", self.module.name);
-                    let resolved: Vec<SensitivityId> = sens.iter().filter_map(|s| {
-                        if let Some(&id) = self.signal_name_to_id.get(s.signal_name.as_str()) {
-                            return Some(SensitivityId { signal_id: id, edge: s.edge });
-                        }
-                        // Top-prefix strip fallback (`tb.x_soc.foo` →
-                        // `x_soc.foo`) — see the matching block in
-                        // build_comb_entries for rationale.
-                        if let Some(stripped) = s.signal_name.strip_prefix(&top_prefix) {
-                            if let Some(&id) = self.signal_name_to_id.get(stripped) {
-                                return Some(SensitivityId { signal_id: id, edge: s.edge });
-                            }
-                        }
-                        None
-                    }).collect();
-                    self.edge_blocks.push(EdgeSensitiveBlock {
-                        resolved_sensitivities: resolved,
-                        stmt: body,
-                        kind: ab.kind,
-                    });
-                    continue;
-                }
-                // @(*) or @* — combinatorial but NOT always_comb.
-                // IEEE 1800: always @* does NOT execute at time 0 unless inputs change.
-                // Keep original kind (Always) to distinguish from always_comb.
-                remaining.push(AlwaysBlock { kind: ab.kind, stmt: body });
-                continue;
-            }
-            // Check for always #delay body — schedule as repeating process
-            if ab.kind == AlwaysKind::Always {
-                if let StatementKind::TimingControl { control: TimingControl::Delay(d), stmt: body } = &ab.stmt.kind {
-                    // Try to detect clock generator: always #N var = ~var
-                    let delay_val = self.eval_expr(d).to_u64().unwrap_or(0);
-                    if delay_val > 0 {
-                        if let Some(clock_gen) = self.try_extract_clock_gen(body, delay_val) {
-                            sim_dbg_eprintln!("[OPT] clock generator: signal {} period {} (always #{} pattern)",
-                                self.name_for_id(clock_gen.signal_id), delay_val * 2, delay_val);
-                            self.clock_generators.push(clock_gen);
-                            continue;
-                        }
-                    }
-                    let forever_stmt = Statement::new(
-                        StatementKind::Forever { body: Box::new(ab.stmt.clone()) }, ab.stmt.span,
-                    );
-                    let pid = self.next_pid; self.next_pid += 1;
-                    self.event_queue.schedule(0, pid, vec![forever_stmt]);
-                    continue;
-                }
-                // Check for always blocks with internal blocking (delays, events, waits)
-                // These must be scheduled as processes, not treated as combinatorial
-                if self.stmt_is_blocking(&ab.stmt) {
-                    let forever_stmt = Statement::new(
-                        StatementKind::Forever { body: Box::new(ab.stmt.clone()) }, ab.stmt.span,
-                    );
-                    let pid = self.next_pid; self.next_pid += 1;
-                    self.event_queue.schedule(0, pid, vec![forever_stmt]);
-                    continue;
-                }
-            }
-            remaining.push(ab);
+            if let Some(rest) = self.classify_one_always_block(ab) { remaining.push(rest); }
         }
         self.module.always_blocks = remaining;
     }
@@ -3107,8 +3115,20 @@ impl Simulator {
     fn build_comb_entries(&mut self) {
         let mut entries = Vec::new();
 
-        // Continuous assigns
-        for ca in &self.module.continuous_assigns {
+        // Continuous assigns: drain by-value so that the per-CA AST
+        // (lhs + rhs Expression trees) is freed as each entry is processed
+        // — peak memory tracks bytecode size, not the full Vec of source
+        // ASTs. Chains the eager-elab module.continuous_assigns with the
+        // lazy-prefix pending_cont_assign vec; pending entries are
+        // materialized one at a time inside the iterator.
+        //
+        // Measured on c910: serialized continuous_assigns is ~394 MB
+        // (501 K entries with hierarchical-name expressions). In-memory
+        // (with allocator overhead + Box<Expression> per node) is roughly
+        // 4 GB. Streaming drain releases per-CA allocations as we iterate.
+        let cas = std::mem::take(&mut self.module.continuous_assigns);
+        let pending_ca = std::mem::take(&mut self.module.pending_cont_assign);
+        for ca in cas.into_iter().chain(pending_ca.into_iter().map(|p| p.materialize())) {
             let mut reads = HashSet::new();
             let mut writes = HashSet::new();
             Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
@@ -3172,7 +3192,7 @@ impl Simulator {
                 if compiler.compile_cont_assign(&ca.rhs, dst_id, width) {
                     CombItem::CompiledContAssign { compiled: compiler.finish() }
                 } else {
-                    CombItem::ContAssign { lhs: ca.lhs.clone(), rhs: ca.rhs.clone() }
+                    CombItem::ContAssign { lhs: ca.lhs, rhs: ca.rhs }
                 }
             } else if !lhs_is_bare_ident {
                 // Sub-range LHS: try bytecode compile so bit/range writes run
@@ -3191,10 +3211,10 @@ impl Simulator {
                 if lhs_w > 0 && compiler.compile_cont_assign_lhs(&ca.lhs, &ca.rhs, lhs_w) {
                     CombItem::CompiledContAssign { compiled: compiler.finish() }
                 } else {
-                    CombItem::ContAssign { lhs: ca.lhs.clone(), rhs: ca.rhs.clone() }
+                    CombItem::ContAssign { lhs: ca.lhs, rhs: ca.rhs }
                 }
             } else {
-                CombItem::ContAssign { lhs: ca.lhs.clone(), rhs: ca.rhs.clone() }
+                CombItem::ContAssign { lhs: ca.lhs, rhs: ca.rhs }
             };
 
             // Resolve reads, retrying with scope_hint prefix for bare local names.
