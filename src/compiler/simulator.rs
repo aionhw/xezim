@@ -3538,6 +3538,15 @@ impl Simulator {
         // — edge-sensitive ones were moved into self.edge_blocks earlier.
         self.module.continuous_assigns = Vec::new();
         self.module.always_blocks = Vec::new();
+        // Force the glibc allocator to return freed pages to the OS. On
+        // c906 hello the AST drops above release ~1.3 GB but glibc's arena
+        // retains it until a future large allocation triggers reuse —
+        // observed RSS staying at the elaborate-time peak of 2.7 GB through
+        // the entire time-0 settle phase, only dropping to 1.4 GB when the
+        // event loop's allocation pattern shifts. malloc_trim(0) forces
+        // an immediate release. No-op on non-glibc platforms.
+        #[cfg(target_env = "gnu")]
+        unsafe { libc::malloc_trim(0); }
     }
 
     fn collect_leaf_idents(expr: &Expression, out: &mut HashSet<String>) {
