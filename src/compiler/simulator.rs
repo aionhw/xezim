@@ -548,6 +548,10 @@ pub struct Simulator {
     rng: rand::rngs::StdRng,
     settling: bool,
     in_edge_block: bool,
+    /// Reusable bitmap for `check_edges`. Hoisted out of the per-iteration
+    /// `vec![false; blocks.len()]` to avoid ~10 K-byte alloc/drop on every
+    /// settle iter (8938 iters × ~10 K blocks = 89 MB churn on c910 hello).
+    edge_triggered_bitmap: Vec<bool>,
     nba_queue: Vec<NbaEntry>,
     /// Fast-path NBA buffer: pre-resolved (signal_id, value) pairs.
     nba_fast: Vec<NbaFast>,
@@ -1033,6 +1037,7 @@ impl Simulator {
             return_value: None,
             rng: rand::rngs::StdRng::from_entropy(),
             settling: false, in_edge_block: false,
+            edge_triggered_bitmap: Vec::new(),
             nba_queue: Vec::new(), nba_fast: Vec::new(), nba_fast_index: HashMap::new(), edge_blocks: Vec::new(), compiled_edge_blocks: Vec::new(),
             jit_fns: Vec::new(), jit_module: None,
             edge_block_parallel: Vec::new(), edge_block_scope: Vec::new(), edge_block_needs_hint: Vec::new(), vm_regs: Vec::new(), clock_generators: Vec::new(),
@@ -5120,7 +5125,14 @@ impl Simulator {
         // calls per tick (10k blocks × 2 sensitivities) into ~200
         // (one per unique clk/rst/enable signal).
         let t0 = std::time::Instant::now();
-        let mut triggered_bitmap = vec![false; blocks.len()];
+        // Reuse hoisted bitmap. resize+fill is one O(N) write; no alloc on
+        // steady-state runs.
+        if self.edge_triggered_bitmap.len() < blocks.len() {
+            self.edge_triggered_bitmap.resize(blocks.len(), false);
+        } else {
+            for slot in &mut self.edge_triggered_bitmap[..blocks.len()] { *slot = false; }
+        }
+        let triggered_bitmap = &mut self.edge_triggered_bitmap[..blocks.len()];
         // edge_blocks_by_sig is parallel to edge_signal_ids (position-indexed).
         for (pos, &sid) in self.edge_signal_ids.iter().enumerate() {
             let entry = match self.edge_blocks_by_sig.get(pos) {
