@@ -2199,6 +2199,9 @@ impl Simulator {
         }
         self.event_loop();
         if self.aitrace_mode { self.aitrace_finish(); } else { self.vcd_finish(); }
+        if std::env::var("XEZIM_RS_STATS").is_ok() {
+            xezim_core::value::Value::dump_range_select_stats();
+        }
     }
 
     /// Detect `initial begin VAR = CONST; forever #d VAR = ~VAR; end`

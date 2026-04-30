@@ -39,3 +39,4 @@ path = "src/lib.rs"
 lto = true
 codegen-units = 1
 opt-level = 3
+debug = "line-tables-only"
