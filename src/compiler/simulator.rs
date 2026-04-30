@@ -4970,14 +4970,18 @@ impl Simulator {
             }
         }
         self.nba_fast = nba;
-        for i in 0..self.nba_queue.len() {
-            if let Some(ref lhs) = self.nba_queue[i].lhs {
-                let lhs = lhs.clone();
-                let val = self.nba_queue[i].value.clone();
-                self.assign_value(&lhs, &val);
+        // Drain nba_queue by-value so the per-entry lhs Expression and value
+        // Value can be moved into the call site instead of cloned. The
+        // previous `for i in 0..self.nba_queue.len() { … self.nba_queue[i].lhs.clone() … }`
+        // pattern existed because we needed to release the borrow on
+        // `self.nba_queue` before calling `self.assign_value(&self, &mut self)`;
+        // mem::take achieves the same release without the clones.
+        let queue = std::mem::take(&mut self.nba_queue);
+        for entry in queue {
+            if let Some(lhs) = entry.lhs {
+                self.assign_value(&lhs, &entry.value);
             }
         }
-        self.nba_queue.clear();
     }
 
     /// Apply delayed signal updates that are due at or before the current time.
