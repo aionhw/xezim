@@ -3131,9 +3131,14 @@ impl Simulator {
         // 4 GB. Streaming drain releases per-CA allocations as we iterate.
         let cas = std::mem::take(&mut self.module.continuous_assigns);
         let pending_ca = std::mem::take(&mut self.module.pending_cont_assign);
+        // Hoisted out of the loop to reuse capacity across iterations.
+        // Avoids ~2 × N HashMap allocs/drops where N = cont_assign count
+        // (63K on c906, 501K on c910). Clear() preserves the bucket array.
+        let mut reads: HashSet<String> = HashSet::new();
+        let mut writes: HashSet<String> = HashSet::new();
         for ca in cas.into_iter().chain(pending_ca.into_iter().map(|p| p.materialize())) {
-            let mut reads = HashSet::new();
-            let mut writes = HashSet::new();
+            reads.clear();
+            writes.clear();
             Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
             Self::collect_lhs_writes(&ca.lhs, &self.module, &mut writes);
             // Detect identity assigns: assign dst = src (simple signal-to-signal copy)
@@ -3287,12 +3292,13 @@ impl Simulator {
             });
         }
 
-        // Always @* and always_comb blocks
+        // Always @* and always_comb blocks. Reuse `reads`/`writes` from the
+        // continuous_assigns loop above (clear-not-realloc).
         for ab in &self.module.always_blocks {
             if matches!(ab.kind, AlwaysKind::AlwaysComb | AlwaysKind::Always) {
                 let is_always_comb = ab.kind == AlwaysKind::AlwaysComb;
-                let mut reads = HashSet::new();
-                let mut writes = HashSet::new();
+                reads.clear();
+                writes.clear();
                 Self::collect_stmt_reads(&ab.stmt, &self.module, &mut reads, &mut writes);
                 // Top-prefix-strip helper: `<top>.<rest>` → `<rest>`. Used
                 // to resolve hierarchical refs whose path includes the
