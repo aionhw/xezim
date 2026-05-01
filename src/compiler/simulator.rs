@@ -2815,12 +2815,46 @@ impl Simulator {
                 Insn::LoadSignal(dest, sig_id) => {
                     let d = *dest as usize;
                     let s = *sig_id;
-                    // Reuse vm_regs[d]'s buffer; disjoint fields of self.
+                    // Prefetch the next LoadSignal's signal_table[s'] — for
+                    // c910 with 465K signals × 32 B Value = 15 MB
+                    // signal_table, the access pattern misses L3 often.
+                    // Looking ahead one Insn gives the CPU's prefetcher a
+                    // cycle of headstart on the next read.
+                    #[cfg(target_arch = "x86_64")]
+                    if pc + 1 < len {
+                        match &insns[pc + 1] {
+                            Insn::LoadSignal(_, s2) | Insn::LoadSignalSigned(_, s2) => {
+                                let p = self.signal_table.as_ptr().wrapping_add(*s2);
+                                unsafe {
+                                    core::arch::x86_64::_mm_prefetch(
+                                        p as *const i8,
+                                        core::arch::x86_64::_MM_HINT_T0,
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     self.vm_regs[d].copy_from(&self.signal_table[s]);
                 }
                 Insn::LoadSignalSigned(dest, sig_id) => {
                     let d = *dest as usize;
                     let s = *sig_id;
+                    #[cfg(target_arch = "x86_64")]
+                    if pc + 1 < len {
+                        match &insns[pc + 1] {
+                            Insn::LoadSignal(_, s2) | Insn::LoadSignalSigned(_, s2) => {
+                                let p = self.signal_table.as_ptr().wrapping_add(*s2);
+                                unsafe {
+                                    core::arch::x86_64::_mm_prefetch(
+                                        p as *const i8,
+                                        core::arch::x86_64::_MM_HINT_T0,
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     self.vm_regs[d].copy_from(&self.signal_table[s]);
                     self.vm_regs[d].is_signed = true;
                 }
