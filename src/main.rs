@@ -609,9 +609,14 @@ fn main() {
         if total_err > 0 { std::process::exit(1); }
 
         match xezim::parse_and_elaborate_multi(&sources, top_module.as_deref(), &include_dirs, &source_files, &defines) {
-            Ok((_defs, elab)) => {
+            Ok((_defs, mut elab)) => {
                 println!("Elaboration successful");
                 if let Some(ref out) = _output_file {
+                    // The serialized artifact format flattens always_blocks /
+                    // initial_blocks / continuous_assigns; pending_* are
+                    // `#[serde(skip)]` and would be silently dropped.
+                    // Materialize before serialize so the artifact is complete.
+                    elab.materialize_pending();
                     match xezim::write_compiled(&elab, out) {
                         Ok(()) => println!("Wrote compiled artifact to {}", out),
                         Err(e) => { eprintln!("Error writing '{}': {}", out, e); std::process::exit(1); }
