@@ -395,6 +395,38 @@ impl<'a> BytecodeCompiler<'a> {
         None
     }
 
+    fn lookup_param_value(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
+        let params = self.params?;
+        let raw = Self::hier_raw_name(hier);
+        if let Some(v) = params.get(&raw) { return Some(v.clone()); }
+        if let Some(scope) = &self.scope_hint {
+            let q = format!("{}.{}", scope, raw);
+            if let Some(v) = params.get(&q) { return Some(v.clone()); }
+        }
+        if hier.path.len() == 1 {
+            if let Some(v) = params.get(&hier.path[0].name.name) { return Some(v.clone()); }
+        }
+        // Suffix-match: bare `CARRY_CHAIN` may be stored as
+        // `top.uut.picorv32_core.pcpi_mul.CARRY_CHAIN`. Only accept if a
+        // single param key matches — multiple matches are ambiguous.
+        let mut found: Option<&Value> = None;
+        for (name, value) in params {
+            let raw_has_key_suffix = raw.len() >= name.len()
+                && raw.ends_with(name.as_str())
+                && (raw.len() == name.len()
+                    || raw.as_bytes()[raw.len() - name.len() - 1] == b'.');
+            let key_has_raw_suffix = name.len() >= raw.len()
+                && name.ends_with(raw.as_str())
+                && (name.len() == raw.len()
+                    || name.as_bytes()[name.len() - raw.len() - 1] == b'.');
+            if raw_has_key_suffix || key_has_raw_suffix {
+                if found.is_some() { return None; }
+                found = Some(value);
+            }
+        }
+        found.cloned()
+    }
+
     fn expr_to_signal_id(&self, expr: &Expression) -> Option<usize> {
         match &expr.kind {
             ExprKind::Ident(hier) => self.lookup_signal_id(hier),
@@ -847,16 +879,30 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(r)
             }
             ExprKind::Ident(hier) => {
-                let Some(id) = self.lookup_signal_id(hier) else {
-                    self.bail("ident_lookup");
-                    return None;
-                };
-                let r = self.alloc_reg();
-                if self.signal_signed[id] {
-                    self.emit(Insn::LoadSignalSigned(r, id));
-                } else {
-                    self.emit(Insn::LoadSignal(r, id));
+                if let Some(id) = self.lookup_signal_id(hier) {
+                    let r = self.alloc_reg();
+                    if self.signal_signed[id] {
+                        self.emit(Insn::LoadSignalSigned(r, id));
+                    } else {
+                        self.emit(Insn::LoadSignal(r, id));
+                    }
+                    return Some(r);
                 }
+                if let Some(v) = self.lookup_param_value(hier) {
+                    let r = self.alloc_reg();
+                    self.emit(Insn::LoadConst(r, Box::new(v)));
+                    return Some(r);
+                }
+                self.bail("ident_lookup");
+                None
+            }
+            ExprKind::StringLiteral(s) => {
+                let mut v = Value::from_string(s);
+                if ctx_width > 0 {
+                    v = v.resize(ctx_width);
+                }
+                let r = self.alloc_reg();
+                self.emit(Insn::LoadConst(r, Box::new(v)));
                 Some(r)
             }
             ExprKind::Unary { op, operand } => {
@@ -1640,45 +1686,7 @@ impl<'a> BytecodeCompiler<'a> {
         match &e.kind {
             ExprKind::Number(n) => self.eval_number_static(n)?.to_u64().map(|v| v as u32),
             ExprKind::Paren(inner) => self.eval_const_expr(inner),
-            ExprKind::Ident(hier) => {
-                let params = self.params?;
-                let raw = Self::hier_raw_name(hier);
-                if let Some(v) = params.get(&raw) { return v.to_u64().map(|u| u as u32); }
-                if let Some(scope) = &self.scope_hint {
-                    let q = format!("{}.{}", scope, raw);
-                    if let Some(v) = params.get(&q) { return v.to_u64().map(|u| u as u32); }
-                }
-                if hier.path.len() == 1 {
-                    if let Some(v) = params.get(&hier.path[0].name.name) {
-                        return v.to_u64().map(|u| u as u32);
-                    }
-                }
-                if raw.contains('.') {
-                    let mut found = None;
-                    for (name, value) in params {
-                        let raw_has_key_suffix = raw.len() >= name.len()
-                            && raw.ends_with(name.as_str())
-                            && (raw.len() == name.len()
-                                || raw.as_bytes()[raw.len() - name.len() - 1] == b'.');
-                        let key_has_raw_suffix = name.len() >= raw.len()
-                            && name.ends_with(raw.as_str())
-                            && (name.len() == raw.len()
-                                || name.as_bytes()[name.len() - raw.len() - 1] == b'.');
-                        if raw_has_key_suffix || key_has_raw_suffix
-                        {
-                            if found.is_some() {
-                                found = None;
-                                break;
-                            }
-                            found = Some(value);
-                        }
-                    }
-                    if let Some(v) = found {
-                        return v.to_u64().map(|u| u as u32);
-                    }
-                }
-                None
-            }
+            ExprKind::Ident(hier) => self.lookup_param_value(hier)?.to_u64().map(|u| u as u32),
             // Fold simple parameter arithmetic so slice bounds like
             // `[ENTRY_NUM-1:0]` resolve. Without this, expr_max_width on a
             // sliced range returned 1 (unwrap_or(0)), which then clobbered
