@@ -211,6 +211,13 @@ struct JoinWaiter {
 struct NbaFast {
     signal_id: usize,
     value: Value,
+    /// Source block index. Used by the parallel-dispatch merge to
+    /// recover sequential block-evaluation order before applying NBAs;
+    /// without it the partition path could re-order writes across
+    /// blocks and pick the wrong "last writer" for shared signals
+    /// (see c910 cmark hang). Sequential / non-partition pushes leave
+    /// this 0 — those paths already preserve insertion order.
+    block_index: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -4509,6 +4516,7 @@ impl Simulator {
         signal_name_to_id: &HashMap<Arc<str>, usize>,
         array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
         vm_regs: &mut Vec<Value>,
+        block_index: u32,
     ) -> Vec<NbaFast> {
         use super::bytecode::Insn;
         let mut nba_out: Vec<NbaFast> = Vec::new();
@@ -4690,6 +4698,7 @@ impl Simulator {
                     nba_out.push(NbaFast {
                         signal_id: *sig_id,
                         value: val,
+                        block_index,
                     });
                 }
                 Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
@@ -4711,6 +4720,7 @@ impl Simulator {
                         nba_out.push(NbaFast {
                             signal_id: *sig_id,
                             value: new_val,
+                            block_index,
                         });
                     }
                 }
@@ -4730,6 +4740,7 @@ impl Simulator {
                         nba_out.push(NbaFast {
                             signal_id: *sig_id,
                             value: new_val,
+                            block_index,
                         });
                     }
                 }
@@ -4777,6 +4788,7 @@ impl Simulator {
                         nba_out.push(NbaFast {
                             signal_id: eid,
                             value: val,
+                            block_index,
                         });
                     }
                 }
@@ -5104,6 +5116,7 @@ impl Simulator {
                     // whole-value entry, not into a stale earlier partial.
                     self.nba_fast_index.insert(*sig_id, self.nba_fast.len());
                     self.nba_fast.push(NbaFast {
+                        block_index: 0,
                         signal_id: *sig_id,
                         value: val,
                     });
@@ -5138,6 +5151,7 @@ impl Simulator {
                             new_val.is_signed = self.signal_signed[id];
                             self.nba_fast_index.insert(id, self.nba_fast.len());
                             self.nba_fast.push(NbaFast {
+                                block_index: 0,
                                 signal_id: id,
                                 value: new_val,
                             });
@@ -5155,6 +5169,7 @@ impl Simulator {
                         }
                         self.nba_fast_index.insert(id, self.nba_fast.len());
                         self.nba_fast.push(NbaFast {
+                            block_index: 0,
                             signal_id: id,
                             value: new_val,
                         });
@@ -5175,6 +5190,7 @@ impl Simulator {
                         v.is_signed = self.signal_signed[id];
                         self.nba_fast_index.insert(id, self.nba_fast.len());
                         self.nba_fast.push(NbaFast {
+                            block_index: 0,
                             signal_id: id,
                             value: v,
                         });
@@ -5197,6 +5213,7 @@ impl Simulator {
                             new_val.is_signed = self.signal_signed[id];
                             self.nba_fast_index.insert(id, self.nba_fast.len());
                             self.nba_fast.push(NbaFast {
+                                block_index: 0,
                                 signal_id: id,
                                 value: new_val,
                             });
@@ -5220,6 +5237,7 @@ impl Simulator {
                             }
                             self.nba_fast_index.insert(id, self.nba_fast.len());
                             self.nba_fast.push(NbaFast {
+                                block_index: 0,
                                 signal_id: id,
                                 value: new_val,
                             });
@@ -5237,6 +5255,7 @@ impl Simulator {
                         new_val.set_bit(idx, bit);
                         self.nba_fast_index.insert(id, self.nba_fast.len());
                         self.nba_fast.push(NbaFast {
+                            block_index: 0,
                             signal_id: id,
                             value: new_val,
                         });
@@ -5470,6 +5489,7 @@ impl Simulator {
                         let val = self.vm_regs[*val_reg as usize].resize(*width);
                         self.nba_fast_index.insert(eid, self.nba_fast.len());
                         self.nba_fast.push(NbaFast {
+                            block_index: 0,
                             signal_id: eid,
                             value: val,
                         });
@@ -5507,6 +5527,7 @@ impl Simulator {
                             v.is_signed = self.signal_signed[eid];
                             self.nba_fast_index.insert(eid, self.nba_fast.len());
                             self.nba_fast.push(NbaFast {
+                                block_index: 0,
                                 signal_id: eid,
                                 value: v,
                             });
@@ -5529,6 +5550,7 @@ impl Simulator {
                                 }
                                 self.nba_fast_index.insert(eid, self.nba_fast.len());
                                 self.nba_fast.push(NbaFast {
+                                    block_index: 0,
                                     signal_id: eid,
                                     value: new_val,
                                 });
@@ -8795,7 +8817,7 @@ impl Simulator {
                         let max_regs =
                             chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
                         let mut vm_regs = vec![Value::zero(1); max_regs];
-                        for (_, bs) in chunk {
+                        for (bi, bs) in chunk {
                             if vm_regs.len() < bs.num_regs {
                                 vm_regs.resize(bs.num_regs, Value::zero(1));
                             }
@@ -8808,6 +8830,7 @@ impl Simulator {
                                 signal_name_to_id,
                                 array_first_id,
                                 &mut vm_regs,
+                                *bi as u32,
                             );
                             thread_nba.append(&mut nba);
                         }
@@ -8840,7 +8863,7 @@ impl Simulator {
                                 let max_regs =
                                     chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
                                 let mut vm_regs = vec![Value::zero(1); max_regs];
-                                for (_, bs) in chunk {
+                                for (bi, bs) in chunk {
                                     if vm_regs.len() < bs.num_regs {
                                         vm_regs.resize(bs.num_regs, Value::zero(1));
                                     }
@@ -8854,6 +8877,7 @@ impl Simulator {
                                         signal_name_to_id,
                                         array_first_id,
                                         &mut vm_regs,
+                                        *bi as u32,
                                     );
                                     thread_nba.append(&mut nba);
                                 }
@@ -8868,15 +8892,22 @@ impl Simulator {
                         }
                     });
                 }
-                for nba_batch in all_nba {
-                    // Sync nba_fast_index for each appended entry so the
-                    // sequential-block path that may follow can still find
-                    // the latest entry per signal_id in O(1).
-                    for entry in nba_batch {
-                        self.nba_fast_index
-                            .insert(entry.signal_id, self.nba_fast.len());
-                        self.nba_fast.push(entry);
-                    }
+                // Flatten and re-sort by source block_index so the merged
+                // NBA stream applies in sequential block order regardless
+                // of how chunks were bucketed (partition vs chunk-by-range).
+                // Without this, two parallel blocks writing the same signal
+                // would have the "later partition id" win instead of the
+                // higher block-index — producing different last-writer
+                // semantics from the sequential path. Manifested as a c910
+                // cmark CPU hang under k=4. Each chunk's entries are already
+                // in block-index order (blocks pushed sequentially), so a
+                // stable sort is sufficient and keeps within-block order.
+                let mut merged: Vec<NbaFast> = all_nba.into_iter().flatten().collect();
+                merged.sort_by_key(|n| n.block_index);
+                for entry in merged {
+                    self.nba_fast_index
+                        .insert(entry.signal_id, self.nba_fast.len());
+                    self.nba_fast.push(entry);
                 }
             } else {
                 // Too few blocks for threading overhead to pay off
@@ -12226,6 +12257,7 @@ impl Simulator {
                         // NbaAssign Insn.
                         self.nba_fast_index.insert(id, self.nba_fast.len());
                         self.nba_fast.push(NbaFast {
+                            block_index: 0,
                             signal_id: id,
                             value: val.resize_for_assign(w),
                         });
@@ -13681,6 +13713,7 @@ impl Simulator {
         val.is_signed = self.signal_signed[id];
         self.nba_fast_index.insert(id, self.nba_fast.len());
         self.nba_fast.push(NbaFast {
+            block_index: 0,
             signal_id: id,
             value: val,
         });
@@ -13716,6 +13749,7 @@ impl Simulator {
         }
         self.nba_fast_index.insert(id, self.nba_fast.len());
         self.nba_fast.push(NbaFast {
+            block_index: 0,
             signal_id: id,
             value: new_val,
         });
@@ -13737,6 +13771,7 @@ impl Simulator {
         new_val.set_bit(idx, if bit { LogicBit::One } else { LogicBit::Zero });
         self.nba_fast_index.insert(id, self.nba_fast.len());
         self.nba_fast.push(NbaFast {
+            block_index: 0,
             signal_id: id,
             value: new_val,
         });
