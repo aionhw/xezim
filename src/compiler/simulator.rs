@@ -817,6 +817,11 @@ pub struct Simulator {
     /// simulator's lifetime. Always `None` when the `jit-llvm`
     /// feature is disabled (the type is a stub).
     jit_module_llvm: Option<super::jit_llvm::LlvmJitModule>,
+    /// Persistent TBB task_arena. Created lazily on first parallel
+    /// dispatch when `XEZIM_DISPATCHER=tbb` is active. Reused across
+    /// every delta-cycle's parallel_for so workers stay alive.
+    /// Always `None` when feature `tbb` is off.
+    tbb_arena: Option<crate::tbb::Arena>,
     /// True for blocks eligible for parallel execution (no StmtFallback).
     edge_block_parallel: Vec<bool>,
     /// Per-edge-block partition / core assignment. Indexed by edge_block
@@ -1692,6 +1697,7 @@ impl Simulator {
             jit_fns: Vec::new(),
             jit_module: None,
             jit_module_llvm: None,
+            tbb_arena: None,
             edge_block_parallel: Vec::new(),
             edge_block_partition: Vec::new(),
             edge_block_partition_count: 0,
@@ -8764,11 +8770,26 @@ impl Simulator {
 
                 let mut all_nba: Vec<Vec<NbaFast>> = Vec::new();
                 if use_tbb {
-                    use std::sync::Mutex;
-                    let nba_collect: Mutex<Vec<Vec<NbaFast>>> =
-                        Mutex::new(Vec::with_capacity(chunks.len()));
+                    // Lazily create the persistent task_arena on first
+                    // use. Reusing it across delta cycles avoids the
+                    // ~5-10 µs/cycle TBB cold-start cost.
+                    if self.tbb_arena.is_none() {
+                        let n_threads = std::thread::available_parallelism()
+                            .map(|n| n.get().min(8))
+                            .unwrap_or(4);
+                        self.tbb_arena = crate::tbb::Arena::new(n_threads);
+                    }
+                    // Pre-allocate one Vec<NbaFast> per partition. Each
+                    // TBB task writes to its own slot via raw pointer —
+                    // no locks. Safety: each partition index is touched
+                    // by at most one task, and the Vec is alive for the
+                    // entire arena.parallel_for call.
+                    let mut slots: Vec<Vec<NbaFast>> =
+                        (0..chunks.len()).map(|_| Vec::new()).collect();
+                    let slots_ptr = slots.as_mut_ptr() as usize;
+                    let n_slots = chunks.len();
                     let chunks_ref = &chunks;
-                    crate::tbb::parallel_for_partitions(chunks.len(), 1, |p| {
+                    let dispatch = |p: usize| {
                         let chunk = chunks_ref[p].as_slice();
                         let mut thread_nba: Vec<NbaFast> = Vec::new();
                         let max_regs =
@@ -8778,7 +8799,8 @@ impl Simulator {
                             if vm_regs.len() < bs.num_regs {
                                 vm_regs.resize(bs.num_regs, Value::zero(1));
                             }
-                            let insns = unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
+                            let insns =
+                                unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
                             let mut nba = Self::exec_insns_isolated(
                                 insns,
                                 signal_table,
@@ -8789,9 +8811,24 @@ impl Simulator {
                             );
                             thread_nba.append(&mut nba);
                         }
-                        nba_collect.lock().unwrap().push(thread_nba);
-                    });
-                    all_nba = nba_collect.into_inner().unwrap();
+                        // Write into our exclusive slot via raw pointer.
+                        if p < n_slots {
+                            unsafe {
+                                let dst = (slots_ptr as *mut Vec<NbaFast>).add(p);
+                                std::ptr::write(dst, thread_nba);
+                            }
+                        }
+                    };
+                    if let Some(arena) = self.tbb_arena.as_ref() {
+                        arena.parallel_for(chunks.len(), 1, dispatch);
+                    } else {
+                        // Feature gated off but XEZIM_DISPATCHER=tbb
+                        // somehow set: fall through sequentially.
+                        for p in 0..chunks.len() {
+                            dispatch(p);
+                        }
+                    }
+                    all_nba = slots;
                     self.prof_par_dispatch_tbb += 1;
                 } else {
                     std::thread::scope(|s| {

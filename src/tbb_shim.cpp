@@ -13,6 +13,7 @@
 #include <oneapi/tbb/parallel_for.h>
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/global_control.h>
+#include <oneapi/tbb/task_arena.h>
 #include <cstddef>
 
 extern "C" {
@@ -60,6 +61,54 @@ void xezim_tbb_drop_threads(void* handle) {
     if (handle) {
         delete static_cast<oneapi::tbb::global_control*>(handle);
     }
+}
+
+// Persistent TBB task arena. Created once at simulator start and reused
+// across every delta-cycle's parallel_for. Avoids the ~5-10 µs per-call
+// task setup that was killing the legacy `parallel_for` path on c906
+// (3326 dispatches × 5 µs = 16 ms of pure overhead).
+//
+// `n_threads = 0` defers to TBB's automatic worker selection.
+void* xezim_tbb_arena_create(std::size_t n_threads) {
+    auto* arena = new oneapi::tbb::task_arena();
+    if (n_threads > 0) {
+        arena->initialize(static_cast<int>(n_threads));
+    } else {
+        arena->initialize();
+    }
+    return arena;
+}
+
+void xezim_tbb_arena_destroy(void* handle) {
+    if (handle) {
+        delete static_cast<oneapi::tbb::task_arena*>(handle);
+    }
+}
+
+// Run the parallel_for INSIDE the persistent arena's execute scope.
+// Worker threads stay alive across calls; only task graph allocation
+// is per-call. `grain` is the blocked_range grain size as before.
+void xezim_tbb_arena_parallel_for(
+    void* arena_handle,
+    void* user,
+    std::size_t n_partitions,
+    xezim_tbb_partition_fn fn,
+    std::size_t grain
+) {
+    if (!arena_handle || n_partitions == 0) {
+        return;
+    }
+    auto* arena = static_cast<oneapi::tbb::task_arena*>(arena_handle);
+    arena->execute([&] {
+        oneapi::tbb::parallel_for(
+            oneapi::tbb::blocked_range<std::size_t>(0, n_partitions, grain ? grain : 1),
+            [user, fn](const oneapi::tbb::blocked_range<std::size_t>& r) {
+                for (std::size_t p = r.begin(); p < r.end(); ++p) {
+                    fn(user, p);
+                }
+            }
+        );
+    });
 }
 
 } // extern "C"
