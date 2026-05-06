@@ -8734,6 +8734,14 @@ impl Simulator {
                 unsafe impl Send for BlockSlice {}
                 unsafe impl Sync for BlockSlice {}
 
+                // Sort by block_index so each chunk we build below
+                // (whether by partition id or by index range) ends up
+                // pre-sorted by block_index. The parallel-NBA k-way
+                // merge below relies on this — without it, `triggered`
+                // is in sensitivity-fanout order, chunks inherit that
+                // order, and the merge produces the wrong last-writer
+                // (c910 cmark hang).
+                parallel_blocks.sort_unstable();
                 let mut block_slices: Vec<(usize, BlockSlice)> =
                     Vec::with_capacity(parallel_blocks.len());
                 for &bi in &parallel_blocks {
@@ -8892,22 +8900,48 @@ impl Simulator {
                         }
                     });
                 }
-                // Flatten and re-sort by source block_index so the merged
-                // NBA stream applies in sequential block order regardless
-                // of how chunks were bucketed (partition vs chunk-by-range).
-                // Without this, two parallel blocks writing the same signal
-                // would have the "later partition id" win instead of the
-                // higher block-index — producing different last-writer
-                // semantics from the sequential path. Manifested as a c910
-                // cmark CPU hang under k=4. Each chunk's entries are already
-                // in block-index order (blocks pushed sequentially), so a
-                // stable sort is sufficient and keeps within-block order.
-                let mut merged: Vec<NbaFast> = all_nba.into_iter().flatten().collect();
-                merged.sort_by_key(|n| n.block_index);
-                for entry in merged {
-                    self.nba_fast_index
-                        .insert(entry.signal_id, self.nba_fast.len());
-                    self.nba_fast.push(entry);
+                // Apply NBAs in source block_index order so the merged
+                // stream matches sequential dispatch (last writer per
+                // signal is the highest block index, not the highest
+                // chunk index). Chunk bucketing — especially the
+                // partition path — does not preserve global block order,
+                // so a single misplaced cross-partition pair would flip
+                // last-writer semantics (this is what caused c910 cmark
+                // t=4 k=4 to hang).
+                //
+                // Each chunk's NBA vec is already in block-index order
+                // (blocks within a chunk are processed sequentially), so
+                // we run a k-way min-heap merge: O(N log k) instead of
+                // O(N log N) for a full sort. For k=4 with N in the
+                // millions per cycle that's ~10× cheaper.
+                let total: usize = all_nba.iter().map(Vec::len).sum();
+                if total > 0 {
+                    self.nba_fast.reserve(total);
+                    let mut iters: Vec<std::vec::IntoIter<NbaFast>> =
+                        all_nba.into_iter().map(|v| v.into_iter()).collect();
+                    use std::cmp::Reverse;
+                    use std::collections::BinaryHeap;
+                    // Heap entry: (Reverse(block_index), chunk_idx) — min-heap by block_index.
+                    let mut heap: BinaryHeap<(Reverse<u32>, usize)> =
+                        BinaryHeap::with_capacity(iters.len());
+                    let mut head: Vec<Option<NbaFast>> = (0..iters.len()).map(|_| None).collect();
+                    for (i, it) in iters.iter_mut().enumerate() {
+                        if let Some(n) = it.next() {
+                            heap.push((Reverse(n.block_index), i));
+                            head[i] = Some(n);
+                        }
+                    }
+                    while let Some((_, ci)) = heap.pop() {
+                        if let Some(entry) = head[ci].take() {
+                            self.nba_fast_index
+                                .insert(entry.signal_id, self.nba_fast.len());
+                            self.nba_fast.push(entry);
+                        }
+                        if let Some(n) = iters[ci].next() {
+                            heap.push((Reverse(n.block_index), ci));
+                            head[ci] = Some(n);
+                        }
+                    }
                 }
             } else {
                 // Too few blocks for threading overhead to pay off
