@@ -9188,13 +9188,21 @@ impl Simulator {
             // CompiledAlwaysBlock — avoid scope_hint.clone() and Instant::now()
             // on those paths. Only the AST fallback arms pay that cost.
             //
-            // NOTE: A previous version added a single-stage `_mm_prefetch`
-            // on entries[cur_list[cur_pos+8]] which gave c906 cmark a
-            // 31% wall-time win. Reverted because c910 t=1 k=0 starts
-            // hanging at iters=200040 with the prefetch active despite
-            // the prefetch being a semantic no-op — likely a downstream
-            // cache-state interaction we haven't traced yet. Don't
-            // re-enable without a c910 t=1 k=0 + t=4 k=4 cmark sanity.
+            // ATTEMPTED OPT (REVERTED): prefetching entries[cur_list[cur_pos+8]]
+            // 8 iterations ahead gave c906 cmark a +31% wall-time win,
+            // but c910 t=1 k=0 hung at exact iters=200040 (same signature
+            // as the NBA-order bug). Bisect:
+            //   no-prefetch (baseline):                  c910 PASS
+            //   _mm_prefetch::<T0>(entries+pf_eidx):     c910 HANG
+            //   ptr::read::<u8>(&entries[pf_eidx].item): c910 HANG
+            //   black_box(pf_eidx) only (no load):       c910 PASS
+            // i.e. ANY actual byte read of entries[pf_eidx] is enough to
+            // break c910 — even though the read is a semantic no-op.
+            // c906 is fine, c910 deterministically diverges at the same
+            // sim point. Suggests latent UB / aliasing somewhere in
+            // settle that specific cache-state changes unmask. Don't
+            // re-enable without a deeper audit (e.g. `cargo miri` on a
+            // small repro).
             let mut cur_pos = 0usize;
             while cur_pos < cur_list.len() {
                 let eidx = cur_list[cur_pos];
