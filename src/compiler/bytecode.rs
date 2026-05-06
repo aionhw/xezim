@@ -67,17 +67,23 @@ pub enum Insn {
 
     /// Bit select: dest = src[index]
     BitSelect(RegId, RegId, RegId), // (dest, base, index)
+    /// Bit select with compile-time constant index.
+    BitSelectConst(RegId, RegId, u32), // (dest, base, index)
     /// Range select: dest = src[left:right]
     RangeSelect(RegId, RegId, RegId, RegId), // (dest, base, left, right)
+    /// Range select with compile-time constant bounds.
+    RangeSelectConst(RegId, RegId, u32, u32), // (dest, base, left, right)
     /// Concatenation: dest = {parts...}, part register IDs stored in
     /// the boxed Vec. The `Box` keeps the variant at 16 B (Box ptr only)
     /// instead of inlining a 24 B Vec header — Concat is rare on the
     /// hot path so the extra indirection is cheap, and shrinking this
     /// variant lets the whole `Insn` enum drop from 32 B to 24 B.
     Concat(RegId, Box<Vec<RegId>>),
+    /// Replicate: dest = {count{src}}
+    Replicate(RegId, RegId, u32),
 
     /// Conditional branch: if reg is false, jump to target instruction index.
-    BranchIfFalse(RegId, u32),       // (cond_reg, jump_target)
+    BranchIfFalse(RegId, u32), // (cond_reg, jump_target)
     /// 4-state select: dest = cond ? then_reg : else_reg, with per-bit X merge
     /// (IEEE 1800 §11.4.11 Table 11-21) when cond has unknown bits. Both
     /// branches are always evaluated (no short-circuit) — used for `?:` so
@@ -87,7 +93,7 @@ pub enum Insn {
     Jump(u32),
 
     /// Non-blocking assign: signal_table[id] <= reg (scheduled via NBA queue).
-    NbaAssign(usize, RegId, u32),  // (signal_id, value_reg, width)
+    NbaAssign(usize, RegId, u32), // (signal_id, value_reg, width)
     /// Non-blocking partial assign: signal_table[id][hi:lo] <= reg.
     /// Read-modify-write at exec time using current signal value as base.
     NbaAssignRange(usize, u32, u32, RegId), // (signal_id, hi, lo, value_reg)
@@ -113,11 +119,17 @@ pub enum Insn {
     LoadArrayElem(RegId, Box<String>, RegId), // (dest, array_name, index_reg)
     /// NBA assign to array element.
     NbaAssignArray(Box<String>, RegId, RegId, u32), // (array_name, index_reg, value_reg, width)
+    /// Blocking assign to array element.
+    BlockingAssignArray(Box<String>, RegId, RegId, u32), // (array_name, index_reg, value_reg, width)
+    /// NBA range assign to array element.
+    NbaAssignArrayRange(Box<String>, RegId, RegId, RegId, RegId), // (array_name, index_reg, hi_reg, lo_reg, value_reg)
+    /// Blocking range assign to array element.
+    BlockingAssignArrayRange(Box<String>, RegId, RegId, RegId, RegId), // (array_name, index_reg, hi_reg, lo_reg, value_reg)
 
     /// Marks end of a compiled block (no-op, helps debugging).
     /// Copy src register to dest register.
-    Move(RegId, RegId),       // (dest, src)
-
+    Move(RegId, RegId), // (dest, src)
+    
     /// Fallback: invoke the AST interpreter on an untranslated statement.
     /// Used for rare constructs (e.g. $display, complex LHS) so an edge
     /// block containing one unsupported stmt can still run most of its
@@ -383,11 +395,89 @@ impl<'a> BytecodeCompiler<'a> {
         None
     }
 
+    fn lookup_param_value(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
+        let params = self.params?;
+        let raw = Self::hier_raw_name(hier);
+        if let Some(v) = params.get(&raw) { return Some(v.clone()); }
+        if let Some(scope) = &self.scope_hint {
+            let q = format!("{}.{}", scope, raw);
+            if let Some(v) = params.get(&q) { return Some(v.clone()); }
+        }
+        if hier.path.len() == 1 {
+            if let Some(v) = params.get(&hier.path[0].name.name) { return Some(v.clone()); }
+        }
+        // Suffix-match: bare `CARRY_CHAIN` may be stored as
+        // `top.uut.picorv32_core.pcpi_mul.CARRY_CHAIN`. Only accept if a
+        // single param key matches — multiple matches are ambiguous.
+        let mut found: Option<&Value> = None;
+        for (name, value) in params {
+            let raw_has_key_suffix = raw.len() >= name.len()
+                && raw.ends_with(name.as_str())
+                && (raw.len() == name.len()
+                    || raw.as_bytes()[raw.len() - name.len() - 1] == b'.');
+            let key_has_raw_suffix = name.len() >= raw.len()
+                && name.ends_with(raw.as_str())
+                && (name.len() == raw.len()
+                    || name.as_bytes()[name.len() - raw.len() - 1] == b'.');
+            if raw_has_key_suffix || key_has_raw_suffix {
+                if found.is_some() { return None; }
+                found = Some(value);
+            }
+        }
+        found.cloned()
+    }
+
     fn expr_to_signal_id(&self, expr: &Expression) -> Option<usize> {
         match &expr.kind {
             ExprKind::Ident(hier) => self.lookup_signal_id(hier),
             ExprKind::Paren(inner) => self.expr_to_signal_id(inner),
             _ => None,
+        }
+    }
+
+    fn flattened_outer_zero_signal_id(&self, expr: &Expression) -> Option<usize> {
+        let ExprKind::Index { expr: base, index } = &expr.kind else {
+            return None;
+        };
+        if self.eval_const_expr(index)? != 0 {
+            return None;
+        }
+        let ExprKind::Ident(hier) = &base.kind else {
+            return None;
+        };
+        if self.lookup_array_name(hier).is_some() {
+            return None;
+        }
+        self.lookup_signal_id(hier)
+    }
+
+    fn flattened_const_range_target(
+        &self,
+        expr: &Expression,
+        left: &Expression,
+        right: &Expression,
+    ) -> Option<(usize, u32, u32)> {
+        let ExprKind::Index { expr: base, index } = &expr.kind else {
+            return None;
+        };
+        let outer = self.eval_const_expr(index)?;
+        let ExprKind::Ident(hier) = &base.kind else {
+            return None;
+        };
+        if self.lookup_array_name(hier).is_some() {
+            return None;
+        }
+        let id = self.lookup_signal_id(hier)?;
+        let l = self.eval_const_expr(left)?;
+        let r = self.eval_const_expr(right)?;
+        let (lo, hi) = if l >= r { (r, l) } else { (l, r) };
+        let elem_w = hi - lo + 1;
+        let flat_lo = outer.checked_mul(elem_w)?.checked_add(lo)?;
+        let flat_hi = outer.checked_mul(elem_w)?.checked_add(hi)?;
+        if flat_hi < self.signal_widths[id] {
+            Some((id, flat_hi, flat_lo))
+        } else {
+            None
         }
     }
 
@@ -789,13 +879,30 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(r)
             }
             ExprKind::Ident(hier) => {
-                let id = self.lookup_signal_id(hier)?;
-                let r = self.alloc_reg();
-                if self.signal_signed[id] {
-                    self.emit(Insn::LoadSignalSigned(r, id));
-                } else {
-                    self.emit(Insn::LoadSignal(r, id));
+                if let Some(id) = self.lookup_signal_id(hier) {
+                    let r = self.alloc_reg();
+                    if self.signal_signed[id] {
+                        self.emit(Insn::LoadSignalSigned(r, id));
+                    } else {
+                        self.emit(Insn::LoadSignal(r, id));
+                    }
+                    return Some(r);
                 }
+                if let Some(v) = self.lookup_param_value(hier) {
+                    let r = self.alloc_reg();
+                    self.emit(Insn::LoadConst(r, Box::new(v)));
+                    return Some(r);
+                }
+                self.bail("ident_lookup");
+                None
+            }
+            ExprKind::StringLiteral(s) => {
+                let mut v = Value::from_string(s);
+                if ctx_width > 0 {
+                    v = v.resize(ctx_width);
+                }
+                let r = self.alloc_reg();
+                self.emit(Insn::LoadConst(r, Box::new(v)));
                 Some(r)
             }
             ExprKind::Unary { op, operand } => {
@@ -804,23 +911,22 @@ impl<'a> BytecodeCompiler<'a> {
                 match op {
                     UnaryOp::Plus => return Some(src),
                     UnaryOp::Minus => self.emit(Insn::Negate(dest, src)),
-                    UnaryOp::Plus => self.emit(Insn::Move(dest, src)),
                     UnaryOp::LogNot => self.emit(Insn::LogNot(dest, src)),
                     UnaryOp::BitNot => self.emit(Insn::BitNot(dest, src)),
                     UnaryOp::BitAnd => self.emit(Insn::ReduceAnd(dest, src)),
                     UnaryOp::BitNand => {
                         self.emit(Insn::ReduceAnd(dest, src));
-                        self.emit(Insn::LogNot(dest, dest));
+                        self.emit(Insn::BitNot(dest, dest));
                     }
                     UnaryOp::BitOr => self.emit(Insn::ReduceOr(dest, src)),
                     UnaryOp::BitNor => {
                         self.emit(Insn::ReduceOr(dest, src));
-                        self.emit(Insn::LogNot(dest, dest));
+                        self.emit(Insn::BitNot(dest, dest));
                     }
                     UnaryOp::BitXor => self.emit(Insn::ReduceXor(dest, src)),
                     UnaryOp::BitXnor => {
                         self.emit(Insn::ReduceXor(dest, src));
-                        self.emit(Insn::LogNot(dest, dest));
+                        self.emit(Insn::BitNot(dest, dest));
                     }
                     _ => { self.bail("UnaryOp_other"); return None; }
                 }
@@ -914,53 +1020,97 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 // Bit select
                 let base = self.compile_expr(expr, 0)?;
+                if let Some(idx) = self.eval_const_expr(index) {
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::BitSelectConst(dest, base, idx));
+                    return Some(dest);
+                }
                 let idx = self.compile_expr(index, 0)?;
                 let dest = self.alloc_reg();
                 self.emit(Insn::BitSelect(dest, base, idx));
                 Some(dest)
             }
-            ExprKind::RangeSelect { expr, left, right, kind, .. } => {
-                match kind {
-                    RangeKind::Constant => {
-                        let base = self.compile_expr(expr, 0)?;
-                        let l = self.compile_expr(left, 0)?;
-                        let r = self.compile_expr(right, 0)?;
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind,
+                ..
+            } => match kind {
+                RangeKind::Constant => {
+                    let base = self.compile_expr(expr, 0)?;
+                    if let (Some(l), Some(r)) = (self.eval_const_expr(left), self.eval_const_expr(right))
+                    {
                         let dest = self.alloc_reg();
-                        self.emit(Insn::RangeSelect(dest, base, l, r));
-                        Some(dest)
+                        self.emit(Insn::RangeSelectConst(dest, base, l, r));
+                        return Some(dest);
                     }
-                    RangeKind::IndexedUp | RangeKind::IndexedDown => {
-                        // `sig[idx +: W]` / `sig[idx -: W]` — W must be constant.
-                        // Emit idx register, then compute hi/lo via Add/Sub with a
-                        // const (W-1), and reuse existing RangeSelect insn.
-                        let width = match self.eval_const_expr(right) {
-                            Some(w) if w > 0 => w,
-                            _ => { self.bail("RangeSelect_width_nonconst"); return None; }
-                        };
-                        let base = self.compile_expr(expr, 0)?;
-                        let idx = self.compile_expr(left, 0)?;
-                        let dest = self.alloc_reg();
-                        if width == 1 {
-                            self.emit(Insn::RangeSelect(dest, base, idx, idx));
-                        } else {
-                            let delta = self.alloc_reg();
-                            self.emit(Insn::LoadConst(delta, Box::new(Value::from_u64((width - 1) as u64, 32))));
-                            let other = self.alloc_reg();
-                            if *kind == RangeKind::IndexedUp {
-                                self.emit(Insn::Add(other, idx, delta));
-                                self.emit(Insn::RangeSelect(dest, base, other, idx));
-                            } else {
-                                self.emit(Insn::Sub(other, idx, delta));
-                                self.emit(Insn::RangeSelect(dest, base, idx, other));
-                            }
-                        }
-                        Some(dest)
-                    }
+                    let l = self.compile_expr(left, 0)?;
+                    let r = self.compile_expr(right, 0)?;
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::RangeSelect(dest, base, l, r));
+                    Some(dest)
                 }
-            }
+                RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                    // `sig[idx +: W]` / `sig[idx -: W]` — W must be constant.
+                    // Emit idx register, then compute hi/lo via Add/Sub with a
+                    // const (W-1), and reuse existing RangeSelect insn.
+                    let width = match self.eval_const_expr(right) {
+                        Some(w) if w > 0 => w,
+                        _ => {
+                            self.bail("RangeSelect_width_nonconst");
+                            return None;
+                        }
+                    };
+                    let base = self.compile_expr(expr, 0)?;
+                    let idx = self.compile_expr(left, 0)?;
+                    let dest = self.alloc_reg();
+                    if width == 1 {
+                        self.emit(Insn::RangeSelect(dest, base, idx, idx));
+                    } else {
+                        let delta = self.alloc_reg();
+                        self.emit(Insn::LoadConst(
+                            delta,
+                            Box::new(Value::from_u64((width - 1) as u64, 32)),
+                        ));
+                        let other = self.alloc_reg();
+                        if *kind == RangeKind::IndexedUp {
+                            self.emit(Insn::Add(other, idx, delta));
+                            self.emit(Insn::RangeSelect(dest, base, other, idx));
+                        } else {
+                            self.emit(Insn::Sub(other, idx, delta));
+                            self.emit(Insn::RangeSelect(dest, base, idx, other));
+                        }
+                    }
+                    Some(dest)
+                }
+            },
             ExprKind::Replication { count, exprs } => {
-                let n = self.eval_const_expr(count)?;
-                if n == 0 || n > 1024 { self.bail("Replication_bad_count"); return None; }
+                let n = match self.eval_const_expr(count) {
+                    Some(val) => val,
+                    _ => {
+                        self.bail("Replication_nonconst_count");
+                        return None;
+                    }
+                };
+                if n == 0 {
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::LoadConst(dest, Box::new(Value::zero(0))));
+                    return Some(dest);
+                }
+                if n > 10000 {
+                    self.bail("Replication_excessive_count");
+                    return None;
+                }
+
+                // Optimization: use Insn::Replicate if possible
+                if exprs.len() == 1 {
+                    let r = self.compile_expr(&exprs[0], 0)?;
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::Replicate(dest, r, n));
+                    return Some(dest);
+                }
+
                 let mut regs = Vec::with_capacity((exprs.len() * n as usize).max(1));
                 for _ in 0..n {
                     for e in exprs {
@@ -993,7 +1143,11 @@ impl<'a> BytecodeCompiler<'a> {
                         let r = self.compile_expr(args.first()?, 0)?;
                         Some(r)
                     }
-                    other => { self.bail("SystemCall_other"); let _ = other; None }
+                    other => {
+                        self.bail("SystemCall_other");
+                        let _ = other;
+                        None
+                    }
                 }
             }
             other => {
@@ -1040,29 +1194,145 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
+                if let Some(id) = self.flattened_outer_zero_signal_id(expr) {
+                    if let Some(idx_reg) = self.compile_expr(index, 0) {
+                        self.emit(Insn::NbaAssignBitDyn(id, idx_reg, val_reg));
+                        return true;
+                    }
+                }
                 self.bail("nba_index_other");
                 false
             }
-            ExprKind::RangeSelect { expr, left, right, kind } => {
-                if *kind != RangeKind::Constant { self.bail("nba_range_nonconst"); return false; }
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind,
+            } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(id) = self.lookup_signal_id(hier) {
-                        // Fast path: compile-time constant range.
-                        if let (Some(hi), Some(lo)) = (self.eval_const_expr(left), self.eval_const_expr(right)) {
-                            self.emit(Insn::NbaAssignRange(id, hi, lo, val_reg));
-                            let _ = width;
+                        match kind {
+                            RangeKind::Constant => {
+                                if let (Some(hi), Some(lo)) =
+                                    (self.eval_const_expr(left), self.eval_const_expr(right))
+                                {
+                                    self.emit(Insn::NbaAssignRange(id, hi, lo, val_reg));
+                                    return true;
+                                }
+                            }
+                            RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                                let width = match self.eval_const_expr(right) {
+                                    Some(w) if w > 0 => w,
+                                    _ => {
+                                        self.bail("nba_range_width_nonconst");
+                                        return false;
+                                    }
+                                };
+                                let resized = self.alloc_reg();
+                                self.emit(Insn::Move(resized, val_reg));
+                                self.emit(Insn::Resize(resized, width));
+                                let Some(idx) = self.compile_expr(left, 0) else {
+                                    self.bail("nba_range_base");
+                                    return false;
+                                };
+                                let (hi_reg, lo_reg) = if width == 1 {
+                                    (idx, idx)
+                                } else {
+                                    let delta = self.alloc_reg();
+                                    self.emit(Insn::LoadConst(
+                                        delta,
+                                        Box::new(Value::from_u64((width - 1) as u64, 32)),
+                                    ));
+                                    let other = self.alloc_reg();
+                                    if *kind == RangeKind::IndexedUp {
+                                        self.emit(Insn::Add(other, idx, delta));
+                                        (other, idx)
+                                    } else {
+                                        self.emit(Insn::Sub(other, idx, delta));
+                                        (idx, other)
+                                    }
+                                };
+                                self.emit(Insn::NbaAssignRangeDyn(id, hi_reg, lo_reg, resized));
+                                return true;
+                            }
+                        }
+                    }
+                }
+                if let Some(id) = self.flattened_outer_zero_signal_id(expr) {
+                    match kind {
+                        RangeKind::Constant => {
+                            if let (Some(hi), Some(lo)) =
+                                (self.eval_const_expr(left), self.eval_const_expr(right))
+                            {
+                                self.emit(Insn::NbaAssignRange(id, hi, lo, val_reg));
+                                return true;
+                            }
+                        }
+                        RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                            let width = match self.eval_const_expr(right) {
+                                Some(w) if w > 0 => w,
+                                _ => {
+                                    self.bail("nba_range_width_nonconst");
+                                    return false;
+                                }
+                            };
+                            let resized = self.alloc_reg();
+                            self.emit(Insn::Move(resized, val_reg));
+                            self.emit(Insn::Resize(resized, width));
+                            let Some(idx) = self.compile_expr(left, 0) else {
+                                self.bail("nba_range_base");
+                                return false;
+                            };
+                            let (hi_reg, lo_reg) = if width == 1 {
+                                (idx, idx)
+                            } else {
+                                let delta = self.alloc_reg();
+                                self.emit(Insn::LoadConst(
+                                    delta,
+                                    Box::new(Value::from_u64((width - 1) as u64, 32)),
+                                ));
+                                let other = self.alloc_reg();
+                                if *kind == RangeKind::IndexedUp {
+                                    self.emit(Insn::Add(other, idx, delta));
+                                    (other, idx)
+                                } else {
+                                    self.emit(Insn::Sub(other, idx, delta));
+                                    (idx, other)
+                                }
+                            };
+                            self.emit(Insn::NbaAssignRangeDyn(id, hi_reg, lo_reg, resized));
                             return true;
                         }
-                        // Dynamic range: compile left/right as expressions.
-                        // Avoids the AST-interpreter fallback for patterns
-                        // like `q[idx+:W]` or `q[j:j-W+1]` that fire
-                        // millions of times per c910 run.
-                        if let (Some(hi_reg), Some(lo_reg)) =
-                            (self.compile_expr(left, 0), self.compile_expr(right, 0))
-                        {
-                            self.emit(Insn::NbaAssignRangeDyn(id, hi_reg, lo_reg, val_reg));
-                            let _ = width;
-                            return true;
+                    }
+                }
+                if *kind == RangeKind::Constant {
+                    if let Some((id, hi, lo)) = self.flattened_const_range_target(expr, left, right) {
+                        self.emit(Insn::NbaAssignRange(id, hi, lo, val_reg));
+                        return true;
+                    }
+                }
+                // Handle mem[i][hi:lo] <= val
+                if let ExprKind::Index {
+                    expr: arr_expr,
+                    index,
+                } = &expr.kind
+                {
+                    if let ExprKind::Ident(hier) = &arr_expr.kind {
+                        if let Some(name) = self.lookup_array_name(hier) {
+                            if let Some(idx_reg) = self.compile_expr(index, 0) {
+                                if let (Some(hi_reg), Some(lo_reg)) =
+                                    (self.compile_expr(left, 0), self.compile_expr(right, 0))
+                                {
+                                    self.emit(Insn::NbaAssignArrayRange(
+                                        Box::new(name),
+                                        idx_reg,
+                                        hi_reg,
+                                        lo_reg,
+                                        val_reg,
+                                    ));
+                                    return true;
+                                }
+                            }
                         }
                     }
                 }
@@ -1087,10 +1357,16 @@ impl<'a> BytecodeCompiler<'a> {
                 for (i, p) in parts.iter().enumerate().rev() {
                     let pw = part_widths[i];
                     let lo_reg = self.alloc_reg();
-                    self.emit(Insn::LoadConst(lo_reg, Box::new(Value::from_u64(bit_offset as u64, 32))));
+                    self.emit(Insn::LoadConst(
+                        lo_reg,
+                        Box::new(Value::from_u64(bit_offset as u64, 32)),
+                    ));
                     let hi_val = bit_offset + pw - 1;
                     let hi_reg = self.alloc_reg();
-                    self.emit(Insn::LoadConst(hi_reg, Box::new(Value::from_u64(hi_val as u64, 32))));
+                    self.emit(Insn::LoadConst(
+                        hi_reg,
+                        Box::new(Value::from_u64(hi_val as u64, 32)),
+                    ));
                     let part_reg = self.alloc_reg();
                     self.emit(Insn::RangeSelect(part_reg, val_reg, hi_reg, lo_reg));
                     self.emit(Insn::Resize(part_reg, pw));
@@ -1101,8 +1377,14 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 true
             }
-            ExprKind::MemberAccess { .. } => { self.bail("nba_member_access"); false }
-            _ => { self.bail("nba_other"); false }
+            ExprKind::MemberAccess { .. } => {
+                self.bail("nba_member_access");
+                false
+            }
+            _ => {
+                self.bail("nba_other");
+                false
+            }
         }
     }
 
@@ -1121,15 +1403,13 @@ impl<'a> BytecodeCompiler<'a> {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            let elem_name_reg = self.alloc_reg();
-                            let _ = elem_name_reg;
-                            // For blocking array assign, we need to compute the element name
-                            // and do a blocking assign. Use the same pattern as NbaAssignArray
-                            // but with a blocking write.
-                            // BlockingAssignArray doesn't exist yet — fall back.
-                            let _ = idx_reg;
-                            self.bail("blocking_array");
-                            return false;
+                            self.emit(Insn::BlockingAssignArray(
+                                Box::new(name),
+                                idx_reg,
+                                val_reg,
+                                width,
+                            ));
+                            return true;
                         }
                     }
                     if let Some(id) = self.lookup_signal_id(hier) {
@@ -1139,40 +1419,71 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
+                if let Some(id) = self.flattened_outer_zero_signal_id(expr) {
+                    if let Some(idx_reg) = self.compile_expr(index, 0) {
+                        self.emit(Insn::BlockingAssignBitDyn(id, idx_reg, val_reg));
+                        return true;
+                    }
+                }
                 self.bail("blocking_target");
                 false
             }
-            ExprKind::RangeSelect { expr, left, right, kind } => {
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind,
+            } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(id) = self.lookup_signal_id(hier) {
                         match kind {
                             RangeKind::Constant => {
-                                if let (Some(hi), Some(lo)) = (self.eval_const_expr(left), self.eval_const_expr(right)) {
+                                if let (Some(hi), Some(lo)) =
+                                    (self.eval_const_expr(left), self.eval_const_expr(right))
+                                {
                                     let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
-                                    let range_w = high - low + 1;
-                                    let resized = self.alloc_reg();
-                                    self.emit(Insn::Move(resized, val_reg));
-                                    self.emit(Insn::Resize(resized, range_w));
-                                    self.emit(Insn::BlockingAssignRange(id, hi, lo, resized));
+                                    if let Some(range_w) =
+                                        high.checked_sub(low).and_then(|w| w.checked_add(1))
+                                    {
+                                        let resized = self.alloc_reg();
+                                        self.emit(Insn::Move(resized, val_reg));
+                                        self.emit(Insn::Resize(resized, range_w));
+                                        self.emit(Insn::BlockingAssignRange(id, hi, lo, resized));
+                                        return true;
+                                    }
+                                }
+                                if let (Some(hi_reg), Some(lo_reg)) =
+                                    (self.compile_expr(left, 0), self.compile_expr(right, 0))
+                                {
+                                    self.emit(Insn::BlockingAssignRangeDyn(
+                                        id, hi_reg, lo_reg, val_reg,
+                                    ));
                                     return true;
                                 }
                             }
                             RangeKind::IndexedUp | RangeKind::IndexedDown => {
                                 let width = match self.eval_const_expr(right) {
                                     Some(w) if w > 0 => w,
-                                    _ => { self.bail("blocking_range_width_nonconst"); return false; }
+                                    _ => {
+                                        self.bail("blocking_range_width_nonconst");
+                                        return false;
+                                    }
                                 };
                                 let resized = self.alloc_reg();
                                 self.emit(Insn::Move(resized, val_reg));
                                 self.emit(Insn::Resize(resized, width));
                                 let Some(idx) = self.compile_expr(left, 0) else {
-                                    self.bail("blocking_range_base"); return false;
+                                    self.bail("blocking_range_base");
+                                    return false;
                                 };
                                 let (hi_reg, lo_reg) = if width == 1 {
                                     (idx, idx)
                                 } else {
                                     let delta = self.alloc_reg();
-                                    self.emit(Insn::LoadConst(delta, Box::new(Value::from_u64((width - 1) as u64, 32))));
+                                    self.emit(Insn::LoadConst(
+                                        delta,
+                                        Box::new(Value::from_u64((width - 1) as u64, 32)),
+                                    ));
                                     let other = self.alloc_reg();
                                     if *kind == RangeKind::IndexedUp {
                                         self.emit(Insn::Add(other, idx, delta));
@@ -1184,6 +1495,104 @@ impl<'a> BytecodeCompiler<'a> {
                                 };
                                 self.emit(Insn::BlockingAssignRangeDyn(id, hi_reg, lo_reg, resized));
                                 return true;
+                            }
+                        }
+                    }
+                }
+                if let Some(id) = self.flattened_outer_zero_signal_id(expr) {
+                    match kind {
+                        RangeKind::Constant => {
+                            if let (Some(hi), Some(lo)) =
+                                (self.eval_const_expr(left), self.eval_const_expr(right))
+                            {
+                                let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
+                                if let Some(range_w) =
+                                    high.checked_sub(low).and_then(|w| w.checked_add(1))
+                                {
+                                    let resized = self.alloc_reg();
+                                    self.emit(Insn::Move(resized, val_reg));
+                                    self.emit(Insn::Resize(resized, range_w));
+                                    self.emit(Insn::BlockingAssignRange(id, hi, lo, resized));
+                                    return true;
+                                }
+                            }
+                            if let (Some(hi_reg), Some(lo_reg)) =
+                                (self.compile_expr(left, 0), self.compile_expr(right, 0))
+                            {
+                                self.emit(Insn::BlockingAssignRangeDyn(
+                                    id, hi_reg, lo_reg, val_reg,
+                                ));
+                                return true;
+                            }
+                        }
+                        RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                            let width = match self.eval_const_expr(right) {
+                                Some(w) if w > 0 => w,
+                                _ => {
+                                    self.bail("blocking_range_width_nonconst");
+                                    return false;
+                                }
+                            };
+                            let resized = self.alloc_reg();
+                            self.emit(Insn::Move(resized, val_reg));
+                            self.emit(Insn::Resize(resized, width));
+                            let Some(idx) = self.compile_expr(left, 0) else {
+                                self.bail("blocking_range_base");
+                                return false;
+                            };
+                            let (hi_reg, lo_reg) = if width == 1 {
+                                (idx, idx)
+                            } else {
+                                let delta = self.alloc_reg();
+                                self.emit(Insn::LoadConst(
+                                    delta,
+                                    Box::new(Value::from_u64((width - 1) as u64, 32)),
+                                ));
+                                let other = self.alloc_reg();
+                                if *kind == RangeKind::IndexedUp {
+                                    self.emit(Insn::Add(other, idx, delta));
+                                    (other, idx)
+                                } else {
+                                    self.emit(Insn::Sub(other, idx, delta));
+                                    (idx, other)
+                                }
+                            };
+                            self.emit(Insn::BlockingAssignRangeDyn(id, hi_reg, lo_reg, resized));
+                            return true;
+                        }
+                    }
+                }
+                if *kind == RangeKind::Constant {
+                    if let Some((id, hi, lo)) = self.flattened_const_range_target(expr, left, right) {
+                        let range_w = hi - lo + 1;
+                        let resized = self.alloc_reg();
+                        self.emit(Insn::Move(resized, val_reg));
+                        self.emit(Insn::Resize(resized, range_w));
+                        self.emit(Insn::BlockingAssignRange(id, hi, lo, resized));
+                        return true;
+                    }
+                }
+                // Handle mem[i][hi:lo] = val
+                if let ExprKind::Index {
+                    expr: arr_expr,
+                    index,
+                } = &expr.kind
+                {
+                    if let ExprKind::Ident(hier) = &arr_expr.kind {
+                        if let Some(name) = self.lookup_array_name(hier) {
+                            if let Some(idx_reg) = self.compile_expr(index, 0) {
+                                if let (Some(hi_reg), Some(lo_reg)) =
+                                    (self.compile_expr(left, 0), self.compile_expr(right, 0))
+                                {
+                                    self.emit(Insn::BlockingAssignArrayRange(
+                                        Box::new(name),
+                                        idx_reg,
+                                        hi_reg,
+                                        lo_reg,
+                                        val_reg,
+                                    ));
+                                    return true;
+                                }
                             }
                         }
                     }
@@ -1201,10 +1610,16 @@ impl<'a> BytecodeCompiler<'a> {
                 for (i, p) in parts.iter().enumerate().rev() {
                     let pw = part_widths[i];
                     let lo_reg = self.alloc_reg();
-                    self.emit(Insn::LoadConst(lo_reg, Box::new(Value::from_u64(bit_offset as u64, 32))));
+                    self.emit(Insn::LoadConst(
+                        lo_reg,
+                        Box::new(Value::from_u64(bit_offset as u64, 32)),
+                    ));
                     let hi_val = bit_offset + pw - 1;
                     let hi_reg = self.alloc_reg();
-                    self.emit(Insn::LoadConst(hi_reg, Box::new(Value::from_u64(hi_val as u64, 32))));
+                    self.emit(Insn::LoadConst(
+                        hi_reg,
+                        Box::new(Value::from_u64(hi_val as u64, 32)),
+                    ));
                     let part_reg = self.alloc_reg();
                     self.emit(Insn::RangeSelect(part_reg, val_reg, hi_reg, lo_reg));
                     self.emit(Insn::Resize(part_reg, pw));
@@ -1257,7 +1672,7 @@ impl<'a> BytecodeCompiler<'a> {
                     RangeKind::Constant => {
                         if let (Some(l), Some(r)) = (self.eval_const_expr(left), self.eval_const_expr(right)) {
                             let (hi, lo) = if l >= r { (l, r) } else { (r, l) };
-                            hi - lo + 1
+                            hi.checked_sub(lo).and_then(|w| w.checked_add(1)).unwrap_or(32)
                         } else { 32 }
                     }
                 }
@@ -1271,21 +1686,7 @@ impl<'a> BytecodeCompiler<'a> {
         match &e.kind {
             ExprKind::Number(n) => self.eval_number_static(n)?.to_u64().map(|v| v as u32),
             ExprKind::Paren(inner) => self.eval_const_expr(inner),
-            ExprKind::Ident(hier) => {
-                let params = self.params?;
-                let raw = Self::hier_raw_name(hier);
-                if let Some(v) = params.get(&raw) { return v.to_u64().map(|u| u as u32); }
-                if let Some(scope) = &self.scope_hint {
-                    let q = format!("{}.{}", scope, raw);
-                    if let Some(v) = params.get(&q) { return v.to_u64().map(|u| u as u32); }
-                }
-                if hier.path.len() == 1 {
-                    if let Some(v) = params.get(&hier.path[0].name.name) {
-                        return v.to_u64().map(|u| u as u32);
-                    }
-                }
-                None
-            }
+            ExprKind::Ident(hier) => self.lookup_param_value(hier)?.to_u64().map(|u| u as u32),
             // Fold simple parameter arithmetic so slice bounds like
             // `[ENTRY_NUM-1:0]` resolve. Without this, expr_max_width on a
             // sliced range returned 1 (unwrap_or(0)), which then clobbered

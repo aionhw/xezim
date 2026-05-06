@@ -18,17 +18,18 @@ use xezim::simulate;
 
 fn run_stress(file: &str, top: &str, max_time: u64) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
-    let src = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+    let src =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
     // simulate() takes a source string and a max time (ns). The stress
     // designs all $finish themselves at MAX_TIME, so a generous cap is fine.
     let _ = top; // simulate() picks the last module by default; stress files put `top` last.
-    let sim = simulate(&src, max_time)
-        .unwrap_or_else(|e| panic!("simulation of {} failed: {}", file, e));
+    let sim =
+        simulate(&src, max_time).unwrap_or_else(|e| panic!("simulation of {} failed: {}", file, e));
     assert!(
         sim.time > 0,
         "{} simulation did not advance simulated time (got time={})",
-        file, sim.time
+        file,
+        sim.time
     );
 }
 

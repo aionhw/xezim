@@ -79,12 +79,7 @@ pub unsafe extern "C" fn xezim_jit_load_signal(sim: *mut u8, id: u32) -> u64 {
 /// `Insn::BlockingAssign` semantics. Returns nothing; caller trusts
 /// the bridge to propagate correctly.
 #[no_mangle]
-pub unsafe extern "C" fn xezim_jit_store_signal(
-    sim: *mut u8,
-    id: u32,
-    val_bits: u64,
-    width: u32,
-) {
+pub unsafe extern "C" fn xezim_jit_store_signal(sim: *mut u8, id: u32, val_bits: u64, width: u32) {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
     sim.jit_store_signal(id as usize, val_bits, width);
 }
@@ -93,30 +88,56 @@ pub unsafe extern "C" fn xezim_jit_store_signal(
 /// `nba_fast` so the next `apply_nba` pass writes `signal_table[id]`.
 /// Mirrors `Insn::NbaAssign` semantics.
 #[no_mangle]
-pub unsafe extern "C" fn xezim_jit_schedule_nba(
-    sim: *mut u8,
-    id: u32,
-    val_bits: u64,
-    width: u32,
-) {
+pub unsafe extern "C" fn xezim_jit_schedule_nba(sim: *mut u8, id: u32, val_bits: u64, width: u32) {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
     sim.jit_schedule_nba(id as usize, val_bits, width);
 }
 
-/// Schedule a non-blocking assign to a bit-range: merges `val_bits`
-/// at bits `[hi:lo]` into the current signal value (or in-flight NBA
-/// entry) and pushes to `nba_fast`. Mirrors `Insn::NbaAssignRange` +
-/// `Insn::NbaAssignRangeDyn`.
+/// Schedule a non-blocking assign to a dynamic bit-range: merges `val_bits`
+/// at bits `[hi_bits:lo_bits]` into the current signal value.
 #[no_mangle]
-pub unsafe extern "C" fn xezim_jit_schedule_nba_range(
+pub unsafe extern "C" fn xezim_jit_schedule_nba_range_dyn(
     sim: *mut u8,
     id: u32,
-    hi: u32,
-    lo: u32,
+    hi_bits: u64,
+    lo_bits: u64,
     val_bits: u64,
 ) {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
-    sim.jit_schedule_nba_range(id as usize, hi, lo, val_bits);
+    sim.jit_schedule_nba_range(id as usize, hi_bits as u32, lo_bits as u32, val_bits);
+}
+
+/// Schedule a non-blocking assign to a dynamic bit-index.
+#[no_mangle]
+pub unsafe extern "C" fn xezim_jit_schedule_nba_bit_dyn(
+    sim: *mut u8,
+    id: u32,
+    idx: u64,
+    val_bits: u64,
+) {
+    let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
+    sim.jit_schedule_nba_bit(id as usize, idx as usize, val_bits != 0);
+}
+
+/// Perform a blocking assign to a dynamic bit-range.
+#[no_mangle]
+pub unsafe extern "C" fn xezim_jit_blocking_assign_range_dyn(
+    sim: *mut u8,
+    id: u32,
+    hi_bits: u64,
+    lo_bits: u64,
+    val_bits: u64,
+) {
+    let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
+    sim.jit_blocking_assign_range(id as usize, hi_bits as u32, lo_bits as u32, val_bits);
+}
+
+/// Load an array element value as u64.
+#[no_mangle]
+pub unsafe extern "C" fn xezim_jit_load_array_elem(sim: *mut u8, name_ptr: *const u8, idx: i64) -> u64 {
+    let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
+    let name = std::ffi::CStr::from_ptr(name_ptr as *const i8).to_string_lossy();
+    sim.jit_load_array_elem(&name, idx)
 }
 
 /// Path B X/Z runtime pre-check. Reads the slice of `n` u32 sig_ids
@@ -140,7 +161,11 @@ pub unsafe extern "C" fn xezim_jit_inputs_have_xz(
 ) -> u32 {
     let sim = &*(sim as *const crate::compiler::simulator::Simulator);
     let ids = std::slice::from_raw_parts(ids_ptr, n as usize);
-    if sim.jit_inputs_have_xz(ids) { 1 } else { 0 }
+    if sim.jit_inputs_have_xz(ids) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Stubs when the feature is disabled — everything is None / no-op so
@@ -152,19 +177,28 @@ mod stub {
 
     pub struct JitModule;
     impl JitModule {
-        pub fn new() -> Option<Self> { None }
-        pub fn try_compile(&mut self, _insns: &[Insn], _num_regs: u32) -> Option<JitFn> { None }
+        pub fn new() -> Option<Self> {
+            None
+        }
+        pub fn try_compile(&mut self, _insns: &[Insn], _num_regs: u32) -> Option<JitFn> {
+            None
+        }
     }
 }
 
 #[cfg(feature = "jit")]
 mod enabled {
     use super::super::bytecode::Insn;
-    use super::{JitFn, xezim_jit_load_signal, xezim_jit_store_signal, xezim_jit_schedule_nba, xezim_jit_schedule_nba_range, xezim_jit_inputs_have_xz};
+    use super::{
+        xezim_jit_blocking_assign_range_dyn, xezim_jit_inputs_have_xz,
+        xezim_jit_load_array_elem, xezim_jit_load_signal, xezim_jit_schedule_nba,
+        xezim_jit_schedule_nba_bit_dyn, xezim_jit_schedule_nba_range_dyn,
+        xezim_jit_store_signal, JitFn,
+    };
+    use cranelift::codegen::ir::{FuncRef, StackSlot};
     use cranelift::prelude::*;
-    use cranelift::codegen::ir::{StackSlot, FuncRef};
     use cranelift_jit::{JITBuilder, JITModule as ClJitModule};
-    use cranelift_module::{Linkage, Module, FuncId};
+    use cranelift_module::{FuncId, Linkage, Module};
 
     pub struct JitModule {
         module: ClJitModule,
@@ -181,11 +215,42 @@ mod enabled {
             let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
             // Register bridge function symbols so the JIT can link to them.
             builder.symbol("xezim_jit_load_signal", xezim_jit_load_signal as *const u8);
-            builder.symbol("xezim_jit_store_signal", xezim_jit_store_signal as *const u8);
-            builder.symbol("xezim_jit_schedule_nba", xezim_jit_schedule_nba as *const u8);
-            builder.symbol("xezim_jit_schedule_nba_range", xezim_jit_schedule_nba_range as *const u8);
-            builder.symbol("xezim_jit_inputs_have_xz", xezim_jit_inputs_have_xz as *const u8);
-            Some(Self { module: ClJitModule::new(builder), next_id: 0 })
+            builder.symbol(
+                "xezim_jit_store_signal",
+                xezim_jit_store_signal as *const u8,
+            );
+            builder.symbol(
+                "xezim_jit_schedule_nba",
+                xezim_jit_schedule_nba as *const u8,
+            );
+            builder.symbol(
+                "xezim_jit_schedule_nba_range",
+                xezim_jit_schedule_nba_range_dyn as *const u8,
+            );
+            builder.symbol(
+                "xezim_jit_schedule_nba_range_dyn",
+                xezim_jit_schedule_nba_range_dyn as *const u8,
+            );
+            builder.symbol(
+                "xezim_jit_schedule_nba_bit_dyn",
+                xezim_jit_schedule_nba_bit_dyn as *const u8,
+            );
+            builder.symbol(
+                "xezim_jit_blocking_assign_range_dyn",
+                xezim_jit_blocking_assign_range_dyn as *const u8,
+            );
+            builder.symbol(
+                "xezim_jit_load_array_elem",
+                xezim_jit_load_array_elem as *const u8,
+            );
+            builder.symbol(
+                "xezim_jit_inputs_have_xz",
+                xezim_jit_inputs_have_xz as *const u8,
+            );
+            Some(Self {
+                module: ClJitModule::new(builder),
+                next_id: 0,
+            })
         }
 
         /// Try to JIT-compile a block's instruction list. Returns None if
@@ -193,7 +258,9 @@ mod enabled {
         /// interpreter in that case.
         pub fn try_compile(&mut self, insns: &[Insn], num_regs: u32) -> Option<JitFn> {
             for insn in insns {
-                if !is_supported(insn) { return None; }
+                if !is_supported(insn) {
+                    return None;
+                }
             }
             // Collect the set of signal IDs this block reads via LoadSignal*.
             // The Path B X/Z prelude pre-checks these before letting the
@@ -208,26 +275,33 @@ mod enabled {
                     _ => None,
                 };
                 if let Some(sid) = id_opt {
-                    if seen.insert(sid) { input_ids.push(sid); }
+                    if seen.insert(sid) {
+                        input_ids.push(sid);
+                    }
                 }
             }
             self.codegen_block(insns, num_regs, &input_ids).ok()
         }
 
-        fn codegen_block(&mut self, insns: &[Insn], num_regs: u32, input_ids: &[u32]) -> Result<JitFn, ()> {
+        fn codegen_block(
+            &mut self,
+            insns: &[Insn],
+            num_regs: u32,
+            input_ids: &[u32],
+        ) -> Result<JitFn, ()> {
             let pointer_type = self.module.target_config().pointer_type();
 
             // Declare bridge signatures (shared across all compiled blocks).
             let mut load_sig = self.module.make_signature();
-            load_sig.params.push(AbiParam::new(pointer_type));   // sim
-            load_sig.params.push(AbiParam::new(types::I32));     // id
-            load_sig.returns.push(AbiParam::new(types::I64));    // val_bits
+            load_sig.params.push(AbiParam::new(pointer_type)); // sim
+            load_sig.params.push(AbiParam::new(types::I32)); // id
+            load_sig.returns.push(AbiParam::new(types::I64)); // val_bits
 
             let mut store_sig = self.module.make_signature();
-            store_sig.params.push(AbiParam::new(pointer_type));  // sim
-            store_sig.params.push(AbiParam::new(types::I32));    // id
-            store_sig.params.push(AbiParam::new(types::I64));    // val_bits
-            store_sig.params.push(AbiParam::new(types::I32));    // width
+            store_sig.params.push(AbiParam::new(pointer_type)); // sim
+            store_sig.params.push(AbiParam::new(types::I32)); // id
+            store_sig.params.push(AbiParam::new(types::I64)); // val_bits
+            store_sig.params.push(AbiParam::new(types::I32)); // width
 
             let nba_sig = store_sig.clone();
 
@@ -246,19 +320,44 @@ mod enabled {
             xz_check_sig.params.push(AbiParam::new(types::I32));
             xz_check_sig.returns.push(AbiParam::new(types::I32));
 
-            let load_id: FuncId = self.module
+            let load_id: FuncId = self
+                .module
                 .declare_function("xezim_jit_load_signal", Linkage::Import, &load_sig)
                 .map_err(|_| ())?;
-            let store_id: FuncId = self.module
+            let store_id: FuncId = self
+                .module
                 .declare_function("xezim_jit_store_signal", Linkage::Import, &store_sig)
                 .map_err(|_| ())?;
-            let nba_id: FuncId = self.module
+            let nba_id: FuncId = self
+                .module
                 .declare_function("xezim_jit_schedule_nba", Linkage::Import, &nba_sig)
                 .map_err(|_| ())?;
-            let nba_range_id: FuncId = self.module
-                .declare_function("xezim_jit_schedule_nba_range", Linkage::Import, &nba_range_sig)
+            let nba_range_id: FuncId = self
+                .module
+                .declare_function(
+                    "xezim_jit_schedule_nba_range_dyn",
+                    Linkage::Import,
+                    &nba_range_sig,
+                )
                 .map_err(|_| ())?;
-            let xz_check_id: FuncId = self.module
+            let nba_bit_id: FuncId = self
+                .module
+                .declare_function("xezim_jit_schedule_nba_bit_dyn", Linkage::Import, &nba_sig)
+                .map_err(|_| ())?;
+            let blk_range_id: FuncId = self
+                .module
+                .declare_function(
+                    "xezim_jit_blocking_assign_range_dyn",
+                    Linkage::Import,
+                    &nba_range_sig,
+                )
+                .map_err(|_| ())?;
+            let load_array_id: FuncId = self
+                .module
+                .declare_function("xezim_jit_load_array_elem", Linkage::Import, &load_sig)
+                .map_err(|_| ())?;
+            let xz_check_id: FuncId = self
+                .module
                 .declare_function("xezim_jit_inputs_have_xz", Linkage::Import, &xz_check_sig)
                 .map_err(|_| ())?;
 
@@ -290,14 +389,20 @@ mod enabled {
                     _ => None,
                 };
                 if let Some(t) = target {
-                    if t < n { is_leader[t] = true; }
-                    if i + 1 < n { is_leader[i + 1] = true; }
+                    if t < n {
+                        is_leader[t] = true;
+                    }
+                    if i + 1 < n {
+                        is_leader[i + 1] = true;
+                    }
                 }
             }
             let mut pc_to_block: Vec<Option<cranelift::codegen::ir::Block>> = vec![None; n.max(1)];
             let exit_block = builder.create_block();
             for (i, &leader) in is_leader.iter().enumerate() {
-                if leader { pc_to_block[i] = Some(builder.create_block()); }
+                if leader {
+                    pc_to_block[i] = Some(builder.create_block());
+                }
             }
 
             // Path B X/Z prelude block: created BEFORE the original entry
@@ -320,10 +425,25 @@ mod enabled {
             // so the prelude can call xz_check_ref before the per-Insn
             // codegen begins.
             let load_ref = self.module.declare_func_in_func(load_id, &mut builder.func);
-            let store_ref = self.module.declare_func_in_func(store_id, &mut builder.func);
+            let store_ref = self
+                .module
+                .declare_func_in_func(store_id, &mut builder.func);
             let nba_ref = self.module.declare_func_in_func(nba_id, &mut builder.func);
-            let nba_range_ref = self.module.declare_func_in_func(nba_range_id, &mut builder.func);
-            let xz_check_ref = self.module.declare_func_in_func(xz_check_id, &mut builder.func);
+            let nba_range_ref = self
+                .module
+                .declare_func_in_func(nba_range_id, &mut builder.func);
+            let nba_bit_ref = self
+                .module
+                .declare_func_in_func(nba_bit_id, &mut builder.func);
+            let blk_range_ref = self
+                .module
+                .declare_func_in_func(blk_range_id, &mut builder.func);
+            let load_array_ref = self
+                .module
+                .declare_func_in_func(load_array_id, &mut builder.func);
+            let xz_check_ref = self
+                .module
+                .declare_func_in_func(xz_check_id, &mut builder.func);
 
             if input_ids.is_empty() {
                 // No reads — no X/Z risk. Fall straight through.
@@ -332,19 +452,26 @@ mod enabled {
                 // Materialise input_ids as a fixed stack-slot u32 array,
                 // then call xezim_jit_inputs_have_xz(sim, ptr, n).
                 let slot_size = (input_ids.len() * 4) as u32;
-                let id_slot = builder.create_sized_stack_slot(
-                    StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 2));
+                let id_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    slot_size,
+                    2,
+                ));
                 for (i, &id) in input_ids.iter().enumerate() {
                     let id_val = builder.ins().iconst(types::I32, id as i64);
                     builder.ins().stack_store(id_val, id_slot, (i * 4) as i32);
                 }
                 let ids_ptr = builder.ins().stack_addr(pointer_type, id_slot, 0);
                 let n_val = builder.ins().iconst(types::I32, input_ids.len() as i64);
-                let call = builder.ins().call(xz_check_ref, &[prelude_sim_ptr, ids_ptr, n_val]);
+                let call = builder
+                    .ins()
+                    .call(xz_check_ref, &[prelude_sim_ptr, ids_ptr, n_val]);
                 let xz_rc = builder.inst_results(call)[0];
                 // Branch: rc != 0 → fallback_block (return 1); rc == 0 →
                 // jump to entry_block with sim_ptr.
-                builder.ins().brif(xz_rc, fallback_block, &[], entry_block, &[prelude_sim_ptr]);
+                builder
+                    .ins()
+                    .brif(xz_rc, fallback_block, &[], entry_block, &[prelude_sim_ptr]);
             }
             builder.seal_block(prelude_block);
 
@@ -362,14 +489,18 @@ mod enabled {
             // Allocate one 8-byte stack slot per VM register. For blocks
             // with very few registers this still only costs a few bytes.
             let reg_slots: Vec<StackSlot> = (0..num_regs as usize)
-                .map(|_| builder.create_sized_stack_slot(
-                    StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3)
-                ))
+                .map(|_| {
+                    builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        8,
+                        3,
+                    ))
+                })
                 .collect();
 
-            let resolve_target = |t: usize, pc_to_block: &Vec<Option<cranelift::codegen::ir::Block>>|
-                -> cranelift::codegen::ir::Block
-            {
+            let resolve_target = |t: usize,
+                                  pc_to_block: &Vec<Option<cranelift::codegen::ir::Block>>|
+             -> cranelift::codegen::ir::Block {
                 if t < pc_to_block.len() {
                     pc_to_block[t].unwrap_or(exit_block)
                 } else {
@@ -392,11 +523,15 @@ mod enabled {
                 }
                 match insn {
                     Insn::BranchIfFalse(cond, target) => {
-                        let cv = builder.ins().stack_load(types::I64, reg_slots[*cond as usize], 0);
+                        let cv = builder
+                            .ins()
+                            .stack_load(types::I64, reg_slots[*cond as usize], 0);
                         let target_b = resolve_target(*target as usize, &pc_to_block);
                         let fall_b = if i + 1 < n {
                             pc_to_block[i + 1].unwrap_or(exit_block)
-                        } else { exit_block };
+                        } else {
+                            exit_block
+                        };
                         // brif: if cv != 0 -> fall_b (cond true, don't branch)
                         //        else     -> target_b (cond false, take branch)
                         builder.ins().brif(cv, fall_b, &[], target_b, &[]);
@@ -408,7 +543,19 @@ mod enabled {
                         live = false;
                     }
                     other => {
-                        emit_insn(&mut builder, other, sim_ptr, &reg_slots, load_ref, store_ref, nba_ref, nba_range_ref)?;
+                        emit_insn(
+                            &mut builder,
+                            other,
+                            sim_ptr,
+                            &reg_slots,
+                            load_ref,
+                            store_ref,
+                            nba_ref,
+                            nba_range_ref,
+                            nba_bit_ref,
+                            blk_range_ref,
+                            load_array_ref,
+                        )?;
                     }
                 }
             }
@@ -424,11 +571,17 @@ mod enabled {
             builder.finalize();
 
             // Define + finalize the function.
-            let fn_name = { self.next_id += 1; format!("xezim_block_{}", self.next_id) };
-            let func_id = self.module
+            let fn_name = {
+                self.next_id += 1;
+                format!("xezim_block_{}", self.next_id)
+            };
+            let func_id = self
+                .module
                 .declare_function(&fn_name, Linkage::Export, &ctx.func.signature)
                 .map_err(|_| ())?;
-            self.module.define_function(func_id, &mut ctx).map_err(|_| ())?;
+            self.module
+                .define_function(func_id, &mut ctx)
+                .map_err(|_| ())?;
             self.module.clear_context(&mut ctx);
             self.module.finalize_definitions().map_err(|_| ())?;
 
@@ -445,7 +598,10 @@ mod enabled {
         load_ref: FuncRef,
         store_ref: FuncRef,
         nba_ref: FuncRef,
-        _nba_range_ref: FuncRef,
+        nba_range_ref: FuncRef,
+        nba_bit_ref: FuncRef,
+        blk_range_ref: FuncRef,
+        load_array_ref: FuncRef,
     ) -> Result<(), ()> {
         use Insn::*;
         match insn {
@@ -467,8 +623,9 @@ mod enabled {
             }
             Add(d, l, r) => emit_binop(builder, regs, *d, *l, *r, |b, x, y| b.ins().iadd(x, y)),
             Sub(d, l, r) => emit_binop(builder, regs, *d, *l, *r, |b, x, y| b.ins().isub(x, y)),
+            Mul(d, l, r) => emit_binop(builder, regs, *d, *l, *r, |b, x, y| b.ins().imul(x, y)),
             BitAnd(d, l, r) => emit_binop(builder, regs, *d, *l, *r, |b, x, y| b.ins().band(x, y)),
-            BitOr(d, l, r)  => emit_binop(builder, regs, *d, *l, *r, |b, x, y| b.ins().bor(x, y)),
+            BitOr(d, l, r) => emit_binop(builder, regs, *d, *l, *r, |b, x, y| b.ins().bor(x, y)),
             BitXor(d, l, r) => emit_binop(builder, regs, *d, *l, *r, |b, x, y| b.ins().bxor(x, y)),
             BitNot(d, s) => {
                 let v = builder.ins().stack_load(types::I64, regs[*s as usize], 0);
@@ -560,7 +717,9 @@ mod enabled {
             // or (b) the JIT tracks per-register width and inserts
             // mask insns before width-sensitive ops.
             Select(d, cond, t, e) => {
-                let cv = builder.ins().stack_load(types::I64, regs[*cond as usize], 0);
+                let cv = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*cond as usize], 0);
                 let tv = builder.ins().stack_load(types::I64, regs[*t as usize], 0);
                 let ev = builder.ins().stack_load(types::I64, regs[*e as usize], 0);
                 let zero = builder.ins().iconst(types::I64, 0);
@@ -586,30 +745,71 @@ mod enabled {
                 // when materialising results into signal_table.
             }
             BlockingAssign(sig_id, val_reg, width) => {
-                let v = builder.ins().stack_load(types::I64, regs[*val_reg as usize], 0);
+                let v = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*val_reg as usize], 0);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let w = builder.ins().iconst(types::I32, *width as i64);
                 builder.ins().call(store_ref, &[sim_ptr, id, v, w]);
             }
+            BlockingAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
+                let v = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*val_reg as usize], 0);
+                let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                let hi = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*hi_reg as usize], 0);
+                let lo = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*lo_reg as usize], 0);
+                builder
+                    .ins()
+                    .call(blk_range_ref, &[sim_ptr, id, hi, lo, v]);
+            }
             NbaAssign(sig_id, val_reg, width) => {
-                let v = builder.ins().stack_load(types::I64, regs[*val_reg as usize], 0);
+                let v = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*val_reg as usize], 0);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let w = builder.ins().iconst(types::I32, *width as i64);
                 builder.ins().call(nba_ref, &[sim_ptr, id, v, w]);
             }
-            // NbaAssignRange: now safe under Path B (X/Z pre-check at
-            // function entry; if any input has X/Z we bail before any
-            // side effects). The c910 regression (9m30s → 12m40s) was
-            // caused by 2-state bridge values diverging from the
-            // interpreter's 4-state semantics during reset — Path B
-            // skips the JIT body entirely while reset is asserted, so
-            // the wrong-cascade can't happen.
             NbaAssignRange(sig_id, hi, lo, val_reg) => {
-                let v = builder.ins().stack_load(types::I64, regs[*val_reg as usize], 0);
+                let v = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*val_reg as usize], 0);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let hi_v = builder.ins().iconst(types::I32, *hi as i64);
                 let lo_v = builder.ins().iconst(types::I32, *lo as i64);
-                builder.ins().call(_nba_range_ref, &[sim_ptr, id, hi_v, lo_v, v]);
+                builder
+                    .ins()
+                    .call(nba_range_ref, &[sim_ptr, id, hi_v, lo_v, v]);
+            }
+            NbaAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
+                let v = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*val_reg as usize], 0);
+                let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                let hi = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*hi_reg as usize], 0);
+                let lo = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*lo_reg as usize], 0);
+                builder
+                    .ins()
+                    .call(nba_range_ref, &[sim_ptr, id, hi, lo, v]);
+            }
+            NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
+                let v = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*val_reg as usize], 0);
+                let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                let idx = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*idx_reg as usize], 0);
+                builder.ins().call(nba_bit_ref, &[sim_ptr, id, idx, v]);
             }
             // NbaAssignRangeDyn / NbaAssignBitDyn still left out — they
             // need dynamic hi/lo from VM regs, requiring extra value
@@ -620,15 +820,31 @@ mod enabled {
                 // the common narrowing case; widening is already zero-ext
                 // since stack slots are u64.
                 let v = builder.ins().stack_load(types::I64, regs[*reg as usize], 0);
-                let mask: u64 = if *width >= 64 { u64::MAX } else { (1u64 << *width) - 1 };
+                let mask: u64 = if *width >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << *width) - 1
+                };
                 let mc = builder.ins().iconst(types::I64, mask as i64);
                 let masked = builder.ins().band(v, mc);
                 builder.ins().stack_store(masked, regs[*reg as usize], 0);
             }
             BitSelect(dest, base, idx) => {
                 // dest = (base >> idx) & 1
-                let b = builder.ins().stack_load(types::I64, regs[*base as usize], 0);
+                let b = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*base as usize], 0);
                 let i = builder.ins().stack_load(types::I64, regs[*idx as usize], 0);
+                let shifted = builder.ins().ushr(b, i);
+                let one = builder.ins().iconst(types::I64, 1);
+                let result = builder.ins().band(shifted, one);
+                builder.ins().stack_store(result, regs[*dest as usize], 0);
+            }
+            BitSelectConst(dest, base, idx) => {
+                let b = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*base as usize], 0);
+                let i = builder.ins().iconst(types::I64, *idx as i64);
                 let shifted = builder.ins().ushr(b, i);
                 let one = builder.ins().iconst(types::I64, 1);
                 let result = builder.ins().band(shifted, one);
@@ -640,9 +856,15 @@ mod enabled {
                 // gives u64::MAX at width=64 thanks to x86/riscv's
                 // shift-amount-masked-to-low-bits semantics (which is
                 // also what cranelift's ushr lowers to).
-                let b = builder.ins().stack_load(types::I64, regs[*base as usize], 0);
-                let l = builder.ins().stack_load(types::I64, regs[*left_r as usize], 0);
-                let r = builder.ins().stack_load(types::I64, regs[*right_r as usize], 0);
+                let b = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*base as usize], 0);
+                let l = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*left_r as usize], 0);
+                let r = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*right_r as usize], 0);
                 let le = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, l, r);
                 let lsb = builder.ins().select(le, l, r);
                 let msb = builder.ins().select(le, r, l);
@@ -657,6 +879,33 @@ mod enabled {
                 let result = builder.ins().band(shifted, mask);
                 builder.ins().stack_store(result, regs[*dest as usize], 0);
             }
+            RangeSelectConst(dest, base, l_imm, r_imm) => {
+                let b = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*base as usize], 0);
+                let lsb = (*l_imm).min(*r_imm);
+                let msb = (*l_imm).max(*r_imm);
+                let width = msb - lsb + 1;
+                let shifted = builder.ins().ushr_imm(b, lsb as i64);
+                let mask: u64 = if width >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << width) - 1
+                };
+                let mc = builder.ins().iconst(types::I64, mask as i64);
+                let result = builder.ins().band(shifted, mc);
+                builder.ins().stack_store(result, regs[*dest as usize], 0);
+            }
+            LoadArrayElem(dest, name, idx_reg) => {
+                let pointer_type = builder.func.dfg.value_type(sim_ptr);
+                let name_ptr = builder.ins().iconst(pointer_type, name.as_ptr() as i64);
+                let idx = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*idx_reg as usize], 0);
+                let call = builder.ins().call(load_array_ref, &[sim_ptr, name_ptr, idx]);
+                let val = builder.inst_results(call)[0];
+                builder.ins().stack_store(val, regs[*dest as usize], 0);
+            }
             _ => return Err(()),
         }
         Ok(())
@@ -665,7 +914,9 @@ mod enabled {
     fn emit_cmp(
         builder: &mut FunctionBuilder,
         regs: &[StackSlot],
-        d: u16, l: u16, r: u16,
+        d: u16,
+        l: u16,
+        r: u16,
         cc: IntCC,
     ) {
         let lv = builder.ins().stack_load(types::I64, regs[l as usize], 0);
@@ -681,7 +932,9 @@ mod enabled {
     fn emit_binop(
         builder: &mut FunctionBuilder,
         regs: &[StackSlot],
-        d: u16, l: u16, r: u16,
+        d: u16,
+        l: u16,
+        r: u16,
         op: impl FnOnce(&mut FunctionBuilder, Value, Value) -> Value,
     ) {
         let lv = builder.ins().stack_load(types::I64, regs[l as usize], 0);
@@ -694,22 +947,52 @@ mod enabled {
     /// the CFG-construction code in `codegen_block`.
     fn is_supported(insn: &Insn) -> bool {
         use Insn::*;
-        matches!(insn,
-            LoadConst(..) | LoadSignal(..) | LoadSignalSigned(..)
-            | Move(..)
-            | BlockingAssign(..) | NbaAssign(..) | NbaAssignRange(..)
-            | Add(..) | Sub(..)
-            | BitAnd(..) | BitOr(..) | BitXor(..) | BitXnor(..) | BitNot(..)
-            | LogAnd(..) | LogOr(..) | LogNot(..)
-            | Negate(..)
-            | Eq(..) | Neq(..) | CaseEq(..) | Lt(..) | Leq(..) | Gt(..) | Geq(..)
-            | Shl(..) | Shr(..) | AShr(..)
-            | ReduceOr(..) | ReduceXor(..)
-            | SetSigned(..)
-            | Resize(..)
-            | BitSelect(..) | RangeSelect(..)
-            | BranchIfFalse(..) | Jump(..)
-            | Nop
+        matches!(
+            insn,
+            LoadConst(..)
+                | LoadSignal(..)
+                | LoadSignalSigned(..)
+                | Move(..)
+                | BlockingAssign(..)
+                | NbaAssign(..)
+                | NbaAssignRange(..)
+                | Add(..)
+                | Sub(..)
+                | Mul(..)
+                | BitAnd(..)
+                | BitOr(..)
+                | BitXor(..)
+                | BitXnor(..)
+                | BitNot(..)
+                | LogAnd(..)
+                | LogOr(..)
+                | LogNot(..)
+                | Negate(..)
+                | Eq(..)
+                | Neq(..)
+                | CaseEq(..)
+                | Lt(..)
+                | Leq(..)
+                | Gt(..)
+                | Geq(..)
+                | Shl(..)
+                | Shr(..)
+                | AShr(..)
+                | ReduceOr(..)
+                | ReduceXor(..)
+                | SetSigned(..)
+                | Resize(..)
+                | BitSelect(..)
+                | BitSelectConst(..)
+                | RangeSelect(..)
+                | RangeSelectConst(..)
+                | LoadArrayElem(..)
+                | BranchIfFalse(..)
+                | Jump(..)
+                | NbaAssignBitDyn(..)
+                | NbaAssignRangeDyn(..)
+                | BlockingAssignRangeDyn(..)
+                | Nop
         )
     }
 }

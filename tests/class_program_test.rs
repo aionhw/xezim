@@ -1,5 +1,4 @@
 use xezim::*;
-use xezim::ast::*;
 
 #[test]
 fn test_parse_class_program() {

@@ -1,4 +1,3 @@
-
 use xezim::simulate;
 
 #[test]

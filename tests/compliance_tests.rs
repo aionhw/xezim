@@ -1,11 +1,10 @@
 //! SV LRM compliance tests (unit tests for compiler components).
-use xezim::*;
-use xezim::ast::*;
-use xezim::ast::module::*;
 use xezim::ast::decl::*;
-use xezim::ast::types::*;
 use xezim::ast::expr::*;
+use xezim::ast::module::*;
 use xezim::ast::stmt::*;
+use xezim::ast::*;
+use xezim::*;
 
 fn parse_ok(source: &str) -> ParseResult {
     let result = xezim::parse_str(source);
@@ -44,7 +43,8 @@ fn test_lrm_6_2_data_types() {
 
 #[test]
 fn test_lrm_11_4_concatenation() {
-    let res = parse_ok("module top; logic [3:0] a, b; logic [7:0] c; initial c = {a, b}; endmodule");
+    let res =
+        parse_ok("module top; logic [3:0] a, b; logic [7:0] c; initial c = {a, b}; endmodule");
     let m = first_module(&res);
     // 0: logic [3:0] a, b; 1: logic [7:0] c; 2: initial ...
     if let ModuleItem::InitialConstruct(ic) = &m.items[2] {

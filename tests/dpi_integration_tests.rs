@@ -64,17 +64,29 @@ fn assert_dpi_pass(c_file: &str, stem: &str, sv_file: &str) {
 
 #[test]
 fn dpi_simple_test() {
-    assert_dpi_pass("tests/dpi/simple_dpi.c", "simple_dpi", "tests/dpi/simple_dpi_test.sv");
+    assert_dpi_pass(
+        "tests/dpi/simple_dpi.c",
+        "simple_dpi",
+        "tests/dpi/simple_dpi_test.sv",
+    );
 }
 
 #[test]
 fn dpi_extended_test() {
-    assert_dpi_pass("tests/dpi/extended_dpi.c", "extended_dpi", "tests/dpi/extended_dpi_test.sv");
+    assert_dpi_pass(
+        "tests/dpi/extended_dpi.c",
+        "extended_dpi",
+        "tests/dpi/extended_dpi_test.sv",
+    );
 }
 
 #[test]
 fn dpi_logic_vec_test() {
-    assert_dpi_pass("tests/dpi/logic_vec_dpi.c", "logic_vec_dpi", "tests/dpi/logic_vec_dpi_test.sv");
+    assert_dpi_pass(
+        "tests/dpi/logic_vec_dpi.c",
+        "logic_vec_dpi",
+        "tests/dpi/logic_vec_dpi_test.sv",
+    );
 }
 
 #[test]
@@ -88,5 +100,9 @@ fn dpi_shortreal_string_test() {
 
 #[test]
 fn dpi_open_array_test() {
-    assert_dpi_pass("tests/dpi/open_array_dpi.c", "open_array_dpi", "tests/dpi/open_array_dpi_test.sv");
+    assert_dpi_pass(
+        "tests/dpi/open_array_dpi.c",
+        "open_array_dpi",
+        "tests/dpi/open_array_dpi_test.sv",
+    );
 }

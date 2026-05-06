@@ -1,10 +1,10 @@
 //! Simulation tests for the SystemVerilog compiler/simulator.
 
-use xezim::{simulate, simulate_multi};
-use xezim::compiler::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+use xezim::compiler::Value;
+use xezim::{simulate, simulate_multi};
 
 fn sim_ok(src: &str) -> xezim::compiler::Simulator {
     match simulate(src, 100_000) {
@@ -30,6 +30,12 @@ fn sim_ok_plusargs(src: &str, plusargs: &[&str]) -> xezim::compiler::Simulator {
         false,
         &plusargs_vec,
         1,
+        None,
+        0,
+        "text",
+        None,
+        "debug",
+        None,
     ) {
         Ok(sim) => sim,
         Err(e) => panic!("Simulation failed: {}", e),
@@ -107,8 +113,7 @@ fn test_sim_readmemh_loads_array_data() {
             end
         endmodule
         ",
-        mem_path_sv,
-        out_path_sv
+        mem_path_sv, out_path_sv
     );
     let _sim = sim_ok(&src);
     let contents = fs::read_to_string(&out_path).expect("read readmemh output");
@@ -161,7 +166,8 @@ fn test_value_bitwise() {
 
 #[test]
 fn test_sim_assign_and() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic a, b, y;
             assign y = a & b;
@@ -173,14 +179,16 @@ fn test_sim_assign_and() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("y = 1"));
     assert!(sim.output[1].message.contains("y = 0"));
 }
 
 #[test]
 fn test_sim_assign_or() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic a, b, y;
             assign y = a | b;
@@ -190,14 +198,16 @@ fn test_sim_assign_or() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("0"));
     assert!(sim.output[1].message.contains("1"));
 }
 
 #[test]
 fn test_sim_assign_xor() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic a, b, y;
             assign y = a ^ b;
@@ -207,14 +217,16 @@ fn test_sim_assign_xor() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("0"));
     assert!(sim.output[1].message.contains("1"));
 }
 
 #[test]
 fn test_sim_not() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic a, y;
             assign y = ~a;
@@ -224,14 +236,16 @@ fn test_sim_not() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("1"));
     assert!(sim.output[1].message.contains("0"));
 }
 
 #[test]
 fn test_sim_multibit_add() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic [7:0] a, b, sum;
             assign sum = a + b;
@@ -241,13 +255,15 @@ fn test_sim_multibit_add() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("sum=155"));
 }
 
 #[test]
 fn test_sim_ternary_mux() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic sel;
             logic [7:0] a, b, y;
@@ -259,14 +275,16 @@ fn test_sim_ternary_mux() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("99"));
     assert!(sim.output[1].message.contains("42"));
 }
 
 #[test]
 fn test_sim_concatenation() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic [3:0] hi, lo;
             logic [7:0] out;
@@ -277,13 +295,15 @@ fn test_sim_concatenation() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("a5"));
 }
 
 #[test]
 fn test_sim_always_comb_case_mux() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic [1:0] sel;
             logic [7:0] a, b, c, d, y;
@@ -304,7 +324,8 @@ fn test_sim_always_comb_case_mux() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("y=10"));
     assert!(sim.output[1].message.contains("y=20"));
     assert!(sim.output[2].message.contains("y=30"));
@@ -313,7 +334,8 @@ fn test_sim_always_comb_case_mux() {
 
 #[test]
 fn test_sim_always_comb_if_else() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic [7:0] a, b, max_val;
             always_comb begin
@@ -326,14 +348,16 @@ fn test_sim_always_comb_if_else() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("max=50"));
     assert!(sim.output[1].message.contains("max=80"));
 }
 
 #[test]
 fn test_sim_chained_assign() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic [7:0] a, b, c;
             assign b = a + 1;
@@ -344,7 +368,8 @@ fn test_sim_chained_assign() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("a=5"));
     assert!(sim.output[0].message.contains("b=6"));
     assert!(sim.output[0].message.contains("c=12"));
@@ -352,7 +377,8 @@ fn test_sim_chained_assign() {
 
 #[test]
 fn test_sim_full_adder() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic a, b, cin, sum, cout;
             assign sum = a ^ b ^ cin;
@@ -365,7 +391,8 @@ fn test_sim_full_adder() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("s=0") && sim.output[0].message.contains("c=0"));
     assert!(sim.output[1].message.contains("s=1") && sim.output[1].message.contains("c=0"));
     assert!(sim.output[2].message.contains("s=0") && sim.output[2].message.contains("c=1"));
@@ -374,7 +401,8 @@ fn test_sim_full_adder() {
 
 #[test]
 fn test_sim_decoder_2to4() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic [1:0] in_val;
             logic [3:0] out_val;
@@ -387,7 +415,8 @@ fn test_sim_decoder_2to4() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("out=0001"));
     assert!(sim.output[1].message.contains("out=0010"));
     assert!(sim.output[2].message.contains("out=0100"));
@@ -425,7 +454,8 @@ fn test_sim_comparison_ops() {
 
 #[test]
 fn test_sim_for_loop_display() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             initial begin
                 for (int i = 0; i < 4; i++) begin
@@ -434,7 +464,8 @@ fn test_sim_for_loop_display() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert_eq!(sim.output.len(), 4);
     assert!(sim.output[0].message.contains("i=0"));
     assert!(sim.output[3].message.contains("i=3"));
@@ -442,7 +473,8 @@ fn test_sim_for_loop_display() {
 
 #[test]
 fn test_sim_shift_operations() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic [7:0] a, shl, shr;
             assign shl = a << 2;
@@ -453,14 +485,16 @@ fn test_sim_shift_operations() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("shl=00110000"));
     assert!(sim.output[0].message.contains("shr=00000110"));
 }
 
 #[test]
 fn test_sim_alu() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic [7:0] a, b, result;
             logic [2:0] op;
@@ -484,14 +518,16 @@ fn test_sim_alu() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("ADD: 25"));
     assert!(sim.output[1].message.contains("SUB: 5"));
 }
 
 #[test]
 fn test_sim_display_hex() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic [15:0] val;
             initial begin
@@ -500,14 +536,16 @@ fn test_sim_display_hex() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("hex=dead"));
     assert!(sim.output[0].message.contains("dec=57005"));
 }
 
 #[test]
 fn test_sim_time_display() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             initial begin
                 $display(\"t=%0t\", $time);
@@ -518,13 +556,15 @@ fn test_sim_time_display() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert_eq!(sim.output.len(), 3);
 }
 
 #[test]
 fn test_sim_finish_stops() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             initial begin
                 $display(\"before\");
@@ -532,7 +572,8 @@ fn test_sim_finish_stops() {
                 $display(\"after\");
             end
         endmodule
-    ");
+    ",
+    );
     assert_eq!(sim.output.len(), 1);
     assert!(sim.output[0].message.contains("before"));
 }
@@ -543,7 +584,8 @@ fn test_sim_finish_stops() {
 
 #[test]
 fn test_sim_dff_posedge() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic clk, d, q;
             always_ff @(posedge clk) q <= d;
@@ -555,13 +597,15 @@ fn test_sim_dff_posedge() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("q=1"));
 }
 
 #[test]
 fn test_sim_dff_with_reset() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic clk, rst_n;
             logic [7:0] q;
@@ -580,13 +624,15 @@ fn test_sim_dff_with_reset() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("q=3"));
 }
 
 #[test]
 fn test_sim_counter_posedge() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic clk;
             logic [3:0] count;
@@ -602,14 +648,16 @@ fn test_sim_counter_posedge() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("count=4"));
 }
 
 #[test]
 fn test_sim_nba_deferred() {
     // Non-blocking assigns should be deferred: both read old values
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic clk;
             logic [7:0] a, b;
@@ -625,7 +673,8 @@ fn test_sim_nba_deferred() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     // Both read old values: a gets old b (20), b gets old a (10) — swap!
     assert!(sim.output[0].message.contains("a=20"));
     assert!(sim.output[0].message.contains("b=10"));
@@ -634,7 +683,8 @@ fn test_sim_nba_deferred() {
 #[test]
 fn test_sim_blocking_vs_nonblocking() {
     // Blocking: sequential in same always block
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic clk;
             logic [7:0] x, y;
@@ -651,7 +701,8 @@ fn test_sim_blocking_vs_nonblocking() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     // After 2 posedges: x goes 0->1->2, y gets old x: 0->0->1
     assert!(sim.output[0].message.contains("x=2"));
     assert!(sim.output[0].message.contains("y=1"));
@@ -659,7 +710,8 @@ fn test_sim_blocking_vs_nonblocking() {
 
 #[test]
 fn test_sim_clock_forever() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic clk;
             logic [3:0] count;
@@ -674,14 +726,16 @@ fn test_sim_clock_forever() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     // Posedges at t=5,15,25,35,45 = 5 posedges
     assert!(sim.output[0].message.contains("count=5"));
 }
 
 #[test]
 fn test_sim_shift_register() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic clk, din;
             logic [3:0] sr;
@@ -699,13 +753,15 @@ fn test_sim_shift_register() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("sr=1001"));
 }
 
 #[test]
 fn test_sim_negedge() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module test;
             logic clk;
             logic [3:0] count;
@@ -720,7 +776,8 @@ fn test_sim_negedge() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     assert!(sim.output[0].message.contains("count=2"));
 }
 
@@ -734,7 +791,8 @@ fn test_sim_negedge() {
 // signal width when bounds aren't const-evaluable.
 #[test]
 fn test_sim_param_slice_bitand_reduce_or() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module dut(
             input  [7:0] a,
             input  [7:0] b,
@@ -757,15 +815,36 @@ fn test_sim_param_slice_bitand_reduce_or() {
                 $finish;
             end
         endmodule
-    ");
-    assert!(sim.output[0].message.contains("y=1"), "bit 0 set: {}", sim.output[0].message);
-    assert!(sim.output[1].message.contains("y=0"), "all zero: {}", sim.output[1].message);
+    ",
+    );
+    assert!(
+        sim.output[0].message.contains("y=1"),
+        "bit 0 set: {}",
+        sim.output[0].message
+    );
+    assert!(
+        sim.output[1].message.contains("y=0"),
+        "all zero: {}",
+        sim.output[1].message
+    );
     // Pre-fix bug: bit 1 set returned y=0 instead of 1.
-    assert!(sim.output[2].message.contains("y=1"), "bit 1 set: {}", sim.output[2].message);
+    assert!(
+        sim.output[2].message.contains("y=1"),
+        "bit 1 set: {}",
+        sim.output[2].message
+    );
     // Pre-fix bug: bit 7 set returned y=0 instead of 1.
-    assert!(sim.output[3].message.contains("y=1"), "bit 7 set: {}", sim.output[3].message);
+    assert!(
+        sim.output[3].message.contains("y=1"),
+        "bit 7 set: {}",
+        sim.output[3].message
+    );
     // Mismatched bits -> AND=0 -> y=0 (correctness check on the fix).
-    assert!(sim.output[4].message.contains("y=0"), "non-overlap: {}", sim.output[4].message);
+    assert!(
+        sim.output[4].message.contains("y=0"),
+        "non-overlap: {}",
+        sim.output[4].message
+    );
 }
 
 // Regression: 3-operand bit-AND with parameter-bounded slices on all three
@@ -773,7 +852,8 @@ fn test_sim_param_slice_bitand_reduce_or() {
 //   `assign pop_req = |(pop_ptr[N-1:0] & counter_done[N-1:0] & entry_vld[N-1:0])`).
 #[test]
 fn test_sim_param_slice_3way_reduce_or() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module dut(
             input  [7:0] a, b, c,
             output       y
@@ -792,9 +872,18 @@ fn test_sim_param_slice_3way_reduce_or() {
                 $finish;
             end
         endmodule
-    ");
-    assert!(sim.output[0].message.contains("y=1"), "3-way bit 1: {}", sim.output[0].message);
-    assert!(sim.output[1].message.contains("y=0"), "3-way zero: {}", sim.output[1].message);
+    ",
+    );
+    assert!(
+        sim.output[0].message.contains("y=1"),
+        "3-way bit 1: {}",
+        sim.output[0].message
+    );
+    assert!(
+        sim.output[1].message.contains("y=0"),
+        "3-way zero: {}",
+        sim.output[1].message
+    );
 }
 
 // Regression: parameter arithmetic in slice bounds — `[N+1:N-1]`, `[N*2-1:0]`,
@@ -802,7 +891,8 @@ fn test_sim_param_slice_3way_reduce_or() {
 // BitXor + unary +/-/~. Each must compute the right slice width.
 #[test]
 fn test_sim_param_arith_slice_widths() {
-    let sim = sim_ok("
+    let sim = sim_ok(
+        "
         module dut(
             input  [15:0] x,
             output [3:0]  s_sub,    // x[N-1:N-4]   width 4
@@ -827,7 +917,8 @@ fn test_sim_param_arith_slice_widths() {
                 $finish;
             end
         endmodule
-    ");
+    ",
+    );
     // x = 0xABCD = 1010_1011_1100_1101
     //   N=8, x[7:4]   = 0xC (sub)
     //   x[11:8]       = 0xB (add)

@@ -15,12 +15,20 @@ fn insn_size_fits_cache_line() {
     // boxes), the enum sits at 24 B. Going back to 32 B is a 33%
     // bytecode-footprint regression on dense designs — investigate
     // which variant got fat.
-    assert!(sz <= 24, "Insn enum grew to {} B (max-variant needs a Box?)", sz);
+    assert!(
+        sz <= 24,
+        "Insn enum grew to {} B (max-variant needs a Box?)",
+        sz
+    );
 }
 
 #[test]
 fn value_size_bounded() {
     let sz = std::mem::size_of::<Value>();
     eprintln!("size_of Value = {}", sz);
-    assert!(sz <= 32, "Value grew to {} B (A1 candidate: strip is_signed/is_real)", sz);
+    assert!(
+        sz <= 32,
+        "Value grew to {} B (A1 candidate: strip is_signed/is_real)",
+        sz
+    );
 }

@@ -7,8 +7,10 @@ fn proc_kb(path: &str, key: &str) -> Option<u64> {
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix(key) {
             // expect "<key>: <num> kB"
-            return rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace())
-                .split_whitespace().next()
+            return rest
+                .trim_start_matches(|c: char| c == ':' || c.is_whitespace())
+                .split_whitespace()
+                .next()
                 .and_then(|n| n.parse::<u64>().ok());
         }
     }
@@ -43,7 +45,9 @@ fn spawn_memory_watchdog() {
                     // SIGKILL self — bypasses panic handlers, no Drop runs,
                     // but ensures the process actually exits even if a thread
                     // is stuck inside a long allocation.
-                    unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
                     // Fallback if libc isn't available somehow.
                     std::process::exit(137);
                 }
@@ -73,6 +77,13 @@ fn print_usage() {
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
     eprintln!("                   n>=2 offloads VCD/AITRACE dumping and stdout");
     eprintln!("                   writes to background threads.");
+    eprintln!("  --xtrace <file>  Emit XTrace v1.1 dump to <file>");
+    eprintln!("  --xtrace-format <text>  XTrace output format (binary reserved)");
+    eprintln!("  --xtrace-profile <name> XTrace profile header value");
+    eprintln!("  --xtrace-signals <debug|all>  XTrace signal set (default: debug)");
+    eprintln!("  --xtrace-compress <none|zstd> XTrace compression");
+    eprintln!("  --xtrace-level <0>      XTrace level (higher levels reserved)");
+    eprintln!("  +fst             Convert $dumpfile VCD output to FST via vcd2fst");
     eprintln!("Compatibility:");
     eprintln!("  -Ifoo, -DNAME=V  Accepted");
     eprintln!("  +incdir+dir1+dir2 / +define+FOO=1+BAR Accepted");
@@ -138,11 +149,14 @@ fn preprocess_sources(
         pp.add_include_dir(std::path::PathBuf::from(dir));
     }
     for (name, val) in defines {
-        pp.define(name.clone(), xezim::preprocessor::MacroDef {
-            name: name.clone(),
-            params: None,
-            body: val.clone().unwrap_or_default(),
-        });
+        pp.define(
+            name.clone(),
+            xezim::preprocessor::MacroDef {
+                name: name.clone(),
+                params: None,
+                body: val.clone().unwrap_or_default(),
+            },
+        );
     }
 
     let mut preprocessed = Vec::with_capacity(sources.len());
@@ -255,7 +269,14 @@ fn process_command_file(
                     i += 1;
                     if i < toks.len() {
                         let nested = resolve_rel(base, &toks[i]);
-                        process_command_file(&nested, source_files, include_dirs, defines, lib_dirs, plusargs)?;
+                        process_command_file(
+                            &nested,
+                            source_files,
+                            include_dirs,
+                            defines,
+                            lib_dirs,
+                            plusargs,
+                        )?;
                     }
                 }
                 _ if t.starts_with("-I") && t.len() > 2 => {
@@ -271,7 +292,14 @@ fn process_command_file(
                 }
                 _ if t.starts_with("-f") && t.len() > 2 => {
                     let nested = resolve_rel(base, &t[2..]);
-                    process_command_file(&nested, source_files, include_dirs, defines, lib_dirs, plusargs)?;
+                    process_command_file(
+                        &nested,
+                        source_files,
+                        include_dirs,
+                        defines,
+                        lib_dirs,
+                        plusargs,
+                    )?;
                 }
                 _ if t.starts_with("+incdir+") => {
                     push_plus_incdir(t, include_dirs, lib_dirs);
@@ -308,7 +336,11 @@ fn main() {
     let mut dump_tokens = false;
     let mut dump_ast = false;
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Mode { Parse, Compile, Simulate }
+    enum Mode {
+        Parse,
+        Compile,
+        Simulate,
+    }
     let mut mode: Mode = Mode::Simulate;
     let mut mode_explicit = false;
     let mut verbose = false;
@@ -320,6 +352,12 @@ fn main() {
     let mut sdf_file: Option<String> = None;
     let mut sdf_select: Option<xezim::compiler::sdf::DelaySelect> = None;
     let mut aitrace = false;
+    let mut xtrace_file: Option<String> = None;
+    let mut xtrace_level: u8 = 0;
+    let mut xtrace_format = "text".to_string();
+    let mut xtrace_profile: Option<String> = None;
+    let mut xtrace_signals = "debug".to_string();
+    let mut xtrace_compress: Option<String> = None;
     let mut sim_debug = false;
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut plusargs: Vec<String> = Vec::new();
@@ -332,10 +370,15 @@ fn main() {
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
-            "-h" | "--help" => { print_usage(); std::process::exit(0); }
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
             "-I" => {
                 i += 1;
-                if i < args.len() { include_dirs.push(args[i].clone()); }
+                if i < args.len() {
+                    include_dirs.push(args[i].clone());
+                }
             }
             _ if arg.starts_with("-I") && arg.len() > 2 => {
                 include_dirs.push(arg[2..].to_string());
@@ -351,21 +394,27 @@ fn main() {
             }
             "-o" => {
                 i += 1;
-                if i < args.len() { _output_file = Some(args[i].clone()); }
+                if i < args.len() {
+                    _output_file = Some(args[i].clone());
+                }
             }
             _ if arg.starts_with("-o") && arg.len() > 2 => {
                 _output_file = Some(arg[2..].to_string());
             }
             "-l" => {
                 i += 1;
-                if i < args.len() { log_file = Some(args[i].clone()); }
+                if i < args.len() {
+                    log_file = Some(args[i].clone());
+                }
             }
             _ if arg.starts_with("-l") && arg.len() > 2 => {
                 log_file = Some(arg[2..].to_string());
             }
             "-s" => {
                 i += 1;
-                if i < args.len() { top_module = Some(args[i].clone()); }
+                if i < args.len() {
+                    top_module = Some(args[i].clone());
+                }
             }
             _ if arg.starts_with("-s") && arg.len() > 2 => {
                 top_module = Some(arg[2..].to_string());
@@ -373,21 +422,44 @@ fn main() {
             "-c" | "-f" => {
                 i += 1;
                 if i < args.len() {
-                    match process_command_file(&args[i], &mut source_files, &mut include_dirs, &mut defines, &mut lib_dirs, &mut plusargs) {
+                    match process_command_file(
+                        &args[i],
+                        &mut source_files,
+                        &mut include_dirs,
+                        &mut defines,
+                        &mut lib_dirs,
+                        &mut plusargs,
+                    ) {
                         Ok(()) => {}
-                        Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
             _ if arg.starts_with("-f") && arg.len() > 2 => {
-                match process_command_file(&arg[2..], &mut source_files, &mut include_dirs, &mut defines, &mut lib_dirs, &mut plusargs) {
+                match process_command_file(
+                    &arg[2..],
+                    &mut source_files,
+                    &mut include_dirs,
+                    &mut defines,
+                    &mut lib_dirs,
+                    &mut plusargs,
+                ) {
                     Ok(()) => {}
-                    Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
                 }
             }
             "-y" => {
                 i += 1;
-                if i < args.len() { lib_dirs.push(args[i].clone()); include_dirs.push(args[i].clone()); }
+                if i < args.len() {
+                    lib_dirs.push(args[i].clone());
+                    include_dirs.push(args[i].clone());
+                }
             }
             _ if arg.starts_with("-y") && arg.len() > 2 => {
                 lib_dirs.push(arg[2..].to_string());
@@ -395,7 +467,10 @@ fn main() {
             }
             "--lib" => {
                 i += 1;
-                if i < args.len() { lib_dirs.push(args[i].clone()); include_dirs.push(args[i].clone()); }
+                if i < args.len() {
+                    lib_dirs.push(args[i].clone());
+                    include_dirs.push(args[i].clone());
+                }
             }
             _ if arg.starts_with("+incdir+") => {
                 push_plus_incdir(arg, &mut include_dirs, &mut lib_dirs);
@@ -406,28 +481,49 @@ fn main() {
             _ if arg.starts_with('+') => {
                 plusargs.push(arg.clone());
             }
-            "-v" => { verbose = true; }
-            "-V" => { print_version(); std::process::exit(0); }
+            "-v" => {
+                verbose = true;
+            }
+            "-V" => {
+                print_version();
+                std::process::exit(0);
+            }
             "--parse" => {
                 if mode_explicit && mode != Mode::Parse {
-                    eprintln!("Error: --parse conflicts with previously set mode"); std::process::exit(1);
+                    eprintln!("Error: --parse conflicts with previously set mode");
+                    std::process::exit(1);
                 }
-                mode = Mode::Parse; mode_explicit = true;
+                mode = Mode::Parse;
+                mode_explicit = true;
             }
             "--compile" | "--no-sim" => {
                 if mode_explicit && mode != Mode::Compile {
-                    eprintln!("Error: --compile conflicts with previously set mode"); std::process::exit(1);
+                    eprintln!("Error: --compile conflicts with previously set mode");
+                    std::process::exit(1);
                 }
-                mode = Mode::Compile; mode_explicit = true;
+                mode = Mode::Compile;
+                mode_explicit = true;
             }
             "--simulate" => {
                 if mode_explicit && mode != Mode::Simulate {
-                    eprintln!("Error: --simulate conflicts with previously set mode"); std::process::exit(1);
+                    eprintln!("Error: --simulate conflicts with previously set mode");
+                    std::process::exit(1);
                 }
-                mode = Mode::Simulate; mode_explicit = true;
+                mode = Mode::Simulate;
+                mode_explicit = true;
             }
-            "--dump-tokens" => { dump_tokens = true; if !mode_explicit { mode = Mode::Parse; } }
-            "--dump-ast" => { dump_ast = true; if !mode_explicit { mode = Mode::Parse; } }
+            "--dump-tokens" => {
+                dump_tokens = true;
+                if !mode_explicit {
+                    mode = Mode::Parse;
+                }
+            }
+            "--dump-ast" => {
+                dump_ast = true;
+                if !mode_explicit {
+                    mode = Mode::Parse;
+                }
+            }
             "--max-time" => {
                 i += 1;
                 if i < args.len() {
@@ -440,16 +536,84 @@ fn main() {
                     settle_limit = Some(args[i].parse().unwrap_or(100));
                 }
             }
-            "--activity-mon" => { activity_mon = true; }
+            "--activity-mon" => {
+                activity_mon = true;
+            }
             "--sdf" => {
                 i += 1;
-                if i < args.len() { sdf_file = Some(args[i].clone()); }
+                if i < args.len() {
+                    sdf_file = Some(args[i].clone());
+                }
             }
-            "--sdf-min" => { sdf_select = Some(xezim::compiler::sdf::DelaySelect::Min); }
-            "--sdf-typ" => { sdf_select = Some(xezim::compiler::sdf::DelaySelect::Typ); }
-            "--sdf-max" => { sdf_select = Some(xezim::compiler::sdf::DelaySelect::Max); }
-            "--aitrace" => { aitrace = true; }
-            "--sim_debug" => { sim_debug = true; }
+            "--sdf-min" => {
+                sdf_select = Some(xezim::compiler::sdf::DelaySelect::Min);
+            }
+            "--sdf-typ" => {
+                sdf_select = Some(xezim::compiler::sdf::DelaySelect::Typ);
+            }
+            "--sdf-max" => {
+                sdf_select = Some(xezim::compiler::sdf::DelaySelect::Max);
+            }
+            "--aitrace" => {
+                aitrace = true;
+            }
+            "--xtrace" => {
+                i += 1;
+                if i < args.len() {
+                    xtrace_file = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--xtrace=") => {
+                xtrace_file = Some(arg["--xtrace=".len()..].to_string());
+            }
+            "--xtrace-level" => {
+                i += 1;
+                if i < args.len() {
+                    xtrace_level = args[i].parse().unwrap_or(0);
+                }
+            }
+            _ if arg.starts_with("--xtrace-level=") => {
+                xtrace_level = arg["--xtrace-level=".len()..].parse().unwrap_or(0);
+            }
+            "--xtrace-format" => {
+                i += 1;
+                if i < args.len() {
+                    xtrace_format = args[i].clone();
+                }
+            }
+            _ if arg.starts_with("--xtrace-format=") => {
+                xtrace_format = arg["--xtrace-format=".len()..].to_string();
+            }
+            "--xtrace-profile" => {
+                i += 1;
+                if i < args.len() {
+                    xtrace_profile = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--xtrace-profile=") => {
+                xtrace_profile = Some(arg["--xtrace-profile=".len()..].to_string());
+            }
+            "--xtrace-signals" => {
+                i += 1;
+                if i < args.len() {
+                    xtrace_signals = args[i].clone();
+                }
+            }
+            _ if arg.starts_with("--xtrace-signals=") => {
+                xtrace_signals = arg["--xtrace-signals=".len()..].to_string();
+            }
+            "--xtrace-compress" => {
+                i += 1;
+                if i < args.len() {
+                    xtrace_compress = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--xtrace-compress=") => {
+                xtrace_compress = Some(arg["--xtrace-compress=".len()..].to_string());
+            }
+            "--sim_debug" => {
+                sim_debug = true;
+            }
             "--threads" => {
                 i += 1;
                 if i < args.len() {
@@ -461,7 +625,9 @@ fn main() {
             }
             "--dpi-lib" => {
                 i += 1;
-                if i < args.len() { dpi_libs.push(args[i].clone()); }
+                if i < args.len() {
+                    dpi_libs.push(args[i].clone());
+                }
             }
             _ if arg.starts_with('-') => {
                 eprintln!("Warning: unknown flag '{}' (ignored)", arg);
@@ -485,12 +651,48 @@ fn main() {
             std::process::exit(1);
         }
     }
+    if xtrace_level != 0 {
+        eprintln!(
+            "Warning: --xtrace-level {} is reserved; emitting level 0 signal deltas",
+            xtrace_level
+        );
+        xtrace_level = 0;
+    }
+    if xtrace_format != "text" {
+        eprintln!(
+            "Warning: --xtrace-format '{}' is reserved; emitting text",
+            xtrace_format
+        );
+        xtrace_format = "text".to_string();
+    }
+    if xtrace_signals != "debug" && xtrace_signals != "all" {
+        eprintln!(
+            "Warning: --xtrace-signals '{}' is unknown; using debug",
+            xtrace_signals
+        );
+        xtrace_signals = "debug".to_string();
+    }
+    if xtrace_compress.as_deref() == Some("none") {
+        xtrace_compress = None;
+    }
+    if let Some(ref c) = xtrace_compress {
+        if c != "zstd" {
+            eprintln!(
+                "Warning: --xtrace-compress '{}' is unknown; writing uncompressed text",
+                c
+            );
+            xtrace_compress = None;
+        }
+    }
 
     // Fast path: if the only source file is a xezim compiled artifact, load
     // it and jump straight to simulation (skip parse + elaborate).
     if source_files.len() == 1 && mode == Mode::Simulate {
         let sf = &source_files[0];
-        if let Ok(head) = std::fs::read(sf).as_ref().map(|v| v.iter().take(8).copied().collect::<Vec<u8>>()) {
+        if let Ok(head) = std::fs::read(sf)
+            .as_ref()
+            .map(|v| v.iter().take(8).copied().collect::<Vec<u8>>())
+        {
             if head.len() == 8 && &head[..] == xezim::XEZIM_BYTECODE_MAGIC {
                 match xezim::read_compiled(sf) {
                     Ok(Some(elab)) => {
@@ -498,18 +700,44 @@ fn main() {
                         println!("Loaded compiled: {}", sf);
                         println!("Max time: {}", max_time);
                         println!("------------------------------");
+                        let total_start = std::time::Instant::now();
                         xezim::compiler::simulator::set_sim_debug(sim_debug);
                         xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
                         let mut sim = xezim::compiler::Simulator::new(elab, max_time);
-                        if let Some(limit) = settle_limit { sim.settle_limit = limit; }
+                        if let Some(limit) = settle_limit {
+                            sim.settle_limit = limit;
+                        }
                         sim.activity_mon = activity_mon;
                         sim.aitrace_mode = aitrace;
+                        sim.xtrace_file = xtrace_file.clone();
+                        sim.xtrace_level = xtrace_level;
+                        sim.xtrace_format = xtrace_format.clone();
+                        sim.xtrace_profile = xtrace_profile.clone();
+                        sim.xtrace_signal_policy = xtrace_signals.clone();
+                        sim.xtrace_compress = xtrace_compress.clone();
                         sim.set_plusargs(&plusargs);
                         sim.set_threads(threads);
-                        sim.run();
+                        let compilation_start = std::time::Instant::now();
+                        sim.compile();
+                        eprintln!(
+                            "[PHASE] compilation: {:.1}ms",
+                            compilation_start.elapsed().as_secs_f64() * 1000.0
+                        );
+                        let simulation_start = std::time::Instant::now();
+                        sim.simulate();
+                        eprintln!(
+                            "[PHASE] simulation: {:.1}ms",
+                            simulation_start.elapsed().as_secs_f64() * 1000.0
+                        );
+                        eprintln!(
+                            "[PHASE] total: {:.1}ms",
+                            total_start.elapsed().as_secs_f64() * 1000.0
+                        );
                         println!("------------------------------");
                         println!("Simulation finished at time {}", sim.time);
-                        if sim.finished { println!("($finish called)"); }
+                        if sim.finished {
+                            println!("($finish called)");
+                        }
                         return;
                     }
                     Ok(None) => {}
@@ -542,21 +770,29 @@ fn main() {
         }
     }
 
-    let preprocessed_sources = match preprocess_sources(&sources, &source_files, &include_dirs, &defines) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Error: preprocessing failed: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let preprocessed_sources =
+        match preprocess_sources(&sources, &source_files, &include_dirs, &defines) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error: preprocessing failed: {}", e);
+                std::process::exit(1);
+            }
+        };
 
     if mode == Mode::Parse {
         if dump_tokens {
-            for (_i, (label, source)) in file_labels.iter().zip(preprocessed_sources.iter()).enumerate() {
+            for (_i, (label, source)) in file_labels
+                .iter()
+                .zip(preprocessed_sources.iter())
+                .enumerate()
+            {
                 println!("=== Tokens: {} ===", label);
                 let tokens = xezim::tokenize_file(source, None);
                 for tok in &tokens {
-                    println!("{:?} '{}' @ {}..{}", tok.kind, tok.text, tok.span.start, tok.span.end);
+                    println!(
+                        "{:?} '{}' @ {}..{}",
+                        tok.kind, tok.text, tok.span.start, tok.span.end
+                    );
                 }
             }
         }
@@ -568,21 +804,37 @@ fn main() {
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
             let diags = parser.diagnostics().to_vec();
-            for err in diags.iter().filter(|d| d.severity == xezim::diagnostics::Severity::Error) {
+            for err in diags
+                .iter()
+                .filter(|d| d.severity == xezim::diagnostics::Severity::Error)
+            {
                 let (line, col) = byte_to_line_col(source, err.span.start);
                 eprintln!("[{}] {}:{}: error: {}", label, line, col, err.message);
             }
             total_desc += source_ast.descriptions.len();
-            total_err += diags.iter().filter(|d| d.severity == xezim::diagnostics::Severity::Error).count();
-            total_warn += diags.iter().filter(|d| d.severity == xezim::diagnostics::Severity::Warning).count();
+            total_err += diags
+                .iter()
+                .filter(|d| d.severity == xezim::diagnostics::Severity::Error)
+                .count();
+            total_warn += diags
+                .iter()
+                .filter(|d| d.severity == xezim::diagnostics::Severity::Warning)
+                .count();
             if dump_ast {
                 println!("=== AST: {} ===", label);
                 println!("{:#?}", source_ast);
             }
         }
-        println!("Parsed {} file(s): {} descriptions, {} errors, {} warnings",
-            preprocessed_sources.len(), total_desc, total_err, total_warn);
-        if total_err > 0 { std::process::exit(1); }
+        println!(
+            "Parsed {} file(s): {} descriptions, {} errors, {} warnings",
+            preprocessed_sources.len(),
+            total_desc,
+            total_err,
+            total_warn
+        );
+        if total_err > 0 {
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -596,19 +848,41 @@ fn main() {
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
             let diags = parser.diagnostics().to_vec();
-            for err in diags.iter().filter(|d| d.severity == xezim::diagnostics::Severity::Error) {
+            for err in diags
+                .iter()
+                .filter(|d| d.severity == xezim::diagnostics::Severity::Error)
+            {
                 let (line, col) = byte_to_line_col(source, err.span.start);
                 eprintln!("[{}] {}:{}: error: {}", label, line, col, err.message);
             }
             total_desc += source_ast.descriptions.len();
-            total_err += diags.iter().filter(|d| d.severity == xezim::diagnostics::Severity::Error).count();
-            total_warn += diags.iter().filter(|d| d.severity == xezim::diagnostics::Severity::Warning).count();
+            total_err += diags
+                .iter()
+                .filter(|d| d.severity == xezim::diagnostics::Severity::Error)
+                .count();
+            total_warn += diags
+                .iter()
+                .filter(|d| d.severity == xezim::diagnostics::Severity::Warning)
+                .count();
         }
-        println!("Parsed {} file(s): {} descriptions, {} errors, {} warnings",
-            preprocessed_sources.len(), total_desc, total_err, total_warn);
-        if total_err > 0 { std::process::exit(1); }
+        println!(
+            "Parsed {} file(s): {} descriptions, {} errors, {} warnings",
+            preprocessed_sources.len(),
+            total_desc,
+            total_err,
+            total_warn
+        );
+        if total_err > 0 {
+            std::process::exit(1);
+        }
 
-        match xezim::parse_and_elaborate_multi(&sources, top_module.as_deref(), &include_dirs, &source_files, &defines) {
+        match xezim::parse_and_elaborate_multi(
+            &sources,
+            top_module.as_deref(),
+            &include_dirs,
+            &source_files,
+            &defines,
+        ) {
             Ok((_defs, mut elab)) => {
                 println!("Elaboration successful");
                 if let Some(ref out) = _output_file {
@@ -619,7 +893,10 @@ fn main() {
                     elab.materialize_pending();
                     match xezim::write_compiled(&elab, out) {
                         Ok(()) => println!("Wrote compiled artifact to {}", out),
-                        Err(e) => { eprintln!("Error writing '{}': {}", out, e); std::process::exit(1); }
+                        Err(e) => {
+                            eprintln!("Error writing '{}': {}", out, e);
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
@@ -637,11 +914,33 @@ fn main() {
     xezim::compiler::simulator::set_sim_debug(sim_debug);
     xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
 
-    match xezim::simulate_multi(&sources, max_time, top_module.as_deref(), &include_dirs, &source_files, settle_limit, activity_mon, sdf_file.as_deref(), sdf_select, &defines, aitrace, &plusargs, threads) {
+    match xezim::simulate_multi(
+        &sources,
+        max_time,
+        top_module.as_deref(),
+        &include_dirs,
+        &source_files,
+        settle_limit,
+        activity_mon,
+        sdf_file.as_deref(),
+        sdf_select,
+        &defines,
+        aitrace,
+        &plusargs,
+        threads,
+        xtrace_file.as_deref(),
+        xtrace_level,
+        &xtrace_format,
+        xtrace_profile.as_deref(),
+        &xtrace_signals,
+        xtrace_compress.as_deref(),
+    ) {
         Ok(sim) => {
             println!("------------------------------");
             println!("Simulation finished at time {}", sim.time);
-            if sim.finished { println!("($finish called)"); }
+            if sim.finished {
+                println!("($finish called)");
+            }
         }
         Err(e) => {
             eprintln!("Simulation error: {}", e);
@@ -654,9 +953,15 @@ fn byte_to_line_col(source: &str, byte_offset: usize) -> (usize, usize) {
     let mut line = 1;
     let mut col = 1;
     for (i, ch) in source.char_indices() {
-        if i >= byte_offset { break; }
-        if ch == '\n' { line += 1; col = 1; }
-        else { col += 1; }
+        if i >= byte_offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
     }
     (line, col)
 }

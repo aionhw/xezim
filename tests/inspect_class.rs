@@ -1,5 +1,5 @@
-use xezim::*;
 use xezim::ast::*;
+use xezim::*;
 
 #[test]
 fn test_class_items() {

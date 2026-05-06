@@ -27,6 +27,13 @@ fi
 
 PGO_DATA=${PGO_DATA:-/tmp/xezim-pgo-data}
 LLVM_PROFDATA=$(find ~/.rustup -name 'llvm-profdata' 2>/dev/null | head -1)
+if [ -z "$LLVM_PROFDATA" ]; then
+    SYSROOT=$(rustc --print sysroot)
+    HOST=$(rustc -vV | sed -n 's/host: //p')
+    if [ -f "$SYSROOT/lib/rustlib/$HOST/bin/llvm-profdata" ]; then
+        LLVM_PROFDATA="$SYSROOT/lib/rustlib/$HOST/bin/llvm-profdata"
+    fi
+fi
 [ -z "$LLVM_PROFDATA" ] && {
     echo "error: llvm-profdata not found. Install via: rustup component add llvm-tools-preview" >&2
     exit 1

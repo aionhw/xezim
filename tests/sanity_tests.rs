@@ -1,6 +1,6 @@
-use xezim::*;
+use sv_parser::{parse, tokenize};
 use xezim::ast::*;
-use sv_parser::{tokenize, parse};
+use xezim::*;
 
 #[test]
 fn test_lex_empty() {
@@ -190,7 +190,8 @@ fn test_parse_parameters() {
 
 #[test]
 fn test_parse_typedef_enum_struct() {
-    let result = parse("module top; typedef enum {A, B} e_t; typedef struct { int x; } s_t; endmodule");
+    let result =
+        parse("module top; typedef enum {A, B} e_t; typedef struct { int x; } s_t; endmodule");
     assert!(result.errors.is_empty());
 }
 
@@ -233,7 +234,9 @@ fn test_parse_multiple_descriptions() {
 
 #[test]
 fn test_parse_function_task() {
-    let result = parse("module top; function int f(int x); return x; endfunction task t; #1; endtask endmodule");
+    let result = parse(
+        "module top; function int f(int x); return x; endfunction task t; #1; endtask endmodule",
+    );
     assert!(result.errors.is_empty());
     if let Description::Module(m) = &result.source.descriptions[0] {
         assert_eq!(m.items.len(), 2);
