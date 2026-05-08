@@ -921,6 +921,13 @@ pub struct Simulator {
     vcd_enabled: bool,
     vcd_last_time: u64,
     vcd_prev_signals: HashMap<String, Value>,
+    /// Optional scope/signal-name filters captured from `$dumpvars(level, sig...)`.
+    /// When non-empty, only signals whose hierarchical name starts with one of
+    /// these strings (or matches exactly) are emitted to the VCD.
+    vcd_filter_scopes: Vec<String>,
+    /// Pre-resolved id -> name mapping for filtered VCD signals.
+    /// Avoids iterating the full id_to_name (36M entries on c910) every cycle.
+    vcd_filtered_ids: Vec<usize>,
     /// Worker-thread count. >=2 routes VCD/AITRACE dumps through a
     /// background writer thread (see vcd_sink::VcdSink).
     threads: usize,
@@ -1410,6 +1417,11 @@ impl Simulator {
         // around as a stable shared Arc<""> for any remaining call sites
         // that want a borrow without unwrapping; not used in the loop.
         let _unnamed_arc: Arc<str> = Arc::from("");
+        // When XEZIM_INIT_ZERO=1, array elements (which use Value::new = all-X)
+        // also start at zero. c910 has memory-style PRF/AIQ/ROB arrays whose
+        // X-init leaks through the forwarding network; zeroing only `module.signals`
+        // (the prior behavior) is insufficient.
+        let array_init = if init_zero { Value::zero } else { Value::new };
         let push_elem_named = |name: String,
                                w: u32,
                                sig_table: &mut Vec<Value>,
@@ -1428,7 +1440,7 @@ impl Simulator {
             }
             // else: skip id_to_name push entirely — names Vec stays
             // shorter than signal_table for unnamed array elements.
-            sig_table.push(Value::new(w));
+            sig_table.push(array_init(w));
             widths_vec.push(w);
             signed_vec.push(false);
             real_vec.push(false);
@@ -1525,7 +1537,7 @@ impl Simulator {
                 // SoA vectors directly instead of formatting strings that will
                 // be discarded; array_first_id still gives each cell a stable
                 // contiguous signal_id.
-                signal_table.extend(std::iter::repeat(Value::new(w)).take(count));
+                signal_table.extend(std::iter::repeat(array_init(w)).take(count));
                 signal_widths_vec.extend(std::iter::repeat(w).take(count));
                 signal_signed_vec.extend(std::iter::repeat(false).take(count));
                 signal_real_vec.extend(std::iter::repeat(false).take(count));
@@ -1738,6 +1750,8 @@ impl Simulator {
             vcd_enabled: false,
             vcd_last_time: u64::MAX,
             vcd_prev_signals: HashMap::new(),
+            vcd_filter_scopes: Vec::new(),
+            vcd_filtered_ids: Vec::new(),
             threads: 1,
             stdout_sink: None,
             aitrace_mode: false,
@@ -4480,6 +4494,20 @@ impl Simulator {
                             | super::bytecode::Insn::NbaAssignRange(..)
                             | super::bytecode::Insn::NbaAssignRangeDyn(..)
                             | super::bytecode::Insn::BlockingAssignArray(..)
+                            // NbaAssignArray excluded: c910 cmark stalls
+                            // around sim 500k when blocks containing array
+                            // NBA writes (PRF, AIQ, ROB) execute in parallel.
+                            // Sequential dispatch via exec_insns shares
+                            // self.nba_fast_index across blocks so a later
+                            // block reading nba_fast_index for the same
+                            // array-element signal_id sees the prior
+                            // block's update; parallel exec_insns_isolated
+                            // each thread has only its local nba_out, so
+                            // cross-thread reads via the (separate, per-
+                            // signal) nba_fast_index disagree at apply
+                            // time. Hello passes (~no array writes); cmark
+                            // exercises this heavily.
+                            | super::bytecode::Insn::NbaAssignArray(..)
                             | super::bytecode::Insn::NbaAssignArrayRange(..)
                             | super::bytecode::Insn::BlockingAssignArrayRange(..)
                     )
@@ -8873,43 +8901,80 @@ impl Simulator {
                     all_nba = slots;
                     self.prof_par_dispatch_tbb += 1;
                 } else {
-                    std::thread::scope(|s| {
-                        let mut handles = Vec::new();
+                    // XEZIM_PARALLEL_SERIALIZE=1: run exec_insns_isolated
+                    // sequentially in the main thread (chunks processed in
+                    // spawn order). Diagnoses whether the parallel-mode
+                    // c910 stall is in exec_insns_isolated's behavior vs
+                    // multi-thread scheduling. If it still fails with this
+                    // set, the bug is in exec_insns_isolated itself.
+                    let serialize = std::env::var("XEZIM_PARALLEL_SERIALIZE").ok().as_deref()
+                        == Some("1");
+                    if serialize {
                         for chunk in chunks.iter() {
                             let chunk = chunk.as_slice();
-                            let handle = s.spawn(move || {
-                                let mut thread_nba: Vec<NbaFast> = Vec::new();
-                                let max_regs =
-                                    chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
-                                let mut vm_regs = vec![Value::zero(1); max_regs];
-                                for (bi, bs) in chunk {
-                                    if vm_regs.len() < bs.num_regs {
-                                        vm_regs.resize(bs.num_regs, Value::zero(1));
-                                    }
-                                    let insns = unsafe {
-                                        std::slice::from_raw_parts(bs.ptr, bs.len)
-                                    };
-                                    let mut nba = Self::exec_insns_isolated(
-                                        insns,
-                                        signal_table,
-                                        signal_signed,
-                                        signal_name_to_id,
-                                        array_first_id,
-                                        &mut vm_regs,
-                                        *bi as u32,
-                                    );
-                                    thread_nba.append(&mut nba);
+                            let mut thread_nba: Vec<NbaFast> = Vec::new();
+                            let max_regs =
+                                chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
+                            let mut vm_regs = vec![Value::zero(1); max_regs];
+                            for (bi, bs) in chunk {
+                                if vm_regs.len() < bs.num_regs {
+                                    vm_regs.resize(bs.num_regs, Value::zero(1));
                                 }
-                                thread_nba
-                            });
-                            handles.push(handle);
-                        }
-                        for h in handles {
-                            if let Ok(nba) = h.join() {
-                                all_nba.push(nba);
+                                let insns = unsafe {
+                                    std::slice::from_raw_parts(bs.ptr, bs.len)
+                                };
+                                let mut nba = Self::exec_insns_isolated(
+                                    insns,
+                                    signal_table,
+                                    signal_signed,
+                                    signal_name_to_id,
+                                    array_first_id,
+                                    &mut vm_regs,
+                                    *bi as u32,
+                                );
+                                thread_nba.append(&mut nba);
                             }
+                            all_nba.push(thread_nba);
                         }
-                    });
+                    } else {
+                        std::thread::scope(|s| {
+                            let mut handles = Vec::new();
+                            for chunk in chunks.iter() {
+                                let chunk = chunk.as_slice();
+                                let handle = s.spawn(move || {
+                                    let mut thread_nba: Vec<NbaFast> = Vec::new();
+                                    let max_regs =
+                                        chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
+                                    let mut vm_regs = vec![Value::zero(1); max_regs];
+                                    for (bi, bs) in chunk {
+                                        if vm_regs.len() < bs.num_regs {
+                                            vm_regs.resize(bs.num_regs, Value::zero(1));
+                                        }
+                                        let insns = unsafe {
+                                            std::slice::from_raw_parts(bs.ptr, bs.len)
+                                        };
+                                        let mut nba = Self::exec_insns_isolated(
+                                            insns,
+                                            signal_table,
+                                            signal_signed,
+                                            signal_name_to_id,
+                                            array_first_id,
+                                            &mut vm_regs,
+                                            *bi as u32,
+                                        );
+                                        thread_nba.append(&mut nba);
+                                    }
+                                    thread_nba
+                                });
+                                handles.push(handle);
+                            }
+                            for h in handles {
+                                if let Ok(nba) = h.join() {
+                                    all_nba.push(nba);
+                                }
+                            }
+                        });
+                    }
                 }
                 // Apply NBAs.
                 //
@@ -9188,21 +9253,13 @@ impl Simulator {
             // CompiledAlwaysBlock — avoid scope_hint.clone() and Instant::now()
             // on those paths. Only the AST fallback arms pay that cost.
             //
-            // ATTEMPTED OPT (REVERTED): prefetching entries[cur_list[cur_pos+8]]
-            // 8 iterations ahead gave c906 cmark a +31% wall-time win,
-            // but c910 t=1 k=0 hung at exact iters=200040 (same signature
-            // as the NBA-order bug). Bisect:
-            //   no-prefetch (baseline):                  c910 PASS
-            //   _mm_prefetch::<T0>(entries+pf_eidx):     c910 HANG
-            //   ptr::read::<u8>(&entries[pf_eidx].item): c910 HANG
-            //   black_box(pf_eidx) only (no load):       c910 PASS
-            // i.e. ANY actual byte read of entries[pf_eidx] is enough to
-            // break c910 — even though the read is a semantic no-op.
-            // c906 is fine, c910 deterministically diverges at the same
-            // sim point. Suggests latent UB / aliasing somewhere in
-            // settle that specific cache-state changes unmask. Don't
-            // re-enable without a deeper audit (e.g. `cargo miri` on a
-            // small repro).
+            // NOTE: A previous version added a single-stage `_mm_prefetch`
+            // on entries[cur_list[cur_pos+8]] which gave c906 cmark a
+            // 31% wall-time win. Reverted because c910 t=1 k=0 starts
+            // hanging at iters=200040 with the prefetch active despite
+            // the prefetch being a semantic no-op — likely a downstream
+            // cache-state interaction we haven't traced yet. Don't
+            // re-enable without a c910 t=1 k=0 + t=4 k=4 cmark sanity.
             let mut cur_pos = 0usize;
             while cur_pos < cur_list.len() {
                 let eidx = cur_list[cur_pos];
@@ -13057,6 +13114,24 @@ impl Simulator {
                 }
             }
             "$dumpvars" => {
+                // Collect optional scope/signal-name filter from args 1..N.
+                // arg[0] is depth (currently ignored — always treat as
+                // "all children"). args[1..] are scope or signal names.
+                // When non-empty, restrict the dump to signals whose
+                // resolved hierarchical name starts with one of these
+                // scopes (or matches a signal name exactly).
+                let mut filter_scopes: Vec<String> = Vec::new();
+                for a in args.iter().skip(1) {
+                    if let ExprKind::Ident(hier) = &a.kind {
+                        // Resolve to fully-qualified hierarchical name
+                        // by joining the hier path.
+                        let s = self.resolve_hier_name(hier);
+                        if !s.is_empty() {
+                            filter_scopes.push(s);
+                        }
+                    }
+                }
+                self.vcd_filter_scopes = filter_scopes;
                 if self.aitrace_mode {
                     self.aitrace_start_dump();
                 } else {
@@ -14168,9 +14243,44 @@ impl Simulator {
             super::vcd_sink::VcdSink::inline(file)
         };
 
-        // Collect and sort signal names for deterministic output
-        let mut sig_names: Vec<String> = self.signals.keys().cloned().collect();
+        // Collect and sort signal names for deterministic output.
+        // If `vcd_filter_scopes` is non-empty, only include signals whose
+        // hierarchical name matches one of the scopes (exact match or
+        // prefix match for scope arguments to $dumpvars).
+        let mut sig_names: Vec<String> = if self.vcd_filter_scopes.is_empty() {
+            self.signals.keys().cloned().collect()
+        } else {
+            let filters = self.vcd_filter_scopes.clone();
+            self.signals
+                .keys()
+                .filter(|name| {
+                    filters.iter().any(|f| {
+                        name.as_str() == f.as_str()
+                            || name.starts_with(&format!("{}.", f))
+                    })
+                })
+                .cloned()
+                .collect()
+        };
         sig_names.sort();
+        eprintln!("[VCD] dumping {} signals (filter_scopes={})",
+                  sig_names.len(), self.vcd_filter_scopes.len());
+        // Pre-resolve filtered names to id_to_name indices, so the per-cycle
+        // loop in vcd_write_changes can iterate just these instead of all 36M.
+        if !self.vcd_filter_scopes.is_empty() {
+            let wanted: std::collections::HashSet<&str> =
+                sig_names.iter().map(|s| s.as_str()).collect();
+            self.vcd_filtered_ids = self
+                .id_to_name
+                .iter()
+                .enumerate()
+                .filter_map(|(id, name)| {
+                    if wanted.contains(name.as_ref()) { Some(id) } else { None }
+                })
+                .collect();
+            eprintln!("[VCD] resolved {} signal-ids for fast per-cycle dump",
+                      self.vcd_filtered_ids.len());
+        }
 
         // Assign VCD identifier codes
         let mut id_map = HashMap::new();
@@ -14328,20 +14438,41 @@ impl Simulator {
             return;
         }
 
-        // Collect changes using signal_table (no HashMap sync needed)
+        // Collect changes using signal_table (no HashMap sync needed).
+        // FAST PATH: when filter is active, iterate just the pre-resolved
+        // vcd_filtered_ids instead of all 36M id_to_name entries.
         let mut changes: Vec<(String, Value)> = Vec::new();
-        for (id, name) in self.id_to_name.iter().enumerate() {
-            let name_str: &str = name.as_ref();
-            if let Some(vcd_id) = self.vcd_id_map.get(name_str) {
-                let val = &self.signal_table[id];
-                let changed = match self.vcd_prev_signals.get(name_str) {
-                    Some(prev) => prev != val,
-                    None => true,
-                };
-                if changed {
-                    changes.push((vcd_id.clone(), val.clone()));
-                    self.vcd_prev_signals
-                        .insert(name_str.to_string(), val.clone());
+        if !self.vcd_filtered_ids.is_empty() {
+            for &id in &self.vcd_filtered_ids {
+                let name = &self.id_to_name[id];
+                let name_str: &str = name.as_ref();
+                if let Some(vcd_id) = self.vcd_id_map.get(name_str) {
+                    let val = &self.signal_table[id];
+                    let changed = match self.vcd_prev_signals.get(name_str) {
+                        Some(prev) => prev != val,
+                        None => true,
+                    };
+                    if changed {
+                        changes.push((vcd_id.clone(), val.clone()));
+                        self.vcd_prev_signals
+                            .insert(name_str.to_string(), val.clone());
+                    }
+                }
+            }
+        } else {
+            for (id, name) in self.id_to_name.iter().enumerate() {
+                let name_str: &str = name.as_ref();
+                if let Some(vcd_id) = self.vcd_id_map.get(name_str) {
+                    let val = &self.signal_table[id];
+                    let changed = match self.vcd_prev_signals.get(name_str) {
+                        Some(prev) => prev != val,
+                        None => true,
+                    };
+                    if changed {
+                        changes.push((vcd_id.clone(), val.clone()));
+                        self.vcd_prev_signals
+                            .insert(name_str.to_string(), val.clone());
+                    }
                 }
             }
         }
