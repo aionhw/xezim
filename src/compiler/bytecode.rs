@@ -906,7 +906,22 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(r)
             }
             ExprKind::Unary { op, operand } => {
-                let src = self.compile_expr(operand, ctx_width)?;
+                // Reduction (&a, |a, ^a, ~&a, ~|a, ~^a) and logical-NOT (!a)
+                // are SELF-DETERMINED: operand keeps its natural width, the
+                // unary produces 1 bit. Passing parent ctx_width here would
+                // resize the operand and corrupt the reduction
+                // (e.g. zero-extending a 32-bit value to 64 makes &a = 0
+                // even when the 32-bit value was all 1s).
+                let operand_ctx = if matches!(op,
+                    UnaryOp::BitAnd | UnaryOp::BitNand
+                    | UnaryOp::BitOr  | UnaryOp::BitNor
+                    | UnaryOp::BitXor | UnaryOp::BitXnor
+                    | UnaryOp::LogNot) {
+                    0
+                } else {
+                    ctx_width
+                };
+                let src = self.compile_expr(operand, operand_ctx)?;
                 let dest = self.alloc_reg();
                 match op {
                     UnaryOp::Plus => return Some(src),
@@ -1815,11 +1830,8 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             }
             ExprKind::Unary { op, operand } => {
-                // Reduction operators (&a, |a, ^a, ~&a, ~|a, ~^a) and logical
-                // NOT (!a) always produce 1 bit regardless of operand width.
-                // Returning operand width here pollutes ctx_width on a
-                // sibling bitwise op via &&/|| (same bug class as the
-                // relational/logical Binary fix above).
+                // Self-determined unary: reductions and logical NOT all
+                // produce 1 bit regardless of operand width.
                 if matches!(op,
                     UnaryOp::BitAnd | UnaryOp::BitNand
                     | UnaryOp::BitOr  | UnaryOp::BitNor
@@ -1836,11 +1848,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Conditional { then_expr, else_expr, .. } => {
                 // Verilog: result of `cond ? then : else` is max(then, else).
-                // The condition is self-determined to its own width and
-                // reduced to a boolean — it does NOT contribute to the
-                // result width. Including condition.width here would
-                // pollute ctx_width when the condition is wide
-                // (e.g. `wide_var ? a : b`).
+                // Condition is self-determined (does NOT contribute to result width).
                 self.expr_max_width(then_expr)
                     .max(self.expr_max_width(else_expr))
             }
