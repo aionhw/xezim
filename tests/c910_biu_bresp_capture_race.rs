@@ -317,6 +317,135 @@ module tb;
 endmodule
 "#;
 
+// Many-clock-domain shape: 8 sibling gated_clk_cells off coreclk (mirroring
+// the c910 BIU's 8 gated clocks: vict_awcpuclk, st_awcpuclk, bus_arb_w_fifo_clk,
+// vict_wcpuclk, st_wcpuclk, round_wcpuclk, bcpuclk, coreclk). Each has a
+// dummy FF. The bresp capture FF still depends on back_full computed from
+// FFs on the input coreclk. Tests whether having MANY gated-clock domains
+// triggers an NBA ordering bug at the bresp FF.
+const SRC_MULTI_CLK: &str = r#"
+`timescale 1ns/100ps
+
+module gated_clk_cell(
+  input  clk_in,
+  input  global_en, module_en, local_en, external_en, pad_yy_icg_scan_en,
+  output clk_out
+);
+  assign clk_out = clk_in;
+endmodule
+
+module dut(
+  input  coreclk,
+  input  cpurst_b,
+  input  pad_biu_bvalid,
+  output reg cur_bresp_buf_bvalid
+);
+  // Eight gated clocks, all passthroughs from coreclk
+  wire vict_awclk, st_awclk, fifo_clk, vict_wclk, st_wclk, round_wclk, bcpuclk;
+  gated_clk_cell g1 (coreclk, 1'b1, 1'b1, 1'b1, 1'b0, 1'b0, vict_awclk);
+  gated_clk_cell g2 (coreclk, 1'b1, 1'b1, 1'b1, 1'b0, 1'b0, st_awclk);
+  gated_clk_cell g3 (coreclk, 1'b1, 1'b1, 1'b1, 1'b0, 1'b0, fifo_clk);
+  gated_clk_cell g4 (coreclk, 1'b1, 1'b1, 1'b1, 1'b0, 1'b0, vict_wclk);
+  gated_clk_cell g5 (coreclk, 1'b1, 1'b1, 1'b1, 1'b0, 1'b0, st_wclk);
+  gated_clk_cell g6 (coreclk, 1'b1, 1'b1, 1'b1, 1'b0, 1'b0, round_wclk);
+  gated_clk_cell g7 (coreclk, 1'b1, 1'b1, 1'b1, 1'b0, 1'b0, bcpuclk);
+
+  reg [7:0] dummy_vict_aw, dummy_st_aw, dummy_fifo, dummy_vict_w;
+  reg [7:0] dummy_st_w, dummy_round_w;
+  reg       back_valid, back_pending;
+  wire      back_full = back_valid && back_pending;
+  wire      blast_done = cur_bresp_buf_bvalid && !back_full;
+  wire      pad_biu_back_ready = 1'b1;
+
+  // Dummy FFs on each gated clock - simulate the 17 always blocks
+  always @(posedge vict_awclk or negedge cpurst_b) begin
+    if(~cpurst_b) dummy_vict_aw <= 8'b0;
+    else          dummy_vict_aw <= dummy_vict_aw + 1;
+  end
+  always @(posedge st_awclk or negedge cpurst_b) begin
+    if(~cpurst_b) dummy_st_aw <= 8'b0;
+    else          dummy_st_aw <= dummy_st_aw + 1;
+  end
+  always @(posedge fifo_clk or negedge cpurst_b) begin
+    if(~cpurst_b) dummy_fifo <= 8'b0;
+    else          dummy_fifo <= dummy_fifo + 1;
+  end
+  always @(posedge vict_wclk or negedge cpurst_b) begin
+    if(~cpurst_b) dummy_vict_w <= 8'b0;
+    else          dummy_vict_w <= dummy_vict_w + 1;
+  end
+  always @(posedge st_wclk or negedge cpurst_b) begin
+    if(~cpurst_b) dummy_st_w <= 8'b0;
+    else          dummy_st_w <= dummy_st_w + 1;
+  end
+  always @(posedge round_wclk or negedge cpurst_b) begin
+    if(~cpurst_b) dummy_round_w <= 8'b0;
+    else          dummy_round_w <= dummy_round_w + 1;
+  end
+
+  // The actual bresp capture FF on bcpuclk
+  always @(posedge bcpuclk or negedge cpurst_b) begin
+    if(~cpurst_b)                          cur_bresp_buf_bvalid <= 1'b0;
+    else if(pad_biu_bvalid && !back_full)  cur_bresp_buf_bvalid <= 1'b1;
+    else if(!back_full)                    cur_bresp_buf_bvalid <= 1'b0;
+  end
+
+  // back FFs on coreclk
+  always @(posedge coreclk or negedge cpurst_b) begin
+    if(~cpurst_b)                       back_valid <= 1'b0;
+    else if(blast_done || back_pending) back_valid <= 1'b1;
+    else if(pad_biu_back_ready)         back_valid <= 1'b0;
+  end
+  always @(posedge coreclk or negedge cpurst_b) begin
+    if(~cpurst_b)                          back_pending <= 1'b0;
+    else if(pad_biu_back_ready)            back_pending <= 1'b0;
+    else if(blast_done && back_valid)      back_pending <= 1'b1;
+  end
+endmodule
+
+module tb;
+  reg coreclk = 0;
+  reg cpurst_b = 0;
+  reg pad_biu_bvalid = 0;
+  wire cur_bresp_buf_bvalid;
+  integer capture_count;
+
+  dut u_dut (
+    .coreclk(coreclk), .cpurst_b(cpurst_b),
+    .pad_biu_bvalid(pad_biu_bvalid),
+    .cur_bresp_buf_bvalid(cur_bresp_buf_bvalid)
+  );
+
+  always #5 coreclk = ~coreclk;
+  always @(posedge cur_bresp_buf_bvalid) capture_count = capture_count + 1;
+
+  initial begin
+    capture_count = 0;
+    cpurst_b = 0; pad_biu_bvalid = 0;
+    #20; cpurst_b = 1;
+    @(posedge coreclk);
+
+    repeat (8) begin
+      @(posedge coreclk); #1; pad_biu_bvalid = 1;
+      @(posedge coreclk); #1; pad_biu_bvalid = 0;
+      @(posedge coreclk);
+    end
+    #50; $finish;
+  end
+endmodule
+"#;
+
+#[test]
+fn multi_clock_domain_all_8_captures() {
+    let sim = simulate(SRC_MULTI_CLK, 500).expect("simulate failed");
+    let count = lookup(&sim, "capture_count") & 0xFFFFFFFF;
+    assert_eq!(
+        count, 8,
+        "Expected 8 captures with 8 gated-clock-domain siblings, got {}",
+        count
+    );
+}
+
 #[test]
 fn nested_hierarchy_all_8_captures() {
     let sim = simulate(SRC_NESTED, 500).expect("simulate failed");
