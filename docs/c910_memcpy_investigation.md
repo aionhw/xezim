@@ -260,6 +260,58 @@ preclude speculative one-shot fixes.
    produces correct half_num arm selection for all 32 input combos.
    Hypothesis #3 eliminated.
 
+## Round 26 (2026-05-10) — SECOND REORIENT: same bug as cmark canary
+
+Widening the retire+writeback tracer to capture all retire events
+during sim 46000-47000 (not just the 0x700-0x720 loop region) caught
+the actual termination event: **TEST FAILED at t=46665**.
+
+The full retire sequence at the failure:
+```
+t=46025 pc=0x0150 wb0=0x0       wb1=0x0
+t=46055 pc=0x0158 wb0=0x10      wb1=0x2
+t=46055 pc=0x015c wb0=0x10      wb1=0x2
+t=46075 pc=0x0160 wb0=0x400     wb1=0x410
+t=46115 pc=0x0166 wb0=0x400     wb1=0x410
+t=46115 pc=0x0168 wb0=0x400     wb1=0x410
+t=46115 pc=0x016c wb0=0x400     wb1=0x410
+t=46535 pc=0x0170 wb0=0x400     wb1=0xee
+t=46555 pc=0x0172 wb0=0xe6      wb1=0xee
+t=46655 pc=0x00ee wb0=0x2c      wb1=0x0
+t=46665 pc=0x00fa wb0=0x3b      wb1=0x0
+TEST FAILED
+```
+
+So the memcpy loop at 0x710 DOES terminate (jumps to 0x150 around
+t=46000), then falls into post-loop code 0x158→0x172, then takes a
+branch/jump to 0x0ee→0x0fa where the failure sentinel `64'h2382348720`
+is observed in `value0`/`value1`/`value2` per tb.v:562, triggering
+`$display("TEST FAILED")`.
+
+**`0x2382348720` is the EXACT same failure sentinel** documented in
+the existing memory `feedback_c910_cmark_test_failed_canary.md` for
+the c910 cmark test:
+
+> TEST FAILED is tb.v sentinel hitting 0x2382348720 from corrupt
+> `idu_iu_rf_pipex_src0/src1` at sim 49405. Bug is in xezim's IDU
+> mux/PRF/forwarding path. Heisenbug hypothesis falsified — both
+> ae1e88f and 7d4aede fail identically.
+
+**Conclusion**: c910 memcpy and c910 cmark fail with the same bug —
+**xezim's IDU register-file-pipe source-operand mux delivers corrupt
+data**. The IFU/IBUF cone-of-influence tests (rounds 23-24) and the
+PC 0x712 / retire-log-presentation analysis (rounds 22, 25) were all
+investigating the wrong layer. The bug has been characterized in
+prior sessions but not fixed.
+
+**Concrete next step** (follows previous-session investigation
+trail): probe `idu_iu_rf_pipex_src0` / `idu_iu_rf_pipex_src1` at
+t=46555 in xezim vs iverilog reference; the divergence cycle pinpoints
+which specific PRF read or forward path delivers the wrong value.
+Once that pipe/cycle is known, the fix target in
+`xezim/src/compiler/` is a specific compile_expr or NBA-ordering
+bug; the cmark canary memory entry has the relevant pointer.
+
 ## Round 25 (2026-05-10) — RETIRE-STREAM REORIENT: loop iterates forever
 
 **Major reorient via live retire tracer (added to tb.v, not under
