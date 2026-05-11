@@ -1509,7 +1509,13 @@ impl Simulator {
             module.signals.len(),
             n,
         );
-        for (base, &(lo, hi, w)) in &module.arrays {
+        // Sort by base name so signal_id allocation is deterministic
+        // across runs (HashMap iteration is non-deterministic, which
+        // makes downstream block-dispatch order race-dependent in
+        // designs like c910 where many arrays share the same scope).
+        let mut arrays_sorted: Vec<(&String, &(i64, i64, u32))> = module.arrays.iter().collect();
+        arrays_sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (base, &(lo, hi, w)) in arrays_sorted {
             let first_id = signal_table.len();
             array_first_id.insert(Arc::from(base.as_str()), (first_id, lo, hi));
             let count = (hi - lo + 1).max(0) as usize;
@@ -1545,7 +1551,9 @@ impl Simulator {
         }
         let arrays_1d_ms = phase_arrays_1d.elapsed().as_secs_f64() * 1000.0;
         let phase_arrays_other = std::time::Instant::now();
-        for (base, &((lo1, hi1), (lo2, hi2), w)) in &module.arrays_2d {
+        let mut arrays_2d_sorted: Vec<(&String, &((i64, i64), (i64, i64), u32))> = module.arrays_2d.iter().collect();
+        arrays_2d_sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (base, &((lo1, hi1), (lo2, hi2), w)) in arrays_2d_sorted {
             for i in lo1..=hi1 {
                 for j in lo2..=hi2 {
                     push_elem(
@@ -1561,7 +1569,9 @@ impl Simulator {
                 }
             }
         }
-        for (base, (shape, w)) in &module.arrays_nd {
+        let mut arrays_nd_sorted: Vec<(&String, &(Vec<(i64, i64)>, u32))> = module.arrays_nd.iter().collect();
+        arrays_nd_sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (base, (shape, w)) in arrays_nd_sorted {
             fn enumerate(dims: &[(i64, i64)], prefix: String, out: &mut Vec<String>) {
                 if dims.is_empty() {
                     out.push(prefix);
