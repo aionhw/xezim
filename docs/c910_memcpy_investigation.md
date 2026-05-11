@@ -135,6 +135,49 @@ Ranked by likelihood and ease of testing:
 - **Timescale conversion**: iverilog writes VCD in 100ps; xezim writes
   in 1ns. Divide iverilog timestamps by 10 to match xezim.
 
+## Definitive bug characterization (Round 22 — Questa cross-reference)
+
+A QuestaSim 2021.1 VCD at `/home/bondan/agent/repo/memcpy_30k_70k.vcd`
+covering sim 30K-70K with retire and AXI signals provides
+ground-truth retire stream for the memcpy loop region.
+
+**Questa retire stream around T=45005**:
+- Cycle T=45005: PCs 0x710, 0x712, 0x714, 0x716 ALL retire across the 3 slots
+- Loop body has 4 instructions
+
+**xezim retire stream same cycle**:
+- Cycle T=45005: PCs 0x710, 0x714, 0x716 retire (PC 0x712 MISSING)
+- Searched all 3 retire slots across the entire run: **PC 0x712 NEVER appears**
+
+PC 0x712 corresponds to the halfword at byte offset 2 within the
+16-byte cacheline 0x710-0x71F. The original handoff diagnosed
+"vector op at PC 0x712 stuck" — this Questa cross-reference proves
+the diagnosis was correct all along; the 22 rounds of downstream
+probing chased cascading symptoms while heisenbug probe-set shifts
+made the downstream picture inconsistent.
+
+**Bug location**: xezim's IFU never delivers PC 0x712 to the IDU's
+dispatch unit. Pre-decode (`ct_ifu_precode.v`) or instruction-buffer
+pop (`ct_ifu_ibuf.v` pop_h0/h1 selection) drops it.
+
+The c910 testbench byte-distribution (tb.v:436-454) distributes each
+inst.pat 32-bit literal across 16 byte-banks; `f_spsram_large.v:176-190`
+reassembles them via `Q[N*8+7:N*8] = ramN_dout`. So for the cacheline
+holding PC 0x710, byte 0x710 = ram0[i] = literal[31:24]. Whether this
+makes PC 0x710 a 16-bit RVC or 32-bit RV instruction depends on the
+exact halfword value — Questa shows it as a 16-bit RVC (since PC 0x712
+retires separately, the inst at 0x710 must be 16-bit).
+
+**Three remaining hypotheses for the next-session fix**:
+
+1. **xezim mis-evaluates `ct_ifu_precode.v`** for the specific halfword
+   data at this cacheline. The boolean expressions are straightforward
+   (lines 240-296) but one could mis-compile.
+2. **xezim's pop_h0/pop_h1 selection logic** (`ct_ifu_ibuf.v` lines
+   5687-5694 and the 8000-line case-tree at 7920-8362) drops PC 0x712.
+3. **xezim's pre-decode flag propagation** from the icache to the
+   ibuf entries loses the bry0/bry1 bit for h2 (offset 2 halfword).
+
 ## Test files added (committed)
 
 - `tests/dep_reg_entry_synth.rs` — c910 dep_reg_entry synth, passes
