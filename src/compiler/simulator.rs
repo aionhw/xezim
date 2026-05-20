@@ -11275,6 +11275,17 @@ impl Simulator {
                 v
             }
             ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$cast" => {
+                    // `$cast(dest, src)` as a function: assign src to dest,
+                    // return 1 (success). No dynamic type enforcement.
+                    if args.len() >= 2 {
+                        let v = self.eval_expr(&args[1]);
+                        self.assign_value(&args[0], &v);
+                        Value::from_u64(1, 32)
+                    } else {
+                        Value::zero(32)
+                    }
+                }
                 "$clog2" => {
                     let v = args
                         .first()
@@ -13614,6 +13625,16 @@ impl Simulator {
 
     fn exec_system_task(&mut self, name: &str, args: &[Expression]) {
         match name {
+            "$cast" => {
+                // `$cast(dest, src)` as a statement: evaluate src and assign
+                // to dest. Dynamic-cast type checking is not enforced — a
+                // class handle is assigned through, matching how UVM relies
+                // on `$cast` for safe downcasts of factory-created objects.
+                if args.len() >= 2 {
+                    let v = self.eval_expr(&args[1]);
+                    self.assign_value(&args[0], &v);
+                }
+            }
             "$display" | "$displayb" | "$displayh" | "$displayo" => {
                 let m = self.format_args(args, name);
                 self.record_output(m.clone());
@@ -16824,47 +16845,40 @@ impl Simulator {
                     // UVM_ACTIVE is typically 1 in UVM
                     return Value::from_u64(1, 32);
                 }
-                if !real_uvm
-                    && (name == "uvm_report_info"
-                        || name == "uvm_report_warning"
-                        || name == "uvm_report_error"
-                        || name == "uvm_report_fatal")
+                if name == "uvm_report_info"
+                    || name == "uvm_report_warning"
+                    || name == "uvm_report_error"
+                    || name == "uvm_report_fatal"
                 {
-                    let id = if args.len() > 0 {
-                        if let ExprKind::StringLiteral(s) = &args[0].kind {
-                            s.clone()
-                        } else {
-                            "UVM".to_string()
-                        }
-                    } else {
-                        "".to_string()
-                    };
-                    let msg = if args.len() > 1 {
-                        if let ExprKind::StringLiteral(s) = &args[1].kind {
-                            s.clone()
-                        } else if let ExprKind::SystemCall {
-                            name,
-                            args: sys_args,
-                        } = &args[1].kind
-                        {
-                            if name == "$sformatf" {
-                                // Since we don't have self as mutable here in a way we can call format_args easily if it takes &mut self
-                                // Actually format_args takes &mut self, eval_call takes &mut self.
-                                self.format_args(sys_args, "$sformatf")
-                            } else {
-                                "<expr>".to_string()
-                            }
-                        } else {
-                            "<expr>".to_string()
-                        }
-                    } else {
-                        "".to_string()
-                    };
+                    let id = args
+                        .first()
+                        .map(|a| self.eval_expr(a).to_sv_string())
+                        .unwrap_or_default();
+                    let msg = args
+                        .get(1)
+                        .map(|a| self.eval_expr(a).to_sv_string())
+                        .unwrap_or_default();
+                    // Component context: the `this` handle's UVM name, if any.
+                    let ctx = self
+                        .this_stack
+                        .last()
+                        .copied()
+                        .flatten()
+                        .and_then(|h| self.heap.get(h).and_then(|x| x.as_ref()))
+                        .and_then(|inst| inst.properties.get("m_name").cloned())
+                        .map(|v| v.to_sv_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "reporter".to_string());
                     let severity = name.replace("uvm_report_", "").to_uppercase();
-                    println!(
-                        "UVM_{} @ {:>3}: reporter [{}] {}",
-                        severity, self.time, id, msg
+                    let line = format!(
+                        "UVM_{} @ {}: {} [{}] {}",
+                        severity, self.time, ctx, id, msg
                     );
+                    self.record_output(line.clone());
+                    self.stdout_writeln(&line);
+                    if name == "uvm_report_fatal" {
+                        self.finished = true;
+                    }
                     return Value::zero(32);
                 }
                 if name == "run_test" && !real_uvm {
