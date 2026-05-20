@@ -799,6 +799,9 @@ pub struct Simulator {
     /// keyed `"ClassName::propname"` where ClassName is the class that
     /// declared the static property.
     class_statics: HashMap<String, Value>,
+    /// Class-typed procedural locals — variable name -> class type name.
+    /// Lets a later `name = new();` know which class to construct.
+    var_class_types: HashMap<String, String>,
     /// Built-in mailboxes (handle -> queue of values)
     mailboxes: HashMap<usize, std::collections::VecDeque<Value>>,
     /// Built-in semaphores (handle -> current count)
@@ -1754,6 +1757,7 @@ impl Simulator {
             dpi_unresolved: HashSet::default(),
             heap: vec![None], // index 0 is null
             class_statics: HashMap::default(),
+            var_class_types: HashMap::default(),
             mailboxes: HashMap::default(),
             semaphores: HashMap::default(),
             cg_heap: vec![None],
@@ -10184,7 +10188,10 @@ impl Simulator {
                     }
                 }
                 if let ExprKind::Ident(hier) = &expr.kind {
-                    let name = self.resolve_hier_name(hier);
+                    let mut name = self.resolve_hier_name(hier);
+                    if let Some(scoped) = self.instance_assoc_member(&name) {
+                        name = scoped;
+                    }
                     let idx_val = self.eval_expr(index);
                     let idx_str = if self.is_associative_array(&name) {
                         self.assoc_key_str(&name, &idx_val)
@@ -11136,7 +11143,10 @@ impl Simulator {
                 }
                 // Check if this is an array element access (memory[idx]) vs bit select
                 if let ExprKind::Ident(hier) = &expr.kind {
-                    let name = self.resolve_hier_name(hier);
+                    let mut name = self.resolve_hier_name(hier);
+                    if let Some(scoped) = self.instance_assoc_member(&name) {
+                        name = scoped;
+                    }
                     if self.module.arrays.contains_key(&name) || self.is_associative_array(&name) {
                         // Array element access: look up signal "name[idx]"
                         if self.module.dynamic_arrays.contains(&name) {
@@ -12007,6 +12017,22 @@ impl Simulator {
                             self.settle_combinatorial();
                         }
                         return;
+                    }
+                }
+                // Class associative-array member element write
+                // (`m_member[key] = rhs`) — route through `assign_value`,
+                // which maps the base to its instance-scoped store.
+                if let ExprKind::Index { expr: base, .. } = &lvalue.kind {
+                    if let ExprKind::Ident(bh) = &base.kind {
+                        let bn = self.resolve_hier_name(bh);
+                        if self.instance_assoc_member(&bn).is_some() {
+                            let v = self.eval_expr(rvalue);
+                            self.assign_value(lvalue, &v);
+                            if !self.in_edge_block {
+                                self.settle_combinatorial();
+                            }
+                            return;
+                        }
                     }
                 }
                 // Slice assignment for N-dimensional unpacked arrays where LHS
@@ -13127,17 +13153,49 @@ impl Simulator {
             }
             StatementKind::Foreach { array, vars, body } => {
                 if let ExprKind::Ident(hier) = &array.kind {
-                    let name = self.resolve_hier_name(hier);
-                    let size = self.lookup_signal_width(&name).unwrap_or(1) as u64;
+                    let mut name = self.resolve_hier_name(hier);
+                    if let Some(scoped) = self.instance_assoc_member(&name) {
+                        name = scoped;
+                    }
                     if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
                         self.widths.insert(var.name.clone(), 32);
-                        for i in 0..size {
-                            if self.finished {
-                                break;
+                        if self.is_associative_array(&name) {
+                            let prefix = format!("{}[", name);
+                            let mut keys: Vec<String> = self
+                                .signals
+                                .keys()
+                                .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
+                                .map(|k| k[prefix.len()..k.len() - 1].to_string())
+                                .collect();
+                            keys.sort();
+                            let is_str = self
+                                .module
+                                .associative_arrays
+                                .get(&name)
+                                .copied()
+                                .unwrap_or(false);
+                            for key in keys {
+                                if self.finished {
+                                    break;
+                                }
+                                let kv = if is_str {
+                                    Value::from_string(&key)
+                                } else {
+                                    Value::from_u64(key.parse::<u64>().unwrap_or(0), 32)
+                                };
+                                self.signals.insert(var.name.clone(), kv);
+                                self.exec_statement(body);
                             }
-                            self.signals
-                                .insert(var.name.clone(), Value::from_u64(i, 32));
-                            self.exec_statement(body);
+                        } else {
+                            let size = self.lookup_signal_width(&name).unwrap_or(1) as u64;
+                            for i in 0..size {
+                                if self.finished {
+                                    break;
+                                }
+                                self.signals
+                                    .insert(var.name.clone(), Value::from_u64(i, 32));
+                                self.exec_statement(body);
+                            }
                         }
                     }
                 }
@@ -13487,6 +13545,14 @@ impl Simulator {
                         };
                         self.widths.insert(d.name.name.clone(), w);
                         self.signals.insert(d.name.name.clone(), v);
+                        // Record a class-typed local's type so a later
+                        // separate `name = new();` knows what to construct.
+                        if let Some(cn) = &class_name {
+                            if self.module.classes.contains_key(cn) {
+                                self.var_class_types
+                                    .insert(d.name.name.clone(), cn.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -16469,6 +16535,29 @@ impl Simulator {
         }
     }
 
+    /// If `name` is a bare identifier naming an associative-array property
+    /// of the current class context (and `this` is a live handle), return
+    /// the instance-scoped storage name `<handle>#<name>`.
+    fn instance_assoc_member(&self, name: &str) -> Option<String> {
+        if name.contains('#') || name.contains('.') || name.contains('[') {
+            return None;
+        }
+        let handle = self.this_stack.last().copied().flatten()?;
+        if handle == 0 {
+            return None;
+        }
+        let ctx = self.class_context_stack.last().cloned().flatten()?;
+        let mut cur = Some(ctx);
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if cd.assoc_properties.contains_key(name) {
+                return Some(format!("{}#{}", handle, name));
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
     /// Does `class_name` or any ancestor declare a method `name`?
     fn class_has_method(&self, class_name: &str, name: &str) -> bool {
         let mut cur = Some(class_name.to_string());
@@ -16536,7 +16625,10 @@ impl Simulator {
 
             // Check for built-in methods on identifiers
             if let ExprKind::Ident(hier) = &expr.kind {
-                let name = self.resolve_hier_name(hier);
+                let mut name = self.resolve_hier_name(hier);
+                if let Some(scoped) = self.instance_assoc_member(&name) {
+                    name = scoped;
+                }
                 if let Some(res) = self.eval_builtin_method(&name, mname, args) {
                     return res;
                 }
@@ -17485,8 +17577,12 @@ impl Simulator {
         for cdef in classes_to_init.iter().rev() {
             for (prop_name, prop_sig) in &cdef.properties {
                 // Static properties live in the shared `class_statics`
-                // cell, not per-instance — skip them here.
-                if cdef.static_properties.contains(prop_name) {
+                // cell; associative-array properties live in the
+                // instance-scoped signal map — neither is a per-instance
+                // scalar, so skip both here.
+                if cdef.static_properties.contains(prop_name)
+                    || cdef.assoc_properties.contains_key(prop_name)
+                {
                     continue;
                 }
                 instance
@@ -17508,6 +17604,16 @@ impl Simulator {
                     let v = self.eval_expr(&e);
                     instance.properties.insert(pname.clone(), v);
                 }
+            }
+        }
+        // Register per-instance associative-array members under an
+        // instance-scoped name `<handle>#<member>` so the existing
+        // signal-keyed assoc machinery gives each instance its own map.
+        for cdef in &classes_to_init {
+            for (prop, &is_str) in &cdef.assoc_properties {
+                self.module
+                    .associative_arrays
+                    .insert(format!("{}#{}", handle, prop), is_str);
             }
         }
         self.heap.push(Some(instance));
@@ -18222,6 +18328,10 @@ impl Simulator {
                     .and_then(|id| self.signal_type_names.get(id).cloned())
                 {
                     return Some(t);
+                }
+                // A class-typed procedural local declared in this scope.
+                if let Some(t) = self.var_class_types.get(&name) {
+                    return Some(t.clone());
                 }
                 // A class property referenced bare inside a method —
                 // resolve its type through the current class context.
