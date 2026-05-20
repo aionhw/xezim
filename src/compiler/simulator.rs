@@ -10104,6 +10104,17 @@ impl Simulator {
                 changed
             }
             ExprKind::Index { expr, index } => {
+                // Class associative-array member element write — base may be
+                // a bare member (`m[k]=v`) or another object's (`obj.m[k]=v`).
+                if let Some(an) = self.expr_assoc_name(expr) {
+                    let idx_val = self.eval_expr(index);
+                    let idx_str = self.assoc_key_str(&an, &idx_val);
+                    let elem_name = format!("{}[{}]", an, idx_str);
+                    let changed =
+                        self.signals.get(&elem_name).map_or(true, |p| p != val);
+                    self.signals.insert(elem_name, val.clone());
+                    return changed;
+                }
                 // N-dimensional (N >= 3) unpacked array element assignment
                 {
                     let mut cur = expr.as_ref();
@@ -11077,6 +11088,18 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // Class associative-array member element read — base may be
+                // a bare member (`m[k]`) or another object's (`obj.m[k]`).
+                if let Some(an) = self.expr_assoc_name(expr) {
+                    let idx_val = self.eval_expr(index);
+                    let idx_str = self.assoc_key_str(&an, &idx_val);
+                    let elem_name = format!("{}[{}]", an, idx_str);
+                    return self
+                        .signals
+                        .get(&elem_name)
+                        .cloned()
+                        .unwrap_or_else(|| Value::zero(32));
+                }
                 // N-dimensional (N >= 3) unpacked array element access
                 {
                     let mut cur = expr.as_ref();
@@ -12020,20 +12043,49 @@ impl Simulator {
                     }
                 }
                 // Class associative-array member element write
-                // (`m_member[key] = rhs`) — route through `assign_value`,
-                // which maps the base to its instance-scoped store.
+                // (`m[key] = rhs` or `obj.m[key] = rhs`) — route through
+                // `assign_value`, which maps the base to its instance-
+                // scoped store.
                 if let ExprKind::Index { expr: base, .. } = &lvalue.kind {
-                    if let ExprKind::Ident(bh) = &base.kind {
-                        let bn = self.resolve_hier_name(bh);
-                        if self.instance_assoc_member(&bn).is_some() {
-                            let v = self.eval_expr(rvalue);
-                            self.assign_value(lvalue, &v);
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
-                            return;
+                    if self.expr_assoc_name(base).is_some() {
+                        let v = self.eval_expr(rvalue);
+                        self.assign_value(lvalue, &v);
+                        if !self.in_edge_block {
+                            self.settle_combinatorial();
                         }
+                        return;
                     }
+                }
+                // Whole associative-array copy between class members
+                // (`a.m = b.m`) — clear the destination, copy every entry.
+                if let (Some(dst), Some(src)) =
+                    (self.expr_assoc_name(lvalue), self.expr_assoc_name(rvalue))
+                {
+                    let dst_prefix = format!("{}[", dst);
+                    let dst_keys: Vec<String> = self
+                        .signals
+                        .keys()
+                        .filter(|k| k.starts_with(&dst_prefix))
+                        .cloned()
+                        .collect();
+                    for k in dst_keys {
+                        self.signals.remove(&k);
+                    }
+                    // Re-key each `<src>[k]` entry as `<dst>[k]` — the
+                    // suffix from `src.len()` already includes `[k]`.
+                    let src_prefix = format!("{}[", src);
+                    let entries: Vec<(String, Value)> = self
+                        .signals
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(&src_prefix))
+                        .map(|(k, v)| {
+                            (format!("{}{}", dst, &k[src.len()..]), v.clone())
+                        })
+                        .collect();
+                    for (k, v) in entries {
+                        self.signals.insert(k, v);
+                    }
+                    return;
                 }
                 // Slice assignment for N-dimensional unpacked arrays where LHS
                 // and RHS both supply fewer indices than dimensions:
@@ -13152,6 +13204,46 @@ impl Simulator {
                 }
             }
             StatementKind::Foreach { array, vars, body } => {
+                // `foreach (obj.assoc_member[k])` — iterate that object's
+                // instance-scoped associative array (base may be a 2-seg
+                // Ident `b.edges` or a MemberAccess).
+                {
+                    if let Some(an) = self.expr_assoc_name(array) {
+                        if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
+                            let prefix = format!("{}[", an);
+                            let mut keys: Vec<String> = self
+                                .signals
+                                .keys()
+                                .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
+                                .map(|k| k[prefix.len()..k.len() - 1].to_string())
+                                .collect();
+                            keys.sort();
+                            let is_str = self
+                                .module
+                                .associative_arrays
+                                .get(&an)
+                                .copied()
+                                .unwrap_or(false);
+                            self.widths.insert(var.name.clone(), 32);
+                            for key in keys {
+                                if self.finished {
+                                    break;
+                                }
+                                let kv = if is_str {
+                                    Value::from_string(&key)
+                                } else {
+                                    Value::from_u64(
+                                        key.parse::<u64>().unwrap_or(0),
+                                        32,
+                                    )
+                                };
+                                self.signals.insert(var.name.clone(), kv);
+                                self.exec_statement(body);
+                            }
+                        }
+                        return;
+                    }
+                }
                 if let ExprKind::Ident(hier) = &array.kind {
                     let mut name = self.resolve_hier_name(hier);
                     if let Some(scoped) = self.instance_assoc_member(&name) {
@@ -16558,6 +16650,68 @@ impl Simulator {
         None
     }
 
+    /// Does `class_name` or an ancestor declare `member` as an
+    /// associative array?
+    fn class_assoc_member(&self, class_name: &str, member: &str) -> bool {
+        let mut cur = Some(class_name.to_string());
+        while let Some(cn) = cur {
+            match self.module.classes.get(&cn) {
+                Some(cd) => {
+                    if cd.assoc_properties.contains_key(member) {
+                        return true;
+                    }
+                    cur = cd.extends.clone();
+                }
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Instance-scoped storage name for an associative-array access whose
+    /// base expression is either a bare member (`m` — uses `this`) or a
+    /// member of another object (`obj.m`). Returns `<handle>#<member>`.
+    fn expr_assoc_name(&self, expr: &Expression) -> Option<String> {
+        // `obj`/`member` pair → instance-scoped name if `member` is an
+        // associative property of the object the handle points at.
+        let obj_member = |sim: &Self, obj: &str, member: &str| -> Option<String> {
+            let handle = sim.eval_ident_handle(obj).unwrap_or(0);
+            if handle == 0 {
+                return None;
+            }
+            let cn = sim
+                .heap
+                .get(handle)
+                .and_then(|x| x.as_ref())
+                .map(|i| i.class_name.clone())?;
+            if sim.class_assoc_member(&cn, member) {
+                Some(format!("{}#{}", handle, member))
+            } else {
+                None
+            }
+        };
+        match &expr.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                self.instance_assoc_member(&h.path[0].name.name)
+            }
+            // Flattened `obj.member` as a 2-segment hierarchical Ident.
+            ExprKind::Ident(h) if h.path.len() == 2 => obj_member(
+                self,
+                &h.path[0].name.name,
+                &h.path[1].name.name,
+            ),
+            ExprKind::MemberAccess { expr: base, member } => {
+                if let ExprKind::Ident(bh) = &base.kind {
+                    if bh.path.len() == 1 {
+                        return obj_member(self, &bh.path[0].name.name, &member.name);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     /// Does `class_name` or any ancestor declare a method `name`?
     fn class_has_method(&self, class_name: &str, name: &str) -> bool {
         let mut cur = Some(class_name.to_string());
@@ -16622,6 +16776,14 @@ impl Simulator {
         let real_uvm = self.uses_real_uvm();
         if let ExprKind::MemberAccess { expr, member } = &func.kind {
             let mname = member.name.as_str();
+
+            // Built-in method on a class associative-array member —
+            // `m.exists/num/delete/...` or `obj.m.exists(...)`.
+            if let Some(an) = self.expr_assoc_name(expr) {
+                if let Some(res) = self.eval_builtin_method(&an, mname, args) {
+                    return res;
+                }
+            }
 
             // Check for built-in methods on identifiers
             if let ExprKind::Ident(hier) = &expr.kind {
@@ -18405,6 +18567,11 @@ impl Simulator {
         }
         if let Some(&id) = self.signal_name_to_id.get(name) {
             return self.signal_table[id].to_u64().map(|h| h as usize);
+        }
+        // Module-scope / procedural-block locals live in the legacy
+        // `signals` map (no signal id).
+        if let Some(v) = self.signals.get(name) {
+            return v.to_u64().map(|h| h as usize);
         }
         None
     }
