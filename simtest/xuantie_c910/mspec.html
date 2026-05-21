@@ -1,0 +1,1849 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>M-Spec · Xuantie C910</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,600;9..144,800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0d10;
+    --bg-2: #11161a;
+    --panel: #161c22;
+    --panel-2: #1c242c;
+    --line: #232c34;
+    --line-bright: #354352;
+    --ink: #e8ecef;
+    --ink-dim: #98a3ad;
+    --ink-mute: #5d6b75;
+    --phos: #7fffb3;
+    --amber: #ffb44a;
+    --rust: #ff6a3d;
+    --azure: #5fb3ff;
+    --magenta: #ff7fb0;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink); }
+  body {
+    font-family: 'Fraunces', Georgia, serif;
+    line-height: 1.6;
+    background-image:
+      radial-gradient(circle at 100% 0%, rgba(127, 255, 179, 0.04), transparent 50%),
+      linear-gradient(var(--bg), var(--bg));
+    background-attachment: fixed;
+  }
+  .grid-bg {
+    position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background-image:
+      linear-gradient(rgba(127, 255, 179, 0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(127, 255, 179, 0.02) 1px, transparent 1px);
+    background-size: 48px 48px;
+    mask-image: radial-gradient(ellipse at top, black 30%, transparent 80%);
+  }
+
+  /* ---- Top bar ---- */
+  .topbar {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(10, 13, 16, 0.85);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--line);
+    padding: 14px 32px; display: flex; justify-content: space-between; align-items: center;
+    font-family: 'JetBrains Mono', monospace; font-size: 12px;
+  }
+  .topbar a { color: var(--ink-dim); text-decoration: none; letter-spacing: 0.1em; }
+  .topbar a:hover { color: var(--phos); }
+  .topbar .right { display: flex; gap: 24px; }
+
+  /* ---- Layout ---- */
+  .shell {
+    position: relative; z-index: 1;
+    max-width: 1280px; margin: 0 auto;
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 48px;
+    padding: 48px 32px 120px;
+  }
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: 1fr; gap: 24px; }
+    nav.toc { position: static !important; }
+  }
+  nav.toc {
+    position: sticky; top: 70px; align-self: start;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; letter-spacing: 0.06em;
+    border-left: 1px solid var(--line); padding-left: 16px;
+  }
+  nav.toc a {
+    display: block; color: var(--ink-mute); padding: 6px 0;
+    text-decoration: none; text-transform: uppercase;
+    transition: color 0.15s, padding-left 0.15s;
+    border-left: 2px solid transparent; margin-left: -18px; padding-left: 16px;
+  }
+  nav.toc a:hover { color: var(--ink); }
+  nav.toc a.active { color: var(--phos); border-left-color: var(--phos); }
+
+  main.content { min-width: 0; }
+
+  /* ---- Hero ---- */
+  .hero {
+    margin-bottom: 64px;
+  }
+  .eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase;
+    color: var(--phos); margin-bottom: 20px;
+  }
+  h1 {
+    font-family: 'Fraunces', serif; font-weight: 300;
+    font-size: clamp(48px, 7vw, 88px); line-height: 0.92; letter-spacing: -0.035em;
+    margin: 0 0 8px; font-variation-settings: "opsz" 144;
+  }
+  h1 em { font-style: italic; font-weight: 700; color: var(--amber); }
+  .subtitle { color: var(--ink-dim); font-size: 20px; max-width: 60ch; }
+
+  .badges {
+    display: flex; flex-wrap: wrap; gap: 8px; margin-top: 28px;
+  }
+  .badge {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    padding: 4px 10px; border: 1px solid var(--line);
+    color: var(--ink-dim); letter-spacing: 0.05em;
+  }
+  .badge.lit { color: var(--phos); border-color: var(--phos); }
+
+  /* ---- Section headings ---- */
+  section { margin: 64px 0; scroll-margin-top: 80px; }
+  h2 {
+    font-family: 'Fraunces', serif; font-weight: 400;
+    font-size: 36px; letter-spacing: -0.02em; line-height: 1.1;
+    margin: 0 0 8px; display: flex; align-items: baseline; gap: 16px;
+  }
+  h2 .num {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px; color: var(--phos); letter-spacing: 0.1em;
+  }
+  h2 em { font-style: italic; color: var(--amber); font-weight: 600; }
+  h3 {
+    font-family: 'JetBrains Mono', monospace; font-weight: 500;
+    font-size: 13px; letter-spacing: 0.15em; text-transform: uppercase;
+    color: var(--ink-dim); margin: 32px 0 16px;
+  }
+  .section-desc { color: var(--ink-dim); max-width: 70ch; margin-bottom: 24px; }
+
+  /* ---- Tables ---- */
+  .tbl { width: 100%; border-collapse: collapse; font-size: 14px; }
+  .tbl th, .tbl td {
+    text-align: left; padding: 10px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .tbl th {
+    font-family: 'JetBrains Mono', monospace; font-weight: 500;
+    font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--ink-mute); background: var(--bg-2);
+  }
+  .tbl td { font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--ink); }
+  .tbl td:first-child { color: var(--phos); }
+  .tbl tr:hover td { background: var(--panel); }
+
+  /* ---- Cards grid ---- */
+  .grid-cards {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 12px;
+  }
+  .res-card {
+    background: var(--panel); border: 1px solid var(--line);
+    padding: 14px 16px; font-family: 'JetBrains Mono', monospace;
+    font-size: 12px; position: relative; overflow: hidden;
+  }
+  .res-card::before {
+    content: ""; position: absolute; top: 0; left: 0; width: 3px; height: 100%;
+    background: var(--phos); opacity: 0.7;
+  }
+  .res-card.alu::before { background: var(--phos); }
+  .res-card.lsu::before { background: var(--azure); }
+  .res-card.fpu::before { background: var(--amber); }
+  .res-card.vec::before { background: var(--magenta); }
+  .res-card.rf::before  { background: var(--rust); }
+  .res-card.cache::before { background: var(--ink-dim); }
+  .res-card .name {
+    font-weight: 700; color: var(--ink); letter-spacing: 0.04em; margin-bottom: 6px;
+  }
+  .res-card .row { color: var(--ink-dim); font-size: 11px; padding: 1px 0; }
+  .res-card .row b { color: var(--ink); font-weight: 500; }
+
+  /* ---- Code / pre blocks ---- */
+  .code-toggle {
+    background: var(--panel); border: 1px solid var(--line);
+    overflow: hidden; margin-top: 24px;
+  }
+  .code-toggle summary {
+    cursor: pointer; padding: 12px 18px;
+    font-family: 'JetBrains Mono', monospace; font-size: 12px;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-dim);
+    list-style: none;
+  }
+  .code-toggle summary::-webkit-details-marker { display: none; }
+  .code-toggle summary::after { content: " ▾"; color: var(--phos); }
+  .code-toggle[open] summary::after { content: " ▴"; }
+  .code-toggle pre {
+    margin: 0; padding: 16px 20px; border-top: 1px solid var(--line);
+    background: #0d1216; font-family: 'JetBrains Mono', monospace;
+    font-size: 12px; line-height: 1.55; color: var(--ink);
+    overflow-x: auto; max-height: 70vh;
+  }
+
+  /* ---- Pipeline diagram ---- */
+  .pipeline-wrap {
+    background: var(--panel); border: 1px solid var(--line);
+    padding: 24px; margin: 24px 0; overflow-x: auto;
+  }
+  .pipeline-wrap svg { display: block; width: 100%; min-width: 900px; height: auto; }
+
+  /* ---- KV-list (for hazards, control, etc.) ---- */
+  .kvlist {
+    font-family: 'JetBrains Mono', monospace; font-size: 13px;
+    background: var(--panel); border: 1px solid var(--line); padding: 18px 22px;
+  }
+  .kvlist .kv { display: flex; gap: 18px; padding: 4px 0; }
+  .kvlist .kv .k { color: var(--phos); min-width: 160px; }
+  .kvlist .kv .v { color: var(--ink); }
+
+  /* ---- OOO subsystem block ---- */
+  .ooo-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 16px;
+  }
+  .ooo-card {
+    background: var(--panel); border: 1px solid var(--line);
+    padding: 18px 20px;
+  }
+  .ooo-card h4 {
+    font-family: 'JetBrains Mono', monospace; font-size: 12px;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--amber); margin: 0 0 12px;
+  }
+  .ooo-card .pair {
+    display: flex; justify-content: space-between; padding: 3px 0;
+    font-family: 'JetBrains Mono', monospace; font-size: 12px;
+    border-bottom: 1px dashed var(--line);
+  }
+  .ooo-card .pair:last-child { border-bottom: none; }
+  .ooo-card .pair .k { color: var(--ink-dim); }
+  .ooo-card .pair .v { color: var(--ink); }
+
+  /* ---- Highlight chips ---- */
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    padding: 2px 8px; border: 1px solid var(--line); color: var(--ink-dim);
+    border-radius: 1px;
+  }
+  .chip.phos { color: var(--phos); border-color: var(--phos); }
+  .chip.amber { color: var(--amber); border-color: var(--amber); }
+  .chip.azure { color: var(--azure); border-color: var(--azure); }
+
+  .small-mono { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--ink-mute); }
+
+  footer.sitefoot {
+    margin-top: 80px; padding: 24px 0 0;
+    border-top: 1px solid var(--line);
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    color: var(--ink-mute); display: flex; justify-content: space-between;
+    letter-spacing: 0.08em;
+  }
+</style>
+</head>
+<body>
+<div class="grid-bg"></div>
+
+<div class="topbar">
+  <a href="index.html">← C910 BUNDLE</a>
+  <div class="right">
+    <a href="index.html">INDEX</a>
+    <a href="mspec.html" style="color:var(--phos)">M-SPEC</a>
+    <a href="vspec.html">V-SPEC</a>
+  </div>
+</div>
+
+<div class="shell">
+<nav class="toc" id="toc">
+  <a href="#header">§00 · Header</a>
+  <a href="#pipeline">§01 · Pipeline</a>
+  <a href="#stages">§02 · Stages</a>
+  <a href="#resources">§03 · Resources</a>
+  <a href="#classes">§04 · Classes</a>
+  <a href="#hazards">§05 · Hazards</a>
+  <a href="#control">§06 · Control</a>
+  <a href="#ooo">§07 · OOO Engine</a>
+  <a href="#pred">§08 · Prediction</a>
+  <a href="#opt">§09 · Refinements</a>
+  <a href="#ext">§10 · Extensions</a>
+  <a href="#yaml">§11 · YAML Source</a>
+</nav>
+
+<main class="content">
+
+<div class="hero" id="header">
+  <div class="eyebrow">Document 01 · M-Spec 1.2 · Conformance Class C</div>
+  <h1>M-Spec · <em>C910</em></h1>
+  <p class="subtitle">
+    A compact microarchitectural description of T-Head's Xuantie C910,
+    rendered against the M-Spec exchange format with the OOO and Prediction
+    extensions enabled.
+  </p>
+  <div class="badges">
+    <span class="badge lit">@mspec/1.2</span>
+    <span class="badge">arch=RV64GCV</span>
+    <span class="badge">profile=rich</span>
+    <span class="badge">+ Appendix D</span>
+    <span class="badge">+ Appendix E</span>
+    <span class="badge">class C</span>
+  </div>
+</div>
+
+<!-- ===================== §01  Pipeline diagram ===================== -->
+<section id="pipeline">
+  <h2><span class="num">§01</span> Pipeline at a <em>glance</em></h2>
+  <p class="section-desc">
+    Twelve in-order frontend/backend stages, with out-of-order issue and
+    writeback in the middle. Stages are listed oldest (left) to youngest (right).
+  </p>
+  <div class="pipeline-wrap" id="pipeline-svg-wrap"></div>
+</section>
+
+<!-- ===================== §02  Stages ===================== -->
+<section id="stages">
+  <h2><span class="num">§02</span> Per-stage <em>roles</em></h2>
+  <table class="tbl" id="stages-tbl">
+    <thead><tr><th>Stage</th><th>Role</th><th>Attributes</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<!-- ===================== §03  Resources ===================== -->
+<section id="resources">
+  <h2><span class="num">§03</span> Resources &amp; <em>execution ports</em></h2>
+  <p class="section-desc">
+    Eight execution ports: two ALUs, one branch unit, one mul/div pipe,
+    two memory pipes, two FPUs, and one vector pipe.
+    Distributed schedulers (per IQ) feed the ports.
+  </p>
+  <h3>Execution units</h3>
+  <div class="grid-cards" id="res-units"></div>
+  <h3>Register files</h3>
+  <div class="grid-cards" id="res-rfs"></div>
+  <h3>Caches &amp; TLBs</h3>
+  <div class="grid-cards" id="res-cache"></div>
+</section>
+
+<!-- ===================== §04  Classes ===================== -->
+<section id="classes">
+  <h2><span class="num">§04</span> Instruction <em>classes</em></h2>
+  <p class="section-desc">
+    Each class declares operand roles, the producing unit, the production
+    stage, and the writeback stage. Optional latency hints live in
+    <code>opt.lat</code>.
+  </p>
+  <table class="tbl" id="cls-tbl">
+    <thead><tr>
+      <th>Class</th><th>Match</th><th>Src</th><th>Dst</th>
+      <th>Unit</th><th>Prod</th><th>WB</th><th>Lat</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<!-- ===================== §05  Hazards ===================== -->
+<section id="hazards">
+  <h2><span class="num">§05</span> <em>Hazards</em> &amp; forwarding</h2>
+  <p class="section-desc">
+    Renaming removes WAR / WAW on registers. The remaining hazards are
+    RAW bypasses, load-use bubbles, structural stalls on non-pipelined units,
+    and memory ordering.
+  </p>
+  <div class="kvlist" id="haz-list"></div>
+</section>
+
+<!-- ===================== §06  Control ===================== -->
+<section id="control">
+  <h2><span class="num">§06</span> <em>Control</em>: branches &amp; exceptions</h2>
+  <div class="kvlist" id="ctl-list"></div>
+</section>
+
+<!-- ===================== §07  OOO engine ===================== -->
+<section id="ooo">
+  <h2><span class="num">§07</span> Out-of-order <em>engine</em></h2>
+  <p class="section-desc">
+    Appendix D extension. Rename + ROB + distributed IQs + LSQ +
+    checkpoint-restore recovery.
+  </p>
+  <div class="ooo-grid" id="ooo-grid"></div>
+</section>
+
+<!-- ===================== §08  Prediction ===================== -->
+<section id="pred">
+  <h2><span class="num">§08</span> <em>Prediction</em> &amp; prefetch</h2>
+  <p class="section-desc">
+    Appendix E extension. Hybrid direction predictor + BTB +
+    indirect target table + return-address stack + sequential/branch-path
+    instruction prefetcher + memory-replay predictor.
+  </p>
+  <div class="ooo-grid" id="pred-grid"></div>
+</section>
+
+<!-- ===================== §09  Optional refinements ===================== -->
+<section id="opt">
+  <h2><span class="num">§09</span> Optional <em>refinements</em></h2>
+  <div class="ooo-grid" id="opt-grid"></div>
+</section>
+
+<!-- ===================== §10  Extensions ===================== -->
+<section id="ext">
+  <h2><span class="num">§10</span> Project <em>extensions</em></h2>
+  <p class="section-desc">
+    Vendor-specific extensions live in the <code>ext</code> namespace and
+    are preserved by class-C readers without interpretation.
+  </p>
+  <div class="ooo-grid" id="ext-grid"></div>
+</section>
+
+<!-- ===================== §11  Full YAML ===================== -->
+<section id="yaml">
+  <h2><span class="num">§11</span> Full YAML <em>source</em></h2>
+  <p class="section-desc">
+    The complete normative document. This is what an AI agent or downstream
+    tool would consume; everything above is rendered from it.
+  </p>
+  <details class="code-toggle" open>
+    <summary>c910_mspec.yaml — 428 lines</summary>
+    <pre id="yaml-pre"># =============================================================================
+# M-Spec v1.2  —  Xuantie C910 (T-Head / Alibaba)
+# Profile : rich + OOO extension (Appendix D) + prediction extension (Appendix E)
+# Conformance class: C (full interchange)
+# =============================================================================
+hdr:
+  fmt: mspec
+  ver: 1.2
+  arch: RV64GCV
+  name: xuantie_c910
+
+# -----------------------------------------------------------------------------
+# Top-level pipeline shape
+# 12-stage, 3-wide decode, 4-wide rename, 8-wide OoO issue, 3-wide retire
+# -----------------------------------------------------------------------------
+top:
+  issue: 8           # peak OoO issue width across 8 execution ports
+  commit: 3          # in-order retire width (matches 3-wide decode)
+  inorder: 0         # out-of-order machine
+  stages: [IF1, IF2, IF3, IB, ID, IR, DP, IS, RR, EX, WB, CM]
+
+# -----------------------------------------------------------------------------
+# Per-stage role declarations
+# -----------------------------------------------------------------------------
+stg:
+  IF1: {role: fetch,     pc_gen: 1, bpred_lookup: 1}
+  IF2: {role: fetch,     icache_access: 1}
+  IF3: {role: fetch,     predecode: 1, ras_pop: 1}
+  IB:  {role: fetch,     ibuffer: 1, align_16_32: 1}
+  ID:  {role: decode,    decode_width: 3}
+  IR:  {role: rename,    rename_width: 4, freelist_alloc: 1}
+  DP:  {role: dispatch,  rob_alloc: 1, iq_dispatch: 1, lsq_alloc: 1}
+  IS:  {role: issue,     wakeup: 1, select: 1, issue_width: 8}
+  RR:  {role: issue,     rf_read: 1}
+  EX:  {role: execute,   alu: 2, bru: 1, fpu: 2, lsu: 2, vu: 1}
+  WB:  {role: writeback, rf_write: 1, cdb_broadcast: 1}
+  CM:  {role: commit,    retire_width: 3, csr_update: 1, exception_point: 1}
+
+# -----------------------------------------------------------------------------
+# Resources — units, register files, queues, caches
+# -----------------------------------------------------------------------------
+res:
+  # Physical register files (~96-ish int / ~64 fp on real silicon, modeled here)
+  prf_int: {type: regfile, rd_ports: 10, wr_ports: 5, entries: 96}
+  prf_fp:  {type: regfile, rd_ports: 6,  wr_ports: 3, entries: 64}
+  prf_vec: {type: regfile, rd_ports: 4,  wr_ports: 2, entries: 64}
+
+  # Execution units (8 ports)
+  alu0: {type: alu,    stage: EX, count: 1, latency: 1}
+  alu1: {type: alu,    stage: EX, count: 1, latency: 1}
+  bru0: {type: branch, stage: EX, count: 1, latency: 1}
+  mdu0: {type: muldiv, stage: EX, count: 1, mul_lat: 3, div_lat: var}
+  lsu0: {type: lsu,    stage: EX, count: 1}     # load pipe
+  lsu1: {type: lsu,    stage: EX, count: 1}     # store / second load
+  fpu0: {type: fpu,    stage: EX, count: 1, fma_lat: 4}
+  fpu1: {type: fpu,    stage: EX, count: 1, fma_lat: 4}
+  vu0:  {type: vector, stage: EX, count: 1}     # vector pipeline (RVV 0.7.1)
+
+  # Caches (private L1, cluster-shared L2)
+  icache: {type: cache, level: 1, size: 64K, ways: 2, line: 64, replace: fifo,
+           predecode_bits_per_16b: 4}
+  dcache: {type: cache, level: 1, size: 64K, ways: 4, line: 64,
+           write_policy: writeback}
+  l2:     {type: cache, level: 2, shared: cluster, ways: 16, coherent: 1}
+
+  # TLBs
+  itlb: {type: tlb, entries: 32}
+  dtlb: {type: tlb, entries: 32}
+  l2tlb: {type: tlb, entries: 1024, shared: 1}
+
+# -----------------------------------------------------------------------------
+# Instruction classes — production / writeback timing model
+# -----------------------------------------------------------------------------
+cls:
+  ALU:
+    match: [ADD, SUB, AND, OR, XOR, SLT, SLTU, ADDI, ANDI, ORI, XORI,
+            SLTI, SLLI, SRLI, SRAI, LUI, AUIPC, ADDW, SUBW]
+    src:  [rs1, &quot;rs2?&quot;]
+    dst:  [rd]
+    unit: alu0|alu1
+    prod: EX
+    wb:   WB
+    cons: EX
+
+  BR:
+    match: [BEQ, BNE, BLT, BGE, BLTU, BGEU, JAL, JALR]
+    src:  [rs1, &quot;rs2?&quot;]
+    dst:  [&quot;rd?&quot;]
+    unit: bru0
+    resolve: EX
+    prod: EX
+    wb:   WB
+
+  MUL:
+    match: [MUL, MULH, MULHU, MULHSU, MULW]
+    src:  [rs1, rs2]
+    dst:  [rd]
+    unit: mdu0
+    prod: EX+2
+    wb:   WB
+    lat:  3
+
+  DIV:
+    match: [DIV, DIVU, REM, REMU, DIVW, DIVUW, REMW, REMUW]
+    src:  [rs1, rs2]
+    dst:  [rd]
+    unit: mdu0
+    prod: EX+var
+    wb:   WB
+    lat:  variable
+    nonpipe: 1
+
+  LOAD:
+    match: [LB, LH, LW, LD, LBU, LHU, LWU, FLW, FLD]
+    src:  [rs1]
+    dst:  [rd]
+    unit: lsu0|lsu1
+    addr: EX
+    mem:  EX+1
+    prod: EX+2
+    wb:   WB
+    cons: EX
+
+  STORE:
+    match: [SB, SH, SW, SD, FSW, FSD]
+    src:  [rs1, rs2]
+    dst:  []
+    unit: lsu0|lsu1
+    addr: EX
+    data: EX
+    visible: CM   # store buffer drains after commit
+
+  FPU:
+    match: [FADD_S, FSUB_S, FMUL_S, FMADD_S, FADD_D, FSUB_D, FMUL_D, FMADD_D]
+    src:  [rs1, rs2, &quot;rs3?&quot;]
+    dst:  [rd]
+    unit: fpu0|fpu1
+    prod: EX+3
+    wb:   WB
+    lat:  4
+
+  VEC:
+    match: [VADD_VV, VMUL_VV, VLE, VSE, VFADD_VV]
+    src:  [&quot;vs1?&quot;, &quot;vs2?&quot;, &quot;rs1?&quot;]
+    dst:  [&quot;vd?&quot;]
+    unit: vu0
+    prod: EX+var
+    wb:   WB
+
+  CSR:
+    match: [CSRRW, CSRRS, CSRRC, CSRRWI, CSRRSI, CSRRCI]
+    src:  [&quot;rs1?&quot;, csr]
+    dst:  [&quot;rd?&quot;, csr]
+    unit: alu0
+    prod: EX
+    wb:   WB
+    serialize: 1   # CSR ops serialize the pipe
+
+  FENCE:
+    match: [FENCE, FENCE_I, SFENCE_VMA]
+    src:  []
+    dst:  []
+    serialize: 1
+    drain: store_buffer
+
+# -----------------------------------------------------------------------------
+# Shared timing anchors
+# -----------------------------------------------------------------------------
+mov:
+  rf_read:   RR
+  ex_use:    EX
+  mem_req:   EX
+  mem_rsp:   EX+1
+  rf_write:  WB
+  commit:    CM
+
+# -----------------------------------------------------------------------------
+# Hazards (renaming removes most WAR/WAW; only RAW and memory hazards modeled)
+# -----------------------------------------------------------------------------
+haz:
+  raw:
+    - {from: WB, to: RR, via: fwd}        # CDB → RF read
+    - {from: EX, to: EX, via: fwd}        # ALU → ALU same-cycle bypass
+    - {from: EX+1, to: EX, via: fwd}      # load → use (1-cycle bubble best case)
+  load_use:
+    detect: IS
+    when:  &quot;producer=LOAD &amp;&amp; consumer_cons=EX&quot;
+    act:   stall1
+  struct:
+    - {unit: mdu0, busy: 1, act: stall}   # MUL/DIV not fully pipelined for DIV
+    - {unit: vu0,  busy: var, act: stall}
+  mem_order:
+    war: renamed
+    waw: renamed
+    raw_mem: lsq_disambiguate
+  store_to_load_forward:
+    enable: 1
+    granularity: byte
+    partial_overlap: replay
+
+# -----------------------------------------------------------------------------
+# Control: branch resolution, flush domains, exceptions
+# -----------------------------------------------------------------------------
+ctl:
+  branch:
+    resolve: EX
+    predict: hybrid
+    mispredict:
+      flush: [IF1, IF2, IF3, IB, ID, IR, DP, IS, RR]
+      restart: IF1
+      penalty_cycles: 9
+  exception:
+    precise: 1
+    point: CM
+    flush_younger: 1
+  interrupt:
+    taken_at: CM
+
+# -----------------------------------------------------------------------------
+# Optional refinements (rich profile)
+# -----------------------------------------------------------------------------
+opt:
+  lat:
+    ALU:   1
+    BR:    1
+    LOAD:  3      # load-to-use observable latency
+    STORE: 1
+    MUL:   3
+    DIV:   var
+    FPU:   4
+    VEC:   var
+  cons:
+    ALU:   EX
+    BR:    EX
+    LOAD:  EX
+    STORE: EX
+    FPU:   EX
+    VEC:   EX
+  slots:
+    decode:  3
+    rename:  4
+    dispatch: 4
+    issue:   8
+    retire:  3
+  bypass:
+    paths:
+      - {from: alu0, to: [alu0, alu1, bru0, lsu0, lsu1], stage: EX, prio: 1}
+      - {from: alu1, to: [alu0, alu1, bru0, lsu0, lsu1], stage: EX, prio: 1}
+      - {from: lsu0, to: [alu0, alu1, bru0, lsu1],       stage: EX+1, prio: 2}
+      - {from: fpu0, to: [fpu0, fpu1],                   stage: EX+3, prio: 1}
+  flush:
+    domains:
+      front:  [IF1, IF2, IF3, IB]
+      decode: [ID, IR, DP]
+      sched:  [IS, RR]
+    late_kill: EX
+  commit:
+    visible_stage: CM
+    side_effect_order: program_order
+    store_visible: after_commit
+  naming:
+    bp: branch_predictor
+    ip: indirect_predictor
+    pf: prefetcher
+    rp: replay_predictor
+
+# -----------------------------------------------------------------------------
+# OOO extension (Appendix D)
+# -----------------------------------------------------------------------------
+ooo:
+  rename:
+    enable: 1
+    stage: IR
+    src_map: [rs1, rs2, rs3]
+    dst_alloc: [rd]
+    freelist: 1
+    checkpoints: branch     # checkpoint at every branch for fast recovery
+
+  preg:
+    int: 96
+    fp:  64
+    vec: 64
+
+  map:
+    int_arch: 32
+    fp_arch:  32
+    vec_arch: 32
+    zero_fixed: 1            # x0 hardwired
+    release: commit          # old phys reg released at retirement of overwriter
+
+  rob:
+    entries: 192
+    alloc_stage: DP
+    writeback: WB
+    retire_stage: CM
+    retire_width: 3
+    precise_exceptions: 1
+    early_release: 1         # Cortex-A73-style early resource release
+
+  iq:
+    # Distributed scheduler — per port group
+    int_a:  {entries: 16, issue_width: 2, wakeup: common_data_bus,
+             select: age_oldest_ready, age_vec_bits: 7}
+    int_b:  {entries: 8,  issue_width: 1, wakeup: common_data_bus,
+             select: age_oldest_ready, age_vec_bits: 7}
+    mem:    {entries: 16, issue_width: 2, wakeup: common_data_bus,
+             select: oldest_ready, age_vec_bits: 7}
+    fp:     {entries: 16, issue_width: 2, wakeup: common_data_bus,
+             select: oldest_ready}
+    vec:    {entries: 8,  issue_width: 1, wakeup: common_data_bus,
+             select: oldest_ready}
+
+  rs:
+    distributed: 1
+
+  lsq:
+    ldq: 32
+    stq: 24
+    store_visible: commit
+    ld_pass_st: speculative
+    st_to_ld_fwd: 1
+    violation: replay
+    partial_fwd: replay
+
+  memory:
+    ordering: weak_riscv      # RVWMO weak memory model
+    fence_serializes: 1
+    sfence_vma_drains_tlb: 1
+
+  wakeup:
+    event: writeback
+    broadcast: tag
+
+  select:
+    policy: age_oldest_ready
+    tie_break: port_priority
+    age_vec_bits: 7
+
+  commit:
+    stage: CM
+    width: 3
+    state_update: commit
+    csr_at: commit
+    exception_point: commit
+
+  recover:
+    branch: checkpoint_restore
+    exception: flush_younger
+    mem_violation: replay_from_rob
+    redirect_stage: IF1
+
+# -----------------------------------------------------------------------------
+# Prediction / Prefetch / Replay extension (Appendix E)
+# -----------------------------------------------------------------------------
+pred:
+  bpred:
+    enable: 1
+    stage: IF1
+    kind: hybrid
+    dir: tournament         # bimodal + gshare-style hybrid
+    target: btb
+    btb_entries: 1024
+    update: commit
+    mispredict_redirect: IF1
+
+  ipred:
+    enable: 1
+    kind: ittb              # indirect target table
+    entries: 256
+    stage: IF1
+    update: commit
+
+  ras:
+    enable: 1
+    depth: 32
+    push: call              # JAL/JALR with rd=x1 or x5
+    pop:  ret               # JALR with rs1=x1 or x5, rd=x0
+    repair: checkpoint_restore
+
+  prefetch:
+    enable: 1
+    stage: IF1
+    trigger: seq_plus_branch
+    degree: 2
+    distance: 4
+    throttle: miss_queue
+    cancel_on_redirect: 1
+
+  replay_pred:
+    enable: 1
+    scope: mem
+    stage: IS
+    signal: violation_or_nack
+    action: defer_issue
+    update: replay_event
+
+  ftq:
+    enable: 1
+    entries: 16
+    checkpoint: branch
+    redirect_stage: IF1
+
+# -----------------------------------------------------------------------------
+# Metadata
+# -----------------------------------------------------------------------------
+meta:
+  author: &quot;specification synthesized from public C910 documentation&quot;
+  references:
+    - &quot;Chen et al., &#x27;Xuantie-910&#x27;, ISCA 2020&quot;
+    - &quot;T-Head OpenC910 RTL, github.com/XUANTIE-RV/openc910&quot;
+    - &quot;Chips and Cheese microarchitecture analysis (2025)&quot;
+  process: &quot;TSMC 12nm FinFET&quot;
+  clock_target_ghz: 2.5
+  cores_per_cluster: &quot;1 to 4&quot;
+  status: descriptive
+
+# -----------------------------------------------------------------------------
+# Project-specific extensions
+# -----------------------------------------------------------------------------
+ext:
+  thead.xie:
+    description: &quot;XuanTie Instruction Extension — custom load/store, sync, cache ops&quot;
+    classes: [XIE_LDST, XIE_SYNC, XIE_CACHEOP]
+  thead.xmae:
+    description: &quot;XuanTie Memory Attributes Extension&quot;
+    extra_pte_bits: [SO, CA, BU, SE, T]
+  thead.dcp:
+    description: &quot;Device Coherence Port — coherent DMA path&quot;
+</pre>
+  </details>
+</section>
+
+<footer class="sitefoot">
+  <div>M-SPEC 1.2 · XUANTIE C910 · RV64GCV</div>
+  <div>STATUS · DESCRIPTIVE</div>
+</footer>
+
+</main>
+</div>
+
+<script id="mspec-data" type="application/json">{
+  "hdr": {
+    "fmt": "mspec",
+    "ver": 1.2,
+    "arch": "RV64GCV",
+    "name": "xuantie_c910"
+  },
+  "top": {
+    "issue": 8,
+    "commit": 3,
+    "inorder": 0,
+    "stages": [
+      "IF1",
+      "IF2",
+      "IF3",
+      "IB",
+      "ID",
+      "IR",
+      "DP",
+      "IS",
+      "RR",
+      "EX",
+      "WB",
+      "CM"
+    ]
+  },
+  "stg": {
+    "IF1": {
+      "role": "fetch",
+      "pc_gen": 1,
+      "bpred_lookup": 1
+    },
+    "IF2": {
+      "role": "fetch",
+      "icache_access": 1
+    },
+    "IF3": {
+      "role": "fetch",
+      "predecode": 1,
+      "ras_pop": 1
+    },
+    "IB": {
+      "role": "fetch",
+      "ibuffer": 1,
+      "align_16_32": 1
+    },
+    "ID": {
+      "role": "decode",
+      "decode_width": 3
+    },
+    "IR": {
+      "role": "rename",
+      "rename_width": 4,
+      "freelist_alloc": 1
+    },
+    "DP": {
+      "role": "dispatch",
+      "rob_alloc": 1,
+      "iq_dispatch": 1,
+      "lsq_alloc": 1
+    },
+    "IS": {
+      "role": "issue",
+      "wakeup": 1,
+      "select": 1,
+      "issue_width": 8
+    },
+    "RR": {
+      "role": "issue",
+      "rf_read": 1
+    },
+    "EX": {
+      "role": "execute",
+      "alu": 2,
+      "bru": 1,
+      "fpu": 2,
+      "lsu": 2,
+      "vu": 1
+    },
+    "WB": {
+      "role": "writeback",
+      "rf_write": 1,
+      "cdb_broadcast": 1
+    },
+    "CM": {
+      "role": "commit",
+      "retire_width": 3,
+      "csr_update": 1,
+      "exception_point": 1
+    }
+  },
+  "res": {
+    "prf_int": {
+      "type": "regfile",
+      "rd_ports": 10,
+      "wr_ports": 5,
+      "entries": 96
+    },
+    "prf_fp": {
+      "type": "regfile",
+      "rd_ports": 6,
+      "wr_ports": 3,
+      "entries": 64
+    },
+    "prf_vec": {
+      "type": "regfile",
+      "rd_ports": 4,
+      "wr_ports": 2,
+      "entries": 64
+    },
+    "alu0": {
+      "type": "alu",
+      "stage": "EX",
+      "count": 1,
+      "latency": 1
+    },
+    "alu1": {
+      "type": "alu",
+      "stage": "EX",
+      "count": 1,
+      "latency": 1
+    },
+    "bru0": {
+      "type": "branch",
+      "stage": "EX",
+      "count": 1,
+      "latency": 1
+    },
+    "mdu0": {
+      "type": "muldiv",
+      "stage": "EX",
+      "count": 1,
+      "mul_lat": 3,
+      "div_lat": "var"
+    },
+    "lsu0": {
+      "type": "lsu",
+      "stage": "EX",
+      "count": 1
+    },
+    "lsu1": {
+      "type": "lsu",
+      "stage": "EX",
+      "count": 1
+    },
+    "fpu0": {
+      "type": "fpu",
+      "stage": "EX",
+      "count": 1,
+      "fma_lat": 4
+    },
+    "fpu1": {
+      "type": "fpu",
+      "stage": "EX",
+      "count": 1,
+      "fma_lat": 4
+    },
+    "vu0": {
+      "type": "vector",
+      "stage": "EX",
+      "count": 1
+    },
+    "icache": {
+      "type": "cache",
+      "level": 1,
+      "size": "64K",
+      "ways": 2,
+      "line": 64,
+      "replace": "fifo",
+      "predecode_bits_per_16b": 4
+    },
+    "dcache": {
+      "type": "cache",
+      "level": 1,
+      "size": "64K",
+      "ways": 4,
+      "line": 64,
+      "write_policy": "writeback"
+    },
+    "l2": {
+      "type": "cache",
+      "level": 2,
+      "shared": "cluster",
+      "ways": 16,
+      "coherent": 1
+    },
+    "itlb": {
+      "type": "tlb",
+      "entries": 32
+    },
+    "dtlb": {
+      "type": "tlb",
+      "entries": 32
+    },
+    "l2tlb": {
+      "type": "tlb",
+      "entries": 1024,
+      "shared": 1
+    }
+  },
+  "cls": {
+    "ALU": {
+      "match": [
+        "ADD",
+        "SUB",
+        "AND",
+        "OR",
+        "XOR",
+        "SLT",
+        "SLTU",
+        "ADDI",
+        "ANDI",
+        "ORI",
+        "XORI",
+        "SLTI",
+        "SLLI",
+        "SRLI",
+        "SRAI",
+        "LUI",
+        "AUIPC",
+        "ADDW",
+        "SUBW"
+      ],
+      "src": [
+        "rs1",
+        "rs2?"
+      ],
+      "dst": [
+        "rd"
+      ],
+      "unit": "alu0|alu1",
+      "prod": "EX",
+      "wb": "WB",
+      "cons": "EX"
+    },
+    "BR": {
+      "match": [
+        "BEQ",
+        "BNE",
+        "BLT",
+        "BGE",
+        "BLTU",
+        "BGEU",
+        "JAL",
+        "JALR"
+      ],
+      "src": [
+        "rs1",
+        "rs2?"
+      ],
+      "dst": [
+        "rd?"
+      ],
+      "unit": "bru0",
+      "resolve": "EX",
+      "prod": "EX",
+      "wb": "WB"
+    },
+    "MUL": {
+      "match": [
+        "MUL",
+        "MULH",
+        "MULHU",
+        "MULHSU",
+        "MULW"
+      ],
+      "src": [
+        "rs1",
+        "rs2"
+      ],
+      "dst": [
+        "rd"
+      ],
+      "unit": "mdu0",
+      "prod": "EX+2",
+      "wb": "WB",
+      "lat": 3
+    },
+    "DIV": {
+      "match": [
+        "DIV",
+        "DIVU",
+        "REM",
+        "REMU",
+        "DIVW",
+        "DIVUW",
+        "REMW",
+        "REMUW"
+      ],
+      "src": [
+        "rs1",
+        "rs2"
+      ],
+      "dst": [
+        "rd"
+      ],
+      "unit": "mdu0",
+      "prod": "EX+var",
+      "wb": "WB",
+      "lat": "variable",
+      "nonpipe": 1
+    },
+    "LOAD": {
+      "match": [
+        "LB",
+        "LH",
+        "LW",
+        "LD",
+        "LBU",
+        "LHU",
+        "LWU",
+        "FLW",
+        "FLD"
+      ],
+      "src": [
+        "rs1"
+      ],
+      "dst": [
+        "rd"
+      ],
+      "unit": "lsu0|lsu1",
+      "addr": "EX",
+      "mem": "EX+1",
+      "prod": "EX+2",
+      "wb": "WB",
+      "cons": "EX"
+    },
+    "STORE": {
+      "match": [
+        "SB",
+        "SH",
+        "SW",
+        "SD",
+        "FSW",
+        "FSD"
+      ],
+      "src": [
+        "rs1",
+        "rs2"
+      ],
+      "dst": [],
+      "unit": "lsu0|lsu1",
+      "addr": "EX",
+      "data": "EX",
+      "visible": "CM"
+    },
+    "FPU": {
+      "match": [
+        "FADD_S",
+        "FSUB_S",
+        "FMUL_S",
+        "FMADD_S",
+        "FADD_D",
+        "FSUB_D",
+        "FMUL_D",
+        "FMADD_D"
+      ],
+      "src": [
+        "rs1",
+        "rs2",
+        "rs3?"
+      ],
+      "dst": [
+        "rd"
+      ],
+      "unit": "fpu0|fpu1",
+      "prod": "EX+3",
+      "wb": "WB",
+      "lat": 4
+    },
+    "VEC": {
+      "match": [
+        "VADD_VV",
+        "VMUL_VV",
+        "VLE",
+        "VSE",
+        "VFADD_VV"
+      ],
+      "src": [
+        "vs1?",
+        "vs2?",
+        "rs1?"
+      ],
+      "dst": [
+        "vd?"
+      ],
+      "unit": "vu0",
+      "prod": "EX+var",
+      "wb": "WB"
+    },
+    "CSR": {
+      "match": [
+        "CSRRW",
+        "CSRRS",
+        "CSRRC",
+        "CSRRWI",
+        "CSRRSI",
+        "CSRRCI"
+      ],
+      "src": [
+        "rs1?",
+        "csr"
+      ],
+      "dst": [
+        "rd?",
+        "csr"
+      ],
+      "unit": "alu0",
+      "prod": "EX",
+      "wb": "WB",
+      "serialize": 1
+    },
+    "FENCE": {
+      "match": [
+        "FENCE",
+        "FENCE_I",
+        "SFENCE_VMA"
+      ],
+      "src": [],
+      "dst": [],
+      "serialize": 1,
+      "drain": "store_buffer"
+    }
+  },
+  "mov": {
+    "rf_read": "RR",
+    "ex_use": "EX",
+    "mem_req": "EX",
+    "mem_rsp": "EX+1",
+    "rf_write": "WB",
+    "commit": "CM"
+  },
+  "haz": {
+    "raw": [
+      {
+        "from": "WB",
+        "to": "RR",
+        "via": "fwd"
+      },
+      {
+        "from": "EX",
+        "to": "EX",
+        "via": "fwd"
+      },
+      {
+        "from": "EX+1",
+        "to": "EX",
+        "via": "fwd"
+      }
+    ],
+    "load_use": {
+      "detect": "IS",
+      "when": "producer=LOAD && consumer_cons=EX",
+      "act": "stall1"
+    },
+    "struct": [
+      {
+        "unit": "mdu0",
+        "busy": 1,
+        "act": "stall"
+      },
+      {
+        "unit": "vu0",
+        "busy": "var",
+        "act": "stall"
+      }
+    ],
+    "mem_order": {
+      "war": "renamed",
+      "waw": "renamed",
+      "raw_mem": "lsq_disambiguate"
+    },
+    "store_to_load_forward": {
+      "enable": 1,
+      "granularity": "byte",
+      "partial_overlap": "replay"
+    }
+  },
+  "ctl": {
+    "branch": {
+      "resolve": "EX",
+      "predict": "hybrid",
+      "mispredict": {
+        "flush": [
+          "IF1",
+          "IF2",
+          "IF3",
+          "IB",
+          "ID",
+          "IR",
+          "DP",
+          "IS",
+          "RR"
+        ],
+        "restart": "IF1",
+        "penalty_cycles": 9
+      }
+    },
+    "exception": {
+      "precise": 1,
+      "point": "CM",
+      "flush_younger": 1
+    },
+    "interrupt": {
+      "taken_at": "CM"
+    }
+  },
+  "opt": {
+    "lat": {
+      "ALU": 1,
+      "BR": 1,
+      "LOAD": 3,
+      "STORE": 1,
+      "MUL": 3,
+      "DIV": "var",
+      "FPU": 4,
+      "VEC": "var"
+    },
+    "cons": {
+      "ALU": "EX",
+      "BR": "EX",
+      "LOAD": "EX",
+      "STORE": "EX",
+      "FPU": "EX",
+      "VEC": "EX"
+    },
+    "slots": {
+      "decode": 3,
+      "rename": 4,
+      "dispatch": 4,
+      "issue": 8,
+      "retire": 3
+    },
+    "bypass": {
+      "paths": [
+        {
+          "from": "alu0",
+          "to": [
+            "alu0",
+            "alu1",
+            "bru0",
+            "lsu0",
+            "lsu1"
+          ],
+          "stage": "EX",
+          "prio": 1
+        },
+        {
+          "from": "alu1",
+          "to": [
+            "alu0",
+            "alu1",
+            "bru0",
+            "lsu0",
+            "lsu1"
+          ],
+          "stage": "EX",
+          "prio": 1
+        },
+        {
+          "from": "lsu0",
+          "to": [
+            "alu0",
+            "alu1",
+            "bru0",
+            "lsu1"
+          ],
+          "stage": "EX+1",
+          "prio": 2
+        },
+        {
+          "from": "fpu0",
+          "to": [
+            "fpu0",
+            "fpu1"
+          ],
+          "stage": "EX+3",
+          "prio": 1
+        }
+      ]
+    },
+    "flush": {
+      "domains": {
+        "front": [
+          "IF1",
+          "IF2",
+          "IF3",
+          "IB"
+        ],
+        "decode": [
+          "ID",
+          "IR",
+          "DP"
+        ],
+        "sched": [
+          "IS",
+          "RR"
+        ]
+      },
+      "late_kill": "EX"
+    },
+    "commit": {
+      "visible_stage": "CM",
+      "side_effect_order": "program_order",
+      "store_visible": "after_commit"
+    },
+    "naming": {
+      "bp": "branch_predictor",
+      "ip": "indirect_predictor",
+      "pf": "prefetcher",
+      "rp": "replay_predictor"
+    }
+  },
+  "ooo": {
+    "rename": {
+      "enable": 1,
+      "stage": "IR",
+      "src_map": [
+        "rs1",
+        "rs2",
+        "rs3"
+      ],
+      "dst_alloc": [
+        "rd"
+      ],
+      "freelist": 1,
+      "checkpoints": "branch"
+    },
+    "preg": {
+      "int": 96,
+      "fp": 64,
+      "vec": 64
+    },
+    "map": {
+      "int_arch": 32,
+      "fp_arch": 32,
+      "vec_arch": 32,
+      "zero_fixed": 1,
+      "release": "commit"
+    },
+    "rob": {
+      "entries": 192,
+      "alloc_stage": "DP",
+      "writeback": "WB",
+      "retire_stage": "CM",
+      "retire_width": 3,
+      "precise_exceptions": 1,
+      "early_release": 1
+    },
+    "iq": {
+      "int_a": {
+        "entries": 16,
+        "issue_width": 2,
+        "wakeup": "common_data_bus",
+        "select": "age_oldest_ready",
+        "age_vec_bits": 7
+      },
+      "int_b": {
+        "entries": 8,
+        "issue_width": 1,
+        "wakeup": "common_data_bus",
+        "select": "age_oldest_ready",
+        "age_vec_bits": 7
+      },
+      "mem": {
+        "entries": 16,
+        "issue_width": 2,
+        "wakeup": "common_data_bus",
+        "select": "oldest_ready",
+        "age_vec_bits": 7
+      },
+      "fp": {
+        "entries": 16,
+        "issue_width": 2,
+        "wakeup": "common_data_bus",
+        "select": "oldest_ready"
+      },
+      "vec": {
+        "entries": 8,
+        "issue_width": 1,
+        "wakeup": "common_data_bus",
+        "select": "oldest_ready"
+      }
+    },
+    "rs": {
+      "distributed": 1
+    },
+    "lsq": {
+      "ldq": 32,
+      "stq": 24,
+      "store_visible": "commit",
+      "ld_pass_st": "speculative",
+      "st_to_ld_fwd": 1,
+      "violation": "replay",
+      "partial_fwd": "replay"
+    },
+    "memory": {
+      "ordering": "weak_riscv",
+      "fence_serializes": 1,
+      "sfence_vma_drains_tlb": 1
+    },
+    "wakeup": {
+      "event": "writeback",
+      "broadcast": "tag"
+    },
+    "select": {
+      "policy": "age_oldest_ready",
+      "tie_break": "port_priority",
+      "age_vec_bits": 7
+    },
+    "commit": {
+      "stage": "CM",
+      "width": 3,
+      "state_update": "commit",
+      "csr_at": "commit",
+      "exception_point": "commit"
+    },
+    "recover": {
+      "branch": "checkpoint_restore",
+      "exception": "flush_younger",
+      "mem_violation": "replay_from_rob",
+      "redirect_stage": "IF1"
+    }
+  },
+  "pred": {
+    "bpred": {
+      "enable": 1,
+      "stage": "IF1",
+      "kind": "hybrid",
+      "dir": "tournament",
+      "target": "btb",
+      "btb_entries": 1024,
+      "update": "commit",
+      "mispredict_redirect": "IF1"
+    },
+    "ipred": {
+      "enable": 1,
+      "kind": "ittb",
+      "entries": 256,
+      "stage": "IF1",
+      "update": "commit"
+    },
+    "ras": {
+      "enable": 1,
+      "depth": 32,
+      "push": "call",
+      "pop": "ret",
+      "repair": "checkpoint_restore"
+    },
+    "prefetch": {
+      "enable": 1,
+      "stage": "IF1",
+      "trigger": "seq_plus_branch",
+      "degree": 2,
+      "distance": 4,
+      "throttle": "miss_queue",
+      "cancel_on_redirect": 1
+    },
+    "replay_pred": {
+      "enable": 1,
+      "scope": "mem",
+      "stage": "IS",
+      "signal": "violation_or_nack",
+      "action": "defer_issue",
+      "update": "replay_event"
+    },
+    "ftq": {
+      "enable": 1,
+      "entries": 16,
+      "checkpoint": "branch",
+      "redirect_stage": "IF1"
+    }
+  },
+  "meta": {
+    "author": "specification synthesized from public C910 documentation",
+    "references": [
+      "Chen et al., 'Xuantie-910', ISCA 2020",
+      "T-Head OpenC910 RTL, github.com/XUANTIE-RV/openc910",
+      "Chips and Cheese microarchitecture analysis (2025)"
+    ],
+    "process": "TSMC 12nm FinFET",
+    "clock_target_ghz": 2.5,
+    "cores_per_cluster": "1 to 4",
+    "status": "descriptive"
+  },
+  "ext": {
+    "thead.xie": {
+      "description": "XuanTie Instruction Extension \u2014 custom load/store, sync, cache ops",
+      "classes": [
+        "XIE_LDST",
+        "XIE_SYNC",
+        "XIE_CACHEOP"
+      ]
+    },
+    "thead.xmae": {
+      "description": "XuanTie Memory Attributes Extension",
+      "extra_pte_bits": [
+        "SO",
+        "CA",
+        "BU",
+        "SE",
+        "T"
+      ]
+    },
+    "thead.dcp": {
+      "description": "Device Coherence Port \u2014 coherent DMA path"
+    }
+  }
+}</script>
+<script>
+(function () {
+  const doc = JSON.parse(document.getElementById('mspec-data').textContent);
+
+  // ---------- Pipeline SVG ----------
+  const stages = doc.top.stages;
+  const W = 1100, H = 240, pad = 36;
+  const cellW = (W - pad*2) / stages.length;
+  const colorOf = (role) => ({
+    fetch: '#7fffb3', decode: '#5fb3ff', rename: '#5fb3ff',
+    dispatch: '#5fb3ff', issue: '#ffb44a',
+    execute: '#ff6a3d', writeback: '#ffb44a', commit: '#ff7fb0'
+  })[role] || '#98a3ad';
+  let svg = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`;
+  // Title row
+  svg += `<text x="${pad}" y="24" font-family="JetBrains Mono, monospace" font-size="11" fill="#7fffb3" letter-spacing="2">12-STAGE PIPELINE · 3-WIDE DECODE · 8-PORT OoO EXECUTE · 3-WIDE RETIRE</text>`;
+
+  // Pipeline arrow line
+  svg += `<line x1="${pad}" y1="${H/2}" x2="${W-pad}" y2="${H/2}" stroke="#232c34" stroke-width="1"/>`;
+
+  stages.forEach((s, i) => {
+    const x = pad + i*cellW + 6;
+    const w = cellW - 12;
+    const role = (doc.stg[s] && doc.stg[s].role) || '';
+    const c = colorOf(role);
+    const y = H/2 - 28;
+    svg += `<rect x="${x}" y="${y}" width="${w}" height="56" fill="#161c22" stroke="${c}" stroke-width="1.2" rx="1"/>`;
+    svg += `<text x="${x+w/2}" y="${y+22}" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" font-weight="700" fill="#e8ecef">${s}</text>`;
+    svg += `<text x="${x+w/2}" y="${y+42}" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9.5" fill="${c}" letter-spacing="1.5">${role.toUpperCase()}</text>`;
+    // tick marks above with cycle index
+    svg += `<text x="${x+w/2}" y="${y-8}" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" fill="#5d6b75">t+${i}</text>`;
+  });
+
+  // Frontend / Backend bracket labels
+  const beStart = pad + 9*cellW; // EX index in stages
+  svg += `<line x1="${pad}" y1="${H-22}" x2="${pad + 8*cellW}" y2="${H-22}" stroke="#5fb3ff" stroke-width="1"/>`;
+  svg += `<text x="${pad+8}" y="${H-8}" font-family="JetBrains Mono, monospace" font-size="10" fill="#5fb3ff">FRONTEND · IN-ORDER</text>`;
+  svg += `<line x1="${beStart}" y1="${H-22}" x2="${W-pad}" y2="${H-22}" stroke="#ff6a3d" stroke-width="1"/>`;
+  svg += `<text x="${beStart+8}" y="${H-8}" font-family="JetBrains Mono, monospace" font-size="10" fill="#ff6a3d">BACKEND · OoO / RETIRE</text>`;
+
+  svg += `</svg>`;
+  document.getElementById('pipeline-svg-wrap').innerHTML = svg;
+
+  // ---------- Stages table ----------
+  const stbody = document.querySelector('#stages-tbl tbody');
+  stages.forEach(s => {
+    const entry = doc.stg[s] || {};
+    const role = entry.role || '';
+    const attrs = Object.entries(entry)
+      .filter(([k]) => k !== 'role')
+      .map(([k, v]) => `${k}=${v}`).join('  ·  ');
+    stbody.insertAdjacentHTML('beforeend',
+      `<tr><td>${s}</td><td>${role}</td><td>${attrs || '—'}</td></tr>`);
+  });
+
+  // ---------- Resources ----------
+  function resCard(name, kind, obj) {
+    const rows = Object.entries(obj).filter(([k]) => k !== 'type')
+      .map(([k, v]) => `<div class="row"><b>${k}</b> = ${v}</div>`).join('');
+    return `<div class="res-card ${kind}">
+      <div class="name">${name} <span class="small-mono">${obj.type || ''}</span></div>
+      ${rows}
+    </div>`;
+  }
+  const resByKind = { units: [], rfs: [], cache: [] };
+  for (const [name, r] of Object.entries(doc.res)) {
+    const t = (r.type || '').toLowerCase();
+    if (t === 'regfile') resByKind.rfs.push(resCard(name, 'rf', r));
+    else if (t === 'cache' || t === 'tlb') resByKind.cache.push(resCard(name, 'cache', r));
+    else {
+      const cls = ({alu:'alu', lsu:'lsu', fpu:'fpu', vector:'vec',
+                    branch:'alu', muldiv:'alu'})[t] || 'alu';
+      resByKind.units.push(resCard(name, cls, r));
+    }
+  }
+  document.getElementById('res-units').innerHTML = resByKind.units.join('');
+  document.getElementById('res-rfs').innerHTML = resByKind.rfs.join('');
+  document.getElementById('res-cache').innerHTML = resByKind.cache.join('');
+
+  // ---------- Classes ----------
+  const clsBody = document.querySelector('#cls-tbl tbody');
+  for (const [name, c] of Object.entries(doc.cls)) {
+    const lat = (doc.opt && doc.opt.lat && doc.opt.lat[name]) ?? c.lat ?? '—';
+    const match = (c.match || []).slice(0, 4).join(', ') +
+                  ((c.match && c.match.length > 4) ? ` … +${c.match.length-4}` : '');
+    clsBody.insertAdjacentHTML('beforeend', `<tr>
+      <td>${name}</td>
+      <td>${match || '—'}</td>
+      <td>${(c.src || []).join(', ') || '—'}</td>
+      <td>${(c.dst || []).join(', ') || '—'}</td>
+      <td>${c.unit || '—'}</td>
+      <td>${c.prod || '—'}</td>
+      <td>${c.wb || '—'}</td>
+      <td>${lat}</td>
+    </tr>`);
+  }
+
+  // ---------- Hazards ----------
+  function kvHtml(obj, indent = 0) {
+    if (obj === null || obj === undefined) return '<span style="color:var(--ink-mute)">∅</span>';
+    if (typeof obj !== 'object') return String(obj);
+    if (Array.isArray(obj)) {
+      if (obj.every(x => typeof x !== 'object')) return obj.join(', ');
+      return '<div style="padding-left:' + (indent*12) + 'px">' +
+        obj.map(o => kvHtml(o, indent+1)).join('<br>') + '</div>';
+    }
+    return Object.entries(obj).map(([k,v]) =>
+      `<span style="color:var(--ink-dim)">${k}=</span><span style="color:var(--ink)">${kvHtml(v, indent+1)}</span>`
+    ).join('  ·  ');
+  }
+  const hazList = document.getElementById('haz-list');
+  for (const [k, v] of Object.entries(doc.haz || {})) {
+    hazList.insertAdjacentHTML('beforeend',
+      `<div class="kv"><span class="k">${k}</span><span class="v">${kvHtml(v)}</span></div>`);
+  }
+
+  // ---------- Control ----------
+  const ctlList = document.getElementById('ctl-list');
+  for (const [k, v] of Object.entries(doc.ctl || {})) {
+    ctlList.insertAdjacentHTML('beforeend',
+      `<div class="kv"><span class="k">${k}</span><span class="v">${kvHtml(v)}</span></div>`);
+  }
+
+  // ---------- OOO ----------
+  function subCard(title, obj) {
+    if (obj === null || typeof obj !== 'object') {
+      return `<div class="ooo-card"><h4>${title}</h4><div class="pair"><span class="k">value</span><span class="v">${obj}</span></div></div>`;
+    }
+    if (Array.isArray(obj)) {
+      return `<div class="ooo-card"><h4>${title}</h4>${
+        obj.map((o,i) => `<div class="pair"><span class="k">[${i}]</span><span class="v">${kvHtml(o)}</span></div>`).join('')
+      }</div>`;
+    }
+    const rows = Object.entries(obj).map(([k, v]) => {
+      if (v !== null && typeof v === 'object') {
+        return `<div class="pair"><span class="k">${k}</span><span class="v">${kvHtml(v)}</span></div>`;
+      }
+      return `<div class="pair"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+    }).join('');
+    return `<div class="ooo-card"><h4>${title}</h4>${rows}</div>`;
+  }
+  const oooGrid = document.getElementById('ooo-grid');
+  for (const [k, v] of Object.entries(doc.ooo || {})) {
+    oooGrid.insertAdjacentHTML('beforeend', subCard(k, v));
+  }
+
+  // ---------- Pred ----------
+  const predGrid = document.getElementById('pred-grid');
+  for (const [k, v] of Object.entries(doc.pred || {})) {
+    predGrid.insertAdjacentHTML('beforeend', subCard(k, v));
+  }
+
+  // ---------- Opt ----------
+  const optGrid = document.getElementById('opt-grid');
+  for (const [k, v] of Object.entries(doc.opt || {})) {
+    optGrid.insertAdjacentHTML('beforeend', subCard(k, v));
+  }
+
+  // ---------- Ext ----------
+  const extGrid = document.getElementById('ext-grid');
+  for (const [k, v] of Object.entries(doc.ext || {})) {
+    extGrid.insertAdjacentHTML('beforeend', subCard(k, v));
+  }
+
+  // ---------- TOC scrollspy ----------
+  const links = document.querySelectorAll('nav.toc a');
+  const sections = [...document.querySelectorAll('main.content section')];
+  const obs = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        links.forEach(a => a.classList.toggle('active',
+          a.getAttribute('href') === '#' + e.target.id));
+      }
+    });
+  }, { rootMargin: '-40% 0px -55% 0px', threshold: 0 });
+  sections.forEach(s => obs.observe(s));
+})();
+</script>
+</body>
+</html>

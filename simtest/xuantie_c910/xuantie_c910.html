@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Xuantie C910 · Specification Bundle</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,600;9..144,800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0d10;
+    --bg-2: #11161a;
+    --panel: #161c22;
+    --line: #232c34;
+    --ink: #e8ecef;
+    --ink-dim: #98a3ad;
+    --ink-mute: #5d6b75;
+    --phos: #7fffb3;       /* phosphor green */
+    --amber: #ffb44a;      /* warm amber accent */
+    --rust: #ff6a3d;
+    --azure: #5fb3ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink); }
+  body {
+    font-family: 'Fraunces', Georgia, serif;
+    font-weight: 400;
+    line-height: 1.55;
+    min-height: 100vh;
+    background-image:
+      radial-gradient(circle at 20% 0%, rgba(127, 255, 179, 0.06), transparent 40%),
+      radial-gradient(circle at 80% 100%, rgba(255, 180, 74, 0.05), transparent 40%),
+      linear-gradient(var(--bg), var(--bg));
+    background-attachment: fixed;
+  }
+  .grid-bg {
+    position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background-image:
+      linear-gradient(rgba(127, 255, 179, 0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(127, 255, 179, 0.025) 1px, transparent 1px);
+    background-size: 48px 48px;
+    mask-image: radial-gradient(ellipse at center, black 30%, transparent 80%);
+  }
+  main {
+    position: relative; z-index: 1;
+    max-width: 1100px; margin: 0 auto; padding: 80px 48px 120px;
+  }
+  .eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase;
+    color: var(--phos); margin-bottom: 24px;
+  }
+  h1 {
+    font-family: 'Fraunces', serif;
+    font-weight: 300; font-style: normal;
+    font-size: clamp(56px, 9vw, 128px);
+    line-height: 0.92; letter-spacing: -0.04em; margin: 0 0 8px;
+    font-variation-settings: "opsz" 144;
+  }
+  h1 em {
+    font-style: italic; font-weight: 800; color: var(--amber);
+    font-variation-settings: "opsz" 144;
+  }
+  .tagline {
+    font-size: 22px; color: var(--ink-dim); max-width: 56ch;
+    margin: 28px 0 0; font-weight: 300;
+  }
+  .meta-row {
+    display: flex; flex-wrap: wrap; gap: 32px;
+    margin: 56px 0 80px; padding: 24px 0;
+    border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+    font-family: 'JetBrains Mono', monospace; font-size: 12px;
+  }
+  .meta-item { display: flex; flex-direction: column; gap: 6px; }
+  .meta-item .k { color: var(--ink-mute); letter-spacing: 0.1em; text-transform: uppercase; font-size: 10px; }
+  .meta-item .v { color: var(--ink); }
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 64px; }
+  @media (max-width: 720px) { .cards { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 2px;
+    padding: 36px 32px 32px; position: relative; overflow: hidden;
+    transition: transform 0.4s cubic-bezier(.2,.7,.3,1), border-color 0.3s;
+    text-decoration: none; color: inherit; display: block;
+  }
+  .card::before {
+    content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, var(--phos), transparent 60%);
+    opacity: 0.6;
+  }
+  .card:hover { transform: translateY(-4px); border-color: var(--phos); }
+  .card .label {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    letter-spacing: 0.2em; text-transform: uppercase; color: var(--phos);
+  }
+  .card h2 {
+    font-family: 'Fraunces', serif; font-weight: 400; font-size: 44px;
+    margin: 16px 0 8px; letter-spacing: -0.02em; line-height: 1;
+  }
+  .card h2 em { font-style: italic; font-weight: 600; color: var(--amber); }
+  .card p { color: var(--ink-dim); margin: 12px 0 20px; font-size: 15px; }
+  .card .arrow {
+    font-family: 'JetBrains Mono', monospace; font-size: 13px;
+    color: var(--ink); letter-spacing: 0.1em;
+  }
+  .footer {
+    margin-top: 80px; padding-top: 32px; border-top: 1px solid var(--line);
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    color: var(--ink-mute); display: flex; justify-content: space-between;
+    letter-spacing: 0.08em;
+  }
+  .glyph {
+    position: absolute; right: 24px; bottom: 18px;
+    font-family: 'JetBrains Mono', monospace; font-size: 10px;
+    color: var(--ink-mute); letter-spacing: 0.2em;
+  }
+</style>
+</head>
+<body>
+<div class="grid-bg"></div>
+<main>
+  <div class="eyebrow">M-Spec 1.2 · V-Spec 1.0 · Conformance Class C</div>
+  <h1>Xuantie <em>C910</em></h1>
+  <p class="tagline">
+    A 12-stage, 3-decode / 8-issue, out-of-order RV64GCV implementation —
+    formalized in two complementary languages.
+  </p>
+
+  <div class="meta-row">
+    <div class="meta-item"><span class="k">ISA</span><span class="v">RV64GCV + XIE</span></div>
+    <div class="meta-item"><span class="k">Pipeline</span><span class="v">12 stages</span></div>
+    <div class="meta-item"><span class="k">Decode</span><span class="v">3-wide</span></div>
+    <div class="meta-item"><span class="k">Rename</span><span class="v">4-wide</span></div>
+    <div class="meta-item"><span class="k">Issue</span><span class="v">8-wide OoO</span></div>
+    <div class="meta-item"><span class="k">Retire</span><span class="v">3-wide</span></div>
+    <div class="meta-item"><span class="k">ROB</span><span class="v">192 entries</span></div>
+    <div class="meta-item"><span class="k">Target</span><span class="v">TSMC 12nm · 2.5 GHz</span></div>
+  </div>
+
+  <div class="cards">
+    <a class="card" href="mspec.html">
+      <div class="label">Document 01 / M-Spec</div>
+      <h2>Microarchitectural <em>Exchange</em></h2>
+      <p>
+        Compact, machine-parseable description of pipeline stages,
+        resources, instruction classes, hazards, and the out-of-order engine.
+        Profile: <strong>rich</strong> with OOO and prediction extensions.
+      </p>
+      <div class="arrow">→ OPEN MSPEC</div>
+      <span class="glyph">@mspec/1.2</span>
+    </a>
+    <a class="card" href="vspec.html">
+      <div class="label">Document 02 / V-Spec</div>
+      <h2>Verifiable <em>Contract</em></h2>
+      <p>
+        Formal architectural and behavioral rules over symbolic time —
+        decode, ALU, rename, memory ordering, SoC transactions, reset and
+        retention. Roughly 30 rules across 12 sections.
+      </p>
+      <div class="arrow">→ OPEN VSPEC</div>
+      <span class="glyph">vspec/1.0</span>
+    </a>
+  </div>
+
+  <div class="footer">
+    <div>SYNTHESIZED FROM PUBLIC C910 DOCUMENTATION</div>
+    <div>STATUS · DESCRIPTIVE</div>
+  </div>
+</main>
+</body>
+</html>

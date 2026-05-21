@@ -1,0 +1,1834 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>V-Spec · Xuantie C910</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,600;9..144,800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0d10; --bg-2: #11161a; --panel: #161c22; --panel-2: #1c242c;
+    --line: #232c34; --ink: #e8ecef; --ink-dim: #98a3ad; --ink-mute: #5d6b75;
+    --phos: #7fffb3; --amber: #ffb44a; --rust: #ff6a3d; --azure: #5fb3ff; --magenta: #ff7fb0;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; background:var(--bg); color:var(--ink); }
+  body {
+    font-family: 'Fraunces', Georgia, serif; line-height: 1.6;
+    background-image:
+      radial-gradient(circle at 0% 100%, rgba(255, 180, 74, 0.04), transparent 50%),
+      linear-gradient(var(--bg), var(--bg));
+    background-attachment: fixed;
+  }
+  .grid-bg {
+    position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background-image:
+      linear-gradient(rgba(255, 180, 74, 0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 180, 74, 0.02) 1px, transparent 1px);
+    background-size: 48px 48px;
+    mask-image: radial-gradient(ellipse at bottom, black 30%, transparent 80%);
+  }
+  .topbar {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(10, 13, 16, 0.85); backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--line);
+    padding: 14px 32px; display:flex; justify-content:space-between; align-items:center;
+    font-family: 'JetBrains Mono', monospace; font-size: 12px;
+  }
+  .topbar a { color: var(--ink-dim); text-decoration: none; letter-spacing: 0.1em; }
+  .topbar a:hover { color: var(--amber); }
+  .topbar .right { display: flex; gap: 24px; }
+  .shell {
+    position: relative; z-index: 1;
+    max-width: 1280px; margin: 0 auto;
+    display: grid; grid-template-columns: 240px 1fr; gap: 48px;
+    padding: 48px 32px 120px;
+  }
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: 1fr; gap: 24px; }
+    nav.toc { position: static !important; }
+  }
+  nav.toc {
+    position: sticky; top: 70px; align-self: start;
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.04em;
+    border-left: 1px solid var(--line); padding-left: 16px;
+  }
+  nav.toc a {
+    display: block; color: var(--ink-mute); padding: 6px 0;
+    text-decoration: none; text-transform: uppercase;
+    border-left: 2px solid transparent; margin-left: -18px; padding-left: 16px;
+  }
+  nav.toc a:hover { color: var(--ink); }
+  nav.toc a.active { color: var(--amber); border-left-color: var(--amber); }
+  main.content { min-width: 0; }
+  .hero { margin-bottom: 64px; }
+  .eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase;
+    color: var(--amber); margin-bottom: 20px;
+  }
+  h1 {
+    font-family: 'Fraunces', serif; font-weight: 300;
+    font-size: clamp(48px, 7vw, 88px); line-height: 0.92; letter-spacing: -0.035em;
+    margin: 0 0 8px; font-variation-settings: "opsz" 144;
+  }
+  h1 em { font-style: italic; font-weight: 700; color: var(--phos); }
+  .subtitle { color: var(--ink-dim); font-size: 20px; max-width: 60ch; }
+  .badges { display:flex; flex-wrap:wrap; gap:8px; margin-top: 28px; }
+  .badge {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    padding: 4px 10px; border: 1px solid var(--line);
+    color: var(--ink-dim); letter-spacing: 0.05em;
+  }
+  .badge.lit { color: var(--amber); border-color: var(--amber); }
+  section { margin: 64px 0; scroll-margin-top: 80px; }
+  h2 {
+    font-family: 'Fraunces', serif; font-weight: 400;
+    font-size: 36px; letter-spacing: -0.02em; line-height: 1.1;
+    margin: 0 0 6px; display: flex; align-items: baseline; gap: 16px;
+  }
+  h2 .num {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px; color: var(--amber); letter-spacing: 0.1em;
+  }
+  .counts {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px;
+    letter-spacing: 0.18em; color: var(--ink-mute);
+    margin-bottom: 24px; text-transform: uppercase;
+  }
+  details.block {
+    background: var(--panel); border: 1px solid var(--line);
+    margin-bottom: 12px; overflow: hidden;
+  }
+  details.block summary {
+    cursor: pointer; padding: 12px 18px;
+    list-style: none; display: flex; gap: 12px; align-items: center;
+    font-family: 'JetBrains Mono', monospace; font-size: 12px;
+  }
+  details.block summary::-webkit-details-marker { display: none; }
+  details.block summary::after { content: " ▾"; color: var(--amber); margin-left: auto; }
+  details.block[open] summary::after { content: " ▴"; }
+  details.block .kind {
+    font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase;
+    padding: 2px 8px; border: 1px solid var(--phos); color: var(--phos);
+  }
+  details.block[open] .kind { background: rgba(127,255,179,0.08); }
+  details.block .head { color: var(--ink); }
+  details.block pre {
+    margin: 0; padding: 16px 20px; border-top: 1px solid var(--line);
+    background: #0d1216; font-family: 'JetBrains Mono', monospace;
+    font-size: 12px; line-height: 1.55; color: var(--ink); overflow-x: auto;
+  }
+  .rules { display: flex; flex-direction: column; gap: 16px; }
+  .rule {
+    background: var(--panel); border: 1px solid var(--line);
+    border-left: 3px solid var(--amber); padding: 18px 22px;
+  }
+  .rule:hover { border-left-color: var(--phos); }
+  .rule-head {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 12px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .rule-name {
+    font-size: 14px; color: var(--ink); font-weight: 700; letter-spacing: 0.02em;
+  }
+  .rule-tag {
+    font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--amber); border: 1px solid var(--amber); padding: 2px 6px;
+  }
+  .rule-body .row {
+    display: grid; grid-template-columns: 80px 1fr; gap: 16px; align-items: start;
+    padding: 4px 0;
+  }
+  .rule-body .lbl {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px;
+    letter-spacing: 0.18em; color: var(--ink-mute); padding-top: 4px;
+  }
+  .rule-body .lbl.arrow { color: var(--phos); font-size: 16px; letter-spacing: 0; }
+  pre.inline {
+    margin: 0; padding: 6px 10px; background: #0d1216;
+    font-family: 'JetBrains Mono', monospace; font-size: 12px;
+    color: var(--ink); white-space: pre-wrap; word-break: break-word;
+    border: 1px solid var(--line); border-radius: 1px;
+  }
+  .k  { color: var(--phos); }
+  .k2 { color: var(--amber); }
+  .lit{ color: var(--rust); }
+  .num{ color: var(--azure); }
+  .c  { color: var(--ink-mute); font-style: italic; }
+  .op { color: var(--phos); }
+  footer.sitefoot {
+    margin-top: 80px; padding: 24px 0 0;
+    border-top: 1px solid var(--line);
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    color: var(--ink-mute); display: flex; justify-content: space-between;
+    letter-spacing: 0.08em;
+  }
+  details.full-src {
+    background: var(--panel); border: 1px solid var(--line);
+    overflow: hidden; margin-top: 24px;
+  }
+  details.full-src summary {
+    cursor: pointer; padding: 12px 18px;
+    font-family: 'JetBrains Mono', monospace; font-size: 12px;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-dim);
+    list-style: none;
+  }
+  details.full-src summary::-webkit-details-marker { display: none; }
+  details.full-src summary::after { content: " ▾"; color: var(--amber); }
+  details.full-src[open] summary::after { content: " ▴"; }
+  details.full-src pre {
+    margin: 0; padding: 16px 20px; border-top: 1px solid var(--line);
+    background: #0d1216; font-family: 'JetBrains Mono', monospace;
+    font-size: 12px; line-height: 1.55; color: var(--ink);
+    overflow-x: auto; max-height: 70vh;
+  }
+</style>
+</head>
+<body>
+<div class="grid-bg"></div>
+
+<div class="topbar">
+  <a href="index.html">← C910 BUNDLE</a>
+  <div class="right">
+    <a href="index.html">INDEX</a>
+    <a href="mspec.html">M-SPEC</a>
+    <a href="vspec.html" style="color:var(--amber)">V-SPEC</a>
+  </div>
+</div>
+
+<div class="shell">
+<nav class="toc" id="toc">
+<a href="#sec-1">§01 · Architectural and microarchitectural state</a><a href="#sec-2">§02 · Decode and immediate handling (with explicit width adaptation)</a><a href="#sec-3">§03 · Integer ALU semantics (uses explicit width-adapted helpers)</a><a href="#sec-4">§04 · Register renaming and physical destination allocation</a><a href="#sec-5">§05 · ROB allocation, retirement, and precise exceptions</a><a href="#sec-6">§06 · Out-of-order issue and wakeup</a><a href="#sec-7">§07 · Load / Store / memory ordering</a><a href="#sec-8">§08 · Branch prediction, resolution, and recovery</a><a href="#sec-9">§09 · Instruction fetch and prefetch</a><a href="#sec-10">§10 · SoC: AXI4 interconnect, address decode, DCP</a><a href="#sec-11">§11 · Reset, power domains, retention</a><a href="#sec-12">§12 · Global liveness / correctness summary rules</a>
+  <a href="#full-source">§ APPENDIX · SOURCE</a>
+</nav>
+
+<main class="content">
+
+<div class="hero" id="header">
+  <div class="eyebrow">Document 02 · V-Spec 1.0 · Verifiable Specification</div>
+  <h1>V-Spec · <em>C910</em></h1>
+  <p class="subtitle">
+    Architectural and microarchitectural rules over symbolic time —
+    decode, ALU, rename, memory ordering, SoC transactions, reset and retention.
+  </p>
+  <div class="badges">
+    <span class="badge lit">vspec/1.0</span>
+    <span class="badge">arch=RV64GCV</span>
+    <span class="badge">53 rules</span>
+    <span class="badge">12 sections</span>
+    <span class="badge">SoC + Power + Retention</span>
+  </div>
+</div>
+
+
+    <section id="sec-1">
+      <h2><span class="num">§01</span> Architectural and microarchitectural state</h2>
+      <div class="counts">0 RULES · 1 BLOCK</div>
+      
+        <details class="block">
+          <summary><span class="kind">state</span><span class="head">state C910 {</span></summary>
+          <pre><span class="k">state</span> C910 {
+  # --- Architectural <span class="k">state</span> ---
+  <span class="k">reg</span> pc       : <span class="k2">bv</span>[<span class="num">64</span>];
+  <span class="k">reg</span> IR       : <span class="k2">bv</span>[<span class="num">32</span>];                # current decoded instruction word
+  <span class="k">reg</span> xrf      : <span class="k">array</span> [<span class="num">32</span>] <span class="k">of</span> <span class="k2">bv</span>[<span class="num">64</span>];  # integer architectural <span class="k">reg</span> file
+  <span class="k">reg</span> frf      : <span class="k">array</span> [<span class="num">32</span>] <span class="k">of</span> <span class="k2">bv</span>[<span class="num">64</span>];  # FP architectural <span class="k">reg</span> file
+  <span class="k">reg</span> vrf      : <span class="k">array</span> [<span class="num">32</span>] <span class="k">of</span> <span class="k2">bv</span>[<span class="num">128</span>]; # vector architectural <span class="k">reg</span> file (model)
+
+  # --- Privileged <span class="k">state</span> (subset) ---
+  <span class="k">reg</span> mstatus  : <span class="k2">bv</span>[<span class="num">64</span>];
+  <span class="k">reg</span> mcause   : <span class="k2">bv</span>[<span class="num">64</span>];
+  <span class="k">reg</span> mepc     : <span class="k2">bv</span>[<span class="num">64</span>];
+  <span class="k">reg</span> mtvec    : <span class="k2">bv</span>[<span class="num">64</span>];
+  <span class="k">reg</span> satp     : <span class="k2">bv</span>[<span class="num">64</span>];                # Sv39 paging
+  <span class="k">reg</span> priv     : <span class="k2">bv</span>[<span class="num">2</span>];                 # M/S/U
+
+  # --- Memory ---
+  <span class="k">reg</span> dmem     : <span class="k">array</span> [<span class="lit">0xFFFFFFFFFF</span>] <span class="k">of</span> <span class="k2">bv</span>[<span class="num">8</span>];   # <span class="num">40</span>-bit PA byte memory
+
+  # --- Microarchitectural observables ---
+  <span class="k">reg</span> rob_head : <span class="k2">bv</span>[<span class="num">8</span>];
+  <span class="k">reg</span> rob_tail : <span class="k2">bv</span>[<span class="num">8</span>];
+  <span class="k">reg</span> ldq_occ  : <span class="k2">bv</span>[<span class="num">6</span>];                 # <span class="num">0</span>..<span class="num">32</span>
+  <span class="k">reg</span> stq_occ  : <span class="k2">bv</span>[<span class="num">6</span>];                 # <span class="num">0</span>..<span class="num">24</span>
+  <span class="k">reg</span> flush    : <span class="k2">bool</span>;
+
+  # --- Reset / clock / power ---
+  <span class="k">reg</span> core_reset_n  : <span class="k2">bool</span>;
+  <span class="k">reg</span> core_clk_en   : <span class="k2">bool</span>;
+  <span class="k">reg</span> core_ready    : <span class="k2">bool</span>;
+  <span class="k">reg</span> pd_core_on    : <span class="k2">bool</span>;
+  <span class="k">reg</span> pd_core_retention : <span class="k2">bool</span>;
+  <span class="k">reg</span> pd_l2_on      : <span class="k2">bool</span>;
+}</pre>
+        </details>
+        
+      
+    </section>
+    
+    <section id="sec-2">
+      <h2><span class="num">§02</span> Decode and immediate handling (with explicit width adaptation)</h2>
+      <div class="counts">4 RULES · 1 BLOCK</div>
+      
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence Decode {</span></summary>
+          <pre><span class="k">sequence</span> Decode {
+  <span class="k2">instr</span> I1: GENERIC;
+
+  # I-type immediate: bits [<span class="num">31</span>:<span class="num">20</span>], sign-extend to <span class="num">64</span> (RISC-V convention).
+  <span class="k">rule</span> ITypeImmSlice:
+    <span class="k">assert</span> (I1.valid == <span class="k">true</span> &amp;&amp; I1.fmt == I_TYPE)
+    <span class="op">-&gt;</span> <span class="k">always</span> (I1.imm12 == C910.IR[<span class="num">31</span>:<span class="num">20</span>]);
+
+  <span class="k">rule</span> ITypeImmSext:
+    <span class="k">assert</span> (I1.valid == <span class="k">true</span> &amp;&amp; I1.fmt == I_TYPE)
+    <span class="op">-&gt;</span> <span class="k">always</span> (I1.imm_sext ==
+               { <span class="lit">52'b0000000000000000000000000000000000000000000000000000</span>,
+                 I1.imm12 });   # placeholder for sign-extension helper
+
+  # Opcode is the low <span class="num">7</span> bits.
+  <span class="k">rule</span> OpcodeSlice:
+    <span class="k">assert</span> (I1.valid == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (I1.opcode == C910.IR[<span class="num">6</span>:<span class="num">0</span>]);
+
+  <span class="k">rule</span> RegFieldSlices:
+    <span class="k">assert</span> (I1.valid == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (I1.rd  == C910.IR[<span class="num">11</span>:<span class="num">7</span>]
+            &amp;&amp; I1.rs1 == C910.IR[<span class="num">19</span>:<span class="num">15</span>]
+            &amp;&amp; I1.rs2 == C910.IR[<span class="num">24</span>:<span class="num">20</span>]);
+}</pre>
+        </details>
+        
+      <div class="rules">
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">ITypeImmSlice</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">I1.valid == <span class="k">true</span> &amp;&amp; I1.fmt == I_TYPE</pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (I1.imm12 == C910.IR[<span class="num">31</span>:<span class="num">20</span>])</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">ITypeImmSext</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">I1.valid == <span class="k">true</span> &amp;&amp; I1.fmt == I_TYPE</pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (I1.imm_sext ==
+               { <span class="lit">52'b0000000000000000000000000000000000000000000000000000</span>,
+                 I1.imm12 })</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">OpcodeSlice</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">I1.valid == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (I1.opcode == C910.IR[<span class="num">6</span>:<span class="num">0</span>])</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">RegFieldSlices</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">I1.valid == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (I1.rd  == C910.IR[<span class="num">11</span>:<span class="num">7</span>]
+            &amp;&amp; I1.rs1 == C910.IR[<span class="num">19</span>:<span class="num">15</span>]
+            &amp;&amp; I1.rs2 == C910.IR[<span class="num">24</span>:<span class="num">20</span>])</pre></div>
+              </div>
+            </div>
+            </div>
+    </section>
+    
+    <section id="sec-3">
+      <h2><span class="num">§03</span> Integer ALU semantics (uses explicit width-adapted helpers)</h2>
+      <div class="counts">4 RULES · 1 BLOCK</div>
+      
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence IntegerALU {</span></summary>
+          <pre><span class="k">sequence</span> IntegerALU {
+  <span class="k2">instr</span> A1: ADDI r3, r1, <span class="lit">12'h00A</span>;    # placeholder example
+  <span class="k2">instr</span> A2: ADD  r4, r1, r2;
+
+  <span class="k">rule</span> ADDIResult:
+    <span class="k">assert</span> (A1.valid == <span class="k">true</span> &amp;&amp; A1.opcode == <span class="lit">7'b0010011</span> &amp;&amp; A1.funct3 == <span class="lit">3'b000</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (A1.result == A1.src1_val + A1.imm_sext);
+
+  <span class="k">rule</span> ADDResult:
+    <span class="k">assert</span> (A2.valid == <span class="k">true</span> &amp;&amp; A2.opcode == <span class="lit">7'b0110011</span> &amp;&amp; A2.funct3 == <span class="lit">3'b000</span>
+                              &amp;&amp; A2.funct7 == <span class="lit">7'b0000000</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (A2.result == A2.src1_val + A2.src2_val);
+
+  # ALU is single-cycle: writeback within <span class="num">1</span> cycle after issue.
+  <span class="k">rule</span> ALULatency:
+    <span class="k">assert</span> (A2.issued == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">eventually</span> [<span class="num">1</span>:<span class="num">1</span>] (A2.writeback_en == <span class="k">true</span> &amp;&amp; A2.writeback_data == A2.result);
+
+  # x0 is architecturally hardwired to zero.
+  <span class="k">rule</span> X0HardwiredZero:
+    <span class="k">assert</span> (<span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (C910.xrf[<span class="num">0</span>] == <span class="lit">64'h0000000000000000</span>);
+}</pre>
+        </details>
+        
+      <div class="rules">
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">ADDIResult</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">A1.valid == <span class="k">true</span> &amp;&amp; A1.opcode == <span class="lit">7'b0010011</span> &amp;&amp; A1.funct3 == <span class="lit">3'b000</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (A1.result == A1.src1_val + A1.imm_sext)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">ADDResult</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">A2.valid == <span class="k">true</span> &amp;&amp; A2.opcode == <span class="lit">7'b0110011</span> &amp;&amp; A2.funct3 == <span class="lit">3'b000</span>
+                              &amp;&amp; A2.funct7 == <span class="lit">7'b0000000</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (A2.result == A2.src1_val + A2.src2_val)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">ALULatency</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">A2.issued == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">eventually</span> [<span class="num">1</span>:<span class="num">1</span>] (A2.writeback_en == <span class="k">true</span> &amp;&amp; A2.writeback_data == A2.result)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">X0HardwiredZero</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline"><span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (C910.xrf[<span class="num">0</span>] == <span class="lit">64'h0000000000000000</span>)</pre></div>
+              </div>
+            </div>
+            </div>
+    </section>
+    
+    <section id="sec-4">
+      <h2><span class="num">§04</span> Register renaming and physical destination allocation</h2>
+      <div class="counts">3 RULES · 1 BLOCK</div>
+      
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence Rename {</span></summary>
+          <pre><span class="k">sequence</span> Rename {
+  <span class="k2">instr</span> R1: ADDI r3, r1, <span class="lit">12'h001</span>;
+  <span class="k2">instr</span> R2: ADDI r3, r3, <span class="lit">12'h001</span>;   # writes same arch <span class="k">reg</span> → must get new PR
+
+  # After rename, two consecutive writers <span class="k">of</span> the same architectural register
+  # must receive distinct physical destinations.
+  <span class="k">rule</span> WAWRenamed:
+    <span class="k">assert</span> (R1.renamed == <span class="k">true</span> &amp;&amp; R2.renamed == <span class="k">true</span> &amp;&amp; R1.arch_dest == R2.arch_dest)
+    <span class="op">-&gt;</span> <span class="k">always</span> (R1.phys_dest != R2.phys_dest);
+
+  # Source operand <span class="k">of</span> younger instruction is mapped to *previous* writer's
+  # physical destination, if there is one.
+  <span class="k">rule</span> SourceRenameLookup:
+    <span class="k">assert</span> (R2.renamed == <span class="k">true</span> &amp;&amp; R2.arch_src1 == R1.arch_dest
+                               &amp;&amp; R1.in_flight == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (R2.phys_src1 == R1.phys_dest);
+
+  # Old physical register returns to the freelist only at commit <span class="k">of</span> overwriter.
+  <span class="k">rule</span> FreelistReleaseAtCommit:
+    <span class="k">assert</span> (R2.committed == <span class="k">true</span> &amp;&amp; R2.arch_dest == R1.arch_dest
+                                 &amp;&amp; R1.committed == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">eventually</span> [<span class="num">0</span>:<span class="num">1</span>] (R2.old_phys_dest_freed == <span class="k">true</span>);
+}</pre>
+        </details>
+        
+      <div class="rules">
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">WAWRenamed</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">R1.renamed == <span class="k">true</span> &amp;&amp; R2.renamed == <span class="k">true</span> &amp;&amp; R1.arch_dest == R2.arch_dest</pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (R1.phys_dest != R2.phys_dest)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">SourceRenameLookup</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">R2.renamed == <span class="k">true</span> &amp;&amp; R2.arch_src1 == R1.arch_dest
+                               &amp;&amp; R1.in_flight == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (R2.phys_src1 == R1.phys_dest)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">FreelistReleaseAtCommit</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">R2.committed == <span class="k">true</span> &amp;&amp; R2.arch_dest == R1.arch_dest
+                                 &amp;&amp; R1.committed == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">eventually</span> [<span class="num">0</span>:<span class="num">1</span>] (R2.old_phys_dest_freed == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            </div>
+    </section>
+    
+    <section id="sec-5">
+      <h2><span class="num">§05</span> ROB allocation, retirement, and precise exceptions</h2>
+      <div class="counts">3 RULES · 1 BLOCK</div>
+      
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence ROB {</span></summary>
+          <pre><span class="k">sequence</span> ROB {
+  <span class="k2">instr</span> Ix: GENERIC;
+
+  <span class="k">rule</span> ROBAllocAtDispatch:
+    <span class="k">assert</span> (Ix.dispatched == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (Ix.rob_index != ROB_INVALID);
+
+  # ROB retires in program order.
+  <span class="k">rule</span> InOrderRetire:
+    <span class="k">assert</span> (Ix.committed == <span class="k">true</span> &amp;&amp; Iy.committed == <span class="k">true</span> &amp;&amp; Ix.older_than(Iy))
+    <span class="op">-&gt;</span> <span class="k">always</span> (Ix.commit_cycle &lt;= Iy.commit_cycle);
+
+  # Precise exception: when an exception is signaled at commit, all younger
+  # in-flight instructions are flushed and architectural <span class="k">state</span> is restored.
+  <span class="k">rule</span> PreciseException:
+    <span class="k">assert</span> (Ix.exception_at_commit == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">next</span> (C910.flush == <span class="k">true</span>
+          &amp;&amp; (<span class="k">forall</span> Iy : Iy.older_than(Ix) == <span class="k">false</span> &amp;&amp; Iy.in_flight == <span class="k">true</span>
+                          <span class="op">-&gt;</span> Iy.killed == <span class="k">true</span>));
+}</pre>
+        </details>
+        
+      <div class="rules">
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">ROBAllocAtDispatch</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">Ix.dispatched == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (Ix.rob_index != ROB_INVALID)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">InOrderRetire</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">Ix.committed == <span class="k">true</span> &amp;&amp; Iy.committed == <span class="k">true</span> &amp;&amp; Ix.older_than(Iy)</pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (Ix.commit_cycle &lt;= Iy.commit_cycle)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">PreciseException</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">Ix.exception_at_commit == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">next</span> (C910.flush == <span class="k">true</span>
+          &amp;&amp; (<span class="k">forall</span> Iy : Iy.older_than(Ix) == <span class="k">false</span> &amp;&amp; Iy.in_flight == <span class="k">true</span>
+                          <span class="op">-&gt;</span> Iy.killed == <span class="k">true</span>))</pre></div>
+              </div>
+            </div>
+            </div>
+    </section>
+    
+    <section id="sec-6">
+      <h2><span class="num">§06</span> Out-of-order issue and wakeup</h2>
+      <div class="counts">2 RULES · 1 BLOCK</div>
+      
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence IssueWakeup {</span></summary>
+          <pre><span class="k">sequence</span> IssueWakeup {
+  <span class="k2">instr</span> P : GENERIC;          # producer
+  <span class="k2">instr</span> C : GENERIC;          # consumer <span class="k">of</span> P
+
+  # A consumer can only issue once every source operand is ready
+  # (either already in PRF or available via wakeup tag broadcast on the CDB).
+  <span class="k">rule</span> WakeupSelectReadiness:
+    <span class="k">assert</span> (C.issued == <span class="k">true</span> &amp;&amp; C.src1_tag == P.phys_dest)
+    <span class="op">-&gt;</span> <span class="k">always</span> (<span class="k">prev</span>(P.writeback_en) == <span class="k">true</span>
+            || <span class="k">prev</span>(P.cdb_broadcast) == <span class="k">true</span>);
+
+  # Age-based selection: among ready ops in the same IQ, the oldest issues
+  # first (<span class="num">7</span>-bit age vector).
+  <span class="k">rule</span> AgeOldestReady:
+    <span class="k">assert</span> (C.iq == P.iq &amp;&amp; C.ready == <span class="k">true</span> &amp;&amp; P.ready == <span class="k">true</span>
+                         &amp;&amp; P.age &gt; C.age)
+    <span class="op">-&gt;</span> <span class="k">always</span> (P.selected_before_or_same_cycle_as(C));
+}</pre>
+        </details>
+        
+      <div class="rules">
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">WakeupSelectReadiness</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C.issued == <span class="k">true</span> &amp;&amp; C.src1_tag == P.phys_dest</pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (<span class="k">prev</span>(P.writeback_en) == <span class="k">true</span>
+            || <span class="k">prev</span>(P.cdb_broadcast) == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">AgeOldestReady</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C.iq == P.iq &amp;&amp; C.ready == <span class="k">true</span> &amp;&amp; P.ready == <span class="k">true</span>
+                         &amp;&amp; P.age &gt; C.age</pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (P.selected_before_or_same_cycle_as(C))</pre></div>
+              </div>
+            </div>
+            </div>
+    </section>
+    
+    <section id="sec-7">
+      <h2><span class="num">§07</span> Load / Store / memory ordering</h2>
+      <div class="counts">6 RULES · 3 BLOCKS</div>
+      
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence StoreLoadForwarding {</span></summary>
+          <pre><span class="k">sequence</span> StoreLoadForwarding {
+  <span class="k2">instr</span> S1: SW [x1+<span class="num">0</span>], x2;
+  <span class="k2">instr</span> L1: LW x3, [x4+<span class="num">0</span>];
+
+  # Same-address forwarding from store buffer.
+  <span class="k">rule</span> StoreToLoadFwd:
+    <span class="k">assert</span> (S1.committed == <span class="k">false</span> &amp;&amp; S1.executed == <span class="k">true</span>
+                                  &amp;&amp; S1.addr == L1.addr
+                                  &amp;&amp; S1.byte_mask == L1.byte_mask
+                                  &amp;&amp; S1.older_than(L1))
+    <span class="op">-&gt;</span> <span class="k">always</span> (L1.load_val == S1.data_val);
+
+  # Different addresses: load reads memory.
+  <span class="k">rule</span> LoadFromMemory:
+    <span class="k">assert</span> (S1.addr != L1.addr)
+    <span class="op">-&gt;</span> <span class="k">always</span> (L1.load_val == { C910.dmem[L1.addr+<span class="num">7</span>], C910.dmem[L1.addr+<span class="num">6</span>],
+                                C910.dmem[L1.addr+<span class="num">5</span>], C910.dmem[L1.addr+<span class="num">4</span>],
+                                C910.dmem[L1.addr+<span class="num">3</span>], C910.dmem[L1.addr+<span class="num">2</span>],
+                                C910.dmem[L1.addr+<span class="num">1</span>], C910.dmem[L1.addr+<span class="num">0</span>] });
+
+  # Partial-overlap forwarding is not safe: triggers replay.
+  <span class="k">rule</span> PartialOverlapReplays:
+    <span class="k">assert</span> (S1.addr == L1.addr &amp;&amp; S1.byte_mask != L1.byte_mask
+                               &amp;&amp; S1.older_than(L1)
+                               &amp;&amp; S1.committed == <span class="k">false</span>)
+    <span class="op">-&gt;</span> <span class="k">eventually</span> [<span class="num">1</span>:<span class="num">4</span>] (L1.replay == <span class="k">true</span>);
+}</pre>
+        </details>
+        
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence MemoryOrdering {</span></summary>
+          <pre><span class="k">sequence</span> MemoryOrdering {
+  <span class="k2">instr</span> LD_A: LW r1, [r10];
+  <span class="k2">instr</span> ST_B: SW [r11], r2;
+
+  # Speculative load may pass an older unresolved store; on conflict, replay.
+  <span class="k">rule</span> SpeculativeLoadAllowed:
+    <span class="k">assert</span> (LD_A.older_than(ST_B) == <span class="k">false</span>
+         &amp;&amp; LD_A.addr_resolved == <span class="k">true</span> &amp;&amp; ST_B.addr_resolved == <span class="k">false</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (LD_A.may_issue == <span class="k">true</span>);
+
+  <span class="k">rule</span> MemViolationReplay:
+    <span class="k">assert</span> (ST_B.addr_resolved == <span class="k">true</span> &amp;&amp; LD_A.addr == ST_B.addr
+                                       &amp;&amp; ST_B.older_than(LD_A)
+                                       &amp;&amp; LD_A.executed_before(ST_B))
+    <span class="op">-&gt;</span> <span class="k">eventually</span> [<span class="num">1</span>:<span class="num">6</span>] (LD_A.replay_from_rob == <span class="k">true</span>);
+}</pre>
+        </details>
+        
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence FenceDrainsStores {</span></summary>
+          <pre><span class="k">sequence</span> FenceDrainsStores {
+  <span class="k2">instr</span> F1: FENCE;
+  <span class="k">rule</span> FenceDrainsStoreBuffer:
+    <span class="k">assert</span> (F1.dispatched == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">eventually</span> [<span class="num">1</span>:<span class="num">64</span>] (C910.stq_occ == <span class="lit">6'h00</span> &amp;&amp; F1.completed == <span class="k">true</span>);
+}</pre>
+        </details>
+        
+      <div class="rules">
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">StoreToLoadFwd</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">S1.committed == <span class="k">false</span> &amp;&amp; S1.executed == <span class="k">true</span>
+                                  &amp;&amp; S1.addr == L1.addr
+                                  &amp;&amp; S1.byte_mask == L1.byte_mask
+                                  &amp;&amp; S1.older_than(L1)</pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (L1.load_val == S1.data_val)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">LoadFromMemory</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">S1.addr != L1.addr</pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (L1.load_val == { C910.dmem[L1.addr+<span class="num">7</span>], C910.dmem[L1.addr+<span class="num">6</span>],
+                                C910.dmem[L1.addr+<span class="num">5</span>], C910.dmem[L1.addr+<span class="num">4</span>],
+                                C910.dmem[L1.addr+<span class="num">3</span>], C910.dmem[L1.addr+<span class="num">2</span>],
+                                C910.dmem[L1.addr+<span class="num">1</span>], C910.dmem[L1.addr+<span class="num">0</span>] })</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">PartialOverlapReplays</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">S1.addr == L1.addr &amp;&amp; S1.byte_mask != L1.byte_mask
+                               &amp;&amp; S1.older_than(L1)
+                               &amp;&amp; S1.committed == <span class="k">false</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">eventually</span> [<span class="num">1</span>:<span class="num">4</span>] (L1.replay == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">SpeculativeLoadAllowed</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">LD_A.older_than(ST_B) == <span class="k">false</span>
+         &amp;&amp; LD_A.addr_resolved == <span class="k">true</span> &amp;&amp; ST_B.addr_resolved == <span class="k">false</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (LD_A.may_issue == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">MemViolationReplay</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">ST_B.addr_resolved == <span class="k">true</span> &amp;&amp; LD_A.addr == ST_B.addr
+                                       &amp;&amp; ST_B.older_than(LD_A)
+                                       &amp;&amp; LD_A.executed_before(ST_B)</pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">eventually</span> [<span class="num">1</span>:<span class="num">6</span>] (LD_A.replay_from_rob == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">FenceDrainsStoreBuffer</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">F1.dispatched == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">eventually</span> [<span class="num">1</span>:<span class="num">64</span>] (C910.stq_occ == <span class="lit">6'h00</span> &amp;&amp; F1.completed == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            </div>
+    </section>
+    
+    <section id="sec-8">
+      <h2><span class="num">§08</span> Branch prediction, resolution, and recovery</h2>
+      <div class="counts">5 RULES · 2 BLOCKS</div>
+      
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence BranchPredict {</span></summary>
+          <pre><span class="k">sequence</span> BranchPredict {
+  <span class="k2">instr</span> B1: BEQ r1, r2, +offset;
+
+  # Prediction is consulted at IF1.
+  <span class="k">rule</span> PredictAtFetch:
+    <span class="k">assert</span> (B1.fetched == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (B1.prediction_made_at_stage == IF1);
+
+  # Branch outcome is resolved at EX. On mispredict, front-end is redirected to IF1.
+  <span class="k">rule</span> MispredictRedirect:
+    <span class="k">assert</span> (B1.resolved == <span class="k">true</span> &amp;&amp; B1.predicted_taken != B1.actually_taken)
+    <span class="op">-&gt;</span> <span class="k">eventually</span> [<span class="num">1</span>:<span class="num">1</span>] (C910.flush == <span class="k">true</span>
+                       &amp;&amp; B1.redirect_stage == IF1);
+
+  # Predictor <span class="k">state</span> is updated only at commit (not on speculative execution).
+  <span class="k">rule</span> PredictorUpdateAtCommit:
+    <span class="k">assert</span> (B1.committed == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">next</span> (B1.bpred_state_updated == <span class="k">true</span>);
+
+  # Return-address stack: a call pushes link, a return pops the same address
+  # in well-nested programs (modulo overflow).
+  <span class="k">rule</span> RASPushPop:
+    <span class="k">assert</span> (B1.is_call == <span class="k">true</span> &amp;&amp; B1.committed == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">next</span> (C910.ras_top == B1.return_addr);
+}</pre>
+        </details>
+        
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence ReplayPredictor {</span></summary>
+          <pre><span class="k">sequence</span> ReplayPredictor {
+  <span class="k2">instr</span> LD: LW r1, [r10];
+
+  # If a load class previously triggered a memory-order replay, the replay
+  # predictor defers issuing further instances until older stores resolve.
+  <span class="k">rule</span> DeferOnPriorViolation:
+    <span class="k">assert</span> (LD.prior_violation == <span class="k">true</span> &amp;&amp; LD.dispatched == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (LD.defer_until_older_stores_resolved == <span class="k">true</span>);
+}</pre>
+        </details>
+        
+      <div class="rules">
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">PredictAtFetch</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">B1.fetched == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (B1.prediction_made_at_stage == IF1)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">MispredictRedirect</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">B1.resolved == <span class="k">true</span> &amp;&amp; B1.predicted_taken != B1.actually_taken</pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">eventually</span> [<span class="num">1</span>:<span class="num">1</span>] (C910.flush == <span class="k">true</span>
+                       &amp;&amp; B1.redirect_stage == IF1)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">PredictorUpdateAtCommit</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">B1.committed == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">next</span> (B1.bpred_state_updated == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">RASPushPop</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">B1.is_call == <span class="k">true</span> &amp;&amp; B1.committed == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">next</span> (C910.ras_top == B1.return_addr)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">DeferOnPriorViolation</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">LD.prior_violation == <span class="k">true</span> &amp;&amp; LD.dispatched == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (LD.defer_until_older_stores_resolved == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            </div>
+    </section>
+    
+    <section id="sec-9">
+      <h2><span class="num">§09</span> Instruction fetch and prefetch</h2>
+      <div class="counts">2 RULES · 1 BLOCK</div>
+      
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence Fetch {</span></summary>
+          <pre><span class="k">sequence</span> Fetch {
+  <span class="k2">instr</span> Fblk: FETCH_BLOCK;
+
+  <span class="k">rule</span> FetchAdvancesPC:
+    <span class="k">assert</span> (C910.core_ready == <span class="k">true</span> &amp;&amp; Fblk.fetched == <span class="k">true</span> &amp;&amp; C910.flush == <span class="k">false</span>)
+    <span class="op">-&gt;</span> <span class="k">next</span> (C910.pc == <span class="k">prev</span>(C910.pc) + Fblk.block_size);
+
+  <span class="k">rule</span> PrefetchCancelOnRedirect:
+    <span class="k">assert</span> (C910.flush == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">next</span> (Fblk.speculative_prefetches_canceled == <span class="k">true</span>);
+}</pre>
+        </details>
+        
+      <div class="rules">
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">FetchAdvancesPC</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C910.core_ready == <span class="k">true</span> &amp;&amp; Fblk.fetched == <span class="k">true</span> &amp;&amp; C910.flush == <span class="k">false</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">next</span> (C910.pc == <span class="k">prev</span>(C910.pc) + Fblk.block_size)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">PrefetchCancelOnRedirect</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C910.flush == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">next</span> (Fblk.speculative_prefetches_canceled == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            </div>
+    </section>
+    
+    <section id="sec-10">
+      <h2><span class="num">§10</span> SoC: AXI4 interconnect, address decode, DCP</h2>
+      <div class="counts">9 RULES · 4 BLOCKS</div>
+      
+        <details class="block">
+          <summary><span class="kind">state</span><span class="head">state SoC {</span></summary>
+          <pre><span class="k">state</span> SoC {
+  <span class="k">reg</span> sram        : <span class="k">array</span> [<span class="lit">0x100000</span>] <span class="k">of</span> <span class="k2">bv</span>[<span class="num">64</span>];
+  <span class="k">reg</span> uart_rx     : <span class="k2">bv</span>[<span class="num">8</span>];
+  <span class="k">reg</span> uart_tx     : <span class="k2">bv</span>[<span class="num">8</span>];
+
+  <span class="k">reg</span> axi_req_valid : <span class="k2">bool</span>;
+  <span class="k">reg</span> axi_req_ready : <span class="k2">bool</span>;
+  <span class="k">reg</span> axi_req_addr  : <span class="k2">bv</span>[<span class="num">40</span>];
+  <span class="k">reg</span> axi_req_data  : <span class="k2">bv</span>[<span class="num">64</span>];
+  <span class="k">reg</span> axi_req_write : <span class="k2">bool</span>;
+  <span class="k">reg</span> axi_req_id    : <span class="k2">bv</span>[<span class="num">8</span>];
+
+  <span class="k">reg</span> axi_rsp_valid : <span class="k2">bool</span>;
+  <span class="k">reg</span> axi_rsp_data  : <span class="k2">bv</span>[<span class="num">64</span>];
+  <span class="k">reg</span> axi_rsp_error : <span class="k2">bool</span>;
+  <span class="k">reg</span> axi_rsp_id    : <span class="k2">bv</span>[<span class="num">8</span>];
+
+  <span class="k">reg</span> dcp_req_valid : <span class="k2">bool</span>;        # device coherence port
+  <span class="k">reg</span> dcp_req_addr  : <span class="k2">bv</span>[<span class="num">40</span>];
+}</pre>
+        </details>
+        
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence MemoryMappedRouting {</span></summary>
+          <pre><span class="k">sequence</span> MemoryMappedRouting {
+  <span class="k2">instr</span> T1: WRITE_REQ C910, SRAM, addr, data;
+
+  <span class="k">rule</span> RouteSRAM:
+    <span class="k">assert</span> (T1.addr[<span class="num">39</span>:<span class="num">28</span>] == <span class="lit">12'h000</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (T1.dst == SRAM);
+
+  <span class="k">rule</span> RouteUART:
+    <span class="k">assert</span> (T1.addr[<span class="num">39</span>:<span class="num">28</span>] == <span class="lit">12'h100</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (T1.dst == UART);
+
+  <span class="k">rule</span> RouteL2:
+    <span class="k">assert</span> (T1.addr[<span class="num">39</span>:<span class="num">36</span>] == <span class="lit">4'b0001</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (T1.dst == L2_CACHE);
+}</pre>
+        </details>
+        
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence AXIHandshake {</span></summary>
+          <pre><span class="k">sequence</span> AXIHandshake {
+  <span class="k2">instr</span> T1: WRITE_REQ C910, SRAM, <span class="lit">40'h00_0000_1000</span>, <span class="lit">64'hDEADBEEF_CAFEBABE</span>;
+
+  <span class="k">rule</span> HandshakeMonotonic:
+    <span class="k">assert</span> (T1.valid == <span class="k">true</span> &amp;&amp; T1.accepted == <span class="k">false</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (SoC.axi_req_valid == <span class="k">true</span>);
+
+  <span class="k">rule</span> AcceptedEventually:
+    <span class="k">assert</span> (T1.valid == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">eventually</span> [<span class="num">1</span>:<span class="num">32</span>] (T1.accepted == <span class="k">true</span>);
+
+  <span class="k">rule</span> WriteUpdatesMemory:
+    <span class="k">assert</span> (T1.accepted == <span class="k">true</span> &amp;&amp; T1.write == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">eventually</span> [<span class="num">1</span>:<span class="num">8</span>] (SoC.sram[T1.addr] == T1.data);
+
+  <span class="k">rule</span> ResponseIDMatches:
+    <span class="k">assert</span> (T1.accepted == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">eventually</span> [<span class="num">1</span>:<span class="num">32</span>] (SoC.axi_rsp_valid == <span class="k">true</span>
+                       &amp;&amp; SoC.axi_rsp_id == T1.id);
+
+  <span class="k">rule</span> NoStarvation:
+    <span class="k">assert</span> (T1.valid == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">eventually</span> [<span class="num">1</span>:<span class="num">64</span>] (T1.accepted == <span class="k">true</span>);
+}</pre>
+        </details>
+        
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence DeviceCoherencePort {</span></summary>
+          <pre><span class="k">sequence</span> DeviceCoherencePort {
+  <span class="k2">instr</span> D1: DMA_WRITE DEVICE, MEM, addr, data;
+
+  # DCP traffic participates in coherence: a DMA write invalidates matching
+  # L1 lines in C910.
+  <span class="k">rule</span> DCPInvalidatesL1:
+    <span class="k">assert</span> (D1.valid == <span class="k">true</span> &amp;&amp; D1.write == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">eventually</span> [<span class="num">1</span>:<span class="num">16</span>] (C910.l1d_line_state[D1.addr.line] == INVALID);
+}</pre>
+        </details>
+        
+      <div class="rules">
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">RouteSRAM</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">T1.addr[<span class="num">39</span>:<span class="num">28</span>] == <span class="lit">12'h000</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (T1.dst == SRAM)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">RouteUART</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">T1.addr[<span class="num">39</span>:<span class="num">28</span>] == <span class="lit">12'h100</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (T1.dst == UART)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">RouteL2</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">T1.addr[<span class="num">39</span>:<span class="num">36</span>] == <span class="lit">4'b0001</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (T1.dst == L2_CACHE)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">HandshakeMonotonic</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">T1.valid == <span class="k">true</span> &amp;&amp; T1.accepted == <span class="k">false</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (SoC.axi_req_valid == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">AcceptedEventually</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">T1.valid == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">eventually</span> [<span class="num">1</span>:<span class="num">32</span>] (T1.accepted == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">WriteUpdatesMemory</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">T1.accepted == <span class="k">true</span> &amp;&amp; T1.write == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">eventually</span> [<span class="num">1</span>:<span class="num">8</span>] (SoC.sram[T1.addr] == T1.data)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">ResponseIDMatches</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">T1.accepted == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">eventually</span> [<span class="num">1</span>:<span class="num">32</span>] (SoC.axi_rsp_valid == <span class="k">true</span>
+                       &amp;&amp; SoC.axi_rsp_id == T1.id)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">NoStarvation</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">T1.valid == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">eventually</span> [<span class="num">1</span>:<span class="num">64</span>] (T1.accepted == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">DCPInvalidatesL1</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">D1.valid == <span class="k">true</span> &amp;&amp; D1.write == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">eventually</span> [<span class="num">1</span>:<span class="num">16</span>] (C910.l1d_line_state[D1.addr.line] == INVALID)</pre></div>
+              </div>
+            </div>
+            </div>
+    </section>
+    
+    <section id="sec-11">
+      <h2><span class="num">§11</span> Reset, power domains, retention</h2>
+      <div class="counts">12 RULES · 3 BLOCKS</div>
+      
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence ResetSequence {</span></summary>
+          <pre><span class="k">sequence</span> ResetSequence {
+  <span class="k">rule</span> ResetVectorHeld:
+    <span class="k">assert</span> (C910.core_reset_n == <span class="k">false</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (C910.pc == <span class="lit">64'h0000_0000_8000_0000</span>);   # typical RV reset vec
+
+  <span class="k">rule</span> NotReadyDuringReset:
+    <span class="k">assert</span> (C910.core_reset_n == <span class="k">false</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (C910.core_ready == <span class="k">false</span>);
+
+  <span class="k">rule</span> NoCommitDuringReset:
+    <span class="k">assert</span> (C910.core_reset_n == <span class="k">false</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (<span class="k">forall</span> I : I.committed != <span class="k">true</span>);
+
+  <span class="k">rule</span> ReadyEventuallyAfterRelease:
+    <span class="k">assert</span> (<span class="k">prev</span>(C910.core_reset_n) == <span class="k">false</span> &amp;&amp; C910.core_reset_n == <span class="k">true</span>
+                                              &amp;&amp; C910.pd_core_on == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">eventually</span> [<span class="num">1</span>:<span class="num">32</span>] (C910.core_ready == <span class="k">true</span>);
+}</pre>
+        </details>
+        
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence PowerDomains {</span></summary>
+          <pre><span class="k">sequence</span> PowerDomains {
+  <span class="k">rule</span> CoreReadyRequiresCoreDomain:
+    <span class="k">assert</span> (C910.core_ready == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (C910.pd_core_on == <span class="k">true</span>);
+
+  <span class="k">rule</span> CoreReadyRequiresL2Domain:
+    <span class="k">assert</span> (C910.core_ready == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (C910.pd_l2_on == <span class="k">true</span>);
+
+  <span class="k">rule</span> CoreCannotAdvanceWithoutClock:
+    <span class="k">assert</span> (C910.core_clk_en == <span class="k">false</span>)
+    <span class="op">-&gt;</span> <span class="k">next</span> (C910.pc == <span class="k">prev</span>(C910.pc));
+}</pre>
+        </details>
+        
+        <details class="block">
+          <summary><span class="kind">sequence</span><span class="head">sequence Retention {</span></summary>
+          <pre><span class="k">sequence</span> Retention {
+  # In retention, the core is not operational, but architected <span class="k">state</span> survives.
+  <span class="k">rule</span> NotOperationalInRetention:
+    <span class="k">assert</span> (C910.pd_core_retention == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (C910.core_ready == <span class="k">false</span>);
+
+  <span class="k">rule</span> XRFPreservedInRetention:
+    <span class="k">assert</span> (C910.pd_core_retention == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">next</span> (C910.xrf[idx] == <span class="k">prev</span>(C910.xrf[idx]));
+
+  <span class="k">rule</span> PCPreservedInRetention:
+    <span class="k">assert</span> (C910.pd_core_retention == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">next</span> (C910.pc == <span class="k">prev</span>(C910.pc));
+
+  <span class="k">rule</span> WakeFromRetentionReady:
+    <span class="k">assert</span> (<span class="k">prev</span>(C910.pd_core_retention) == <span class="k">true</span>
+         &amp;&amp; C910.pd_core_retention == <span class="k">false</span>
+         &amp;&amp; C910.pd_core_on == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">eventually</span> [<span class="num">1</span>:<span class="num">32</span>] (C910.core_ready == <span class="k">true</span>);
+
+  <span class="k">rule</span> NoNewTransactionsInRetention:
+    <span class="k">assert</span> (C910.pd_core_retention == <span class="k">true</span>)
+    <span class="op">-&gt;</span> <span class="k">always</span> (SoC.axi_req_valid != <span class="k">true</span>);
+}</pre>
+        </details>
+        
+      <div class="rules">
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">ResetVectorHeld</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C910.core_reset_n == <span class="k">false</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (C910.pc == <span class="lit">64'h0000_0000_8000_0000</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">NotReadyDuringReset</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C910.core_reset_n == <span class="k">false</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (C910.core_ready == <span class="k">false</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">NoCommitDuringReset</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C910.core_reset_n == <span class="k">false</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (<span class="k">forall</span> I : I.committed != <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">ReadyEventuallyAfterRelease</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline"><span class="k">prev</span>(C910.core_reset_n) == <span class="k">false</span> &amp;&amp; C910.core_reset_n == <span class="k">true</span>
+                                              &amp;&amp; C910.pd_core_on == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">eventually</span> [<span class="num">1</span>:<span class="num">32</span>] (C910.core_ready == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">CoreReadyRequiresCoreDomain</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C910.core_ready == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (C910.pd_core_on == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">CoreReadyRequiresL2Domain</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C910.core_ready == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (C910.pd_l2_on == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">CoreCannotAdvanceWithoutClock</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C910.core_clk_en == <span class="k">false</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">next</span> (C910.pc == <span class="k">prev</span>(C910.pc))</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">NotOperationalInRetention</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C910.pd_core_retention == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (C910.core_ready == <span class="k">false</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">XRFPreservedInRetention</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C910.pd_core_retention == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">next</span> (C910.xrf[idx] == <span class="k">prev</span>(C910.xrf[idx]))</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">PCPreservedInRetention</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C910.pd_core_retention == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">next</span> (C910.pc == <span class="k">prev</span>(C910.pc))</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">WakeFromRetentionReady</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline"><span class="k">prev</span>(C910.pd_core_retention) == <span class="k">true</span>
+         &amp;&amp; C910.pd_core_retention == <span class="k">false</span>
+         &amp;&amp; C910.pd_core_on == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">eventually</span> [<span class="num">1</span>:<span class="num">32</span>] (C910.core_ready == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">NoNewTransactionsInRetention</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C910.pd_core_retention == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (SoC.axi_req_valid != <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            </div>
+    </section>
+    
+    <section id="sec-12">
+      <h2><span class="num">§12</span> Global liveness / correctness summary rules</h2>
+      <div class="counts">3 RULES · 0 BLOCKS</div>
+      
+      <div class="rules">
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">ForwardProgress</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">C910.core_ready == <span class="k">true</span> &amp;&amp; C910.flush == <span class="k">false</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">eventually</span> [<span class="num">1</span>:<span class="num">1024</span>] (<span class="k">exists</span> I : I.committed == <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">NoCommitWithoutDispatch</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">Ix.committed == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (Ix.dispatched == <span class="k">true</span> &amp;&amp; Ix.dispatched_before(Ix.committed))</pre></div>
+              </div>
+            </div>
+            
+            <div class="rule">
+              <div class="rule-head">
+                <span class="rule-name">MispredictNoArchitecturalEffect</span>
+                <span class="rule-tag">rule</span>
+              </div>
+              <div class="rule-body">
+                <div class="row"><span class="lbl">ASSERT</span><pre class="inline">Ix.on_wrong_path == <span class="k">true</span></pre></div>
+                <div class="row"><span class="lbl arrow">⟶</span><pre class="inline"><span class="k">always</span> (Ix.committed != <span class="k">true</span>)</pre></div>
+              </div>
+            </div>
+            </div>
+    </section>
+    
+
+<section id="full-source">
+  <h2><span class="num">§AX</span> Full <em>source</em></h2>
+  <div class="counts">REFERENCE · 443 LINES</div>
+  <details class="full-src">
+    <summary>c910_vspec.vsp — 443 lines</summary>
+    <pre># =============================================================================
+# V-Spec v1.0  —  Xuantie C910 (T-Head / Alibaba)
+# Verifiable Specification: architectural and microarchitectural contract.
+# Includes CPU rules, SoC/interconnect rules, and reset/power/retention rules.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# §1  Architectural and microarchitectural state
+# -----------------------------------------------------------------------------
+state C910 {
+  # --- Architectural state ---
+  reg pc       : bv[64];
+  reg IR       : bv[32];                # current decoded instruction word
+  reg xrf      : array [32] of bv[64];  # integer architectural reg file
+  reg frf      : array [32] of bv[64];  # FP architectural reg file
+  reg vrf      : array [32] of bv[128]; # vector architectural reg file (model)
+
+  # --- Privileged state (subset) ---
+  reg mstatus  : bv[64];
+  reg mcause   : bv[64];
+  reg mepc     : bv[64];
+  reg mtvec    : bv[64];
+  reg satp     : bv[64];                # Sv39 paging
+  reg priv     : bv[2];                 # M/S/U
+
+  # --- Memory ---
+  reg dmem     : array [0xFFFFFFFFFF] of bv[8];   # 40-bit PA byte memory
+
+  # --- Microarchitectural observables ---
+  reg rob_head : bv[8];
+  reg rob_tail : bv[8];
+  reg ldq_occ  : bv[6];                 # 0..32
+  reg stq_occ  : bv[6];                 # 0..24
+  reg flush    : bool;
+
+  # --- Reset / clock / power ---
+  reg core_reset_n  : bool;
+  reg core_clk_en   : bool;
+  reg core_ready    : bool;
+  reg pd_core_on    : bool;
+  reg pd_core_retention : bool;
+  reg pd_l2_on      : bool;
+}
+
+
+# =============================================================================
+# §2  Decode and immediate handling (with explicit width adaptation)
+# =============================================================================
+sequence Decode {
+  instr I1: GENERIC;
+
+  # I-type immediate: bits [31:20], sign-extend to 64 (RISC-V convention).
+  rule ITypeImmSlice:
+    assert (I1.valid == true &amp;&amp; I1.fmt == I_TYPE)
+    -&gt; always (I1.imm12 == C910.IR[31:20]);
+
+  rule ITypeImmSext:
+    assert (I1.valid == true &amp;&amp; I1.fmt == I_TYPE)
+    -&gt; always (I1.imm_sext ==
+               { 52&#x27;b0000000000000000000000000000000000000000000000000000,
+                 I1.imm12 });   # placeholder for sign-extension helper
+
+  # Opcode is the low 7 bits.
+  rule OpcodeSlice:
+    assert (I1.valid == true)
+    -&gt; always (I1.opcode == C910.IR[6:0]);
+
+  rule RegFieldSlices:
+    assert (I1.valid == true)
+    -&gt; always (I1.rd  == C910.IR[11:7]
+            &amp;&amp; I1.rs1 == C910.IR[19:15]
+            &amp;&amp; I1.rs2 == C910.IR[24:20]);
+}
+
+
+# =============================================================================
+# §3  Integer ALU semantics (uses explicit width-adapted helpers)
+# =============================================================================
+sequence IntegerALU {
+  instr A1: ADDI r3, r1, 12&#x27;h00A;    # placeholder example
+  instr A2: ADD  r4, r1, r2;
+
+  rule ADDIResult:
+    assert (A1.valid == true &amp;&amp; A1.opcode == 7&#x27;b0010011 &amp;&amp; A1.funct3 == 3&#x27;b000)
+    -&gt; always (A1.result == A1.src1_val + A1.imm_sext);
+
+  rule ADDResult:
+    assert (A2.valid == true &amp;&amp; A2.opcode == 7&#x27;b0110011 &amp;&amp; A2.funct3 == 3&#x27;b000
+                              &amp;&amp; A2.funct7 == 7&#x27;b0000000)
+    -&gt; always (A2.result == A2.src1_val + A2.src2_val);
+
+  # ALU is single-cycle: writeback within 1 cycle after issue.
+  rule ALULatency:
+    assert (A2.issued == true)
+    -&gt; eventually [1:1] (A2.writeback_en == true &amp;&amp; A2.writeback_data == A2.result);
+
+  # x0 is architecturally hardwired to zero.
+  rule X0HardwiredZero:
+    assert (true)
+    -&gt; always (C910.xrf[0] == 64&#x27;h0000000000000000);
+}
+
+
+# =============================================================================
+# §4  Register renaming and physical destination allocation
+# =============================================================================
+sequence Rename {
+  instr R1: ADDI r3, r1, 12&#x27;h001;
+  instr R2: ADDI r3, r3, 12&#x27;h001;   # writes same arch reg → must get new PR
+
+  # After rename, two consecutive writers of the same architectural register
+  # must receive distinct physical destinations.
+  rule WAWRenamed:
+    assert (R1.renamed == true &amp;&amp; R2.renamed == true &amp;&amp; R1.arch_dest == R2.arch_dest)
+    -&gt; always (R1.phys_dest != R2.phys_dest);
+
+  # Source operand of younger instruction is mapped to *previous* writer&#x27;s
+  # physical destination, if there is one.
+  rule SourceRenameLookup:
+    assert (R2.renamed == true &amp;&amp; R2.arch_src1 == R1.arch_dest
+                               &amp;&amp; R1.in_flight == true)
+    -&gt; always (R2.phys_src1 == R1.phys_dest);
+
+  # Old physical register returns to the freelist only at commit of overwriter.
+  rule FreelistReleaseAtCommit:
+    assert (R2.committed == true &amp;&amp; R2.arch_dest == R1.arch_dest
+                                 &amp;&amp; R1.committed == true)
+    -&gt; eventually [0:1] (R2.old_phys_dest_freed == true);
+}
+
+
+# =============================================================================
+# §5  ROB allocation, retirement, and precise exceptions
+# =============================================================================
+sequence ROB {
+  instr Ix: GENERIC;
+
+  rule ROBAllocAtDispatch:
+    assert (Ix.dispatched == true)
+    -&gt; always (Ix.rob_index != ROB_INVALID);
+
+  # ROB retires in program order.
+  rule InOrderRetire:
+    assert (Ix.committed == true &amp;&amp; Iy.committed == true &amp;&amp; Ix.older_than(Iy))
+    -&gt; always (Ix.commit_cycle &lt;= Iy.commit_cycle);
+
+  # Precise exception: when an exception is signaled at commit, all younger
+  # in-flight instructions are flushed and architectural state is restored.
+  rule PreciseException:
+    assert (Ix.exception_at_commit == true)
+    -&gt; next (C910.flush == true
+          &amp;&amp; (forall Iy : Iy.older_than(Ix) == false &amp;&amp; Iy.in_flight == true
+                          -&gt; Iy.killed == true));
+}
+
+
+# =============================================================================
+# §6  Out-of-order issue and wakeup
+# =============================================================================
+sequence IssueWakeup {
+  instr P : GENERIC;          # producer
+  instr C : GENERIC;          # consumer of P
+
+  # A consumer can only issue once every source operand is ready
+  # (either already in PRF or available via wakeup tag broadcast on the CDB).
+  rule WakeupSelectReadiness:
+    assert (C.issued == true &amp;&amp; C.src1_tag == P.phys_dest)
+    -&gt; always (prev(P.writeback_en) == true
+            || prev(P.cdb_broadcast) == true);
+
+  # Age-based selection: among ready ops in the same IQ, the oldest issues
+  # first (7-bit age vector).
+  rule AgeOldestReady:
+    assert (C.iq == P.iq &amp;&amp; C.ready == true &amp;&amp; P.ready == true
+                         &amp;&amp; P.age &gt; C.age)
+    -&gt; always (P.selected_before_or_same_cycle_as(C));
+}
+
+
+# =============================================================================
+# §7  Load / Store / memory ordering
+# =============================================================================
+sequence StoreLoadForwarding {
+  instr S1: SW [x1+0], x2;
+  instr L1: LW x3, [x4+0];
+
+  # Same-address forwarding from store buffer.
+  rule StoreToLoadFwd:
+    assert (S1.committed == false &amp;&amp; S1.executed == true
+                                  &amp;&amp; S1.addr == L1.addr
+                                  &amp;&amp; S1.byte_mask == L1.byte_mask
+                                  &amp;&amp; S1.older_than(L1))
+    -&gt; always (L1.load_val == S1.data_val);
+
+  # Different addresses: load reads memory.
+  rule LoadFromMemory:
+    assert (S1.addr != L1.addr)
+    -&gt; always (L1.load_val == { C910.dmem[L1.addr+7], C910.dmem[L1.addr+6],
+                                C910.dmem[L1.addr+5], C910.dmem[L1.addr+4],
+                                C910.dmem[L1.addr+3], C910.dmem[L1.addr+2],
+                                C910.dmem[L1.addr+1], C910.dmem[L1.addr+0] });
+
+  # Partial-overlap forwarding is not safe: triggers replay.
+  rule PartialOverlapReplays:
+    assert (S1.addr == L1.addr &amp;&amp; S1.byte_mask != L1.byte_mask
+                               &amp;&amp; S1.older_than(L1)
+                               &amp;&amp; S1.committed == false)
+    -&gt; eventually [1:4] (L1.replay == true);
+}
+
+sequence MemoryOrdering {
+  instr LD_A: LW r1, [r10];
+  instr ST_B: SW [r11], r2;
+
+  # Speculative load may pass an older unresolved store; on conflict, replay.
+  rule SpeculativeLoadAllowed:
+    assert (LD_A.older_than(ST_B) == false
+         &amp;&amp; LD_A.addr_resolved == true &amp;&amp; ST_B.addr_resolved == false)
+    -&gt; always (LD_A.may_issue == true);
+
+  rule MemViolationReplay:
+    assert (ST_B.addr_resolved == true &amp;&amp; LD_A.addr == ST_B.addr
+                                       &amp;&amp; ST_B.older_than(LD_A)
+                                       &amp;&amp; LD_A.executed_before(ST_B))
+    -&gt; eventually [1:6] (LD_A.replay_from_rob == true);
+}
+
+sequence FenceDrainsStores {
+  instr F1: FENCE;
+  rule FenceDrainsStoreBuffer:
+    assert (F1.dispatched == true)
+    -&gt; eventually [1:64] (C910.stq_occ == 6&#x27;h00 &amp;&amp; F1.completed == true);
+}
+
+
+# =============================================================================
+# §8  Branch prediction, resolution, and recovery
+# =============================================================================
+sequence BranchPredict {
+  instr B1: BEQ r1, r2, +offset;
+
+  # Prediction is consulted at IF1.
+  rule PredictAtFetch:
+    assert (B1.fetched == true)
+    -&gt; always (B1.prediction_made_at_stage == IF1);
+
+  # Branch outcome is resolved at EX. On mispredict, front-end is redirected to IF1.
+  rule MispredictRedirect:
+    assert (B1.resolved == true &amp;&amp; B1.predicted_taken != B1.actually_taken)
+    -&gt; eventually [1:1] (C910.flush == true
+                       &amp;&amp; B1.redirect_stage == IF1);
+
+  # Predictor state is updated only at commit (not on speculative execution).
+  rule PredictorUpdateAtCommit:
+    assert (B1.committed == true)
+    -&gt; next (B1.bpred_state_updated == true);
+
+  # Return-address stack: a call pushes link, a return pops the same address
+  # in well-nested programs (modulo overflow).
+  rule RASPushPop:
+    assert (B1.is_call == true &amp;&amp; B1.committed == true)
+    -&gt; next (C910.ras_top == B1.return_addr);
+}
+
+sequence ReplayPredictor {
+  instr LD: LW r1, [r10];
+
+  # If a load class previously triggered a memory-order replay, the replay
+  # predictor defers issuing further instances until older stores resolve.
+  rule DeferOnPriorViolation:
+    assert (LD.prior_violation == true &amp;&amp; LD.dispatched == true)
+    -&gt; always (LD.defer_until_older_stores_resolved == true);
+}
+
+
+# =============================================================================
+# §9  Instruction fetch and prefetch
+# =============================================================================
+sequence Fetch {
+  instr Fblk: FETCH_BLOCK;
+
+  rule FetchAdvancesPC:
+    assert (C910.core_ready == true &amp;&amp; Fblk.fetched == true &amp;&amp; C910.flush == false)
+    -&gt; next (C910.pc == prev(C910.pc) + Fblk.block_size);
+
+  rule PrefetchCancelOnRedirect:
+    assert (C910.flush == true)
+    -&gt; next (Fblk.speculative_prefetches_canceled == true);
+}
+
+
+# =============================================================================
+# §10  SoC: AXI4 interconnect, address decode, DCP
+# =============================================================================
+state SoC {
+  reg sram        : array [0x100000] of bv[64];
+  reg uart_rx     : bv[8];
+  reg uart_tx     : bv[8];
+
+  reg axi_req_valid : bool;
+  reg axi_req_ready : bool;
+  reg axi_req_addr  : bv[40];
+  reg axi_req_data  : bv[64];
+  reg axi_req_write : bool;
+  reg axi_req_id    : bv[8];
+
+  reg axi_rsp_valid : bool;
+  reg axi_rsp_data  : bv[64];
+  reg axi_rsp_error : bool;
+  reg axi_rsp_id    : bv[8];
+
+  reg dcp_req_valid : bool;        # device coherence port
+  reg dcp_req_addr  : bv[40];
+}
+
+sequence MemoryMappedRouting {
+  instr T1: WRITE_REQ C910, SRAM, addr, data;
+
+  rule RouteSRAM:
+    assert (T1.addr[39:28] == 12&#x27;h000)
+    -&gt; always (T1.dst == SRAM);
+
+  rule RouteUART:
+    assert (T1.addr[39:28] == 12&#x27;h100)
+    -&gt; always (T1.dst == UART);
+
+  rule RouteL2:
+    assert (T1.addr[39:36] == 4&#x27;b0001)
+    -&gt; always (T1.dst == L2_CACHE);
+}
+
+sequence AXIHandshake {
+  instr T1: WRITE_REQ C910, SRAM, 40&#x27;h00_0000_1000, 64&#x27;hDEADBEEF_CAFEBABE;
+
+  rule HandshakeMonotonic:
+    assert (T1.valid == true &amp;&amp; T1.accepted == false)
+    -&gt; always (SoC.axi_req_valid == true);
+
+  rule AcceptedEventually:
+    assert (T1.valid == true)
+    -&gt; eventually [1:32] (T1.accepted == true);
+
+  rule WriteUpdatesMemory:
+    assert (T1.accepted == true &amp;&amp; T1.write == true)
+    -&gt; eventually [1:8] (SoC.sram[T1.addr] == T1.data);
+
+  rule ResponseIDMatches:
+    assert (T1.accepted == true)
+    -&gt; eventually [1:32] (SoC.axi_rsp_valid == true
+                       &amp;&amp; SoC.axi_rsp_id == T1.id);
+
+  rule NoStarvation:
+    assert (T1.valid == true)
+    -&gt; eventually [1:64] (T1.accepted == true);
+}
+
+sequence DeviceCoherencePort {
+  instr D1: DMA_WRITE DEVICE, MEM, addr, data;
+
+  # DCP traffic participates in coherence: a DMA write invalidates matching
+  # L1 lines in C910.
+  rule DCPInvalidatesL1:
+    assert (D1.valid == true &amp;&amp; D1.write == true)
+    -&gt; eventually [1:16] (C910.l1d_line_state[D1.addr.line] == INVALID);
+}
+
+
+# =============================================================================
+# §11  Reset, power domains, retention
+# =============================================================================
+sequence ResetSequence {
+  rule ResetVectorHeld:
+    assert (C910.core_reset_n == false)
+    -&gt; always (C910.pc == 64&#x27;h0000_0000_8000_0000);   # typical RV reset vec
+
+  rule NotReadyDuringReset:
+    assert (C910.core_reset_n == false)
+    -&gt; always (C910.core_ready == false);
+
+  rule NoCommitDuringReset:
+    assert (C910.core_reset_n == false)
+    -&gt; always (forall I : I.committed != true);
+
+  rule ReadyEventuallyAfterRelease:
+    assert (prev(C910.core_reset_n) == false &amp;&amp; C910.core_reset_n == true
+                                              &amp;&amp; C910.pd_core_on == true)
+    -&gt; eventually [1:32] (C910.core_ready == true);
+}
+
+sequence PowerDomains {
+  rule CoreReadyRequiresCoreDomain:
+    assert (C910.core_ready == true)
+    -&gt; always (C910.pd_core_on == true);
+
+  rule CoreReadyRequiresL2Domain:
+    assert (C910.core_ready == true)
+    -&gt; always (C910.pd_l2_on == true);
+
+  rule CoreCannotAdvanceWithoutClock:
+    assert (C910.core_clk_en == false)
+    -&gt; next (C910.pc == prev(C910.pc));
+}
+
+sequence Retention {
+  # In retention, the core is not operational, but architected state survives.
+  rule NotOperationalInRetention:
+    assert (C910.pd_core_retention == true)
+    -&gt; always (C910.core_ready == false);
+
+  rule XRFPreservedInRetention:
+    assert (C910.pd_core_retention == true)
+    -&gt; next (C910.xrf[idx] == prev(C910.xrf[idx]));
+
+  rule PCPreservedInRetention:
+    assert (C910.pd_core_retention == true)
+    -&gt; next (C910.pc == prev(C910.pc));
+
+  rule WakeFromRetentionReady:
+    assert (prev(C910.pd_core_retention) == true
+         &amp;&amp; C910.pd_core_retention == false
+         &amp;&amp; C910.pd_core_on == true)
+    -&gt; eventually [1:32] (C910.core_ready == true);
+
+  rule NoNewTransactionsInRetention:
+    assert (C910.pd_core_retention == true)
+    -&gt; always (SoC.axi_req_valid != true);
+}
+
+
+# =============================================================================
+# §12  Global liveness / correctness summary rules
+# =============================================================================
+rule ForwardProgress:
+  assert (C910.core_ready == true &amp;&amp; C910.flush == false)
+  -&gt; eventually [1:1024] (exists I : I.committed == true);
+
+rule NoCommitWithoutDispatch:
+  assert (Ix.committed == true)
+  -&gt; always (Ix.dispatched == true &amp;&amp; Ix.dispatched_before(Ix.committed));
+
+rule MispredictNoArchitecturalEffect:
+  assert (Ix.on_wrong_path == true)
+  -&gt; always (Ix.committed != true);
+</pre>
+  </details>
+</section>
+
+<footer class="sitefoot">
+  <div>V-SPEC 1.0 · XUANTIE C910 · 53 RULES</div>
+  <div>STATUS · DESCRIPTIVE</div>
+</footer>
+
+</main>
+</div>
+
+<script>
+(function() {
+  const links = document.querySelectorAll('nav.toc a');
+  const sections = [...document.querySelectorAll('main.content section')];
+  const obs = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        links.forEach(a => a.classList.toggle('active',
+          a.getAttribute('href') === '#' + e.target.id));
+      }
+    });
+  }, { rootMargin: '-40% 0px -55% 0px', threshold: 0 });
+  sections.forEach(s => obs.observe(s));
+})();
+</script>
+</body>
+</html>
