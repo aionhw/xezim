@@ -19549,6 +19549,15 @@ impl Simulator {
         if let ExprKind::StringLiteral(fmt) = &args[0].kind {
             return self.format_string(fmt, &args[1..], tn);
         }
+        // The format string may also be any string-valued expression — a
+        // ternary `cond ? "%0df" : "%0db"`, a string variable, the result of
+        // another `$sformatf`, etc. Evaluate, recover the runtime string, and
+        // use it as the format spec. (riscv-dv's branch-label code uses the
+        // ternary form.)
+        if self.expr_is_string_valued(&args[0]) {
+            let fmt = self.eval_expr(&args[0]).to_sv_string();
+            return self.format_string(&fmt, &args[1..], tn);
+        }
         let r = if tn.ends_with('b') {
             'b'
         } else if tn.ends_with('h') {
