@@ -361,6 +361,9 @@ fn main() {
     let mut write_profile: Option<String> = None;
     let mut profile_input: Option<String> = None;
     let mut collapse_islands: bool = false;
+    let mut pdes_c910_stub: Option<String> = None;
+    let mut pdes_c910_ticks: u64 = 100;
+    let mut multikernel_scope: Option<String> = None;
 
     let mut include_dirs: Vec<String> = Vec::new();
     let mut defines: Vec<(String, Option<String>)> = Vec::new();
@@ -606,6 +609,37 @@ fn main() {
             }
             _ if arg.starts_with("--load-partition=") => {
                 load_partition = Some(arg["--load-partition=".len()..].to_string());
+            }
+            "--pdes-c910-stub" => {
+                i += 1;
+                if i < args.len() {
+                    pdes_c910_stub = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--pdes-c910-stub=") => {
+                pdes_c910_stub = Some(arg["--pdes-c910-stub=".len()..].to_string());
+            }
+            "--pdes-c910-ticks" => {
+                i += 1;
+                if i < args.len() {
+                    if let Ok(n) = args[i].parse::<u64>() {
+                        pdes_c910_ticks = n;
+                    }
+                }
+            }
+            _ if arg.starts_with("--pdes-c910-ticks=") => {
+                if let Ok(n) = arg["--pdes-c910-ticks=".len()..].parse::<u64>() {
+                    pdes_c910_ticks = n;
+                }
+            }
+            "--multikernel-scope" => {
+                i += 1;
+                if i < args.len() {
+                    multikernel_scope = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--multikernel-scope=") => {
+                multikernel_scope = Some(arg["--multikernel-scope=".len()..].to_string());
             }
             "--write-profile" => {
                 i += 1;
@@ -882,6 +916,32 @@ fn main() {
     xezim::compiler::simulator::set_sim_debug(sim_debug);
     xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
 
+    // PDES c910 stub mode: parse + elaborate + compile, then run the
+    // PdesCoordinator with stub blocks for `pdes_c910_ticks` ticks.
+    // Skips the regular event_loop. Front-half integration test for
+    // the worktree perlp-experiment branch.
+    if let Some(lp_a_prefix) = &pdes_c910_stub {
+        match xezim::pdes_c910_stub_multi(
+            &sources,
+            top_module.as_deref(),
+            &include_dirs,
+            &source_files,
+            &defines,
+            lp_a_prefix,
+            pdes_c910_ticks,
+        ) {
+            Ok(()) => {
+                println!("------------------------------");
+                println!("PDES c910 stub complete");
+            }
+            Err(e) => {
+                eprintln!("PDES stub error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     match xezim::simulate_multi(
         &sources,
         max_time,
@@ -903,6 +963,7 @@ fn main() {
         write_profile.as_deref(),
         profile_input.as_deref(),
         collapse_islands,
+        multikernel_scope.as_deref(),
     ) {
         Ok(sim) => {
             println!("------------------------------");

@@ -93,6 +93,27 @@ pub unsafe extern "C" fn xezim_jit_schedule_nba(sim: *mut u8, id: u32, val_bits:
     sim.jit_schedule_nba(id as usize, val_bits, width);
 }
 
+/// JIT Stage 4 Tier A — leaner NBA schedule variant.  Caller (JIT
+/// codegen) emits a call to this only when:
+///   - `id` is in range (validated at JIT-compile time)
+///   - `val_bits` is already masked to `signal_widths[id]`
+///     (the Insn::NbaAssign width arg matched signal_widths[id])
+///
+/// Skips: bounds check, width compare, Value::resize.  Still uses
+/// the same nba_fast / nba_fast_index path so partial-bit NBAs to
+/// the same signal merge correctly.  Net per-call saving: ~3-5 ns
+/// (the bulk of NBA cost — HashMap insert + Vec push — remains in
+/// Tier B/C territory).
+#[no_mangle]
+pub unsafe extern "C" fn xezim_jit_schedule_nba_fast(
+    sim: *mut u8,
+    id: u32,
+    val_bits: u64,
+) {
+    let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
+    sim.jit_schedule_nba_fast(id as usize, val_bits);
+}
+
 /// Schedule a non-blocking assign to a dynamic bit-range: merges `val_bits`
 /// at bits `[hi_bits:lo_bits]` into the current signal value.
 #[no_mangle]
@@ -192,6 +213,9 @@ mod stub {
         ) -> Option<JitFn> {
             None
         }
+        pub fn set_inline_bits_storage(&mut self, _ptr: u64, _len: u32) {}
+        pub fn set_signal_widths(&mut self, _widths: Vec<u32>) {}
+        pub fn set_nba_side_queue(&mut self, _base_ptr: u64, _len_ptr: u64, _cap: u32) {}
     }
 }
 
@@ -201,8 +225,8 @@ mod enabled {
     use super::{
         xezim_jit_blocking_assign_range_dyn, xezim_jit_inputs_have_xz,
         xezim_jit_load_array_elem, xezim_jit_load_signal, xezim_jit_schedule_nba,
-        xezim_jit_schedule_nba_bit_dyn, xezim_jit_schedule_nba_range_dyn,
-        xezim_jit_store_signal, JitFn,
+        xezim_jit_schedule_nba_bit_dyn, xezim_jit_schedule_nba_fast,
+        xezim_jit_schedule_nba_range_dyn, xezim_jit_store_signal, JitFn,
     };
     use cranelift::codegen::ir::{FuncRef, StackSlot};
     use cranelift::prelude::*;
@@ -212,12 +236,38 @@ mod enabled {
     pub struct JitModule {
         module: ClJitModule,
         next_id: u64,
+        /// JIT Stage 2 (JIT-REDESIGN-NOTES.md): when set, codegen for
+        /// LoadSignal / LoadSignalSigned reads `signal_inline_bits[id*16]`
+        /// directly via a baked-in absolute pointer + offset instead of
+        /// calling `xezim_jit_load_signal` across FFI.  Eliminates ~10-20 ns
+        /// per signal load.  Set via `set_inline_bits_storage` after the
+        /// JitModule is constructed, by the simulator caller that knows
+        /// the pointer and length.
+        inline_bits_ptr: Option<(u64, u32)>,
+        /// JIT Stage 4 Tier A: snapshot of `Simulator::signal_widths` used
+        /// at JIT-compile time to pick between the slow nba bridge (with
+        /// width arg) and the leaner nba_fast bridge (assumes
+        /// width == signal_widths[sig_id]).  Set via
+        /// `set_signal_widths` after JitModule construction.
+        signal_widths_snapshot: Vec<u32>,
+        /// JIT Stage 4 Tier C Path C1: (base_ptr, len_ptr, capacity) of
+        /// the simulator's `jit_nba_side_queue`.  When set, NbaAssign
+        /// codegen emits an inline write to this queue (no FFI),
+        /// bumping the length counter at len_ptr.  drain_jit_nba_side_queue
+        /// transfers entries into nba_fast at apply_nba time.
+        nba_side_queue: Option<(u64, u64, u32)>,
     }
 
     impl JitModule {
         pub fn new() -> Option<Self> {
             let isa_builder = cranelift_native::builder().ok()?;
-            let flag_builder = settings::builder();
+            let mut flag_builder = settings::builder();
+            // Cranelift defaults to opt_level=none (no regalloc opt / DCE /
+            // stack-slot promotion), which produced JIT'd code SLOWER than the
+            // tight interpreter (measured 79.5 vs 59.7 ns/insn). Enable the
+            // optimizing pipeline so VM-reg stack slots get promoted to
+            // registers and dead code is removed.
+            let _ = flag_builder.set("opt_level", "speed");
             let isa = isa_builder
                 .finish(settings::Flags::new(flag_builder))
                 .ok()?;
@@ -231,6 +281,10 @@ mod enabled {
             builder.symbol(
                 "xezim_jit_schedule_nba",
                 xezim_jit_schedule_nba as *const u8,
+            );
+            builder.symbol(
+                "xezim_jit_schedule_nba_fast",
+                xezim_jit_schedule_nba_fast as *const u8,
             );
             builder.symbol(
                 "xezim_jit_schedule_nba_range",
@@ -259,7 +313,41 @@ mod enabled {
             Some(Self {
                 module: ClJitModule::new(builder),
                 next_id: 0,
+                inline_bits_ptr: None,
+                signal_widths_snapshot: Vec::new(),
+                nba_side_queue: None,
             })
+        }
+
+        /// Stage 2: enable inline LoadSignal codegen by providing the
+        /// base pointer + element count of `Simulator::signal_inline_bits`.
+        /// Must remain valid for the JitModule's lifetime.  Call BEFORE
+        /// any `try_compile_*` invocation; existing JIT'd functions
+        /// won't see the change.
+        pub fn set_inline_bits_storage(&mut self, ptr: u64, len: u32) {
+            self.inline_bits_ptr = Some((ptr, len));
+        }
+
+        /// Stage 4 Tier A: enable the leaner NBA bridge by providing a
+        /// snapshot of signal widths.  JIT codegen uses this to detect
+        /// when `Insn::NbaAssign`'s width arg matches signal_widths[id]
+        /// — that's the common case where the slow bridge's width
+        /// resize is redundant.  Call after JitModule construction.
+        pub fn set_signal_widths(&mut self, widths: Vec<u32>) {
+            self.signal_widths_snapshot = widths;
+        }
+
+        /// Stage 4 Tier C Path C1: enable inline NBA queue writes by
+        /// providing the base pointer of `jit_nba_side_queue` + the
+        /// pointer to its length counter.  When set + the width-
+        /// matches condition holds, NbaAssign codegen emits a direct
+        /// memory write to the side queue (no FFI).
+        ///
+        /// The pointers MUST remain valid for the JitModule's
+        /// lifetime — the side queue is pre-allocated to fixed
+        /// capacity and never resized.
+        pub fn set_nba_side_queue(&mut self, base_ptr: u64, len_ptr: u64, cap: u32) {
+            self.nba_side_queue = Some((base_ptr, len_ptr, cap));
         }
 
         /// Try to JIT-compile a block's instruction list. Returns None if
@@ -350,6 +438,15 @@ mod enabled {
 
             let nba_sig = store_sig.clone();
 
+            // Tier A leaner NBA bridge: (sim, id: u32, val_bits: u64).
+            // Skips the width parameter — caller (JIT codegen) only
+            // emits the call when width matches signal_widths[id] at
+            // compile time, so no resize is needed.
+            let mut nba_fast_sig = self.module.make_signature();
+            nba_fast_sig.params.push(AbiParam::new(pointer_type)); // sim
+            nba_fast_sig.params.push(AbiParam::new(types::I32)); // id
+            nba_fast_sig.params.push(AbiParam::new(types::I64)); // val_bits
+
             // nba_bit_dyn bridge ABI: (sim, id: u32, idx: u64, val_bits: u64).
             // The dynamic bit/range schedulers take the bit-pos as u64
             // (matches Rust fn sig). Earlier we re-used `nba_sig` here,
@@ -388,6 +485,14 @@ mod enabled {
             let nba_id: FuncId = self
                 .module
                 .declare_function("xezim_jit_schedule_nba", Linkage::Import, &nba_sig)
+                .map_err(|_| ())?;
+            let nba_fast_id: FuncId = self
+                .module
+                .declare_function(
+                    "xezim_jit_schedule_nba_fast",
+                    Linkage::Import,
+                    &nba_fast_sig,
+                )
                 .map_err(|_| ())?;
             let nba_range_id: FuncId = self
                 .module
@@ -486,6 +591,9 @@ mod enabled {
                 .module
                 .declare_func_in_func(store_id, &mut builder.func);
             let nba_ref = self.module.declare_func_in_func(nba_id, &mut builder.func);
+            let nba_fast_ref = self
+                .module
+                .declare_func_in_func(nba_fast_id, &mut builder.func);
             let nba_range_ref = self
                 .module
                 .declare_func_in_func(nba_range_id, &mut builder.func);
@@ -598,6 +706,24 @@ mod enabled {
             // Walk insns, switching blocks at leaders, emitting terminators
             // for branches/jumps. `live` tracks whether the current block
             // is still open (no terminator emitted yet).
+            //
+            // JIT Stage 4 Tier A: borrow the signal_widths snapshot so
+            // the NbaAssign case below can compile-time-decide between
+            // the slow xezim_jit_schedule_nba (with width arg) and the
+            // leaner xezim_jit_schedule_nba_fast (no width arg, assumes
+            // val_bits already matches signal_widths[sig_id]).
+            let signal_widths = &self.signal_widths_snapshot;
+            // JIT Stage 4 Tier C Path C1: cache the side-queue config
+            // so NbaAssign can emit an inline write to the queue
+            // (no FFI) when conditions are met.
+            let nba_side_queue = self.nba_side_queue;
+            // JIT Stage 2: cache the inline_bits pointer so the
+            // LoadSignal / LoadSignalSigned cases below can emit a
+            // direct load instead of the FFI bridge call.  Stride is
+            // 16 bytes per entry; offset 0 holds val_bits (the only
+            // field the JIT needs since the X/Z prelude already
+            // checked xz_bits for input ids).
+            let inline_storage = self.inline_bits_ptr;
             let mut live = true;
             for (i, insn) in insns.iter().enumerate() {
                 if i != 0 && is_leader[i] {
@@ -628,6 +754,90 @@ mod enabled {
                         let target_b = resolve_target(*target as usize, &pc_to_block);
                         builder.ins().jump(target_b, &[]);
                         live = false;
+                    }
+                    // JIT Stage 4 Tier C Path C1: when width matches AND
+                    // the side queue is configured, emit a full inline
+                    // write — load len, write (sig_id, val_bits) into
+                    // queue[len], bump len.  No FFI call.  Saves ~25-30 ns
+                    // per NBA vs the Tier A fast bridge.
+                    Insn::NbaAssign(sig_id, val_reg, width)
+                        if signal_widths
+                            .get(*sig_id)
+                            .map_or(false, |&w| w == *width)
+                            && nba_side_queue.is_some() =>
+                    {
+                        let (base_ptr, len_ptr, _cap) = nba_side_queue.unwrap();
+                        let v = builder
+                            .ins()
+                            .stack_load(types::I64, reg_slots[*val_reg as usize], 0);
+                        // Load current length (u32) from *len_ptr.
+                        let len_addr = builder.ins().iconst(pointer_type, len_ptr as i64);
+                        let len = builder.ins().load(
+                            types::I32,
+                            MemFlags::trusted(),
+                            len_addr,
+                            0,
+                        );
+                        // Compute slot address: base + len * 16 (sizeof JitNbaSideEntry).
+                        let base = builder.ins().iconst(pointer_type, base_ptr as i64);
+                        let len64 = builder.ins().uextend(types::I64, len);
+                        let entry_size = builder.ins().iconst(types::I64, 16);
+                        let offset = builder.ins().imul(len64, entry_size);
+                        let slot = builder.ins().iadd(base, offset);
+                        // Write signal_id (u32) at offset 0.
+                        let sid = builder.ins().iconst(types::I32, *sig_id as i64);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), sid, slot, 0);
+                        // Write val_bits (u64) at offset 8 (skip the 4-byte
+                        // pad after signal_id).
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), v, slot, 8);
+                        // Increment len.
+                        let one = builder.ins().iconst(types::I32, 1);
+                        let new_len = builder.ins().iadd(len, one);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), new_len, len_addr, 0);
+                    }
+                    // JIT Stage 4 Tier A: when the Insn::NbaAssign's
+                    // width matches the signal's declared width, emit
+                    // a call to the leaner nba_fast bridge (3-arg, no
+                    // width).  Otherwise fall through to the existing
+                    // 4-arg bridge below.
+                    Insn::NbaAssign(sig_id, val_reg, width)
+                        if signal_widths
+                            .get(*sig_id)
+                            .map_or(false, |&w| w == *width) =>
+                    {
+                        let v = builder
+                            .ins()
+                            .stack_load(types::I64, reg_slots[*val_reg as usize], 0);
+                        let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                        builder.ins().call(nba_fast_ref, &[sim_ptr, id, v]);
+                    }
+                    // JIT Stage 2: inline LoadSignal / LoadSignalSigned
+                    // when signal_inline_bits storage is available.
+                    // Replaces an FFI call (~10-20 ns per load) with a
+                    // single u64 load from a baked-in pointer + offset.
+                    // Falls through to the FFI path when storage is
+                    // unset (XEZIM_INLINE_BITS=0) or sid out of range.
+                    Insn::LoadSignal(dest, sig_id) | Insn::LoadSignalSigned(dest, sig_id)
+                        if inline_storage
+                            .map_or(false, |(_, len)| (*sig_id as u32) < len) =>
+                    {
+                        let (base_ptr, _len) = inline_storage.unwrap();
+                        let base = builder.ins().iconst(pointer_type, base_ptr as i64);
+                        // Each [u64; 2] entry is 16 bytes; val_bits is at offset 0.
+                        let offset = (*sig_id as i32) * 16;
+                        let val = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            base,
+                            offset,
+                        );
+                        builder.ins().stack_store(val, reg_slots[*dest as usize], 0);
                     }
                     other => {
                         emit_insn(

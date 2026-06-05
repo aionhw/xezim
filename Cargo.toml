@@ -59,3 +59,15 @@ codegen-units = 1
 opt-level = 3
 debug = "line-tables-only"
 panic = "abort"
+
+# Interpreter-only LTO build. Use when NOT building with `--features jit`
+# or `--features jit-llvm` (LTO miscompiles the LLVM JIT path).
+# Build with:
+#   cargo build --release --profile release-lto --bin xezim
+# (Binary lands in `target/release-lto/xezim`.)  Measured on c910 hello
+# to shave a few seconds off the interpreter hot path via cross-crate
+# inlining of Value ops and signal_table access.
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
