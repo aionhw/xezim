@@ -34,18 +34,23 @@ Current capabilities include:
 * Sequential simulation infrastructure
 * Test execution framework
 * Waveform / trace dumps — VCD (`$dumpfile`/`$dumpvars`), XTrace v1.0 (`--xtrace`,
-  optional zstd compression + scope filtering), and AITRACE-T (`--aitrace`); see
-  [`docs/TRACING.md`](docs/TRACING.md)
+  optional zstd compression + scope filtering), and AITRACE-T (`--aitrace`)
+* UVM 1.2 runtime support with `-DUVM_NO_DPI`, demonstrated by running the
+  `riscv-dv` instruction generator end-to-end (random RV32IMC programs that
+  assemble cleanly with `riscv64-unknown-elf-as -march=rv32imc_zicsr_zifencei`)
+* Event-driven edge gating (`XEZIM_EVENT_EDGE=1`) — opt-in skip of clocked
+  flop fires whose data inputs haven't changed; 1.13-1.30× wall on the C910 /
+  C906 hello / memcpy / cmark benchmarks, correct-by-construction
 
 ---
 
 # Project Structure
 
-xezim is split across three sibling repos:
+xezim is split across sibling repos checked out side-by-side:
 
 ```
 ../xezim-core/   — shared library: parser, elaboration, value, SDF, VCD sink
-../xezim/        — bytecode interpreter (this repo, binary: xezim)
+./               — bytecode interpreter + simulator (this repo, binary: xezim)
 ```
 
 This repo:
@@ -71,6 +76,22 @@ This repo:
 **Simulator** — event-driven VM over a bytecode lowering of cont_assigns and always blocks.
 
 **Native compiler** (`xezim-b`) — AOT-lowers an elaborated design to Rust and links a standalone binary.
+
+---
+
+# Verified Workloads
+
+End-to-end TEST PASSED with bit-identical results vs the workloads' own
+golden expectations:
+
+| Design | Test | sim_time / cycles | baseline wall | +O1 wall |
+|---|---|---|---|---|
+| XuanTie C910 (dual-core) | hello | sim_time 44695 | 95s | **73s** (1.30×) |
+| XuanTie C910 | memcpy ×7000 | sim_time 101965 | 216s | **166s** (1.30×) |
+| XuanTie C910 | cmark ×1 (`+iterations=1`, INIT_ZERO=1) | 167124 cycles | 87 min | **73 min** (1.19×) |
+| XuanTie C906 (single-core) | memcpy ×50 | — | 99s | **88s** (1.13×) |
+| XuanTie C906 | cmark ×1 (INIT_ZERO=1) | 295294 cycles | 714s | **587s** (1.22×) |
+| riscv-dv (UVM 1.2) | `+num_of_tests=10` random RV32IMC | — | — | 10/10 assemble clean |
 
 ---
 
@@ -138,8 +159,13 @@ Common options:
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
 | `--aitrace` | Make `$dumpfile`/`$dumpvars` emit AITRACE-T text instead of VCD |
 
-> Waveform / trace dumps (VCD via `$dumpfile`/`$dumpvars`, XTrace via `--xtrace`,
-> AITRACE via `--aitrace`) are documented in **[`docs/TRACING.md`](docs/TRACING.md)**.
+Selected env knobs (off by default unless noted):
+
+| Env var | Effect |
+|---|---|
+| `XEZIM_EVENT_EDGE=1` | Skip gateable clocked flop fires whose data is unchanged (1.13-1.30× wall on c910/c906) |
+| `XEZIM_INIT_ZERO=1` | Coerce X-initialized signals/arrays to 0 (required for some C910/C906 workloads, e.g. cmark) |
+| `XEZIM_PROGRESS=N` | Emit a `[PROGRESS]` line every N wall-seconds (sim_time, iters, edges_fired, nba_q) |
 
 Example — run the picorv32 testbench against a gate-level netlist:
 
