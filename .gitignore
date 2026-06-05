@@ -7,3 +7,18 @@ dump.vcd
 # Third-party Accellera UVM source — kept as a local working copy,
 # not vendored into the repo (see tests/uvm_integration_tests.rs).
 uvm-1.2/
+
+# Scratch notes — kept locally, not tracked
+/FUNCTIONAL-PARLOOP-SCOPE.md
+/HOT-ARENA-NOTES.md
+/IMPROVEMENT-SUGGESTIONS.md
+/IN-PLACE-SETTLE-SCOPE.md
+/JIT-REDESIGN-NOTES.md
+/MULTIKERNEL-NOTES.md
+/PARALLELIZATION-ALTERNATIVES.md
+/PER-LP-NEXT-STEPS.md
+/PERLP-EVENTLOOP-PLAN.md
+/SESSION-3-SUMMARY.md
+/SESSION-4-SUMMARY.md
+/SESSION-SUMMARY.md
+/docs/TRACING.md
