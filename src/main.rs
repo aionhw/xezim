@@ -82,6 +82,8 @@ fn print_usage() {
     eprintln!("                   A '.zst'/'.zstd' suffix zstd-compresses the stream.");
     eprintln!("  --xtrace-scope <hier>  Restrict the XTrace dump to signals under <hier>");
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
+    eprintln!("  --sv2017         Parse as IEEE 1800-2017 (default is 1800-2023)");
+    eprintln!("  --sv2023         Parse as IEEE 1800-2023 (default; kept for back-compat)");
     eprintln!("Compatibility:");
     eprintln!("  -Ifoo, -DNAME=V  Accepted");
     eprintln!("  +incdir+dir1+dir2 / +define+FOO=1+BAR Accepted");
@@ -322,6 +324,11 @@ fn process_command_file(
 fn main() {
     spawn_memory_watchdog();
 
+    // Default to IEEE 1800-2023 mode. SV-2023 is additive over -2017, so
+    // valid -2017 code stays valid; pass `--sv2017` to opt back to the
+    // older grammar where a new keyword or syntax form gets in the way.
+    sv_parser::set_sv2023(true);
+
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         print_usage();
@@ -515,7 +522,11 @@ fn main() {
                 mode_explicit = true;
             }
             "--sv2023" => {
+                // No-op now (default), kept for back-compat with existing scripts.
                 sv_parser::set_sv2023(true);
+            }
+            "--sv2017" => {
+                sv_parser::set_sv2023(false);
             }
             "--dump-tokens" => {
                 dump_tokens = true;

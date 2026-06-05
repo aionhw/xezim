@@ -26,6 +26,7 @@ The simulator is being developed incrementally, starting from simple combination
 
 Current capabilities include:
 
+* IEEE 1800-2023 grammar by default (`--sv2017` opts back to the earlier edition)
 * SystemVerilog module parsing
 * Signal and net representation
 * Continuous assignments

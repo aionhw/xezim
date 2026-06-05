@@ -11163,7 +11163,7 @@ impl Simulator {
 
     /// Drain every process scheduled at `self.time` in the event_queue,
     /// running each to its next suspension point. Used inside
-    /// `drain_edge_cascade` to honour the IEEE 1800-2017 §4.4.5 active-
+    /// `drain_edge_cascade` to honour the IEEE 1800-2023 §4.4.5 active-
     /// region drain: after check_edges has woken event_waiters at the
     /// current time, their continuations must run BEFORE apply_nba so
     /// they see the pre-NBA state of this cycle's NBA-driven signals.
@@ -13852,7 +13852,7 @@ impl Simulator {
         self.prof_edge_cg += _t_cg.elapsed().as_nanos() as u64;
 
         // Wake up event_waiters whose sensitivity conditions are met.
-        // IEEE 1800-2017 §4.4.5: triggered continuations run in the
+        // IEEE 1800-2023 §4.4.5: triggered continuations run in the
         // active region of the same time-step (before NBA region).
         // Collect their continuations locally and run them INLINE
         // below — DON'T schedule into event_queue, because event_queue
@@ -13895,7 +13895,7 @@ impl Simulator {
         // Run the triggered waiter continuations IMMEDIATELY (active
         // region of current time-step, before apply_nba commits) so
         // their NBA pushes join the same nba_fast queue as the
-        // edge_blocks just fired — IEEE 1800-2017 §4.4.5 semantics.
+        // edge_blocks just fired — IEEE 1800-2023 §4.4.5 semantics.
         //
         // Default behavior preserves the legacy schedule-into-event_queue
         // path (waiter runs in NEXT event_loop iter after apply_nba) —
@@ -18361,7 +18361,7 @@ impl Simulator {
             } => {
                 let val = self.eval_expr(rvalue);
                 // SV-2023: NBA to a ref formal redirects to the caller's
-                // actual lvalue (IEEE 1800-2017 §13.5.2).
+                // actual lvalue (IEEE 1800-2023 §13.5.2).
                 let lvalue_owned;
                 let lvalue: &Expression = if let ExprKind::Ident(hier) = &lvalue.kind {
                     if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
@@ -23450,7 +23450,7 @@ impl Simulator {
                 let r = if mname == "tolower" { s.to_lowercase() } else { s.to_uppercase() };
                 return Value::from_string(&r);
             }
-            // String-to-number conversions (IEEE 1800-2017 §6.16.9). Parse the
+            // String-to-number conversions (IEEE 1800-2023 §6.16.9). Parse the
             // longest valid numeric prefix in the given radix; 0 on no match.
             if matches!(mname, "atoi" | "atohex" | "atooct" | "atobin")
                 && args.is_empty()
@@ -24398,7 +24398,7 @@ impl Simulator {
         }
         self.local_stack.push(locals);
         // SV-2023: redirect NBAs targeting a `ref` formal back to the caller's
-        // actual variable (IEEE 1800-2017 §13.5.2).
+        // actual variable (IEEE 1800-2023 §13.5.2).
         let mut ref_map: HashMap<String, Expression> = HashMap::default();
         for (i, port) in td.ports.iter().enumerate() {
             if matches!(port.direction, crate::ast::types::PortDirection::Ref)

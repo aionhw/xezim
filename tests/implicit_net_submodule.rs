@@ -1,5 +1,5 @@
 //! Regression for the c910 memcpy/cmark hang root cause (xezim-core
-//! 8d46dd5): IEEE 1800-2017 §6.10 implicit nets — a bare identifier on
+//! 8d46dd5): IEEE 1800-2023 §6.10 implicit nets — a bare identifier on
 //! the LHS of a continuous assign with no `wire` declaration — were only
 //! created for the *top* module's cont-assigns, not for cont-assigns in
 //! deferred sub-module bodies. So an `assign undeclared = ...;` inside a
@@ -27,7 +27,7 @@ fn u64_of(sim: &xezim::compiler::Simulator, names: &[&str]) -> u64 {
 // One level of nesting: tb -> inner. `mid` is an undeclared implicit net.
 const SRC_1LEVEL: &str = r#"
 module inner(input [7:0] a, input [7:0] b, output [7:0] y);
-  // No `wire mid;` — implicit 1-bit net (IEEE 1800-2017 §6.10).
+  // No `wire mid;` — implicit 1-bit net (IEEE 1800-2023 §6.10).
   assign mid = a[0] ^ b[0];
   assign y = {7'b0, mid};
 endmodule

@@ -3,7 +3,7 @@ name = "xezim"
 version = "0.1.2"
 edition = "2021"
 rust-version = "1.75"
-description = "SystemVerilog bytecode interpreter (IEEE 1800-2017/2023). For native compilation, see xezim-b."
+description = "SystemVerilog bytecode interpreter (IEEE 1800-2023, with --sv2017 opt-out). For native compilation, see xezim-b."
 license = "MIT OR Apache-2.0"
 
 [dependencies]

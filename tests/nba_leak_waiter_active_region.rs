@@ -1,4 +1,4 @@
-//! IEEE 1800-2017 §4.4.5 active-region semantics test.
+//! IEEE 1800-2023 §4.4.5 active-region semantics test.
 //!
 //! Verifies that an `initial begin forever @(posedge clk) … end` waiter
 //! sees the same pre-NBA signal state as a sibling `always @(posedge
@@ -53,7 +53,7 @@ fn lookup(sim: &xezim::compiler::Simulator, name: &str) -> u64 {
 
 #[test]
 fn waiter_sees_pre_nba_state_of_current_cycle() {
-    // Enable active-region drain (opt-in per IEEE 1800-2017 §4.4.5).
+    // Enable active-region drain (opt-in per IEEE 1800-2023 §4.4.5).
     // Default off because some testbenches (e.g. c910 tb.v initial
     // blocks with `@(posedge clk)` reads) depend on the legacy
     // schedule-into-event_queue behavior.

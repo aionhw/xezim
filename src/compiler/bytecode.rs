@@ -998,7 +998,7 @@ impl<'a> BytecodeCompiler<'a> {
                     BinaryOp::BitXnor => self.emit(Insn::BitXnor(dest, l, r)),
                     BinaryOp::LogAnd => self.emit(Insn::LogAnd(dest, l, r)),
                     BinaryOp::LogOr => self.emit(Insn::LogOr(dest, l, r)),
-                    // a -> b  ==  !a || b   (IEEE 1800-2017 §11.4.7)
+                    // a -> b  ==  !a || b   (IEEE 1800-2023 §11.4.7)
                     BinaryOp::LogImplies => {
                         self.emit(Insn::LogNot(dest, l));
                         self.emit(Insn::LogOr(dest, dest, r));
