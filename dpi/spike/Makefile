@@ -23,8 +23,18 @@ REAL_CXXFLAGS     = -DXEZIM_SPIKE_REAL=1 -I$(SPIKE_PREFIX)/include
 REAL_LDFLAGS_FRONT = -L$(SPIKE_PREFIX)/lib -Wl,-rpath,$(SPIKE_PREFIX)/lib
 REAL_LIBS         = -lriscv -lfesvr -lsoftfloat
 
-.PHONY: all real clean
+.PHONY: all real clean test-elf
 all: $(OUT)
+
+# RV32IMC cross-compile of test_spike_asm.S → test_spike_asm.elf.
+# Build the test ELF with `make test-elf` (needs riscv64-unknown-elf-gcc
+# on PATH or via $(RISCV_PREFIX)).
+RISCV_PREFIX ?= riscv64-unknown-elf-
+test-elf: test_spike_asm.elf
+test_spike_asm.elf: test_spike_asm.S link.ld
+	$(RISCV_PREFIX)gcc -march=rv32imc -mabi=ilp32 \
+	    -nostartfiles -nostdlib -T link.ld \
+	    -o $@ test_spike_asm.S
 
 $(OUT): $(SRC)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
@@ -35,4 +45,4 @@ real: LIBS     += $(REAL_LIBS)
 real: $(OUT)
 
 clean:
-	rm -f $(OUT) *.o
+	rm -f $(OUT) *.o test_spike_asm.elf

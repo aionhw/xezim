@@ -23,15 +23,29 @@ testbench wiring) without depending on Spike. `make real` enables the
 `XEZIM_SPIKE_REAL=1` compile path; the marked `TODO` blocks in
 `xezim_spike_dpi.cpp` become real `processor_t::step()` calls.
 
-## Smoke test
+## Smoke test (real Spike, end-to-end)
 
 ```bash
-make
-xezim -s tb --dpi-lib ./xezim_spike_dpi.so test_spike_dpi.sv
+make real SPIKE_PREFIX=/home/bondan/gnu      # build .so against libriscv
+make test-elf RISCV_PREFIX=riscv64-unknown-elf-   # cross-compile asm test
+xezim -s tb -I . --dpi-lib ./xezim_spike_dpi.so test_spike_dpi.sv
 ```
 
-You should see three retire lines and the final `x1 = 3`, `pc =
-0x8000000c` summary.
+Expected output — Spike actually executes a 12-instruction RV32IMC
+program and the SV side reads every register write back through DPI:
+
+```
+[xezim_spike_dpi] elf loaded; entry=0x80000000 xlen=32
+step  2: pc=0x80000002 retired=1  x1=0x0000dead
+step  4: pc=0x8000000a retired=1  x1=0x0000dead x2=0x0000beef
+step  6: pc=0x80000010 retired=1  x1=0x0000dead x2=0x0000beef x3=0x00001234
+step  8: pc=0x80000016 retired=1  x1=0x0000dead x2=0x0000beef x3=0x00001234 x4=0x00005678
+step 10: pc=0x8000001c retired=1  x1=0x0000dead x2=0x0000beef x3=0x00001234 x4=0x00005678 x5=0x0000cafe
+step 12: pc=0x80000022 retired=1  x1=0x0000dead x2=0x0000beef x3=0x00001234 x4=0x00005678 x5=0x0000cafe x6=0x0000babe
+```
+
+In stub mode (`make` only), the test still runs; it just shows the
+canned stub values from the shim instead of real Spike state.
 
 ## Filling in the real Spike calls (Phase 2)
 

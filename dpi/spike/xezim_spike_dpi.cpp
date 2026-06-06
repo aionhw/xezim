@@ -137,8 +137,9 @@ int xezim_spike_init(const char* elf_path, const char* isa, const char* priv) {
                 load_elf(s->elf.c_str(), &s->sim->memif(), &entry, 0);
                 s->proc->get_state()->pc = entry;
                 std::fprintf(stderr,
-                             "[xezim_spike_dpi] elf loaded; entry=0x%llx\n",
-                             (unsigned long long)entry);
+                             "[xezim_spike_dpi] elf loaded; entry=0x%llx xlen=%u\n",
+                             (unsigned long long)entry,
+                             s->proc->get_xlen());
             } catch (const std::exception& e) {
                 std::fprintf(stderr,
                              "[xezim_spike_dpi] elf load failed: %s\n", e.what());
