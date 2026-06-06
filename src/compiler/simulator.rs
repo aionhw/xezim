@@ -18102,6 +18102,17 @@ impl Simulator {
                             }
                             return;
                         }
+                        // Bare `cg c1 = new;` — same handle-as-u32 form as
+                        // classes, just routed through the covergroup heap so
+                        // sample_covergroup / instantiate_covergroup wire up.
+                        if let Some(cg_def) = self.module.covergroups.get(&tname).cloned() {
+                            let handle = self.instantiate_covergroup(&cg_def, &[]);
+                            self.assign_value(lvalue, &handle.resize(w));
+                            if !self.in_edge_block {
+                                self.settle_combinatorial();
+                            }
+                            return;
+                        }
                     }
                 }
                 let val = if let ExprKind::Call { func, args } = &rvalue.kind {
@@ -24777,11 +24788,21 @@ impl Simulator {
                     }
                 }
                 CovergroupItem::Cross(cr) => {
+                    // Cross items name COVERPOINTS, not signals — resolve each
+                    // to its coverpoint's expression in this covergroup and
+                    // eval, so the tuple captures the actual sampled values.
                     let mut tuple = Vec::new();
                     for id in &cr.items {
-                        // Resolve each item in cross
-                        let name = id.name.clone();
-                        let val = self.lookup_signal_value(&name).unwrap_or(Value::zero(1));
+                        let mut val = Value::zero(1);
+                        for it in &def.items {
+                            if let CovergroupItem::Coverpoint(cp) = it {
+                                let cp_name = cp.name.as_ref().map(|n| n.name.as_str());
+                                if cp_name == Some(id.name.as_str()) {
+                                    val = self.eval_expr(&cp.expr);
+                                    break;
+                                }
+                            }
+                        }
                         tuple.push(val);
                     }
                     let cr_name = cr.name.as_ref().map(|n| n.name.clone()).unwrap_or_else(|| {
