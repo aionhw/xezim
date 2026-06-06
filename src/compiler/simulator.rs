@@ -59,6 +59,26 @@ fn configured_dpi_libs() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Escape a string for embedding inside a JSON `"..."` literal — covers the
+/// minimum set of control / structural characters so the coverage-DB output
+/// stays valid JSON for covergroup / coverpoint names that include `"` or
+/// `\`.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn cached_env_flag(name: &'static str, slot: &'static OnceLock<bool>) -> bool {
     *slot.get_or_init(|| std::env::var(name).ok().as_deref() == Some("1"))
 }
@@ -965,6 +985,21 @@ struct CovergroupInstance {
     point_hits: HashMap<String, HashSet<Value>>,
     /// Cross hits: cross_name -> Set of observed tuples
     cross_hits: HashMap<String, HashSet<Vec<Value>>>,
+    /// Total `sample()` invocations on this instance.
+    sample_count: u64,
+}
+
+/// Per-source-location running tally for `assert` / `assume` / `cover` (the
+/// immediate-assertion forms). Keyed by `Statement.span.start` so each
+/// distinct source position is tracked once across all executions.
+#[derive(Debug, Clone, Copy, Default)]
+struct AssertionStat {
+    /// "assert" / "assume" / "cover" — one of three kinds
+    kind: u8,
+    /// Times the predicate evaluated true (`cover` calls these "hits").
+    pass_count: u64,
+    /// Times the predicate evaluated false (`cover` ignores).
+    fail_count: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1306,6 +1341,12 @@ pub struct Simulator {
     semaphores: HashMap<usize, i64>,
     /// Covergroup instance heap (index 0 is null).
     cg_heap: Vec<Option<CovergroupInstance>>,
+    /// Running tallies for every distinct `assert`/`assume`/`cover` source
+    /// location. Keyed by the statement's `span.start` byte offset so a
+    /// single source line aggregates across all dynamic executions.
+    /// Emitted at end-of-sim under `[COV] assertion summary` + (when
+    /// `XEZIM_COV_DB` is set) the JSON coverage database file.
+    assertion_stats: HashMap<usize, AssertionStat>,
     /// Call stack for tracking 'this' and local variables.
     this_stack: Vec<Option<usize>>,
     local_stack: Vec<HashMap<String, Value>>,
@@ -2403,6 +2444,7 @@ impl Simulator {
             mailboxes: HashMap::default(),
             semaphores: HashMap::default(),
             cg_heap: vec![None],
+            assertion_stats: HashMap::default(),
             this_stack: vec![],
             local_stack: vec![],
             class_context_stack: vec![],
@@ -11738,6 +11780,10 @@ impl Simulator {
             self.loop_iters,
             sim_elapsed.as_secs_f64() * 1e6 / self.loop_iters.max(1) as f64
         );
+        // Assertion + coverage summary (always when any data was recorded;
+        // dump the JSON database iff XEZIM_COV_DB=<path> is set, else default
+        // path xezim_cov.json when at least one stat exists).
+        self.emit_coverage_summary();
         if self.edge_block_stats_enabled {
             self.print_edge_block_stats();
         }
@@ -11745,6 +11791,114 @@ impl Simulator {
         // Activity monitor report
         if self.activity_mon {
             self.print_activity_report();
+        }
+    }
+
+    /// End-of-sim assertion + functional coverage report.
+    ///
+    /// Always emits a one-line `[COV]` summary when at least one assertion
+    /// site fired or one covergroup instance was sampled. When the env var
+    /// `XEZIM_COV_DB` is set (or the default `xezim_cov.json` path is
+    /// writable AND there is data to record), writes a JSON coverage
+    /// database with per-site assertion counts and per-coverpoint /
+    /// per-cross hit sets + sample totals.
+    fn emit_coverage_summary(&self) {
+        let n_assert_sites = self.assertion_stats.len();
+        let mut tot_pass = 0u64;
+        let mut tot_fail = 0u64;
+        let mut k_assert_sites = 0usize;
+        let mut k_assume_sites = 0usize;
+        let mut k_cover_sites = 0usize;
+        for s in self.assertion_stats.values() {
+            tot_pass += s.pass_count;
+            tot_fail += s.fail_count;
+            match s.kind {
+                0 => k_assert_sites += 1,
+                1 => k_assume_sites += 1,
+                _ => k_cover_sites += 1,
+            }
+        }
+        let n_cg_instances = self.cg_heap.iter().filter(|x| x.is_some()).count().saturating_sub(0);
+        let mut n_cp_bins_hit = 0usize;
+        let mut n_cross_tuples_hit = 0usize;
+        let mut tot_samples = 0u64;
+        for inst in self.cg_heap.iter().flatten() {
+            tot_samples += inst.sample_count;
+            for (_n, set) in &inst.point_hits { n_cp_bins_hit += set.len(); }
+            for (_n, set) in &inst.cross_hits { n_cross_tuples_hit += set.len(); }
+        }
+
+        if n_assert_sites == 0 && n_cg_instances == 0 {
+            return;
+        }
+        eprintln!(
+            "[COV] assertions: {} sites (assert={}, assume={}, cover={}) — \
+             {} passes, {} fails",
+            n_assert_sites, k_assert_sites, k_assume_sites, k_cover_sites,
+            tot_pass, tot_fail
+        );
+        eprintln!(
+            "[COV] coverage: {} covergroup instances, {} samples, \
+             {} unique coverpoint values, {} unique cross tuples",
+            n_cg_instances, tot_samples, n_cp_bins_hit, n_cross_tuples_hit
+        );
+
+        // Coverage DB: skip if no data; default path used only when there IS
+        // data (so unrelated runs don't drop files).
+        let db_path = std::env::var("XEZIM_COV_DB")
+            .unwrap_or_else(|_| "xezim_cov.json".to_string());
+        let mut json = String::new();
+        json.push_str("{\n");
+        json.push_str(&format!("  \"sim_time\": {},\n", self.time));
+        json.push_str(&format!("  \"assertion_sites\": {},\n", n_assert_sites));
+        json.push_str(&format!("  \"assertion_pass_total\": {},\n", tot_pass));
+        json.push_str(&format!("  \"assertion_fail_total\": {},\n", tot_fail));
+        json.push_str("  \"assertions\": [\n");
+        let mut sites: Vec<_> = self.assertion_stats.iter().collect();
+        sites.sort_by_key(|(k, _)| **k);
+        for (i, (off, st)) in sites.iter().enumerate() {
+            let kind = match st.kind { 0 => "assert", 1 => "assume", _ => "cover" };
+            json.push_str(&format!(
+                "    {{\"span_start\": {}, \"kind\": \"{}\", \"pass\": {}, \"fail\": {}}}{}\n",
+                off, kind, st.pass_count, st.fail_count,
+                if i + 1 < sites.len() { "," } else { "" }
+            ));
+        }
+        json.push_str("  ],\n");
+        json.push_str("  \"covergroups\": [\n");
+        let mut cg_items: Vec<&CovergroupInstance> = self.cg_heap.iter().flatten().collect();
+        // Keep input order; the cg_heap index IS the instance handle.
+        let _ = &mut cg_items;
+        for (i, inst) in cg_items.iter().enumerate() {
+            json.push_str(&format!(
+                "    {{\"name\": \"{}\", \"samples\": {}, \"coverpoints\": {{",
+                json_escape(&inst.cg_name), inst.sample_count
+            ));
+            let mut cp_iter = inst.point_hits.iter().peekable();
+            while let Some((name, set)) = cp_iter.next() {
+                json.push_str(&format!(
+                    "\"{}\": {}{}",
+                    json_escape(name), set.len(),
+                    if cp_iter.peek().is_some() { ", " } else { "" }
+                ));
+            }
+            json.push_str("}, \"crosses\": {");
+            let mut cr_iter = inst.cross_hits.iter().peekable();
+            while let Some((name, set)) = cr_iter.next() {
+                json.push_str(&format!(
+                    "\"{}\": {}{}",
+                    json_escape(name), set.len(),
+                    if cr_iter.peek().is_some() { ", " } else { "" }
+                ));
+            }
+            json.push_str("}}");
+            if i + 1 < cg_items.len() { json.push(','); }
+            json.push('\n');
+        }
+        json.push_str("  ]\n}\n");
+        match std::fs::write(&db_path, &json) {
+            Ok(()) => eprintln!("[COV] wrote coverage DB to {}", db_path),
+            Err(e) => eprintln!("[COV] warning: could not write {}: {}", db_path, e),
         }
     }
 
@@ -18982,7 +19136,23 @@ impl Simulator {
                 }
             }
             StatementKind::Assertion(a) => {
-                if !self.eval_expr(&a.expr).is_true() {
+                use crate::ast::stmt::AssertionKind;
+                let true_branch = self.eval_expr(&a.expr).is_true();
+                // Track per-site tallies for end-of-sim summary + JSON DB.
+                let kind_tag: u8 = match a.kind {
+                    AssertionKind::Assert => 0,
+                    AssertionKind::Assume => 1,
+                    AssertionKind::Cover  => 2,
+                };
+                let entry = self.assertion_stats
+                    .entry(a.span.start)
+                    .or_insert(AssertionStat { kind: kind_tag, pass_count: 0, fail_count: 0 });
+                if true_branch {
+                    entry.pass_count += 1;
+                } else {
+                    entry.fail_count += 1;
+                }
+                if !true_branch {
                     if let Some(ea) = &a.else_action {
                         self.exec_statement(ea);
                     }
@@ -24476,6 +24646,7 @@ impl Simulator {
             cg_name: cg_def.name.name.clone(),
             point_hits: HashMap::default(),
             cross_hits: HashMap::default(),
+            sample_count: 0,
         };
         self.cg_heap.push(Some(instance));
 
@@ -24581,6 +24752,10 @@ impl Simulator {
         } else {
             return;
         };
+        // Per-instance sample tally — feeds the end-of-sim coverage DB.
+        if let Some(Some(inst)) = self.cg_heap.get_mut(handle) {
+            inst.sample_count += 1;
+        }
 
         let def = if let Some(d) = self.module.covergroups.get(&cg_name).cloned() {
             d
