@@ -25,6 +25,8 @@
   #include <riscv/cfg.h>
   #include <riscv/devices.h>
   #include <riscv/debug_module.h>
+  #include <fesvr/elfloader.h>
+  #include <fesvr/memif.h>
 #endif
 
 namespace {
@@ -122,13 +124,30 @@ int xezim_spike_init(const char* elf_path, const char* isa, const char* priv) {
             /*cmd_file=*/nullptr,
             /*instruction_limit=*/std::nullopt
         );
-        // sim_t inherits from htif_t. Calling start() resets the harts,
-        // loads the ELF passed via args[] into memory, and sets the
-        // entry PC. Without this, step() runs the bootrom from 0x1000.
-        s->sim->start();
         s->proc = s->sim->get_core(static_cast<size_t>(0));
-        s->initialised = (s->proc != nullptr);
-        return s->initialised ? 0 : 1;
+        if (!s->proc) return 1;
+
+        // Skip Spike's bootrom path entirely: load the ELF directly into
+        // memory via fesvr's elfloader, then point the processor at the
+        // ELF entry. This avoids the bootrom-config + memory-map dance
+        // that `sim->start()` requires.
+        if (!s->elf.empty()) {
+            try {
+                reg_t entry = 0;
+                load_elf(s->elf.c_str(), &s->sim->memif(), &entry, 0);
+                s->proc->get_state()->pc = entry;
+                std::fprintf(stderr,
+                             "[xezim_spike_dpi] elf loaded; entry=0x%llx\n",
+                             (unsigned long long)entry);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr,
+                             "[xezim_spike_dpi] elf load failed: %s\n", e.what());
+                return 3;
+            }
+        }
+
+        s->initialised = true;
+        return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr,
                      "[xezim_spike_dpi] init exception: %s\n", e.what());
