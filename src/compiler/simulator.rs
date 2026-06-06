@@ -21039,6 +21039,55 @@ impl Simulator {
         }
         self.signals.get(name)
     }
+
+    // ---- assertion + coverage accessors (for regression tests + tools) ----
+
+    /// Number of distinct source positions that fired an immediate
+    /// `assert` / `assume` / `cover` at least once.
+    pub fn assertion_site_count(&self) -> usize {
+        self.assertion_stats.len()
+    }
+    /// Total pass count across all assertion sites.
+    pub fn assertion_pass_total(&self) -> u64 {
+        self.assertion_stats.values().map(|s| s.pass_count).sum()
+    }
+    /// Total fail count across all assertion sites.
+    pub fn assertion_fail_total(&self) -> u64 {
+        self.assertion_stats.values().map(|s| s.fail_count).sum()
+    }
+    /// Number of allocated covergroup instances (index 0 is the null
+    /// sentinel; skipped here).
+    pub fn covergroup_instance_count(&self) -> usize {
+        self.cg_heap.iter().skip(1).filter(|x| x.is_some()).count()
+    }
+    /// Total `sample()` invocations across every covergroup instance.
+    pub fn covergroup_sample_total(&self) -> u64 {
+        self.cg_heap.iter().flatten().map(|i| i.sample_count).sum()
+    }
+    /// Hit cardinality for a named coverpoint on the first instance whose
+    /// covergroup matches `cg_name`. Returns 0 if none found.
+    pub fn coverpoint_hits(&self, cg_name: &str, cp_name: &str) -> usize {
+        for inst in self.cg_heap.iter().flatten() {
+            if inst.cg_name == cg_name {
+                if let Some(set) = inst.point_hits.get(cp_name) {
+                    return set.len();
+                }
+            }
+        }
+        0
+    }
+    /// Cross-tuple cardinality for a named cross on the first matching
+    /// covergroup instance.
+    pub fn cross_hits(&self, cg_name: &str, cr_name: &str) -> usize {
+        for inst in self.cg_heap.iter().flatten() {
+            if inst.cg_name == cg_name {
+                if let Some(set) = inst.cross_hits.get(cr_name) {
+                    return set.len();
+                }
+            }
+        }
+        0
+    }
     pub fn set_signal(&mut self, name: &str, val: Value) {
         if let Some(&id) = self.signal_name_to_id.get(name) {
             let w = self.signal_widths[id];
