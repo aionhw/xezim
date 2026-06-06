@@ -167,6 +167,48 @@ fn preprocess_sources(
     Ok(preprocessed)
 }
 
+/// Expand `$VAR` and `${VAR}` style references against the process
+/// environment. Unknown variables expand to empty (matching the typical
+/// VCS / Xcelium / Verilator behaviour on `-f` filelists). Used so that
+/// command files like core-v-verif's `${DV_UVML_HRTBT_PATH}/pkg.flist`
+/// resolve without requiring callers to pre-substitute.
+fn expand_env_vars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() {
+            // ${NAME}
+            if bytes[i + 1] == b'{' {
+                if let Some(end) = s[i + 2..].find('}') {
+                    let name = &s[i + 2..i + 2 + end];
+                    if let Ok(v) = std::env::var(name) {
+                        out.push_str(&v);
+                    }
+                    i = i + 2 + end + 1;
+                    continue;
+                }
+            }
+            // $NAME (alphanumeric / underscore)
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j > i + 1 {
+                let name = &s[i + 1..j];
+                if let Ok(v) = std::env::var(name) {
+                    out.push_str(&v);
+                }
+                i = j;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 fn split_filelist_line(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -236,7 +278,10 @@ fn process_command_file(
                 continue;
             }
         }
-        let toks = split_filelist_line(line);
+        let toks: Vec<String> = split_filelist_line(line)
+            .into_iter()
+            .map(|t| expand_env_vars(&t))
+            .collect();
         if toks.is_empty() {
             continue;
         }
