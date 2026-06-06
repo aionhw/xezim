@@ -92,7 +92,14 @@ int xezim_spike_init(const char* elf_path, const char* isa, const char* priv) {
         s->cfg->mem_layout.emplace_back(Shim::MEM_BASE, Shim::MEM_SIZE);
         s->cfg->hartids = {0};
         s->cfg->explicit_hartids = true;
-        s->cfg->start_pc = 0; // typical cv32e40p reset vector lives at the ROM start
+        // Anchor PC to the start of main memory so an ELF whose text
+        // begins at 0x80000000 (cv32e40p convention) starts there.
+        // Adjustable via env XEZIM_SPIKE_ENTRY for other layouts.
+        if (const char* e = std::getenv("XEZIM_SPIKE_ENTRY")) {
+            s->cfg->start_pc = std::stoull(e, nullptr, 0);
+        } else {
+            s->cfg->start_pc = Shim::MEM_BASE;
+        }
 
         auto* ram = new mem_t(Shim::MEM_SIZE);
         s->mems.emplace_back(Shim::MEM_BASE, ram);
@@ -115,6 +122,10 @@ int xezim_spike_init(const char* elf_path, const char* isa, const char* priv) {
             /*cmd_file=*/nullptr,
             /*instruction_limit=*/std::nullopt
         );
+        // sim_t inherits from htif_t. Calling start() resets the harts,
+        // loads the ELF passed via args[] into memory, and sets the
+        // entry PC. Without this, step() runs the bootrom from 0x1000.
+        s->sim->start();
         s->proc = s->sim->get_core(static_cast<size_t>(0));
         s->initialised = (s->proc != nullptr);
         return s->initialised ? 0 : 1;
