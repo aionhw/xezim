@@ -12347,13 +12347,37 @@ impl Simulator {
         let saved_pid = self.current_pid;
         let saved_break = self.break_flag;
         loop {
-            let next = self.event_queue.next_time();
-            let nt = match next {
+            // Advance to the EARLIEST of: event_queue, clock_generators (so a
+            // `#10` from inside an initial block doesn't silently jump over
+            // clock toggles — without this, always_ff sensitive to those
+            // clocks stops firing for the rest of the delay window).
+            let next_eq = self.event_queue.next_time();
+            let next_clk = self
+                .clock_generators
+                .iter()
+                .map(|c| c.next_toggle_time)
+                .min();
+            let nt_opt = match (next_eq, next_clk) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            let nt = match nt_opt {
                 Some(t) if t <= target => t,
                 _ => break,
             };
             if nt > self.time {
                 self.time = nt;
+            }
+            // Fire any clock generators whose next_toggle_time matches.
+            let fired_clock = self
+                .clock_generators
+                .iter()
+                .any(|c| c.next_toggle_time == self.time);
+            if fired_clock {
+                self.fire_clock_generators();
+                self.dirty_any = true;
             }
             let processes = self.event_queue.remove(self.time);
             for (pid, stmts) in processes {
@@ -12370,6 +12394,14 @@ impl Simulator {
             }
             if self.dirty_any {
                 self.settle_combinatorial();
+            }
+            // After advancing time and firing clocks, check for edge
+            // triggers so always_ff blocks sensitive to the clock fire
+            // within this delay window.
+            if fired_clock {
+                self.check_edges();
+                let _ = self.drain_edge_cascade(self.cascade_limit);
+                self.snapshot_edge_signals();
             }
         }
         self.current_pid = saved_pid;
