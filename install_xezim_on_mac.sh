@@ -3,8 +3,8 @@
 #  xezim — Full Install & Build Script for macOS Intel (i7)
 #  
 #  Usage:
-#    chmod +x install_xezim.sh
-#    ./install_xezim.sh
+#    chmod +x install_xezim_on_mac.sh
+#    ./install_xezim_on_mac.sh
 #
 #  What this does:
 #    1. Installs Xcode CLI tools (if missing)
