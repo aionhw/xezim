@@ -7693,6 +7693,7 @@ impl Simulator {
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
             compiler.set_params(&self.module.parameters);
+            compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
             compiler.top_module_name = Some(self.module.name.clone());
             if compiler.compile_stmt(&block.stmt) {
                 let cb = compiler.finish();
@@ -9763,6 +9764,7 @@ impl Simulator {
                 );
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
+                compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 compiler.top_module_name = Some(self.module.name.clone());
                 if compiler.compile_cont_assign(&ca.rhs, dst_id, width) {
                     CombItem::CompiledContAssign {
@@ -9813,6 +9815,7 @@ impl Simulator {
                 );
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
+                compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 compiler.top_module_name = Some(self.module.name.clone());
                 let lhs_w = compiler.infer_lhs_width_pub(&ca.lhs);
                 if lhs_w > 0 && compiler.compile_cont_assign_lhs(&ca.lhs, &ca.rhs, lhs_w) {
@@ -10018,6 +10021,7 @@ impl Simulator {
                     compiler.set_scope_hint(scope_hint.clone());
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_params(&self.module.parameters);
+                    compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.top_module_name = Some(self.module.name.clone());
                     // Enable AST fallback so partially-unsupported constructs
                     // compile to StmtFallback insns instead of failing the
@@ -15861,6 +15865,363 @@ impl Simulator {
                         self.mark_dirty_id(id);
                     }
                     return changed;
+                }
+                // Fall-through for LHS range-select on storage NOT backed by
+                // signal_table — local-stack vars (`logic [3:0] r; r[3:0] = ...`
+                // inside an initial/task), this.<prop> instance fields, and
+                // module signals only in the slow-path `signals` HashMap.
+                // Without these branches `is_equal[3:0] = {4{...}}` in
+                // cv32e40p_alu would silently no-op and leave is_equal at X,
+                // breaking BLT → traps → infinite handler loop on every
+                // compliance test.
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    // Class instance field / packed struct field via flattened
+                    // hier path: `h.field[msb:lsb]` and `s.field[msb:lsb]` both
+                    // parse as Ident([root, field]) + RangeSelect.
+                    if hier.path.len() == 2 {
+                        let root = hier.path[0].name.name.clone();
+                        let fname = hier.path[1].name.name.clone();
+                        // (b) Packed struct: slice into the parent signal at
+                        //     `packed_struct_fields[root] → (fname, off, w)`.
+                        if let Some(fields) = self
+                            .module
+                            .packed_struct_fields
+                            .get(&root)
+                            .cloned()
+                        {
+                            if let Some((_, field_off, field_w)) = fields
+                                .iter()
+                                .find(|(m, _, _)| m == &fname)
+                                .cloned()
+                            {
+                                if let Some(&id) =
+                                    self.signal_name_to_id.get(root.as_str())
+                                {
+                                    let total_w = self.signal_widths[id] as usize;
+                                    let lo = (field_off as usize) + lsb;
+                                    let hi = (field_off as usize)
+                                        + msb.min((field_w as usize).saturating_sub(1));
+                                    if hi < total_w {
+                                        let mut cur = self.signal_table[id].clone();
+                                        let mut changed = false;
+                                        for i in lo..=hi {
+                                            let nb = val.get_bit(i - lo);
+                                            if cur.get_bit(i) != nb {
+                                                cur.set_bit(i, nb);
+                                                changed = true;
+                                            }
+                                        }
+                                        if changed {
+                                            self.signal_table[id] = cur;
+                                            self.table_modified = true;
+                                            self.after_signal_write(id);
+                                            self.mark_dirty(&root);
+                                        }
+                                        return changed;
+                                    }
+                                }
+                                if let Some(cur_sig) = self.signals.get(&root).cloned() {
+                                    let total_w = cur_sig.width as usize;
+                                    let lo = (field_off as usize) + lsb;
+                                    let hi = (field_off as usize)
+                                        + msb.min((field_w as usize).saturating_sub(1));
+                                    if hi < total_w {
+                                        let mut nv = cur_sig.clone();
+                                        let mut changed = false;
+                                        for i in lo..=hi {
+                                            let nb = val.get_bit(i - lo);
+                                            if nv.get_bit(i) != nb {
+                                                nv.set_bit(i, nb);
+                                                changed = true;
+                                            }
+                                        }
+                                        if changed {
+                                            self.signals.insert(root.clone(), nv);
+                                            self.mark_dirty(&root);
+                                        }
+                                        return changed;
+                                    }
+                                }
+                            }
+                        }
+                        // Resolve `root` to a handle from any storage class.
+                        let root_handle: Option<usize> = {
+                            let from_local = self.local_stack.last()
+                                .and_then(|m| m.get(&root))
+                                .and_then(|v| v.to_u64())
+                                .map(|h| h as usize)
+                                .filter(|&h| h != 0);
+                            let from_this = self.this_stack.last().copied().flatten()
+                                .and_then(|h| self.heap.get(h))
+                                .and_then(|o| o.as_ref())
+                                .and_then(|i| i.properties.get(&root))
+                                .and_then(|v| v.to_u64())
+                                .map(|h| h as usize)
+                                .filter(|&h| h != 0);
+                            let from_sig = self.signals.get(&root)
+                                .and_then(|v| v.to_u64())
+                                .map(|h| h as usize)
+                                .filter(|&h| h != 0);
+                            let from_table = self.signal_name_to_id.get(root.as_str())
+                                .and_then(|&id| self.signal_table.get(id))
+                                .and_then(|v| v.to_u64())
+                                .map(|h| h as usize)
+                                .filter(|&h| h != 0);
+                            from_local.or(from_this).or(from_sig).or(from_table)
+                        };
+                        if let Some(handle) = root_handle {
+                            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                                if let Some(cur) = inst.properties.get(&fname).cloned() {
+                                    let width = cur.width as usize;
+                                    let mut nv = cur.clone();
+                                    let mut changed = false;
+                                    for i in lsb..=msb.min(width.saturating_sub(1)) {
+                                        let nb = val.get_bit(i - lsb);
+                                        if nv.get_bit(i) != nb {
+                                            nv.set_bit(i, nb);
+                                            changed = true;
+                                        }
+                                    }
+                                    if changed {
+                                        inst.properties.insert(fname, nv);
+                                    }
+                                    return changed;
+                                }
+                            }
+                        }
+                    }
+                    if hier.path.len() == 1 {
+                        let bare = hier.path[0].name.name.clone();
+                        // local_stack frame
+                        if !self.local_stack.is_empty() {
+                            let last_idx = self.local_stack.len() - 1;
+                            if let Some(cur) = self.local_stack[last_idx].get(&bare).cloned() {
+                                let width = cur.width as usize;
+                                let mut nv = cur.clone();
+                                let mut changed = false;
+                                for i in lsb..=msb.min(width.saturating_sub(1)) {
+                                    let nb = val.get_bit(i - lsb);
+                                    if nv.get_bit(i) != nb {
+                                        nv.set_bit(i, nb);
+                                        changed = true;
+                                    }
+                                }
+                                if changed {
+                                    self.local_stack[last_idx].insert(bare.clone(), nv);
+                                }
+                                return changed;
+                            }
+                        }
+                        // this.<prop>
+                        if let Some(Some(handle)) = self.this_stack.last().copied() {
+                            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                                if let Some(cur) = inst.properties.get(&bare).cloned() {
+                                    let width = cur.width as usize;
+                                    let mut nv = cur.clone();
+                                    let mut changed = false;
+                                    for i in lsb..=msb.min(width.saturating_sub(1)) {
+                                        let nb = val.get_bit(i - lsb);
+                                        if nv.get_bit(i) != nb {
+                                            nv.set_bit(i, nb);
+                                            changed = true;
+                                        }
+                                    }
+                                    if changed {
+                                        inst.properties.insert(bare, nv);
+                                    }
+                                    return changed;
+                                }
+                            }
+                        }
+                    }
+                    // signals slow-path
+                    let name = self.resolve_hier_name(hier);
+                    if let Some(cur) = self.signals.get(&name).cloned() {
+                        let width = cur.width as usize;
+                        let mut nv = cur.clone();
+                        let mut changed = false;
+                        for i in lsb..=msb.min(width.saturating_sub(1)) {
+                            let nb = val.get_bit(i - lsb);
+                            if nv.get_bit(i) != nb {
+                                nv.set_bit(i, nb);
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            self.signals.insert(name.clone(), nv);
+                            self.mark_dirty(&name);
+                        }
+                        return changed;
+                    }
+                }
+                // MemberAccess base: `obj.field[msb:lsb]` or `s.field[msb:lsb]`.
+                // Two storage classes:
+                //   (a) `obj` is a class instance handle, `field` lives in
+                //       `heap[handle].properties` — bit-loop into the property
+                //       value.
+                //   (b) `s` is a packed struct whose backing signal exists in
+                //       signal_table / signals slow-path, and `field` is a
+                //       slice at `packed_struct_fields[s] → (field, off, w)` —
+                //       bit-loop into the parent signal at `off+lsb .. off+msb`.
+                if let ExprKind::MemberAccess { expr: base, member } = &expr.kind {
+                    // (a) class instance property.
+                    let handle_opt: Option<usize> = match &base.kind {
+                        ExprKind::This => self.this_stack.last().copied().flatten(),
+                        _ => {
+                            let v = self.eval_expr(base);
+                            v.to_u64().map(|h| h as usize).filter(|&h| h != 0)
+                        }
+                    };
+                    if let Some(handle) = handle_opt {
+                        let pname = member.name.clone();
+                        if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                            if let Some(cur) = inst.properties.get(&pname).cloned() {
+                                let width = cur.width as usize;
+                                let mut nv = cur.clone();
+                                let mut changed = false;
+                                for i in lsb..=msb.min(width.saturating_sub(1)) {
+                                    let nb = val.get_bit(i - lsb);
+                                    if nv.get_bit(i) != nb {
+                                        nv.set_bit(i, nb);
+                                        changed = true;
+                                    }
+                                }
+                                if changed {
+                                    inst.properties.insert(pname, nv);
+                                }
+                                return changed;
+                            }
+                        }
+                    }
+                    // (b) packed struct field.
+                    if let ExprKind::Ident(bh) = &base.kind {
+                        let base_name = self.resolve_hier_name(bh);
+                        if let Some(fields) = self
+                            .module
+                            .packed_struct_fields
+                            .get(&base_name)
+                            .cloned()
+                        {
+                            if let Some((_, field_off, field_w)) = fields
+                                .iter()
+                                .find(|(m, _, _)| m == &member.name)
+                                .cloned()
+                            {
+                                // signal_table path
+                                if let Some(&id) =
+                                    self.signal_name_to_id.get(base_name.as_str())
+                                {
+                                    let total_w = self.signal_widths[id] as usize;
+                                    let lo = (field_off as usize) + lsb;
+                                    let hi = (field_off as usize)
+                                        + msb.min((field_w as usize).saturating_sub(1));
+                                    if hi < total_w {
+                                        let mut changed = false;
+                                        let mut cur = self.signal_table[id].clone();
+                                        for i in lo..=hi {
+                                            let nb = val.get_bit(i - lo);
+                                            if cur.get_bit(i) != nb {
+                                                cur.set_bit(i, nb);
+                                                changed = true;
+                                            }
+                                        }
+                                        if changed {
+                                            self.signal_table[id] = cur;
+                                            self.table_modified = true;
+                                            self.after_signal_write(id);
+                                            self.mark_dirty(&base_name);
+                                        }
+                                        return changed;
+                                    }
+                                }
+                                // signals slow-path
+                                if let Some(cur_sig) =
+                                    self.signals.get(&base_name).cloned()
+                                {
+                                    let total_w = cur_sig.width as usize;
+                                    let lo = (field_off as usize) + lsb;
+                                    let hi = (field_off as usize)
+                                        + msb.min((field_w as usize).saturating_sub(1));
+                                    if hi < total_w {
+                                        let mut nv = cur_sig.clone();
+                                        let mut changed = false;
+                                        for i in lo..=hi {
+                                            let nb = val.get_bit(i - lo);
+                                            if nv.get_bit(i) != nb {
+                                                nv.set_bit(i, nb);
+                                                changed = true;
+                                            }
+                                        }
+                                        if changed {
+                                            self.signals.insert(base_name.clone(), nv);
+                                            self.mark_dirty(&base_name);
+                                        }
+                                        return changed;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Index base: `mat[i][msb:lsb]` for a packed multi-D vector
+                // whose elements are elem_w bits each (registered in
+                // `packed_signal_elem_widths`). Compute the slice offset
+                // into the flat parent signal: `i*elem_w + lsb`.
+                if let ExprKind::Index { expr: arr_expr, index } = &expr.kind {
+                    if let ExprKind::Ident(ah) = &arr_expr.kind {
+                        let arr_name = self.resolve_hier_name(ah);
+                        if let Some(&elem_w) =
+                            self.module.packed_signal_elem_widths.get(&arr_name)
+                        {
+                            let idx = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
+                            let base_off = idx * (elem_w as usize);
+                            let lo = base_off + lsb;
+                            let hi = base_off
+                                + msb.min((elem_w as usize).saturating_sub(1));
+                            if let Some(&id) =
+                                self.signal_name_to_id.get(arr_name.as_str())
+                            {
+                                let total_w = self.signal_widths[id] as usize;
+                                if hi < total_w {
+                                    let mut changed = false;
+                                    let mut cur = self.signal_table[id].clone();
+                                    for i in lo..=hi {
+                                        let nb = val.get_bit(i - lo);
+                                        if cur.get_bit(i) != nb {
+                                            cur.set_bit(i, nb);
+                                            changed = true;
+                                        }
+                                    }
+                                    if changed {
+                                        self.signal_table[id] = cur;
+                                        self.table_modified = true;
+                                        self.after_signal_write(id);
+                                        self.mark_dirty(&arr_name);
+                                    }
+                                    return changed;
+                                }
+                            }
+                            if let Some(cur_sig) = self.signals.get(&arr_name).cloned() {
+                                let total_w = cur_sig.width as usize;
+                                if hi < total_w {
+                                    let mut nv = cur_sig.clone();
+                                    let mut changed = false;
+                                    for i in lo..=hi {
+                                        let nb = val.get_bit(i - lo);
+                                        if nv.get_bit(i) != nb {
+                                            nv.set_bit(i, nb);
+                                            changed = true;
+                                        }
+                                    }
+                                    if changed {
+                                        self.signals.insert(arr_name.clone(), nv);
+                                        self.mark_dirty(&arr_name);
+                                    }
+                                    return changed;
+                                }
+                            }
+                        }
+                    }
                 }
                 false
             }

@@ -195,6 +195,13 @@ pub struct BytecodeCompiler<'a> {
     /// `lookup_signal_id` strips this prefix before re-trying the lookup
     /// to recover from those baked-in absolute paths.
     pub top_module_name: Option<String>,
+    /// Per-signal packed-element width for multi-D packed vectors
+    /// (e.g. `logic [3:0][7:0] x` → elem_w=8). Used by `compile_blocking_target`
+    /// so that `x[i] = v` emits a 8-bit slice write at `i*8 +: 8` instead of
+    /// the default bit-select-write (`BlockingAssignBitDyn`) which only sets
+    /// bit `i` and silently drops the upper bits. Set via
+    /// `set_packed_elem_widths`.
+    packed_elem_widths: Option<&'a HashMap<String, u32>>,
 }
 
 impl<'a> BytecodeCompiler<'a> {
@@ -222,11 +229,16 @@ impl<'a> BytecodeCompiler<'a> {
             tasks_inlined: 0,
             params: None,
             top_module_name: None,
+            packed_elem_widths: None,
         }
     }
 
     pub fn set_params(&mut self, params: &'a HashMap<String, Value>) {
         self.params = Some(params);
+    }
+
+    pub fn set_packed_elem_widths(&mut self, w: &'a HashMap<String, u32>) {
+        self.packed_elem_widths = Some(w);
     }
 
     pub fn set_ast_fallback(&mut self, allow: bool) {
@@ -1051,6 +1063,41 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit(Insn::LoadArrayElem(dest, Box::new(name), idx_reg));
                         return Some(dest);
                     }
+                    // Packed multi-D READ: `mem_q[i]` for `logic [N-1:0][W-1:0]`
+                    // must extract a W-bit slice at `i*W +: W`, not a single
+                    // bit. Mirror the LHS variable-index slice path so reads
+                    // and writes stay symmetric.
+                    let raw = Self::hier_raw_name(hier);
+                    let elem_w = self.packed_elem_widths.and_then(|m| {
+                        m.get(raw.as_str())
+                            .copied()
+                            .or_else(|| {
+                                hier.path
+                                    .last()
+                                    .and_then(|s| m.get(s.name.name.as_str()).copied())
+                            })
+                    }).filter(|&w| w > 1);
+                    if let Some(elem_w) = elem_w {
+                        let base = self.compile_expr(expr, 0)?;
+                        let idx_reg = self.compile_expr(index, 0)?;
+                        let elem_w_reg = self.alloc_reg();
+                        self.emit(Insn::LoadConst(
+                            elem_w_reg,
+                            Box::new(Value::from_u64(elem_w as u64, 32)),
+                        ));
+                        let lo_reg = self.alloc_reg();
+                        self.emit(Insn::Mul(lo_reg, idx_reg, elem_w_reg));
+                        let em1_reg = self.alloc_reg();
+                        self.emit(Insn::LoadConst(
+                            em1_reg,
+                            Box::new(Value::from_u64((elem_w - 1) as u64, 32)),
+                        ));
+                        let hi_reg = self.alloc_reg();
+                        self.emit(Insn::Add(hi_reg, lo_reg, em1_reg));
+                        let dest = self.alloc_reg();
+                        self.emit(Insn::RangeSelect(dest, base, hi_reg, lo_reg));
+                        return Some(dest);
+                    }
                 }
                 // Bit select
                 let base = self.compile_expr(expr, 0)?;
@@ -1222,6 +1269,38 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                     if let Some(id) = self.lookup_signal_id(hier) {
+                        // Packed multi-D NBA: `mem[i] <= data` must write the
+                        // W-bit slice at `i*W +: W`. Mirrors compile_blocking_target.
+                        let raw = Self::hier_raw_name(hier);
+                        let elem_w = self.packed_elem_widths.and_then(|m| {
+                            m.get(raw.as_str())
+                                .copied()
+                                .or_else(|| {
+                                    hier.path
+                                        .last()
+                                        .and_then(|s| m.get(s.name.name.as_str()).copied())
+                                })
+                        }).filter(|&w| w > 1);
+                        if let Some(elem_w) = elem_w {
+                            if let Some(idx_reg) = self.compile_expr(index, 0) {
+                                let elem_w_reg = self.alloc_reg();
+                                self.emit(Insn::LoadConst(
+                                    elem_w_reg,
+                                    Box::new(Value::from_u64(elem_w as u64, 32)),
+                                ));
+                                let lo_reg = self.alloc_reg();
+                                self.emit(Insn::Mul(lo_reg, idx_reg, elem_w_reg));
+                                let em1_reg = self.alloc_reg();
+                                self.emit(Insn::LoadConst(
+                                    em1_reg,
+                                    Box::new(Value::from_u64((elem_w - 1) as u64, 32)),
+                                ));
+                                let hi_reg = self.alloc_reg();
+                                self.emit(Insn::Add(hi_reg, lo_reg, em1_reg));
+                                self.emit(Insn::NbaAssignRangeDyn(id, hi_reg, lo_reg, val_reg));
+                                return true;
+                            }
+                        }
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
                             self.emit(Insn::NbaAssignBitDyn(id, idx_reg, val_reg));
                             return true;
@@ -1447,6 +1526,44 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                     if let Some(id) = self.lookup_signal_id(hier) {
+                        // Packed multi-D LHS: `mem_n[i] = data_i` for
+                        // `logic [N-1:0][W-1:0] mem_n` must write a W-bit
+                        // slice at `i*W +: W`, not a single bit. Emit a
+                        // RangeDyn write of `(i*W+W-1):(i*W)` instead.
+                        let raw = Self::hier_raw_name(hier);
+                        let elem_w = self.packed_elem_widths.and_then(|m| {
+                            m.get(raw.as_str())
+                                .copied()
+                                .or_else(|| {
+                                    hier.path
+                                        .last()
+                                        .and_then(|s| m.get(s.name.name.as_str()).copied())
+                                })
+                        }).filter(|&w| w > 1);
+                        if let Some(elem_w) = elem_w {
+                            if let Some(idx_reg) = self.compile_expr(index, 0) {
+                                // lo = idx * elem_w
+                                let elem_w_reg = self.alloc_reg();
+                                self.emit(Insn::LoadConst(
+                                    elem_w_reg,
+                                    Box::new(Value::from_u64(elem_w as u64, 32)),
+                                ));
+                                let lo_reg = self.alloc_reg();
+                                self.emit(Insn::Mul(lo_reg, idx_reg, elem_w_reg));
+                                // hi = lo + elem_w - 1
+                                let em1_reg = self.alloc_reg();
+                                self.emit(Insn::LoadConst(
+                                    em1_reg,
+                                    Box::new(Value::from_u64((elem_w - 1) as u64, 32)),
+                                ));
+                                let hi_reg = self.alloc_reg();
+                                self.emit(Insn::Add(hi_reg, lo_reg, em1_reg));
+                                self.emit(Insn::BlockingAssignRangeDyn(
+                                    id, hi_reg, lo_reg, val_reg,
+                                ));
+                                return true;
+                            }
+                        }
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
                             self.emit(Insn::BlockingAssignBitDyn(id, idx_reg, val_reg));
                             return true;
@@ -1694,7 +1811,19 @@ impl<'a> BytecodeCompiler<'a> {
                     if let Some((_, _, elem_w)) = self.arrays.get(&raw) {
                         return *elem_w;
                     }
-                    // Not an array — it's a bit-select on a packed signal; width = 1.
+                    // Packed multi-D vector: element is N bits, not 1.
+                    if let Some(elem_w) = self.packed_elem_widths.and_then(|m| {
+                        m.get(raw.as_str())
+                            .copied()
+                            .or_else(|| {
+                                hier.path
+                                    .last()
+                                    .and_then(|s| m.get(s.name.name.as_str()).copied())
+                            })
+                    }) {
+                        if elem_w > 1 { return elem_w; }
+                    }
+                    // Not an array — bit-select on a plain packed signal; width = 1.
                     1
                 } else { 32 }
             }
