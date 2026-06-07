@@ -12347,28 +12347,34 @@ impl Simulator {
         let saved_pid = self.current_pid;
         let saved_break = self.break_flag;
         loop {
-            // Advance to the EARLIEST of: event_queue, clock_generators (so a
-            // `#10` from inside an initial block doesn't silently jump over
-            // clock toggles — without this, always_ff sensitive to those
-            // clocks stops firing for the rest of the delay window).
+            // Advance to the EARLIEST of: event_queue, clock_generators,
+            // and delayed-update queue (so a `#10` from inside an initial
+            // block doesn't silently jump over clock toggles OR inertial /
+            // SDF / `assign #N` delayed commits — LRM §4.4.2 + §10.4.2).
             let next_eq = self.event_queue.next_time();
             let next_clk = self
                 .clock_generators
                 .iter()
                 .map(|c| c.next_toggle_time)
                 .min();
-            let nt_opt = match (next_eq, next_clk) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
+            let next_dly = self.next_delayed_time();
+            let nt_opt = [next_eq, next_clk, next_dly]
+                .into_iter()
+                .flatten()
+                .min();
             let nt = match nt_opt {
                 Some(t) if t <= target => t,
                 _ => break,
             };
             if nt > self.time {
                 self.time = nt;
+            }
+            // Commit delayed updates whose target time matches first —
+            // their values must be visible to clock-fire / process eval
+            // at this delta cycle.
+            let dly_applied = self.apply_delayed_updates();
+            if dly_applied {
+                self.dirty_any = true;
             }
             // Fire any clock generators whose next_toggle_time matches.
             let fired_clock = self
@@ -12395,10 +12401,10 @@ impl Simulator {
             if self.dirty_any {
                 self.settle_combinatorial();
             }
-            // After advancing time and firing clocks, check for edge
-            // triggers so always_ff blocks sensitive to the clock fire
-            // within this delay window.
-            if fired_clock {
+            // After advancing time and any clock/delay fires, check for
+            // edge triggers so always_ff blocks fire within this delay
+            // window, then re-snapshot for the next iter.
+            if fired_clock || dly_applied {
                 self.check_edges();
                 let _ = self.drain_edge_cascade(self.cascade_limit);
                 self.snapshot_edge_signals();
@@ -19840,14 +19846,36 @@ impl Simulator {
                         let _ = self.drain_edge_cascade(self.cascade_limit);
                         self.snapshot_edge_signals();
                         let target = self.time + delay;
-                        // Run scheduled continuations (other processes) whose fire
-                        // time falls inside this delay window so concurrent blocks
-                        // can advance while we're sleeping inside a task.
+                        // Run scheduled continuations (other processes,
+                        // clock toggles, delayed updates) whose fire time
+                        // falls inside this delay window so concurrent
+                        // blocks advance while we're sleeping in a task.
                         self.run_events_until(target);
                         if self.time < target {
                             self.time = target;
                         }
+                        // Full active→inactive→NBA traversal at the new
+                        // time, per LRM §4.4: a delayed update or clocked
+                        // block scheduled AT target itself must fire before
+                        // the sleeping process resumes.
+                        if self.apply_delayed_updates() {
+                            self.dirty_any = true;
+                        }
+                        if self
+                            .clock_generators
+                            .iter()
+                            .any(|c| c.next_toggle_time == self.time)
+                        {
+                            self.fire_clock_generators();
+                            self.dirty_any = true;
+                        }
+                        if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() {
+                            self.apply_nba();
+                        }
                         self.settle_combinatorial();
+                        self.check_edges();
+                        let _ = self.drain_edge_cascade(self.cascade_limit);
+                        self.snapshot_edge_signals();
                         self.check_monitor();
                     }
                     TimingControl::Event(e) => {
