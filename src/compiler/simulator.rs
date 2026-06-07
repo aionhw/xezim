@@ -17123,6 +17123,27 @@ impl Simulator {
                         if self.module.dynamic_arrays.contains(&name) {
                             self.dollar_bound.pop();
                         }
+                        // Fast path for 1-D arrays: compute signal_id directly
+                        // via `array_first_id`. Critical for LARGE arrays
+                        // (e.g. xezim_mem[0:4M]) where per-element names are
+                        // NOT registered in `signal_name_to_id` — the
+                        // string-keyed fallback below would return X for
+                        // every element, silently corrupting reads.
+                        if !self.is_associative_array(&name) {
+                            if let Some(&(first_id, lo, hi)) =
+                                self.array_first_id.get(name.as_str())
+                            {
+                                let idx = idx_val.to_u64().unwrap_or(0) as i64;
+                                if idx >= lo && idx <= hi {
+                                    let eid = first_id + (idx - lo) as usize;
+                                    let mut v = self.signal_table[eid].clone();
+                                    if self.signal_signed[eid] {
+                                        v.is_signed = true;
+                                    }
+                                    return v;
+                                }
+                            }
+                        }
                         let idx_str = if self.is_associative_array(&name) {
                             self.assoc_key_str(&name, &idx_val)
                         } else {
