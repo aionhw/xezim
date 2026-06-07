@@ -74,9 +74,10 @@ echo "Test      : $UVM_TEST_ARG"
 echo "Binary    : $XEZIM"
 
 exec "$XEZIM" $MODE \
-    --max-time 100000 \
+    --max-time 20000000 \
     -s uvmt_cv32e40p_tb \
     -DUVM_NO_DPI \
+    -DUVM \
     -I $UVM/src \
     -I $DV_UVMT_PATH \
     -I $RVCFG \
