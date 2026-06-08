@@ -1790,7 +1790,44 @@ pub struct Simulator {
 /// (large 1-D arrays have per-element entries skipped to save memory).
 static EMPTY_NAME: &str = "";
 
+#[derive(Clone, Debug)]
+pub struct SignalMetadata {
+    pub id: usize,
+    pub name: String,
+    pub width: u32,
+    pub is_signed: bool,
+    pub is_real: bool,
+    pub type_name: Option<String>,
+}
+
 impl Simulator {
+    pub fn top_module_name(&self) -> &str {
+        &self.module.name
+    }
+
+    pub fn signal_metadata(&self) -> Vec<SignalMetadata> {
+        let mut signals: Vec<_> = self
+            .id_to_name
+            .iter()
+            .enumerate()
+            .map(|(id, name)| SignalMetadata {
+                id,
+                name: name.to_string(),
+                width: self.signal_widths.get(id).copied().unwrap_or(1),
+                is_signed: self.signal_signed.get(id).copied().unwrap_or(false),
+                is_real: self.signal_real.get(id).copied().unwrap_or(false),
+                type_name: self.signal_type_names.get(&id).cloned(),
+            })
+            .collect();
+
+        signals.sort_by(|a, b| a.name.cmp(&b.name));
+        signals
+    }
+
+    pub fn signal_value_by_id(&self, id: usize) -> Option<Value> {
+        self.signal_table.get(id).cloned()
+    }
+
     /// Safe accessor for `id_to_name`. Large-array element ids may sit
     /// past the end of `id_to_name` (we skip the per-element push to
     /// save ~528 MB on c910). Returns "" for unnamed ids; callers that

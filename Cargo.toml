@@ -45,6 +45,14 @@ tbb = []
 name = "xezim"
 path = "src/main.rs"
 
+[[bin]]
+name = "xezim-surfer-plugin"
+path = "src/bin/xezim-surfer-plugin.rs"
+
+[[bin]]
+name = "synthetic-surfer"
+path = "src/bin/synthetic-surfer.rs"
+
 [lib]
 name = "xezim"
 path = "src/lib.rs"

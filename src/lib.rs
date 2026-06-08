@@ -68,23 +68,14 @@ pub fn simulate_multi(
     multikernel_scope: Option<&str>,
 ) -> Result<compiler::Simulator, String> {
     let total_start = std::time::Instant::now();
-    let compilation_start = std::time::Instant::now();
-    let (definitions, elab) = parse_and_elaborate_multi(
+    let mut sim = compile_multi(
         sources,
+        max_time,
         top_module_name,
         include_dirs,
         source_paths,
         defines,
     )?;
-
-    // Drop the parsed-AST table now that elaborate has produced ElaboratedModule.
-    // Nothing downstream (Simulator::new, sim.run, SDF parse) needs it. Without
-    // this the AHashMap<String, SourceDefinition> (Rc<ModuleDeclaration> for
-    // ~hundreds of c910 modules) sits in RSS for the entire 3-min simulation.
-    // Measured: c910 hello peak 9.98 GB → ~8 GB after explicit drop.
-    drop(definitions);
-
-    let mut sim = compiler::Simulator::new(elab, max_time);
     if let Some(limit) = settle_limit {
         sim.settle_limit = limit;
     }
@@ -105,11 +96,6 @@ pub fn simulate_multi(
         let annotation = xezim_core::sdf::annotate_sdf(&sdf, sim_timescale, select);
         sim.sdf_annotation = Some(annotation);
     }
-    sim.compile();
-    eprintln!(
-        "[PHASE] compilation: {:.1}ms",
-        compilation_start.elapsed().as_secs_f64() * 1000.0
-    );
 
     if let Some(path) = emit_hypergraph {
         let t = std::time::Instant::now();
@@ -238,6 +224,39 @@ pub fn simulate_multi(
     );
     eprintln!("------------------------------");
     eprintln!("Simulation finished at time {}", sim.time);
+    Ok(sim)
+}
+
+pub fn compile_multi(
+    sources: &[String],
+    max_time: u64,
+    top_module_name: Option<&str>,
+    include_dirs: &[String],
+    source_paths: &[String],
+    defines: &[(String, Option<String>)],
+) -> Result<compiler::Simulator, String> {
+    let compilation_start = std::time::Instant::now();
+    let (definitions, elab) = parse_and_elaborate_multi(
+        sources,
+        top_module_name,
+        include_dirs,
+        source_paths,
+        defines,
+    )?;
+
+    // Drop the parsed-AST table now that elaborate has produced ElaboratedModule.
+    // Nothing downstream (Simulator::new, sim.run, SDF parse) needs it. Without
+    // this the AHashMap<String, SourceDefinition> (Rc<ModuleDeclaration> for
+    // ~hundreds of c910 modules) sits in RSS for the entire 3-min simulation.
+    // Measured: c910 hello peak 9.98 GB → ~8 GB after explicit drop.
+    drop(definitions);
+
+    let mut sim = compiler::Simulator::new(elab, max_time);
+    sim.compile();
+    eprintln!(
+        "[PHASE] compilation: {:.1}ms",
+        compilation_start.elapsed().as_secs_f64() * 1000.0
+    );
     Ok(sim)
 }
 
