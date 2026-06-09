@@ -1,6 +1,6 @@
 # xezim — SystemVerilog Simulator (Rust)
 
-**xezim** is a lightweight **SystemVerilog simulator written in Rust** designed for experimentation, learning, and exploring AI-assisted chip design workflows.
+**xezim** is a **SystemVerilog simulator written in Rust** designed for experimentation, learning, and exploring AI-assisted chip design workflows.
 
 > `xezim` was previously developed under the name `sisSIM`. The binary, library, and compiled-artifact magic were renamed in place; behavior is unchanged.
 
