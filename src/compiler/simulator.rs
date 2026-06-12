@@ -15922,6 +15922,39 @@ impl Simulator {
                         }
                     }
                 }
+                // Packed multi-D element bit-select write: `p2d[i][j] = bit`
+                // where `p2d` is `logic [..][W-1:0]`. The inner Index selects
+                // element i (a W-bit slice at bits [i*W +: W]); the outer index
+                // j selects bit j within it. Resolve to the flat bit offset
+                // i*W + j and write a single bit (LRM §7.4.1, §11.5.1). Without
+                // this the lvalue's `expr` is an Index (not an Ident), so the
+                // single-index path below is skipped and the write is lost.
+                if let ExprKind::Index { expr: inner_expr, index: outer_idx } = &expr.kind {
+                    if let ExprKind::Ident(hier) = &inner_expr.kind {
+                        let base = self.resolve_hier_name(hier);
+                        if let Some(&elem_w) = self.module.packed_signal_elem_widths.get(&base) {
+                            if let Some(&id) = self.signal_name_to_id.get(base.as_str()) {
+                                let total_w = self.signal_widths[id] as usize;
+                                let i = self.eval_expr(outer_idx).to_u64().unwrap_or(0) as usize;
+                                let j = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
+                                let lo = i * (elem_w as usize) + j;
+                                if lo < total_w {
+                                    let mut cur = self.signal_table[id].clone();
+                                    let prev = cur.clone();
+                                    cur.set_bit(lo, val.get_bit(0));
+                                    let changed = cur != prev;
+                                    if changed {
+                                        self.signal_table[id] = cur;
+                                        self.table_modified = true;
+                                        self.after_signal_write(id);
+                                        self.mark_dirty(&base);
+                                    }
+                                    return changed;
+                                }
+                            }
+                        }
+                    }
+                }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let mut name = self.resolve_hier_name(hier);
                     if let Some(scoped) = self.instance_assoc_member(&name) {
@@ -18152,6 +18185,28 @@ impl Simulator {
                     if let Some(arg) = args.first() {
                         if let ExprKind::Ident(hier) = &arg.kind {
                             let name = self.resolve_hier_name(hier);
+                            // Unpacked array: $bits = element_bits * product of
+                            // dimension sizes (IEEE 1800-2017 §20.6.2). The
+                            // signal's own Value holds only one element, so the
+                            // array shape must be consulted explicitly.
+                            if let Some(&(lo, hi, ew)) = self.module.arrays.get(&name) {
+                                let n = (hi - lo).unsigned_abs() + 1;
+                                return Value::from_u64(n * ew as u64, 32);
+                            }
+                            if let Some(&((a0, a1), (b0, b1), ew)) =
+                                self.module.arrays_2d.get(&name)
+                            {
+                                let n = ((a1 - a0).unsigned_abs() + 1)
+                                    * ((b1 - b0).unsigned_abs() + 1);
+                                return Value::from_u64(n * ew as u64, 32);
+                            }
+                            if let Some((shape, ew)) = self.module.arrays_nd.get(&name) {
+                                let n: u64 = shape
+                                    .iter()
+                                    .map(|(l, h)| (h - l).unsigned_abs() + 1)
+                                    .product();
+                                return Value::from_u64(n * *ew as u64, 32);
+                            }
                             if let Some(w) = self.module.typedefs.get(&name) {
                                 return Value::from_u64(*w as u64, 32);
                             }
