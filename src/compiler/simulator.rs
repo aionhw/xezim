@@ -27243,7 +27243,29 @@ impl Simulator {
                     if inner_member.name.as_str() == "type_id" {
                         if let ExprKind::Ident(hier) = &inner_expr.kind {
                             let class_name = &hier.path[0].name.name;
-                            let intercept = !real_uvm || !class_name.starts_with("uvm_");
+                            // The real UVM factory returns null for uvm_ classes
+                            // (per-specialization registry isn't modeled). For
+                            // uvm_component-derived classes we leave that alone to
+                            // avoid build-time recursion, but a uvm_ LEAF object
+                            // (e.g. uvm_report_handler) returning null is fatal:
+                            // every component's m_rh becomes null, so get_action
+                            // returns UVM_NO_ACTION and *all* `uvm_info/`uvm_error
+                            // macros are silently suppressed. Construct such leaf
+                            // uvm_ objects directly so they run new()->initialize().
+                            let is_uvm = class_name.starts_with("uvm_");
+                            let is_component = if is_uvm {
+                                let mut cur = Some(class_name.clone());
+                                let mut found = false;
+                                let mut depth = 0;
+                                while let Some(c) = cur {
+                                    if c == "uvm_component" { found = true; break; }
+                                    if depth > 64 { break; }
+                                    depth += 1;
+                                    cur = self.module.classes.get(&c).and_then(|cd| cd.extends.clone());
+                                }
+                                found
+                            } else { false };
+                            let intercept = !real_uvm || !is_uvm || !is_component;
                             if intercept {
                                 if let Some(class_def) =
                                     self.module.classes.get(class_name).cloned()
