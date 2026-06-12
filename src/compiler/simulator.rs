@@ -7895,7 +7895,7 @@ impl Simulator {
                 stmt: body,
             } = &ab.stmt.kind
             {
-                let delay_val = self.eval_expr(d).to_u64().unwrap_or(0);
+                let delay_val = self.eval_delay_ticks(d);
                 if delay_val > 0 {
                     if let Some(clock_gen) = self.try_extract_clock_gen(body, delay_val) {
                         sim_dbg_eprintln!(
@@ -12795,6 +12795,22 @@ impl Simulator {
         self.restore_process_context(saved);
     }
 
+    /// Evaluate a `#delay` expression to an integer number of simulator ticks.
+    /// A real-valued delay (e.g. `#1.5`, or `#0.5` under a finer `\`timescale`)
+    /// is rounded to the nearest tick — LRM §3.14.3 rounds delays to the time
+    /// precision. Crucially this avoids reading a real Value's raw float *bits*
+    /// as a huge integer (the old `to_u64()` did, scheduling the continuation
+    /// astronomically far out so it never fired and the process was lost).
+    fn eval_delay_ticks(&mut self, d: &Expression) -> u64 {
+        let v = self.eval_expr(d);
+        if v.is_real {
+            let f = v.to_f64();
+            if f.is_finite() && f > 0.0 { f.round() as u64 } else { 0 }
+        } else {
+            v.to_u64().unwrap_or(0)
+        }
+    }
+
     fn run_process_stmts(&mut self, pid: usize, stmts: &[Statement]) {
         self.current_pid = pid;
         sim_dbg_eprintln!(
@@ -12872,7 +12888,7 @@ impl Simulator {
             {
                 match control {
                     TimingControl::Delay(d) => {
-                        let delay = self.eval_expr(d).to_u64().unwrap_or(0);
+                        let delay = self.eval_delay_ticks(d);
                         let mut cont = vec![*body.clone()];
                         cont.extend_from_slice(&stmts[i + 1..]);
                         self.event_queue.schedule(self.time + delay, pid, cont);
@@ -13152,7 +13168,7 @@ impl Simulator {
             {
                 match control {
                     TimingControl::Delay(d) => {
-                        let delay = self.eval_expr(d).to_u64().unwrap_or(0);
+                        let delay = self.eval_delay_ticks(d);
                         let mut cont = vec![*tbody.clone()];
                         cont.extend_from_slice(&body_stmts[i + 1..]);
                         cont.push(Statement::new(
@@ -20709,7 +20725,7 @@ impl Simulator {
             StatementKind::TimingControl { control, stmt } => {
                 match control {
                     TimingControl::Delay(d) => {
-                        let delay = self.eval_expr(d).to_u64().unwrap_or(0);
+                        let delay = self.eval_delay_ticks(d);
                         self.apply_nba();
                         self.settle_combinatorial();
                         self.check_edges();

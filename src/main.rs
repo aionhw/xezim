@@ -85,6 +85,8 @@ fn print_usage() {
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
     eprintln!("  --sv2017         Parse as IEEE 1800-2017 (default is 1800-2023)");
     eprintln!("  --sv2023         Parse as IEEE 1800-2023 (default; kept for back-compat)");
+    eprintln!("  --no-strict      Disable strict negative-test diagnostics (accept LRM-illegal");
+    eprintln!("                   constructs instead of erroring; default is strict/on)");
     eprintln!("Compatibility:");
     eprintln!("  -Ifoo, -DNAME=V  Accepted");
     eprintln!("  +incdir+dir1+dir2 / +define+FOO=1+BAR Accepted");
@@ -164,6 +166,11 @@ fn preprocess_sources(
     for (i, source) in sources.iter().enumerate() {
         let source_path = source_files.get(i).map(|p| std::path::PathBuf::from(p));
         preprocessed.push(pp.preprocess_file(source, source_path.as_deref()));
+    }
+    // §22 strict-mode directive errors (`\`line`/`\`pragma`/`\`resetall`/…).
+    // Collected only when strict checks are on; a non-empty list fails the run.
+    if !pp.errors().is_empty() {
+        return Err(pp.errors().join("; "));
     }
     Ok(preprocessed)
 }
@@ -582,6 +589,14 @@ fn main() {
             }
             "--sv2017" => {
                 sv_parser::set_sv2023(false);
+            }
+            // Strict negative-test diagnostics (reject LRM-illegal constructs).
+            // ON by default; `--no-strict` (alias `--lenient`) turns it off.
+            "--strict" => {
+                sv_parser::set_strict_checks(true);
+            }
+            "--no-strict" | "--lenient" => {
+                sv_parser::set_strict_checks(false);
             }
             "--dump-tokens" => {
                 dump_tokens = true;
