@@ -30,6 +30,55 @@ module tb;
 endmodule
 "#;
 
+const SRC_BINSOF: &str = r#"
+module tb;
+  int a, b;
+  covergroup cg;
+    cp_a: coverpoint a;
+    cp_b: coverpoint b;
+    cr_ab: cross cp_a, cp_b {
+      bins low_a = binsof(cp_a) intersect { [0:3] };
+      bins mid_a = binsof(cp_a) intersect { [4:7] };
+      bins hi_a  = binsof(cp_a) intersect { [8:15] };
+    }
+  endgroup
+  cg c1 = new;
+  initial begin
+    a = 2; b = 0; c1.sample();
+    a = 5; b = 1; c1.sample();
+    a = 5; b = 2; c1.sample();
+    a = 12; b = 3; c1.sample();
+    a = 12; b = 4; c1.sample();
+    a = 12; b = 5; c1.sample();
+    $finish;
+  end
+endmodule
+"#;
+
+#[test]
+fn cross_binsof_intersect_filters() {
+    let sim = simulate(SRC_BINSOF, 1000).expect("simulate failed");
+    // 6 samples — cp_a=2 once, cp_a=5 twice, cp_a=12 three times.
+    assert_eq!(
+        sim.cross_bin_hits("cg", "cr_ab.low_a"),
+        1,
+        "low_a (cp_a in [0:3]) — expected 1, got {}",
+        sim.cross_bin_hits("cg", "cr_ab.low_a")
+    );
+    assert_eq!(
+        sim.cross_bin_hits("cg", "cr_ab.mid_a"),
+        2,
+        "mid_a (cp_a in [4:7]) — expected 2, got {}",
+        sim.cross_bin_hits("cg", "cr_ab.mid_a")
+    );
+    assert_eq!(
+        sim.cross_bin_hits("cg", "cr_ab.hi_a"),
+        3,
+        "hi_a (cp_a in [8:15]) — expected 3, got {}",
+        sim.cross_bin_hits("cg", "cr_ab.hi_a")
+    );
+}
+
 #[test]
 fn bare_new_covergroup_sample_and_cross() {
     let sim = simulate(SRC, 1000).expect("simulate failed");

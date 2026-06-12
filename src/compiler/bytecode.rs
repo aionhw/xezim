@@ -7,7 +7,7 @@ use crate::ast::decl::TaskDeclaration;
 use crate::ast::expr::*;
 use crate::ast::stmt::*;
 use std::sync::Arc;
-use xezim_core::hasher::HashMap;
+use xezim_core::hasher::{HashMap, HashSet};
 
 const MAX_INLINE_DEPTH: usize = 8;
 
@@ -202,6 +202,19 @@ pub struct BytecodeCompiler<'a> {
     /// bit `i` and silently drops the upper bits. Set via
     /// `set_packed_elem_widths`.
     packed_elem_widths: Option<&'a HashMap<String, u32>>,
+    /// Stack of pending `break` jump-target patches, one entry per enclosing
+    /// loop. When the loop's end address is known we rewrite each `Jump(0)`
+    /// at these insn-indices to the loop-exit address. LRM §12.7.
+    loop_break_patches: Vec<Vec<usize>>,
+    /// Same stack-of-Vecs shape, but for `continue` — patched to the loop's
+    /// step (or condition-recheck) address.
+    loop_continue_patches: Vec<Vec<usize>>,
+    /// Set of signal names declared as `string` (LRM §6.16). When a
+    /// concatenation involves any of these, the bytecode bails to the AST
+    /// interpreter, which has byte-level (not bit-level) concat semantics.
+    /// Set via `set_string_signals`. None = no string info available, in
+    /// which case the compiler can only catch the literal-operand case.
+    string_signals: Option<&'a HashSet<String>>,
 }
 
 impl<'a> BytecodeCompiler<'a> {
@@ -230,7 +243,14 @@ impl<'a> BytecodeCompiler<'a> {
             params: None,
             top_module_name: None,
             packed_elem_widths: None,
+            loop_break_patches: Vec::new(),
+            loop_continue_patches: Vec::new(),
+            string_signals: None,
         }
+    }
+
+    pub fn set_string_signals(&mut self, s: &'a HashSet<String>) {
+        self.string_signals = Some(s);
     }
 
     pub fn set_params(&mut self, params: &'a HashMap<String, Value>) {
@@ -251,6 +271,38 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_tasks(&mut self, tasks: &'a HashMap<String, TaskDeclaration>) {
         self.tasks = Some(tasks);
+    }
+
+    /// Static-only heuristic: does this expression CLEARLY produce a string?
+    /// Used to bail string-concat to the interpreter (which has byte-level
+    /// concat semantics). We can only see syntactic clues at compile time —
+    /// the full `string_signals` set lives on the simulator, not the
+    /// bytecode compiler. A string-literal operand is always a string; a
+    /// `$sformatf` / `$psprintf` call returns a string. Bare idents whose
+    /// declared type we don't have here remain false — those cases get
+    /// folded into the bit-vector concat path, which is the existing
+    /// behavior. The interpreter side's special-case is what carries the
+    /// LRM-correct path when the compiler can't see the type.
+    fn expr_is_string_concat_operand(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::StringLiteral(_) => true,
+            ExprKind::Paren(inner) => self.expr_is_string_concat_operand(inner),
+            ExprKind::Concatenation(parts) => parts.iter().any(|p| self.expr_is_string_concat_operand(p)),
+            ExprKind::SystemCall { name, .. } => matches!(name.as_str(), "$sformatf" | "$psprintf"),
+            ExprKind::Ident(h) => {
+                if let Some(set) = self.string_signals {
+                    let last = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                    if set.contains(last) { return true; }
+                    // Try scope-qualified form too.
+                    if let Some(scope) = &self.scope_hint {
+                        let q = format!("{}.{}", scope, last);
+                        if set.contains(&q) { return true; }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
     fn stmt_has_break_or_continue(stmt: &Statement) -> bool {
@@ -376,6 +428,19 @@ impl<'a> BytecodeCompiler<'a> {
         if !self.for_loop_var_ids.is_empty() && hier.path.len() == 1 && !raw.contains('.') {
             if let Some(&id) = self.for_loop_var_ids.get(&raw) {
                 return Some(id);
+            }
+        }
+        // Scope-first for SINGLE-SEGMENT bare names — LRM §22.4 / §23.6: a
+        // local declaration shadows a same-named wildcard-imported member.
+        // Without this, a module's local anon-enum FINISH=2 resolves to
+        // pkg mult_state_e::FINISH=4 because the flat signal_name_to_id
+        // registers BOTH `FINISH` (pkg) and `<scope>.FINISH` (local).
+        if !raw.contains('.') {
+            if let Some(scope) = &self.scope_hint {
+                let qualified = format!("{}.{}", scope, raw);
+                if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
+                    return Some(id);
+                }
             }
         }
         if let Some(&id) = self.signal_name_to_id.get(raw.as_str()) {
@@ -740,13 +805,11 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit_fallback(stmt)
             }
             StatementKind::For { init, condition, step, body } => {
-                // break/continue inside a compiled loop body would set the AST
-                // interpreter's break_flag which the bytecode VM never reads —
-                // bail so the whole For falls back to the AST path.
-                if Self::stmt_has_break_or_continue(body) {
-                    self.bail("For_break_continue");
-                    return false;
-                }
+                // LRM §12.7 — `break`/`continue` are now compiled to direct
+                // jumps; we push fresh patch lists on entry and apply them
+                // once we know the step-start and loop-end addresses.
+                self.loop_break_patches.push(Vec::new());
+                self.loop_continue_patches.push(Vec::new());
                 // Save outer for-loop overrides so nested loops don't leak.
                 let saved_for_vars = std::mem::take(&mut self.for_loop_var_ids);
                 // Inherit the outer overrides too — a nested loop's body
@@ -817,7 +880,19 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit(Insn::BranchIfFalse(cond_reg, 0));
                     Some(idx)
                 } else { None };
-                if !self.compile_stmt(body) { return false; }
+                if !self.compile_stmt(body) {
+                    // Bail path — pop patches so they don't leak.
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    return false;
+                }
+                let step_start = self.insns.len() as u32;
+                // `continue` jumps to the step (or to loop_start if there is
+                // no step) — patch now.
+                let cont_targ = if step.is_empty() { loop_start } else { step_start };
+                if let Some(patches) = self.loop_continue_patches.pop() {
+                    for idx in patches { self.insns[idx] = Insn::Jump(cont_targ); }
+                }
                 for s in step {
                     // For-loop step can be either the legacy `Binary{Assign,…}`
                     // shape or the newer `AssignExpr { lvalue, rvalue }` emitted
@@ -846,9 +921,40 @@ impl<'a> BytecodeCompiler<'a> {
                         self.insns[idx] = Insn::BranchIfFalse(reg, end);
                     }
                 }
+                // `break` jumps to the loop-exit address.
+                if let Some(patches) = self.loop_break_patches.pop() {
+                    for idx in patches { self.insns[idx] = Insn::Jump(end); }
+                }
                 // Restore outer for-loop's override map.
                 self.for_loop_var_ids = saved_for_vars;
                 true
+            }
+            StatementKind::Break => {
+                // LRM §12.7 — exits innermost enclosing loop. Compiled as a
+                // forward Jump(0) patched after the loop body+step finish.
+                // Outside a loop in the compiled scope: bail so the AST path
+                // can produce the right diagnostic.
+                if self.loop_break_patches.last().is_some() {
+                    let idx = self.insns.len();
+                    self.emit(Insn::Jump(0));
+                    self.loop_break_patches.last_mut().unwrap().push(idx);
+                    true
+                } else {
+                    self.bail("Break_outside_loop");
+                    self.emit_fallback(stmt)
+                }
+            }
+            StatementKind::Continue => {
+                // LRM §12.7 — restart innermost enclosing loop at its step.
+                if self.loop_continue_patches.last().is_some() {
+                    let idx = self.insns.len();
+                    self.emit(Insn::Jump(0));
+                    self.loop_continue_patches.last_mut().unwrap().push(idx);
+                    true
+                } else {
+                    self.bail("Continue_outside_loop");
+                    self.emit_fallback(stmt)
+                }
             }
             other => {
                 let name: &'static str = match other {
@@ -1029,6 +1135,13 @@ impl<'a> BytecodeCompiler<'a> {
                     BinaryOp::Eq => self.emit(Insn::Eq(dest, l, r)),
                     BinaryOp::Neq => self.emit(Insn::Neq(dest, l, r)),
                     BinaryOp::CaseEq => self.emit(Insn::CaseEq(dest, l, r)),
+                    // LRM §11.4.5: `!==` is the bit-exact negation of `===`.
+                    // No dedicated Insn; compose CaseEq → LogNot. (Previously
+                    // this hit the catch-all and bailed to the AST interp.)
+                    BinaryOp::CaseNeq => {
+                        self.emit(Insn::CaseEq(dest, l, r));
+                        self.emit(Insn::LogNot(dest, dest));
+                    }
                     BinaryOp::Lt => self.emit(Insn::Lt(dest, l, r)),
                     BinaryOp::Leq => self.emit(Insn::Leq(dest, l, r)),
                     BinaryOp::Gt => self.emit(Insn::Gt(dest, l, r)),
@@ -1039,6 +1152,23 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     BinaryOp::ShiftRight => self.emit(Insn::Shr(dest, l, r)),
                     BinaryOp::ArithShiftRight => self.emit(Insn::AShr(dest, l, r)),
+                    // LRM §11.4.3 power. There is no runtime Pow instruction;
+                    // every `**` seen in RTL has constant operands (`2**level`
+                    // after genvar substitution, `2**N` parameters), so fold
+                    // it to a constant here. Without this arm `**` hit the
+                    // catch-all `bail` below — which, for a `**` inside an
+                    // array-element LHS index like `mem[2**lvl-1+k]`, dropped
+                    // the whole continuous assign to the AST interpreter and
+                    // mis-evaluated the RHS. A genuinely non-constant `a**b`
+                    // still bails (rare; preserves prior behavior).
+                    BinaryOp::Power => {
+                        if let Some(v) = self.eval_const_expr(expr) {
+                            self.emit(Insn::LoadConst(dest, Box::new(Value::from_u64(v as u64, 32))));
+                        } else {
+                            self.bail("power_nonconst");
+                            return None;
+                        }
+                    }
                     _ => { self.bail("BinaryOp_other"); return None; }
                 }
                 Some(dest)
@@ -1204,6 +1334,17 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(dest)
             }
             ExprKind::Concatenation(parts) => {
+                // LRM §11.4.12 — when any operand is a `string`, `{a, b, …}`
+                // is a string concat (byte-level), not a bit-vector concat.
+                // The bytecode `Concat` insn bit-concatenates and would
+                // shift the bytes (e.g. a 5-char "hello" gets sized to 40
+                // bits and aligned wrong), so for any string-valued operand
+                // we bail to the AST interpreter which has the special
+                // case at `eval_expr_ctx::Concatenation`.
+                if parts.iter().any(|p| self.expr_is_string_concat_operand(p)) {
+                    self.bail("Concat_string");
+                    return None;
+                }
                 let mut regs = Vec::new();
                 for p in parts {
                     let r = self.compile_expr(p, 0)?;
@@ -1857,6 +1998,24 @@ impl<'a> BytecodeCompiler<'a> {
             // producing wrong results for `|(a[N-1:0] & b[N-1:0])`-shape
             // expressions. (Bug seen on c910 axi_fifo pop_req.)
             ExprKind::Binary { op, left, right } => {
+                // LRM §11.4 operator set, evaluated in u64 (then truncated to
+                // u32 for the slice-bound use-case). Logical && / || short-
+                // circuit on the LHS to match §11.4.7.
+                match op {
+                    BinaryOp::LogAnd => {
+                        let l = self.eval_const_expr(left)? as u64;
+                        if l == 0 { return Some(0); }
+                        let r = self.eval_const_expr(right)? as u64;
+                        return Some(if r != 0 { 1 } else { 0 });
+                    }
+                    BinaryOp::LogOr => {
+                        let l = self.eval_const_expr(left)? as u64;
+                        if l != 0 { return Some(1); }
+                        let r = self.eval_const_expr(right)? as u64;
+                        return Some(if r != 0 { 1 } else { 0 });
+                    }
+                    _ => {}
+                }
                 let l = self.eval_const_expr(left)? as u64;
                 let r = self.eval_const_expr(right)? as u64;
                 let v: u64 = match op {
@@ -1865,11 +2024,24 @@ impl<'a> BytecodeCompiler<'a> {
                     BinaryOp::Mul => l.wrapping_mul(r),
                     BinaryOp::Div => if r == 0 { return None } else { l / r },
                     BinaryOp::Mod => if r == 0 { return None } else { l % r },
-                    BinaryOp::ShiftLeft => l.checked_shl(r as u32)?,
+                    // LRM §11.4.3 power — silently dropped before this fix.
+                    BinaryOp::Power => {
+                        let e = u32::try_from(r as i64).ok()?;
+                        (l as i64).checked_pow(e)? as u64
+                    }
+                    BinaryOp::ShiftLeft  | BinaryOp::ArithShiftLeft  => l.checked_shl(r as u32)?,
                     BinaryOp::ShiftRight => l.checked_shr(r as u32)?,
-                    BinaryOp::BitAnd => l & r,
-                    BinaryOp::BitOr  => l | r,
-                    BinaryOp::BitXor => l ^ r,
+                    BinaryOp::ArithShiftRight => ((l as i64).wrapping_shr(r as u32)) as u64,
+                    BinaryOp::BitAnd  => l & r,
+                    BinaryOp::BitOr   => l | r,
+                    BinaryOp::BitXor  => l ^ r,
+                    BinaryOp::BitXnor => !(l ^ r),
+                    BinaryOp::Eq | BinaryOp::CaseEq    => if l == r { 1 } else { 0 },
+                    BinaryOp::Neq | BinaryOp::CaseNeq  => if l != r { 1 } else { 0 },
+                    BinaryOp::Lt  => if (l as i64) <  (r as i64) { 1 } else { 0 },
+                    BinaryOp::Leq => if (l as i64) <= (r as i64) { 1 } else { 0 },
+                    BinaryOp::Gt  => if (l as i64) >  (r as i64) { 1 } else { 0 },
+                    BinaryOp::Geq => if (l as i64) >= (r as i64) { 1 } else { 0 },
                     _ => return None,
                 };
                 Some(v as u32)
@@ -1877,12 +2049,26 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Unary { op, operand } => {
                 let v = self.eval_const_expr(operand)? as u64;
                 let r: u64 = match op {
-                    UnaryOp::Plus  => v,
-                    UnaryOp::Minus => 0u64.wrapping_sub(v),
-                    UnaryOp::BitNot => !v,
+                    UnaryOp::Plus    => v,
+                    UnaryOp::Minus   => 0u64.wrapping_sub(v),
+                    UnaryOp::BitNot  => !v,
+                    UnaryOp::LogNot  => if v == 0 { 1 } else { 0 },
+                    // LRM §11.4.9 reductions. The unknown bit-width is OK here
+                    // since callers use this for sizing/indexing — `|MASK` only
+                    // needs to be 1 if MASK has any set bits.
+                    UnaryOp::BitAnd  => if v == u64::MAX { 1 } else { 0 },
+                    UnaryOp::BitNand => if v == u64::MAX { 0 } else { 1 },
+                    UnaryOp::BitOr   => if v != 0 { 1 } else { 0 },
+                    UnaryOp::BitNor  => if v != 0 { 0 } else { 1 },
+                    UnaryOp::BitXor  => (v.count_ones() & 1) as u64,
+                    UnaryOp::BitXnor => 1 - ((v.count_ones() & 1) as u64),
                     _ => return None,
                 };
                 Some(r as u32)
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                let c = self.eval_const_expr(condition)?;
+                if c != 0 { self.eval_const_expr(then_expr) } else { self.eval_const_expr(else_expr) }
             }
             _ => None,
         }

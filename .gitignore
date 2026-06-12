@@ -3,6 +3,8 @@ target/
 **/*.rs.bk
 Cargo.lock
 dump.vcd
+xezim_cov.json
+*.pat
 
 # Third-party Accellera UVM source — kept as a local working copy,
 # not vendored into the repo (see tests/uvm_integration_tests.rs).

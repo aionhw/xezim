@@ -69,6 +69,7 @@ fn print_usage() {
     eprintln!("  -D <name>[=val]  Define a macro");
     eprintln!("  -s <topmodule>   Specify the top-level module to elaborate");
     eprintln!("  --no-sim         Alias for --compile (deprecated)");
+    eprintln!("  --preprocess     Run the preprocessor only; emit expanded text");
     eprintln!("  --dump-tokens    With --parse, print the token stream");
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!("  --max-time <n>   Set maximum simulation time (default: 100000)");
@@ -387,6 +388,7 @@ fn main() {
     let mut dump_ast = false;
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Mode {
+        Preprocess,
         Parse,
         Compile,
         Simulate,
@@ -541,6 +543,14 @@ fn main() {
             "-V" => {
                 print_version();
                 std::process::exit(0);
+            }
+            "--preprocess" => {
+                if mode_explicit && mode != Mode::Preprocess {
+                    eprintln!("Error: --preprocess conflicts with previously set mode");
+                    std::process::exit(1);
+                }
+                mode = Mode::Preprocess;
+                mode_explicit = true;
             }
             "--parse" => {
                 if mode_explicit && mode != Mode::Parse {
@@ -836,6 +846,20 @@ fn main() {
                 std::process::exit(1);
             }
         };
+
+    if mode == Mode::Preprocess {
+        // IEEE 1800-2017 §22: preprocess-only mode. The preprocessor has
+        // already run (expanding macros and `\`include`s, evaluating
+        // `\`ifdef`/`\`begin_keywords`, etc.); emit the expanded text. A
+        // preprocessing-mode sv-test passes on a clean exit — `preprocess_sources`
+        // exits 1 above if a directive genuinely failed, so reaching here means
+        // success.
+        for (label, source) in file_labels.iter().zip(preprocessed_sources.iter()) {
+            println!("// === Preprocessed: {} ===", label);
+            print!("{}", source);
+        }
+        return;
+    }
 
     if mode == Mode::Parse {
         if dump_tokens {

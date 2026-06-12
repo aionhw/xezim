@@ -8,7 +8,6 @@
 
 pub mod compiler;
 pub mod multikernel;
-pub mod tbb;
 
 // Re-export xezim-core surface so existing `xezim::...` paths keep working.
 pub use xezim_core::{

@@ -667,6 +667,16 @@ enum EdgeKind {
     AnyEdge,
 }
 
+/// LRM §15.4.2: a process blocked inside `mailbox.get(var)` on an empty
+/// mailbox. The next `put` drains this waiter, assigns its value into
+/// `lvalue`, and reschedules `cont` under `pid` at the current time.
+#[derive(Debug, Clone)]
+struct MailboxGetWaiter {
+    pid: usize,
+    lvalue: Expression,
+    cont: Vec<Statement>,
+}
+
 /// A process waiting for a signal edge event.
 #[derive(Debug, Clone)]
 struct EventWaiter {
@@ -978,6 +988,65 @@ struct ClassInstance {
     properties: HashMap<String, Value>,
 }
 
+/// LRM §4.4 / §16 observed-region probe entry. A concurrent property's
+/// per-cycle re-evaluation registers one of these into
+/// `Simulator::pending_observed` from its sensitivity trigger (e.g. a
+/// `@(posedge clk)` event). When the observed-region drain runs, the
+/// runtime evaluates `predicate` and records the boolean outcome under
+/// `name` in `assertion_stats`. Today only the storage + drain are in
+/// place; no producer wires probes up. M9 (SVA elaboration) is the
+/// consumer-side follow-up.
+#[derive(Debug, Clone)]
+struct ObservedProbe {
+    name: String,
+    predicate: Expression,
+    /// Optional `this` handle so a property declared in a class context can
+    /// resolve member references at evaluation time.
+    this_handle: Option<usize>,
+}
+
+/// LRM §16.5 SVA clocked property site. Registered once when an
+/// `assert property (@clk body)` statement first executes; thereafter
+/// edge-detect on `clock_signal` drives per-cycle evaluation of `body`.
+/// `pending` queues consequents deferred by `|=>` (1 cycle) or `##N`.
+#[derive(Debug, Clone)]
+struct SvaClockedSite {
+    /// Unique identifier (hash of span position) so dedup across
+    /// re-executions is cheap.
+    span_key: usize,
+    /// Resolved signal name for the clock; we re-resolve to value
+    /// each tick rather than caching an id (small site count).
+    clock_signal: String,
+    /// Property body — `Binary{OrFatArrow}` (|=>) and
+    /// `Binary{OrMinusArrow}` (|->) are special-cased; otherwise
+    /// the body is just tallied as a boolean at each clock fire.
+    body: Expression,
+    /// LSB of the most recent observed clock value. Initialised to a
+    /// sentinel (2) so the first tick is treated as "no edge".
+    prev_clock: u8,
+    /// Deferred consequents keyed by cycles_remaining (decremented at
+    /// every clock fire; evaluate + tally when it hits 0).
+    pending: std::collections::VecDeque<(u32, Expression)>,
+    /// LRM §16.12.6 `s_eventually <expr>` watchers — expressions
+    /// that must become true at some future clock cycle. Each tick,
+    /// each entry is evaluated; if true, it's removed and tallied
+    /// as PASS. (No bound expiry; remaining entries at end-of-sim
+    /// are a separate "weak-eventually-never-held" case.)
+    s_eventually: Vec<Expression>,
+    /// LRM §16.12.6 `s_always <expr>` watchers — expressions that
+    /// must hold at every future clock cycle. Each tick, each entry
+    /// is evaluated; failure tallies a FAIL and removes the watcher
+    /// (one-shot failure), otherwise it persists. End-of-sim with a
+    /// remaining watcher counts as PASS (the weak-always pass case).
+    s_always: Vec<Expression>,
+    /// LRM §16.9.3 `$past(<signal>, N)` per-signal value history.
+    /// Each entry is `signal_name → ring of past values (index 0 =
+    /// 1 cycle ago)`. Refreshed at every clock fire from the
+    /// current signal values BEFORE the body evaluation (so the body
+    /// sees the previous-cycle snapshots).
+    past_snapshots: HashMap<String, std::collections::VecDeque<Value>>,
+}
+
 #[derive(Debug, Clone)]
 struct CovergroupInstance {
     cg_name: String,
@@ -985,6 +1054,23 @@ struct CovergroupInstance {
     point_hits: HashMap<String, HashSet<Value>>,
     /// Cross hits: cross_name -> Set of observed tuples
     cross_hits: HashMap<String, HashSet<Vec<Value>>>,
+    /// LRM §19.6 cross-bin filter hit counts. Key: `cross_name.bin_name`.
+    /// Sampling increments the counter when the referenced coverpoint's
+    /// component of the cross-tuple falls in any of the bin's ranges.
+    cross_bin_hits: HashMap<String, u64>,
+    /// Per-explicit-bin hit counts (LRM §19.5). Key: `coverpoint.bin`. Only
+    /// populated for coverpoints that declared `bins`. Sampling increments
+    /// the counter when the value falls in any of the bin's ranges; an
+    /// `illegal_bins` hit also fires an immediate error.
+    #[allow(dead_code)]
+    bin_hits: HashMap<String, u64>,
+    /// LRM §19.5 transition-bin sample-history tracker. For each
+    /// coverpoint that has any transition spec, holds the trailing N-1
+    /// sampled values (where N is the longest declared chain across all
+    /// of the coverpoint's bins). Sampler appends the current sample
+    /// then checks whether any bin's chain matches the trailing window.
+    #[allow(dead_code)]
+    point_history: HashMap<String, std::collections::VecDeque<Value>>,
     /// Total `sample()` invocations on this instance.
     sample_count: u64,
 }
@@ -1294,6 +1380,56 @@ pub struct Simulator {
     /// re-evaluated at drain time so the printed values reflect the
     /// post-NBA state per IEEE 1800 §15.3.4 (postponed region).
     pending_strobes: Vec<(String, Vec<Expression>)>,
+    /// IEEE 1800-2017 §4.4 "observed region" — drained AFTER the NBA region
+    /// has settled and BEFORE the postponed region runs. Concurrent
+    /// property/sequence checkers (LRM §16) register a probe expression
+    /// here; the runtime evaluates each probe and records the boolean
+    /// outcome. Probe = (property-name, predicate-expr, current-instance
+    /// `this` handle).
+    ///
+    /// Today this queue is plumbing only — no producer is wired up.
+    /// Concurrent assertions land in M9, which depends on this region
+    /// existing. Drain is a no-op when empty so behavior is unchanged.
+    pending_observed: Vec<ObservedProbe>,
+    /// LRM §16.5 SVA clocked-assertion sites. Populated lazily on
+    /// the first time the AssertionStatement{is_property,
+    /// expr:SvaClocked} executes. Each site's `prev_clock` lets us
+    /// edge-detect the clock signal each loop iteration; `pending`
+    /// queues consequents deferred by `|=>` or `##N`.
+    sva_sites: Vec<SvaClockedSite>,
+    /// LRM §16.9.3: index of the SVA site whose body is currently
+    /// being evaluated. Set by `tick_sva_sites` around each body
+    /// eval; consulted by `eval_expr`'s `$past` handler to find the
+    /// site's snapshot map. `None` when no SVA body is active —
+    /// `$past` then returns 0.
+    active_sva_site: Option<usize>,
+    /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
+    /// is `cb_name → (signal_name → pre-edge value)`. Updated in
+    /// `tick_clocking_blocks` just before the clock signal's posedge
+    /// is consumed by edge-triggered always blocks. Reads of
+    /// `cb.<signal>` (where the signal is direction `input`) return
+    /// from this snapshot — the `#1step` input skew of LRM §14.3.
+    /// Without the snapshot, `cb.sig` would return the post-edge
+    /// value, defeating UVM monitor patterns that rely on stable
+    /// pre-edge sampling.
+    clocking_snapshots: HashMap<String, HashMap<String, Value>>,
+    /// LRM §14.3: per-cb metadata. `(clock_signal_name, [(signal_name, is_input)])`.
+    /// Populated at compile() from `module.clocking_blocks`.
+    clocking_meta: HashMap<String, (String, Vec<(String, bool)>)>,
+    /// LRM §14.4: pending clocking-output drives. `cb_name → [(signal,
+    /// value)]`. `cb.<out_sig> <= val` queues here instead of driving
+    /// immediately; `tick_clocking_blocks` applies them at the next
+    /// posedge of the cb's clock (output skew).
+    clocking_output_pending: HashMap<String, Vec<(String, Value)>>,
+    /// Per-clocking-block previous clock bit (for edge detection).
+    clocking_prev_clock: HashMap<String, u8>,
+    /// LRM §4.4 "reactive region" — drained AFTER the observed region
+    /// has fired and BEFORE the postponed region runs. In a strict LRM
+    /// implementation this hosts `program`-block procedural code so a
+    /// testbench observes design state only after design NBAs have
+    /// settled. Today the queue is framework-only (no producer is
+    /// wired up); drain is a no-op when empty, so behavior is unchanged.
+    pending_reactive: Vec<crate::ast::stmt::Statement>,
     pub monitor_prev: HashMap<String, Value>,
     /// Active tag for a tagged union variable: signal name → tag name.
     pub active_union_tag: HashMap<String, String>,
@@ -1317,6 +1453,28 @@ pub struct Simulator {
     dpi_unresolved: HashSet<String>,
     /// Class instance heap (index 0 is null).
     heap: Vec<Option<ClassInstance>>,
+    /// LRM §25.8 virtual-interface bindings.
+    /// Key: `(class_instance_handle, property_name)`.
+    /// Value: `(bound_iface_inst_name, modport_opt)`. The modport is
+    /// carried from the class property's declared type (e.g. `virtual
+    /// bus_if.master vif`) so the rewrite path can also emit a direction
+    /// warning when writing to a modport-input member.
+    virtual_iface_bindings: HashMap<(usize, String), (String, Option<String>)>,
+    /// LRM §25.9: stack of per-call virtual-interface formal-arg
+    /// aliases. When a task or function takes `virtual <iface> <name>`,
+    /// the call hooks add a frame mapping `<name>` to the caller's
+    /// interface-instance identifier (e.g. `bus`). `resolve_hier_name`
+    /// consults the top frame so `vif.member` resolves to `bus.member`.
+    /// Popped at task return.
+    local_iface_aliases: Vec<HashMap<String, String>>,
+    /// LRM §18.5.4 dist-pick-once tracking (per-randomize scope). Records
+    /// `(handle, prop_name)` pairs for which a weighted `dist` constraint
+    /// has already drawn one sample in the current randomize call. The
+    /// outer 16-pass fixpoint loop would otherwise re-pick on every
+    /// iteration, biasing the empirical distribution toward higher-
+    /// weighted values (9:1 weights produced ~98:2 instead of 90:10).
+    /// Cleared by `exec_randomize` at entry.
+    dist_picked_once: HashSet<(usize, String)>,
     /// Static class properties — one shared cell per `Class::prop`,
     /// keyed `"ClassName::propname"` where ClassName is the class that
     /// declared the static property.
@@ -1324,6 +1482,12 @@ pub struct Simulator {
     /// Class-typed procedural locals — variable name -> class type name.
     /// Lets a later `name = new();` know which class to construct.
     var_class_types: HashMap<String, String>,
+    /// LRM §6.19.6: typedef-typed local variable → typedef name. So
+    /// `<local>.next()/.first()/.last()/.num()/.prev()` resolves the
+    /// enum-member list via `module.enum_members[typedef]`. Mirrors
+    /// `var_class_types`; populated at VarDecl exec time when the
+    /// data type is a `TypeReference` whose name is in `module.typedefs`.
+    var_typedef_types: HashMap<String, String>,
     /// Names of `string`-typed variables (locals, params, package globals) so
     /// `{a, b}` concatenation involving them is treated as string concat.
     string_signals: HashSet<String>,
@@ -1418,11 +1582,6 @@ pub struct Simulator {
     /// simulator's lifetime. Always `None` when the `jit-llvm`
     /// feature is disabled (the type is a stub).
     jit_module_llvm: Option<super::jit_llvm::LlvmJitModule>,
-    /// Persistent TBB task_arena. Created lazily on first parallel
-    /// dispatch when `XEZIM_DISPATCHER=tbb` is active. Reused across
-    /// every delta-cycle's parallel_for so workers stay alive.
-    /// Always `None` when feature `tbb` is off.
-    tbb_arena: Option<crate::tbb::Arena>,
     /// True for blocks eligible for parallel execution (no StmtFallback).
     edge_block_parallel: Vec<bool>,
     /// Per-edge-block partition / core assignment. Indexed by edge_block
@@ -1520,7 +1679,16 @@ pub struct Simulator {
     /// SV-2023: real-precision time tracker (parallel to integer `time`).
     real_time: f64,
     /// SV-2023: blocked mailbox `get`/`peek` proxies keyed by mailbox handle.
-    mailbox_get_waiters: HashMap<usize, std::collections::VecDeque<Expression>>,
+    /// Each waiter records the suspended process pid, the destination lvalue
+    /// expression to receive the value, and the post-get continuation
+    /// statements. `put` drains a waiter, assigns the value into its lvalue,
+    /// and re-schedules the continuation at the current time.
+    mailbox_get_waiters: HashMap<usize, std::collections::VecDeque<MailboxGetWaiter>>,
+    /// LRM §15.5.3: per-named-event last-trigger time. `e.triggered`
+    /// returns 1 iff this map's `time` matches the current simulation time
+    /// (i.e. the event has been triggered in the same time slot as the
+    /// query). EventTrigger handler stamps this.
+    event_triggered_time: HashMap<String, u64>,
     /// Processes waiting for signal edge events (@(posedge clk), etc.)
     event_waiters: Vec<EventWaiter>,
     /// Covergroups waiting for sampling events
@@ -1741,11 +1909,6 @@ pub struct Simulator {
     prof_pdes_imbalance_sum_ns: u64,
     prof_pdes_max_total_ns: u64,
     prof_pdes_min_total_ns: u64,
-    /// TBB-vs-std::thread::scope split: when XEZIM_DISPATCHER=tbb and
-    /// the feature is compiled in, parallel-block dispatch goes via
-    /// the TBB shim. Counted for the [PROF] line so users can confirm
-    /// which scheduler ran.
-    prof_par_dispatch_tbb: u64,
     prof_edge_waiters: u64,
     prof_edge_cg: u64,
     prof_waiter_iters: u64,
@@ -2430,6 +2593,14 @@ impl Simulator {
             monitor: None,
             monitor_prev: HashMap::default(),
             pending_strobes: Vec::new(),
+            pending_observed: Vec::new(),
+            sva_sites: Vec::new(),
+            active_sva_site: None,
+            clocking_snapshots: HashMap::default(),
+            clocking_meta: HashMap::default(),
+            clocking_output_pending: HashMap::default(),
+            clocking_prev_clock: HashMap::default(),
+            pending_reactive: Vec::new(),
             active_union_tag: HashMap::default(),
             max_time,
             settle_limit: 100,
@@ -2449,8 +2620,12 @@ impl Simulator {
             dpi_unsupported: HashSet::default(),
             dpi_unresolved: HashSet::default(),
             heap: vec![None], // index 0 is null
+            virtual_iface_bindings: HashMap::default(),
+            local_iface_aliases: Vec::new(),
+            dist_picked_once: HashSet::default(),
             class_statics: HashMap::default(),
             var_class_types: HashMap::default(),
+            var_typedef_types: HashMap::default(),
             string_signals: HashSet::default(),
             queue_frame_saves: Vec::new(),
             mailboxes: HashMap::default(),
@@ -2489,7 +2664,6 @@ impl Simulator {
             jit_fns: Vec::new(),
             jit_module: None,
             jit_module_llvm: None,
-            tbb_arena: None,
             edge_block_parallel: Vec::new(),
             edge_block_partition: Vec::new(),
             edge_block_partition_count: 0,
@@ -2520,6 +2694,7 @@ impl Simulator {
             ref_binding_stack: Vec::new(),
             real_time: 0.0,
             mailbox_get_waiters: HashMap::default(),
+            event_triggered_time: HashMap::default(),
             event_waiters: Vec::new(),
             cg_event_waiters: Vec::new(),
             event_waiters_swap: Vec::new(),
@@ -2594,7 +2769,6 @@ impl Simulator {
             prof_edge_exec: 0,
             prof_par_dispatch_partition: 0,
             prof_par_dispatch_legacy: 0,
-            prof_par_dispatch_tbb: 0,
             prof_par_dispatch_pdes: 0,
             prof_pdes_spawn_ns: 0,
             prof_pdes_exec_ns: 0,
@@ -3066,7 +3240,7 @@ impl Simulator {
     /// xezim/docs/MULTIKERNEL.md). The PDES dispatcher integration
     /// (XEZIM_DISPATCHER=pdes) adds the sparse-snapshot + barrier
     /// machinery on top of this partition; without that arm wired in,
-    /// the current dispatchers (tbb / std::scope) still consume this
+    /// the current dispatchers (std::scope) still consume this
     /// partition transparently — they just don't get any speedup from
     /// the LP semantics since they share signal_table.
     pub fn apply_multikernel_scope_partition(&mut self, prefix: &str) -> (usize, usize) {
@@ -4214,6 +4388,37 @@ impl Simulator {
         if self.dpi_bindings.contains_key(sv_name) || self.dpi_unsupported.contains(sv_name) {
             return;
         }
+        // LRM §35.5.3: a DPI import declared `pure` must (a) return non-void
+        // and (b) have ONLY `input` ports — no output/inout/ref. A `pure`
+        // task is illegal. Catch the violations at bind time so a misdeclared
+        // C function fails loudly here rather than silently dropping outputs.
+        if spec.property == Some(crate::ast::decl::DPIProperty::Pure) {
+            let (is_task, ports, has_non_void_ret) = match &spec.proto {
+                crate::ast::decl::DPIProto::Function(f) => (
+                    false, &f.ports,
+                    !matches!(&f.return_type, crate::ast::types::DataType::Void { .. }),
+                ),
+                crate::ast::decl::DPIProto::Task(t) => (true, &t.ports, false),
+            };
+            if is_task {
+                eprintln!("[DPI] '{}' declared `pure` but is a task; LRM §35.5.3 requires a function", sv_name);
+                self.dpi_unsupported.insert(sv_name.to_string());
+                return;
+            }
+            if !has_non_void_ret {
+                eprintln!("[DPI] '{}' declared `pure` but returns void; LRM §35.5.3", sv_name);
+                self.dpi_unsupported.insert(sv_name.to_string());
+                return;
+            }
+            for p in ports {
+                if !matches!(p.direction, crate::ast::types::PortDirection::Input) {
+                    eprintln!("[DPI] '{}' declared `pure` but port '{}' is {:?}; pure imports may only have input ports (LRM §35.5.3)",
+                        sv_name, p.name.name, p.direction);
+                    self.dpi_unsupported.insert(sv_name.to_string());
+                    return;
+                }
+            }
+        }
         let Some((ret, arg_kinds)) = self.dpi_signature(spec) else {
             self.dpi_unsupported.insert(sv_name.to_string());
             eprintln!("[DPI] unsupported prototype for '{}'", sv_name);
@@ -4789,6 +4994,39 @@ impl Simulator {
             return;
         }
         self.sanitize_class_hierarchy();
+        // LRM §14.3 — populate clocking-block metadata: per-cb clock
+        // signal + per-signal direction. `tick_clocking_blocks`
+        // consumes this to maintain `clocking_snapshots`.
+        for (cb_name, cd) in self.module.clocking_blocks.iter() {
+            let clk = cd.clock_signal.as_ref().map(|i| i.name.clone());
+            if let Some(clk) = clk {
+                let sigs: Vec<(String, bool)> = cd
+                    .signals
+                    .iter()
+                    .map(|s| {
+                        let is_input = matches!(
+                            s.direction,
+                            crate::ast::types::PortDirection::Input
+                                | crate::ast::types::PortDirection::Inout
+                        );
+                        (s.name.name.clone(), is_input)
+                    })
+                    .collect();
+                self.clocking_meta.insert(cb_name.clone(), (clk, sigs));
+                self.clocking_prev_clock.insert(cb_name.clone(), 2);
+                self.clocking_snapshots
+                    .insert(cb_name.clone(), HashMap::default());
+            }
+        }
+        // Seed the runtime string_signals set from the elab-time map so that
+        // `expr_is_string_valued` recognises module-level `string` signals
+        // BEFORE any procedural VarDecl has run (those add their own names
+        // dynamically). Without this, `{a, b}` with `string a, b;` falls
+        // into the bit-concat path and truncates to one operand's 1024-bit
+        // width. LRM §6.16 / §11.4.12.
+        for name in self.module.string_signals.iter() {
+            self.string_signals.insert(name.clone());
+        }
 
         // Register static member collections (`static T m[$]`, `static T
         // m[KEY]`) as a single shared global store under their bare name, so
@@ -5152,6 +5390,21 @@ impl Simulator {
             let pid = self.next_pid;
             self.next_pid += 1;
             self.event_queue.schedule(0, pid, stmts);
+        }
+        // LRM §24: `program` initial blocks execute in the reactive region.
+        // Stash each program-initial's statements into `pending_reactive` so
+        // `drain_reactive_region` picks them up at the first time-0 reactive
+        // pass. Synchronous drain matches the basic-coverage scope — any
+        // deeper sub-events scheduled by these statements re-enter the
+        // normal active queue and behave correctly.
+        for ib in std::mem::take(&mut self.module.program_initial_blocks) {
+            let stmts = match ib.stmt.kind {
+                StatementKind::SeqBlock { stmts, .. } => stmts,
+                other => vec![Statement::new(other, ib.stmt.span)],
+            };
+            for s in stmts {
+                self.pending_reactive.push(s);
+            }
         }
         // Open the XTrace dump (if requested) AFTER initial-block scheduling
         // and time-0 settle so the dictionary captures all elaborated signals
@@ -7308,6 +7561,30 @@ impl Simulator {
             self.compile();
         }
         self.event_loop();
+        // LRM §9.2.3 — `final` procedures run after the event loop terminates
+        // but BEFORE any trace flush. May not contain time-consuming
+        // statements (no `#`, `@`, `wait`). We honor that by running each
+        // body through `run_process_stmts` with `finished` momentarily
+        // cleared; if a final block tries to suspend it will simply terminate
+        // when the runtime next checks `finished`.
+        let finals = std::mem::take(&mut self.module.final_blocks);
+        if !finals.is_empty() {
+            let was_finished = self.finished;
+            self.finished = false;
+            for fb in finals {
+                let stmts = match fb.stmt.kind {
+                    StatementKind::SeqBlock { stmts, .. } => stmts,
+                    other => vec![Statement::new(other, fb.stmt.span)],
+                };
+                let pid = self.next_pid;
+                self.next_pid += 1;
+                self.run_process_stmts(pid, &stmts);
+                // A final block's $finish should NOT stop subsequent finals;
+                // re-clear after each.
+                self.finished = false;
+            }
+            self.finished = was_finished;
+        }
         if self.aitrace_mode {
             self.aitrace_finish();
         } else {
@@ -7336,7 +7613,14 @@ impl Simulator {
                     _ => return None,
                 };
                 // RHS must be a compile-time constant (plain integer,
-                // Paren-wrapped, or parameter reference).
+                // Paren-wrapped, or parameter reference). CRUCIAL: a clock seed
+                // is never a function call — bail before evaluating if the RHS
+                // contains one, so this *detection* pass can't run a
+                // side-effecting function (the real execution evaluates it
+                // again, which double-ran every `x = side_effecting_F();`).
+                if Self::expr_contains_call(rvalue) {
+                    return None;
+                }
                 let v = self.eval_expr(rvalue);
                 // Reject X/Z seeds; we need a determinate start value.
                 if v.has_xz() {
@@ -7554,13 +7838,25 @@ impl Simulator {
         if let Some((sens, body)) = self.extract_sensitivity(&ab.stmt) {
             if !sens.is_empty() {
                 let all_level = sens.iter().all(|s| s.edge == EdgeKind::AnyEdge);
-                if all_level {
+                let top_prefix = format!("{}.", self.module.name);
+                // §15.5: `always @(e)` on a named `event` is edge-triggered
+                // (`->e` toggles the event signal; the edge wakes the block
+                // once). The comb-settle path would instead re-run it every
+                // settle iteration, so a non-idempotent body (`i++`) executes
+                // up to settle_limit (100) times. Force such blocks to
+                // edge_blocks even though their sensitivity is AnyEdge.
+                let has_named_event = sens.iter().any(|s| {
+                    let n = s.signal_name.as_str();
+                    self.module.events.contains(n)
+                        || n.strip_prefix(&top_prefix)
+                            .map_or(false, |b| self.module.events.contains(b))
+                });
+                if all_level && !has_named_event {
                     return Some(AlwaysBlock {
                         kind: ab.kind,
                         stmt: body,
                     });
                 }
-                let top_prefix = format!("{}.", self.module.name);
                 let resolved: Vec<SensitivityId> = sens
                     .iter()
                     .filter_map(|s| {
@@ -7694,6 +7990,7 @@ impl Simulator {
             compiler.set_tasks(&self.module.tasks);
             compiler.set_params(&self.module.parameters);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+            compiler.set_string_signals(&self.module.string_signals);
             compiler.top_module_name = Some(self.module.name.clone());
             if compiler.compile_stmt(&block.stmt) {
                 let cb = compiler.finish();
@@ -9670,6 +9967,9 @@ impl Simulator {
             writes.clear();
             Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
             Self::collect_lhs_writes(&ca.lhs, &self.module, &mut writes);
+            let scope_hint = self
+                .infer_contassign_scope_hint(&ca.lhs, &ca.rhs)
+                .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads));
             // Detect identity assigns: assign dst = src (simple signal-to-signal copy)
             let direct_copy = if explicit_delay == 0 {
                 if let (ExprKind::Ident(lhs_hier), ExprKind::Ident(rhs_hier)) =
@@ -9706,11 +10006,7 @@ impl Simulator {
                 None
             };
 
-            let scope_hint = self
-                .infer_contassign_scope_hint(&ca.lhs, &ca.rhs)
-                .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads));
-
-            // Resolve write targets, retrying with scope_hint for bare names
+            // Resolve write targets, retrying with scope_hint for bare names.
             let wids: Vec<usize> = writes
                 .iter()
                 .filter_map(|w| {
@@ -9877,17 +10173,42 @@ impl Simulator {
             // without the top-name prefix (`x_soc.biu_pad_hwdata`), so the
             // lookup misses unless we strip "<top_name>." up front.
             let top_prefix = format!("{}.", self.module.name);
+            // Bytecode-compiled entries (CompiledContAssign / FusedGate)
+            // resolve bare reads SCOPE-FIRST (bytecode.rs `resolve_ident`):
+            // a local `<scope>.<name>` shadows a same-named top signal.
+            // The dependency edge MUST resolve to the same id the entry
+            // actually reads, else the entry never re-triggers when its
+            // true input changes. Direct-copy / fused / delayed-cont-assign
+            // entries resolve their reads the bare way (resolve_hier_name_
+            // static) — for those, keep bare-first so we don't mis-scope a
+            // port-connection source like `u.a = a` (where `a` is genuinely
+            // the top signal, not `<scope>.a`).
+            let entry_is_bytecode = matches!(
+                &item,
+                CombItem::CompiledContAssign { .. }
+            );
             for r in &reads {
+                let mut found = false;
+                if entry_is_bytecode && !r.contains('.') {
+                    if let Some(scope) = &scope_hint {
+                        let q = format!("{}.{}", scope, r);
+                        if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
+                            rids.push(id);
+                            continue;
+                        }
+                    }
+                }
                 if let Some(&id) = self.signal_name_to_id.get(r.as_str()) {
                     rids.push(id);
                     continue;
                 }
-                let mut found = false;
-                if let Some(scope) = &scope_hint {
-                    let qualified = format!("{}.{}", scope, r);
-                    if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
-                        rids.push(id);
-                        found = true;
+                if !entry_is_bytecode {
+                    if let Some(scope) = &scope_hint {
+                        let qualified = format!("{}.{}", scope, r);
+                        if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
+                            rids.push(id);
+                            found = true;
+                        }
                     }
                 }
                 // Top-prefix strip fallback: `<top>.<rest>` → `<rest>`. Fixes
@@ -11479,6 +11800,18 @@ impl Simulator {
         accum.t_settle += dse;
         accum.t_edges += de;
 
+        // LRM §4.4 region ordering — observed runs after the NBA region
+        // has settled but BEFORE the postponed region (which is where
+        // $strobe and $monitor live). No-op when no probes are registered.
+        self.drain_observed_region();
+        // LRM §16.5 SVA clocked property evaluation. Detects edges on
+        // each registered clock signal and ticks pending consequents.
+        self.tick_sva_sites();
+        // LRM §14.3 clocking-block input snapshot — refresh per-cycle
+        // sample state so subsequent `cb.<sig>` reads see the pre-edge
+        // value (`#1step` input skew).
+        self.tick_clocking_blocks();
+        self.drain_reactive_region();
         self.check_monitor();
         self.drain_pending_strobes();
         if self.aitrace_mode {
@@ -11656,8 +11989,9 @@ impl Simulator {
             let has_timed = !self.event_queue.is_empty();
             let has_waiters = !self.event_waiters.is_empty();
             let has_clocks = !self.clock_generators.is_empty();
+            let has_reactive = !self.pending_reactive.is_empty();
 
-            if !has_timed && !has_waiters && !has_clocks && self.delayed_updates.is_empty() {
+            if !has_timed && !has_waiters && !has_clocks && self.delayed_updates.is_empty() && !has_reactive {
                 break;
             }
             // Deadlock: only waiters remain but nothing can ever wake them.
@@ -11680,7 +12014,7 @@ impl Simulator {
                 .into_iter()
                 .flatten()
                 .min()
-                .unwrap_or_else(|| if has_waiters { self.time } else { u64::MAX });
+                .unwrap_or_else(|| if has_waiters || has_reactive { self.time } else { u64::MAX });
 
             if next_time > self.max_time {
                 break;
@@ -11763,10 +12097,9 @@ impl Simulator {
         }
         if self.prof_par_dispatch_partition + self.prof_par_dispatch_legacy > 0 {
             eprintln!(
-                "[PROF] par_dispatch partition={} legacy={} tbb={} pdes={} (partition k={})",
+                "[PROF] par_dispatch partition={} legacy={} pdes={} (partition k={})",
                 self.prof_par_dispatch_partition,
                 self.prof_par_dispatch_legacy,
-                self.prof_par_dispatch_tbb,
                 self.prof_par_dispatch_pdes,
                 self.edge_block_partition_count
             );
@@ -11952,6 +12285,17 @@ impl Simulator {
                     "\"{}\": {}{}",
                     json_escape(name), set.len(),
                     if cr_iter.peek().is_some() { ", " } else { "" }
+                ));
+            }
+            // LRM §19.5 per-explicit-bin hit counts. Empty for coverpoints
+            // that didn't declare bins.
+            json.push_str("}, \"bins\": {");
+            let mut b_iter = inst.bin_hits.iter().peekable();
+            while let Some((name, count)) = b_iter.next() {
+                json.push_str(&format!(
+                    "\"{}\": {}{}",
+                    json_escape(name), count,
+                    if b_iter.peek().is_some() { ", " } else { "" }
                 ));
             }
             json.push_str("}}");
@@ -12471,6 +12815,52 @@ impl Simulator {
                     expanded.extend_from_slice(&stmts[i + 1..]);
                     self.run_process_stmts(pid, &expanded);
                     return;
+                }
+            }
+
+            // LRM §15.4.2: blocking mailbox.get(var) on an empty mailbox.
+            // When the next statement is `<mb>.get(<lvalue>);` and the
+            // resolved mailbox queue is empty, suspend this process: park
+            // the destination expression + post-get continuation in
+            // mailbox_get_waiters and return. A subsequent `put` will
+            // assign + reschedule the continuation.
+            if let StatementKind::Expr(expr) = &stmt.kind {
+                if let ExprKind::Call { func, args } = &expr.kind {
+                    // `mb.get(v)` parses as either
+                    //   Call{ func: Ident(hier=[mb,get]), args=[v] }   (common)
+                    //   Call{ func: MemberAccess{expr=mb, member=get} }
+                    // Recognise both forms; the receiver in the hier-Ident
+                    // case is the path with the last segment stripped.
+                    let (recv_expr_opt, method): (Option<Expression>, String) = match &func.kind {
+                        ExprKind::MemberAccess { expr: recv, member } => {
+                            (Some((**recv).clone()), member.name.clone())
+                        }
+                        ExprKind::Ident(hier) if hier.path.len() >= 2 => {
+                            let mut head = hier.clone();
+                            let last = head.path.pop().unwrap();
+                            let recv = Expression::new(ExprKind::Ident(head), expr.span);
+                            (Some(recv), last.name.name)
+                        }
+                        _ => (None, String::new()),
+                    };
+                    if method == "get" && !args.is_empty() {
+                        if let Some(recv) = recv_expr_opt {
+                            let recv_val = self.eval_expr(&recv);
+                            let handle = recv_val.to_u64().unwrap_or(0) as usize;
+                            if let Some(q) = self.mailboxes.get(&handle) {
+                                if q.is_empty() {
+                                    let lvalue = args[0].clone();
+                                    let cont: Vec<Statement> =
+                                        stmts[i + 1..].to_vec();
+                                    self.mailbox_get_waiters
+                                        .entry(handle)
+                                        .or_insert_with(std::collections::VecDeque::new)
+                                        .push_back(MailboxGetWaiter { pid, lvalue, cont });
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -13569,14 +13959,11 @@ impl Simulator {
                 }
 
                 // XEZIM_DISPATCHER selects parallel-block backend:
-                //   tbb  → Intel TBB work-stealing (feature gated)
                 //   pdes → PDES dispatcher (current: placeholder
                 //          delegating to std::scope; future: sparse
                 //          per-LP snapshot + boundary channels)
                 //   (default / unset) → std::thread::scope chunks
                 let dispatcher_env = dispatcher_env_cached();
-                let use_tbb = crate::tbb::is_available()
-                    && dispatcher_env == Some("tbb");
                 let use_pdes = dispatcher_env == Some("pdes");
 
                 let mut all_nba: Vec<Vec<NbaFast>> = Vec::new();
@@ -13800,68 +14187,6 @@ impl Simulator {
                             .saturating_add((max_t - min_t) as u64);
                     }
                     self.prof_par_dispatch_pdes += 1;
-                } else if use_tbb {
-                    // Lazily create the persistent task_arena on first
-                    // use. Reusing it across delta cycles avoids the
-                    // ~5-10 µs/cycle TBB cold-start cost.
-                    if self.tbb_arena.is_none() {
-                        let n_threads = std::thread::available_parallelism()
-                            .map(|n| n.get().min(8))
-                            .unwrap_or(4);
-                        self.tbb_arena = crate::tbb::Arena::new(n_threads);
-                    }
-                    // Pre-allocate one Vec<NbaFast> per partition. Each
-                    // TBB task writes to its own slot via raw pointer —
-                    // no locks. Safety: each partition index is touched
-                    // by at most one task, and the Vec is alive for the
-                    // entire arena.parallel_for call.
-                    let mut slots: Vec<Vec<NbaFast>> =
-                        (0..chunks.len()).map(|_| Vec::new()).collect();
-                    let slots_ptr = slots.as_mut_ptr() as usize;
-                    let n_slots = chunks.len();
-                    let chunks_ref = &chunks;
-                    let dispatch = |p: usize| {
-                        let chunk = chunks_ref[p].as_slice();
-                        let mut thread_nba: Vec<NbaFast> = Vec::new();
-                        let max_regs =
-                            chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
-                        let mut vm_regs = vec![Value::zero(1); max_regs];
-                        for (bi, bs) in chunk {
-                            if vm_regs.len() < bs.num_regs {
-                                vm_regs.resize(bs.num_regs, Value::zero(1));
-                            }
-                            let insns =
-                                unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
-                            let mut nba = Self::exec_insns_isolated(
-                                insns,
-                                signal_table,
-                                signal_signed,
-                                signal_name_to_id,
-                                array_first_id,
-                                &mut vm_regs,
-                                *bi as u32,
-                            );
-                            thread_nba.append(&mut nba);
-                        }
-                        // Write into our exclusive slot via raw pointer.
-                        if p < n_slots {
-                            unsafe {
-                                let dst = (slots_ptr as *mut Vec<NbaFast>).add(p);
-                                std::ptr::write(dst, thread_nba);
-                            }
-                        }
-                    };
-                    if let Some(arena) = self.tbb_arena.as_ref() {
-                        arena.parallel_for(chunks.len(), 1, dispatch);
-                    } else {
-                        // Feature gated off but XEZIM_DISPATCHER=tbb
-                        // somehow set: fall through sequentially.
-                        for p in 0..chunks.len() {
-                            dispatch(p);
-                        }
-                    }
-                    all_nba = slots;
-                    self.prof_par_dispatch_tbb += 1;
                 } else {
                     // XEZIM_PARALLEL_SERIALIZE=1: run exec_insns_isolated
                     // sequentially in the main thread (chunks processed in
@@ -15244,6 +15569,32 @@ impl Simulator {
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
+                // LRM §25.9: virtual-interface formal-arg alias —
+                // rewrite `vif.member` to `<bound>.member` when `vif`
+                // is in the current task call's alias frame. Must fire
+                // before the local-stack/class-prop checks so `vif`
+                // doesn't shadow a same-named local of unrelated type.
+                if hier.path.len() >= 2 {
+                    if let Some(frame) = self.local_iface_aliases.last() {
+                        let first = hier.path[0].name.name.as_str();
+                        if let Some(bound) = frame.get(first).cloned() {
+                            let rest = hier
+                                .path
+                                .iter()
+                                .skip(1)
+                                .map(|s| s.name.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(".");
+                            let target = format!("{}.{}", bound, rest);
+                            let prev = self.get_signal_value_by_name(&target);
+                            let w = prev.as_ref().map(|v| v.width).unwrap_or(val.width);
+                            let resized = val.resize(w);
+                            let changed = prev.as_ref() != Some(&resized);
+                            self.set_signal_value_by_name(&target, resized);
+                            return changed;
+                        }
+                    }
+                }
                 if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
                     let name = &hier.path[0].name.name;
                     // Check local stack
@@ -16279,6 +16630,124 @@ impl Simulator {
                 changed
             }
             ExprKind::MemberAccess { expr, member } => {
+                // LRM §25.9: virtual-interface formal-arg alias —
+                // task-local. Same as the hier-Ident path above but
+                // for the MemberAccess parse shape.
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if hier.path.len() == 1 {
+                        if let Some(frame) = self.local_iface_aliases.last() {
+                            let first = hier.path[0].name.name.as_str();
+                            if let Some(bound) = frame.get(first).cloned() {
+                                let target = format!("{}.{}", bound, member.name);
+                                let prev = self.get_signal_value_by_name(&target);
+                                let w = prev.as_ref().map(|v| v.width).unwrap_or(val.width);
+                                let resized = val.resize(w);
+                                let changed = prev.as_ref() != Some(&resized);
+                                self.set_signal_value_by_name(&target, resized);
+                                return changed;
+                            }
+                        }
+                    }
+                }
+                // LRM §25.10 — `vif_arr[i].member = ...` (indexed
+                // virtual-iface property write). Index{ Ident(vif_arr), idx }
+                // base shape; look up `(this_h, "vif_arr[idx]")` binding.
+                if let ExprKind::Index { expr: base, index } = &expr.kind {
+                    if let ExprKind::Ident(hier) = &base.kind {
+                        if hier.path.len() == 1 {
+                            let prop_base = hier.path[0].name.name.to_string();
+                            let this_h_opt = self
+                                .this_stack
+                                .last()
+                                .and_then(|t| *t);
+                            if let Some(this_h) = this_h_opt {
+                                let cls_name = self
+                                    .heap
+                                    .get(this_h)
+                                    .and_then(|o| o.as_ref().map(|i| i.class_name.clone()));
+                                let is_vif = cls_name
+                                    .as_ref()
+                                    .and_then(|cn| self.module.classes.get(cn))
+                                    .map(|cd| cd.virtual_iface_properties.contains_key(&prop_base))
+                                    .unwrap_or(false);
+                                if is_vif {
+                                    let idx = self.eval_expr(index).to_u64().unwrap_or(0);
+                                    let key_prop = format!("{}[{}]", prop_base, idx);
+                                    if let Some((bound_name, _modport)) = self
+                                        .virtual_iface_bindings
+                                        .get(&(this_h, key_prop))
+                                        .cloned()
+                                    {
+                                        let target = format!("{}.{}", bound_name, member.name);
+                                        let prev = self.get_signal_value_by_name(&target);
+                                        let w = prev.as_ref().map(|v| v.width).unwrap_or(val.width);
+                                        let resized = val.resize(w);
+                                        let changed = prev.as_ref() != Some(&resized);
+                                        self.set_signal_value_by_name(&target, resized);
+                                        return changed;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // LRM §25.8 — `vif.member = ...` where `vif` is a virtual-
+                // interface property of the current `this`'s class. Look
+                // up the binding, redirect the write to
+                // `<bound>.<member>`.
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if hier.path.len() == 1 {
+                        let prop = hier.path[0].name.name.as_str();
+                        if let Some(Some(this_h)) = self.this_stack.last() {
+                            let cls_name = if let Some(Some(inst)) = self.heap.get(*this_h) {
+                                Some(inst.class_name.clone())
+                            } else { None };
+                            let bound = cls_name
+                                .as_ref()
+                                .and_then(|cn| self.module.classes.get(cn))
+                                .and_then(|cd| cd.virtual_iface_properties.get(prop).map(|_| ()))
+                                .and(self.virtual_iface_bindings
+                                    .get(&(*this_h, prop.to_string())).cloned());
+                            if let Some((bound_name, modport_opt)) = bound {
+                                // LRM §25.4 — warn (don't reject) when
+                                // writing to a member declared `input` by
+                                // the property's modport view. We do not
+                                // block the write because the user may have
+                                // a deliberate test pattern; downstream the
+                                // member will still drive whatever signal
+                                // `<bound>.<member>` names.
+                                if let Some(mp_name) = &modport_opt {
+                                    // Locate the iface type from the class's
+                                    // virtual_iface_properties record.
+                                    let iface_t = cls_name.as_ref()
+                                        .and_then(|cn| self.module.classes.get(cn))
+                                        .and_then(|cd| cd.virtual_iface_properties.get(prop))
+                                        .map(|(t, _)| t.clone());
+                                    if let Some(iface_t) = iface_t {
+                                        if let Some(dirs) = self.module.modport_member_dirs
+                                            .get(&(iface_t.clone(), mp_name.clone()))
+                                        {
+                                            if matches!(
+                                                dirs.get(&member.name),
+                                                Some(crate::ast::types::PortDirection::Input)
+                                            ) {
+                                                eprintln!("[modport] virtual {}.{} write to input member '{}' (LRM §25.4)",
+                                                    iface_t, mp_name, member.name);
+                                            }
+                                        }
+                                    }
+                                }
+                                let target = format!("{}.{}", bound_name, member.name);
+                                let prev = self.get_signal_value_by_name(&target);
+                                let w = prev.as_ref().map(|v| v.width).unwrap_or(val.width);
+                                let resized = val.resize(w);
+                                let changed = prev.as_ref() != Some(&resized);
+                                self.set_signal_value_by_name(&target, resized);
+                                return changed;
+                            }
+                        }
+                    }
+                }
                 // `ClassName::static_prop = ...` — explicit static write.
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if hier.path.len() == 1 {
@@ -16432,6 +16901,54 @@ impl Simulator {
                 val
             }
             ExprKind::Ident(hier) => {
+                // LRM §14.3 clocking-block input read — `cb.<sig>`
+                // returns the snapshot taken at the most recent posedge
+                // of the cb's clock (`#1step` input skew). Falls through
+                // to generic lookup when the cb is unknown or the
+                // signal isn't an input.
+                if hier.path.len() == 2 {
+                    let cb = hier.path[0].name.name.as_str();
+                    let sig = hier.path[1].name.name.as_str();
+                    if let Some(snap) = self.clocking_snapshots.get(cb) {
+                        if let Some(v) = snap.get(sig) {
+                            return v.clone();
+                        }
+                        // Known cb but signal not in snapshot yet:
+                        // first read before any posedge — return the
+                        // current value as a sensible default.
+                        if let Some((_, sigs)) = self.clocking_meta.get(cb) {
+                            if sigs.iter().any(|(n, is_in)| n == sig && *is_in) {
+                                if let Some(v) = self.get_signal_value_by_name(sig)
+                                {
+                                    return v;
+                                }
+                            }
+                        }
+                    }
+                }
+                // LRM §15.5.3: `e.triggered` on a named event.
+                // `e.triggered` parses as Ident(path=[e, triggered]); match
+                // here BEFORE generic signal lookup so we don't get back X.
+                if hier.path.len() >= 2
+                    && hier.path.last().map(|s| s.name.name.as_str())
+                        == Some("triggered")
+                {
+                    let mut head = hier.clone();
+                    head.path.pop();
+                    let bare = head
+                        .path
+                        .last()
+                        .map(|s| s.name.name.clone())
+                        .unwrap_or_default();
+                    let resolved = self.resolve_hier_name(&head);
+                    let fired = self
+                        .event_triggered_time
+                        .get(&bare)
+                        .copied()
+                        .or_else(|| self.event_triggered_time.get(&resolved).copied())
+                        .map_or(false, |t| t == self.time);
+                    return if fired { Value::ones(1) } else { Value::zero(1) };
+                }
                 if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
                     let name = &hier.path[0].name.name;
                     if name == "UVM_ACTIVE" {
@@ -16443,6 +16960,36 @@ impl Simulator {
                     if let Some(locals) = self.local_stack.last() {
                         if let Some(val) = locals.get(name) {
                             return val.clone();
+                        }
+                    }
+                    // LRM §25.8: virtual-interface property read as a
+                    // scalar value. Without an explicit member, the
+                    // property's "value" is the binding existence —
+                    // bound → non-zero (the bound instance's hashed
+                    // sentinel handle), unbound → 0 (null). Drives the
+                    // `vif == null` / `vif != null` idiom.
+                    if let Some(Some(handle)) = self.this_stack.last() {
+                        let cls = self
+                            .heap
+                            .get(*handle)
+                            .and_then(|o| o.as_ref().map(|i| i.class_name.clone()));
+                        if let Some(cn) = cls {
+                            let is_vif = self
+                                .module
+                                .classes
+                                .get(&cn)
+                                .map(|cd| cd.virtual_iface_properties.contains_key(name))
+                                .unwrap_or(false);
+                            if is_vif {
+                                let bound = self
+                                    .virtual_iface_bindings
+                                    .contains_key(&(*handle, name.clone()));
+                                return if bound {
+                                    Value::from_u64(1, 32)
+                                } else {
+                                    Value::zero(32)
+                                };
+                            }
                         }
                     }
                     if let Some(Some(handle)) = self.this_stack.last() {
@@ -16459,6 +17006,47 @@ impl Simulator {
                         }
                     }
                 } else if hier.path.len() > 1 {
+                    // LRM §25.8: `<obj>.<vif>` external read — if `<obj>`
+                    // is a class handle whose class declares `<vif>` as a
+                    // virtual interface, return non-zero iff a binding
+                    // exists. Drives the `if (d.vif == null)` idiom from
+                    // outside the class.
+                    if hier.path.len() == 2 {
+                        let obj = &hier.path[0].name.name;
+                        let prop = &hier.path[1].name.name;
+                        let obj_handle = self
+                            .local_stack
+                            .last()
+                            .and_then(|locals| locals.get(obj).cloned())
+                            .or_else(|| self.get_signal_value_by_name(obj));
+                        if let Some(v) = obj_handle {
+                            let handle = v.to_u64().unwrap_or(0) as usize;
+                            if handle != 0 && handle < self.heap.len() {
+                                let cls = self
+                                    .heap
+                                    .get(handle)
+                                    .and_then(|o| o.as_ref().map(|i| i.class_name.clone()));
+                                if let Some(cn) = cls {
+                                    let is_vif = self
+                                        .module
+                                        .classes
+                                        .get(&cn)
+                                        .map(|cd| cd.virtual_iface_properties.contains_key(prop))
+                                        .unwrap_or(false);
+                                    if is_vif {
+                                        let bound = self
+                                            .virtual_iface_bindings
+                                            .contains_key(&(handle, prop.clone()));
+                                        return if bound {
+                                            Value::from_u64(1, 32)
+                                        } else {
+                                            Value::zero(32)
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // `ClassName::static_prop` — explicit static property read.
                     if hier.path.len() == 2 {
                         let cls = &hier.path[0].name.name;
@@ -16726,6 +17314,12 @@ impl Simulator {
                         v
                     }
                     UnaryOp::HashHash => Value::zero(1),
+                    // LRM §16.12.6 temporal operators outside their
+                    // SVA context — evaluate operand as a boolean (the
+                    // SVA executor handles the temporal semantics
+                    // separately when these appear inside a property
+                    // body).
+                    UnaryOp::SEventually | UnaryOp::SAlways => v,
                 }
             }
             ExprKind::Binary { op, left, right } => {
@@ -16759,6 +17353,44 @@ impl Simulator {
                         BinaryOp::LogEquiv => l.logic_equiv(&r),
                         _ => unreachable!(),
                     };
+                }
+                // LRM §16.12 — SVA implication operators `|->` (overlapping)
+                // and `|=>` (non-overlapping). For our deferred-eval
+                // observed-region framework (M9), evaluating both as plain
+                // logical implication `!a || b` is the right minimum-viable
+                // shape: the antecedent + consequent both already see the
+                // post-NBA settled state. The temporal-cycle distinction
+                // between `|->` and `|=>` would matter once we had a real
+                // automaton (one cycle of delay for `|=>`) — that's L2 in
+                // full and remains the larger follow-up.
+                if matches!(op, BinaryOp::OrMinusArrow | BinaryOp::OrFatArrow) {
+                    let l = self.eval_expr_ctx(left, ctx_width);
+                    let r = self.eval_expr_ctx(right, ctx_width);
+                    return l.logic_impl(&r);
+                }
+                // LRM §16.9 sequence operators — minimum-viable
+                // single-cycle evaluation (the SVA executor handles
+                // the temporal cases inside a property body; this is
+                // the fallback for a bare overlap check):
+                //   `a throughout b`  → a && b  (a must hold while b)
+                //   `a within b`      → a && b  (a inside b)
+                //   `a and b` (seq)   → a && b
+                //   `a or b` (seq)    → a || b
+                //   `a intersect b`   → a && b
+                //   `a until b`       → a || b  (a holds until b)
+                //   `a s_until b`     → a || b
+                if matches!(op,
+                    BinaryOp::Throughout | BinaryOp::Within | BinaryOp::Intersect
+                    | BinaryOp::SeqAnd)
+                {
+                    let l = self.eval_expr_ctx(left, ctx_width);
+                    let r = self.eval_expr_ctx(right, ctx_width);
+                    return l.logic_and(&r);
+                }
+                if matches!(op, BinaryOp::SeqOr | BinaryOp::Until | BinaryOp::SUntil) {
+                    let l = self.eval_expr_ctx(left, ctx_width);
+                    let r = self.eval_expr_ctx(right, ctx_width);
+                    return l.logic_or(&r);
                 }
                 // Unpacked array equality/inequality
                 if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
@@ -17399,6 +18031,75 @@ impl Simulator {
                 v
             }
             ExprKind::SystemCall { name, args } => match name.as_str() {
+                // LRM §16.9.3 `$past(<sig>[, N])` — value of `<sig>` from
+                // N clock cycles ago (default N=1). Only meaningful
+                // inside an SVA clocked body; falls back to current
+                // value when no active site (compile-time use).
+                "$past" => {
+                    let sig_name = match args.first().map(|a| &a.kind) {
+                        Some(ExprKind::Ident(h)) => self.resolve_hier_name(h),
+                        _ => String::new(),
+                    };
+                    let n_cycles = args
+                        .get(1)
+                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(1) as usize)
+                        .unwrap_or(1);
+                    // `refresh_sva_past_snapshots` pushes the CURRENT
+                    // value to ring[0] before body eval, so the value
+                    // from N cycles ago lives at ring[N] (with
+                    // ring[0] = current, ring[1] = 1 cycle ago, …).
+                    let idx = n_cycles;
+                    if let Some(site_idx) = self.active_sva_site {
+                        if let Some(ring) = self
+                            .sva_sites
+                            .get(site_idx)
+                            .and_then(|s| s.past_snapshots.get(&sig_name))
+                        {
+                            if let Some(v) = ring.get(idx) {
+                                return v.clone();
+                            }
+                        }
+                    }
+                    self.get_signal_value_by_name(&sig_name)
+                        .unwrap_or_else(|| Value::zero(32))
+                }
+                // LRM §16.9.3 sampled-value edge functions, all
+                // expressed in terms of `$past`: `$rose(x)` = was 0,
+                // is 1 now; `$fell(x)` = was 1, is 0 now;
+                // `$stable(x)` = value unchanged from previous cycle;
+                // `$changed(x)` = value differs from previous cycle.
+                "$rose" | "$fell" | "$stable" | "$changed" => {
+                    let sig_name = match args.first().map(|a| &a.kind) {
+                        Some(ExprKind::Ident(h)) => self.resolve_hier_name(h),
+                        _ => String::new(),
+                    };
+                    let cur = self
+                        .get_signal_value_by_name(&sig_name)
+                        .unwrap_or_else(|| Value::zero(32));
+                    let prev_opt = self.active_sva_site.and_then(|si| {
+                        self.sva_sites
+                            .get(si)
+                            .and_then(|s| s.past_snapshots.get(&sig_name))
+                            .and_then(|r| r.get(1).cloned())
+                    });
+                    let cur_bit = (cur.to_u64().unwrap_or(0) & 1) as u8;
+                    let prev_bit = prev_opt
+                        .as_ref()
+                        .map(|v| (v.to_u64().unwrap_or(0) & 1) as u8)
+                        .unwrap_or(cur_bit);
+                    let result = match name.as_str() {
+                        "$rose" => cur_bit == 1 && prev_bit == 0,
+                        "$fell" => cur_bit == 0 && prev_bit == 1,
+                        "$stable" => prev_opt.map_or(true, |p| {
+                            p.to_u64() == cur.to_u64()
+                        }),
+                        "$changed" => prev_opt.map_or(false, |p| {
+                            p.to_u64() != cur.to_u64()
+                        }),
+                        _ => unreachable!(),
+                    };
+                    if result { Value::ones(1) } else { Value::zero(1) }
+                }
                 // String-returning formatting functions. `$sformatf`/`$psprintf`
                 // take a format string followed by values and return the result
                 // (UVM's message macros are built almost entirely on these).
@@ -17964,6 +18665,29 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // LRM §15.5.3: `<event>.triggered` — returns 1 iff the
+                // named event was triggered in the same simulation time
+                // slot as this query. `EventTrigger` stamps
+                // `event_triggered_time[name] = self.time`.
+                if member.name == "triggered" {
+                    if let ExprKind::Ident(hier) = &expr.kind {
+                        let bare = hier
+                            .path
+                            .last()
+                            .map(|s| s.name.name.clone())
+                            .unwrap_or_default();
+                        let resolved = self.resolve_hier_name(hier);
+                        let fired = self
+                            .event_triggered_time
+                            .get(&bare)
+                            .copied()
+                            .or_else(|| {
+                                self.event_triggered_time.get(&resolved).copied()
+                            })
+                            .map_or(false, |t| t == self.time);
+                        return if fired { Value::ones(1) } else { Value::zero(1) };
+                    }
+                }
                 // `ClassName::static_prop` — explicit static property read.
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if hier.path.len() == 1 {
@@ -18132,23 +18856,65 @@ impl Simulator {
                 // `fld.sum() with (item.bit_width)`: evaluate `filter` for each
                 // element (with `item` bound to it) and reduce. Without this the
                 // reduction would sum the raw element/handle values.
-                if let ExprKind::Call { func, .. } = &expr.kind {
-                    if let ExprKind::MemberAccess { expr: arr_e, member } = &func.kind {
-                        let method = member.name.clone();
-                        if matches!(
-                            method.as_str(),
-                            "sum" | "product" | "min" | "max" | "and" | "or" | "xor"
-                        ) {
+                // Three parse shapes for `q.<method>`:
+                //   Call{ MemberAccess{q, method}, [] }     (with parens)
+                //   Call{ Ident(hier=[q, method]), [] }     (flat)
+                //   Ident(hier=[q, method])                 (no parens — `q.sort` form)
+                let parsed: Option<(String, String)> = if let ExprKind::Call { func, .. } = &expr.kind {
+                    match &func.kind {
+                        ExprKind::MemberAccess { expr: arr_e, member } => {
                             if let ExprKind::Ident(h) = &arr_e.kind {
-                                let mut arr = self.resolve_hier_name(h);
-                                if let Some(s) = self.instance_assoc_member(&arr) {
-                                    arr = s;
-                                }
-                                if self.module.arrays.contains_key(&arr)
-                                    || self.module.dynamic_arrays.contains(&arr)
-                                {
-                                    return self.reduce_with(&arr, &method, filter);
-                                }
+                                Some((self.resolve_hier_name(h), member.name.clone()))
+                            } else {
+                                None
+                            }
+                        }
+                        ExprKind::Ident(h) if h.path.len() >= 2 => {
+                            let mut head = h.clone();
+                            let last = head.path.pop().unwrap().name.name;
+                            Some((self.resolve_hier_name(&head), last))
+                        }
+                        _ => None,
+                    }
+                } else if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() >= 2 {
+                        let mut head = h.clone();
+                        let last = head.path.pop().unwrap().name.name;
+                        Some((self.resolve_hier_name(&head), last))
+                    } else {
+                        None
+                    }
+                } else if let ExprKind::MemberAccess { expr: arr_e, member } = &expr.kind {
+                    if let ExprKind::Ident(h) = &arr_e.kind {
+                        Some((self.resolve_hier_name(h), member.name.clone()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                {
+                    if let Some((mut arr, method)) = parsed {
+                        if let Some(s) = self.instance_assoc_member(&arr) {
+                            arr = s;
+                        }
+                        let is_arr = self.module.arrays.contains_key(&arr)
+                            || self.module.dynamic_arrays.contains(&arr);
+                        if is_arr {
+                            if matches!(
+                                method.as_str(),
+                                "sum" | "product" | "min" | "max" | "and" | "or" | "xor"
+                            ) {
+                                return self.reduce_with(&arr, &method, filter);
+                            }
+                            // LRM §7.12.2: `q.sort/.rsort/.unique with
+                            // (expr)` — in-place mutators with a per-
+                            // element filter expression (binds `item`).
+                            // sort/rsort use the filter's value as the
+                            // sort key; unique dedups by filter value.
+                            if matches!(method.as_str(), "sort" | "rsort" | "unique") {
+                                self.sort_with(&arr, &method, filter);
+                                return Value::zero(32);
                             }
                         }
                     }
@@ -18219,6 +18985,16 @@ impl Simulator {
             StatementKind::Null => {}
             StatementKind::Expr(expr) => self.exec_expr_stmt(expr),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
+                // LRM §25.8 virtual-interface binding. When the LHS is a
+                // class-property write whose property is declared
+                // `virtual <iface_t>`, the assignment isn't a value copy:
+                // we capture the RHS interface instance's NAME and store
+                // it as a binding. Later `obj.vif.member` accesses look up
+                // the binding and dispatch to `<bound>.<member>`. This
+                // short-circuits the normal Value-copy assignment path.
+                if self.try_bind_virtual_iface(lvalue, rvalue) {
+                    return;
+                }
                 // Dynamic-array sizing: `arr = new[size]`. The postfix `[size]`
                 // parses as `Call{ Ident(new), [size] }`. When the lvalue is a
                 // dynamic array (not a class handle — that would be a `new obj`
@@ -18909,7 +19685,21 @@ impl Simulator {
                             // argument that resolves to a live object handle is
                             // shallow-copied into a fresh instance. riscv-dv's
                             // get_rand_instr does `new instr_template[name]`.
-                            if args.len() == 1 {
+                            // Guard against confusing a small integer literal
+                            // with a handle: only treat the arg as a copy
+                            // source when it's clearly a handle expression
+                            // (Ident/MemberAccess/Index path) — never a
+                            // bare Number, Binary, or SystemCall.
+                            let arg_could_be_handle = args
+                                .first()
+                                .map(|a| matches!(
+                                    &a.kind,
+                                    ExprKind::Ident(_)
+                                        | ExprKind::MemberAccess { .. }
+                                        | ExprKind::Index { .. }
+                                ))
+                                .unwrap_or(false);
+                            if args.len() == 1 && arg_could_be_handle {
                                 let src_h = self.eval_expr(&args[0]).to_u64().unwrap_or(0) as usize;
                                 if src_h != 0 {
                                     if let Some(Some(_)) = self.heap.get(src_h) {
@@ -18980,7 +19770,28 @@ impl Simulator {
                                         }
                                         return;
                                     } else {
-                                        self.eval_expr_ctx(rvalue, w)
+                                        // `lhs = new()` where the LHS type
+                                        // (`tname`) is known but not a modelled
+                                        // class/covergroup — typically a typedef
+                                        // of a parameterized class such as
+                                        // `typedef uvm_pool#(...) uvm_id_actions_array`.
+                                        // Construct an opaque instance tagged
+                                        // with that type. CRUCIAL: never fall
+                                        // back to evaluating the bare `new()` as
+                                        // a generic call — `new` on an
+                                        // assignment RHS denotes the LHS type's
+                                        // constructor, but the generic path
+                                        // re-binds it to the *enclosing* class's
+                                        // `new`, which for UVM
+                                        // `uvm_report_handler::initialize`
+                                        // (`id_actions = new();`) recurses
+                                        // new -> initialize -> new … forever.
+                                        let h = self.heap.len();
+                                        self.heap.push(Some(ClassInstance {
+                                            class_name: tname.clone(),
+                                            properties: HashMap::default(),
+                                        }));
+                                        Value::from_u64(h as u64, 32)
                                     }
                                 }
                             } else {
@@ -18996,7 +19807,18 @@ impl Simulator {
                                     }
                                     return;
                                 } else {
-                                    self.eval_expr_ctx(rvalue, w)
+                                    // `lhs = new()` with an unknown LHS type:
+                                    // opaque instance. NEVER eval the bare
+                                    // `new()` generically — it re-binds to the
+                                    // enclosing class's constructor and
+                                    // recurses (see the matching note above for
+                                    // UVM `uvm_report_handler::initialize`).
+                                    let h = self.heap.len();
+                                    self.heap.push(Some(ClassInstance {
+                                        class_name: String::new(),
+                                        properties: HashMap::default(),
+                                    }));
+                                    Value::from_u64(h as u64, 32)
                                 }
                             }
                         } else {
@@ -19120,9 +19942,14 @@ impl Simulator {
                                         }
                                     };
                                     let (l_lo, l_hi, _) = self.module.arrays[&lname];
+                                    let is_dyn = self.module.dynamic_arrays.contains(&lname);
                                     for (i, v) in results.iter().enumerate() {
                                         let idx = l_lo + i as i64;
-                                        if idx > l_hi {
+                                        // Dynamic arrays / queues start
+                                        // with `l_hi = -1` (empty). Skip
+                                        // the bound check there — the
+                                        // assignment is what GROWS them.
+                                        if !is_dyn && idx > l_hi {
                                             break;
                                         }
                                         self.set_signal_value_by_name(
@@ -19130,7 +19957,7 @@ impl Simulator {
                                             v.clone(),
                                         );
                                     }
-                                    if self.module.dynamic_arrays.contains(&lname) {
+                                    if is_dyn {
                                         self.set_queue_size(&lname, results.len() as u64);
                                     }
                                     if !self.in_edge_block {
@@ -19311,6 +20138,28 @@ impl Simulator {
                 rvalue,
             } => {
                 let val = self.eval_expr(rvalue);
+                // LRM §14.4: clocking-block output drive
+                // `cb.<out_sig> <= val`. Defer to the cb's next clock
+                // edge (output skew) instead of driving now.
+                if let ExprKind::Ident(hier) = &lvalue.kind {
+                    if hier.path.len() == 2 {
+                        let cb = hier.path[0].name.name.as_str();
+                        let sig = hier.path[1].name.name.as_str();
+                        if let Some((_, sigs)) = self.clocking_meta.get(cb) {
+                            // Output signals are the non-input entries.
+                            let is_output = sigs
+                                .iter()
+                                .any(|(n, is_in)| n == sig && !*is_in);
+                            if is_output {
+                                self.clocking_output_pending
+                                    .entry(cb.to_string())
+                                    .or_default()
+                                    .push((sig.to_string(), val));
+                                return;
+                            }
+                        }
+                    }
+                }
                 // SV-2023: NBA to a ref formal redirects to the caller's
                 // actual lvalue (IEEE 1800-2023 §13.5.2).
                 let lvalue_owned;
@@ -19552,26 +20401,47 @@ impl Simulator {
                 {
                     if let Some(an) = self.expr_assoc_name(array) {
                         if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
-                            let prefix = format!("{}[", an);
-                            let mut keys: Vec<String> = self
+                            // A queue / dynamic array carries an authoritative
+                            // `<name>.size` shadow and is DENSE: iterate the
+                            // logical range [0, size). Scanning the raw signal
+                            // keys instead would visit stale elements left
+                            // behind when the queue shrank (e.g. a reassigned
+                            // `obj.q = {…}` that dropped its tail) — those keys
+                            // linger in the `signals` map past the logical size
+                            // and produce phantom iterations / off-by-one index
+                            // counts. Only TRUE associative arrays (sparse, no
+                            // `.size` shadow) fall through to the key-scan.
+                            let keys: Vec<String>;
+                            let is_str;
+                            if let Some(sz) = self
                                 .signals
-                                .keys()
-                                .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
-                                .map(|k| k[prefix.len()..k.len() - 1].to_string())
-                                .collect();
-                            let is_str = self
-                                .module
-                                .associative_arrays
-                                .get(&an)
-                                .copied()
-                                .unwrap_or(false);
-                            // Integer-keyed members (queues, int assoc arrays)
-                            // iterate in NUMERIC order; lexicographic sort would
-                            // visit "10" before "2" and scramble queue order.
-                            if is_str {
-                                keys.sort();
+                                .get(&format!("{}.size", an))
+                                .and_then(|v| v.to_u64())
+                            {
+                                keys = (0..sz).map(|i| i.to_string()).collect();
+                                is_str = false;
                             } else {
-                                keys.sort_by_key(|k| k.parse::<u64>().unwrap_or(0));
+                                let prefix = format!("{}[", an);
+                                let mut ks: Vec<String> = self
+                                    .signals
+                                    .keys()
+                                    .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
+                                    .map(|k| k[prefix.len()..k.len() - 1].to_string())
+                                    .collect();
+                                is_str = self
+                                    .module
+                                    .associative_arrays
+                                    .get(&an)
+                                    .copied()
+                                    .unwrap_or(false);
+                                // Integer-keyed members iterate in NUMERIC order;
+                                // lexicographic sort would visit "10" before "2".
+                                if is_str {
+                                    ks.sort();
+                                } else {
+                                    ks.sort_by_key(|k| k.parse::<u64>().unwrap_or(0));
+                                }
+                                keys = ks;
                             }
                             self.widths.insert(var.name.clone(), 32);
                             for key in keys {
@@ -19956,6 +20826,68 @@ impl Simulator {
             }
             StatementKind::Assertion(a) => {
                 use crate::ast::stmt::AssertionKind;
+                // LRM §16.5 — concurrent (`assert property (…)`) defers
+                // evaluation to the observed region. We queue an
+                // `ObservedProbe`; the drain in `drain_observed_region`
+                // re-evaluates the predicate against the post-NBA settled
+                // state and folds the outcome into assertion_stats. The
+                // action / else_action are not run for concurrent variants
+                // today — they'd need to fire in the reactive region,
+                // which is its own follow-up.
+                if a.is_property {
+                    // LRM §16.6: `assert property (p_name);` —
+                    // resolve a bare property-name reference to its
+                    // stored body before dispatching to SVA. The
+                    // property's body was captured at parse time
+                    // (common `@(clk) <expr>` shape) and stored in
+                    // `module.property_decls`.
+                    let resolved_expr: Expression = match &a.expr.kind {
+                        ExprKind::Ident(h) if h.path.len() == 1 => {
+                            let name = &h.path[0].name.name;
+                            if let Some(body) =
+                                self.module.property_decls.get(name).cloned()
+                            {
+                                body
+                            } else {
+                                a.expr.clone()
+                            }
+                        }
+                        _ => a.expr.clone(),
+                    };
+                    // LRM §16.5: a `SvaClocked{clock, body}` body
+                    // registers a clocked site instead of going through
+                    // the per-iteration observed-probe path. Dedup by
+                    // span_key so re-execution (e.g. inside an always
+                    // block) doesn't grow the site list unbounded.
+                    if let ExprKind::SvaClocked { clock, body } = &resolved_expr.kind {
+                        let span_key = a.span.start;
+                        if !self.sva_sites.iter().any(|s| s.span_key == span_key) {
+                            let clock_signal = match &clock.kind {
+                                ExprKind::Ident(h) => self.resolve_hier_name(h),
+                                _ => String::new(),
+                            };
+                            self.sva_sites.push(SvaClockedSite {
+                                span_key,
+                                clock_signal,
+                                body: (**body).clone(),
+                                prev_clock: 2, // sentinel
+                                pending: std::collections::VecDeque::new(),
+                                s_eventually: Vec::new(),
+                                s_always: Vec::new(),
+                                past_snapshots: HashMap::default(),
+                            });
+                        }
+                        return;
+                    }
+                    let probe_name = format!("prop@{}", a.span.start);
+                    let this_handle = self.this_stack.last().and_then(|t| *t);
+                    self.pending_observed.push(ObservedProbe {
+                        name: probe_name,
+                        predicate: resolved_expr,
+                        this_handle,
+                    });
+                    return;
+                }
                 let true_branch = self.eval_expr(&a.expr).is_true();
                 // Track per-site tallies for end-of-sim summary + JSON DB.
                 let kind_tag: u8 = match a.kind {
@@ -20003,7 +20935,23 @@ impl Simulator {
                 // A 0 width is never valid for a variable.
                 let w = if w0 == 0 { 32 } else { w0 };
                 let two_state = super::elaborate::is_type_two_state(data_type);
-                let default_v = if two_state {
+                // LRM §8.4: an uninitialized class handle defaults to
+                // `null`. Treat class-handle types and `chandle` as
+                // two-state-zero so `if (h == null)` works without an
+                // explicit `= null`. We detect class handles by
+                // resolving the type name against `module.classes`.
+                let is_class_handle = match data_type {
+                    crate::ast::types::DataType::TypeReference { name, .. } => {
+                        let n = &name.name.name;
+                        self.module.classes.contains_key(n)
+                    }
+                    crate::ast::types::DataType::Simple {
+                        kind: crate::ast::types::SimpleType::Chandle,
+                        ..
+                    } => true,
+                    _ => false,
+                };
+                let default_v = if two_state || is_class_handle {
                     Value::zero(w)
                 } else {
                     Value::new(w)
@@ -20060,6 +21008,41 @@ impl Simulator {
                                 self.module.dynamic_arrays.insert(name.clone());
                                 self.widths.insert(name.clone(), w);
                                 self.set_queue_size(&name, 0);
+                                // LRM §7.10 / §7.12.1 — if an initializer
+                                // is provided (e.g. `int idx[$] =
+                                // q.find_first_index with (…);`),
+                                // synthesise a BlockingAssign so the queue
+                                // is populated via the same path as a
+                                // standalone assignment. Without this the
+                                // init is silently dropped and the queue
+                                // stays empty.
+                                if let Some(init) = &d.init {
+                                    let lvalue = crate::ast::expr::Expression::new(
+                                        crate::ast::expr::ExprKind::Ident(
+                                            crate::ast::expr::HierarchicalIdentifier {
+                                                root: None,
+                                                path: vec![crate::ast::expr::HierPathSegment {
+                                                    name: crate::ast::Identifier {
+                                                        name: name.clone(),
+                                                        span: d.name.span,
+                                                    },
+                                                    selects: Vec::new(),
+                                                }],
+                                                span: d.name.span,
+                                                cached_signal_id: std::cell::Cell::new(None),
+                                                cached_resolved_name: std::cell::OnceCell::new(),
+                                            },
+                                        ),
+                                        d.name.span,
+                                    );
+                                    let assign = crate::ast::stmt::Statement::new(
+                                        crate::ast::stmt::StatementKind::BlockingAssign {
+                                            lvalue, rvalue: init.clone(),
+                                        },
+                                        d.name.span,
+                                    );
+                                    self.exec_statement(&assign);
+                                }
                                 continue;
                             }
                             UnpackedDimension::Associative { data_type: key_dt, .. } => {
@@ -20194,6 +21177,22 @@ impl Simulator {
                                     .insert(d.name.name.clone(), cn.clone());
                             }
                         }
+                        // LRM §6.19.6: track typedef-typed locals so
+                        // `local.next()`/`.first()`/etc. find their
+                        // enum-member list. We extract the bare type
+                        // name from a TypeReference data_type.
+                        if let crate::ast::types::DataType::TypeReference {
+                            name, ..
+                        } = data_type
+                        {
+                            let tn = name.name.name.clone();
+                            if self.module.enum_members.contains_key(&tn)
+                                || self.module.typedefs.contains_key(&tn)
+                            {
+                                self.var_typedef_types
+                                    .insert(d.name.name.clone(), tn);
+                            }
+                        }
                     }
                 }
             }
@@ -20229,8 +21228,17 @@ impl Simulator {
                             self.time
                         );
                         self.fast_signal_write(&sig_name, new_val);
+                        // LRM §15.5.3: stamp last-trigger time so
+                        // `e.triggered` returns 1 in the same time slot.
+                        self.event_triggered_time
+                            .insert(sig_name.clone(), self.time);
                     }
                 }
+                // Also stamp the bare name (covers cases where the signal
+                // lookup failed because the event was never registered as a
+                // signal — `.triggered` still reads correctly).
+                self.event_triggered_time
+                    .insert(name.name.clone(), self.time);
                 // Settle combinatorial logic but defer edge-triggered blocks
                 // (always @(e)) to the main event loop so the triggering
                 // process sees pre-event state until its next delay/wait.
@@ -20764,6 +21772,467 @@ impl Simulator {
         }
     }
 
+    /// LRM §4.4 observed-region drain. Each registered probe gets its
+    /// predicate re-evaluated against the post-NBA settled state; the
+    /// boolean outcome is folded into the assertion stats keyed by the
+    /// probe's `name` so a concurrent property's pass/fail count shows up
+    /// alongside the immediate-assertion counters in the coverage DB.
+    ///
+    /// Today's behavior: drains and evaluates whatever's queued. With no
+    /// producer wired yet (M9 deferred), the queue is empty in practice
+    /// and this is an inexpensive no-op.
+    /// LRM §4.4 reactive-region drain. Executes any `Statement`s
+    /// queued by program-block code or other reactive-region producers.
+    /// Today's behavior: drains and runs whatever's queued. With no
+    /// producer wired yet, the queue is empty and this is a cheap no-op.
+    fn drain_reactive_region(&mut self) {
+        if self.pending_reactive.is_empty() {
+            return;
+        }
+        let stmts = std::mem::take(&mut self.pending_reactive);
+        for s in stmts {
+            self.exec_statement(&s);
+        }
+    }
+
+    /// LRM §16.5: edge-detect each registered SVA clock, then for each
+    /// fired clock site:
+    ///   1. Drain any deferred consequents whose cycle counter reaches 0.
+    ///   2. Evaluate the body's antecedent (or whole body if not a
+    ///      `|->`/`|=>`/`##N` shape).
+    ///   3. If `|=>`, push consequent with cycles_remaining=1.
+    ///      If `lhs ##N rhs` (Binary{HashHash, …}), push rhs with N.
+    ///      If `|->`, tally `!lhs || rhs` immediately.
+    fn tick_sva_sites(&mut self) {
+        if self.sva_sites.is_empty() {
+            return;
+        }
+        // Use indices so we can call &mut self methods inside the loop
+        // without holding a borrow on self.sva_sites.
+        for i in 0..self.sva_sites.len() {
+            let clk_name = self.sva_sites[i].clock_signal.clone();
+            if clk_name.is_empty() {
+                continue;
+            }
+            let cur_clk_bit = self
+                .get_signal_value_by_name(&clk_name)
+                .and_then(|v| v.to_u64())
+                .map(|u| (u & 1) as u8)
+                .unwrap_or(2);
+            let prev = self.sva_sites[i].prev_clock;
+            // Update prev_clock for next iteration *before* edge logic
+            // so a posedge fires exactly once per 0→1 transition.
+            self.sva_sites[i].prev_clock = cur_clk_bit;
+            // Posedge only for now (most common SVA form). Edge detect:
+            // prev = 0, cur = 1.
+            if !(prev == 0 && cur_clk_bit == 1) {
+                continue;
+            }
+            // 1) Drain pending consequents whose counter is 1 (they're
+            //    due this cycle), decrement the rest.
+            let mut due: Vec<Expression> = Vec::new();
+            {
+                let pend = &mut self.sva_sites[i].pending;
+                let mut keep: std::collections::VecDeque<(u32, Expression)> =
+                    std::collections::VecDeque::new();
+                while let Some((cycles, e)) = pend.pop_front() {
+                    if cycles <= 1 {
+                        due.push(e);
+                    } else {
+                        keep.push_back((cycles - 1, e));
+                    }
+                }
+                *pend = keep;
+            }
+            // 1b) LRM §16.12.6 `s_eventually` watchers — each tick,
+            // evaluate every watcher; if true, tally PASS and remove.
+            // Otherwise the watcher persists. At end-of-sim, any
+            // remaining watcher counts as FAIL (handled later).
+            let span_key_for_evt = self.sva_sites[i].span_key;
+            let watchers: Vec<Expression> =
+                std::mem::take(&mut self.sva_sites[i].s_eventually);
+            for w in watchers {
+                let outcome = self.eval_expr(&w).is_true();
+                if outcome {
+                    let stat = self
+                        .assertion_stats
+                        .entry(span_key_for_evt)
+                        .or_insert_with(|| AssertionStat {
+                            kind: 0,
+                            pass_count: 0,
+                            fail_count: 0,
+                        });
+                    stat.pass_count += 1;
+                } else {
+                    self.sva_sites[i].s_eventually.push(w);
+                }
+            }
+            // 1c) LRM §16.12.6 `s_always` watchers — each tick,
+            // evaluate; first failure tallies FAIL + removes; success
+            // persists. (Bound-less case; ranged `s_always [m:n]` is
+            // a follow-up.)
+            let always_watchers: Vec<Expression> =
+                std::mem::take(&mut self.sva_sites[i].s_always);
+            for w in always_watchers {
+                let outcome = self.eval_expr(&w).is_true();
+                if outcome {
+                    self.sva_sites[i].s_always.push(w);
+                } else {
+                    let stat = self
+                        .assertion_stats
+                        .entry(span_key_for_evt)
+                        .or_insert_with(|| AssertionStat {
+                            kind: 0,
+                            pass_count: 0,
+                            fail_count: 0,
+                        });
+                    stat.fail_count += 1;
+                }
+            }
+            let span_key = self.sva_sites[i].span_key;
+            for e in due {
+                let v = self.eval_expr(&e).is_true();
+                let stat = self
+                    .assertion_stats
+                    .entry(span_key)
+                    .or_insert_with(|| AssertionStat {
+                        kind: 0, /* assert */
+                        pass_count: 0,
+                        fail_count: 0,
+                    });
+                if v {
+                    stat.pass_count += 1;
+                } else {
+                    stat.fail_count += 1;
+                }
+            }
+            // 2) Process the property body for this clock fire.
+            let body = self.sva_sites[i].body.clone();
+            // LRM §16.9.3: refresh the past-value snapshots BEFORE the
+            // body evaluates, so the body's `$past(<sig>)` reads the
+            // value as of the previous clock cycle. We walk the body
+            // once to collect the `$past`-referenced signal names.
+            self.refresh_sva_past_snapshots(i, &body);
+            let prev_active = self.active_sva_site.replace(i);
+            self.tick_sva_body(span_key, i, &body);
+            self.active_sva_site = prev_active;
+        }
+    }
+
+    /// Collect bare-signal `$past` argument names into the site's
+    /// snapshot ring, pushing the current value and trimming to a max
+    /// depth. Each unique signal gets its own ring; index 0 = most
+    /// recent (1 cycle ago).
+    fn refresh_sva_past_snapshots(&mut self, site_idx: usize, body: &Expression) {
+        const PAST_MAX_DEPTH: usize = 16;
+        let mut names: Vec<String> = Vec::new();
+        self.collect_past_arg_names(body, &mut names);
+        for name in names {
+            let v = self
+                .get_signal_value_by_name(&name)
+                .unwrap_or_else(|| Value::zero(32));
+            let ring = self.sva_sites[site_idx]
+                .past_snapshots
+                .entry(name)
+                .or_insert_with(std::collections::VecDeque::new);
+            ring.push_front(v);
+            while ring.len() > PAST_MAX_DEPTH {
+                ring.pop_back();
+            }
+        }
+    }
+
+    /// Walk `expr` and append every bare signal name referenced by a
+    /// `$past(<signal>[, N])` system call to `out`. Used to refresh
+    /// per-site snapshots once per clock fire.
+    fn collect_past_arg_names(&self, expr: &Expression, out: &mut Vec<String>) {
+        match &expr.kind {
+            ExprKind::SystemCall { name, args }
+                if matches!(
+                    name.as_str(),
+                    "$past" | "$rose" | "$fell" | "$stable" | "$changed"
+                ) =>
+            {
+                if let Some(arg) = args.first() {
+                    if let ExprKind::Ident(h) = &arg.kind {
+                        out.push(self.resolve_hier_name(h));
+                    }
+                }
+                for a in args {
+                    self.collect_past_arg_names(a, out);
+                }
+            }
+            ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    self.collect_past_arg_names(a, out);
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.collect_past_arg_names(left, out);
+                self.collect_past_arg_names(right, out);
+            }
+            ExprKind::Unary { operand, .. } => {
+                self.collect_past_arg_names(operand, out);
+            }
+            ExprKind::Paren(inner) => {
+                self.collect_past_arg_names(inner, out);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.collect_past_arg_names(condition, out);
+                self.collect_past_arg_names(then_expr, out);
+                self.collect_past_arg_names(else_expr, out);
+            }
+            ExprKind::Call { args, .. } => {
+                for a in args {
+                    self.collect_past_arg_names(a, out);
+                }
+            }
+            ExprKind::SvaClocked { body, .. } => {
+                self.collect_past_arg_names(body, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// LRM §16.5: process one clock fire of an SVA property body.
+    fn tick_sva_body(&mut self, span_key: usize, site_idx: usize, body: &Expression) {
+        // LRM §16.6 `disable iff (g)` wrapper. The parser encodes the
+        // clause as `Binary{LogAnd, !g, inner_body}`. When `g` is true
+        // (so `!g` is false), the property is suppressed for this
+        // cycle and any deferred consequents from prior cycles are
+        // dropped — LRM-correct disable-iff semantics.
+        if let ExprKind::Binary { op, left, right } = &body.kind {
+            if matches!(op, crate::ast::expr::BinaryOp::LogAnd) {
+                if let ExprKind::Unary { op: uop, operand } = &left.kind {
+                    if matches!(uop, crate::ast::expr::UnaryOp::LogNot) {
+                        let g_true = self.eval_expr(operand).is_true();
+                        if g_true {
+                            // Suppress this cycle: drop any pending
+                            // consequents and skip tally.
+                            self.sva_sites[site_idx].pending.clear();
+                            return;
+                        }
+                        // Guard false: process the inner body as
+                        // normal.
+                        return self.tick_sva_body(span_key, site_idx, right);
+                    }
+                }
+            }
+        }
+        match &body.kind {
+            // `lhs |=> rhs` — non-overlapping implication. If `lhs` is
+            // true now, register `rhs` to evaluate at the next clock.
+            // Special case: `lhs |=> s_eventually inner` — when lhs
+            // fires, push `inner` to the s_eventually watcher list
+            // instead of a 1-cycle defer; the tick loop checks it
+            // every cycle until true (LRM §16.12.6).
+            ExprKind::Binary { op, left, right }
+                if matches!(op, crate::ast::expr::BinaryOp::OrFatArrow) =>
+            {
+                let lhs_true = self.eval_expr(left).is_true();
+                if lhs_true {
+                    if let ExprKind::Unary {
+                        op: uop,
+                        operand,
+                    } = &right.kind
+                    {
+                        if matches!(uop, crate::ast::expr::UnaryOp::SEventually) {
+                            self.sva_sites[site_idx]
+                                .s_eventually
+                                .push((**operand).clone());
+                            return;
+                        }
+                        if matches!(uop, crate::ast::expr::UnaryOp::SAlways) {
+                            self.sva_sites[site_idx]
+                                .s_always
+                                .push((**operand).clone());
+                            return;
+                        }
+                    }
+                    // `lhs |=> ##N inner` — defer the inner check by
+                    // 1+N cycles (the |=> 1-cycle defer plus the
+                    // ##N delay).
+                    if let ExprKind::Binary { op: rop, left: rl, right: rr } = &right.kind {
+                        if matches!(rop, crate::ast::expr::BinaryOp::HashHash) {
+                            let n = self.eval_expr(rl).to_u64().unwrap_or(0) as u32;
+                            self.sva_sites[site_idx]
+                                .pending
+                                .push_back((1 + n, (**rr).clone()));
+                            return;
+                        }
+                    }
+                    self.sva_sites[site_idx]
+                        .pending
+                        .push_back((1, (**right).clone()));
+                }
+            }
+            // `lhs |-> rhs` — overlapping implication. If `lhs` true,
+            // require `rhs` true at the same clock; tally now.
+            // Special case: when `rhs` is `Binary{HashHash, N, body}`,
+            // i.e. `lhs |-> ##N body`, defer the body check by N cycles
+            // instead of tallying now.
+            ExprKind::Binary { op, left, right }
+                if matches!(op, crate::ast::expr::BinaryOp::OrMinusArrow) =>
+            {
+                let lhs = self.eval_expr(left).is_true();
+                if !lhs {
+                    let stat = self
+                        .assertion_stats
+                        .entry(span_key)
+                        .or_insert_with(|| AssertionStat {
+                            kind: 0,
+                            pass_count: 0,
+                            fail_count: 0,
+                        });
+                    stat.pass_count += 1; // vacuous
+                    return;
+                }
+                // `lhs |-> ##N body` → defer body N cycles.
+                if let ExprKind::Binary { op: rop, left: rl, right: rr } = &right.kind {
+                    if matches!(rop, crate::ast::expr::BinaryOp::HashHash) {
+                        let n = self.eval_expr(rl).to_u64().unwrap_or(0) as u32;
+                        let cycles = n.max(1);
+                        self.sva_sites[site_idx]
+                            .pending
+                            .push_back((cycles, (**rr).clone()));
+                        return;
+                    }
+                }
+                // `lhs |-> rhs` (overlap): check rhs now.
+                let outcome = self.eval_expr(right).is_true();
+                let stat = self
+                    .assertion_stats
+                    .entry(span_key)
+                    .or_insert_with(|| AssertionStat {
+                        kind: 0,
+                        pass_count: 0,
+                        fail_count: 0,
+                    });
+                if outcome {
+                    stat.pass_count += 1;
+                } else {
+                    stat.fail_count += 1;
+                }
+            }
+            // Plain boolean body: tally directly each clock.
+            _ => {
+                let outcome = self.eval_expr(body).is_true();
+                let stat = self
+                    .assertion_stats
+                    .entry(span_key)
+                    .or_insert_with(|| AssertionStat {
+                        kind: 0,
+                        pass_count: 0,
+                        fail_count: 0,
+                    });
+                if outcome {
+                    stat.pass_count += 1;
+                } else {
+                    stat.fail_count += 1;
+                }
+            }
+        }
+    }
+
+    /// LRM §14.3 clocking-block input snapshot. Each registered cb
+    /// has a clock signal; on every posedge transition of that clock
+    /// we snapshot the current values of input-direction signals. The
+    /// snapshot is the value `cb.<sig>` returns for reads until the
+    /// next posedge updates it — this is the `#1step` input-skew
+    /// behavior that lets UVM monitors sample stable pre-edge state.
+    fn tick_clocking_blocks(&mut self) {
+        if self.clocking_meta.is_empty() {
+            return;
+        }
+        let cb_names: Vec<String> = self.clocking_meta.keys().cloned().collect();
+        for cb in cb_names {
+            let (clk, sigs) = self.clocking_meta.get(&cb).cloned().unwrap();
+            let cur = self
+                .get_signal_value_by_name(&clk)
+                .and_then(|v| v.to_u64())
+                .map(|u| (u & 1) as u8)
+                .unwrap_or(2);
+            let prev = *self.clocking_prev_clock.get(&cb).unwrap_or(&2);
+            self.clocking_prev_clock.insert(cb.clone(), cur);
+            if !(prev == 0 && cur == 1) {
+                continue;
+            }
+            // Posedge: refresh input snapshots. We snapshot the
+            // CURRENT signal values — this matches LRM `#1step` for
+            // designs where the producer drives the input signal in
+            // the active region of the same cycle. For
+            // skew-into-prev-cycle semantics, the caller would need
+            // to register the snapshot earlier in the tick; that's
+            // a follow-up.
+            let mut snap = HashMap::default();
+            for (sig, is_input) in &sigs {
+                if *is_input {
+                    if let Some(v) = self.get_signal_value_by_name(sig) {
+                        snap.insert(sig.clone(), v);
+                    }
+                }
+            }
+            self.clocking_snapshots.insert(cb.clone(), snap);
+            // LRM §14.4 output skew: apply any pending output drives
+            // queued by `cb.<out_sig> <= val` since the last edge.
+            // Route through `assign_value` (with a synthesised Ident
+            // lvalue) so width/signedness handling matches a normal
+            // procedural assignment.
+            if let Some(pending) = self.clocking_output_pending.remove(&cb) {
+                for (sig, val) in pending {
+                    let lval = Expression::new(
+                        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                            root: None,
+                            path: vec![crate::ast::expr::HierPathSegment {
+                                name: crate::ast::Identifier {
+                                    name: sig.clone(),
+                                    span: crate::ast::Span::dummy(),
+                                },
+                                selects: Vec::new(),
+                            }],
+                            span: crate::ast::Span::dummy(),
+                            cached_signal_id: std::cell::Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        }),
+                        crate::ast::Span::dummy(),
+                    );
+                    self.assign_value(&lval, &val);
+                }
+            }
+        }
+    }
+
+    fn drain_observed_region(&mut self) {
+        if self.pending_observed.is_empty() {
+            return;
+        }
+        let probes = std::mem::take(&mut self.pending_observed);
+        for probe in probes {
+            // Push `this` so member references in the predicate resolve
+            // against the property's owning class instance (if any).
+            self.this_stack.push(probe.this_handle);
+            let outcome = self.eval_expr(&probe.predicate).is_true();
+            self.this_stack.pop();
+            // Fold into assertion_stats so the coverage DB reflects
+            // concurrent-property hits without a separate channel.
+            // Synthesize a "span_key" by hashing the probe name so it
+            // doesn't collide with file-position-keyed immediate stats.
+            let span_key = probe.name.as_bytes().iter()
+                .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
+                .wrapping_add(1); // never 0
+            // AssertionStat.kind is a u8 tag — reuse the immediate-cover
+            // tag for concurrent-cover probes (no dedicated tag yet).
+            let stat = self.assertion_stats.entry(span_key as usize).or_insert_with(|| {
+                AssertionStat { kind: 2 /* cover */, pass_count: 0, fail_count: 0 }
+            });
+            if outcome { stat.pass_count += 1; } else { stat.fail_count += 1; }
+        }
+    }
+
     fn check_monitor(&mut self) {
         if let Some((tn, args)) = self.monitor.clone() {
             self.sync_table_to_hashmap();
@@ -20826,6 +22295,98 @@ impl Simulator {
             .map(|s| s.name.name.as_str())
             .collect::<Vec<_>>()
             .join(".");
+        // LRM §25.9: if the leading segment names a virtual-interface
+        // formal-arg alias in the current task call frame, rewrite the
+        // path to use the bound interface instance name. Has to fire
+        // before the class-property dispatch below so a task formal
+        // `vif` doesn't get shadowed by a same-named class prop.
+        if let Some(frame) = self.local_iface_aliases.last() {
+            if !frame.is_empty() && hier.path.len() >= 2 {
+                let first = hier.path[0].name.name.as_str();
+                if let Some(bound) = frame.get(first) {
+                    let rest = hier
+                        .path
+                        .iter()
+                        .skip(1)
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    return format!("{}.{}", bound, rest);
+                }
+            }
+        }
+        // LRM §25.8 virtual-interface late-dispatch. When the inner
+        // segment of `<vif>.<member>...` is a class property declared
+        // `virtual <iface_t>`, replace it with the bound interface
+        // instance name. Two recognised shapes:
+        //   `vif.member`           → this_stack's class.virtual_iface[vif]
+        //   `obj.vif.member`       → obj's class.virtual_iface[vif]
+        if hier.path.len() >= 2 {
+            let segs: Vec<&str> = hier.path.iter().map(|s| s.name.name.as_str()).collect();
+            // Form 1: bare `vif.member.…` — `vif` looked up against
+            // the current `this` instance.
+            if let Some(Some(this_h)) = self.this_stack.last() {
+                let cls_name = if let Some(Some(inst)) = self.heap.get(*this_h) {
+                    Some(inst.class_name.clone())
+                } else { None };
+                if let Some(cn) = cls_name {
+                    let cls_has_vif = self.module.classes.get(&cn)
+                        .map(|c| c.virtual_iface_properties.contains_key(segs[0]))
+                        .unwrap_or(false);
+                    if cls_has_vif {
+                        if let Some((bound, _mp)) = self.virtual_iface_bindings
+                            .get(&(*this_h, segs[0].to_string())) {
+                            let rest = segs[1..].join(".");
+                            return format!("{}.{}", bound, rest);
+                        }
+                    }
+                }
+            }
+            // Form 2: `obj.vif.member.…` — `obj` is a local class
+            // handle whose class has `vif` as virtual-iface.
+            if hier.path.len() >= 3 {
+                let obj_name = segs[0];
+                let obj_handle_v = if let Some(locals) = self.local_stack.last() {
+                    locals.get(obj_name).cloned()
+                } else { None }
+                    .or_else(|| self.get_signal_value_by_name(obj_name));
+                if let Some(v) = obj_handle_v {
+                    let handle = v.to_u64().unwrap_or(0) as usize;
+                    if handle != 0 && handle < self.heap.len() {
+                        if let Some(Some(inst)) = self.heap.get(handle) {
+                            let cn = inst.class_name.clone();
+                            let cls_has_vif = self.module.classes.get(&cn)
+                                .map(|c| c.virtual_iface_properties.contains_key(segs[1]))
+                                .unwrap_or(false);
+                            if cls_has_vif {
+                                if let Some((bound, _mp)) = self.virtual_iface_bindings
+                                    .get(&(handle, segs[1].to_string())) {
+                                    let rest = segs[2..].join(".");
+                                    return format!("{}.{}", bound, rest);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Scope-qualified shadowing for SINGLE-SEGMENT bare names — LRM
+        // §22.4 / §23.6: a local declaration in the enclosing scope
+        // shadows a same-named member brought in via wildcard package
+        // import. If `hint.name` resolves, prefer it over the global
+        // bare name. Without this, two modules' anon-enum members
+        // (e.g. cv32e40p_alu_div::FINISH=2 vs
+        // cv32e40p_pkg::mult_state_e::FINISH=4) share one global slot;
+        // whichever was registered last wins and the divider's FSM
+        // truncates State_SN into a 2-bit register, losing FINISH.
+        if !raw.contains('.') {
+            if let Some(hint) = self.name_resolve_hint.borrow().as_ref() {
+                let scoped = format!("{}.{}", hint, raw);
+                if self.signal_name_to_id.contains_key(scoped.as_str()) {
+                    return scoped;
+                }
+            }
+        }
         // Exact dotted name match first.
         if self.signal_name_to_id.contains_key(raw.as_str()) {
             if raw.contains('.') {
@@ -21722,6 +23283,19 @@ impl Simulator {
     fn collect_signal_names(&self, expr: &Expression, names: &mut Vec<String>) {
         match &expr.kind {
             ExprKind::Ident(hier) => {
+                // LRM §15.5.3: `<event>.triggered` — the wakeable signal
+                // is the event itself, not the synthetic "triggered" field.
+                // Strip the trailing segment so `wait(e.triggered)`
+                // registers an edge watcher on `e`.
+                if hier.path.len() >= 2
+                    && hier.path.last().map(|s| s.name.name.as_str())
+                        == Some("triggered")
+                {
+                    let mut head = hier.clone();
+                    head.path.pop();
+                    names.push(self.resolve_hier_name(&head));
+                    return;
+                }
                 names.push(self.resolve_hier_name(hier));
             }
             // Virtual-interface member access (`vif.signal`) and other dotted
@@ -21923,6 +23497,18 @@ impl Simulator {
             if inst.cg_name == cg_name {
                 if let Some(set) = inst.cross_hits.get(cr_name) {
                     return set.len();
+                }
+            }
+        }
+        0
+    }
+    /// LRM §19.6: hit count for a specific cross body bin filter.
+    /// `key` is `<cross_name>.<bin_name>`.
+    pub fn cross_bin_hits(&self, cg_name: &str, key: &str) -> u64 {
+        for inst in self.cg_heap.iter().flatten() {
+            if inst.cg_name == cg_name {
+                if let Some(&n) = inst.cross_bin_hits.get(key) {
+                    return n;
                 }
             }
         }
@@ -22827,6 +24413,18 @@ impl Simulator {
     }
 
     fn get_signal_value_by_name(&self, name: &str) -> Option<Value> {
+        if !name.contains('.') {
+            if let Some(hint) = self.name_resolve_hint.borrow().as_ref() {
+                let scoped = format!("{}.{}", hint, name);
+                if let Some(&id) = self.signal_name_to_id.get(scoped.as_str()) {
+                    let mut v = self.signal_table[id].clone();
+                    if self.signal_signed[id] {
+                        v.is_signed = true;
+                    }
+                    return Some(v);
+                }
+            }
+        }
         if let Some(&id) = self.signal_name_to_id.get(name) {
             let mut v = self.signal_table[id].clone();
             if self.signal_signed[id] {
@@ -23181,6 +24779,48 @@ impl Simulator {
                                     _ => None,
                                 })
                                 .collect();
+                            // Relational items (`t > e`, `t <= e`, …): narrow a
+                            // [lo, hi] interval per target across the WHOLE
+                            // constraint set, then pick uniformly inside it.
+                            // Item-at-a-time re-picking would ping-pong between
+                            // `a > 100` and `a < 200`; interval narrowing
+                            // converges in one shot (same approach as the
+                            // real-rand bounds scan in exec_randomize).
+                            for (name, lv) in &targets {
+                                let cur = self.eval_expr(lv);
+                                let width = cur.width.max(1);
+                                let signed = cur.is_signed;
+                                let (mut lo, mut hi): (i64, i64) = if signed {
+                                    if width >= 64 {
+                                        (i64::MIN, i64::MAX)
+                                    } else {
+                                        (-(1i64 << (width - 1)), (1i64 << (width - 1)) - 1)
+                                    }
+                                } else if width >= 63 {
+                                    (0, i64::MAX)
+                                } else {
+                                    (0, (1i64 << width) - 1)
+                                };
+                                let mut any = false;
+                                for c in constraints {
+                                    self.narrow_relational_bounds(
+                                        c, name, &targets, &mut lo, &mut hi, &mut any,
+                                    );
+                                }
+                                if any && lo <= hi {
+                                    use rand::Rng;
+                                    let pick =
+                                        if lo == hi { lo } else { self.rng.gen_range(lo..=hi) };
+                                    let masked = if width >= 64 {
+                                        pick as u64
+                                    } else {
+                                        (pick as u64) & ((1u64 << width) - 1)
+                                    };
+                                    let mut v = Value::from_u64(masked, width);
+                                    v.is_signed = signed;
+                                    self.assign_value(lv, &v);
+                                }
+                            }
                             for _ in 0..8 {
                                 for c in constraints {
                                     self.apply_inline_constraint(c, &targets);
@@ -23305,19 +24945,24 @@ impl Simulator {
                 }
                 _ => {}
             },
-            CI::Inside { expr, range, .. } => {
+            CI::Inside { expr, range, is_dist, dist_weights, .. } => {
                 if let Some(lv) = self.target_for(expr, targets) {
-                    let rs: Vec<Expression> = range
-                        .iter()
-                        .map(|r| match r {
-                            ConstraintRange::Value(e) => e.clone(),
-                            ConstraintRange::Range { lo, hi } => Expression::new(
-                                ExprKind::Range(Box::new((*lo).clone()), Box::new((*hi).clone())),
-                                lo.span,
-                            ),
-                        })
-                        .collect();
-                    if let Some(v) = self.pick_inside_value(&rs) {
+                    let picked = if *is_dist && !dist_weights.is_empty() {
+                        self.pick_dist_value(range, dist_weights)
+                    } else {
+                        let rs: Vec<Expression> = range
+                            .iter()
+                            .map(|r| match r {
+                                ConstraintRange::Value(e) => e.clone(),
+                                ConstraintRange::Range { lo, hi } => Expression::new(
+                                    ExprKind::Range(Box::new((*lo).clone()), Box::new((*hi).clone())),
+                                    lo.span,
+                                ),
+                            })
+                            .collect();
+                        self.pick_inside_value(&rs)
+                    };
+                    if let Some(v) = picked {
                         self.assign_value(&lv, &v);
                     }
                 }
@@ -23389,6 +25034,90 @@ impl Simulator {
         }
     }
 
+    /// Narrow the [lo, hi] interval for randomize target `name` using the
+    /// relational items (`<`, `<=`, `>`, `>=`) in one inline-constraint item.
+    /// Only `target REL bound` shapes where `bound` references no other
+    /// randomize target contribute (inter-target relations are left to the
+    /// equality/fixpoint pass). Sets `any` when at least one bound applied.
+    fn narrow_relational_bounds(
+        &mut self,
+        item: &crate::ast::decl::ConstraintItem,
+        name: &str,
+        targets: &[(String, Expression)],
+        lo: &mut i64,
+        hi: &mut i64,
+        any: &mut bool,
+    ) {
+        use crate::ast::decl::ConstraintItem as CI;
+        match item {
+            CI::Expr(e) => {
+                if let ExprKind::Binary { op, left, right } = &e.kind {
+                    if !matches!(
+                        op,
+                        BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq
+                    ) {
+                        return;
+                    }
+                    let on_left = matches!(&left.kind,
+                        ExprKind::Ident(h) if self.resolve_hier_name(h) == name);
+                    let on_right = matches!(&right.kind,
+                        ExprKind::Ident(h) if self.resolve_hier_name(h) == name);
+                    if on_left == on_right {
+                        return;
+                    }
+                    let bound_side = if on_left { right } else { left };
+                    let mut ids = HashSet::default();
+                    self.collect_expr_idents(bound_side, &mut ids);
+                    if targets.iter().any(|(n, _)| ids.contains(n)) {
+                        return;
+                    }
+                    let b = self.eval_expr(bound_side).to_i64().unwrap_or(0);
+                    // Normalize to `name REL bound` (swap when name is on
+                    // the right: `100 < a` means `a > 100`).
+                    let eff = if on_right {
+                        match op {
+                            BinaryOp::Lt => BinaryOp::Gt,
+                            BinaryOp::Gt => BinaryOp::Lt,
+                            BinaryOp::Leq => BinaryOp::Geq,
+                            BinaryOp::Geq => BinaryOp::Leq,
+                            other => *other,
+                        }
+                    } else {
+                        *op
+                    };
+                    match eff {
+                        BinaryOp::Gt => {
+                            *lo = (*lo).max(b.saturating_add(1));
+                            *any = true;
+                        }
+                        BinaryOp::Geq => {
+                            *lo = (*lo).max(b);
+                            *any = true;
+                        }
+                        BinaryOp::Lt => {
+                            *hi = (*hi).min(b.saturating_sub(1));
+                            *any = true;
+                        }
+                        BinaryOp::Leq => {
+                            *hi = (*hi).min(b);
+                            *any = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            CI::Block(items) => {
+                for it in items {
+                    self.narrow_relational_bounds(it, name, targets, lo, hi, any);
+                }
+            }
+            CI::Soft(inner) => {
+                self.narrow_relational_bounds(inner, name, targets, lo, hi, any)
+            }
+            _ => {}
+        }
+    }
+
     /// Match `expr` (a constraint operand) to one of the randomize targets,
     /// returning its lvalue expression.
     fn target_for(
@@ -23410,6 +25139,90 @@ impl Simulator {
     /// Pick a concrete value from an `inside {...}` range list. A bare queue/
     /// array operand contributes its elements; `[lo:hi]` a uniform sample; a
     /// scalar its value. Returns None if no candidate could be formed.
+    /// LRM §18.5.4 weighted distribution picker.
+    ///
+    /// Each `(range[i], weights[i])` pair contributes to a probability mass:
+    /// - `Each(w)` (the `:=` operator) — every individual value the range
+    ///   covers gets weight `w`. A bare value contributes 1 outcome of
+    ///   weight `w`; a `[lo:hi]` range contributes `hi-lo+1` outcomes each
+    ///   of weight `w`.
+    /// - `Total(w)` (the `:/` operator) — the weight is split evenly across
+    ///   the values in the range. A bare value still gets the full `w`; a
+    ///   `[lo:hi]` range gives each member `w / (hi-lo+1)` (we use fixed-
+    ///   point integer math, multiplying everything by the range span to
+    ///   keep arithmetic exact).
+    /// - `None` — defaults to `Each(1)` per the LRM.
+    ///
+    /// Sampling: build a `Vec<(value, weight)>`, accumulate to total, draw
+    /// `rng % total`, walk the prefix-sum. Ranges wider than `MAX_BUCKETS`
+    /// are downsampled to that many evenly-spaced reps to bound enumeration.
+    fn pick_dist_value(
+        &mut self,
+        ranges: &[ConstraintRange],
+        weights: &[Option<crate::ast::decl::DistWeight>],
+    ) -> Option<Value> {
+        use rand::Rng;
+        use crate::ast::decl::DistWeight;
+        const MAX_BUCKETS: i64 = 4096;
+        // Build (value, weight*span_factor) entries. Multiply every weight
+        // by the LCM-ish "span_factor" so Total(w) over an N-wide range can
+        // give each member w (in unified units) instead of w/N.
+        // Practical approach: scale by N when Total, else by N as identity
+        // for Each. Use 1024 as a universal scaler — enough resolution for
+        // practical weights.
+        let scaler: u64 = 1024;
+        let mut buckets: Vec<(Value, u64)> = Vec::new();
+        for (i, r) in ranges.iter().enumerate() {
+            let w_kind = weights.get(i).and_then(|w| w.as_ref());
+            let w_expr = match w_kind {
+                Some(DistWeight::Each(e)) | Some(DistWeight::Total(e)) => Some(e),
+                None => None,
+            };
+            let w = w_expr.map(|e| self.eval_expr(e).to_u64().unwrap_or(1)).unwrap_or(1);
+            match r {
+                ConstraintRange::Value(e) => {
+                    let v = self.eval_expr(e);
+                    buckets.push((v, w * scaler));
+                }
+                ConstraintRange::Range { lo, hi } => {
+                    let l = self.eval_expr(lo).to_i64().unwrap_or(0);
+                    let h = self.eval_expr(hi).to_i64().unwrap_or(l);
+                    if h < l { continue; }
+                    let span = (h - l + 1).min(MAX_BUCKETS) as u64;
+                    if span == 0 { continue; }
+                    let per_value_weight = match w_kind {
+                        Some(DistWeight::Total(_)) | None if matches!(w_kind, Some(DistWeight::Total(_))) => {
+                            // Total: w split evenly across span items.
+                            (w * scaler) / span
+                        }
+                        _ => {
+                            // Each (or no marker, which defaults to Each).
+                            w * scaler
+                        }
+                    };
+                    // Downsample if the range exceeds MAX_BUCKETS.
+                    let stride = ((h - l + 1) as u64).div_ceil(span).max(1);
+                    let mut v = l;
+                    let mut emitted = 0u64;
+                    while v <= h && emitted < span {
+                        buckets.push((Value::from_u64(v as u64, 32), per_value_weight.max(1)));
+                        v = v.saturating_add(stride as i64);
+                        emitted += 1;
+                    }
+                }
+            }
+        }
+        if buckets.is_empty() { return None; }
+        let total: u64 = buckets.iter().map(|(_, w)| *w).sum();
+        if total == 0 { return Some(buckets[0].0.clone()); }
+        let mut draw = self.rng.gen::<u64>() % total;
+        for (v, w) in &buckets {
+            if draw < *w { return Some(v.clone()); }
+            draw -= *w;
+        }
+        Some(buckets.last().unwrap().0.clone())
+    }
+
     fn pick_inside_value(&mut self, ranges: &[Expression]) -> Option<Value> {
         use rand::Rng;
         let mut candidates: Vec<Value> = Vec::new();
@@ -23488,8 +25301,103 @@ impl Simulator {
 
     /// Evaluate an array reduction (`sum`/`product`/`min`/`max`/`and`/`or`/`xor`)
     /// with a `with (item...)` expression, binding `item` to each element.
+    /// LRM §7.12.2: in-place sort/rsort/unique on `arr` with the
+    /// per-element key expression `filter` (binds `item` to each
+    /// element). Mirrors `reduce_with`'s `item` plumbing.
+    fn sort_with(&mut self, arr: &str, method: &str, filter: &Expression) {
+        let size = self.get_queue_size(arr);
+        if size == 0 {
+            return;
+        }
+        let pushed_frame = if self.local_stack.is_empty() {
+            self.local_stack.push(HashMap::default());
+            true
+        } else {
+            false
+        };
+        let saved_item = self
+            .local_stack
+            .last()
+            .and_then(|f| f.get("item").cloned());
+        // Compute key for each element.
+        let mut pairs: Vec<(i64, Value)> = Vec::with_capacity(size as usize);
+        for i in 0..size {
+            let elem = self
+                .get_signal_value_by_name(&format!("{}[{}]", arr, i))
+                .unwrap_or_else(|| Value::zero(32));
+            if let Some(f) = self.local_stack.last_mut() {
+                f.insert("item".to_string(), elem.clone());
+            }
+            let key = self.eval_expr(filter).to_i64().unwrap_or(0);
+            pairs.push((key, elem));
+        }
+        // Restore item binding.
+        if let Some(f) = self.local_stack.last_mut() {
+            match saved_item {
+                Some(v) => {
+                    f.insert("item".to_string(), v);
+                }
+                None => {
+                    f.remove("item");
+                }
+            }
+        }
+        if pushed_frame {
+            self.local_stack.pop();
+        }
+        // Apply the requested mutation.
+        let new_elems: Vec<Value> = match method {
+            "sort" => {
+                pairs.sort_by_key(|(k, _)| *k);
+                pairs.into_iter().map(|(_, v)| v).collect()
+            }
+            "rsort" => {
+                pairs.sort_by(|a, b| b.0.cmp(&a.0));
+                pairs.into_iter().map(|(_, v)| v).collect()
+            }
+            "unique" => {
+                let mut seen: std::collections::HashSet<i64> =
+                    std::collections::HashSet::new();
+                pairs
+                    .into_iter()
+                    .filter_map(|(k, v)| {
+                        if seen.insert(k) {
+                            Some(v)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
+            _ => return,
+        };
+        let new_size = new_elems.len() as u64;
+        for (i, v) in new_elems.into_iter().enumerate() {
+            self.set_signal_value_by_name(&format!("{}[{}]", arr, i), v);
+        }
+        // For unique (which may shrink the array), update the queue
+        // size. sort/rsort preserve length so this is a no-op there.
+        if new_size != size {
+            self.set_queue_size(arr, new_size);
+            // Clear trailing stale slots.
+            for i in new_size..size {
+                self.signals.remove(&format!("{}[{}]", arr, i));
+            }
+        }
+    }
+
     fn reduce_with(&mut self, arr: &str, method: &str, filter: &Expression) -> Value {
         let size = self.get_queue_size(arr);
+        // Ensure a local frame exists so `item` has somewhere to live.
+        // Initial-block-scope calls (no enclosing function) reach here
+        // with an empty local_stack, which previously silenced every
+        // `item` insert and made the filter eval as 0.
+        let pushed_frame = if self.local_stack.is_empty() {
+            self.local_stack.push(HashMap::default());
+            true
+        } else {
+            false
+        };
         let saved_item = self
             .local_stack
             .last()
@@ -23521,6 +25429,9 @@ impl Simulator {
                 Some(v) => { f.insert("item".to_string(), v); }
                 None => { f.remove("item"); }
             }
+        }
+        if pushed_frame {
+            self.local_stack.pop();
         }
         Value::from_u64(acc.unwrap_or(0) as u64, 32)
     }
@@ -23627,6 +25538,42 @@ impl Simulator {
         }
         self.set_queue_size(pname, size);
         true
+    }
+
+    /// LRM §8.4: evaluate a value argument destined for a queue/array
+    /// element store. When the queue/array's element type is a class
+    /// (registered via `module.array_elem_class`) and the arg is a
+    /// bare `new(<args>)` call, construct an instance of that class
+    /// and return its handle. Otherwise fall back to regular eval.
+    fn queue_eval_arg(&mut self, container_name: &str, arg: &Expression) -> Value {
+        let class_name = self
+            .module
+            .array_elem_class
+            .get(container_name)
+            .cloned();
+        if let Some(cn) = class_name {
+            if let ExprKind::Call { func, args: call_args } = &arg.kind {
+                let is_new = match &func.kind {
+                    ExprKind::Ident(h) => h
+                        .path
+                        .last()
+                        .map_or(false, |s| s.name.name == "new"),
+                    _ => false,
+                };
+                if is_new {
+                    if let Some(class_def) = self.module.classes.get(&cn).cloned() {
+                        return self
+                            .instantiate_class_with_type_args(
+                                &class_def,
+                                call_args,
+                                None,
+                            )
+                            .resize(32);
+                    }
+                }
+            }
+        }
+        self.eval_expr(arg)
     }
 
     fn eval_builtin_method(
@@ -23761,7 +25708,12 @@ impl Simulator {
         }
         if mname == "push_back" {
             if let Some(arg) = args.first() {
-                let val = self.eval_expr(arg);
+                // LRM §8.4: if the queue's element type is a class and
+                // the arg is a bare `new(...)` call, construct the
+                // class instead of `eval_expr`-ing the call (which
+                // returns 0 because the bare `new` has no class
+                // context). The resulting handle is what gets pushed.
+                let val = self.queue_eval_arg(obj_name, arg);
                 let cur_size = self.get_queue_size(obj_name);
                 if let Some(&max) = self.module.queue_max_sizes.get(obj_name) {
                     if cur_size >= max as u64 {
@@ -23775,7 +25727,7 @@ impl Simulator {
         }
         if mname == "push_front" {
             if let Some(arg) = args.first() {
-                let val = self.eval_expr(arg);
+                let val = self.queue_eval_arg(obj_name, arg);
                 let cur_size = self.get_queue_size(obj_name);
                 if let Some(&max) = self.module.queue_max_sizes.get(obj_name) {
                     if cur_size >= max as u64 {
@@ -23872,6 +25824,26 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
+        // LRM §7.12.1 array `shuffle()` — Fisher-Yates in place using
+        // the simulator's PRNG so seeded runs are reproducible.
+        if mname == "shuffle" {
+            use rand::Rng;
+            let cur_size = self.get_queue_size(obj_name) as usize;
+            if cur_size > 1 {
+                let mut elements: Vec<Value> = (0..cur_size)
+                    .filter_map(|i| self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)))
+                    .collect();
+                // Fisher-Yates
+                for i in (1..elements.len()).rev() {
+                    let j = self.rng.gen_range(0..=i);
+                    elements.swap(i, j);
+                }
+                for (i, v) in elements.into_iter().enumerate() {
+                    self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i), v);
+                }
+            }
+            return Some(Value::zero(32));
+        }
         if mname == "insert" {
             if args.len() >= 2 {
                 let idx = self.eval_expr(&args[0]).to_u64().unwrap_or(0);
@@ -23889,6 +25861,16 @@ impl Simulator {
             return Some(Value::zero(32));
         }
         if mname == "num" {
+            // §15.4.2: a mailbox's `num()` counts queued messages, which live in
+            // `self.mailboxes` (keyed by handle), not in `obj[i]` signal slots.
+            // This expression path (e.g. `m.num()` inside `$display(...)`) must
+            // resolve the handle before falling back to the queue/assoc count.
+            if let Some(handle_val) = self.get_signal_value_by_name(obj_name) {
+                let handle = handle_val.to_u64().unwrap_or(0) as usize;
+                if let Some(q) = self.mailboxes.get(&handle) {
+                    return Some(Value::from_u64(q.len() as u64, 32));
+                }
+            }
             let prefix = format!("{}[", obj_name);
             let count1 = self
                 .signals
@@ -24269,6 +26251,116 @@ impl Simulator {
 
     /// Write a static class property's shared cell. Returns false if
     /// `prop` is not a static property of `start_class` or an ancestor.
+    /// LRM §25.8 — try to record an `obj.vif = iface_inst;` binding instead
+    /// of doing a Value copy. Returns true if the assignment was handled
+    /// (the caller should `return` immediately).
+    ///
+    /// Recognises two forms:
+    ///   - LHS = `name` where `name` is a class-typed local whose class
+    ///     declares `name` as virtual-iface (single-segment local var).
+    ///   - LHS = `<obj>.<prop>` where `obj`'s class declares `prop` as a
+    ///     virtual-iface property.
+    /// RHS must be a single-segment Ident — the bound interface instance
+    /// name. Other RHS forms fall through to the normal assignment path.
+    fn try_bind_virtual_iface(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> bool {
+        let rhs_name = match &rvalue.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => h.path[0].name.name.clone(),
+            _ => return false,
+        };
+        // (handle, prop) for the target. `prop` for arrays encodes the
+        // index as `"vif_arr[<idx>]"` so existing single-key storage
+        // can stash per-index bindings (LRM §25.10).
+        let (handle, prop) = match &lvalue.kind {
+            ExprKind::Ident(h) if h.path.len() == 2 => {
+                let obj = h.path[0].name.name.as_str();
+                let prop = h.path[1].name.name.clone();
+                let v = if let Some(locals) = self.local_stack.last() {
+                    locals.get(obj).cloned()
+                } else { None }
+                    .or_else(|| self.get_signal_value_by_name(obj));
+                let handle = v.and_then(|x| x.to_u64()).unwrap_or(0) as usize;
+                (handle, prop)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let obj_handle = if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 {
+                        let obj = &h.path[0].name.name;
+                        let v = if let Some(locals) = self.local_stack.last() {
+                            locals.get(obj).cloned()
+                        } else { None }
+                            .or_else(|| self.get_signal_value_by_name(obj));
+                        v.and_then(|x| x.to_u64()).unwrap_or(0) as usize
+                    } else { 0 }
+                } else { 0 };
+                (obj_handle, member.name.clone())
+            }
+            // LRM §25.10 virtual-interface array: `d.vif_arr[i] = bus`.
+            // Parses as Index { expr: <obj.prop>, index: <idx_expr> }.
+            // Encode the index into the binding's prop key.
+            ExprKind::Index { expr: base, index } => {
+                let idx = self.eval_expr(index).to_u64().unwrap_or(0);
+                let (obj_handle, prop_base) = match &base.kind {
+                    // d.vif_arr  (MemberAccess on a class handle)
+                    ExprKind::MemberAccess { expr: outer, member } => {
+                        let h = if let ExprKind::Ident(h) = &outer.kind {
+                            if h.path.len() == 1 {
+                                let obj = &h.path[0].name.name;
+                                let v = if let Some(locals) = self.local_stack.last() {
+                                    locals.get(obj).cloned()
+                                } else { None }
+                                    .or_else(|| self.get_signal_value_by_name(obj));
+                                v.and_then(|x| x.to_u64()).unwrap_or(0) as usize
+                            } else { 0 }
+                        } else { 0 };
+                        (h, member.name.clone())
+                    }
+                    // d.vif_arr in hier-Ident form: Ident([d, vif_arr])
+                    ExprKind::Ident(h) if h.path.len() == 2 => {
+                        let obj = h.path[0].name.name.as_str();
+                        let prop = h.path[1].name.name.clone();
+                        let v = if let Some(locals) = self.local_stack.last() {
+                            locals.get(obj).cloned()
+                        } else { None }
+                            .or_else(|| self.get_signal_value_by_name(obj));
+                        let h_v = v.and_then(|x| x.to_u64()).unwrap_or(0) as usize;
+                        (h_v, prop)
+                    }
+                    _ => return false,
+                };
+                (obj_handle, format!("{}[{}]", prop_base, idx))
+            }
+            _ => return false,
+        };
+        if handle == 0 || handle >= self.heap.len() { return false; }
+        // Look up the class to see if `prop` is virtual-iface. Strip
+        // any `[idx]` suffix on the prop key so array elements match
+        // the bare property declaration.
+        let class_name = if let Some(Some(inst)) = self.heap.get(handle) {
+            inst.class_name.clone()
+        } else { return false; };
+        let prop_base: &str = prop.split('[').next().unwrap_or(&prop);
+        let prop_info = self.module.classes.get(&class_name)
+            .and_then(|cd| cd.virtual_iface_properties.get(prop_base).cloned());
+        let Some((_iface_t, modport)) = prop_info else { return false; };
+        // Record the binding. Subsequent `obj.<prop>.<member>` accesses
+        // will follow it; the modport (if any) is consulted at write
+        // time to emit a direction warning.
+        self.virtual_iface_bindings.insert((handle, prop), (rhs_name, modport));
+        true
+    }
+
+    /// Resolve a `(handle, prop)` virtual-interface binding to its bound
+    /// interface instance name, if any.
+    #[allow(dead_code)]
+    fn virtual_iface_bound_name(&self, handle: usize, prop: &str) -> Option<String> {
+        self.virtual_iface_bindings.get(&(handle, prop.to_string()))
+            .map(|(n, _)| n.clone())
+    }
+
     fn class_static_set(&mut self, start_class: &str, prop: &str, val: Value) -> bool {
         if let Some(key) = self.static_prop_key(start_class, prop) {
             self.class_statics.insert(key, val);
@@ -25076,6 +27168,17 @@ impl Simulator {
             let path = &hier.path;
             let len = path.len();
 
+            // `std::randomize(vars)` where the scope qualifier flattened into
+            // the ident path (`Call{ Ident([std, randomize]) }`) — the
+            // MemberAccess form is handled above; the parser produces this
+            // shape for the plain (no-`with`) call. LRM §18.12.
+            if len == 2
+                && path[0].name.name == "std"
+                && path[1].name.name == "randomize"
+            {
+                return self.exec_std_randomize(args);
+            }
+
             // Enum `.name()` / string `.tolower()`/`.toupper()` where the
             // receiver flattened into the ident path (`v.name()` ->
             // Ident([v, name])). The MemberAccess form is handled earlier; this
@@ -25084,6 +27187,7 @@ impl Simulator {
                 && matches!(
                     path[len - 1].name.name.as_str(),
                     "name" | "tolower" | "toupper" | "atoi" | "atohex" | "atooct" | "atobin"
+                        | "first" | "last" | "next" | "prev" | "num"
                 )
             {
                 let m = path[len - 1].name.name.clone();
@@ -25095,6 +27199,87 @@ impl Simulator {
                     cached_resolved_name: std::cell::OnceCell::new(),
                 };
                 let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
+                // LRM §6.19.6: enum reflection on a hier-Ident receiver.
+                // Same logic as the MemberAccess branch above — but the
+                // parser flattens `c.next()` into `Call{Ident([c,next])}`
+                // for the common local-var case, so we mirror the
+                // resolution here.
+                if matches!(
+                    m.as_str(),
+                    "first" | "last" | "next" | "prev" | "num"
+                ) {
+                    if let Some(tn) = self.get_expr_type_name(&base_expr) {
+                        if let Some(members) =
+                            self.module.enum_members.get(&tn).cloned()
+                        {
+                            if members.is_empty() {
+                                return Value::zero(32);
+                            }
+                            let mw = self
+                                .module
+                                .signals
+                                .get(&members[0].0)
+                                .map(|s| s.width)
+                                .unwrap_or(32);
+                            match m.as_str() {
+                                "num" => {
+                                    return Value::from_u64(
+                                        members.len() as u64,
+                                        32,
+                                    );
+                                }
+                                "first" => {
+                                    return Value::from_u64(members[0].1, mw);
+                                }
+                                "last" => {
+                                    return Value::from_u64(
+                                        members[members.len() - 1].1,
+                                        mw,
+                                    );
+                                }
+                                "next" | "prev" => {
+                                    let cur = self
+                                        .eval_expr(&base_expr)
+                                        .to_u64()
+                                        .unwrap_or(0);
+                                    let pos = members
+                                        .iter()
+                                        .position(|(_, v)| *v == cur);
+                                    if let Some(p) = pos {
+                                        let np = if m == "next" {
+                                            if p + 1 >= members.len() {
+                                                0
+                                            } else {
+                                                p + 1
+                                            }
+                                        } else if p == 0 {
+                                            members.len() - 1
+                                        } else {
+                                            p - 1
+                                        };
+                                        return Value::from_u64(
+                                            members[np].1,
+                                            mw,
+                                        );
+                                    }
+                                    return Value::zero(mw);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                // §15.4.2: `m.num()` on a mailbox handle (flattened to
+                // `Ident([m, num])`) is not an enum reflection — resolve the
+                // handle and return the queued-message count. Without this,
+                // `num` falls into the `atoi`-style else-branch below and
+                // returns garbage (the test saw `num()` == 0).
+                if m == "num" {
+                    let h = self.eval_expr(&base_expr).to_u64().unwrap_or(0) as usize;
+                    if let Some(q) = self.mailboxes.get(&h) {
+                        return Value::from_u64(q.len() as u64, 32);
+                    }
+                }
                 if m == "name" {
                     let val = self.eval_expr(&base_expr).to_u64().unwrap_or(0);
                     let hint = self.get_expr_type_name(&base_expr);
@@ -25760,6 +27945,29 @@ impl Simulator {
             }
         }
         self.local_stack.push(locals);
+        // LRM §25.9: virtual-interface formals. When a formal's
+        // declared data type names a known interface, register an
+        // alias from the formal name to the caller's actual ident.
+        // The alias frame is consulted by `resolve_hier_name` so
+        // `vif.member` inside the task body resolves to
+        // `<bound>.member` for the duration of this call.
+        let mut iface_alias_frame: HashMap<String, String> = HashMap::default();
+        for (i, port) in td.ports.iter().enumerate() {
+            if let crate::ast::types::DataType::TypeReference { name, .. } =
+                &port.data_type
+            {
+                if self.module.interfaces.contains(&name.name.name)
+                    && i < args.len()
+                {
+                    if let ExprKind::Ident(h) = &args[i].kind {
+                        let actual = self.resolve_hier_name(h);
+                        iface_alias_frame
+                            .insert(port.name.name.clone(), actual);
+                    }
+                }
+            }
+        }
+        self.local_iface_aliases.push(iface_alias_frame);
         // SV-2023: redirect NBAs targeting a `ref` formal back to the caller's
         // actual variable (IEEE 1800-2023 §13.5.2).
         let mut ref_map: HashMap<String, Expression> = HashMap::default();
@@ -25789,6 +27997,9 @@ impl Simulator {
         }
         self.current_static_task = prev_static;
         self.ref_binding_stack.pop();
+        // Pop the virtual-interface alias frame we pushed at call
+        // entry (LRM §25.9).
+        self.local_iface_aliases.pop();
         self.continue_flag = saved_continue;
         // Copy output/ref values back to caller
         let locals = self.local_stack.pop().unwrap_or_default();
@@ -25838,7 +28049,10 @@ impl Simulator {
         let instance = CovergroupInstance {
             cg_name: cg_def.name.name.clone(),
             point_hits: HashMap::default(),
+            bin_hits: HashMap::default(),
+            point_history: HashMap::default(),
             cross_hits: HashMap::default(),
+            cross_bin_hits: HashMap::default(),
             sample_count: 0,
         };
         self.cg_heap.push(Some(instance));
@@ -25959,17 +28173,174 @@ impl Simulator {
         for item in &def.items {
             match item {
                 CovergroupItem::Coverpoint(cp) => {
+                    // LRM §19.5 `iff (guard)` — skip the sample when the
+                    // guard expression is false (or X/Z). Done before any
+                    // value-eval / bin checking so a guarded sample is a
+                    // pure no-op (no point_hits, no bin_increments, no
+                    // history update).
+                    if let Some(guard) = &cp.iff_guard {
+                        if !self.eval_expr(guard).is_true() {
+                            continue;
+                        }
+                    }
                     let val = self.eval_expr(&cp.expr);
                     let cp_name = cp
                         .name
                         .as_ref()
                         .map(|n| n.name.clone())
                         .unwrap_or_else(|| format!("{:?}", cp.expr));
+                    // Per-explicit-bin tallies (LRM §19.5). Done before the
+                    // existing per-value-set bookkeeping so an illegal_bins
+                    // hit can fire before the value is recorded. `default`
+                    // bins are deferred: counted only if no explicit
+                    // (Bins / Ignore / Illegal) bin in this coverpoint
+                    // matched.
+                    let mut bin_increments: Vec<(String, bool)> = Vec::new();
+                    let mut any_explicit_match = false;
+                    let mut default_bin_keys: Vec<String> = Vec::new();
+                    // LRM §19.5 transition bins — needs the trailing
+                    // sample history. We snapshot it before bin matching
+                    // and append the current sample after all bins fire.
+                    let history_for_trans: Vec<Value> = self.cg_heap.get(handle)
+                        .and_then(|x| x.as_ref())
+                        .and_then(|inst| inst.point_history.get(&cp_name))
+                        .map(|hq| hq.iter().cloned().collect())
+                        .unwrap_or_default();
+                    // Longest declared chain for this coverpoint — caps the
+                    // history we keep.
+                    let max_chain_len = cp.bins.iter()
+                        .flat_map(|b| b.transitions.iter().map(|c| c.len()))
+                        .max()
+                        .unwrap_or(0);
+                    for bin in &cp.bins {
+                        // For `bins name[]` array form, the recorded key
+                        // is `cp.name[<val>]` so each distinct matched
+                        // value gets its own sub-bin counter (LRM §19.5).
+                        let base_key = format!("{}.{}", cp_name, bin.name.name);
+                        let key_for_val = || -> String {
+                            if bin.array_form {
+                                match val.to_u64() {
+                                    Some(u) => format!("{}[{}]", base_key, u),
+                                    None    => format!("{}[?]", base_key),
+                                }
+                            } else { base_key.clone() }
+                        };
+                        match bin.kind {
+                            crate::ast::decl::CoverBinKind::Default => {
+                                default_bin_keys.push(key_for_val());
+                            }
+                            _ => {
+                                // LRM §19.5 transition bin: `(prev => cur)`.
+                                // Fires when (prev_sampled, val) matches any
+                                // listed pair. Falls back to the value-set
+                                // path when the bin has no transitions.
+                                let trans_match = !bin.transitions.is_empty()
+                                    && bin.transitions.iter().any(|chain| {
+                                        use crate::ast::decl::ConstraintRange;
+                                        let cl = chain.len();
+                                        if cl < 2 { return false; }
+                                        if history_for_trans.len() + 1 < cl { return false; }
+                                        let start = history_for_trans.len() + 1 - cl;
+                                        let mut window: Vec<&Value> = history_for_trans[start..]
+                                            .iter().collect();
+                                        window.push(&val);
+                                        // Element-wise membership: each
+                                        // step's ConstraintRange must
+                                        // contain the corresponding window
+                                        // value.
+                                        chain.iter().zip(window.iter()).all(|(step, v)| {
+                                            let v_u = v.to_u64();
+                                            match step {
+                                                ConstraintRange::Value(e) => {
+                                                    let e_u = self.eval_expr(e).to_u64();
+                                                    e_u.is_some() && e_u == v_u
+                                                }
+                                                ConstraintRange::Range { lo, hi } => {
+                                                    let l = self.eval_expr(lo).to_u64();
+                                                    let h = self.eval_expr(hi).to_u64();
+                                                    match (l, h, v_u) {
+                                                        (Some(lo_v), Some(hi_v), Some(vv)) =>
+                                                            vv >= lo_v && vv <= hi_v,
+                                                        _ => false,
+                                                    }
+                                                }
+                                            }
+                                        })
+                                    });
+                                let value_match = if !bin.transitions.is_empty() {
+                                    false // transition bins are not value-list bins
+                                } else if bin.is_wildcard {
+                                    // LRM §19.5 wildcard match: bit-wise
+                                    // compare with the bin pattern; pattern
+                                    // bits that are X/Z/? are don't-cares.
+                                    bin.values.iter().any(|r| {
+                                        use crate::ast::decl::ConstraintRange;
+                                        match r {
+                                            ConstraintRange::Value(e) => {
+                                                let pat = self.eval_expr(e);
+                                                val.wildcard_eq(&pat).is_true()
+                                            }
+                                            // Wildcard with [lo:hi] isn't
+                                            // standard; treat as plain range.
+                                            ConstraintRange::Range { lo, hi } => {
+                                                let l = self.eval_expr(lo);
+                                                let h = self.eval_expr(hi);
+                                                val.greater_equal(&l).is_true()
+                                                    && val.less_equal(&h).is_true()
+                                            }
+                                        }
+                                    })
+                                } else {
+                                    self.value_in_ranges(&val, &bin.values)
+                                };
+                                let matched = trans_match || value_match;
+                                if matched {
+                                    any_explicit_match = true;
+                                    let key = key_for_val();
+                                    match bin.kind {
+                                        crate::ast::decl::CoverBinKind::Bins => bin_increments.push((key, false)),
+                                        crate::ast::decl::CoverBinKind::Ignore => { /* drop */ }
+                                        crate::ast::decl::CoverBinKind::Illegal => {
+                                            eprintln!("[cov] illegal_bins hit: {} (val={:?}) (LRM §19.5)",
+                                                      key, val.to_u64());
+                                            bin_increments.push((key, true));
+                                        }
+                                        crate::ast::decl::CoverBinKind::Default => unreachable!(),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !any_explicit_match {
+                        for k in default_bin_keys {
+                            bin_increments.push((k, false));
+                        }
+                    }
                     if let Some(Some(inst)) = self.cg_heap.get_mut(handle) {
-                        inst.point_hits.entry(cp_name).or_default().insert(val);
+                        inst.point_hits.entry(cp_name.clone()).or_default().insert(val.clone());
+                        for (k, _illegal) in bin_increments {
+                            *inst.bin_hits.entry(k).or_insert(0) += 1;
+                        }
+                        // Update the transition-tracker history. Keep at
+                        // most (max_chain_len) entries — the longest chain
+                        // needs that many for its trailing window.
+                        if max_chain_len >= 2 {
+                            let hq = inst.point_history.entry(cp_name).or_default();
+                            hq.push_back(val);
+                            while hq.len() > max_chain_len {
+                                hq.pop_front();
+                            }
+                        }
                     }
                 }
                 CovergroupItem::Cross(cr) => {
+                    // LRM §19.6 `iff (guard)` — skip the cross sample
+                    // when the guard expression is false.
+                    if let Some(guard) = &cr.iff_guard {
+                        if !self.eval_expr(guard).is_true() {
+                            continue;
+                        }
+                    }
                     // Cross items name COVERPOINTS, not signals — resolve each
                     // to its coverpoint's expression in this covergroup and
                     // eval, so the tuple captures the actual sampled values.
@@ -25994,8 +28365,47 @@ impl Simulator {
                             .collect::<Vec<_>>()
                             .join("_")
                     });
+                    // LRM §19.6 cross body bin filters. For each
+                    // `bins NAME = binsof(<cp>) intersect { ranges };`,
+                    // look up cp's index in the cross items list and
+                    // check whether the tuple's component at that index
+                    // falls in any of the bin's constant ranges. Compute
+                    // the increments here BEFORE the mutable borrow of
+                    // the cg instance below.
+                    let mut bin_increments: Vec<String> = Vec::new();
+                    for b in &cr.bins {
+                        let idx_opt = cr
+                            .items
+                            .iter()
+                            .position(|i| i.name == b.cp_ref.name);
+                        let Some(idx) = idx_opt else { continue };
+                        let Some(v) = tuple.get(idx).cloned() else {
+                            continue;
+                        };
+                        let in_range = b.ranges.iter().any(|r| match r {
+                            crate::ast::decl::ConstraintRange::Value(e) => {
+                                self.eval_expr(e).to_u64() == v.to_u64()
+                            }
+                            crate::ast::decl::ConstraintRange::Range { lo, hi } => {
+                                let lo_v = self.eval_expr(lo).to_u64().unwrap_or(0);
+                                let hi_v = self.eval_expr(hi).to_u64().unwrap_or(0);
+                                let v_v = v.to_u64().unwrap_or(0);
+                                lo_v <= v_v && v_v <= hi_v
+                            }
+                        });
+                        if in_range {
+                            bin_increments
+                                .push(format!("{}.{}", cr_name, b.name.name));
+                        }
+                    }
                     if let Some(Some(inst)) = self.cg_heap.get_mut(handle) {
-                        inst.cross_hits.entry(cr_name).or_default().insert(tuple);
+                        inst.cross_hits
+                            .entry(cr_name.clone())
+                            .or_default()
+                            .insert(tuple);
+                        for k in bin_increments {
+                            *inst.cross_bin_hits.entry(k).or_insert(0) += 1;
+                        }
                     }
                 }
                 _ => {}
@@ -26292,7 +28702,26 @@ impl Simulator {
                 "put" => {
                     if let Some(arg) = args.first() {
                         let v = self.eval_expr(arg);
-                        self.mailboxes.get_mut(&handle).unwrap().push_back(v);
+                        // LRM §15.4.2: if a blocking get is waiting on this
+                        // mailbox, hand the value directly to the waiter
+                        // (skipping the queue) and reschedule its
+                        // continuation at the current time.
+                        let waiter = self
+                            .mailbox_get_waiters
+                            .get_mut(&handle)
+                            .and_then(|q| q.pop_front());
+                        if let Some(w) = waiter {
+                            let MailboxGetWaiter { pid, lvalue, cont } = w;
+                            let width = self.infer_lhs_width(&lvalue);
+                            self.assign_value(&lvalue, &v.resize(width));
+                            if !cont.is_empty() {
+                                self.event_queue.schedule(self.time, pid, cont);
+                            } else {
+                                self.child_finished(pid);
+                            }
+                        } else {
+                            self.mailboxes.get_mut(&handle).unwrap().push_back(v);
+                        }
                     }
                     return Value::zero(32);
                 }
@@ -26311,7 +28740,22 @@ impl Simulator {
                 "try_put" => {
                     if let Some(arg) = args.first() {
                         let v = self.eval_expr(arg);
-                        self.mailboxes.get_mut(&handle).unwrap().push_back(v);
+                        let waiter = self
+                            .mailbox_get_waiters
+                            .get_mut(&handle)
+                            .and_then(|q| q.pop_front());
+                        if let Some(w) = waiter {
+                            let MailboxGetWaiter { pid, lvalue, cont } = w;
+                            let width = self.infer_lhs_width(&lvalue);
+                            self.assign_value(&lvalue, &v.resize(width));
+                            if !cont.is_empty() {
+                                self.event_queue.schedule(self.time, pid, cont);
+                            } else {
+                                self.child_finished(pid);
+                            }
+                        } else {
+                            self.mailboxes.get_mut(&handle).unwrap().push_back(v);
+                        }
                     }
                     return Value::from_u64(1, 32);
                 }
@@ -26642,6 +29086,9 @@ impl Simulator {
     }
 
     fn exec_randomize(&mut self, handle: usize) -> Value {
+        // Reset the dist-pick-once tracker so each randomize call gets a
+        // fresh weighted draw per `(handle, prop)`.
+        self.dist_picked_once.clear();
         use rand::Rng;
         let class_name = if let Some(Some(inst)) = self.heap.get(handle) {
             inst.class_name.clone()
@@ -26735,6 +29182,11 @@ impl Simulator {
         }
         let has_post = self.class_has_method(&class_name, "post_randomize");
         for _trial in 0..1000 {
+            // LRM §18.5.4 dist: clear the pick-once gate at each trial so a
+            // failed trial doesn't permanently freeze the dist constraint.
+            // Within a single trial the gate still ensures the fixpoint
+            // loop draws only one weighted sample per (handle, prop).
+            self.dist_picked_once.clear();
             let mut solved_props: HashMap<String, Value> = HashMap::default();
             let mut backup = HashMap::default();
 
@@ -26834,8 +29286,61 @@ impl Simulator {
                 }
             }
 
-            // Solve properties
+            // LRM §18.5.9 — `solve X before Y` precedence ordering.
+            // Walk every constraint block, gather (before, after) name pairs,
+            // build a precedence graph keyed by rand_props indices, and
+            // topologically sort `pids_to_solve` so that X's index appears
+            // before Y's. Names not referenced fall back to declaration
+            // order. Cycles are broken by emitting any deadlocked nodes in
+            // their original order (matches what most simulators do — a
+            // proper LRM-strict implementation would error on cycles, but
+            // we prefer best-effort for compatibility with imperfect
+            // testbenches).
+            let mut solve_pairs: Vec<(String, String)> = Vec::new();
+            for con in &constraints {
+                Self::collect_solve_pairs(&con.items, &mut solve_pairs);
+            }
             let mut pids_to_solve: Vec<usize> = (0..rand_props.len()).collect();
+            if !solve_pairs.is_empty() {
+                let name_to_idx: HashMap<String, usize> = rand_props
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (n, _))| (n.clone(), i))
+                    .collect();
+                let n = rand_props.len();
+                let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+                let mut in_deg: Vec<u32> = vec![0; n];
+                for (b, a) in &solve_pairs {
+                    if let (Some(&bi), Some(&ai)) = (name_to_idx.get(b), name_to_idx.get(a)) {
+                        if bi != ai {
+                            adj[bi].push(ai);
+                            in_deg[ai] += 1;
+                        }
+                    }
+                }
+                // Kahn's algorithm — preserves declaration order within
+                // equivalent layers by always taking the lowest-numbered
+                // ready node.
+                let mut topo: Vec<usize> = Vec::with_capacity(n);
+                let mut emitted = vec![false; n];
+                loop {
+                    let next = (0..n).find(|&i| !emitted[i] && in_deg[i] == 0);
+                    if let Some(idx) = next {
+                        emitted[idx] = true;
+                        topo.push(idx);
+                        for &nei in &adj[idx] {
+                            if in_deg[nei] > 0 { in_deg[nei] -= 1; }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                // Append any unsolved (cycle members) in original order.
+                for i in 0..n {
+                    if !emitted[i] { topo.push(i); }
+                }
+                pids_to_solve = topo;
+            }
             let mut progress = true;
             while !pids_to_solve.is_empty() && progress {
                 progress = false;
@@ -27052,10 +29557,34 @@ impl Simulator {
             // constraints be satisfied without relying on random luck.
             let rand_set: HashSet<String> =
                 rand_props.iter().map(|(n, _)| n.clone()).collect();
+            // LRM §18.5.14: a `soft` constraint is overridden by any
+            // hard constraint on the same variable. Collect the set of
+            // variables targeted by HARD (non-soft) constraint items so
+            // soft items on those variables can be skipped during the
+            // fixpoint pass.
+            let mut hard_target_vars: HashSet<String> = HashSet::default();
+            for con in &constraints {
+                for item in &con.items {
+                    if !matches!(item, ConstraintItem::Soft(_)) {
+                        if let Some(v) = Self::constraint_item_target(item) {
+                            hard_target_vars.insert(v);
+                        }
+                    }
+                }
+            }
             for _pass in 0..16 {
                 let mut changed = false;
                 for con in &constraints {
                     for item in &con.items {
+                        // Skip a soft constraint whose target variable is
+                        // pinned by a hard constraint (the hard one wins).
+                        if let ConstraintItem::Soft(_) = item {
+                            if let Some(v) = Self::constraint_item_target(item) {
+                                if hard_target_vars.contains(&v) {
+                                    continue;
+                                }
+                            }
+                        }
                         if self.solve_forced(handle, item, &rand_set) {
                             changed = true;
                         }
@@ -27131,8 +29660,36 @@ impl Simulator {
             // solve_forced pass.
             let foreach_constrained_arrays: HashSet<String> = {
                 let mut set = HashSet::default();
+                // Only a POSITIVE `arr[i] inside {…}` body is something
+                // solve_forced_array_elem can solve — only those arrays must
+                // be left to it. A negated-only body (`!(arr[i] inside {…})`,
+                // riscv-dv's gpr_c) is exclusion-shaped: the rand_array pool
+                // pass below handles it via collect_array_exclusions (and
+                // picks distinct elements), so such arrays must NOT be
+                // skipped here — skipping left gpr[0] free to keep ZERO and
+                // emit an illegal `la x0, _start`.
+                fn has_positive_inside(item: &ConstraintItem) -> bool {
+                    match item {
+                        ConstraintItem::Expr(e) => {
+                            matches!(&e.kind, ExprKind::Inside { .. })
+                        }
+                        ConstraintItem::Inside { .. } => true,
+                        ConstraintItem::Block(items) => {
+                            items.iter().any(has_positive_inside)
+                        }
+                        ConstraintItem::Soft(inner) => has_positive_inside(inner),
+                        _ => false,
+                    }
+                }
                 fn walk(item: &ConstraintItem, out: &mut HashSet<String>) {
-                    if let ConstraintItem::Foreach { array, .. } = item {
+                    if let ConstraintItem::Foreach { array, item: body, .. } = item {
+                        // Only skip the pool pass for arrays whose foreach body
+                        // has a POSITIVE `inside` (what solve_forced_array_elem
+                        // can solve); negated-only bodies are exclusion-shaped
+                        // and belong to the pool pass.
+                        if !has_positive_inside(body.as_ref()) {
+                            return;
+                        }
                         let inner_h = match &array.kind {
                             ExprKind::Index { expr: b, .. } => match &b.kind {
                                 ExprKind::Ident(h) => Some(h),
@@ -27197,6 +29754,38 @@ impl Simulator {
                     };
                     self.signals
                         .insert(format!("{}[{}]", scoped, i), Value::from_u64(v, *width));
+                }
+            }
+
+            // §18.5.5 `unique {arr}`: re-enforce AFTER the rand_array pool
+            // pass above, which just re-seeded every element with fresh
+            // randoms — a non-enum array (no pool) gets unconstrained picks
+            // there, so distinctness applied during the fixpoint would not
+            // survive into the final state.
+            {
+                fn collect_unique_items<'a>(
+                    item: &'a ConstraintItem,
+                    out: &mut Vec<&'a ConstraintItem>,
+                ) {
+                    match item {
+                        ConstraintItem::Unique { .. } => out.push(item),
+                        ConstraintItem::Block(items) => {
+                            for it in items {
+                                collect_unique_items(it, out);
+                            }
+                        }
+                        ConstraintItem::Soft(inner) => collect_unique_items(inner, out),
+                        _ => {}
+                    }
+                }
+                let mut uniques: Vec<&ConstraintItem> = Vec::new();
+                for con in &constraints {
+                    for item in &con.items {
+                        collect_unique_items(item, &mut uniques);
+                    }
+                }
+                for item in uniques {
+                    self.solve_forced(handle, item, &rand_set);
                 }
             }
 
@@ -27318,6 +29907,7 @@ impl Simulator {
     /// Evaluate the (lo, hi) bounds of a constraint range list and test whether
     /// `val` already falls inside any of them.
     fn value_in_ranges(&mut self, val: &Value, ranges: &[ConstraintRange]) -> bool {
+        let val_u = val.to_u64();
         for r in ranges {
             match r {
                 ConstraintRange::Value(e) => {
@@ -27329,14 +29919,16 @@ impl Simulator {
                             if let Some(ev) =
                                 self.get_signal_value_by_name(&format!("{}[{}]", nm, i))
                             {
-                                if *val == ev {
+                                if val_u.is_some() && val_u == ev.to_u64() {
                                     return true;
                                 }
                             }
                         }
                         continue;
                     }
-                    if *val == self.eval_expr(e) {
+                    // Compare numerically rather than width-sensitively
+                    // (4-bit `15` vs 32-bit literal `15` would otherwise miss).
+                    if val_u.is_some() && val_u == self.eval_expr(e).to_u64() {
                         return true;
                     }
                 }
@@ -27551,6 +30143,37 @@ impl Simulator {
         excluded
     }
 
+    /// Declared enum type of a class property, walking the `extends` chain
+    /// from the instance's dynamic class. Used by the `!=` solver arm so a
+    /// re-pick on an enum-typed field draws a *valid* member rather than a
+    /// raw width-masked random.
+    fn prop_enum_type(&self, handle: usize, prop: &str) -> Option<String> {
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        let mut guard = 0;
+        while let Some(cname) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            if let Some(class_def) = self.module.classes.get(&cname) {
+                if let Some(sig) = class_def.properties.get(prop) {
+                    return sig
+                        .type_name
+                        .clone()
+                        .filter(|tn| self.module.enum_members.contains_key(tn));
+                }
+                cur = class_def.extends.clone();
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
     fn solve_forced(
         &mut self,
         handle: usize,
@@ -27581,6 +30204,66 @@ impl Simulator {
                     }
                     false
                 }
+                // `a != b` (the desugared form of `unique {…}`, §18.5.5, and
+                // plain inequality constraints): when the two sides are
+                // currently equal, re-pick one rand side to a fresh value
+                // that differs from the other side. The surrounding fixpoint
+                // loop re-checks every pair each pass, so transitive
+                // collisions introduced by a re-pick converge over passes.
+                ExprKind::Binary { op: BinaryOp::Neq, left, right } => {
+                    let lv = self.eval_expr(left);
+                    let rv = self.eval_expr(right);
+                    if lv.to_u64() != rv.to_u64() {
+                        return false; // already satisfied
+                    }
+                    // Prefer re-picking a rand side (right first so that a
+                    // `rand != const` constraint with the const on the left
+                    // still resolves).
+                    let (target, other_val) =
+                        if let Some(v) = self.rand_lvalue_name(right, rand_set) {
+                            (v, lv)
+                        } else if let Some(v) = self.rand_lvalue_name(left, rand_set) {
+                            (v, rv)
+                        } else {
+                            return false; // neither side is rand — nothing to force
+                        };
+                    let width = other_val.width.max(1);
+                    let avoid = other_val.to_u64().unwrap_or(0);
+                    use rand::Rng;
+                    // Enum-typed field: re-pick among valid members only.
+                    if let Some(et) = self.prop_enum_type(handle, &target) {
+                        let members: Vec<u64> = self
+                            .module
+                            .enum_members
+                            .get(&et)
+                            .map(|m| m.iter().map(|x| x.1).filter(|v| *v != avoid).collect())
+                            .unwrap_or_default();
+                        if members.is_empty() {
+                            return false;
+                        }
+                        let pick = members[self.rng.gen_range(0..members.len())];
+                        return self.set_prop_if_changed(
+                            handle,
+                            &target,
+                            Value::from_u64(pick, width),
+                        );
+                    }
+                    for _try in 0..32 {
+                        let cand = if width >= 64 {
+                            self.rng.gen::<u64>()
+                        } else {
+                            self.rng.gen::<u64>() & ((1u64 << width) - 1)
+                        };
+                        if cand != avoid {
+                            return self.set_prop_if_changed(
+                                handle,
+                                &target,
+                                Value::from_u64(cand, width),
+                            );
+                        }
+                    }
+                    false
+                }
                 ExprKind::Inside { expr: inner, ranges } => {
                     if let Some(v) = self.rand_lvalue_name(inner, rand_set) {
                         let cr: Vec<ConstraintRange> = ranges
@@ -27606,15 +30289,40 @@ impl Simulator {
                 }
                 _ => false,
             },
-            ConstraintItem::Inside { expr, range, .. } => {
+            ConstraintItem::Inside { expr, range, is_dist, dist_weights, .. } => {
                 if let Some(v) = self.rand_lvalue_name(expr, rand_set) {
                     let cur = self.eval_expr(expr);
+                    let is_weighted = *is_dist && !dist_weights.is_empty();
+                    // For non-weighted `inside`, if the current value already
+                    // satisfies the constraint we skip re-picking. For
+                    // weighted `dist`, we pick EXACTLY ONCE per randomize
+                    // call (gated by `dist_picked_once`) and then skip
+                    // subsequent iterations of the fixpoint loop. Without
+                    // the gate the empirical distribution biases toward the
+                    // higher-weighted values because each iteration re-rolls
+                    // and the loop tends to exit on a run of "no-change"
+                    // picks — which favors the high-probability outcome.
+                    if is_weighted {
+                        let key = (handle, v.clone());
+                        if self.dist_picked_once.contains(&key) {
+                            return false;
+                        }
+                        let width = cur.width.max(1);
+                        let picked = self.pick_dist_value(range, dist_weights)
+                            .map(|p| p.resize(width));
+                        if let Some(p) = picked {
+                            self.dist_picked_once.insert(key);
+                            return self.set_prop_if_changed(handle, &v, p);
+                        }
+                        return false;
+                    }
                     if self.value_in_ranges(&cur, range) {
                         return false;
                     }
                     let width = cur.width.max(1);
-                    if let Some(picked) = self.pick_from_ranges(range, width) {
-                        return self.set_prop_if_changed(handle, &v, picked);
+                    let picked = self.pick_from_ranges(range, width);
+                    if let Some(p) = picked {
+                        return self.set_prop_if_changed(handle, &v, p);
                     }
                 }
                 false
@@ -27704,6 +30412,106 @@ impl Simulator {
                 }
                 changed
             }
+            // §18.5.5 `unique {arr}` over a whole rand fixed array: make the
+            // elements pairwise distinct. (Multi-expression `unique` lists
+            // were already desugared to pairwise `!=` by the parser; only
+            // the single-expression whole-array form reaches this variant.)
+            ConstraintItem::Unique { exprs, .. } => {
+                let prop = match exprs.first().map(|e| &e.kind) {
+                    Some(ExprKind::Ident(h)) if h.path.len() == 1 => {
+                        h.path[0].name.name.clone()
+                    }
+                    _ => return false,
+                };
+                if !rand_set.contains(&prop) {
+                    return false;
+                }
+                // Element range/width from array_properties, walking the
+                // inheritance chain (same lookup as the Foreach arm).
+                let mut range: Option<(i64, i64, u32)> = None;
+                let mut cn = match self
+                    .heap
+                    .get(handle)
+                    .and_then(|x| x.as_ref())
+                    .map(|i| i.class_name.clone())
+                {
+                    Some(c) => c,
+                    None => return false,
+                };
+                loop {
+                    if let Some(cd) = self.module.classes.get(&cn) {
+                        if let Some(&(lo, hi, w)) = cd.array_properties.get(&prop) {
+                            range = Some((lo, hi, w));
+                            break;
+                        }
+                        if let Some(parent) = cd.extends.clone() {
+                            cn = parent;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                let (lo, hi, w) = match range {
+                    Some(r) => r,
+                    None => return false,
+                };
+                // Read the elements (scoped per-instance key first — where
+                // exec_randomize writes the baseline — then unscoped).
+                let read_elem = |s: &Self, i: i64| -> Option<Value> {
+                    s.signals
+                        .get(&format!("{}#{}[{}]", handle, prop, i))
+                        .cloned()
+                        .or_else(|| s.signals.get(&format!("{}[{}]", prop, i)).cloned())
+                };
+                let enum_pool: Vec<u64> = self
+                    .prop_enum_type(handle, &prop)
+                    .and_then(|et| self.module.enum_members.get(&et).cloned())
+                    .map(|m| m.iter().map(|x| x.1).collect())
+                    .unwrap_or_default();
+                let mut used: HashSet<u64> = HashSet::default();
+                let mut changed = false;
+                use rand::Rng;
+                for i in lo..=hi {
+                    let cur = read_elem(self, i).and_then(|v| v.to_u64());
+                    let needs_repick = match cur {
+                        Some(cv) => !used.insert(cv),
+                        None => true,
+                    };
+                    if !needs_repick {
+                        continue;
+                    }
+                    // Duplicate (or unreadable) element: re-pick a value not
+                    // yet used — from the enum pool when the element type is
+                    // an enum, otherwise width-masked random with retries.
+                    let pick = if !enum_pool.is_empty() {
+                        let avail: Vec<u64> = enum_pool
+                            .iter()
+                            .copied()
+                            .filter(|v| !used.contains(v))
+                            .collect();
+                        if avail.is_empty() {
+                            continue; // domain exhausted — leave as-is
+                        }
+                        Some(avail[self.rng.gen_range(0..avail.len())])
+                    } else {
+                        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                        (0..64)
+                            .map(|_| self.rng.gen::<u64>() & mask)
+                            .find(|c| !used.contains(c))
+                    };
+                    if let Some(p) = pick {
+                        used.insert(p);
+                        let v = Value::from_u64(p, w);
+                        self.signals
+                            .insert(format!("{}#{}[{}]", handle, prop, i), v.clone());
+                        self.set_signal_value_by_name(&format!("{}[{}]", prop, i), v);
+                        changed = true;
+                    }
+                }
+                changed
+            }
             _ => false,
         }
     }
@@ -27734,7 +30542,6 @@ impl Simulator {
                 }
                 let width = cur.width.max(32);
                 if let Some(picked) = self.pick_from_ranges(range, width) {
-                    eprintln!("[xezim][foreach-elem] writing {} = {:?}", elem_name, picked.to_u64());
                     self.set_signal_value_by_name(&elem_name, picked.clone());
                     return true;
                 }
@@ -27793,9 +30600,67 @@ impl Simulator {
     /// cannot model (dynamic-array `.size()`/`.sum()`/`.exists()` etc., foreach
     /// iteration, solve-ordering). Such items are skipped in the satisfiability
     /// check so they cannot spuriously fail randomization.
+    /// Walk a list of constraint items collecting every `solve X before Y`
+    /// pair (LRM §18.5.9). Pushes `(X_name, Y_name)` into `out`.
+    /// Recurses into nested blocks; ignores items inside `if`/`implication`
+    /// (those are runtime-conditional and would need solver-time
+    /// dependency analysis to honor correctly).
+    /// LRM §18.5.14: extract the bare target variable name of a
+    /// constraint item, for the common single-variable shapes
+    /// (`x == K`, `x < K`, `x inside {…}`, etc.). Used to decide
+    /// whether a `soft` constraint is overridden by a hard
+    /// constraint on the same variable. Returns None for
+    /// multi-variable / structural items.
+    fn constraint_item_target(item: &ConstraintItem) -> Option<String> {
+        fn ident_of(e: &Expression) -> Option<String> {
+            match &e.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 => {
+                    Some(h.path[0].name.name.clone())
+                }
+                ExprKind::Paren(inner) => ident_of(inner),
+                _ => None,
+            }
+        }
+        match item {
+            ConstraintItem::Expr(e) => match &e.kind {
+                ExprKind::Binary { left, .. } => ident_of(left),
+                ExprKind::Paren(inner) => {
+                    Self::constraint_item_target(&ConstraintItem::Expr(
+                        (**inner).clone(),
+                    ))
+                }
+                _ => None,
+            },
+            ConstraintItem::Inside { expr, .. } => ident_of(expr),
+            ConstraintItem::Soft(inner) => Self::constraint_item_target(inner),
+            _ => None,
+        }
+    }
+
+    fn collect_solve_pairs(items: &[ConstraintItem], out: &mut Vec<(String, String)>) {
+        for it in items {
+            match it {
+                ConstraintItem::Solve { before, after, .. } => {
+                    for b in before {
+                        for a in after {
+                            out.push((b.name.clone(), a.name.clone()));
+                        }
+                    }
+                }
+                ConstraintItem::Block(inner) => Self::collect_solve_pairs(inner, out),
+                ConstraintItem::Soft(inner) => Self::collect_solve_pairs(&[(**inner).clone()], out),
+                _ => {}
+            }
+        }
+    }
+
     fn constraint_unmodeled(item: &ConstraintItem) -> bool {
         match item {
-            ConstraintItem::Foreach { .. } | ConstraintItem::Solve { .. } => true,
+            ConstraintItem::Foreach { .. }
+            | ConstraintItem::Solve { .. }
+            // `unique {arr}` is enforced by its solve_forced arm; the
+            // post-hoc checker has no element-set view, so skip it there.
+            | ConstraintItem::Unique { .. } => true,
             ConstraintItem::Expr(e) => Self::expr_unmodeled(e),
             ConstraintItem::Inside { expr, .. } => Self::expr_unmodeled(expr),
             ConstraintItem::Implication { condition, constraint, .. } => {
@@ -27909,11 +30774,15 @@ impl Simulator {
             }
             ConstraintItem::Inside { expr, range, .. } => {
                 let val = self.eval_expr(expr);
+                let val_u = val.to_u64();
                 for r in range {
                     match r {
                         ConstraintRange::Value(e) => {
-                            let v = self.eval_expr(e);
-                            if val == v {
+                            // Compare numerically rather than by raw Value
+                            // equality (which is width-sensitive — a 4-bit `1`
+                            // is unequal to a 32-bit literal `1`).
+                            let v_u = self.eval_expr(e).to_u64();
+                            if val_u.is_some() && val_u == v_u {
                                 return true;
                             }
                         }
@@ -28074,12 +30943,34 @@ impl Simulator {
                     self.this_stack.push(Some(handle));
                     self.local_stack.push(locals);
                     self.class_context_stack.push(Some(cname.clone()));
+                    // LRM §25.9 virtual-interface formal-arg aliasing
+                    // (class-method dispatch). Mirrors exec_task_call.
+                    let mut iface_alias_frame: HashMap<String, String> =
+                        HashMap::default();
+                    for (i, port) in ports.iter().enumerate() {
+                        if let crate::ast::types::DataType::TypeReference {
+                            name, ..
+                        } = &port.data_type
+                        {
+                            if self.module.interfaces.contains(&name.name.name)
+                                && i < args.len()
+                            {
+                                if let ExprKind::Ident(h) = &args[i].kind {
+                                    let actual = self.resolve_hier_name(h);
+                                    iface_alias_frame
+                                        .insert(port.name.name.clone(), actual);
+                                }
+                            }
+                        }
+                    }
+                    self.local_iface_aliases.push(iface_alias_frame);
                     for stmt in body {
                         self.exec_statement(stmt);
                         if self.break_flag {
                             break;
                         }
                     }
+                    self.local_iface_aliases.pop();
                     self.break_flag = saved_break;
                     self.continue_flag = saved_continue;
                     self.class_context_stack.pop();
@@ -28216,6 +31107,11 @@ impl Simulator {
                 if let Some(t) = self.var_class_types.get(&name) {
                     return Some(t.clone());
                 }
+                // LRM §6.19.6: typedef-typed local — used by
+                // `local.next/.first/.last/.num/.prev` resolution.
+                if let Some(t) = self.var_typedef_types.get(&name) {
+                    return Some(t.clone());
+                }
                 // A class property referenced bare inside a method —
                 // resolve its type through the current class context.
                 if hier.path.len() == 1 {
@@ -28232,6 +31128,62 @@ impl Simulator {
                                 return Some(t);
                             }
                         }
+                    }
+                }
+                None
+            }
+            // LRM §6.19.6: `<enum_var>.next()` / `.prev()` / `.first()`
+            // / `.last()` returns a value of the enum type. Inherit
+            // the receiver's typedef name so a chained `.name()` finds
+            // the member list.
+            ExprKind::Call { func, args } if args.is_empty() => {
+                let m = match &func.kind {
+                    ExprKind::MemberAccess { member, .. } => Some(member.name.clone()),
+                    ExprKind::Ident(h) if h.path.len() >= 2 => h
+                        .path
+                        .last()
+                        .map(|s| s.name.name.clone()),
+                    _ => None,
+                };
+                if matches!(
+                    m.as_deref(),
+                    Some("next") | Some("prev") | Some("first") | Some("last")
+                ) {
+                    let receiver: Option<Expression> = match &func.kind {
+                        ExprKind::MemberAccess { expr: recv, .. } => {
+                            Some((**recv).clone())
+                        }
+                        ExprKind::Ident(h) if h.path.len() >= 2 => {
+                            let mut head = h.clone();
+                            head.path.pop();
+                            Some(Expression::new(
+                                ExprKind::Ident(head),
+                                expr.span,
+                            ))
+                        }
+                        _ => None,
+                    };
+                    if let Some(r) = receiver {
+                        return self.get_expr_type_name(&r);
+                    }
+                }
+                None
+            }
+            // LRM §8.4: `arr[i]` / `arr[i][j]` / `arr[i][j][k]` element
+            // type. Walks through chained Index nodes to find the root
+            // Ident, then consults `array_elem_class` for the registered
+            // class name. Handles 1D, 2D, and N-D arrays.
+            ExprKind::Index { expr: base, .. } => {
+                let mut cur: &Expression = base.as_ref();
+                while let ExprKind::Index { expr: inner, .. } = &cur.kind {
+                    cur = inner.as_ref();
+                }
+                if let ExprKind::Ident(bh) = &cur.kind {
+                    let bname = self.resolve_hier_name(bh);
+                    if let Some(cn) =
+                        self.module.array_elem_class.get(&bname).cloned()
+                    {
+                        return Some(cn);
                     }
                 }
                 None

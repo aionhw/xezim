@@ -36,10 +36,6 @@ cc = "1"
 default = []
 jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
 jit-llvm = ["dep:inkwell"]
-# Intel TBB-based work-stealing dispatcher for parallel edge blocks.
-# Requires `libtbb-dev` on the host. Activated at runtime via
-# XEZIM_DISPATCHER=tbb; default remains std::thread::scope chunking.
-tbb = []
 
 [[bin]]
 name = "xezim"
