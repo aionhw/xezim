@@ -26564,7 +26564,16 @@ impl Simulator {
         // `obj`/`member` pair → instance-scoped name if `member` is an
         // associative property of the object the handle points at.
         let obj_member = |sim: &Self, obj: &str, member: &str| -> Option<String> {
-            let handle = sim.eval_ident_handle(obj).unwrap_or(0);
+            // `this.member` — resolve via the current `this` handle, not a
+            // variable lookup. Without this, an explicit-`this` associative or
+            // queue write (`this.m_successors[k]=1`, as UVM's phase graph and
+            // many class methods use) fails to resolve to `<handle>#member` and
+            // is silently dropped, while the bare `member[k]=1` form works.
+            let handle = if obj == "this" {
+                sim.this_stack.last().copied().flatten().unwrap_or(0)
+            } else {
+                sim.eval_ident_handle(obj).unwrap_or(0)
+            };
             if handle == 0 {
                 return None;
             }
@@ -26645,6 +26654,10 @@ impl Simulator {
     /// a `&self` context, applying instance scoping for member-array bases.
     fn eval_handle_expr(&self, expr: &Expression) -> Option<usize> {
         match &expr.kind {
+            // `this` resolves to the current object handle. Needed so
+            // `this.member` selects/associative-writes resolve to
+            // `<handle>#member` (e.g. UVM's `this.m_successors[k]=1`).
+            ExprKind::This => self.this_stack.last().copied().flatten(),
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 self.eval_ident_handle(&h.path[0].name.name)
             }
@@ -26865,6 +26878,22 @@ impl Simulator {
                 }
                 if find_config_db(expr) {
                     return self.exec_config_db(mname, args);
+                }
+            }
+
+            // Class-property collection accessed EXTERNALLY
+            // (`obj.member.num()/.exists()/.size()/...`): resolve the
+            // instance-scoped storage name (`<handle>#member`) up front, before
+            // the enum-method handler (which also claims `num`) and the bare-name
+            // array handler below can misroute it. Internal `member.num()`
+            // already resolves via `instance_assoc_member`; this is the external
+            // counterpart that UVM's phase graph relies on
+            // (`domain.m_successors.num()`, `phase.m_predecessors.exists(p)`).
+            if Self::is_array_builtin_method(mname) {
+                if let Some(an) = self.expr_assoc_name(expr) {
+                    if let Some(res) = self.eval_builtin_method(&an, mname, args) {
+                        return res;
+                    }
                 }
             }
 
@@ -27317,6 +27346,31 @@ impl Simulator {
                 && path[1].name.name == "randomize"
             {
                 return self.exec_std_randomize(args);
+            }
+
+            // Class-property collection accessed EXTERNALLY as a flattened
+            // ident (`obj.member.num()/.exists()/.size()/...` parses as
+            // `Call{Ident([obj, member, method])}`): resolve the instance-scoped
+            // storage (`<handle>#member`) and route to the array builtin BEFORE
+            // the enum-reflection handler below claims `num`. Internal
+            // `member.num()` resolves via `instance_assoc_member`; this is the
+            // external counterpart UVM's phase graph depends on
+            // (`domain.m_successors.num()`, `phase.m_predecessors.exists(p)`).
+            if len >= 2 && Self::is_array_builtin_method(path[len - 1].name.name.as_str()) {
+                let m = path[len - 1].name.name.clone();
+                let base = HierarchicalIdentifier {
+                    root: hier.root.clone(),
+                    path: path[..len - 1].to_vec(),
+                    span: hier.span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                };
+                let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
+                if let Some(an) = self.expr_assoc_name(&base_expr) {
+                    if let Some(res) = self.eval_builtin_method(&an, &m, args) {
+                        return res;
+                    }
+                }
             }
 
             // Enum `.name()` / string `.tolower()`/`.toupper()` where the
