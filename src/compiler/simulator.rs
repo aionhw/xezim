@@ -1097,6 +1097,26 @@ struct ProcessContext {
     return_value: Option<Value>,
     break_flag: bool,
     continue_flag: bool,
+    // Carried so a task that suspends mid-body keeps its full call context
+    // (needed once blocking task/method calls are inlined into the process
+    // statement stream — see `task_cleanup` and `StatementKind::ScopePop`).
+    local_iface_aliases: Vec<HashMap<String, String>>,
+    ref_binding_stack: Vec<HashMap<String, Expression>>,
+    queue_frame_saves: Vec<HashMap<String, Vec<(String, Value)>>>,
+    task_cleanup: Vec<TaskCleanup>,
+}
+
+/// Deferred teardown for an inlined blocking task/method call: the work
+/// `exec_task_call` would normally run synchronously after the body, replayed
+/// at the body's `ScopePop` sentinel so the process can suspend in between.
+#[derive(Debug, Clone, Default)]
+struct TaskCleanup {
+    output_bindings: Vec<(String, crate::ast::expr::Expression)>,
+    assoc_params: Vec<(String, String)>,
+    array_params: Vec<String>,
+    saved_break: bool,
+    saved_continue: bool,
+    prev_static: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1676,6 +1696,10 @@ pub struct Simulator {
     /// SV-2023: redirected lvalues for `ref` formal parameters during a call.
     /// Top-of-stack scope is consulted when assigning to a known formal name.
     ref_binding_stack: Vec<HashMap<String, Expression>>,
+    /// Deferred teardown for inlined blocking task/method calls (LIFO). Each
+    /// `ScopePop` sentinel pops and replays the top entry. Per-process (carried
+    /// in ProcessContext across suspension).
+    task_cleanup: Vec<TaskCleanup>,
     /// SV-2023: real-precision time tracker (parallel to integer `time`).
     real_time: f64,
     /// SV-2023: blocked mailbox `get`/`peek` proxies keyed by mailbox handle.
@@ -2692,6 +2716,7 @@ impl Simulator {
             disable_target: None,
             killed_pids: HashSet::default(),
             ref_binding_stack: Vec::new(),
+            task_cleanup: Vec::new(),
             real_time: 0.0,
             mailbox_get_waiters: HashMap::default(),
             event_triggered_time: HashMap::default(),
@@ -12655,6 +12680,10 @@ impl Simulator {
             return_value: self.return_value.clone(),
             break_flag: self.break_flag,
             continue_flag: self.continue_flag,
+            local_iface_aliases: self.local_iface_aliases.clone(),
+            ref_binding_stack: self.ref_binding_stack.clone(),
+            queue_frame_saves: self.queue_frame_saves.clone(),
+            task_cleanup: self.task_cleanup.clone(),
         }
     }
 
@@ -12666,6 +12695,10 @@ impl Simulator {
         self.return_value = ctx.return_value;
         self.break_flag = ctx.break_flag;
         self.continue_flag = ctx.continue_flag;
+        self.local_iface_aliases = ctx.local_iface_aliases;
+        self.ref_binding_stack = ctx.ref_binding_stack;
+        self.queue_frame_saves = ctx.queue_frame_saves;
+        self.task_cleanup = ctx.task_cleanup;
     }
 
     fn inherit_current_process_context(&mut self, pid: usize) {
@@ -12831,6 +12864,37 @@ impl Simulator {
                     expanded.extend_from_slice(&stmts[i + 1..]);
                     self.run_process_stmts(pid, &expanded);
                     return;
+                }
+            }
+
+            // Stage 1: a call to a free task whose body blocks (top-level
+            // `#delay`/`@event`/`wait`) is INLINED — bind the call frame, splice
+            // the body + a ScopePop sentinel + the rest into this process's
+            // stream, and recurse. The body's waits then suspend the process via
+            // the machinery below instead of running synchronously (which spins
+            // to a loop cap). Non-blocking task calls keep the synchronous path.
+            if let StatementKind::Expr(expr) = &stmt.kind {
+                if let ExprKind::Call { func, args } = &expr.kind {
+                    if let ExprKind::Ident(h) = &func.kind {
+                        if h.path.len() == 1 {
+                            if let Some(td) =
+                                self.module.tasks.get(&h.path[0].name.name).cloned()
+                            {
+                                if self.stmts_have_blocking(&td.items) {
+                                    let cleanup = self.bind_task_frame(&td, args);
+                                    self.task_cleanup.push(cleanup);
+                                    let mut cont: Vec<Statement> = td.items.clone();
+                                    cont.push(Statement::new(
+                                        StatementKind::ScopePop,
+                                        stmt.span,
+                                    ));
+                                    cont.extend_from_slice(&stmts[i + 1..]);
+                                    self.run_process_stmts(pid, &cont);
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -19123,6 +19187,11 @@ impl Simulator {
         }
         match &stmt.kind {
             StatementKind::Null => {}
+            StatementKind::ScopePop => {
+                if let Some(c) = self.task_cleanup.pop() {
+                    self.unwind_task_frame(c);
+                }
+            }
             StatementKind::Expr(expr) => self.exec_expr_stmt(expr),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
                 // LRM §25.8 virtual-interface binding. When the LHS is a
@@ -28057,6 +28126,62 @@ impl Simulator {
 
     /// Execute a module-level task call with arguments.
     fn exec_task_call(&mut self, td: &TaskDeclaration, args: &[Expression]) {
+        let cleanup = self.bind_task_frame(td, args);
+        // Execute task body
+        for stmt in &td.items {
+            self.exec_statement(stmt);
+            if self.return_value.is_some() {
+                break;
+            }
+        }
+        self.unwind_task_frame(cleanup);
+    }
+
+    /// Replay the deferred teardown of an inlined (or synchronous) task call:
+    /// the work that `exec_task_call` runs after the body. Mirrors the original
+    /// inline cleanup exactly.
+    fn unwind_task_frame(&mut self, c: TaskCleanup) {
+        self.current_static_task = c.prev_static;
+        self.ref_binding_stack.pop();
+        self.local_iface_aliases.pop();
+        self.continue_flag = c.saved_continue;
+        let locals = self.local_stack.pop().unwrap_or_default();
+        for (port_name, caller_expr) in &c.output_bindings {
+            if let Some(val) = locals.get(port_name) {
+                self.assign_value(caller_expr, val);
+            }
+        }
+        for (param_name, _caller_name) in &c.assoc_params {
+            let prefix = format!("{}[", param_name);
+            let keys: Vec<String> = self
+                .signals
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for k in keys {
+                self.signals.remove(&k);
+            }
+            self.module.associative_arrays.remove(param_name);
+        }
+        for param_name in &c.array_params {
+            let prefix = format!("{}[", param_name);
+            let keys: Vec<String> = self
+                .signals
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for k in keys {
+                self.signals.remove(&k);
+            }
+            self.module.arrays.remove(param_name);
+        }
+        self.break_flag = c.saved_break;
+        self.pop_and_restore_queue_frame();
+    }
+
+    fn bind_task_frame(&mut self, td: &TaskDeclaration, args: &[Expression]) -> TaskCleanup {
         use crate::ast::types::PortDirection;
         // Evaluate input args and collect output/ref arg expressions
         let mut locals = HashMap::default();
@@ -28204,56 +28329,14 @@ impl Simulator {
         if matches!(td.lifetime, Some(crate::ast::types::Lifetime::Static)) {
             self.current_static_task = Some(td.name.name.name.clone());
         }
-        // Execute task body
-        for stmt in &td.items {
-            self.exec_statement(stmt);
-            if self.return_value.is_some() {
-                break;
-            }
+        TaskCleanup {
+            output_bindings,
+            assoc_params,
+            array_params,
+            saved_break,
+            saved_continue,
+            prev_static,
         }
-        self.current_static_task = prev_static;
-        self.ref_binding_stack.pop();
-        // Pop the virtual-interface alias frame we pushed at call
-        // entry (LRM §25.9).
-        self.local_iface_aliases.pop();
-        self.continue_flag = saved_continue;
-        // Copy output/ref values back to caller
-        let locals = self.local_stack.pop().unwrap_or_default();
-        for (port_name, caller_expr) in &output_bindings {
-            if let Some(val) = locals.get(port_name) {
-                self.assign_value(caller_expr, val);
-            }
-        }
-        // Clean up associative array params
-        for (param_name, _caller_name) in &assoc_params {
-            let prefix = format!("{}[", param_name);
-            let keys: Vec<String> = self
-                .signals
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .cloned()
-                .collect();
-            for k in keys {
-                self.signals.remove(&k);
-            }
-            self.module.associative_arrays.remove(param_name);
-        }
-        // Clean up unpacked-array params
-        for param_name in &array_params {
-            let prefix = format!("{}[", param_name);
-            let keys: Vec<String> = self
-                .signals
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .cloned()
-                .collect();
-            for k in keys {
-                self.signals.remove(&k);
-            }
-            self.module.arrays.remove(param_name);
-        }
-        self.break_flag = saved_break;
-        self.pop_and_restore_queue_frame();
     }
 
     fn instantiate_covergroup(
@@ -29075,6 +29158,10 @@ impl Simulator {
                                 return_value: None,
                                 break_flag: false,
                                 continue_flag: false,
+                                local_iface_aliases: Vec::new(),
+                                ref_binding_stack: Vec::new(),
+                                queue_frame_saves: Vec::new(),
+                                task_cleanup: Vec::new(),
                             },
                         );
                         self.event_queue.schedule(self.time, pid, t.items.clone());
