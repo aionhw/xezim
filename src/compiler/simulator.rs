@@ -15828,6 +15828,30 @@ impl Simulator {
                 changed
             }
             ExprKind::Index { expr, index } => {
+                // Ascending packed vector bit-write (`logic [0:7] pa; pa[i]=b`):
+                // label i targets internal bit (W-1)-i (LRM §7.4.1, §11.5.1).
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let nm = self.resolve_hier_name(h);
+                    if let Some(w) = self.module.ascending_packed.get(&nm).copied() {
+                        if let Some(&id) = self.signal_name_to_id.get(nm.as_str()) {
+                            let i = self.eval_expr(index).to_u64().unwrap_or(0) as u32;
+                            if i < w {
+                                let pos = (w - 1 - i) as usize;
+                                let mut cur = self.signal_table[id].clone();
+                                let prev = cur.clone();
+                                cur.set_bit(pos, val.get_bit(0));
+                                let changed = cur != prev;
+                                if changed {
+                                    self.signal_table[id] = cur;
+                                    self.table_modified = true;
+                                    self.after_signal_write(id);
+                                    self.mark_dirty(&nm);
+                                }
+                                return changed;
+                            }
+                        }
+                    }
+                }
                 // Class associative-array member element write — base may be
                 // a bare member (`m[k]=v`) or another object's (`obj.m[k]=v`).
                 if let Some(an) = self.expr_assoc_name(expr) {
@@ -16208,11 +16232,25 @@ impl Simulator {
             } => {
                 let l = self.eval_expr(left).to_u64().unwrap_or(0) as usize;
                 let r = self.eval_expr(right).to_u64().unwrap_or(0) as usize;
-                let (msb, lsb) = match kind {
+                let (mut msb, mut lsb) = match kind {
                     RangeKind::Constant => (l.max(r), l.min(r)),
                     RangeKind::IndexedUp => (l + r.saturating_sub(1), l),
                     RangeKind::IndexedDown => (l, l.saturating_sub(r.saturating_sub(1))),
                 };
+                // Ascending packed vector part-write (`logic [0:7] pa; pa[0:3]=v`):
+                // labels index from the MSB end → internal [(W-1)-lsb : (W-1)-msb]
+                // (LRM §7.4.1, §11.5.1).
+                if matches!(kind, RangeKind::Constant) {
+                    if let ExprKind::Ident(h) = &expr.kind {
+                        let nm = self.resolve_hier_name(h);
+                        if let Some(w) = self.module.ascending_packed.get(&nm).copied() {
+                            let top = w as usize - 1;
+                            let (new_msb, new_lsb) = (top.saturating_sub(lsb), top.saturating_sub(msb));
+                            msb = new_msb;
+                            lsb = new_lsb;
+                        }
+                    }
+                }
                 // Unpacked array slice assignment: copy element-by-element
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
@@ -17730,6 +17768,21 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // Ascending packed vector bit-select (`logic [0:7] pa; pa[i]`):
+                // label i is the MSB end, so it reads internal bit (W-1)-i
+                // (LRM §7.4.1, §11.5.1). Whole-value storage is normal.
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let nm = self.resolve_hier_name(h);
+                    if let Some(w) = self.module.ascending_packed.get(&nm).copied() {
+                        let i = self.eval_expr(index).to_u64().unwrap_or(0) as u32;
+                        let sig = self.eval_expr(expr);
+                        if i < w {
+                            let pos = (w - 1 - i) as usize;
+                            return sig.range_select(pos, pos);
+                        }
+                        return Value::new(1);
+                    }
+                }
                 // Nested-collection element read: `assoc_of_queue[key][i]`
                 // (e.g. `instr_category[cat][i]`). The base `assoc[key]` maps to
                 // a compound queue name; read its `[i]` element.
@@ -18019,6 +18072,22 @@ impl Simulator {
                             }
                         }
                         return acc;
+                    }
+                }
+                // Ascending packed vector part-select (`logic [0:7] pa; pa[0:3]`):
+                // labels index from the MSB end, so map [a:b] to internal
+                // [(W-1)-a : (W-1)-b] (LRM §7.4.1, §11.5.1).
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let nm = self.resolve_hier_name(h);
+                    if let Some(w) = self.module.ascending_packed.get(&nm).copied() {
+                        if matches!(kind, RangeKind::Constant) {
+                            let a = self.eval_expr(left).to_u64().unwrap_or(0) as u32;
+                            let b = self.eval_expr(right).to_u64().unwrap_or(0) as u32;
+                            let base = self.eval_expr(expr);
+                            let hi = (w - 1).saturating_sub(a.min(b)) as usize;
+                            let lo = (w - 1).saturating_sub(a.max(b)) as usize;
+                            return base.range_select(hi, lo);
+                        }
                     }
                 }
                 let base = self.eval_expr(expr);
