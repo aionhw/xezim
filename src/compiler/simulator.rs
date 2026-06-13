@@ -1454,6 +1454,8 @@ pub struct Simulator {
     /// Active tag for a tagged union variable: signal name → tag name.
     pub active_union_tag: HashMap<String, String>,
     pub max_time: u64,
+    /// Seconds per simulation tick (finest timescale precision; 1e-9 default).
+    pub tick_s: f64,
     /// Maximum iterations for combinatorial settling per cycle.
     pub settle_limit: u32,
     /// Maximum snapshot→apply_nba→settle→check_edges rounds per event-loop
@@ -2165,6 +2167,15 @@ impl Simulator {
 
     pub fn new(mut module: ElaboratedModule, max_time: u64) -> Self {
         let phase_total = std::time::Instant::now();
+        // The simulator counts ticks of `module.tick_s` (the finest timescale
+        // precision; 1 ns by default). Delays were pre-scaled to ticks at
+        // elaboration. `max_time` is supplied in nanoseconds, so convert it to
+        // ticks here (no change when tick_s == 1 ns).
+        let tick_s = module.tick_s;
+        let max_time = {
+            let scale = (1e-9_f64 / tick_s).round();
+            (max_time as f64 * scale.max(1.0)) as u64
+        };
         // X-init coercion: when XEZIM_INIT_ZERO=1, signals matching one of
         // XEZIM_INIT_ZERO_PATHS (comma-separated substring filters) start
         // at 0 instead of X. Use this for designs where intentional `1'bx`
@@ -2652,6 +2663,7 @@ impl Simulator {
             pending_reactive: Vec::new(),
             active_union_tag: HashMap::default(),
             max_time,
+            tick_s,
             settle_limit: 100,
             cascade_limit: std::env::var("XEZIM_CASCADE_LIMIT")
                 .ok()
@@ -18411,9 +18423,9 @@ impl Simulator {
                     v.is_signed = false;
                     v
                 }
-                "$time" => Value::from_u64(self.time, 64),
-                "$realtime" => Value::from_f64(self.real_time),
-                "$stime" => Value::from_u64(self.time & 0xFFFF_FFFF, 32),
+                "$time" => Value::from_u64((self.time as f64 * self.tick_s * 1e9).round() as u64, 64),
+                "$realtime" => Value::from_f64(self.time as f64 * self.tick_s * 1e9),
+                "$stime" => Value::from_u64(((self.time as f64 * self.tick_s * 1e9).round() as u64) & 0xFFFF_FFFF, 32),
                 "$inferred_clock" | "$inferred_disable" if sv_parser::is_sv2023() => {
                     Value::from_u64(0, 1)
                 }
@@ -27664,9 +27676,9 @@ impl Simulator {
                 let name = &path[0].name.name;
                 if name.starts_with('$') {
                     return match name.as_str() {
-                        "$time" => Value::from_u64(self.time, 64),
-                        "$realtime" => Value::from_f64(self.real_time),
-                        "$stime" => Value::from_u64(self.time & 0xFFFF_FFFF, 32),
+                        "$time" => Value::from_u64((self.time as f64 * self.tick_s * 1e9).round() as u64, 64),
+                        "$realtime" => Value::from_f64(self.time as f64 * self.tick_s * 1e9),
+                        "$stime" => Value::from_u64(((self.time as f64 * self.tick_s * 1e9).round() as u64) & 0xFFFF_FFFF, 32),
                         "$inferred_clock" | "$inferred_disable" if sv_parser::is_sv2023() => {
                             Value::from_u64(0, 1)
                         }
