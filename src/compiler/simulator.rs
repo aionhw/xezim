@@ -2401,19 +2401,44 @@ impl Simulator {
         // Static signals/parameters reserved only `n` slots above; unpacked
         // arrays can add millions more signal IDs. Reserve once so large
         // memory construction does not repeatedly grow/copy the SoA vectors.
+        // Sanity guard: an unpacked array whose index range exceeds 1 G
+        // elements (1 << 30) is never a real design — it's the symptom of a
+        // parameter that resolved to 0 so a `[N-1:0]` dimension underflowed to
+        // ~u32::MAX. Materializing it would allocate one Signal per element
+        // (tens of GB) and OOM the process. Refuse with a clear error instead
+        // of crashing. Real large memories (c910 ~2 M entries) are far below
+        // this. Checked per array — a single oversized array is the pathology;
+        // many legitimate banks may sum higher.
+        const MAX_ARRAY_ELEMENTS: usize = 1 << 30;
+        let check_array_size = |name: &str, count: usize| {
+            if count > MAX_ARRAY_ELEMENTS {
+                eprintln!(
+                    "[xezim][error] array '{}' has {} elements (> {} = 1G index limit); \
+                     refusing to allocate — a dimension parameter likely resolved to 0, \
+                     underflowing `[N-1:0]` to a near-u32::MAX range",
+                    name, count, MAX_ARRAY_ELEMENTS
+                );
+                std::process::exit(1);
+            }
+        };
         let mut array_elem_count: usize = 0;
-        for &(lo, hi, _) in module.arrays.values() {
-            array_elem_count = array_elem_count.saturating_add((hi - lo + 1).max(0) as usize);
+        for (name, &(lo, hi, _)) in module.arrays.iter() {
+            let count = (hi - lo + 1).max(0) as usize;
+            check_array_size(name, count);
+            array_elem_count = array_elem_count.saturating_add(count);
         }
-        for &((lo1, hi1), (lo2, hi2), _) in module.arrays_2d.values() {
+        for (name, &((lo1, hi1), (lo2, hi2), _)) in module.arrays_2d.iter() {
             let d1 = (hi1 - lo1 + 1).max(0) as usize;
             let d2 = (hi2 - lo2 + 1).max(0) as usize;
-            array_elem_count = array_elem_count.saturating_add(d1.saturating_mul(d2));
+            let count = d1.saturating_mul(d2);
+            check_array_size(name, count);
+            array_elem_count = array_elem_count.saturating_add(count);
         }
-        for (shape, _) in module.arrays_nd.values() {
+        for (name, (shape, _)) in module.arrays_nd.iter() {
             let count = shape.iter().fold(1usize, |acc, &(lo, hi)| {
                 acc.saturating_mul((hi - lo + 1).max(0) as usize)
             });
+            check_array_size(name, count);
             array_elem_count = array_elem_count.saturating_add(count);
         }
         signal_table.reserve(array_elem_count);
@@ -10425,12 +10450,33 @@ impl Simulator {
             // Use a temporary visited matrix row-by-row to avoid double-counting edges.
             let mut seen_pred: Vec<u32> = vec![u32::MAX; n];
             let mut edges: Vec<(u32, u32)> = Vec::new();
+            // A single net with thousands of combinational writers is never real
+            // RTL (one driver per net is the norm). It arises when a parameter
+            // underflows so a `for i: assign bus[i] = …` generate-loop's index
+            // select collapses — `bus` clamped to 1 bit makes every `bus[i]`
+            // alias the SAME signal id, yielding W writers on one net and a
+            // W × R dependency-edge explosion (black-parrot's lru_decode.mask_o:
+            // 10000 × 20000 = 200 M edges → 1.6 GB → OOM). Cap the predecessor
+            // fan-in from any such degenerate net; its entries still converge via
+            // the unresolved-read re-fire path, just without precise topo order.
+            const MAX_WRITERS_PER_NET: usize = 1024;
+            let mut capped_warned = false;
             for b in 0..n {
                 for &sid in &entries[b].read_signal_ids {
                     if sid >= num_signals {
                         continue;
                     }
                     if let Some(writers) = writers_by_sig.get(&sid) {
+                        if writers.len() > MAX_WRITERS_PER_NET {
+                            if !capped_warned {
+                                capped_warned = true;
+                                std::eprintln!("[xezim][warning] net sid={} has {} combinational \
+                                    writers (> {}); skipping its dependency edges — likely a \
+                                    parameter-underflow generate-loop artifact",
+                                    sid, writers.len(), MAX_WRITERS_PER_NET);
+                            }
+                            continue;
+                        }
                         for &a in writers {
                             if a == b {
                                 continue;
