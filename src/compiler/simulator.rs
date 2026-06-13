@@ -19217,6 +19217,11 @@ impl Simulator {
                 v
             }
             NumberLiteral::Real(f) => Value::from_f64(*f),
+            // A time literal in a value context evaluates to its magnitude in the
+            // simulation tick unit (1 ns) — `10ns` → 10.0 — matching the prior
+            // behaviour. (Delay contexts route through eval_delay_ticks, which
+            // applies the timescale/precision conversion.)
+            NumberLiteral::Time(s) => Value::from_f64(*s * 1e9),
             NumberLiteral::UnbasedUnsized(c) => match c {
                 '0' => Value::zero(32),
                 '1' => Value::ones(32),

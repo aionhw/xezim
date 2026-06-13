@@ -2091,6 +2091,9 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(v)
             }
             NumberLiteral::Real(f) => Some(Value::from_u64(*f as u64, 64)),
+            // Time literal magnitude in tick units (1 ns), matching the
+            // interpreter's value-context handling.
+            NumberLiteral::Time(s) => Some(Value::from_u64((*s * 1e9) as u64, 64)),
             NumberLiteral::UnbasedUnsized(c) => Some(match c {
                 '0' => Value::zero(32),
                 '1' => Value::ones(32),
