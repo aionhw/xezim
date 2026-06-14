@@ -841,10 +841,13 @@ fn main() {
             eprintln!("Error: file '{}' not found", sf);
             std::process::exit(1);
         }
-        match std::fs::read_to_string(path) {
-            Ok(s) => {
+        // Lossy decode: some real RTL files contain stray non-UTF-8 bytes
+        // (e.g. latin-1 in a comment — scr1_pipe_hdu.sv). Read raw bytes and
+        // replace invalid sequences with U+FFFD instead of failing the whole run.
+        match std::fs::read(path) {
+            Ok(bytes) => {
                 file_labels.push(sf.clone());
-                sources.push(s);
+                sources.push(String::from_utf8_lossy(&bytes).into_owned());
             }
             Err(e) => {
                 eprintln!("Error: cannot read '{}': {}", sf, e);
