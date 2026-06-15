@@ -9,8 +9,8 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 ahash = { version = "0.8", features = ["serde"] }
 rand = "0.8"
-xezim-core = { path = "xezim-core" }
-sv-parser = { path = "xezim-core/xezim-parser" }
+xezim-core = { path = "../xezim-core" }
+sv-parser = { path = "../xezim-core/xezim-parser" }
 libloading = "0.8"
 libffi = "3"
 libc = "0.2"
