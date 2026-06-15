@@ -95,7 +95,7 @@ fn print_usage() {
 }
 
 fn print_version() {
-    println!("xezim version 0.1.0");
+    println!("xezim version {}", env!("CARGO_PKG_VERSION"));
 }
 
 fn push_define_token(tok: &str, defines: &mut Vec<(String, Option<String>)>) {
