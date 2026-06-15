@@ -2452,6 +2452,15 @@ impl Simulator {
             check_array_size(name, count);
             array_elem_count = array_elem_count.saturating_add(count);
         }
+        // Free the elaboration-time `signals` map BEFORE allocating the
+        // (potentially multi-GB) array-element storage below — its data
+        // (per-signal width, signed/real, type_name) is already projected into
+        // the parallel signal_widths/signal_signed/signal_real/
+        // signal_type_names vectors + signal_name_to_id, which the sim uses
+        // instead. Clearing it here (rather than at end of construction) keeps
+        // its ~one-long-name-string-plus-Signal-per-entry footprint out of the
+        // peak-RSS window during the big array reserve.
+        module.signals = Default::default();
         signal_table.reserve(array_elem_count);
         signal_widths_vec.reserve(array_elem_count);
         signal_signed_vec.reserve(array_elem_count);
@@ -25863,16 +25872,13 @@ impl Simulator {
             let tn_opt: Option<String> = self
                 .signal_name_to_id
                 .get(obj_name)
-                .and_then(|id| self.signal_type_names.get(id).cloned())
-                .or_else(|| self.module.signals.get(obj_name).and_then(|s| s.type_name.clone()));
+                .and_then(|id| self.signal_type_names.get(id).cloned());
             if let Some(tn) = tn_opt {
                 if let Some(members) = self.module.enum_members.get(&tn).cloned() {
                     if members.is_empty() { return Some(Value::zero(32)); }
                     // All enum members share the typedef's base width.
-                    let mw = self.module.signals.get(&members[0].0)
-                        .map(|s| s.width)
-                        .or_else(|| self.signal_name_to_id.get(members[0].0.as_str())
-                            .and_then(|id| self.signal_widths.get(*id).copied()))
+                    let mw = self.signal_name_to_id.get(members[0].0.as_str())
+                        .and_then(|id| self.signal_widths.get(*id).copied())
                         .unwrap_or(32);
                     return Some(match mname {
                         "num"   => Value::from_u64(members.len() as u64, 32),
@@ -27094,8 +27100,8 @@ impl Simulator {
                         }
                         // Width inherited from any one member's signal entry
                         // (all members share base_width).
-                        let mw = self.module.signals.get(&members[0].0)
-                            .map(|s| s.width)
+                        let mw = self.signal_name_to_id.get(members[0].0.as_str())
+                            .and_then(|id| self.signal_widths.get(*id).copied())
                             .unwrap_or(32);
                         match mname {
                             "num" => return Value::from_u64(members.len() as u64, 32),
