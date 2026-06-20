@@ -15553,6 +15553,108 @@ impl Simulator {
         }
     }
 
+    /// AST comb-entry eval (`CombItem::ContAssign` / `AlwaysBlock`). These need
+    /// the full `&mut self` interpreter (`eval_expr_ctx` / `exec_statement`), so
+    /// they can't go through `eval_comb_entry_isolated`. Factored out of the
+    /// `settle_combinatorial_inner` match so the canonical settle and a future
+    /// level-BSP settle driver share one implementation. `entry` borrows the
+    /// caller's (taken) comb-entry list, not `self`. Behavior is identical to
+    /// the former inline arms (signal_table writes + dirty bookkeeping).
+    fn eval_ast_comb_entry(&mut self, entry: &CombEntry) {
+        match &entry.item {
+            CombItem::ContAssign {
+                lhs,
+                rhs,
+                delay: explicit_delay,
+            } => {
+                let scope_hint = entry.scope_hint.clone();
+                let t_entry = std::time::Instant::now();
+                let saved_hint = self.name_resolve_hint.borrow().clone();
+                if let Some(hint) = &scope_hint {
+                    *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
+                }
+                let lhs_id = self.get_lhs_signal_id(lhs);
+                if scope_hint.is_none() {
+                    if let Some(id) = lhs_id {
+                        if let Some(full) = self.id_to_name.get(id) {
+                            if let Some((parent, _)) = full.rsplit_once('.') {
+                                *self.name_resolve_hint.borrow_mut() = Some(parent.to_string());
+                            }
+                        }
+                    }
+                }
+                let w = self.infer_lhs_width(lhs);
+                let val = self.eval_expr_ctx(rhs, w).resize(w);
+                let delay = if *explicit_delay > 0 {
+                    *explicit_delay
+                } else {
+                    lhs_id
+                        .and_then(|id| self.sdf_delays.get(id).copied())
+                        .unwrap_or(0)
+                };
+                if delay > 0 {
+                    if let Some(id) = lhs_id {
+                        if self.signal_table[id] != val {
+                            self.schedule_delayed_with_delay(id, val, delay);
+                        }
+                    }
+                } else if let Some(id) = lhs_id {
+                    let width = self.signal_widths[id];
+                    let mut resized = if self.signal_real[id] {
+                        if val.is_real {
+                            val.clone()
+                        } else {
+                            Value::from_f64(val.to_f64())
+                        }
+                    } else if val.is_real {
+                        Value::from_u64(val.to_f64() as u64, width)
+                    } else {
+                        val.resize(width)
+                    };
+                    resized.is_signed = self.signal_signed[id];
+                    if self.signal_table[id] != resized {
+                        self.mark_dirty_id(id);
+                        write_sig!(self, id, resized);
+                        self.table_modified = true;
+                    }
+                } else {
+                    self.assign_value(lhs, &val);
+                }
+                *self.name_resolve_hint.borrow_mut() = saved_hint;
+                self.prof_settle_ca_ns += t_entry.elapsed().as_nanos() as u64;
+                self.prof_settle_ca_count += 1;
+            }
+            CombItem::AlwaysBlock { stmt, .. } => {
+                let scope_hint = entry.scope_hint.clone();
+                let t_entry = std::time::Instant::now();
+                let saved_hint = self.name_resolve_hint.borrow().clone();
+                if let Some(hint) = &scope_hint {
+                    *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
+                }
+                self.settle_prev_values.clear();
+                for &id in &entry.write_signal_ids {
+                    self.settle_prev_values
+                        .push((id, self.signal_table[id].clone()));
+                }
+                self.exec_statement(stmt);
+                *self.name_resolve_hint.borrow_mut() = saved_hint;
+                for i in 0..self.settle_prev_values.len() {
+                    let (id, ref old_val) = self.settle_prev_values[i];
+                    if self.signal_table[id] != *old_val {
+                        if !self.dirty_signals[id] {
+                            self.dirty_signals[id] = true;
+                            self.dirty_list.push(id);
+                        }
+                        self.dirty_any = true;
+                    }
+                }
+                self.prof_settle_ab_ns += t_entry.elapsed().as_nanos() as u64;
+                self.prof_settle_ab_count += 1;
+            }
+            _ => {}
+        }
+    }
+
     fn settle_combinatorial_inner(&mut self) {
         if self.settling {
             return;
@@ -15842,97 +15944,9 @@ impl Simulator {
                         self.exec_insns(insns);
                         self.prof_settle_dc_count += 1;
                     }
-                    CombItem::ContAssign { lhs, rhs, delay: explicit_delay } => {
-                        let scope_hint = entries[eidx].scope_hint.clone();
-                        let t_entry = std::time::Instant::now();
-                        let saved_hint = self.name_resolve_hint.borrow().clone();
-                        if let Some(hint) = &scope_hint {
-                            *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
-                        }
-                        let lhs_id = self.get_lhs_signal_id(lhs);
-                        if scope_hint.is_none() {
-                            if let Some(id) = lhs_id {
-                                if let Some(full) = self.id_to_name.get(id) {
-                                    if let Some((parent, _)) = full.rsplit_once('.') {
-                                        *self.name_resolve_hint.borrow_mut() =
-                                            Some(parent.to_string());
-                                    }
-                                }
-                            }
-                        }
-                        let w = self.infer_lhs_width(lhs);
-                        let val = self.eval_expr_ctx(rhs, w).resize(w);
-                        // Check if this continuous assignment or the LHS target has a delay.
-                        let delay = if *explicit_delay > 0 {
-                            *explicit_delay
-                        } else {
-                            lhs_id
-                            .and_then(|id| self.sdf_delays.get(id).copied())
-                            .unwrap_or(0)
-                        };
-                        if delay > 0 {
-                            if let Some(id) = lhs_id {
-                                if self.signal_table[id] != val {
-                                    self.schedule_delayed_with_delay(id, val, delay);
-                                }
-                            }
-                        } else {
-                            if let Some(id) = lhs_id {
-                                let width = self.signal_widths[id];
-                                let mut resized = if self.signal_real[id] {
-                                    if val.is_real {
-                                        val.clone()
-                                    } else {
-                                        Value::from_f64(val.to_f64())
-                                    }
-                                } else {
-                                    if val.is_real {
-                                        Value::from_u64(val.to_f64() as u64, width)
-                                    } else {
-                                        val.resize(width)
-                                    }
-                                };
-                                resized.is_signed = self.signal_signed[id];
-                                if self.signal_table[id] != resized {
-                                    self.mark_dirty_id(id);
-                                    write_sig!(self, id, resized);
-                                    self.table_modified = true;
-                                }
-                            } else {
-                                self.assign_value(lhs, &val);
-                            }
-                        }
-                        *self.name_resolve_hint.borrow_mut() = saved_hint;
-                        self.prof_settle_ca_ns += t_entry.elapsed().as_nanos() as u64;
-                        self.prof_settle_ca_count += 1;
-                    }
-                    CombItem::AlwaysBlock { stmt, .. } => {
-                        let scope_hint = entries[eidx].scope_hint.clone();
-                        let t_entry = std::time::Instant::now();
-                        let saved_hint = self.name_resolve_hint.borrow().clone();
-                        if let Some(hint) = &scope_hint {
-                            *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
-                        }
-                        let write_ids = &entries[eidx].write_signal_ids;
-                        self.settle_prev_values.clear();
-                        for &id in write_ids {
-                            self.settle_prev_values
-                                .push((id, self.signal_table[id].clone()));
-                        }
-                        self.exec_statement(stmt);
-                        *self.name_resolve_hint.borrow_mut() = saved_hint;
-                        for i in 0..self.settle_prev_values.len() {
-                            let (id, ref old_val) = self.settle_prev_values[i];
-                            if self.signal_table[id] != *old_val {
-                                if !self.dirty_signals[id] {
-                                    self.dirty_signals[id] = true;
-                                    self.dirty_list.push(id);
-                                }
-                                self.dirty_any = true;
-                            }
-                        }
-                        self.prof_settle_ab_ns += t_entry.elapsed().as_nanos() as u64;
-                        self.prof_settle_ab_count += 1;
+                    CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {
+                        // Factored AST eval (shared with the BSP settle driver).
+                        self.eval_ast_comb_entry(&entries[eidx]);
                     }
                     CombItem::CompiledAlwaysBlock { compiled, .. } => {
                         // Bytecode path: BlockingAssign/NbaAssign insns mark
