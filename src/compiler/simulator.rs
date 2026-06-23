@@ -20551,14 +20551,30 @@ impl Simulator {
                 let handle = base.to_u64().unwrap_or(0) as usize;
                 if handle == 0 || handle >= self.heap.len() {
                     Value::zero(32)
-                } else if let Some(instance) = &self.heap[handle] {
-                    instance
-                        .properties
-                        .get(&member.name)
-                        .cloned()
-                        .unwrap_or(Value::zero(32))
                 } else {
-                    Value::zero(32)
+                    let prop = self.heap[handle]
+                        .as_ref()
+                        .and_then(|i| i.properties.get(&member.name).cloned());
+                    if let Some(v) = prop {
+                        v
+                    } else {
+                        // SV §13.4.1: `obj.f` with no parens calls a
+                        // no-argument function `f`. The member matched no
+                        // property, so dispatch to a same-named parameterless
+                        // function if the class declares one (UVM uvm_driver:
+                        // `if(seq_item_port.size<1)`).
+                        let cls = self.heap[handle]
+                            .as_ref()
+                            .map(|i| i.class_name.clone());
+                        match cls {
+                            Some(cn)
+                                if self.class_parameterless_function(&cn, &member.name) =>
+                            {
+                                self.exec_method_call(handle, &member.name, &[])
+                            }
+                            _ => Value::zero(32),
+                        }
+                    }
                 }
             }
             ExprKind::Call { func, args } => self.eval_call(func, args),
@@ -28575,6 +28591,29 @@ impl Simulator {
     }
 
     /// Does `class_name` or any ancestor declare a method `name`?
+    /// SV §13.4.1: a function with no arguments may be invoked without
+    /// parentheses (`port.size`, `obj.num`). True iff `class_name` or an
+    /// ancestor declares a FUNCTION `name` with no formal args — so a
+    /// member read `obj.name` that matches no property should dispatch to
+    /// it. Tasks and arg-bearing functions are excluded (a bare read can't
+    /// supply arguments and a task yields no value). UVM relies on this:
+    /// uvm_driver checks `if(seq_item_port.size<1)`.
+    fn class_parameterless_function(&self, class_name: &str, name: &str) -> bool {
+        use crate::ast::decl::ClassMethodKind;
+        let mut cur = Some(class_name.to_string());
+        while let Some(cname) = cur {
+            if let Some(cd) = self.module.classes.get(&cname) {
+                if let Some(m) = cd.methods.get(name) {
+                    return matches!(&m.kind, ClassMethodKind::Function(f) if f.ports.is_empty());
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
     fn class_has_method(&self, class_name: &str, name: &str) -> bool {
         let mut cur = Some(class_name.to_string());
         while let Some(cname) = cur {
