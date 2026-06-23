@@ -31169,8 +31169,23 @@ impl Simulator {
         // process spawning per UVM 1.2 §9.6 / IEEE 1800-2017 §13.4 — functions
         // cannot consume time): walk the component tree and invoke each phase
         // method directly in order.
+        for &c in &components {
+            if self.finished { return; }
+            self.exec_method_call(c, "connect_phase", &[]);
+        }
+        // Port resolution (uvm_component::do_resolve_bindings, IEEE 1800.2
+        // §5.5) runs between connect and end_of_elaboration: it walks each
+        // port's connect()-established m_provided_by chain and fills m_imp_list
+        // so size()/get_if() work and a driver's seq_item_port reaches the
+        // sequencer (else get_next_item has no interface -> DRVCONNECT, no
+        // stimulus). do_resolve_bindings recurses into child (incl. port)
+        // components and is idempotent (m_resolved guard), so a per-component
+        // pass covers the whole tree safely.
+        for &c in &components {
+            if self.finished { return; }
+            self.exec_method_call(c, "do_resolve_bindings", &[]);
+        }
         for phase in [
-            "connect_phase",
             "end_of_elaboration_phase",
             "start_of_simulation_phase",
         ] {
