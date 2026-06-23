@@ -12277,12 +12277,45 @@ impl Simulator {
                     };
                     let mut idents = Vec::new();
                     collect_ident_names(&ee.expr, &mut idents);
-                    for h in idents {
+                    for &h in &idents {
                         let sig = self.resolve_hier_name(h);
                         out.push(Sensitivity {
                             signal_name: sig,
                             edge,
                         });
+                    }
+                    // P6: `@(posedge vif.clk)` — a virtual-interface member is a
+                    // MemberAccess, which collect_ident_names doesn't gather.
+                    // Resolve `vif.member` through the this-relative
+                    // virtual-interface binding (`<bound>.member`) so the driver/
+                    // monitor suspend on the real interface clock/reset instead
+                    // of spinning on an empty sensitivity.
+                    if idents.is_empty() {
+                        if let ExprKind::MemberAccess { expr: base, member } =
+                            &ee.expr.kind
+                        {
+                            if let ExprKind::Ident(bh) = &base.kind {
+                                if bh.path.len() == 1 {
+                                    let vifname = bh.path[0].name.name.clone();
+                                    let bound = self
+                                        .this_stack
+                                        .last()
+                                        .copied()
+                                        .flatten()
+                                        .and_then(|h| {
+                                            self.virtual_iface_bindings
+                                                .get(&(h, vifname.clone()))
+                                                .map(|(b, _)| b.clone())
+                                        });
+                                    if let Some(b) = bound {
+                                        out.push(Sensitivity {
+                                            signal_name: format!("{}.{}", b, member.name),
+                                            edge,
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 out
@@ -26471,6 +26504,18 @@ impl Simulator {
                     // Also publish under bare-field key for plain inst_name=""
                     // gets that just lookup the field. Latest set wins.
                     self.signals.insert(format!("__uvm_cfgdb__{}", field), val);
+                    // P6: for a virtual-interface value (set with an interface
+                    // instance identifier, e.g. `::set(.., "in_intf", ivif)`),
+                    // remember the instance NAME so a later get can bind it for
+                    // `vif.member` resolution + `@(posedge vif.clk)` sensitivity.
+                    if let ExprKind::Ident(h) = &v.kind {
+                        let iname = self.resolve_hier_name(h);
+                        let nv = Value::from_string(&iname);
+                        self.signals
+                            .insert(format!("__uvm_cfgvif__{}|{}", inst, field), nv.clone());
+                        self.signals
+                            .insert(format!("__uvm_cfgvif__{}", field), nv);
+                    }
                 }
                 Value::zero(32)
             }
@@ -26502,6 +26547,55 @@ impl Simulator {
                 if let Some(val) = hit {
                     if let Some(dst) = value_expr {
                         self.assign_value(dst, &val);
+                        // P6: if this field carried a virtual-interface instance
+                        // name, bind it to the destination vif property so
+                        // `vif.member` resolves and `@(posedge vif.clk)` events
+                        // sensitize on the real interface signal.
+                        let vif_cands = [
+                            format!("__uvm_cfgvif__{}|{}", inst, field),
+                            format!("__uvm_cfgvif__*|{}", field),
+                            format!("__uvm_cfgvif__*{}|{}", inst, field),
+                            format!("__uvm_cfgvif__{}", field),
+                        ];
+                        let iface_name = vif_cands
+                            .iter()
+                            .find_map(|k| self.signals.get(k).map(|v| v.to_sv_string()))
+                            .filter(|s| !s.is_empty());
+                        if let Some(iname) = iface_name {
+                            let hp: Option<(usize, String)> = match &dst.kind {
+                                ExprKind::Ident(h) if h.path.len() == 1 => self
+                                    .this_stack
+                                    .last()
+                                    .copied()
+                                    .flatten()
+                                    .map(|hh| (hh, h.path[0].name.name.clone())),
+                                ExprKind::Ident(h) if h.path.len() == 2 => self
+                                    .eval_ident_handle(&h.path[0].name.name)
+                                    .map(|hh| (hh, h.path[1].name.name.clone())),
+                                ExprKind::MemberAccess { expr, member } => self
+                                    .eval_handle_expr(expr)
+                                    .map(|hh| (hh, member.name.clone())),
+                                _ => None,
+                            };
+                            if let Some((hh, prop)) = hp {
+                                if hh != 0 {
+                                    let is_vif = self
+                                        .heap
+                                        .get(hh)
+                                        .and_then(|o| o.as_ref())
+                                        .map(|i| i.class_name.clone())
+                                        .and_then(|cn| self.module.classes.get(&cn))
+                                        .map(|c| {
+                                            c.virtual_iface_properties.contains_key(&prop)
+                                        })
+                                        .unwrap_or(false);
+                                    if is_vif {
+                                        self.virtual_iface_bindings
+                                            .insert((hh, prop), (iname, None));
+                                    }
+                                }
+                            }
+                        }
                     }
                     Value::from_u64(1, 32)
                 } else {
