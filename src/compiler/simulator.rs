@@ -20827,6 +20827,39 @@ impl Simulator {
                         return Value::zero(32);
                     }
                 }
+                // LRM §25.8: virtual-interface member VALUE read `vif.member`
+                // (MemberAccess shape, base is `this.vif`). eval(vif) returns the
+                // binding-existence sentinel (1), not a heap handle, so the
+                // properties path below misses and returns 0 — even though the
+                // @(posedge vif.sig) EDGE path resolves the binding correctly
+                // (via resolve_hier_name). Resolve the binding here and read the
+                // bound interface signal directly. (UVM driver `vif.rst_n`.)
+                if let ExprKind::Ident(vh) = &expr.kind {
+                    if vh.path.len() == 1 {
+                        if let Some(Some(this_h)) = self.this_stack.last().copied() {
+                            let seg0 = &vh.path[0].name.name;
+                            let is_vif = self
+                                .heap
+                                .get(this_h)
+                                .and_then(|o| o.as_ref().map(|i| i.class_name.clone()))
+                                .and_then(|cn| self.module.classes.get(&cn))
+                                .map(|c| c.virtual_iface_properties.contains_key(seg0))
+                                .unwrap_or(false);
+                            if is_vif {
+                                if let Some((bound, _mp)) = self
+                                    .virtual_iface_bindings
+                                    .get(&(this_h, seg0.clone()))
+                                    .cloned()
+                                {
+                                    let resolved = format!("{}.{}", bound, member.name);
+                                    if let Some(v) = self.lookup_signal_value(&resolved) {
+                                        return v;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let base = self.eval_expr(expr);
                 let handle = base.to_u64().unwrap_or(0) as usize;
                 if handle == 0 || handle >= self.heap.len() {
