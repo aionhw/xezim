@@ -25905,6 +25905,15 @@ impl Simulator {
         if self.condition_waiters.iter().any(|(p, _)| *p == pid) {
             return true;
         }
+        // A process blocked on `fork...join`/`join_any` is the PARENT of a
+        // join_waiter — also suspended. Without this it was treated as finished,
+        // so its process context (this_stack, locals) was dropped and the
+        // join-resume restored an empty context (this=None) — the UVM sequencer
+        // arbitration's m_wait_for_available_sequence fork lost the sequencer
+        // `this`, breaking arb_sequence_q resolution.
+        if self.join_waiters.iter().any(|w| w.parent_pid == pid) {
+            return true;
+        }
         false
     }
 
