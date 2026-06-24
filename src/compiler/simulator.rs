@@ -1548,6 +1548,15 @@ pub struct Simulator {
     uvm_components: Vec<usize>,
     /// Set once the post-run phases have executed so they run exactly once.
     uvm_post_run_done: bool,
+    /// UVM TLM connection graph: port/export handle -> connected target
+    /// handles, in connect() order. Recorded by intercepting `connect()`
+    /// (the UVM source keys its m_provided_by by get_full_name(), which xezim
+    /// returns as the component LEAF — so two exports named "analysis_export"
+    /// collided and only the last connect survived). `write()`/`put()` deliver
+    /// through this map (analysis broadcast to ALL subscribers, put -> fifo).
+    /// The pull-port path (get_next_item) still uses the UVM m_imp_list, which
+    /// connect() also builds, so it is unaffected.
+    tlm_connections: HashMap<usize, Vec<usize>>,
     /// LRM §25.9: stack of per-call virtual-interface formal-arg
     /// aliases. When a task or function takes `virtual <iface> <name>`,
     /// the call hooks add a frame mapping `<name>` to the caller's
@@ -2875,6 +2884,7 @@ impl Simulator {
             uvm_pending_end: None,
             uvm_components: Vec::new(),
             uvm_post_run_done: false,
+            tlm_connections: HashMap::default(),
             local_iface_aliases: Vec::new(),
             dist_picked_once: HashSet::default(),
             class_statics: HashMap::default(),
@@ -29319,6 +29329,31 @@ impl Simulator {
                 return self.handle_uvm_objection(mname, args);
             }
 
+            // UVM TLM: record the connection graph and deliver analysis/put
+            // traffic through it (see tlm_connections). Done before the UVM
+            // source dispatch so analysis broadcast reaches EVERY subscriber.
+            if real_uvm {
+                if mname == "connect" {
+                    let ph = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
+                    let tgt = args
+                        .first()
+                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as usize)
+                        .unwrap_or(0);
+                    if ph != 0 && tgt != 0 {
+                        self.tlm_connections.entry(ph).or_default().push(tgt);
+                    }
+                    // fall through: UVM connect() still builds m_imp_list for
+                    // the pull-port (get_next_item) path.
+                } else if matches!(mname, "write" | "put") {
+                    let ph = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
+                    if ph != 0 && self.tlm_deliver(ph, mname, args) {
+                        return Value::zero(32);
+                    }
+                    // no recorded targets → fall through (e.g. an analysis_imp's
+                    // own write forwards to its parent via the UVM source).
+                }
+            }
+
             // §18.13 rand_mode / constraint_mode
             // Receiver forms:
             //   obj.x.rand_mode(0/1)        — disable/enable rand var x
@@ -31920,6 +31955,37 @@ impl Simulator {
             }
         }
         self.finished = true;
+    }
+
+    /// Deliver a TLM `write`/`put` through the recorded connection graph: call
+    /// the same method on every connected target (an analysis_export/imp that
+    /// forwards to its subscriber/fifo, or a fifo's put_export). Returns true if
+    /// at least one target was recorded (caller should not also run the UVM
+    /// source path). Analysis ports broadcast to ALL targets.
+    fn tlm_deliver(&mut self, port: usize, mname: &str, args: &[Expression]) -> bool {
+        let targets = match self.tlm_connections.get(&port) {
+            Some(t) if !t.is_empty() => t.clone(),
+            _ => return false,
+        };
+        for tgt in targets {
+            // A connected target is typically a uvm_*_imp/export that forwards
+            // the call to the actual implementer it wraps (its `m_imp`: the
+            // subscriber, the fifo, ...). Deliver straight to that implementer —
+            // the imp's own forwarding `task put`/`function write` carries a
+            // "port not bound" guard keyed on m_imp_list (which the route-B
+            // phaser doesn't populate), so calling the imp directly would stall.
+            let implementer = self
+                .heap
+                .get(tgt)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get("m_imp"))
+                .and_then(|v| v.to_u64())
+                .map(|h| h as usize)
+                .filter(|&h| h != 0 && h < self.heap.len())
+                .unwrap_or(tgt);
+            self.exec_method_call(implementer, mname, args);
+        }
+        true
     }
 
     /// UVM run-phase objection bookkeeping (simplified, global counter).
