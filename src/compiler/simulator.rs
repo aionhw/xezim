@@ -14201,6 +14201,68 @@ impl Simulator {
                 }
             }
 
+            // A `for` loop with a blocking body (e.g. a UVM sequence's
+            // `for (i=0; i<n; i++) `uvm_do(req)`) must iterate via the
+            // suspend-aware path — otherwise the synchronous exec runs the
+            // body's blocking start_item/finish_item once and the loop never
+            // advances (only 1 transaction sent). Run the init now, then lower
+            // to `while (cond) { body; step; }` and recurse.
+            if let StatementKind::For { init, condition, step, body } = &stmt.kind {
+                if condition.is_some()
+                    && (self.stmt_has_event_wait(body) || self.stmt_is_blocking(body))
+                {
+                    for fi in init {
+                        match fi {
+                            ForInit::VarDecl { data_type, name, init: e } => {
+                                let v = self.eval_expr(e);
+                                let w = super::elaborate::resolve_type_width(
+                                    data_type,
+                                    Some(&self.module.parameters),
+                                    Some(&self.module.typedefs),
+                                );
+                                self.widths.insert(name.name.clone(), w);
+                                let mut rv = v.resize(w);
+                                if super::elaborate::is_type_signed(data_type) {
+                                    rv.is_signed = true;
+                                }
+                                if let Some(frame) = self.local_stack.last_mut() {
+                                    frame.insert(name.name.clone(), rv);
+                                } else {
+                                    self.set_signal_value_by_name(&name.name, rv);
+                                }
+                            }
+                            ForInit::Assign { lvalue, rvalue } => {
+                                let v = self.eval_expr(rvalue);
+                                self.assign_value(lvalue, &v);
+                            }
+                        }
+                    }
+                    let mut body_stmts = match &body.kind {
+                        StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                        _ => vec![(**body).clone()],
+                    };
+                    for s in step {
+                        body_stmts
+                            .push(Statement::new(StatementKind::Expr(s.clone()), stmt.span));
+                    }
+                    let while_body = Statement::new(
+                        StatementKind::SeqBlock { name: None, stmts: body_stmts },
+                        stmt.span,
+                    );
+                    let while_stmt = Statement::new(
+                        StatementKind::While {
+                            condition: condition.clone().unwrap(),
+                            body: Box::new(while_body),
+                        },
+                        stmt.span,
+                    );
+                    let mut cont = vec![while_stmt];
+                    cont.extend_from_slice(&stmts[i + 1..]);
+                    self.run_process_stmts(pid, &cont);
+                    return;
+                }
+            }
+
             if let StatementKind::While { condition, body } = &stmt.kind {
                 // Descend into a blocking while-body (event waits, #delays, or
                 // blocking method calls like the UVM sequencer arbitration's
@@ -20113,12 +20175,20 @@ impl Simulator {
                     Value::from_string(&s)
                 }
                 "$cast" => {
-                    // `$cast(dest, src)` as a function: assign src to dest,
-                    // return 1 (success). No dynamic type enforcement.
+                    // `$cast(dest, src)` as a function: succeeds (returns 1 and
+                    // assigns) iff src's object is assignment-compatible with
+                    // dest's declared class type. Returning 1 unconditionally
+                    // broke UVM's `if (!$cast(seq, item))` discrimination
+                    // (uvm_rand_send): a sequence ITEM was misrouted to the
+                    // sequence-start branch, so `uvm_do(item)` sent nothing.
                     if args.len() >= 2 {
                         let v = self.eval_expr(&args[1]);
-                        self.assign_value(&args[0], &v);
-                        Value::from_u64(1, 32)
+                        if self.cast_type_ok(&args[0], &v) {
+                            self.assign_value(&args[0], &v);
+                            Value::from_u64(1, 32)
+                        } else {
+                            Value::zero(32)
+                        }
                     } else {
                         Value::zero(32)
                     }
@@ -29246,6 +29316,58 @@ impl Simulator {
         false
     }
 
+    /// Is class `derived` the same as, or a subclass of, `base`? Walks the
+    /// `extends` chain; compares parameter-stripped names so `uvm_sequence#(T)`
+    /// matches `uvm_sequence`.
+    fn class_is_a(&self, derived: &str, base: &str) -> bool {
+        let strip = |s: &str| s.split('#').next().unwrap_or(s).to_string();
+        let base = strip(base);
+        let mut cur = Some(derived.to_string());
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            if guard > 128 {
+                break;
+            }
+            if strip(&c) == base {
+                return true;
+            }
+            cur = self
+                .module
+                .classes
+                .get(&c)
+                .or_else(|| self.module.classes.get(&strip(&c)))
+                .and_then(|cd| cd.extends.clone());
+        }
+        false
+    }
+
+    /// `$cast(dest, src)` dynamic type check: succeeds if `src`'s object class
+    /// is assignment-compatible with `dest`'s declared class type. Permissive
+    /// when types are unknown (null src, non-class handle, untracked dest type)
+    /// so only a definite type mismatch fails — the case UVM's
+    /// `if (!$cast(seq, item))` relies on.
+    fn cast_type_ok(&self, dest: &Expression, src: &Value) -> bool {
+        let h = src.to_u64().unwrap_or(0) as usize;
+        if h == 0 {
+            return true; // null assigns through
+        }
+        let src_class = match self.heap.get(h).and_then(|o| o.as_ref()) {
+            Some(i) => i.class_name.clone(),
+            None => return true, // not a live class object — don't enforce
+        };
+        let dest_type = match &dest.kind {
+            ExprKind::Ident(hh) if hh.path.len() == 1 => {
+                self.var_class_types.get(&hh.path[0].name.name).cloned()
+            }
+            _ => None,
+        };
+        match dest_type {
+            Some(dt) => self.class_is_a(&src_class, &dt),
+            None => true, // unknown dest type — stay permissive
+        }
+    }
+
     /// Find a class TASK method named `method` in `start_class` or an ancestor.
     /// Returns its declaration + the defining class name. Used by the process
     /// scheduler to INLINE a blocking method call so its internal waits
@@ -31465,6 +31587,30 @@ impl Simulator {
     }
 
     fn exec_method_call(&mut self, handle: usize, method_name: &str, args: &[Expression]) -> Value {
+        // UVM field-op user-hook query. The UVM source errors (GET_USER_HOOK)
+        // when m_is_set==0, which xezim hits because the field_op recycle pool
+        // (m_get_available_op/m_recycle) reuses an op without re-running set()
+        // before the query during the topology print's nested do_execute_op
+        // recursion. The hook is enabled by default (m_user_hook=1 unless
+        // disable_user_hook was called), so report enabled and skip the guard.
+        if method_name == "user_hook_enabled"
+            && self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.class_name == "uvm_field_op")
+                .unwrap_or(false)
+        {
+            let disabled = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get("m_user_hook"))
+                .and_then(|v| v.to_u64())
+                .map(|v| v == 0)
+                .unwrap_or(false);
+            return Value::from_u64(if disabled { 0 } else { 1 }, 32);
+        }
         if method_name == "randomize" {
             return self.exec_randomize(handle);
         }
