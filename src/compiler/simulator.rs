@@ -25951,6 +25951,40 @@ impl Simulator {
         self.vcd_writer = None;
     }
 
+    /// Hand a put/try_put value to a parked mailbox get/peek waiter. The assign
+    /// to the waiter's destination MUST run in the WAITER's process context
+    /// (its local_stack holds the get/peek's output formal), not the putter's,
+    /// so the continuation's `ScopePop` output writebacks propagate the value
+    /// back to the original caller (the UVM driver's `req`). Assigning in the
+    /// putter's context writes the wrong frame, so the waiter reads a stale/null
+    /// handle (item data=0). Swap to the waiter's saved context, assign, re-save,
+    /// restore the putter's context, then schedule the continuation.
+    fn deliver_to_mailbox_waiter(
+        &mut self,
+        pid: usize,
+        lvalue: &Expression,
+        v: Value,
+        cont: Vec<Statement>,
+    ) {
+        if let Some(ctx) = self.process_contexts.get(&pid).cloned() {
+            let saved = self.snapshot_process_context();
+            self.restore_process_context(ctx);
+            let width = self.infer_lhs_width(lvalue);
+            self.assign_value(lvalue, &v.resize(width));
+            self.process_contexts
+                .insert(pid, self.snapshot_process_context());
+            self.restore_process_context(saved);
+        } else {
+            let width = self.infer_lhs_width(lvalue);
+            self.assign_value(lvalue, &v.resize(width));
+        }
+        if !cont.is_empty() {
+            self.event_queue.schedule(self.time, pid, cont);
+        } else {
+            self.child_finished(pid);
+        }
+    }
+
     fn is_pid_suspended(&self, pid: usize) -> bool {
         if self.event_queue.has_pid(pid) {
             return true;
@@ -25968,6 +26002,19 @@ impl Simulator {
         // arbitration's m_wait_for_available_sequence fork lost the sequencer
         // `this`, breaking arb_sequence_q resolution.
         if self.join_waiters.iter().any(|w| w.parent_pid == pid) {
+            return true;
+        }
+        // A process blocked on a mailbox get/peek (the UVM driver's
+        // m_req_fifo.peek in get_next_item) parks ONLY in mailbox_get_waiters.
+        // Without this it was treated as finished → its process context
+        // (local_stack with the peek's output formal) was dropped, so the
+        // put-wake's writeback chain back to the driver's `req` read empty and
+        // delivered a null handle (item data=0). Count it as suspended.
+        if self
+            .mailbox_get_waiters
+            .values()
+            .any(|q| q.iter().any(|w| w.pid == pid))
+        {
             return true;
         }
         false
@@ -29416,6 +29463,11 @@ impl Simulator {
             if mname == "try_get" {
                 let base = self.eval_expr(expr);
                 let handle = base.to_u64().unwrap_or(0) as usize;
+                // Only intercept a direct mailbox try_get. A non-mailbox receiver
+                // (e.g. uvm_tlm_fifo, whose try_get() method wraps `m.try_get`)
+                // must fall through to the normal method dispatch — returning 0
+                // here made UVM item_done's `m_req_fifo.try_get(t)` always fail
+                // (SQRBADITMDN: item_done with no outstanding request).
                 if self.mailboxes.contains_key(&handle) {
                     let val = self.mailboxes.get_mut(&handle).and_then(|q| q.pop_front());
                     if let (Some(v), Some(arg)) = (val, args.first()) {
@@ -29423,8 +29475,8 @@ impl Simulator {
                         self.assign_value(arg, &v.resize(w));
                         return Value::from_u64(1, 32);
                     }
+                    return Value::zero(32);
                 }
-                return Value::zero(32);
             }
 
             let base = self.eval_expr(expr);
@@ -31226,18 +31278,12 @@ impl Simulator {
                             .and_then(|q| q.pop_front());
                         if let Some(w) = waiter {
                             let MailboxGetWaiter { pid, lvalue, cont, is_peek } = w;
-                            let width = self.infer_lhs_width(&lvalue);
-                            self.assign_value(&lvalue, &v.resize(width));
                             if is_peek {
                                 // peek doesn't consume — leave the item for the
                                 // subsequent get/try_get (sequencer item_done).
-                                self.mailboxes.get_mut(&handle).unwrap().push_back(v);
+                                self.mailboxes.get_mut(&handle).unwrap().push_back(v.clone());
                             }
-                            if !cont.is_empty() {
-                                self.event_queue.schedule(self.time, pid, cont);
-                            } else {
-                                self.child_finished(pid);
-                            }
+                            self.deliver_to_mailbox_waiter(pid, &lvalue, v, cont);
                         } else {
                             self.mailboxes.get_mut(&handle).unwrap().push_back(v);
                         }
@@ -31265,16 +31311,10 @@ impl Simulator {
                             .and_then(|q| q.pop_front());
                         if let Some(w) = waiter {
                             let MailboxGetWaiter { pid, lvalue, cont, is_peek } = w;
-                            let width = self.infer_lhs_width(&lvalue);
-                            self.assign_value(&lvalue, &v.resize(width));
                             if is_peek {
-                                self.mailboxes.get_mut(&handle).unwrap().push_back(v);
+                                self.mailboxes.get_mut(&handle).unwrap().push_back(v.clone());
                             }
-                            if !cont.is_empty() {
-                                self.event_queue.schedule(self.time, pid, cont);
-                            } else {
-                                self.child_finished(pid);
-                            }
+                            self.deliver_to_mailbox_waiter(pid, &lvalue, v, cont);
                         } else {
                             self.mailboxes.get_mut(&handle).unwrap().push_back(v);
                         }
