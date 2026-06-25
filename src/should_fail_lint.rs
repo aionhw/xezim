@@ -40,16 +40,19 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     check_module_item(it, elab, &mut errs);
                 }
                 check_proc_net_assign(&m.items, &mut errs);
+                check_stream_widths(&m.items, elab, &mut errs);
             }
             SourceDefinition::Interface(m) => {
                 for it in &m.items {
                     check_module_item(it, elab, &mut errs);
                 }
+                check_stream_widths(&m.items, elab, &mut errs);
             }
             SourceDefinition::Program(m) => {
                 for it in &m.items {
                     check_module_item(it, elab, &mut errs);
                 }
+                check_stream_widths(&m.items, elab, &mut errs);
             }
             SourceDefinition::Package(_) => {}
         }
@@ -371,6 +374,210 @@ fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
         StatementKind::Return(Some(e)) => for_each_expr(e, f),
         _ => {}
     }
+}
+
+/// Visit every statement node, recursing into blocks, loops and branches.
+fn for_each_stmt(stmt: &Statement, f: &mut dyn FnMut(&Statement)) {
+    f(stmt);
+    match &stmt.kind {
+        StatementKind::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            for_each_stmt(then_stmt, f);
+            if let Some(e) = else_stmt {
+                for_each_stmt(e, f);
+            }
+        }
+        StatementKind::Case { items, .. } => {
+            for it in items {
+                for_each_stmt(&it.stmt, f);
+            }
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body }
+        | StatementKind::TimingControl { stmt: body, .. }
+        | StatementKind::Wait { stmt: body, .. } => for_each_stmt(body, f),
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            stmts.iter().for_each(|s| for_each_stmt(s, f));
+        }
+        _ => {}
+    }
+}
+
+/// §11.4.14.3: a streaming-concatenation source assigned to a *fixed-size*
+/// target must not be wider than the target (a wider target is zero-padded; a
+/// narrower one is an error). We compute the source width as the sum of the
+/// operand widths and the target width from its (fixed integral) type.
+///
+/// Conservative by construction:
+///  - only fixed integral targets with no unpacked dimension (dynamic arrays /
+///    queues resize, so they are never an error and are skipped);
+///  - the source width is taken ONLY when every operand is a plain in-scope
+///    identifier of known fixed width — any unresolved operand bails the check.
+fn check_stream_widths(
+    items: &[ModuleItem],
+    elab: &ElaboratedModule,
+    errs: &mut Vec<String>,
+) {
+    let vw = build_var_widths(items, elab);
+    for it in items {
+        match it {
+            ModuleItem::DataDeclaration(d) => {
+                for decl in &d.declarators {
+                    check_stream_decl(
+                        &d.data_type,
+                        decl.dimensions.is_empty(),
+                        &decl.init,
+                        &decl.name.name,
+                        &vw,
+                        elab,
+                        errs,
+                    );
+                }
+            }
+            ModuleItem::AlwaysConstruct(a) => {
+                for_each_stmt(&a.stmt, &mut |s| check_stmt_stream(s, &vw, elab, errs));
+            }
+            ModuleItem::InitialConstruct(i) => {
+                for_each_stmt(&i.stmt, &mut |s| check_stmt_stream(s, &vw, elab, errs));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_stmt_stream(
+    s: &Statement,
+    vw: &std::collections::HashMap<String, u32>,
+    elab: &ElaboratedModule,
+    errs: &mut Vec<String>,
+) {
+    if let StatementKind::VarDecl {
+        data_type,
+        declarators,
+        ..
+    } = &s.kind
+    {
+        for decl in declarators {
+            check_stream_decl(
+                data_type,
+                decl.dimensions.is_empty(),
+                &decl.init,
+                &decl.name.name,
+                vw,
+                elab,
+                errs,
+            );
+        }
+    }
+}
+
+fn check_stream_decl(
+    dt: &DataType,
+    dims_empty: bool,
+    init: &Option<Expression>,
+    name: &str,
+    vw: &std::collections::HashMap<String, u32>,
+    elab: &ElaboratedModule,
+    errs: &mut Vec<String>,
+) {
+    if !dims_empty {
+        return;
+    }
+    let Some(init) = init else { return };
+    let ExprKind::StreamOp { exprs, .. } = &init.kind else {
+        return;
+    };
+    let Some(target_w) = fixed_int_width(dt, elab) else {
+        return;
+    };
+    let Some(stream_w) = stream_width(exprs, vw) else {
+        return;
+    };
+    if stream_w > target_w {
+        errs.push(format!(
+            "stream '{name}': source width {stream_w} exceeds fixed-size target width {target_w} \
+             (LRM 1800-2017 §11.4.14.3 — streaming source wider than target)"
+        ));
+    }
+}
+
+/// Map of in-module scalar identifier -> fixed integral width.
+fn build_var_widths(
+    items: &[ModuleItem],
+    elab: &ElaboratedModule,
+) -> std::collections::HashMap<String, u32> {
+    let mut m = std::collections::HashMap::new();
+    for it in items {
+        match it {
+            ModuleItem::DataDeclaration(d) => {
+                for decl in &d.declarators {
+                    if decl.dimensions.is_empty() {
+                        if let Some(w) = fixed_int_width(&d.data_type, elab) {
+                            m.insert(decl.name.name.clone(), w);
+                        }
+                    }
+                }
+            }
+            ModuleItem::NetDeclaration(d) => {
+                for decl in &d.declarators {
+                    if decl.dimensions.is_empty() {
+                        if let Some(w) = fixed_int_width(&d.data_type, elab) {
+                            m.insert(decl.name.name.clone(), w);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    m
+}
+
+/// Width of a fixed-size integral data type; None for non-integral or 0-width.
+fn fixed_int_width(dt: &DataType, elab: &ElaboratedModule) -> Option<u32> {
+    if !matches!(
+        dt,
+        DataType::IntegerVector { .. } | DataType::IntegerAtom { .. }
+    ) {
+        return None;
+    }
+    let w = xezim_core::elaborate::resolve_type_width(
+        dt,
+        Some(&elab.parameters),
+        Some(&elab.typedefs),
+    );
+    if w == 0 {
+        None
+    } else {
+        Some(w)
+    }
+}
+
+/// Sum of streaming-concat operand widths; None if ANY operand is not a plain
+/// in-scope identifier of known width (the check then bails, never flagging).
+fn stream_width(exprs: &[Expression], vw: &std::collections::HashMap<String, u32>) -> Option<u32> {
+    if exprs.is_empty() {
+        return None;
+    }
+    let mut total: u32 = 0;
+    for e in exprs {
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let w = vw.get(&h.path[0].name.name)?;
+        total = total.checked_add(*w)?;
+    }
+    Some(total)
 }
 
 /// §6.19: in an enum with an explicit base type, a member whose value is a
