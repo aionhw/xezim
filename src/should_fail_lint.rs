@@ -14,9 +14,9 @@
 use xezim_core::ast::decl::{
     ClassDeclaration, ClassItem, ClassMethodKind, ClassQualifier, ModuleItem, TypedefDeclaration,
 };
-use xezim_core::ast::expr::{Expression, ExprKind, NumberLiteral, RangeKind};
-use xezim_core::ast::stmt::{Statement, StatementKind};
-use xezim_core::ast::types::{DataType, PackedDimension};
+use xezim_core::ast::expr::{AssignmentPatternItem, Expression, ExprKind, NumberLiteral, RangeKind};
+use xezim_core::ast::stmt::{Statement, StatementKind, VarDeclarator};
+use xezim_core::ast::types::{DataType, PackedDimension, UnpackedDimension};
 use xezim_core::elaborate::ElaboratedModule;
 use xezim_core::SourceDefinition;
 
@@ -62,7 +62,12 @@ fn check_module_item(item: &ModuleItem, elab: &ElaboratedModule, errs: &mut Vec<
     match item {
         ModuleItem::ClassDeclaration(c) => check_class(c, errs),
         ModuleItem::TypedefDeclaration(t) => check_typedef(t, elab, errs),
-        ModuleItem::DataDeclaration(d) => check_enum_type(&d.data_type, elab, errs),
+        ModuleItem::DataDeclaration(d) => {
+            check_enum_type(&d.data_type, elab, errs);
+            for decl in &d.declarators {
+                check_array_flat_init(decl, elab, errs);
+            }
+        }
         ModuleItem::NetDeclaration(d) => check_enum_type(&d.data_type, elab, errs),
         ModuleItem::AlwaysConstruct(a) => {
             for_each_stmt_expr(&a.stmt, &mut |e| check_zero_slice(e, elab, errs));
@@ -77,6 +82,57 @@ fn check_module_item(item: &ModuleItem, elab: &ElaboratedModule, errs: &mut Vec<
             }
         }
         _ => {}
+    }
+}
+
+/// §5.10/§10.9.1: an unpacked array with an ordered assignment pattern must
+/// have exactly one element per array entry. A flat C-style list (e.g.
+/// `ms_t ms[1:0] = '{0,0,1,1};` for a 2-entry array) is illegal. Conservative:
+/// only single-dimension arrays with an all-ordered, all-scalar pattern whose
+/// element count differs from the (constant-folded) array size are flagged —
+/// nested patterns, default/replication, and non-const sizes are skipped.
+fn check_array_flat_init(d: &VarDeclarator, elab: &ElaboratedModule, errs: &mut Vec<String>) {
+    if d.dimensions.len() != 1 {
+        return;
+    }
+    let UnpackedDimension::Range { left, right, .. } = &d.dimensions[0] else {
+        return;
+    };
+    let p = Some(&elab.parameters);
+    let (Some(l), Some(r)) = (
+        xezim_core::elaborate::const_eval_i64_with_params(left, p),
+        xezim_core::elaborate::const_eval_i64_with_params(right, p),
+    ) else {
+        return;
+    };
+    let n = (l - r).abs() + 1;
+    let Some(init) = &d.init else { return };
+    let ExprKind::AssignmentPattern(items) = &init.kind else {
+        return;
+    };
+    let mut m: i64 = 0;
+    for it in items {
+        match it {
+            AssignmentPatternItem::Ordered(e) => {
+                // a nested pattern/replication is a proper per-entry init, not flat
+                if matches!(
+                    e.kind,
+                    ExprKind::AssignmentPattern(_) | ExprKind::Replication { .. }
+                ) {
+                    return;
+                }
+                m += 1;
+            }
+            // default/named/typed/keyed forms aren't a flat ordered list
+            _ => return,
+        }
+    }
+    if m != n {
+        errs.push(format!(
+            "array '{}' of size {} initialized with {} flat ordered elements — use a nested \
+             assignment pattern (LRM 1800-2017 §5.10)",
+            d.name.name, n, m
+        ));
     }
 }
 
