@@ -24,3 +24,9 @@ uvm-1.2/
 /SESSION-4-SUMMARY.md
 /SESSION-SUMMARY.md
 /docs/TRACING.md
+
+# Simulation / build artifacts — never commit (caused a >100MB GitHub push reject)
+*.vvp
+*.xt
+*.xt.bz2
+*.vcd
