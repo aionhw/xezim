@@ -13734,6 +13734,16 @@ impl Simulator {
     }
 
     fn run_scheduled_process(&mut self, pid: usize, stmts: &[Statement]) {
+        // A freshly-activated scheduled process must resolve unqualified names
+        // from a clean slate. `name_resolve_hint` is a transient sibling-scope
+        // hint set while resolving DOTTED names (resolve_hier_name records the
+        // parent scope); it is NOT part of the per-process ProcessContext. If a
+        // prior process (e.g. a UVM monitor touching `ivif.clk`) left it set to
+        // `ivif`, this process's bare top-level names (e.g. the clock gen's
+        // `clk`) would mis-resolve to `ivif.clk` — freezing the real `clk` net.
+        // Save + clear it for the run, restore on EVERY exit path so the hint
+        // never leaks across scheduled processes (or back to the caller).
+        let saved_hint = self.name_resolve_hint.borrow_mut().take();
         // Fast path: if we have no saved process context for this pid AND
         // the caller's execution context is empty, skip the full snapshot /
         // restore dance. Forever-loop bodies like `jclk = ~jclk` that run
@@ -13755,6 +13765,7 @@ impl Simulator {
                         .insert(pid, self.snapshot_process_context());
                 }
             }
+            *self.name_resolve_hint.borrow_mut() = saved_hint;
             return;
         }
         let saved = self.snapshot_process_context();
@@ -13768,6 +13779,7 @@ impl Simulator {
             self.process_contexts.remove(&pid);
         }
         self.restore_process_context(saved);
+        *self.name_resolve_hint.borrow_mut() = saved_hint;
     }
 
     /// Evaluate a `#delay` expression to an integer number of simulator ticks.
