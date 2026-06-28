@@ -31634,6 +31634,15 @@ impl Simulator {
         if method_name == "randomize" {
             return self.exec_randomize(handle);
         }
+        // uvm_component::sprint(printer) — the real UVM printer machinery
+        // (uvm_printer field stack / m_uvm_status_container) isn't driven by the
+        // Route-B phaser, so it returns empty. For a component in the live tree,
+        // render the topology table ourselves (uvm_table_printer format) from the
+        // component hierarchy. Non-component objects fall through to the source.
+        if method_name == "sprint" && self.uvm_components.contains(&handle) {
+            let topo = self.render_uvm_topology(handle);
+            return Value::from_string(&topo);
+        }
         // UVM run-phase objection mechanism (also intercepted here for the
         // valid-receiver dispatch path; see handle_uvm_objection).
         if matches!(method_name, "raise_objection" | "drop_objection" | "set_drain_time") {
@@ -32049,6 +32058,11 @@ impl Simulator {
             if self.finished { return; }
             self.exec_method_call(c, "do_resolve_bindings", &[]);
         }
+        // Publish the component list BEFORE end_of_elaboration so the topology
+        // print (`this.sprint(printer)` in end_of_elaboration_phase, intercepted
+        // in exec_method_call) can render the tree. The list is complete after
+        // build_phase; connect/resolve add no components. Refreshed again below.
+        self.uvm_components = components.clone();
         for phase in [
             "end_of_elaboration_phase",
             "start_of_simulation_phase",
@@ -32096,6 +32110,59 @@ impl Simulator {
     }
 
     /// Run the post-run UVM function phases on every component, then finish.
+    /// Render the UVM test-topology table (uvm_table_printer format) for the
+    /// subtree rooted at `root`, from the live component hierarchy. Columns are
+    /// Name / Type / Size / Value; components are indented by hierarchy depth
+    /// and show `@<handle>` as their value. Internal field-automation rows
+    /// (sequencer arrays/integrals) are omitted — the component+port tree is the
+    /// meaningful topology. Handle ids won't match a reference run's inst ids.
+    fn render_uvm_topology(&mut self, root: usize) -> String {
+        let root_name = self
+            .exec_method_call(root, "get_full_name", &[])
+            .to_sv_string();
+        // (full_name, type, handle) for every component under `root`.
+        let mut rows: Vec<(String, String, usize)> = Vec::new();
+        let prefix = format!("{}.", root_name);
+        for h in self.uvm_components.clone() {
+            let fname = self.exec_method_call(h, "get_full_name", &[]).to_sv_string();
+            if fname == root_name || fname.starts_with(&prefix) {
+                let cls = self
+                    .heap
+                    .get(h)
+                    .and_then(|o| o.as_ref())
+                    .map(|i| i.class_name.clone())
+                    .unwrap_or_default();
+                // Skip the internal `uvm_port_component` wrapper twin that each
+                // port/export carries (same leaf name as the port itself) — UVM's
+                // table printer shows only the port, not its wrapper.
+                if cls == "uvm_port_component" {
+                    continue;
+                }
+                rows.push((fname, cls, h));
+            }
+        }
+        // Alphabetical by full name groups children under parents and orders
+        // siblings deterministically (matches UVM creation order on this TB).
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let root_depth = root_name.matches('.').count();
+        let sep = "-".repeat(70);
+        let mut out = String::new();
+        out.push('\n');
+        out.push_str(&sep);
+        out.push('\n');
+        out.push_str(&format!("{:<32}{:<28}{:<6}{}\n", "Name", "Type", "Size", "Value"));
+        out.push_str(&sep);
+        out.push('\n');
+        for (fname, cls, h) in rows {
+            let depth = fname.matches('.').count().saturating_sub(root_depth);
+            let leaf = fname.rsplit('.').next().unwrap_or(&fname);
+            let name_col = format!("{}{}", "  ".repeat(depth), leaf);
+            out.push_str(&format!("{:<32}{:<28}{:<6}@{}\n", name_col, cls, "-", h));
+        }
+        out.push_str(&sep);
+        out
+    }
+
     /// Tally a UVM report for the end-of-run `--- UVM Report Summary ---` block.
     /// `severity` is INFO/WARNING/ERROR/FATAL; `id` is the message id (the first
     /// arg to `uvm_info`/etc.). Called at every UVM report emission site.
