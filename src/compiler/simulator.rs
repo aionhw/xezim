@@ -37,6 +37,21 @@ use std::thread::JoinHandle;
 static SIM_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 static DPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
+thread_local! {
+    /// Current `run_process_stmts` recursion depth. The suspend-aware loop
+    /// handlers trampoline through the event queue (instead of recursing) once
+    /// this exceeds `RPS_TRAMPOLINE_DEPTH`, bounding the stack for long
+    /// synchronous loops (e.g. a UVM sequence's for-loop of non-blocking
+    /// start_item/finish_item that would otherwise recurse until stack overflow).
+    static RPS_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Depth at which `run_process_stmts` loop handlers switch from recursing to
+/// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near
+/// ~2800; 300 leaves a wide margin while keeping normal (shallow) loops on the
+/// fast recursive path.
+const RPS_TRAMPOLINE_DEPTH: usize = 300;
+
 pub fn set_sim_debug(enabled: bool) {
     SIM_DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
 }
@@ -358,6 +373,12 @@ struct JoinWaiter {
     join_type: JoinType,
     continuation: Vec<Statement>,
     finished_children: HashSet<usize>,
+    /// `true` for a `wait fork` waiter. Unlike a plain `join`, its wake
+    /// condition is re-evaluated against the *live* descendant tree on every
+    /// child completion (LRM §9.6.1): it wakes only when the parent has zero
+    /// remaining descendants, so it also waits for grandchildren spawned
+    /// *after* the `wait fork` executed.
+    wait_fork: bool,
 }
 
 /// Fast-path NBA entry: compact (signal_id, value) pair for pre-resolved targets.
@@ -1007,6 +1028,14 @@ impl TimingWheel {
 struct ClassInstance {
     class_name: String,
     properties: HashMap<String, Value>,
+    /// Maps a class TYPE-parameter name (e.g. `T` in
+    /// `class Mk #(type T=Base)`) to the concrete class name it was
+    /// specialized with (e.g. `Base`). Populated by
+    /// `instantiate_class_with_type_args`. Used under PURE_SV_LRM so an
+    /// unqualified `obj = new()` whose declared type is a type parameter
+    /// constructs the bound concrete class (running its real `new`). Empty
+    /// for classes without type parameters / non-specialized instances.
+    type_bindings: HashMap<String, String>,
 }
 
 /// LRM §4.4 / §16 observed-region probe entry. A concurrent property's
@@ -1524,6 +1553,12 @@ pub struct Simulator {
     /// bus_if.master vif`) so the rewrite path can also emit a direction
     /// warning when writing to a modport-input member.
     virtual_iface_bindings: HashMap<(usize, String), (String, Option<String>)>,
+    /// PURE_SV_LRM: `uvm_config_db#(virtual X)::set/get` records the bound
+    /// interface NAME by scope here, because config_db otherwise flows an opaque
+    /// Value and loses the interface identity (so a config_db-bound vif reads
+    /// non-null but `vif.member`/edge-waits don't resolve). Entries are
+    /// (scope_glob, field, iface_name); get matches scope via UVM glob rules.
+    vif_config_db: Vec<(String, String, String)>,
     /// UVM uvm_config_db scope-aware store (in addition to the flat
     /// `__uvm_cfgdb__` signal keys, kept as a fallback). Each set records the
     /// fully-resolved scope pattern `<cntxt.get_full_name()>.<inst_name>`, the
@@ -1543,6 +1578,18 @@ pub struct Simulator {
     uvm_obj_raised: bool,
     uvm_phase_drain: u64,
     uvm_pending_end: Option<u64>,
+    /// When true (env `PURE_SV_LRM=1`), every UVM-specific shim is disabled and
+    /// UVM is executed as ordinary SystemVerilog through the LRM engine (the
+    /// native phaser, objection/config_db/factory/TLM/report/topology
+    /// interceptions are all bypassed). Default false → use the UVM shim.
+    pure_sv_lrm: bool,
+    /// Memo for transitive blocking-task detection (pure-LRM mode only): maps a
+    /// subroutine name to whether its body — following calls — eventually hits a
+    /// blocking construct (`#`/`@`/`wait`/`fork…join[_any]`). Lets a task that
+    /// blocks only via nested calls route through the suspend-aware runner
+    /// instead of the name whitelist. Keyed by bare name (over-approx across a
+    /// free task / same-named method). See `subroutine_name_blocks`.
+    tb_cache: std::cell::RefCell<HashMap<String, bool>>,
     /// Component handles discovered by the route-B phaser (build order), used to
     /// run the post-run function phases at objection-driven phase end.
     uvm_components: Vec<usize>,
@@ -1581,9 +1628,23 @@ pub struct Simulator {
     /// keyed `"ClassName::propname"` where ClassName is the class that
     /// declared the static property.
     class_statics: HashMap<String, Value>,
+    /// Active parameterized-class specialization for per-spec static storage:
+    /// `(base_class, sig)` where `sig` is the canonical `#(...)` param text. Set
+    /// while a `C#(params)::...` static method runs or a `C#(params)::prop` is
+    /// accessed; `static_prop_key` folds `sig` into the key ONLY for statics
+    /// declared in `base_class` (so unrelated/inherited statics stay shared),
+    /// giving each specialization its own cell (§8.25). None = shared cell.
+    current_spec: Option<(String, String)>,
     /// Class-typed procedural locals — variable name -> class type name.
     /// Lets a later `name = new();` know which class to construct.
     var_class_types: HashMap<String, String>,
+    /// Parameterized-class procedural locals — variable name -> the declared
+    /// `#(...)` type-parameter args (as expressions). Lets a SEPARATE-statement
+    /// `name = new(...)` (which can't see the decl's data_type) construct the
+    /// right specialization, so the instance records its type bindings. This is
+    /// UVM's `uvm_resource#(T) r; r = new(field_name);` in config_db — needed
+    /// for per-spec static resolution (get_type vs get_type_handle → GET).
+    var_type_args: HashMap<String, Vec<Expression>>,
     /// §15.3/§15.4: built-in container local variable → "mailbox"/"semaphore".
     /// Populated at VarDecl exec time when the declared base type is a
     /// (possibly parameterized) mailbox/semaphore, so a later separate
@@ -1790,6 +1851,13 @@ pub struct Simulator {
     disable_target: Option<String>,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
     killed_pids: HashSet<usize>,
+    /// Names of init-declared (automatic) `for`-loop variables that — because
+    /// the enclosing process had no local frame — currently live in the signal
+    /// table. A `fork` child must capture these BY VALUE at fork time so the
+    /// canonical `for (int i…) fork … join_none` idiom sees its per-iteration
+    /// `i` instead of the loop's final value (LRM §9.3.2). Pushed/popped as a
+    /// stack by the `for` executor to handle nested loops.
+    auto_loop_vars: Vec<String>,
     /// SV-2023: redirected lvalues for `ref` formal parameters during a call.
     /// Top-of-stack scope is consulted when assigning to a known formal name.
     ref_binding_stack: Vec<HashMap<String, Expression>>,
@@ -2882,11 +2950,14 @@ impl Simulator {
             dpi_unresolved: HashSet::default(),
             heap: vec![None], // index 0 is null
             virtual_iface_bindings: HashMap::default(),
+            vif_config_db: Vec::new(),
             cfgdb_scoped: Vec::new(),
             uvm_obj_count: 0,
             uvm_obj_raised: false,
             uvm_phase_drain: 0,
             uvm_pending_end: None,
+            pure_sv_lrm: std::env::var("PURE_SV_LRM").map(|v| v == "1").unwrap_or(false),
+            tb_cache: std::cell::RefCell::new(HashMap::default()),
             uvm_components: Vec::new(),
             uvm_post_run_done: false,
             uvm_sev_counts: [0; 4],
@@ -2895,7 +2966,9 @@ impl Simulator {
             local_iface_aliases: Vec::new(),
             dist_picked_once: HashSet::default(),
             class_statics: HashMap::default(),
+            current_spec: None,
             var_class_types: HashMap::default(),
+            var_type_args: HashMap::default(),
             var_container_types: HashMap::default(),
             var_typedef_types: HashMap::default(),
             string_signals: HashSet::default(),
@@ -2964,6 +3037,7 @@ impl Simulator {
             rs_return_flag: false,
             disable_target: None,
             killed_pids: HashSet::default(),
+            auto_loop_vars: Vec::new(),
             ref_binding_stack: Vec::new(),
             task_cleanup: Vec::new(),
             condition_waiters: Vec::new(),
@@ -5377,11 +5451,41 @@ impl Simulator {
             })
             .collect();
         for (cn, prop, init) in static_call_inits {
-            self.class_context_stack.push(Some(cn.clone()));
-            self.this_stack.push(None);
-            let v = self.eval_expr(&init);
-            self.this_stack.pop();
-            self.class_context_stack.pop();
+            // A STATIC mailbox/semaphore with `= new()` (e.g. UVM's phaser
+            // `static mailbox m_phase_hopper = new();`) must be allocated as a
+            // real container — eval_expr of bare new() doesn't create one, so
+            // try_put/get silently fail and the run-phase stalls.
+            let cont_kind = self
+                .module
+                .classes
+                .get(&cn)
+                .and_then(|cd| cd.properties.get(&prop))
+                .and_then(|s| s.type_name.as_deref())
+                .and_then(Self::container_base);
+            let is_new = matches!(&init.kind, ExprKind::Call { func, .. }
+                if matches!(&func.kind, ExprKind::Ident(h)
+                    if h.path.len() == 1 && h.path[0].name.name == "new"));
+            let v = if let (Some(kind), true) = (cont_kind, is_new) {
+                let ch = self.heap.len();
+                self.heap.push(Some(ClassInstance {
+                    class_name: kind.to_string(),
+                    properties: HashMap::default(),
+                    type_bindings: HashMap::default(),
+                }));
+                if kind == "semaphore" {
+                    self.semaphores.insert(ch, 0);
+                } else {
+                    self.mailboxes.insert(ch, std::collections::VecDeque::new());
+                }
+                Value::from_u64(ch as u64, 32)
+            } else {
+                self.class_context_stack.push(Some(cn.clone()));
+                self.this_stack.push(None);
+                let v = self.eval_expr(&init);
+                self.this_stack.pop();
+                self.class_context_stack.pop();
+                v
+            };
             self.class_statics.insert(format!("{}::{}", cn, prop), v);
         }
 
@@ -6478,7 +6582,10 @@ impl Simulator {
             CombItem::DirectCopy { dst_id, src_id, width } => {
                 let dst_w = self.signal_widths[*dst_id];
                 let mut handled = false;
-                if *width <= 64 && dst_w == *width {
+                // Inline raw-bit copy only when src and dst widths match;
+                // set_inline_bits does not mask, so narrowing must go through
+                // the resize branch below (pr2224949).
+                if *width <= 64 && dst_w == *width && self.signal_widths[*src_id] == *width {
                     let (sv, sx) = view[*src_id].raw_bits();
                     let (dv, dx) = view[*dst_id].raw_bits();
                     if sv == dv && sx == dx {
@@ -6564,7 +6671,10 @@ impl Simulator {
             CombItem::DirectCopy { dst_id, src_id, width } => {
                 let dst_w = signal_widths[*dst_id];
                 let mut handled = false;
-                if *width <= 64 && dst_w == *width {
+                // Inline raw-bit copy only when src and dst widths match;
+                // set_inline_bits does not mask, so narrowing must go through
+                // the resize branch below (pr2224949).
+                if *width <= 64 && dst_w == *width && signal_widths[*src_id] == *width {
                     let (sv, sx) = view[*src_id].raw_bits();
                     let (dv, dx) = view[*dst_id].raw_bits();
                     if sv == dv && sx == dx {
@@ -10786,8 +10896,8 @@ impl Simulator {
                         self.signal_name_to_id.get(src_name.as_str()),
                     ) {
                         let width = self.signal_widths[dst_id];
+                        let delay = self.sdf_delays.get(dst_id).copied().unwrap_or(0);
                         if width == self.signal_widths[src_id] {
-                            let delay = self.sdf_delays.get(dst_id).copied().unwrap_or(0);
                             if width <= 64 && delay == 0 {
                                 Some(CombItem::FastDirectCopy { dst_id, src_id })
                             } else {
@@ -10797,6 +10907,20 @@ impl Simulator {
                                     width,
                                 })
                             }
+                        } else if delay == 0 {
+                            // Width-mismatched bare ident copy (e.g. a wider
+                            // parent net driving a narrower input port).
+                            // Resolve both ids statically here instead of
+                            // falling through to the bytecode compiler, whose
+                            // scope_hint can mis-resolve a parent-scope RHS to a
+                            // same-named local port signal (self-assign -> X).
+                            // DirectCopy resizes the source to `width` (the
+                            // destination width). (pr2224949)
+                            Some(CombItem::DirectCopy {
+                                dst_id,
+                                src_id,
+                                width,
+                            })
                         } else {
                             None
                         }
@@ -13664,6 +13788,47 @@ impl Simulator {
         }
     }
 
+    /// Like `inherit_current_process_context`, but also captures the current
+    /// values of automatic `for`-loop variables (`auto_loop_vars`) by value into
+    /// the child's context so each fork child sees the loop index at fork time
+    /// (LRM §9.3.2). Used when spawning fork children.
+    fn inherit_fork_child_context(&mut self, pid: usize) {
+        let mut ctx = self.snapshot_process_context();
+        if !self.auto_loop_vars.is_empty() {
+            let mut caps: HashMap<String, Value> = HashMap::default();
+            for nm in &self.auto_loop_vars {
+                if let Some(v) = self.signals.get(nm) {
+                    caps.insert(nm.clone(), v.clone());
+                }
+            }
+            if !caps.is_empty() {
+                // Merge into the top frame if one exists (don't shadow the
+                // forking process's other locals — reads consult only the top
+                // frame); otherwise this becomes the child's first frame.
+                if let Some(top) = ctx.local_stack.last_mut() {
+                    for (k, v) in caps {
+                        top.insert(k, v);
+                    }
+                } else {
+                    ctx.local_stack.push(caps);
+                }
+            }
+        }
+        let trivial = ctx.this_stack.is_empty()
+            && ctx.local_stack.is_empty()
+            && ctx.class_context_stack.is_empty()
+            && ctx.cg_this.is_none()
+            && ctx.return_value.is_none()
+            && !ctx.break_flag
+            && !ctx.continue_flag
+            && !ctx.return_flag;
+        if trivial {
+            self.process_contexts.remove(&pid);
+        } else {
+            self.process_contexts.insert(pid, ctx);
+        }
+    }
+
     /// Drain events in the scheduler whose fire time is at or before `target`.
     /// Used when a task-internal `#delay` needs to yield the simulator so
     /// concurrent processes can advance while this task sleeps.
@@ -13741,6 +13906,14 @@ impl Simulator {
     }
 
     fn run_scheduled_process(&mut self, pid: usize, stmts: &[Statement]) {
+        // A process terminated by `disable fork` (LRM §9.6.2) must not run any
+        // remaining queued continuation (e.g. the resume of a `#delay` it was
+        // parked on when killed). Pids are monotonic and never reused, so it is
+        // safe to leave the entry in `killed_pids` permanently. This is the one
+        // chokepoint every dispatch site funnels through.
+        if self.killed_pids.contains(&pid) {
+            return;
+        }
         // A freshly-activated scheduled process must resolve unqualified names
         // from a clean slate. `name_resolve_hint` is a transient sibling-scope
         // hint set while resolving DOTTED names (resolve_hier_name records the
@@ -13805,8 +13978,40 @@ impl Simulator {
         }
     }
 
+    /// Continue executing `cont` for `pid`. Normally recurses (fast path), but
+    /// when the `run_process_stmts` recursion is deep — a long synchronous loop
+    /// whose body never actually suspends — TRAMPOLINE through the event queue
+    /// at the current simulation time to bound the stack. Same time + same
+    /// continuation ⇒ identical semantics: `is_pid_suspended` sees the scheduled
+    /// entry (via `event_queue.has_pid`) and `run_scheduled_process` snapshots /
+    /// restores the process context, exactly as an immediate `@event` re-arm.
+    fn continue_stmts_or_trampoline(&mut self, pid: usize, cont: Vec<Statement>) {
+        if RPS_DEPTH.with(|c| c.get()) > RPS_TRAMPOLINE_DEPTH {
+            self.event_queue.schedule(self.time, pid, cont);
+        } else {
+            self.run_process_stmts(pid, &cont);
+        }
+    }
+
     fn run_process_stmts(&mut self, pid: usize, stmts: &[Statement]) {
         self.current_pid = pid;
+        // Track run_process_stmts recursion depth so the suspend-aware loop
+        // handlers (While/For/Repeat below) can trampoline through the event
+        // queue instead of recursing when a synchronous loop body never
+        // suspends — otherwise a UVM sequence's 100+-iteration for-loop of
+        // non-blocking start_item/finish_item recurses ~2800 deep and overflows
+        // the stack cloning the continuation. The Cell/guard is always on (a few
+        // ns per call); overflow-prevention is not debug-only.
+        struct DepthGuard;
+        impl Drop for DepthGuard {
+            fn drop(&mut self) {
+                RPS_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+            }
+        }
+        let _dg = {
+            RPS_DEPTH.with(|c| c.set(c.get() + 1));
+            DepthGuard
+        };
         sim_dbg_eprintln!(
             "[DEBUG] running process {} ({} stmts) at time {}",
             pid,
@@ -13844,6 +14049,21 @@ impl Simulator {
                     let mut expanded = inner.clone();
                     expanded.extend_from_slice(&stmts[i + 1..]);
                     self.run_process_stmts(pid, &expanded);
+                    return;
+                }
+            }
+
+            // PURE_SV_LRM: bridge `objn.wait_for(UVM_ALL_DROPPED, obj)` to a
+            // condition-wait on the objection total (see synth_objection_wait).
+            // Must run BEFORE Stage 1b would inline wait_for's real body (whose
+            // `@(m_events[obj].all_dropped)` member-event wait can't block).
+            if self.pure_sv_lrm {
+                if let Some((recv, obj, all_dropped)) = Self::match_objection_wait_for(stmt) {
+                    let wait_stmt =
+                        Self::synth_objection_wait(&recv, obj.as_ref(), all_dropped, stmt.span);
+                    let mut cont = vec![wait_stmt];
+                    cont.extend_from_slice(&stmts[i + 1..]);
+                    self.run_process_stmts(pid, &cont);
                     return;
                 }
             }
@@ -13909,6 +14129,41 @@ impl Simulator {
                                     });
                                     if tn.is_some() || has_plus {
                                         self.run_uvm_test_real(tn);
+                                        return;
+                                    }
+                                }
+                                // PURE_SV_LRM: a bare `run_test(name)` call resolves
+                                // (via module.tasks) to `uvm_root::run_test`'s body,
+                                // which is a METHOD — the uvm_globals.svh wrapper does
+                                // `top = cs.get_root(); top.run_test(name)`. Inline it
+                                // WITH `this` bound to the uvm_root singleton; without a
+                                // `this`, its member accesses (m_children, m_phase_*)
+                                // resolve against nothing, so `m_children.num()==0` and
+                                // the body bails at the NOCOMP fatal before ever
+                                // reaching the phase-runner fork.
+                                if self.pure_sv_lrm
+                                    && td.name.name.name == "run_test"
+                                    && self.stmts_have_blocking(&td.items)
+                                {
+                                    let root_h = self
+                                        .exec_static_method("uvm_root", "get", &[])
+                                        .and_then(|v| v.to_u64())
+                                        .map(|h| h as usize)
+                                        .filter(|h| *h != 0);
+                                    if let Some(rh) = root_h {
+                                        let mut cleanup = self.bind_task_frame(&td, args);
+                                        self.this_stack.push(Some(rh));
+                                        self.class_context_stack
+                                            .push(Some("uvm_root".to_string()));
+                                        cleanup.pushed_method_this = true;
+                                        self.task_cleanup.push(cleanup);
+                                        let mut cont: Vec<Statement> = td.items.clone();
+                                        cont.push(Statement::new(
+                                            StatementKind::ScopePop,
+                                            stmt.span,
+                                        ));
+                                        cont.extend_from_slice(&stmts[i + 1..]);
+                                        self.run_process_stmts(pid, &cont);
                                         return;
                                     }
                                 }
@@ -13986,6 +14241,78 @@ impl Simulator {
                                         self.run_process_stmts(pid, &cont);
                                         return;
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Stage 1c (PURE_SV_LRM): a blocking STATIC method call
+            // `Class::method()` with no receiver handle — Stage 1b skipped it
+            // because `path[0]` is a class name, not a handle var. The UVM phaser
+            // is forked as `uvm_phase::m_run_phases()`, whose body is
+            // `forever begin m_phase_hopper.get(phase); fork ... join_none; #0 end`
+            // — run synchronously its blocking `get` on the empty hopper can't
+            // suspend, so the forever loop spins to the loop cap and never yields
+            // to the forked `execute_phase`. Inline it (static context = the
+            // class, null `this`) so those waits suspend the process.
+            if self.pure_sv_lrm {
+                if let StatementKind::Expr(expr) = &stmt.kind {
+                    if let ExprKind::Call { func, args } = &expr.kind {
+                        // `Class::method()` reaches here in two parse shapes:
+                        // a flattened 2-segment Ident `[Class, method]`, OR a
+                        // MemberAccess `{ expr: Ident(Class), member: method }`
+                        // (the `::` static form). Stage 1b already tried — and
+                        // failed — to resolve the receiver as a handle, so a
+                        // bare class name reaching here is a static call.
+                        let scoped: Option<(String, String)> = match &func.kind {
+                            ExprKind::Ident(h)
+                                if h.path.len() == 2
+                                    && self.module.classes.contains_key(&h.path[0].name.name) =>
+                            {
+                                Some((
+                                    h.path[0].name.name.clone(),
+                                    h.path[1].name.name.clone(),
+                                ))
+                            }
+                            ExprKind::MemberAccess { expr: recv, member } => {
+                                match &recv.kind {
+                                    ExprKind::Ident(h)
+                                        if h.path.len() == 1
+                                            && self
+                                                .module
+                                                .classes
+                                                .contains_key(&h.path[0].name.name) =>
+                                    {
+                                        Some((
+                                            h.path[0].name.name.clone(),
+                                            member.name.clone(),
+                                        ))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some((cls, mn)) = scoped {
+                            if let Some((td, mclass)) = self.resolve_class_task(&cls, &mn) {
+                                if self.stmts_have_blocking(&td.items) {
+                                    let mut cleanup = self.bind_task_frame(&td, args);
+                                    // Static context: push the declaring class for
+                                    // member/static resolution, with a null `this`.
+                                    self.this_stack.push(None);
+                                    self.class_context_stack.push(Some(mclass));
+                                    cleanup.pushed_method_this = true;
+                                    self.task_cleanup.push(cleanup);
+                                    let mut cont: Vec<Statement> = td.items.clone();
+                                    cont.push(Statement::new(
+                                        StatementKind::ScopePop,
+                                        stmt.span,
+                                    ));
+                                    cont.extend_from_slice(&stmts[i + 1..]);
+                                    self.run_process_stmts(pid, &cont);
+                                    return;
                                 }
                             }
                         }
@@ -14183,7 +14510,7 @@ impl Simulator {
                         ));
                     }
                     cont.extend_from_slice(&stmts[i + 1..]);
-                    self.run_process_stmts(pid, &cont);
+                    self.continue_stmts_or_trampoline(pid, cont);
                     return;
                 }
             }
@@ -14277,7 +14604,7 @@ impl Simulator {
                     );
                     let mut cont = vec![while_stmt];
                     cont.extend_from_slice(&stmts[i + 1..]);
-                    self.run_process_stmts(pid, &cont);
+                    self.continue_stmts_or_trampoline(pid, cont);
                     return;
                 }
             }
@@ -14297,7 +14624,7 @@ impl Simulator {
                         let mut cont: Vec<Statement> = body_stmts;
                         cont.push(stmt.clone());
                         cont.extend_from_slice(&stmts[i + 1..]);
-                        self.run_process_stmts(pid, &cont);
+                        self.continue_stmts_or_trampoline(pid, cont);
                         return;
                     } else {
                         i += 1;
@@ -14342,7 +14669,7 @@ impl Simulator {
                     let pid_child = self.next_pid;
                     self.next_pid += 1;
                     self.process_parents.insert(pid_child, pid);
-                    self.inherit_current_process_context(pid_child);
+                    self.inherit_fork_child_context(pid_child);
                     // Schedule children to run at current time
                     self.event_queue
                         .schedule(self.time, pid_child, vec![s.clone()]);
@@ -14362,6 +14689,7 @@ impl Simulator {
                         join_type: *join_type,
                         continuation: cont,
                         finished_children: HashSet::default(),
+                        wait_fork: false,
                     });
                     return;
                 }
@@ -14371,12 +14699,9 @@ impl Simulator {
 
             // Check for WaitFork
             if let StatementKind::WaitFork = &stmt.kind {
-                let children: HashSet<usize> = self
-                    .process_parents
-                    .iter()
-                    .filter(|(_, &p)| p == pid)
-                    .map(|(&c, _)| c)
-                    .collect();
+                // LRM §9.6.1: block until ALL forked descendants (children and
+                // their descendants), not just direct children, have completed.
+                let children: HashSet<usize> = self.collect_fork_descendants(pid);
 
                 if children.is_empty() {
                     i += 1;
@@ -14389,6 +14714,7 @@ impl Simulator {
                         join_type: JoinType::Join,
                         continuation: cont,
                         finished_children: HashSet::default(),
+                        wait_fork: true,
                     });
                     return;
                 }
@@ -14460,10 +14786,86 @@ impl Simulator {
             // structural wait, so it must inline for the eventual suspend point
             // (m_select_sequence's waits, m_req_fifo.peek) to reach the
             // suspend-aware path. Recognise the canonical blocking task names.
-            StatementKind::Expr(e) => Self::call_is_blocking_task(e),
+            StatementKind::Expr(e) => {
+                // Default mode: name whitelist only (behavior unchanged).
+                // Pure-LRM mode: also follow the call into the callee's body so
+                // a task that blocks only transitively (e.g. UVM's `run_test`
+                // -> `uvm_root::run_test` -> `fork m_run_phases join_none;
+                // wait(...)`) is detected and routed through the suspend-aware
+                // runner instead of being executed synchronously.
+                Self::call_is_blocking_task(e)
+                    || (self.pure_sv_lrm && self.callee_transitively_blocks(e))
+            }
             StatementKind::Repeat { body, .. } => self.stmt_is_blocking(body),
             _ => false,
         }
+    }
+
+    /// Pure-LRM transitive blocking detection: true if the call `expr` targets a
+    /// user subroutine whose body eventually reaches a blocking construct.
+    fn callee_transitively_blocks(&self, expr: &Expression) -> bool {
+        // A subroutine call in statement position can parse as Call{func},
+        // a bare Ident (`task_name;` with no args), or a MemberAccess
+        // (`obj.method;`). Extract the leaf callee name from any of these.
+        let callee = match &expr.kind {
+            ExprKind::Call { func, .. } => &**func,
+            other_kind @ (ExprKind::Ident(_) | ExprKind::MemberAccess { .. }) => {
+                let _ = other_kind;
+                expr
+            }
+            _ => return false,
+        };
+        let name = match &callee.kind {
+            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+            ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+            _ => None,
+        };
+        match name {
+            Some(n) => self.subroutine_name_blocks(n),
+            None => false,
+        }
+    }
+
+    /// Memoized: does the subroutine named `name` (free task/function, or any
+    /// same-named class method — over-approximated by name) transitively reach a
+    /// blocking construct? A tentative `false` is cached before recursing so
+    /// cyclic/recursive calls terminate (a pure cycle with no real blocker is
+    /// correctly non-blocking).
+    fn subroutine_name_blocks(&self, name: &str) -> bool {
+        if let Some(&b) = self.tb_cache.borrow().get(name) {
+            return b;
+        }
+        self.tb_cache.borrow_mut().insert(name.to_string(), false);
+        let mut blocks = false;
+        if let Some(t) = self.module.tasks.get(name) {
+            blocks = self.stmts_have_blocking(&t.items);
+        }
+        if !blocks {
+            if let Some(f) = self.module.functions.get(name) {
+                blocks = self.stmts_have_blocking(&f.items);
+            }
+        }
+        if !blocks {
+            // Method-by-name across all classes (the receiver's dynamic type
+            // isn't known here, so over-approximate: blocking if ANY class's
+            // same-named method body blocks).
+            'outer: for cls in self.module.classes.values() {
+                if let Some(m) = cls.methods.get(name) {
+                    let items = match &m.kind {
+                        crate::ast::decl::ClassMethodKind::Function(f)
+                        | crate::ast::decl::ClassMethodKind::Extern(f)
+                        | crate::ast::decl::ClassMethodKind::PureVirtual(f) => &f.items,
+                        crate::ast::decl::ClassMethodKind::Task(t) => &t.items,
+                    };
+                    if self.stmts_have_blocking(items) {
+                        blocks = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        self.tb_cache.borrow_mut().insert(name.to_string(), blocks);
+        blocks
     }
 
     /// True if `expr` is a call to one of UVM's canonical blocking tasks (the
@@ -14506,6 +14908,123 @@ impl Simulator {
                     | "transport"
             )
         )
+    }
+
+    /// PURE_SV_LRM bridge: rewrite `objn.wait_for(UVM_ALL_DROPPED|UVM_RAISED, obj)`
+    /// into `wait(objn.get_objection_total(obj) <op> 0)`. The real
+    /// `uvm_objection::wait_for` blocks on `@(m_events[obj].all_dropped)` — a
+    /// plain SV `event` MEMBER of an assoc-array-indexed object — which xezim
+    /// can't key (only simple-Identifier named events resolve to a signal), so
+    /// the `@` returns immediately and the phase-end loop spins at t0. Bridging
+    /// to a condition-wait on the (working) objection total lets the calling
+    /// process PARK (so time advances to the drop) and wake when it hits 0.
+    fn synth_objection_wait(
+        recv: &Expression,
+        obj: Option<&Expression>,
+        all_dropped: bool,
+        span: crate::ast::Span,
+    ) -> Statement {
+        let func = Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(recv.clone()),
+                member: crate::ast::Identifier {
+                    name: "get_objection_total".to_string(),
+                    span,
+                },
+            },
+            span,
+        );
+        let args: Vec<Expression> = obj.cloned().into_iter().collect();
+        let call = Expression::new(ExprKind::Call { func: Box::new(func), args }, span);
+        let zero = Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: false,
+                base: NumberBase::Decimal,
+                value: "0".to_string(),
+                cached_val: Cell::new(None),
+            }),
+            span,
+        );
+        let op = if all_dropped { BinaryOp::Eq } else { BinaryOp::Gt };
+        let cond = Expression::new(
+            ExprKind::Binary { op, left: Box::new(call), right: Box::new(zero) },
+            span,
+        );
+        Statement::new(
+            StatementKind::Wait {
+                condition: cond,
+                stmt: Box::new(Statement::new(StatementKind::Null, span)),
+            },
+            span,
+        )
+    }
+
+    /// Recognise an objection `wait_for(UVM_ALL_DROPPED|UVM_RAISED, obj)` call
+    /// statement and return `(receiver, obj_arg, all_dropped)`. Gated on the
+    /// first arg being one of the objection-event idents so it never hijacks
+    /// other `wait_for`-named methods (uvm_event/barrier).
+    fn match_objection_wait_for(
+        stmt: &Statement,
+    ) -> Option<(Expression, Option<Expression>, bool)> {
+        let expr = match &stmt.kind {
+            StatementKind::Expr(e) => e,
+            _ => return None,
+        };
+        let (func, args) = match &expr.kind {
+            ExprKind::Call { func, args } => (func, args),
+            _ => return None,
+        };
+        if args.is_empty() {
+            return None;
+        }
+        let evt = match &args[0].kind {
+            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()).unwrap_or(""),
+            _ => "",
+        };
+        let all_dropped = match evt {
+            "UVM_ALL_DROPPED" => true,
+            "UVM_RAISED" => false,
+            _ => return None,
+        };
+        let (recv, method) = match &func.kind {
+            ExprKind::MemberAccess { expr: r, member } => ((**r).clone(), member.name.clone()),
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let mut head = h.clone();
+                let last = head.path.pop().unwrap();
+                (Expression::new(ExprKind::Ident(head), expr.span), last.name.name)
+            }
+            _ => return None,
+        };
+        if method != "wait_for" {
+            return None;
+        }
+        Some((recv, args.get(1).cloned(), all_dropped))
+    }
+
+    /// Is `s` a (potentially blocking) mailbox `get`/`peek` call — `mb.get(v)`
+    /// or `mb.peek(v)` (either MemberAccess or flattened hier-Ident form)? Such
+    /// a call blocks when the mailbox is empty; inside a `forever` it must route
+    /// through the suspend-aware runner (which parks on an empty box) instead of
+    /// running synchronously and delta-spinning the loop (the UVM phaser's
+    /// `forever m_phase_hopper.get(phase)`).
+    fn stmt_is_mailbox_get(s: &Statement) -> bool {
+        if let StatementKind::Expr(e) = &s.kind {
+            if let ExprKind::Call { func, args } = &e.kind {
+                if args.is_empty() {
+                    return false;
+                }
+                let m = match &func.kind {
+                    ExprKind::MemberAccess { member, .. } => member.name.as_str(),
+                    ExprKind::Ident(h) if h.path.len() >= 2 => {
+                        h.path.last().unwrap().name.name.as_str()
+                    }
+                    _ => "",
+                };
+                return m == "get" || m == "peek";
+            }
+        }
+        false
     }
 
     fn exec_forever_sched(&mut self, pid: usize, body: &Statement, after: &[Statement]) {
@@ -14564,7 +15083,8 @@ impl Simulator {
             // synchronously. (Top-level `#delay`/`@event` — e.g. `always #5 clk`
             // clock generators — are handled above and never reach here.)
             if !matches!(&s.kind, StatementKind::TimingControl { .. })
-                && self.stmt_is_blocking(s)
+                && (self.stmt_is_blocking(s)
+                    || (self.pure_sv_lrm && Self::stmt_is_mailbox_get(s)))
             {
                 let mut cont: Vec<Statement> = vec![s.clone()];
                 cont.extend_from_slice(&body_stmts[i + 1..]);
@@ -17312,6 +17832,7 @@ impl Simulator {
                         let mut handled = false;
                         if *width <= 64
                             && dst_w == *width
+                            && self.signal_widths[*src_id] == *width
                             && (self.sdf_delays.is_empty()
                                 || self.sdf_delays.get(*dst_id).copied().unwrap_or(0) == 0)
                         {
@@ -17719,6 +18240,11 @@ impl Simulator {
                         } else {
                             Value::from_f64(val.to_f64())
                         }
+                    } else if width == 0 {
+                        // Untracked class-handle var (width 0) — never truncate
+                        // to 0; keep the value's natural width so a handle
+                        // (`c = factory.create_...()`) survives the store.
+                        val.clone()
                     } else {
                         if val.is_real {
                             Value::from_u64(val.to_f64() as u64, width)
@@ -18746,6 +19272,37 @@ impl Simulator {
                         }
                     }
                 }
+                // Associative-array element struct-member write:
+                // `assoc[key].field = val` where the element is an (unpacked)
+                // struct. UVM's `uvm_resource_pool::ri_tab[rsrc].scope = ...`
+                // (an assoc keyed by a handle, element = `rsrc_info_t`). Stored
+                // as the dotted signal `assoc[keystr].field`, plus a presence
+                // marker `assoc[keystr]` so `exists(key)` sees the slot. Packed-
+                // struct arrays are handled by the dedicated walk below (this is
+                // gated on `is_associative_array`, which they are not).
+                if let ExprKind::Index { expr: idx_base, index } = &expr.kind {
+                    if let ExprKind::Ident(hier) = &idx_base.kind {
+                        let mut an = self.resolve_hier_name(hier);
+                        if let Some(scoped) = self.instance_assoc_member(&an) {
+                            an = scoped;
+                        }
+                        if self.is_associative_array(&an) {
+                            let idx_val = self.eval_expr(index);
+                            let key_str = self.assoc_key_str(&an, &idx_val);
+                            let elem = format!("{}[{}]", an, key_str);
+                            let target = format!("{}.{}", elem, member.name);
+                            let prev = self.get_signal_value_by_name(&target);
+                            let w = prev.as_ref().map(|v| v.width).unwrap_or(val.width);
+                            let resized = val.resize(w);
+                            let changed = prev.as_ref() != Some(&resized);
+                            self.set_signal_value_by_name(&target, resized);
+                            if self.get_signal_value_by_name(&elem).is_none() {
+                                self.set_signal_value_by_name(&elem, Value::zero(1));
+                            }
+                            return changed;
+                        }
+                    }
+                }
                 // LRM §25.8 — `vif.member = ...` where `vif` is a virtual-
                 // interface property of the current `this`'s class. Look
                 // up the binding, redirect the write to
@@ -18939,6 +19496,26 @@ impl Simulator {
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
+        // A parameterized-class specialization (`C#(...)`) in value context
+        // evaluates as its base reference — strip the `Specialization`
+        // wrapper(s) from the member/ident chain so resolution sees the same
+        // shape as the pre-`Specialization` AST. The `#(...)` text only matters
+        // for per-spec static keying (handled at the static-dispatch sites).
+        // Keeps default mode identical to before. (PURE_SV_LRM Stage 1.)
+        if Self::expr_has_specialization(expr) {
+            // Set the active specialization (for per-spec static keying) while
+            // resolving the stripped shape, e.g. `C#(params)::prop` reads the
+            // per-spec static cell. Restore afterward.
+            let saved = self.current_spec.take();
+            if self.pure_sv_lrm {
+                let extracted =
+                    self.resolve_call_spec_params(Self::extract_call_spec(expr), &saved);
+                self.current_spec = extracted.or(saved.clone());
+            }
+            let v = self.eval_expr_ctx(&Self::strip_spec_shape(expr), ctx_width);
+            self.current_spec = saved;
+            return v;
+        }
         match &expr.kind {
             ExprKind::Number(num) => self.eval_number(num),
             ExprKind::StringLiteral(s) => {
@@ -20861,6 +21438,28 @@ impl Simulator {
                         }
                     }
                 }
+                // Associative-array element struct-member read:
+                // `assoc[key].field` (element = unpacked struct). Mirror of the
+                // assign-side handler — reads the dotted signal
+                // `assoc[keystr].field`. Guarded by signal presence, so a
+                // class-handle element (`rtab[nm].method`/`.prop`) where no such
+                // signal exists correctly falls through to the handle path.
+                if let ExprKind::Index { expr: idx_base, index } = &expr.kind {
+                    if let ExprKind::Ident(hier) = &idx_base.kind {
+                        let mut an = self.resolve_hier_name(hier);
+                        if let Some(scoped) = self.instance_assoc_member(&an) {
+                            an = scoped;
+                        }
+                        if self.is_associative_array(&an) {
+                            let idx_val = self.eval_expr(index);
+                            let key_str = self.assoc_key_str(&an, &idx_val);
+                            let target = format!("{}[{}].{}", an, key_str, member.name);
+                            if let Some(v) = self.get_signal_value_by_name(&target) {
+                                return v;
+                            }
+                        }
+                    }
+                }
                 // SV-2023: `arr[idx...].outer.inner...field` for N-dim
                 // arrays of packed-struct elements with chained MemberAccess
                 // — walks BOTH the field path (collecting dotted name) and
@@ -21211,6 +21810,74 @@ impl Simulator {
                 if self.try_bind_virtual_iface(lvalue, rvalue) {
                     return;
                 }
+                // `collection[key] = new(...)`: a bare `new` assigned to an
+                // associative-array / array ELEMENT of class type. The element's
+                // class comes from the COLLECTION's element type (keyed by the
+                // base name), not from a var-named lvalue — so the generic
+                // `new`-resolution (which keys off `var_class_types[lhs_var]`)
+                // can't see it and stores X. This is UVM uvm_config_db's
+                // `m_rsc[cntxt] = new` (a `uvm_pool` per context); without it the
+                // pool is X/null and every config_db set/get fails.
+                if let ExprKind::Index { expr: base, .. } = &lvalue.kind {
+                    let is_new = match &rvalue.kind {
+                        ExprKind::Call { func, .. } => matches!(&func.kind,
+                            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new"),
+                        ExprKind::Ident(h) => h.path.len() == 1 && h.path[0].name.name == "new",
+                        _ => false,
+                    };
+                    if is_new {
+                        if let ExprKind::Ident(bh) = &base.kind {
+                            let bname =
+                                bh.path.last().map(|s| s.name.name.clone()).unwrap_or_default();
+                            let elem_cls = self
+                                .module
+                                .array_elem_class
+                                .get(&bname)
+                                .cloned()
+                                .or_else(|| self.var_class_types.get(&bname).cloned())
+                                .or_else(|| {
+                                    // Class-MEMBER collection (static or instance):
+                                    // resolve the element class from the current
+                                    // class's property type, walking the hierarchy.
+                                    // This is config_db's static `m_rsc[cntxt]=new`
+                                    // (a `uvm_pool` per context) — the local/array
+                                    // maps above don't cover class members.
+                                    let mut cur = self
+                                        .class_context_stack
+                                        .last()
+                                        .cloned()
+                                        .flatten();
+                                    while let Some(cn) = cur {
+                                        if let Some(cd) = self.module.classes.get(&cn) {
+                                            if let Some(tn) = cd
+                                                .properties
+                                                .get(&bname)
+                                                .and_then(|s| s.type_name.clone())
+                                            {
+                                                return Some(tn);
+                                            }
+                                            cur = cd.extends.clone();
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    None
+                                })
+                                .filter(|cn| self.module.classes.contains_key(cn));
+                            if let Some(cn) = elem_cls {
+                                let ctor_args: &[Expression] = match &rvalue.kind {
+                                    ExprKind::Call { args, .. } => args,
+                                    _ => &[],
+                                };
+                                if let Some(cd) = self.module.classes.get(&cn).cloned() {
+                                    let v = self.instantiate_class(&cd, ctor_args);
+                                    self.assign_value(lvalue, &v);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
                 // Dynamic-array sizing: `arr = new[size]`. The postfix `[size]`
                 // parses as `Call{ Ident(new), [size] }`. When the lvalue is a
                 // dynamic array (not a class handle — that would be a `new obj`
@@ -21285,15 +21952,41 @@ impl Simulator {
                     (&lvalue.kind, &rvalue.kind)
                 {
                     let lname = self.resolve_hier_name(lh);
+                    // Take the byte-concat path when EITHER the lvalue is a
+                    // declared `string` OR the RHS is itself string-valued (a
+                    // concat containing a string literal/operand). The latter is
+                    // needed because a `string` local declared inside a class
+                    // method isn't always registered in `string_signals`, so
+                    // `lk = {a, "__M_UVM__", b}` (config_db's resource key) would
+                    // otherwise fall to numeric bit-concat and read as "".
                     if self.string_signals.contains(&lname)
                         || self.string_signals.contains(&lh.path.last().map(|s| s.name.name.clone()).unwrap_or_default())
+                        || self.expr_is_string_valued(rvalue)
                     {
                         let mut s = String::new();
                         for p in parts {
                             let pv = self.eval_expr(p);
                             s.push_str(&pv.to_sv_string());
                         }
-                        self.set_signal_value_by_name(&lname, Value::from_string(&s));
+                        let sval = Value::from_string(&s);
+                        // Store the byte-concat result with correct scoping:
+                        //  - a method-LOCAL string lives in the current call frame
+                        //    (VarDecl frame isolation), and reads consult the frame
+                        //    BEFORE signals, so write the frame slot directly;
+                        //  - otherwise route through `assign_value`, which scopes a
+                        //    class MEMBER lvalue to its instance (`<handle>#m_name`)
+                        //    — writing the bare name lost `uvm_component::m_name =
+                        //    {m_parent.get_full_name(), ".", get_name()}`, leaving
+                        //    every non-top component's get_full_name() empty.
+                        if self
+                            .local_stack
+                            .last()
+                            .map_or(false, |f| f.contains_key(&lname))
+                        {
+                            self.local_stack.last_mut().unwrap().insert(lname.clone(), sval);
+                        } else {
+                            self.assign_value(lvalue, &sval);
+                        }
                         if !self.in_edge_block {
                             self.settle_combinatorial();
                         }
@@ -21850,7 +22543,15 @@ impl Simulator {
                         }
                     }
                 }
-                let w = self.infer_lhs_width(lvalue);
+                // An untracked lvalue (e.g. a module-scope class handle like
+                // `uvm_component c;`) infers width 0; assigning then truncates
+                // the RHS to 0 bits — wrong for a handle. Default unknown width
+                // to 32 (handles/ints) so `c = factory.create_...()` keeps the
+                // returned handle.
+                let w = {
+                    let iw = self.infer_lhs_width(lvalue);
+                    if iw == 0 { 32 } else { iw }
+                };
                 // Handle bare `x = new;` (no parens) as class instantiation
                 let bare_new = if let ExprKind::Ident(hier) = &rvalue.kind {
                     hier.path.len() == 1 && hier.path[0].name.name == "new"
@@ -21859,6 +22560,16 @@ impl Simulator {
                 };
                 if bare_new {
                     let type_name = self.get_expr_type_name(lvalue);
+                    // PURE_SV_LRM type-parameter construction: if the declared
+                    // type is a class type parameter (e.g. `T obj = new;`),
+                    // resolve it through the current instance's bindings to the
+                    // concrete class. Plain class names pass through unchanged.
+                    let type_name = if self.pure_sv_lrm {
+                        type_name
+                            .map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn))
+                    } else {
+                        type_name
+                    };
                     if let Some(tname) = type_name {
                         if let Some(class_def) = self.module.classes.get(&tname).cloned() {
                             let lname_opt = if let ExprKind::Ident(lh) = &lvalue.kind {
@@ -21912,6 +22623,7 @@ impl Simulator {
                                 self.heap.push(Some(ClassInstance {
                                     class_name: kind.to_string(),
                                     properties: HashMap::default(),
+                                    type_bindings: HashMap::default(),
                                 }));
                                 if kind == "semaphore" {
                                     let n = args
@@ -21961,12 +22673,24 @@ impl Simulator {
                                 }
                             }
                             let type_name = self.get_expr_type_name(lvalue);
+                            // PURE_SV_LRM type-parameter construction: resolve a
+                            // declared type that is a class type parameter (e.g.
+                            // `T obj; obj = new(n);`) through the current
+                            // instance's bindings to the concrete class so its
+                            // real `new` runs. Plain class names are unchanged.
+                            let type_name = if self.pure_sv_lrm {
+                                type_name
+                                    .map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn))
+                            } else {
+                                type_name
+                            };
                             if let Some(tname) = type_name {
                                 if tname == "semaphore" {
                                     let handle = self.heap.len();
                                     self.heap.push(Some(ClassInstance {
                                         class_name: tname.clone(),
                                         properties: HashMap::default(),
+                                        type_bindings: HashMap::default(),
                                     }));
                                     let initial_count = args
                                         .first()
@@ -21979,6 +22703,7 @@ impl Simulator {
                                     self.heap.push(Some(ClassInstance {
                                         class_name: tname.clone(),
                                         properties: HashMap::default(),
+                                        type_bindings: HashMap::default(),
                                     }));
                                     self.mailboxes
                                         .insert(handle, std::collections::VecDeque::new());
@@ -21991,9 +22716,13 @@ impl Simulator {
                                     } else {
                                         None
                                     };
-                                    let ta_cloned = lname_opt
-                                        .as_ref()
-                                        .and_then(|n| self.module.class_type_args.get(n).cloned());
+                                    let ta_cloned = lname_opt.as_ref().and_then(|n| {
+                                        self.module
+                                            .class_type_args
+                                            .get(n)
+                                            .cloned()
+                                            .or_else(|| self.var_type_args.get(n).cloned())
+                                    });
                                     self.instantiate_class_with_type_args(
                                         &class_def,
                                         args,
@@ -22038,6 +22767,7 @@ impl Simulator {
                                         self.heap.push(Some(ClassInstance {
                                             class_name: tname.clone(),
                                             properties: HashMap::default(),
+                                            type_bindings: HashMap::default(),
                                         }));
                                         Value::from_u64(h as u64, 32)
                                     }
@@ -22065,6 +22795,7 @@ impl Simulator {
                                     self.heap.push(Some(ClassInstance {
                                         class_name: String::new(),
                                         properties: HashMap::default(),
+                                        type_bindings: HashMap::default(),
                                     }));
                                     Value::from_u64(h as u64, 32)
                                 }
@@ -22584,6 +23315,22 @@ impl Simulator {
                 step,
                 body,
             } => {
+                // Init-declared loop vars are automatic. When the process has no
+                // local frame they land in the signal table; record them so a
+                // `fork` in the body captures the per-iteration value by value
+                // (LRM §9.3.2). Popped on every exit path below.
+                let auto_pushed: usize = if self.local_stack.last().is_none() {
+                    let mut n = 0;
+                    for fi in init {
+                        if let ForInit::VarDecl { name, .. } = fi {
+                            self.auto_loop_vars.push(name.name.clone());
+                            n += 1;
+                        }
+                    }
+                    n
+                } else {
+                    0
+                };
                 for fi in init {
                     match fi {
                         ForInit::VarDecl {
@@ -22681,6 +23428,9 @@ impl Simulator {
                             v.is_signed = true;
                         }
                     }
+                }
+                for _ in 0..auto_pushed {
+                    self.auto_loop_vars.pop();
                 }
             }
             StatementKind::Foreach { array, vars, body } => {
@@ -22977,30 +23727,37 @@ impl Simulator {
             StatementKind::ParBlock {
                 stmts, join_type, ..
             } => {
-                let mut pids = Vec::new();
+                // Mirror the suspend-aware path (run_process_stmts): children are
+                // parented to the CURRENT pid (not 0) and inherit a *snapshot* of
+                // the forking process's context. The snapshot captures automatic
+                // variables (e.g. a loop index) by value at fork time, so the
+                // canonical `for (int i…) fork … join_none` idiom captures the
+                // per-iteration `i` instead of the parent's post-loop value
+                // (LRM §9.3.2 automatic-variable semantics).
+                let mut child_set = HashSet::default();
                 for s in stmts {
                     let pid = self.next_pid;
                     self.next_pid += 1;
-                    pids.push(pid);
-                    self.process_parents.insert(pid, 0); // (top-level as parent for now)
+                    self.process_parents.insert(pid, self.current_pid);
+                    self.inherit_fork_child_context(pid);
                     self.event_queue.schedule(self.time, pid, vec![s.clone()]);
+                    child_set.insert(pid);
                 }
                 match join_type {
-                    JoinType::Join => {
-                        let mut child_set = HashSet::default();
-                        for &cp in &pids {
-                            child_set.insert(cp);
-                        }
+                    // `join` waits for all, `join_any` for the first; both suspend
+                    // the forking process via a JoinWaiter. `join_none` continues.
+                    JoinType::Join | JoinType::JoinAny => {
                         self.join_waiters.push(JoinWaiter {
                             parent_pid: self.current_pid,
                             child_pids: child_set,
                             join_type: *join_type,
                             continuation: Vec::new(),
                             finished_children: HashSet::default(),
+                            wait_fork: false,
                         });
                         self.break_flag = true; // Suspend current execution
                     }
-                    _ => {} // JoinAny/JoinNone: simplified support for now
+                    JoinType::JoinNone => {}
                 }
             }
             StatementKind::TimingControl { control, stmt } => {
@@ -23088,17 +23845,26 @@ impl Simulator {
                 self.break_flag = true;
             }
             StatementKind::DisableFork => {
-                // SV-2023: kill all pending child processes of the current pid.
+                // LRM §9.6.2: terminate all active descendant processes of the
+                // calling process (children AND their descendants), then return.
                 let cur = self.current_pid;
-                let mut to_kill: Vec<usize> = Vec::new();
-                for (pid, parent) in self.process_parents.iter() {
-                    if *parent == cur {
-                        to_kill.push(*pid);
-                    }
-                }
-                for pid in to_kill {
+                let to_kill = self.collect_fork_descendants(cur);
+                for &pid in &to_kill {
+                    // Mark killed so any already-queued continuation is dropped
+                    // at dispatch, and purge every place the process can be
+                    // parked so it never resumes and never satisfies a join.
                     self.killed_pids.insert(pid);
+                    self.process_parents.remove(&pid);
+                    self.process_contexts.remove(&pid);
                 }
+                self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                for q in self.mailbox_get_waiters.values_mut() {
+                    q.retain(|w| !to_kill.contains(&w.pid));
+                }
+                // A killed process must no longer hold back a join waiter: drop
+                // it from every waiter's expected children, and wake any waiter
+                // whose remaining children are now all accounted for.
+                self.release_killed_from_join_waiters(&to_kill);
             }
             StatementKind::WaitFork => {}
             StatementKind::RsReturn => {
@@ -23239,9 +24005,8 @@ impl Simulator {
                 // explicit `= null`. We detect class handles by
                 // resolving the type name against `module.classes`.
                 let is_class_handle = match data_type {
-                    crate::ast::types::DataType::TypeReference { name, .. } => {
-                        let n = &name.name.name;
-                        self.module.classes.contains_key(n)
+                    crate::ast::types::DataType::TypeReference { .. } => {
+                        self.type_ref_is_class_handle(data_type)
                     }
                     crate::ast::types::DataType::Simple {
                         kind: crate::ast::types::SimpleType::Chandle,
@@ -23249,7 +24014,43 @@ impl Simulator {
                     } => true,
                     _ => false,
                 };
-                let default_v = if two_state || is_class_handle {
+                // LRM §8.4: a class handle defaults to `null`. A class-handle
+                // type whose name is a typedef/parameterized alias (e.g.
+                // `uvm_resource_types::rsrc_q_t` → `uvm_queue#(...)`) isn't
+                // found directly in `module.classes`, so `is_class_handle` is
+                // false — but its width resolves to 0 (no data layout). Treat a
+                // 0-width type as a handle and default it to zero, so an
+                // uninitialized `rsrc_q_t rq; if (rq == null) rq = new();` works
+                // inside a method (else `rq` reads X, `rq==null` is X, the
+                // `new()` is skipped, and X is stored — breaking the resource
+                // pool's whole rtab/ri_tab population).
+                // PURE_SV_LRM: a class-scoped typedef (e.g.
+                // `uvm_resource_types::rsrc_q_t` → `uvm_queue#(...)`, declared
+                // INSIDE a class) is registered in neither `typedefs` (the width
+                // map) nor `typedef_types`, so `resolve_type_width` fell back to
+                // 32 and `is_class_handle` is false. A bare TypeReference naming
+                // neither a known width-typedef nor a known class is almost
+                // certainly such a handle alias — default it to null so the
+                // ubiquitous `rsrc_q_t rq; if (rq == null) rq = new();` idiom
+                // works inside a method (else `rq` reads X, `rq==null` is X, the
+                // `new()` is skipped, and X is stored — which silently broke the
+                // resource pool's whole rtab/ri_tab population and config_db).
+                // Gated to pure mode so default mode stays byte-exact.
+                let unknown_typeref_handle = self.pure_sv_lrm
+                    && !two_state
+                    && !is_class_handle
+                    && match data_type {
+                        crate::ast::types::DataType::TypeReference {
+                            name, dimensions, ..
+                        } => {
+                            dimensions.is_empty()
+                                && !self.module.typedefs.contains_key(&name.name.name)
+                                && !self.module.typedef_types.contains_key(&name.name.name)
+                        }
+                        _ => false,
+                    };
+                let default_v = if two_state || is_class_handle || w0 == 0 || unknown_typeref_handle
+                {
                     Value::zero(w)
                 } else {
                     Value::new(w)
@@ -23374,6 +24175,19 @@ impl Simulator {
                                     .associative_arrays
                                     .insert(name.clone(), is_string_key);
                                 self.widths.insert(name.clone(), w);
+                                // If the element type is a known class, record it
+                                // so `assoc[k] = new()` constructs the right class
+                                // (ranged arrays get this at elaborate time; assoc
+                                // arrays were missing it).
+                                if let crate::ast::types::DataType::TypeReference {
+                                    name: en, ..
+                                } = data_type
+                                {
+                                    let ecn = en.name.name.clone();
+                                    if self.module.classes.contains_key(&ecn) {
+                                        self.module.array_elem_class.insert(name.clone(), ecn);
+                                    }
+                                }
                                 continue;
                             }
                             _ => {}
@@ -23402,7 +24216,14 @@ impl Simulator {
                             if let crate::ast::types::DataType::TypeReference { name, .. } =
                                 data_type
                             {
-                                Some(name.name.name.clone())
+                                // Resolve a typedef/scoped alias (e.g.
+                                // `uvm_resource_types::rsrc_q_t`) to its concrete
+                                // class so `name = new()` constructs it; fall back
+                                // to the bare name otherwise.
+                                Some(
+                                    self.resolve_typeref_class_name(name)
+                                        .unwrap_or_else(|| name.name.name.clone()),
+                                )
                             } else {
                                 None
                             };
@@ -23436,8 +24257,26 @@ impl Simulator {
                                         _ => None,
                                     };
                                     if let Some(call_args) = is_new {
-                                        produced =
-                                            Some(self.instantiate_class(&class_def, &call_args));
+                                        // Pass the declared type's `#(...)` args
+                                        // (e.g. `uvm_resource#(int) r = new()`) so
+                                        // the instance records its type bindings
+                                        // (`T -> int`) — needed for per-spec static
+                                        // member resolution (get_type vs
+                                        // get_type_handle → config_db GET).
+                                        let ta: Option<&[Expression]> = match data_type {
+                                            crate::ast::types::DataType::TypeReference {
+                                                type_args,
+                                                ..
+                                            } if !type_args.is_empty() => {
+                                                Some(type_args.as_slice())
+                                            }
+                                            _ => None,
+                                        };
+                                        produced = Some(self.instantiate_class_with_type_args(
+                                            &class_def,
+                                            &call_args,
+                                            ta,
+                                        ));
                                     }
                                 }
                             }
@@ -23446,7 +24285,21 @@ impl Simulator {
                             default_v.clone()
                         };
                         self.widths.insert(d.name.name.clone(), w);
-                        self.signals.insert(d.name.name.clone(), v);
+                        // A local variable inside a method (which has a pushed
+                        // call frame) must live in THAT frame, not the global
+                        // signal table — otherwise a callee's local shadows and
+                        // CLOBBERS a same-named caller local that lives as a
+                        // signal (initial/always blocks have no frame). This is
+                        // uvm_resource_pool::set_scope's local `uvm_resource_base
+                        // r` nulling config_db::set's own `r`. Reads already
+                        // consult `local_stack.last()` before signals, so the
+                        // method still sees its own local. No frame → module/
+                        // initial scope → signal table as before.
+                        if let Some(frame) = self.local_stack.last_mut() {
+                            frame.insert(d.name.name.clone(), v);
+                        } else {
+                            self.signals.insert(d.name.name.clone(), v);
+                        }
                         // Track `signed` scalars so reads carry `is_signed`
                         // (needed for signed division/modulo, comparison, and
                         // `%0d` display). A fresh decl also clears a stale
@@ -23473,7 +24326,45 @@ impl Simulator {
                             if self.module.classes.contains_key(cn) {
                                 self.var_class_types
                                     .insert(d.name.name.clone(), cn.clone());
+                            } else if self.pure_sv_lrm
+                                && self
+                                    .this_stack
+                                    .last()
+                                    .copied()
+                                    .flatten()
+                                    .and_then(|h| {
+                                        self.heap.get(h).and_then(|o| o.as_ref())
+                                    })
+                                    .map_or(false, |inst| {
+                                        inst.type_bindings.contains_key(cn)
+                                    })
+                            {
+                                // `cn` is a class TYPE parameter (e.g. `T obj;`
+                                // inside a parameterized-class method). Record
+                                // the param name so a separate `obj = new()`
+                                // resolves it through the current instance's
+                                // `type_bindings` to the concrete class.
+                                self.var_class_types
+                                    .insert(d.name.name.clone(), cn.clone());
                             }
+                        }
+                        // Record a parameterized local's declared `#(...)` type
+                        // args so a SEPARATE `name = new(...)` constructs the right
+                        // specialization (config_db's `uvm_resource#(T) r; r=new`).
+                        // Clear a stale same-named entry when this decl has none.
+                        if let crate::ast::types::DataType::TypeReference {
+                            type_args,
+                            ..
+                        } = data_type
+                        {
+                            if !type_args.is_empty() {
+                                self.var_type_args
+                                    .insert(d.name.name.clone(), type_args.clone());
+                            } else {
+                                self.var_type_args.remove(&d.name.name);
+                            }
+                        } else {
+                            self.var_type_args.remove(&d.name.name);
                         }
                         // §15.3/§15.4: record a mailbox/semaphore-typed local so
                         // a later separate `name = new(bound)` allocates the right
@@ -23593,6 +24484,15 @@ impl Simulator {
                     if let ExprKind::Ident(hier) = &func.kind {
                         if hier.path.last().unwrap().name.name == "new" {
                             let type_name = self.get_expr_type_name(left);
+                            // PURE_SV_LRM type-parameter construction: resolve a
+                            // type-parameter-typed destination through the
+                            // current instance's bindings to its concrete class.
+                            let type_name = if self.pure_sv_lrm {
+                                type_name
+                                    .map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn))
+                            } else {
+                                type_name
+                            };
                             if let Some(tname) = type_name {
                                 if let Some(class_def) = self.module.classes.get(&tname).cloned() {
                                     let lname_opt = if let ExprKind::Ident(lh) = &left.kind {
@@ -23600,9 +24500,13 @@ impl Simulator {
                                     } else {
                                         None
                                     };
-                                    let ta_cloned = lname_opt
-                                        .as_ref()
-                                        .and_then(|n| self.module.class_type_args.get(n).cloned());
+                                    let ta_cloned = lname_opt.as_ref().and_then(|n| {
+                                        self.module
+                                            .class_type_args
+                                            .get(n)
+                                            .cloned()
+                                            .or_else(|| self.var_type_args.get(n).cloned())
+                                    });
                                     self.instantiate_class_with_type_args(
                                         &class_def,
                                         args,
@@ -23671,6 +24575,19 @@ impl Simulator {
                 let m = self.format_args(args, name);
                 self.record_output(m.clone());
                 self.stdout_write(&m);
+            }
+            // `$swrite(dest, fmt, vals…)` / `$sformat(dest, fmt, vals…)`: format
+            // into the destination STRING (arg0) rather than to stdout. Unlike
+            // the `$sformatf` *function* form, the format string is arg1 here.
+            // UVM's report path uses `$swrite(time_str, "%0t", $time)`, so
+            // without this the composed report line had a blank time field.
+            "$swrite" | "$swriteb" | "$swriteh" | "$swriteo" | "$sformat"
+                if self.pure_sv_lrm =>
+            {
+                if let Some(dest) = args.first() {
+                    let s = self.format_args(&args[1..], name);
+                    self.assign_value(dest, &Value::from_string(&s));
+                }
             }
             // $strobe queues for end-of-timestep playback (postponed
             // region per IEEE 1800 §15.3.4) — formatted AFTER all NBAs
@@ -26203,25 +27120,106 @@ impl Simulator {
         false
     }
 
-    fn child_finished(&mut self, child_pid: usize) {
-        self.process_parents.remove(&child_pid);
-        let mut finished_parents = Vec::new();
-        for (i, waiter) in self.join_waiters.iter_mut().enumerate() {
-            if waiter.child_pids.contains(&child_pid) {
-                waiter.finished_children.insert(child_pid);
-                let should_wake = match waiter.join_type {
-                    JoinType::Join => waiter.finished_children.len() == waiter.child_pids.len(),
-                    JoinType::JoinAny => !waiter.finished_children.is_empty(),
-                    JoinType::JoinNone => true,
-                };
-                if should_wake {
-                    sim_dbg_eprintln!(
-                        "[DEBUG] join waiter for parent process {} triggered at time {}",
-                        waiter.parent_pid,
-                        self.time
-                    );
-                    finished_parents.push(i);
+    /// Collect all active fork descendants of `root` (children, grandchildren,
+    /// …) via the `process_parents` tree. `root` itself is NOT included.
+    /// Used by `disable fork` (§9.6.2) and `wait fork` (§9.6.1), both of which
+    /// act on the entire sub-process tree, not just direct children.
+    fn collect_fork_descendants(&self, root: usize) -> HashSet<usize> {
+        let mut out: HashSet<usize> = HashSet::default();
+        let mut stack = vec![root];
+        while let Some(p) = stack.pop() {
+            for (&child, &parent) in self.process_parents.iter() {
+                if parent == p && out.insert(child) {
+                    stack.push(child);
                 }
+            }
+        }
+        out
+    }
+
+    /// Remove killed pids from every join waiter's tracked children and wake
+    /// any waiter whose join condition is now met (e.g. a `join` whose only
+    /// remaining child was just killed by `disable fork`). Without this a
+    /// parent blocked in `join` would hang forever on a terminated child.
+    fn release_killed_from_join_waiters(&mut self, killed: &HashSet<usize>) {
+        let mut to_wake: Vec<usize> = Vec::new();
+        for (i, w) in self.join_waiters.iter_mut().enumerate() {
+            let before = w.child_pids.len();
+            w.child_pids.retain(|p| !killed.contains(p));
+            w.finished_children.retain(|p| !killed.contains(p));
+            if w.child_pids.len() == before {
+                continue; // unaffected
+            }
+            let met = match w.join_type {
+                JoinType::Join => w.finished_children.len() == w.child_pids.len(),
+                JoinType::JoinAny => {
+                    !w.finished_children.is_empty() || w.child_pids.is_empty()
+                }
+                JoinType::JoinNone => true,
+            };
+            if met {
+                to_wake.push(i);
+            }
+        }
+        to_wake.sort_by(|a, b| b.cmp(a));
+        for i in to_wake {
+            let waiter = self.join_waiters.remove(i);
+            self.event_queue
+                .schedule(self.time, waiter.parent_pid, waiter.continuation);
+        }
+    }
+
+    fn child_finished(&mut self, child_pid: usize) {
+        // Reparent any still-running children of the completing process to its
+        // own parent, so the fork descendant tree stays connected (a `wait fork`
+        // higher up must still see grandchildren whose intermediate parent has
+        // finished). Without this, completing `X` would orphan its child `G`.
+        if let Some(&grandparent) = self.process_parents.get(&child_pid) {
+            let regrandkids: Vec<usize> = self
+                .process_parents
+                .iter()
+                .filter(|(_, &p)| p == child_pid)
+                .map(|(&c, _)| c)
+                .collect();
+            for c in regrandkids {
+                self.process_parents.insert(c, grandparent);
+            }
+        }
+        self.process_parents.remove(&child_pid);
+
+        // Record the completion against every matching plain waiter first
+        // (mutable pass), deferring the wake decision so the `wait fork`
+        // re-check below can borrow `self` immutably.
+        for waiter in self.join_waiters.iter_mut() {
+            if !waiter.wait_fork && waiter.child_pids.contains(&child_pid) {
+                waiter.finished_children.insert(child_pid);
+            }
+        }
+
+        let mut finished_parents = Vec::new();
+        for i in 0..self.join_waiters.len() {
+            let w = &self.join_waiters[i];
+            let should_wake = if w.wait_fork {
+                // §9.6.1: `wait fork` blocks until the parent has NO live
+                // descendants — re-evaluated against the current tree so that
+                // grandchildren spawned after the `wait fork` are also awaited.
+                self.collect_fork_descendants(w.parent_pid).is_empty()
+            } else if w.child_pids.contains(&child_pid) {
+                match w.join_type {
+                    JoinType::Join => w.finished_children.len() == w.child_pids.len(),
+                    JoinType::JoinAny => !w.finished_children.is_empty(),
+                    JoinType::JoinNone => true,
+                }
+            } else {
+                false
+            };
+            if should_wake {
+                sim_dbg_eprintln!(
+                    "[DEBUG] join waiter for parent process {} triggered at time {}",
+                    self.join_waiters[i].parent_pid,
+                    self.time
+                );
+                finished_parents.push(i);
             }
         }
 
@@ -26818,6 +27816,72 @@ impl Simulator {
         self.module.associative_arrays.contains_key(name)
     }
 
+    /// Resolve a `TypeName` (possibly a scoped/class-local typedef alias) to the
+    /// concrete class it ultimately names, if any. Consults, in order: a direct
+    /// class match; a scoped class typedef (`uvm_resource_types::rsrc_q_t` →
+    /// `class uvm_resource_types`'s `typedef_targets["rsrc_q_t"]`); the
+    /// module-level `typedef_types`; and an unscoped search of every class's
+    /// `typedef_targets`. Used both to default a typedef'd handle to `null` and
+    /// to let `rsrc_q_t rq = new()` construct the right class (`uvm_queue`).
+    fn resolve_typeref_class_name(&self, tref: &crate::ast::types::TypeName) -> Option<String> {
+        use crate::ast::types::DataType;
+        let base_class = |s: &str| -> Option<String> {
+            if self.module.classes.contains_key(s) {
+                return Some(s.to_string());
+            }
+            // `uvm_queue#(...)` → base `uvm_queue`
+            let b = s.split('#').next().unwrap_or(s);
+            if b != s && self.module.classes.contains_key(b) {
+                return Some(b.to_string());
+            }
+            None
+        };
+        let nm = &tref.name.name;
+        if let Some(c) = base_class(nm) {
+            return Some(c);
+        }
+        // Find the typedef's target DataType.
+        let mut target: Option<DataType> = None;
+        if let Some(scope) = &tref.scope {
+            if let Some(cls) = self.module.classes.get(&scope.name) {
+                target = cls.typedef_targets.get(nm).cloned();
+            }
+        }
+        if target.is_none() {
+            target = self.module.typedef_types.get(nm).cloned();
+        }
+        if target.is_none() {
+            // Unscoped: a class-local typedef referenced bare from a method of
+            // the same/derived class. Search every class's typedef_targets.
+            for cls in self.module.classes.values() {
+                if let Some(dt) = cls.typedef_targets.get(nm) {
+                    target = Some(dt.clone());
+                    break;
+                }
+            }
+        }
+        match target {
+            Some(DataType::TypeReference { name, .. }) => {
+                if name.name.name == *nm {
+                    return None; // self-reference guard
+                }
+                self.resolve_typeref_class_name(&name)
+            }
+            _ => None,
+        }
+    }
+
+    /// True if a TypeReference data type names a class handle (directly, via a
+    /// parameterized base, or through a typedef chain). Defaults such an
+    /// uninitialized handle to `null` (LRM §8.4) instead of X.
+    fn type_ref_is_class_handle(&self, data_type: &crate::ast::types::DataType) -> bool {
+        if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
+            self.resolve_typeref_class_name(name).is_some()
+        } else {
+            false
+        }
+    }
+
     fn is_string_keyed_array(&self, name: &str) -> bool {
         self.module
             .associative_arrays
@@ -26828,6 +27892,16 @@ impl Simulator {
 
     fn assoc_key_str(&self, name: &str, idx_val: &Value) -> String {
         if self.is_string_keyed_array(name) {
+            idx_val.to_sv_string()
+        } else if idx_val.width > 64 {
+            // A wide key that isn't flagged string-keyed: `to_u64()` would
+            // truncate to the low 64 bits (the last ~8 chars) and collide.
+            // This happens for `pool[KEY]` where KEY is a type parameter bound
+            // to `string` (uvm_pool#(string,...) — the key type isn't resolved
+            // to SimpleType::String at elaboration). Use the full string form so
+            // distinct long keys stay distinct (consistent for set and get).
+            // Genuine wide numeric keys were already truncation-broken here, so
+            // this only improves correctness.
             idx_val.to_sv_string()
         } else {
             idx_val.to_u64().unwrap_or(0).to_string()
@@ -26870,7 +27944,10 @@ impl Simulator {
     fn set_signal_value_by_name(&mut self, name: &str, val: Value) {
         if let Some(&id) = self.signal_name_to_id.get(name) {
             let w = self.signal_widths[id];
-            let resized = val.resize(w);
+            // A width-0 signal (e.g. an untracked module-scope class handle)
+            // would truncate to nothing; keep the value's natural width so a
+            // class handle (`c = factory.create_...()`) is preserved.
+            let resized = if w == 0 { val } else { val.resize(w) };
             if self.signal_table[id] != resized {
                 if !self.dirty_signals[id] {
                     self.dirty_signals[id] = true;
@@ -28218,6 +29295,19 @@ impl Simulator {
             }
         }
         if mname == "size" || mname == "len" {
+            // An associative array's size() == num(): count populated keys.
+            // (Without this it falls through to the queue/.size-shadow/string
+            // paths and reads 0 for a true assoc array — sv_22.)
+            if self.is_associative_array(obj_name) {
+                let prefix = format!("{}[", obj_name);
+                let c1 = self.signals.keys().filter(|k| k.starts_with(&prefix)).count();
+                let c2 = self
+                    .signal_name_to_id
+                    .keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .count();
+                return Some(Value::from_u64((c1 + c2) as u64, 32));
+            }
             if let Some(v) = self.signals.get(&format!("{}.size", obj_name)) {
                 return Some(v.clone());
             }
@@ -28254,6 +29344,23 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
+        // §6.16.9 str.getc(i) — the byte value of character i (0 past the end).
+        // Was unimplemented (returned 0), which made UVM's Verilog-only
+        // `uvm_re_match` glob matcher compare every char as 0==0 — exact matches
+        // passed by accident but `*`/`?` wildcards were never detected, so
+        // `uvm_is_match("*.agent.*", path)` always failed (config_db scope globs).
+        if mname == "getc" {
+            if let Some(idx_arg) = args.get(0) {
+                let idx = self.eval_expr(idx_arg).to_u64().unwrap_or(0) as usize;
+                let s = self
+                    .get_local_or_signal(obj_name)
+                    .map(|v| v.to_sv_string())
+                    .unwrap_or_default();
+                let b = s.as_bytes().get(idx).copied().unwrap_or(0);
+                return Some(Value::from_u64(b as u64, 8));
+            }
+            return Some(Value::zero(8));
+        }
         if mname == "substr" {
             if let Some(first) = args.get(0) {
                 if let Some(second) = args.get(1) {
@@ -28281,6 +29388,47 @@ impl Simulator {
                 }
             }
             return Some(Value::zero(0));
+        }
+        // A class-handle receiver whose class defines a queue-builtin-named
+        // method (e.g. uvm_queue#(T)::push_back/get/size) must dispatch the
+        // USER method, never be treated as a native queue. The flattened
+        // `Call{Ident}` path is guarded by `prefer_user_method`; this covers
+        // the MemberAccess dispatch path (audit class-b gap). Return None so
+        // the class-method dispatch below takes over. A real queue/array never
+        // resolves `obj_name` to a live heap instance, so this is precise.
+        if matches!(
+            mname,
+            "push_back"
+                | "push_front"
+                | "pop_front"
+                | "pop_back"
+                | "sort"
+                | "rsort"
+                | "reverse"
+                | "shuffle"
+                | "insert"
+                | "get"
+                | "size"
+                | "delete"
+                | "first"
+                | "last"
+        ) {
+            if let Some(h) = self
+                .get_local_or_signal(obj_name)
+                .and_then(|v| v.to_u64())
+                .filter(|&h| h != 0)
+            {
+                let cn = self
+                    .heap
+                    .get(h as usize)
+                    .and_then(|o| o.as_ref())
+                    .map(|i| i.class_name.clone());
+                if let Some(cn) = cn {
+                    if self.class_has_method(&cn, mname) {
+                        return None;
+                    }
+                }
+            }
         }
         if mname == "push_back" {
             if let Some(arg) = args.first() {
@@ -28749,7 +29897,10 @@ impl Simulator {
     /// below are bypassed in that case so the genuine UVM source runs —
     /// `uvm_objection` is defined only by the real package.
     fn uses_real_uvm(&self) -> bool {
-        self.module.classes.contains_key("uvm_objection")
+        // PURE_SV_LRM=1 forces this false so every `real_uvm`-gated shim
+        // (native phaser, TLM, factory bridge, run_test, randomize leniency)
+        // is disabled and the genuine UVM SystemVerilog runs instead.
+        !self.pure_sv_lrm && self.module.classes.contains_key("uvm_objection")
     }
 
     /// Break any cycle in the class `extends` graph. A self- or mutually-
@@ -28797,7 +29948,14 @@ impl Simulator {
         while let Some(cname) = cur {
             if let Some(cd) = self.module.classes.get(&cname) {
                 if cd.static_properties.contains(prop) {
-                    return Some(format!("{}::{}", cname, prop));
+                    // Per-specialization keying: when a `C#(params)::...` access
+                    // is active, each specialization gets its own static cell.
+                    return Some(match &self.current_spec {
+                        Some((base, sig)) if *base == cname => {
+                            format!("{}#{}::{}", cname, sig, prop)
+                        }
+                        _ => format!("{}::{}", cname, prop),
+                    });
                 }
                 cur = cd.extends.clone();
             } else {
@@ -28812,7 +29970,10 @@ impl Simulator {
     fn class_static_get(&mut self, start_class: &str, prop: &str) -> Option<Value> {
         let key = self.static_prop_key(start_class, prop)?;
         if !self.class_statics.contains_key(&key) {
-            let decl_class = key.split("::").next().unwrap_or("");
+            // Key head is `DeclClass` or `DeclClass#spec`; strip the spec
+            // suffix to find the class whose initial value seeds the cell.
+            let head = key.split("::").next().unwrap_or("");
+            let decl_class = head.split('#').next().unwrap_or(head);
             let init = self
                 .module
                 .classes
@@ -28948,6 +30109,158 @@ impl Simulator {
     /// virtual interface yields its current target (vif-to-vif copy); a plain
     /// interface-instance ident yields its own name. Returns None when the RHS
     /// is neither (so the caller falls back to a normal value assignment).
+    /// UVM Verilog-only glob match (port of dpi/uvm_regex.svh `uvm_re_match`,
+    /// which returns 0 on match). `*` = any run, `?` = any one char.
+    fn uvm_glob_match(pattern: &str, s: &str) -> bool {
+        let re_full: Vec<u8> = pattern.bytes().collect();
+        if re_full.is_empty() {
+            return true; // uvm: re.len()==0 -> return 0 (match)
+        }
+        let re: &[u8] = if re_full[0] == b'^' {
+            &re_full[1..]
+        } else {
+            &re_full[..]
+        };
+        let sb: Vec<u8> = s.bytes().collect();
+        let g = |v: &[u8], i: usize| -> u8 { *v.get(i).unwrap_or(&0) };
+        let (mut e, mut si, mut es, mut ss) = (0usize, 0usize, 0usize, 0usize);
+        while si != sb.len() && g(re, e) != b'*' {
+            if g(re, e) != g(&sb, si) && g(re, e) != b'?' {
+                return false;
+            }
+            e += 1;
+            si += 1;
+        }
+        while si != sb.len() {
+            if g(re, e) == b'*' {
+                e += 1;
+                if e == re.len() {
+                    return true;
+                }
+                es = e;
+                ss = si + 1;
+            } else if g(re, e) == g(&sb, si) || g(re, e) == b'?' {
+                e += 1;
+                si += 1;
+            } else {
+                e = es;
+                si = ss;
+                ss += 1;
+            }
+        }
+        while e < re.len() && g(re, e) == b'*' {
+            e += 1;
+        }
+        e == re.len()
+    }
+
+    /// config_db scope = replicate uvm_config_db: cntxt==null -> uvm_top
+    /// (full_name ""); inst=="" -> cntxt.get_full_name(); else
+    /// {cntxt.get_full_name(), ".", inst} (unless cntxt full is "").
+    fn config_db_scope(&mut self, cntxt: &Expression, inst: &Expression) -> String {
+        let cntxt_h = self.eval_expr(cntxt).to_u64().unwrap_or(0) as usize;
+        let inst_s = self.eval_expr(inst).to_sv_string();
+        let cntxt_full = if cntxt_h != 0
+            && self.heap.get(cntxt_h).and_then(|o| o.as_ref()).is_some()
+        {
+            self.exec_method_call(cntxt_h, "get_full_name", &[]).to_sv_string()
+        } else {
+            String::new()
+        };
+        if inst_s.is_empty() {
+            cntxt_full
+        } else if cntxt_full.is_empty() {
+            inst_s
+        } else {
+            format!("{}.{}", cntxt_full, inst_s)
+        }
+    }
+
+    /// (handle, prop) for a config_db get's inout target vif expression.
+    fn vif_target_handle_prop(&self, expr: &Expression) -> Option<(usize, String)> {
+        match &expr.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                let handle = self.this_stack.last().copied().flatten().unwrap_or(0);
+                Some((handle, h.path[0].name.name.clone()))
+            }
+            ExprKind::Ident(h) if h.path.len() == 2 => {
+                let oh = self.eval_ident_handle(&h.path[0].name.name).unwrap_or(0);
+                Some((oh, h.path[1].name.name.clone()))
+            }
+            ExprKind::MemberAccess { expr: b, member } => {
+                let oh = self.eval_handle_expr(b).unwrap_or(0);
+                Some((oh, member.name.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// PURE_SV_LRM `uvm_config_db#(virtual X)::set/get` — carry the interface
+    /// binding (which config_db's value round-trip loses). Returns Some(result)
+    /// only when this is genuinely a virtual-interface set/get; None otherwise
+    /// so the real config_db handles ordinary values.
+    fn pure_vif_config_db(&mut self, is_set: bool, args: &[Expression]) -> Option<Value> {
+        if args.len() < 4 {
+            return None;
+        }
+        // Only a VIRTUAL-INTERFACE config_db (`#(virtual X)`), never an object/
+        // scalar one — gate on the specialization sig so an object config_db
+        // (`#(my_cfg)`) is left entirely to the real config_db.
+        let is_vif_spec = self
+            .current_spec
+            .as_ref()
+            .map_or(false, |(_b, sig)| sig.trim_start().starts_with("virtual"));
+        if !is_vif_spec {
+            return None;
+        }
+        if is_set {
+            // Only a vif set: args[3] resolves to an interface / bound vif.
+            let iface = self.resolve_vif_rhs_name(&args[3])?;
+            let scope = self.config_db_scope(&args[0], &args[1]);
+            let field = self.eval_expr(&args[2]).to_sv_string();
+            self.vif_config_db.push((scope, field, iface));
+            Some(Value::zero(32))
+        } else {
+            // GET: detect a vif get by a RECORDED vif set for this field+scope
+            // (the target may be a class vif PROPERTY or a plain LOCAL variable —
+            // the interrupt examples get into a local `temp_int_if`). No match →
+            // return None so the real config_db handles ordinary values.
+            let field = self.eval_expr(&args[2]).to_sv_string();
+            let query = self.config_db_scope(&args[0], &args[1]);
+            let mut found: Option<String> = None;
+            for (scope, f, iface) in &self.vif_config_db {
+                if *f == field && Self::uvm_glob_match(scope, &query) {
+                    found = Some(iface.clone());
+                }
+            }
+            let iface = found?;
+            // Record the (handle, prop) binding when the target is a declared
+            // class vif property, so `obj.vif.member` resolves. A local target
+            // has no such key; the value assignment below still satisfies
+            // existence/null checks (`vif != null`, "handle 0 not found").
+            if let Some((t_handle, t_prop)) = self.vif_target_handle_prop(&args[3]) {
+                let vif_prop = self
+                    .heap
+                    .get(t_handle)
+                    .and_then(|o| o.as_ref())
+                    .map(|i| i.class_name.clone())
+                    .and_then(|cls| self.module.classes.get(&cls))
+                    .and_then(|cd| cd.virtual_iface_properties.get(&t_prop).cloned());
+                if let Some((_t, modport)) = vif_prop {
+                    self.virtual_iface_bindings
+                        .insert((t_handle, t_prop), (iface.clone(), modport));
+                }
+            }
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in iface.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            self.assign_value(&args[3], &Value::from_u64((h & 0x7FFF_FFFF) | 1, 32));
+            Some(Value::from_u64(1, 32))
+        }
+    }
+
     fn resolve_vif_rhs_name(&self, rvalue: &Expression) -> Option<String> {
         match &rvalue.kind {
             // `v` — a bound vif of the current `this`, else a direct instance.
@@ -28972,6 +30285,19 @@ impl Simulator {
                 self.virtual_iface_bindings
                     .get(&(oh, member.name.clone()))
                     .map(|(b, _)| b.clone())
+            }
+            // `INT[i]` — an element of an interface-instance array
+            // (`interrupt_if INT[N]()`). Bind to the element's name so
+            // `vif.member` resolves to `INT[<i>].member` (interrupt examples set
+            // the vif this way: `config_db#(virtual X)::set(..., INT[ii])`).
+            ExprKind::Index { expr: base, index } => {
+                if let ExprKind::Ident(h) = &base.kind {
+                    if h.path.len() == 1 {
+                        let idx = self.eval_scalar_self(index).unwrap_or(0);
+                        return Some(format!("{}[{}]", h.path[0].name.name, idx));
+                    }
+                }
+                None
             }
             _ => None,
         }
@@ -29192,6 +30518,26 @@ impl Simulator {
     /// Evaluate a scalar expression to an i64 in a `&self` context (literals,
     /// const exprs, and simple loop/local/signal variables). Used to resolve
     /// array indices when computing instance-scoped member names.
+    /// Immutable resolution of an array-index expression to a `Value` (for the
+    /// `&self` handle path). Covers the forms that appear as assoc keys: a
+    /// string literal, a local/signal variable (e.g. a `string name`), else a
+    /// scalar. Used to key string-keyed assoc element handle reads.
+    fn eval_index_value_self(&self, e: &Expression) -> Option<Value> {
+        match &e.kind {
+            ExprKind::StringLiteral(s) => Some(Value::from_string(s)),
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                let n = &h.path[0].name.name;
+                self.local_stack
+                    .last()
+                    .and_then(|f| f.get(n).cloned())
+                    .or_else(|| self.get_signal_value_by_name(n))
+            }
+            _ => self
+                .eval_scalar_self(e)
+                .map(|i| Value::from_u64(i as u64, 32)),
+        }
+    }
+
     fn eval_scalar_self(&self, e: &Expression) -> Option<i64> {
         if let Some(v) = super::elaborate::const_eval_i64_with_params(e, None) {
             return Some(v);
@@ -29280,10 +30626,25 @@ impl Simulator {
                 if let ExprKind::Ident(bh) = &base.kind {
                     if bh.path.len() == 1 {
                         let bname = bh.path[0].name.name.clone();
-                        let scoped =
-                            self.instance_assoc_member(&bname).unwrap_or(bname);
-                        let idx = self.eval_scalar_self(index)?;
-                        let key = format!("{}[{}]", scoped, idx);
+                        let scoped = self
+                            .instance_assoc_member(&bname)
+                            .unwrap_or_else(|| bname.clone());
+                        // A STRING-keyed assoc element (`rtab[string]`) must key
+                        // by the string, not a truncated scalar — otherwise
+                        // `assoc[key].method()` (a method on the element class
+                        // handle) resolves to the wrong/empty slot → handle 0 →
+                        // null receiver. This is uvm_resource_pool's
+                        // `rtab[name].get(i)` / config_db's resource lookup.
+                        let string_keyed = self.is_string_keyed_array(&scoped)
+                            || self.is_string_keyed_array(&bname);
+                        let key_str = if string_keyed {
+                            self.eval_index_value_self(index)
+                                .map(|v| v.to_sv_string())
+                                .unwrap_or_default()
+                        } else {
+                            self.eval_scalar_self(index)?.to_string()
+                        };
+                        let key = format!("{}[{}]", scoped, key_str);
                         return self
                             .get_signal_value_by_name(&key)
                             .and_then(|v| v.to_u64())
@@ -29382,7 +30743,25 @@ impl Simulator {
             _ => None,
         };
         match dest_type {
-            Some(dt) => self.class_is_a(&src_class, &dt),
+            Some(dt) => {
+                // The dest may be a TYPE PARAMETER (e.g. `REQ param_t;` inside
+                // uvm_sequencer_param_base::send_request's `$cast(param_t, t)`).
+                // "REQ" is not a real class, so class_is_a would spuriously fail
+                // (SQRSNDREQCAST). Resolve it to the concrete class via the
+                // current instance's bindings; if it can't be resolved to a known
+                // class, don't enforce (stay permissive like the None case).
+                let resolved = if self.module.classes.contains_key(&dt) {
+                    dt
+                } else if let Some(c) = self
+                    .resolve_type_param_binding(&dt)
+                    .filter(|c| self.module.classes.contains_key(c))
+                {
+                    c
+                } else {
+                    return true;
+                };
+                self.class_is_a(&src_class, &resolved)
+            }
             None => true, // unknown dest type — stay permissive
         }
     }
@@ -29456,18 +30835,156 @@ impl Simulator {
         None
     }
 
+    /// Strip `Specialization` wrappers from the call/member shape so dispatch
+    /// matching (which looks for Ident/MemberAccess chains) sees the same shape
+    /// as before the `Specialization` AST node existed. The `#(...)` spec text
+    /// is preserved in the original AST for per-spec static keying (handled at
+    /// the static-dispatch sites under PURE_SV_LRM); this only normalizes shape.
+    fn expr_has_specialization(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Specialization { .. } => true,
+            ExprKind::MemberAccess { expr, .. } => Self::expr_has_specialization(expr),
+            _ => false,
+        }
+    }
+
+    /// Extract `(base_class, sig)` from a `C#(params)::...` expression's
+    /// `Specialization` node (the spec sits on the member/ident chain's base).
+    fn extract_call_spec(e: &Expression) -> Option<(String, String)> {
+        match &e.kind {
+            ExprKind::Specialization { base, type_args_text } => {
+                if let ExprKind::Ident(h) = &base.kind {
+                    h.path
+                        .last()
+                        .map(|s| (s.name.name.clone(), type_args_text.clone()))
+                } else {
+                    None
+                }
+            }
+            ExprKind::MemberAccess { expr, .. } => Self::extract_call_spec(expr),
+            _ => None,
+        }
+    }
+
+    fn strip_spec_shape(e: &Expression) -> Expression {
+        match &e.kind {
+            ExprKind::Specialization { base, .. } => Self::strip_spec_shape(base),
+            ExprKind::MemberAccess { expr, member } => Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(Self::strip_spec_shape(expr)),
+                    member: member.clone(),
+                },
+                e.span,
+            ),
+            _ => e.clone(),
+        }
+    }
+
+    /// PURE-mode (`PURE_SV_LRM=1`) resolution of `C::type_id::create`.
+    /// A class `C` registers itself with a UVM-style factory via a typedef
+    /// `typedef <registry>#(T,"N") type_id;` where `<registry>` is
+    /// `uvm_component_registry` / `uvm_object_registry`. The net effect of
+    /// `C::type_id::create(...)` is to construct the registered type `T`
+    /// (the first type argument). Returns the leaf class name `T` when
+    /// `class_name`'s `type_id` typedef is such a `*registry*` TypeReference,
+    /// else `None`.
+    fn resolve_type_id_target_class(&self, class_name: &str) -> Option<String> {
+        let cd = self.module.classes.get(class_name)?;
+        let dt = cd.typedef_targets.get("type_id")?;
+        if let DataType::TypeReference {
+            name, type_args, ..
+        } = dt
+        {
+            if name.name.name.contains("registry") {
+                if let Some(first) = type_args.first() {
+                    if let ExprKind::Ident(hier) = &first.kind {
+                        return Some(hier.path.last().unwrap().name.name.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn eval_call(&mut self, func: &Expression, args: &[Expression]) -> Value {
+        // For a `C#(params)::method()` static call, make the specialization
+        // active across the whole call (so the method body's static accesses
+        // key per-spec) — a wrapper here covers all of eval_call_inner's early
+        // returns. No spec → call inner directly (zero overhead).
+        if !self.pure_sv_lrm || !Self::expr_has_specialization(func) {
+            return self.eval_call_inner(func, args);
+        }
+        let saved = self.current_spec.take();
+        let extracted = self.resolve_call_spec_params(Self::extract_call_spec(func), &saved);
+        self.current_spec = extracted.or(saved.clone());
+        let r = self.eval_call_inner(func, args);
+        self.current_spec = saved;
+        r
+    }
+
+    fn eval_call_inner(&mut self, func: &Expression, args: &[Expression]) -> Value {
+        // Normalize away Specialization wrappers for dispatch shape-matching
+        // (the `#(...)` text is retained in the original AST + `current_spec`
+        // for per-spec static keying). Keeps pre-Specialization dispatch exact.
+        let func_norm;
+        let func = if Self::expr_has_specialization(func) {
+            func_norm = Self::strip_spec_shape(func);
+            &func_norm
+        } else {
+            func
+        };
         // Intercept UVM method calls
         let real_uvm = self.uses_real_uvm();
         if let ExprKind::MemberAccess { expr, member } = &func.kind {
             let mname = member.name.as_str();
+
+            // PURE_SV_LRM: intercept the factory's by-name create EARLY (before
+            // the real `uvm_default_factory::create_component_by_name` body,
+            // whose `m_type_names` is empty, runs and returns null). Resolve the
+            // requested type to its concrete class and construct it (the real
+            // net effect). Receiver must be a factory instance.
+            if self.pure_sv_lrm
+                && matches!(mname, "create_component_by_name" | "create_object_by_name")
+            {
+                let recv_is_factory = self
+                    .eval_handle_expr(expr)
+                    .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+                    .map_or(false, |i| i.class_name.contains("factory"));
+                if recv_is_factory {
+                    let type_name = args
+                        .first()
+                        .map(|a| self.eval_expr(a).to_sv_string())
+                        .unwrap_or_default();
+                    if let Some(cd) = self.pure_factory_lookup(&type_name) {
+                        let ctor_args: Vec<Expression> = if mname == "create_component_by_name" {
+                            let mut v = Vec::new();
+                            if let Some(n) = args.get(2) { v.push(n.clone()); }
+                            if let Some(p) = args.get(3) { v.push(p.clone()); }
+                            v
+                        } else {
+                            args.get(2).cloned().into_iter().collect()
+                        };
+                        return self.instantiate_class(&cd, &ctor_args);
+                    }
+                }
+            }
 
             // UVM run-phase objection mechanism — intercept by method name
             // regardless of the receiver (the run_phase `phase` arg is a null
             // handle in the route-B phaser, so the normal `obj.method` dispatch
             // would bail before reaching exec_method_call).
             if matches!(mname, "raise_objection" | "drop_objection" | "set_drain_time") {
-                return self.handle_uvm_objection(mname, args);
+                if !self.pure_sv_lrm {
+                    return self.handle_uvm_objection(mname, args);
+                }
+                // PURE_SV_LRM: the real objection runs (drives get_objection_total
+                // for the wait_for bridge), but the pure phaser does NOT exercise
+                // uvm_phase::execute_phase's `m_phase_proc.kill()` termination — so
+                // a run phase whose objections drop would otherwise run its forked
+                // component run_phase forever-loops to max_time. Also drive the
+                // drain/pending-end tracker here so the sim ends when objections
+                // drop; then fall through to the real objection method.
+                self.handle_uvm_objection(mname, args);
             }
 
             // UVM TLM: record the connection graph and deliver analysis/put
@@ -29584,7 +31101,7 @@ impl Simulator {
             // Real UVM routes this through the resource pool, which the direct
             // phaser does not fully drive; service it with a simple field-keyed
             // store so set/get round-trips (riscv-dv passes the cfg this way).
-            if matches!(mname, "set" | "get" | "exists") {
+            if !self.pure_sv_lrm && matches!(mname, "set" | "get" | "exists") {
                 fn find_config_db(e: &Expression) -> bool {
                     match &e.kind {
                         ExprKind::Ident(h) => h.path.iter().any(|s| s.name.name.contains("config_db")),
@@ -29594,6 +31111,24 @@ impl Simulator {
                 }
                 if find_config_db(expr) {
                     return self.exec_config_db(mname, args);
+                }
+            }
+            // PURE_SV_LRM: preserve the virtual-interface binding across
+            // config_db (the value round-trip loses the iface identity).
+            if self.pure_sv_lrm && matches!(mname, "set" | "get") {
+                fn find_config_db2(e: &Expression) -> bool {
+                    match &e.kind {
+                        ExprKind::Ident(h) => {
+                            h.path.iter().any(|s| s.name.name.contains("config_db"))
+                        }
+                        ExprKind::MemberAccess { expr: b, .. } => find_config_db2(b),
+                        _ => false,
+                    }
+                }
+                if find_config_db2(expr) {
+                    if let Some(v) = self.pure_vif_config_db(mname == "set", args) {
+                        return v;
+                    }
                 }
             }
 
@@ -29607,6 +31142,50 @@ impl Simulator {
             // receiver (`obj.member` / bare `member`) still takes the builtin
             // path below — only a plain class-handle receiver is rerouted.
             if Self::is_array_builtin_method(mname) && self.expr_assoc_name(expr).is_none() {
+                if let Some(h) = self.eval_handle_expr(expr) {
+                    if h != 0 {
+                        let cn = self
+                            .heap
+                            .get(h)
+                            .and_then(|o| o.as_ref())
+                            .map(|i| i.class_name.clone());
+                        if let Some(cn) = cn {
+                            if self.class_has_method(&cn, mname) {
+                                return self.exec_method_call(h, mname, args);
+                            }
+                        }
+                    }
+                }
+            }
+            // Assoc/array ELEMENT receiver whose element is a class handle:
+            // `rtab[name].get(i)` / `rtab[name].size()`. The reroute above is
+            // gated off here because `expr_assoc_name(Index)` is Some, so the
+            // method would otherwise apply to the whole collection (e.g.
+            // `rtab.size()` — wrong: returns the assoc's entry count, not the
+            // element queue's size). Resolve the element to its heap handle and
+            // dispatch the user method when its class defines it. A native
+            // array-of-queues element does NOT resolve to a heap instance, so
+            // it correctly falls through to the builtin path below.
+            if matches!(&expr.kind, ExprKind::Index { .. })
+                && (Self::is_array_builtin_method(mname)
+                    || matches!(
+                        mname,
+                        "get" | "push_back"
+                            | "push_front"
+                            | "pop_front"
+                            | "pop_back"
+                            | "insert"
+                            | "delete"
+                            | "first"
+                            | "last"
+                            | "sort"
+                            | "rsort"
+                            | "reverse"
+                            | "shuffle"
+                            | "next"
+                            | "prev"
+                    ))
+            {
                 if let Some(h) = self.eval_handle_expr(expr) {
                     if h != 0 {
                         let cn = self
@@ -29894,7 +31473,20 @@ impl Simulator {
                         return Value::zero(32);
                     }
                 }
-                return Value::zero(32);
+                // Not a mailbox/semaphore: if the receiver is a class instance
+                // whose class defines a user `get` method (e.g. uvm_queue#(T)::
+                // get(i)), do NOT swallow the call — fall through to the generic
+                // method dispatch below. Returning zero here silently dropped
+                // `rtab[name].get(i)` in uvm_resource_pool (lookup_name read a
+                // null resource → config_db get always missed).
+                let is_user_get = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .map_or(false, |i| self.class_has_method(&i.class_name, "get"));
+                if !is_user_get {
+                    return Value::zero(32);
+                }
             }
             if mname == "try_get" {
                 let base = self.eval_expr(expr);
@@ -29981,7 +31573,7 @@ impl Simulator {
             // register and must use their real construction — routing those
             // through here would recurse via uvm_component/report-handler
             // creation during build.
-            if mname == "create" {
+            if !self.pure_sv_lrm && mname == "create" {
                 if let ExprKind::MemberAccess {
                     expr: inner_expr,
                     member: inner_member,
@@ -30024,7 +31616,56 @@ impl Simulator {
                     }
                 }
             }
+            // PURE mode (`PURE_SV_LRM=1`, UVM shim disabled): `C::type_id::create`
+            // is not serviced by the shim above. Resolve it from the design's
+            // own `typedef <registry>#(T,"N") type_id;` registration and
+            // construct the registered type `T` directly — the LRM-faithful net
+            // effect of the real factory's `type_id::create`.
+            if self.pure_sv_lrm && mname == "create" {
+                if let ExprKind::MemberAccess {
+                    expr: inner_expr,
+                    member: inner_member,
+                } = &expr.kind
+                {
+                    if inner_member.name.as_str() == "type_id" {
+                        if let ExprKind::Ident(hier) = &inner_expr.kind {
+                            let class_name = hier.path[0].name.name.clone();
+                            if let Some(target) =
+                                self.resolve_type_id_target_class(&class_name)
+                            {
+                                if let Some(class_def) =
+                                    self.module.classes.get(&target).cloned()
+                                {
+                                    return self.instantiate_class(&class_def, args);
+                                }
+                            }
+                            // `typedef uvm_sequencer#(item) sqr_t; sqr_t::type_id::
+                            // create(...)` — the name is a typedef for a
+                            // parameterized class, not a class itself, so
+                            // resolve_type_id_target_class found nothing. Resolve
+                            // the typedef to its base class + type args and
+                            // construct directly (its `new` builds the ports, e.g.
+                            // uvm_sequencer's seq_item_export — else null → the
+                            // driver's connect fails with a build error).
+                            if let Some(DataType::TypeReference { name, type_args, .. }) =
+                                self.module.typedef_types.get(&class_name).cloned()
+                            {
+                                if let Some(class_def) =
+                                    self.module.classes.get(&name.name.name).cloned()
+                                {
+                                    let ta: Option<&[Expression]> =
+                                        if type_args.is_empty() { None } else { Some(&type_args) };
+                                    return self.instantiate_class_with_type_args(
+                                        &class_def, args, ta,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if !real_uvm
+                && !self.pure_sv_lrm
                 && (mname == "item_done"
                     || mname == "connect"
                     || mname == "raise_objection"
@@ -30068,7 +31709,37 @@ impl Simulator {
                 }
                 return Value::zero(32);
             }
-            if mname == "write" && !real_uvm {
+            // PURE_SV_LRM: same factory bridge, but resolve the requested name
+            // through `pure_factory_lookup` (class name OR a `type_id` registry
+            // typedef's registered name) and construct the real class — the net
+            // effect of the real `wrapper.create_component`/`create_object`
+            // (which runs `T::new`), without the native shim's by-name map.
+            if self.pure_sv_lrm
+                && (mname == "create_component_by_name" || mname == "create_object_by_name")
+            {
+                let type_name = args
+                    .first()
+                    .map(|a| self.eval_expr(a).to_sv_string())
+                    .unwrap_or_default();
+                if let Some(cd) = self.pure_factory_lookup(&type_name) {
+                    let ctor_args: Vec<Expression> = if mname == "create_component_by_name" {
+                        let mut v = Vec::new();
+                        if let Some(n) = args.get(2) { v.push(n.clone()); }
+                        if let Some(p) = args.get(3) { v.push(p.clone()); }
+                        v
+                    } else {
+                        args.get(2).cloned().into_iter().collect()
+                    };
+                    return self.instantiate_class(&cd, &ctor_args);
+                }
+                return Value::zero(32);
+            }
+            // Legacy default-mode analysis-port shim: broadcast a bare
+            // `x.write(...)` to every "scoreboard" instance. This must NOT fire
+            // in PURE_SV_LRM — there the genuine UVM `write` methods run, and
+            // this shim would swallow `uvm_resource#(T)::write` (breaking
+            // config_db's value store → GET read 0).
+            if mname == "write" && !real_uvm && !self.pure_sv_lrm {
                 // Call write on scoreboard
                 let mut sb_handles = Vec::new();
                 for i in 1..self.heap.len() {
@@ -30138,6 +31809,22 @@ impl Simulator {
                 if let Some(an) = self.expr_assoc_name(&base_expr) {
                     if let Some(res) = self.eval_builtin_method(&an, &m, args) {
                         return res;
+                    }
+                }
+                // Module/package-scope array (NOT a class-instance member):
+                // `expr_assoc_name` only resolves class members, so a plain
+                // module-level `int aa[string]` / queue / dynamic array would
+                // otherwise fall through to the enum/0 path. Resolve the bare
+                // name and dispatch the builtin directly. (sv_22 assoc num()/size())
+                if let ExprKind::Ident(bh) = &base_expr.kind {
+                    let bn = self.resolve_hier_name(bh);
+                    if self.is_associative_array(&bn)
+                        || self.module.arrays.contains_key(&bn)
+                        || self.module.dynamic_arrays.contains(&bn)
+                    {
+                        if let Some(res) = self.eval_builtin_method(&bn, &m, args) {
+                            return res;
+                        }
                     }
                 }
             }
@@ -30343,7 +32030,7 @@ impl Simulator {
                         _ => Value::zero(32),
                     };
                 }
-                if name == "uvm_report_enabled" {
+                if !self.pure_sv_lrm && name == "uvm_report_enabled" {
                     // xezim services UVM reporting directly (see the
                     // uvm_report_* interception below and run_uvm_test_real).
                     // The design's real uvm_report_enabled routes through the
@@ -30351,14 +32038,15 @@ impl Simulator {
                     // always report enabled here regardless of real-vs-mock UVM.
                     return Value::from_u64(1, 32);
                 }
-                if name == "get_is_active" && !real_uvm {
+                if !self.pure_sv_lrm && name == "get_is_active" && !real_uvm {
                     // UVM_ACTIVE is typically 1 in UVM
                     return Value::from_u64(1, 32);
                 }
-                if name == "uvm_report_info"
-                    || name == "uvm_report_warning"
-                    || name == "uvm_report_error"
-                    || name == "uvm_report_fatal"
+                if !self.pure_sv_lrm
+                    && (name == "uvm_report_info"
+                        || name == "uvm_report_warning"
+                        || name == "uvm_report_error"
+                        || name == "uvm_report_fatal")
                 {
                     let id = args
                         .first()
@@ -30408,7 +32096,7 @@ impl Simulator {
                     self.run_uvm_test_real(test_name);
                     return Value::zero(32);
                 }
-                if name == "run_test" && !real_uvm {
+                if !self.pure_sv_lrm && name == "run_test" && !real_uvm {
                     let test_name = if let Some(arg) = args.first() {
                         if let ExprKind::StringLiteral(s) = &arg.kind {
                             s.clone()
@@ -30462,7 +32150,8 @@ impl Simulator {
             // phaser (run_uvm_test_real) does not initialize UVM's factory
             // singleton via the normal run_test path, so route construction
             // through xezim's class machinery instead of the real factory.
-            if len >= 3
+            if !self.pure_sv_lrm
+                && len >= 3
                 && path[len - 1].name.name == "create"
                 && path[len - 2].name.name == "type_id"
                 && (!real_uvm || !path[len - 3].name.name.starts_with("uvm_"))
@@ -30474,10 +32163,27 @@ impl Simulator {
             } else if len >= 2 && path[len - 1].name.name == "create" {
             }
 
+            // PURE-mode counterpart of the flattened `...,type_id,create` path
+            // (the MemberAccess form is handled in eval_call_inner's call site
+            // above). Resolve `C::type_id::create` from `C`'s own registry
+            // typedef and construct the registered target class.
+            if self.pure_sv_lrm
+                && len >= 3
+                && path[len - 1].name.name == "create"
+                && path[len - 2].name.name == "type_id"
+            {
+                let class_name = path[len - 3].name.name.clone();
+                if let Some(target) = self.resolve_type_id_target_class(&class_name) {
+                    if let Some(class_def) = self.module.classes.get(&target).cloned() {
+                        return self.instantiate_class(&class_def, args);
+                    }
+                }
+            }
+
             // `uvm_config_db#(T)::set/get/exists(...)` flattened into an Ident
             // path (e.g. from module-scope initial blocks). The MemberAccess
             // branch above only catches the class-method invocation form.
-            if len >= 2 {
+            if !self.pure_sv_lrm && len >= 2 {
                 let tail = path[len - 1].name.name.as_str();
                 if matches!(tail, "set" | "get" | "exists")
                     && path.iter().any(|s| s.name.name.contains("config_db"))
@@ -30583,10 +32289,6 @@ impl Simulator {
                     }
                 }
 
-                if let Some(res) = self.eval_builtin_method(obj_name, method_name, args) {
-                    return res;
-                }
-
                 let obj_val = if let Some(locals) = self.local_stack.last() {
                     locals.get(obj_name).cloned()
                 } else {
@@ -30596,6 +32298,28 @@ impl Simulator {
                         self.signals.get(obj_name).cloned()
                     }
                 };
+                // A class instance's USER method ALWAYS takes precedence over a
+                // same-named collection builtin: uvm_pool/uvm_queue define real
+                // exists()/num()/get()/push_back()/size()/... methods. Without
+                // this, `pool.exists(k)` / `q.push_back(x)` dispatched the builtin
+                // (a collection op on the handle itself → no-op/0), so
+                // uvm_config_db's pool + resource-pool queue ops all silently
+                // failed (NULLRASRC / NOVIF / empty resource lookup). Gate on the
+                // receiver being a LIVE class instance defining the method — a
+                // non-builtin name makes eval_builtin_method return None anyway,
+                // so this only changes the builtin-name-collision cases.
+                let prefer_user_method = obj_val
+                    .as_ref()
+                    .and_then(|v| v.to_u64())
+                    .map(|h| h as usize)
+                    .filter(|&h| h != 0 && h < self.heap.len())
+                    .and_then(|h| self.heap[h].as_ref())
+                    .map_or(false, |i| self.class_has_method(&i.class_name, method_name));
+                if !prefer_user_method {
+                    if let Some(res) = self.eval_builtin_method(obj_name, method_name, args) {
+                        return res;
+                    }
+                }
                 if let Some(v) = obj_val {
                     let handle = v.to_u64().unwrap_or(0) as usize;
                     if handle != 0 {
@@ -31467,12 +33191,121 @@ impl Simulator {
         Value::from_u64(new_handle as u64, 32)
     }
 
+    /// Extract the leaf identifier name from a type-argument expression
+    /// (e.g. `Base` from the `#(Base)` specialization arg). Returns None for
+    /// non-identifier type args (literals, complex type exprs, etc.).
+    fn leaf_ident_name(e: &Expression) -> Option<String> {
+        if let ExprKind::Ident(h) = &e.kind {
+            h.path.last().map(|s| s.name.name.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Resolve a class TYPE-parameter name through the current `this`
+    /// instance's recorded bindings. Returns the concrete class name if `tn`
+    /// is a type parameter bound on the active instance (e.g. `T -> Base`
+    /// inside a `Mk#(Base)` method), else None (so a plain class name passes
+    /// through unchanged at the call site).
+    fn resolve_type_param_binding(&self, tn: &str) -> Option<String> {
+        let spec = self.current_spec.clone();
+        self.resolve_type_param_with(tn, &spec)
+    }
+
+    /// Resolve a type-parameter name `tn` to its concrete type, using (in order)
+    /// the current object's bindings (instance context) then a given active
+    /// `spec = (base, sig)` (static context — `tn`'s position in `base`'s
+    /// type_param_names picks the matching comma element of `sig`). config_db's
+    /// `uvm_resource#(T)` where `T` is `uvm_config_db#(int)`'s own param → `int`.
+    fn resolve_type_param_with(
+        &self,
+        tn: &str,
+        spec: &Option<(String, String)>,
+    ) -> Option<String> {
+        if let Some(h) = self.this_stack.last().copied().flatten() {
+            if let Some(c) = self
+                .heap
+                .get(h)
+                .and_then(|o| o.as_ref())
+                .and_then(|inst| inst.type_bindings.get(tn).cloned())
+            {
+                return Some(c);
+            }
+        }
+        if let Some((base, sig)) = spec {
+            if let Some(cd) = self.module.classes.get(base) {
+                if let Some(idx) = cd.type_param_names.iter().position(|p| p == tn) {
+                    if let Some(v) = sig.split(',').nth(idx) {
+                        let v = v.trim();
+                        if !v.is_empty() {
+                            return Some(v.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve any type-parameter names inside an extracted call spec's sig
+    /// through the ENCLOSING spec, so `uvm_resource#(T)::get_type()` invoked
+    /// from inside `uvm_config_db#(int)` keys `uvm_resource#(int)` — the same
+    /// per-spec cell the concrete resource uses.
+    fn resolve_call_spec_params(
+        &self,
+        spec: Option<(String, String)>,
+        enclosing: &Option<(String, String)>,
+    ) -> Option<(String, String)> {
+        let (base, sig) = spec?;
+        let resolved = sig
+            .split(',')
+            .map(|part| {
+                let p = part.trim();
+                self.resolve_type_param_with(p, enclosing)
+                    .unwrap_or_else(|| p.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Some((base, resolved))
+    }
+
     fn instantiate_class(
         &mut self,
         class_def: &crate::compiler::elaborate::ElaboratedClass,
         args: &[Expression],
     ) -> Value {
         self.instantiate_class_with_type_args(class_def, args, None)
+    }
+
+    /// PURE_SV_LRM: resolve a factory-requested type name to the concrete
+    /// elaborated class. UVM's `uvm_*_utils(C)` registers C under name "C", so
+    /// the requested name usually IS the class name; also reverse-resolve via
+    /// `type_id` typedef targets (`uvm_*_registry#(C,"N")` -> N) for the rare
+    /// case the registered name differs. Returns the class def to construct.
+    fn pure_factory_lookup(&self, requested: &str) -> Option<crate::compiler::elaborate::ElaboratedClass> {
+        use crate::ast::types::DataType;
+        if let Some(cd) = self.module.classes.get(requested) {
+            return Some(cd.clone());
+        }
+        for cd in self.module.classes.values() {
+            if let Some(DataType::TypeReference { name, type_args, .. }) =
+                cd.typedef_targets.get("type_id")
+            {
+                if name.name.name.contains("registry") && type_args.len() >= 2 {
+                    if let ExprKind::StringLiteral(n) = &type_args[1].kind {
+                        if n == requested {
+                            // type_args[0] is the registered class.
+                            if let Some(tc) = Self::leaf_ident_name(&type_args[0]) {
+                                if let Some(c) = self.module.classes.get(&tc) {
+                                    return Some(c.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn instantiate_class_with_type_args(
@@ -31485,6 +33318,7 @@ impl Simulator {
         let mut instance = ClassInstance {
             class_name: class_def.name.clone(),
             properties: HashMap::default(),
+            type_bindings: HashMap::default(),
         };
         let mut classes_to_init = vec![class_def.clone()];
         let mut cur = class_def.extends.clone();
@@ -31571,6 +33405,35 @@ impl Simulator {
                 }
             }
         }
+        // Record concrete bindings for the leaf class's TYPE parameters
+        // (e.g. `T -> Base` for `Mk#(Base)`). A later unqualified `obj =
+        // new()` whose declared type is one of these params resolves through
+        // these bindings to construct the right class (see the `new` dispatch
+        // gated by `pure_sv_lrm`). Type and value params may be INTERLEAVED
+        // (e.g. `uvm_component_registry#(type T, string Tname)` — type first),
+        // so map each type param by its TRUE position in `param_order`, not by
+        // assuming type params follow the data params.
+        for tp_name in class_def.type_param_names.iter() {
+            // Position of this type param among ALL params (declaration order)
+            // = its slot in the positional `#(...)` type-arg list.
+            let pos = class_def
+                .param_order
+                .iter()
+                .position(|n| n == tp_name)
+                .unwrap_or_else(|| class_def.param_defaults.len()); // legacy fallback
+            if let Some(ta) = type_args.and_then(|ta| ta.get(pos)) {
+                if let Some(concrete) = Self::leaf_ident_name(ta) {
+                    // The type arg may itself be a type PARAMETER of the enclosing
+                    // parameterized context (`uvm_resource#(T)` where `T` is
+                    // config_db's own param) — resolve it to the concrete type so
+                    // the instance's binding is `T -> int`, not `T -> T`.
+                    let resolved = self
+                        .resolve_type_param_binding(&concrete)
+                        .unwrap_or(concrete);
+                    instance.type_bindings.insert(tp_name.clone(), resolved);
+                }
+            }
+        }
         self.heap.push(Some(instance));
         // Re-evaluate scalar property initializers against the live parameter
         // table and instance context, before the constructor runs (SV applies
@@ -31588,6 +33451,49 @@ impl Simulator {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             for (pname, init) in inits {
+                // A STATIC member is shared across all instances (it lives in
+                // `class_statics`, not per-instance), so it must NOT be
+                // re-initialized / re-allocated per instance. Doing so gave each
+                // `uvm_phase` instance its OWN `static mailbox m_phase_hopper`
+                // (a fresh handle) — so `execute_phase` (this=phase) put the next
+                // phase into a different mailbox than the one `m_run_phases`
+                // (this=null) was parked on, and the phaser stalled after the
+                // first phase. The static-init path (compile()) allocates the
+                // single shared instance once.
+                if cdef.static_properties.contains(&pname) {
+                    continue;
+                }
+                // A mailbox/semaphore member with an inline `= new()` must be
+                // ALLOCATED here. The `expr_contains_call` skip below leaves it
+                // null otherwise (the constructor has no explicit `mb = new()`),
+                // so try_put/get silently fail — this is exactly UVM's phaser
+                // `mailbox m_phase_hopper = new();`, whose breakage stalls the
+                // whole run-phase.
+                let cont_kind = cdef
+                    .properties
+                    .get(&pname)
+                    .and_then(|s| s.type_name.as_deref())
+                    .and_then(Self::container_base);
+                let is_new = matches!(&init.kind, ExprKind::Call { func, .. }
+                    if matches!(&func.kind, ExprKind::Ident(h)
+                        if h.path.len() == 1 && h.path[0].name.name == "new"));
+                if let (Some(kind), true) = (cont_kind, is_new) {
+                    let ch = self.heap.len();
+                    self.heap.push(Some(ClassInstance {
+                        class_name: kind.to_string(),
+                        properties: HashMap::default(),
+                        type_bindings: HashMap::default(),
+                    }));
+                    if kind == "semaphore" {
+                        self.semaphores.insert(ch, 0);
+                    } else {
+                        self.mailboxes.insert(ch, std::collections::VecDeque::new());
+                    }
+                    if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                        inst.properties.insert(pname, Value::from_u64(ch as u64, 32));
+                    }
+                    continue;
+                }
                 // Only re-evaluate side-effect-free initializers. Ones that call
                 // a function or constructor (`= new`, `= f()`) can recurse or
                 // mutate state and are the constructor's job; leave their
@@ -31607,13 +33513,41 @@ impl Simulator {
     }
 
     fn exec_method_call(&mut self, handle: usize, method_name: &str, args: &[Expression]) -> Value {
+        // PURE_SV_LRM: the real `uvm_factory::create_component_by_name` /
+        // `create_object_by_name` calls (on a real factory handle) reach here.
+        // The genuine factory's `m_type_names` is empty (per-spec registry
+        // registration isn't fully driven), so resolve the requested name to
+        // the concrete class via `pure_factory_lookup` and construct it — the
+        // real net effect (`wrapper.create_component` -> `T::new`).
+        if self.pure_sv_lrm
+            && matches!(method_name, "create_component_by_name" | "create_object_by_name")
+        {
+            let type_name = args
+                .first()
+                .map(|a| self.eval_expr(a).to_sv_string())
+                .unwrap_or_default();
+            if let Some(cd) = self.pure_factory_lookup(&type_name) {
+                let ctor_args: Vec<Expression> = if method_name == "create_component_by_name" {
+                    let mut v = Vec::new();
+                    if let Some(n) = args.get(2) { v.push(n.clone()); }
+                    if let Some(p) = args.get(3) { v.push(p.clone()); }
+                    v
+                } else {
+                    args.get(2).cloned().into_iter().collect()
+                };
+                let r = self.instantiate_class(&cd, &ctor_args);
+                self.return_value = Some(r.clone());
+                return r;
+            }
+        }
         // UVM field-op user-hook query. The UVM source errors (GET_USER_HOOK)
         // when m_is_set==0, which xezim hits because the field_op recycle pool
         // (m_get_available_op/m_recycle) reuses an op without re-running set()
         // before the query during the topology print's nested do_execute_op
         // recursion. The hook is enabled by default (m_user_hook=1 unless
         // disable_user_hook was called), so report enabled and skip the guard.
-        if method_name == "user_hook_enabled"
+        if !self.pure_sv_lrm
+            && method_name == "user_hook_enabled"
             && self
                 .heap
                 .get(handle)
@@ -31639,13 +33573,18 @@ impl Simulator {
         // Route-B phaser, so it returns empty. For a component in the live tree,
         // render the topology table ourselves (uvm_table_printer format) from the
         // component hierarchy. Non-component objects fall through to the source.
-        if method_name == "sprint" && self.uvm_components.contains(&handle) {
+        if !self.pure_sv_lrm
+            && method_name == "sprint"
+            && self.uvm_components.contains(&handle)
+        {
             let topo = self.render_uvm_topology(handle);
             return Value::from_string(&topo);
         }
         // UVM run-phase objection mechanism (also intercepted here for the
         // valid-receiver dispatch path; see handle_uvm_objection).
-        if matches!(method_name, "raise_objection" | "drop_objection" | "set_drain_time") {
+        if !self.pure_sv_lrm
+            && matches!(method_name, "raise_objection" | "drop_objection" | "set_drain_time")
+        {
             return self.handle_uvm_objection(method_name, args);
         }
         // `uvm_cmdline_processor` arg queries. UVM normally fills its arg list
@@ -32213,7 +34152,26 @@ impl Simulator {
             return;
         }
         self.uvm_post_run_done = true;
-        let comps = self.uvm_components.clone();
+        let mut comps = self.uvm_components.clone();
+        if comps.is_empty() {
+            // PURE_SV_LRM: the real UVM phaser builds components via the factory,
+            // not the route-B bootstrap that fills `uvm_components` — so collect
+            // every live uvm_component from the heap for the post-run phases
+            // (extract/check/report/final). Without this a pure run ended with an
+            // empty summary and no monitor `report_phase` (COLLECTED PACKETS).
+            for i in 1..self.heap.len() {
+                if let Some(cn) = self
+                    .heap
+                    .get(i)
+                    .and_then(|o| o.as_ref())
+                    .map(|inst| inst.class_name.clone())
+                {
+                    if self.class_is_a(&cn, "uvm_component") {
+                        comps.push(i);
+                    }
+                }
+            }
+        }
         // extract -> check -> report -> final (function phases). UVM orders
         // extract/check/report bottom-up and final top-down; the flat order is
         // adequate for the report/scoreboard summary.
@@ -34170,6 +36128,8 @@ impl Simulator {
                         }
                         _ => None,
                     };
+                    let ret_is_string = matches!(&method.kind,
+                        ClassMethodKind::Function(f) if Self::is_string_data_type(&f.return_type));
                     self.push_queue_frame();
                     // `output`/`inout`/`ref` formals copy back to the caller's
                     // actual on return (e.g. `randomize_instr(output riscv_instr
@@ -34206,7 +36166,44 @@ impl Simulator {
                         locals.insert(port.name.name.clone(), val);
                     }
                     if let Some(rn) = &fn_ret_name {
-                        locals.entry(rn.clone()).or_insert_with(|| Value::zero(32));
+                        // Initialise the implicit return variable to match its
+                        // declared type. A STRING return must start as an empty
+                        // string Value, not a 32-bit int — otherwise an implicit
+                        // `funcname = {a, "b", ...}` string-concat assignment
+                        // coerces to the int's 32-bit width and reads back empty
+                        // (uvm_default_report_server::compose_report_message uses
+                        // exactly this form, so its composed line came out blank).
+                        let init = if let ClassMethodKind::Function(f) = &method.kind {
+                            if Self::is_string_data_type(&f.return_type) {
+                                Value::from_string("")
+                            } else {
+                                Value::zero(32)
+                            }
+                        } else {
+                            Value::zero(32)
+                        };
+                        locals.entry(rn.clone()).or_insert(init);
+                        // Register the return variable's class type so an
+                        // implicit-return `funcname = new()` knows WHICH class to
+                        // construct — exactly as a typed local `T t = new()` does
+                        // (var_class_types is consulted when a bare `new()` has no
+                        // explicit class). Without this the bare `new()` can't
+                        // resolve its class and yields a broken instance whose
+                        // method calls bind the wrong `this`/params. This is the
+                        // `uvm_report_message::new_report_message` form
+                        // (`new_report_message = new(name)`); fixing it makes the
+                        // real report message's set_action/get_action persist so
+                        // the report-server `$display` fires natively.
+                        if let ClassMethodKind::Function(f) = &method.kind {
+                            if let crate::ast::types::DataType::TypeReference { name, .. } =
+                                &f.return_type
+                            {
+                                let cn = name.name.name.clone();
+                                if self.module.classes.contains_key(&cn) {
+                                    self.var_class_types.insert(rn.clone(), cn);
+                                }
+                            }
+                        }
                     }
                     // Mark string-typed return variable and params so `s[i]`
                     // does byte (character) indexing instead of bit-select.
@@ -34249,6 +36246,54 @@ impl Simulator {
                             }
                         }
                     }
+                    // PURE_SV_LRM §8.25: a `static` member of a parameterized
+                    // class is per-SPECIALIZATION. Reached from an INSTANCE method
+                    // (e.g. `uvm_resource#(T)::my_type` via `r.get_type_handle()->
+                    // get_type()`) there is no `#(spec)` on the call, so
+                    // `current_spec` is None and static_prop_key uses the shared
+                    // `Class::member` cell — while an explicit `Class#(spec)::member`
+                    // uses `Class#spec::member`. That made get_type() !=
+                    // get_type_handle(), breaking the resource-pool type match
+                    // (config_db GET). Seed current_spec from the instance's own
+                    // type bindings so both paths key the same per-spec cell. Sig =
+                    // the type params' bound leaf names in declaration order (the
+                    // parser now captures builtin type args as Ident leaf names, so
+                    // this matches extract_call_spec's type_args_text).
+                    let saved_spec = self.current_spec.clone();
+                    if self.pure_sv_lrm {
+                        if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
+                            let cn = inst.class_name.clone();
+                            let bindings = inst.type_bindings.clone();
+                            // Override the active spec with THIS instance's own
+                            // specialization when they differ by class — an
+                            // instance method of `uvm_resource#(int)` must key
+                            // uvm_resource's per-spec cell even when called while
+                            // an UNRELATED spec is active (e.g. the enclosing
+                            // `uvm_config_db#(int)`, whose base `uvm_config_db`
+                            // wouldn't match `uvm_resource` in static_prop_key and
+                            // would fall back to the shared unspec'd cell → the
+                            // get_type/get_type_handle mismatch that broke GET).
+                            let differs = self
+                                .current_spec
+                                .as_ref()
+                                .map_or(true, |(b, _)| *b != cn);
+                            if differs {
+                                if let Some(cd) = self.module.classes.get(&cn) {
+                                    if !cd.type_param_names.is_empty() && !bindings.is_empty() {
+                                        let sig = cd
+                                            .type_param_names
+                                            .iter()
+                                            .filter_map(|tp| bindings.get(tp).cloned())
+                                            .collect::<Vec<_>>()
+                                            .join(",");
+                                        if !sig.is_empty() {
+                                            self.current_spec = Some((cn, sig));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     self.this_stack.push(Some(handle));
                     self.local_stack.push(locals);
                     self.class_context_stack.push(Some(cname.clone()));
@@ -34259,13 +36304,28 @@ impl Simulator {
                             break;
                         }
                     }
+                    self.current_spec = saved_spec;
                     self.local_iface_aliases.pop();
                     self.break_flag = saved_break;
                     self.continue_flag = saved_continue;
                     self.return_flag = saved_return;
                     self.class_context_stack.pop();
                     let implicit = fn_ret_name.as_ref().and_then(|rn| {
-                        self.local_stack.last().and_then(|m| m.get(rn).cloned())
+                        let lv = self.local_stack.last().and_then(|m| m.get(rn).cloned());
+                        // A `funcname = {a, b, ...}` string-concat assignment is
+                        // serviced by the string-concat path, which writes the
+                        // result via set_signal_value_by_name (the SIGNAL store),
+                        // not the local frame — so a string return whose local is
+                        // still empty has its real value in the signal store
+                        // (this is uvm_default_report_server::compose_report_message,
+                        // whose composed line was coming back blank).
+                        if ret_is_string
+                            && lv.as_ref().map_or(true, |v| v.to_sv_string().is_empty())
+                        {
+                            self.get_signal_value_by_name(rn).or(lv)
+                        } else {
+                            lv
+                        }
                     });
                     let ret = self
                         .return_value
@@ -34705,7 +36765,10 @@ impl CombSettleCtx {
             SendCombItem::DirectCopy { dst_id, src_id, width } => {
                 let dst_w = self.signal_widths[*dst_id];
                 let mut handled = false;
-                if *width <= 64 && dst_w == *width {
+                // Inline raw-bit copy only when src and dst widths match;
+                // set_inline_bits does not mask, so narrowing must go through
+                // the resize branch below (pr2224949).
+                if *width <= 64 && dst_w == *width && self.signal_widths[*src_id] == *width {
                     let (sv, sx) = view[*src_id].raw_bits();
                     let (dv, dx) = view[*dst_id].raw_bits();
                     if sv == dv && sx == dx {

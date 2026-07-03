@@ -1162,8 +1162,20 @@ impl<'a> BytecodeCompiler<'a> {
                     // mis-evaluated the RHS. A genuinely non-constant `a**b`
                     // still bails (rare; preserves prior behavior).
                     BinaryOp::Power => {
-                        if let Some(v) = self.eval_const_expr(expr) {
-                            self.emit(Insn::LoadConst(dest, Box::new(Value::from_u64(v as u64, 32))));
+                        // Fold `**` to a constant (no runtime Pow insn). Compute
+                        // the result in u64 and load it at the expression's
+                        // natural width: `eval_const_expr` truncates to u32 and
+                        // the old `from_u64(v, 32)` truncated again, so 2**N for
+                        // N>=32 collapsed to 0 (e.g. 2**51 -> 0). (pr2865563)
+                        if let (Some(base), Some(exp)) =
+                            (self.eval_const_expr(left), self.eval_const_expr(right))
+                        {
+                            let mut result: u64 = 1;
+                            for _ in 0..(exp as u64).min(64) {
+                                result = result.wrapping_mul(base as u64);
+                            }
+                            let w = self.expr_max_width(expr).max(ctx_width).max(1);
+                            self.emit(Insn::LoadConst(dest, Box::new(Value::from_u64(result, w))));
                         } else {
                             self.bail("power_nonconst");
                             return None;
