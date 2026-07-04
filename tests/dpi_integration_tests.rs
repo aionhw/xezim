@@ -17,9 +17,13 @@ fn unique_so_path(stem: &str) -> PathBuf {
 fn compile_dpi_lib(c_file: &str, stem: &str) -> PathBuf {
     let c_path = manifest_path(c_file);
     let so_path = unique_so_path(stem);
+    // Include the xezim root dir for vpi_user.h and svdpi.h
+    let include_dir = manifest_path("");
     let status = Command::new("cc")
         .arg("-shared")
         .arg("-fPIC")
+        .arg("-I")
+        .arg(&include_dir)
         .arg(&c_path)
         .arg("-o")
         .arg(&so_path)
@@ -104,5 +108,17 @@ fn dpi_open_array_test() {
         "tests/dpi/open_array_dpi.c",
         "open_array_dpi",
         "tests/dpi/open_array_dpi_test.sv",
+    );
+}
+
+#[test]
+fn dpi_vpi_backdoor_compliance_test() {
+    let so = compile_dpi_lib("tests/dpi/vpi_backdoor_compliance.c", "vpi_backdoor_compliance");
+    let log = run_xezim_with_dpi(&so, "tests/dpi/vpi_backdoor_compliance.sv");
+    // The vpi_backdoor_compliance test outputs "RESULT: PASSED" not "TEST_PASS"
+    assert!(
+        log.contains("RESULT: PASSED"),
+        "missing RESULT: PASSED for vpi_backdoor_compliance:\n{}",
+        log
     );
 }

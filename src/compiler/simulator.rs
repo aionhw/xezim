@@ -184,34 +184,37 @@ macro_rules! write_sig {
     ($self:ident, $id:expr, $val:expr) => {{
         let __wsig_id = $id;
         let __wsig_val = $val;
-        if __wsig_id < $self.signal_has_xz.len() {
-            $self.signal_has_xz[__wsig_id] =
-                if __wsig_val.raw_bits().1 != 0 { 1u8 } else { 0u8 };
-        }
-        // JIT-redesign Stage 1 maintenance: keep signal_inline_bits in
-        // sync with signal_table for the future JIT codegen path that
-        // reads values by direct pointer offset.  Zero overhead when
-        // signal_inline_bits is empty (default; allocated only when
-        // XEZIM_INLINE_BITS=1).
-        if __wsig_id < $self.signal_inline_bits.len() {
-            let (__wsig_v, __wsig_x) = __wsig_val.raw_bits();
-            $self.signal_inline_bits[__wsig_id] = [__wsig_v, __wsig_x];
-        }
-        $self.signal_table[__wsig_id] = __wsig_val;
-        // O1 measurement: stamp the signal's last-change phase.
-        if $self.event_measure && __wsig_id < $self.sig_last_change.len() {
-            $self.sig_last_change[__wsig_id] = $self.event_phase;
-        }
-        // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
-        // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
-        // the borrow stays a direct field access in macro-expanded contexts.
-        if ($self.dirty_edge || $self.dirty_edge_shadow)
-            && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
-        {
-            let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
-            if __ep >= 0 && !$self.edge_pos_seen[__ep as usize] {
-                $self.edge_pos_seen[__ep as usize] = true;
-                $self.changed_edge_pos.push(__ep as usize);
+        // LRM §9.3.1: skip writes to forced signals.
+        if !$self.forced_signals.contains_key(&__wsig_id) {
+            if __wsig_id < $self.signal_has_xz.len() {
+                $self.signal_has_xz[__wsig_id] =
+                    if __wsig_val.raw_bits().1 != 0 { 1u8 } else { 0u8 };
+            }
+            // JIT-redesign Stage 1 maintenance: keep signal_inline_bits in
+            // sync with signal_table for the future JIT codegen path that
+            // reads values by direct pointer offset.  Zero overhead when
+            // signal_inline_bits is empty (default; allocated only when
+            // XEZIM_INLINE_BITS=1).
+            if __wsig_id < $self.signal_inline_bits.len() {
+                let (__wsig_v, __wsig_x) = __wsig_val.raw_bits();
+                $self.signal_inline_bits[__wsig_id] = [__wsig_v, __wsig_x];
+            }
+            $self.signal_table[__wsig_id] = __wsig_val;
+            // O1 measurement: stamp the signal's last-change phase.
+            if $self.event_measure && __wsig_id < $self.sig_last_change.len() {
+                $self.sig_last_change[__wsig_id] = $self.event_phase;
+            }
+            // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
+            // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
+            // the borrow stays a direct field access in macro-expanded contexts.
+            if ($self.dirty_edge || $self.dirty_edge_shadow)
+                && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
+            {
+                let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
+                if __ep >= 0 && !$self.edge_pos_seen[__ep as usize] {
+                    $self.edge_pos_seen[__ep as usize] = true;
+                    $self.changed_edge_pos.push(__ep as usize);
+                }
             }
         }
     }};
@@ -1204,6 +1207,10 @@ enum DpiArgKind {
     OpenArrayI32Out,
     VecLogicIn(u32),
     VecLogicOut(u32),
+    /// 2-state packed vector (`bit [N]`) passed as plain `uint32_t*`
+    /// (svBitVecVal*). ABI differs from VecLogicIn: no bval field.
+    VecBitIn(u32),
+    VecBitOut(u32),
 }
 
 struct DpiBinding {
@@ -1359,6 +1366,8 @@ impl Phase2Profile {
 
 pub struct Simulator {
     pub signals: HashMap<String, Value>,
+    /// Signals currently under force/release control (LRM §9.3.1).
+    forced_signals: HashMap<usize, Value>,
     /// Fast signal table: indexed by signal_id for O(1) access.
     signal_table: Vec<Value>,
     /// Parallel array: 1 byte per signal_id, non-zero iff that signal
@@ -2899,6 +2908,7 @@ impl Simulator {
             widths,
             signed_signals,
             real_signals,
+            forced_signals: HashMap::default(),
             signal_has_xz: signal_has_xz_init,
             signal_inline_bits: Vec::new(),
             jit_nba_side_queue: Vec::new(),
@@ -4627,7 +4637,7 @@ impl Simulator {
                     DpiArgKind::Int64In
                 }),
             },
-            DataType::IntegerVector { dimensions, .. } => {
+            DataType::IntegerVector { kind, dimensions, .. } => {
                 if dimensions.is_empty() {
                     Some(if out_dir {
                         DpiArgKind::Int32Out
@@ -4647,10 +4657,21 @@ impl Simulator {
                             DpiArgKind::Int64In
                         })
                     } else {
+                        // 2-state `bit` -> svBitVecVal* (just uint32_t*).
+                        // 4-state `logic`/`reg` -> svLogicVecVal* ({aval, bval}*).
+                        let is_2state = matches!(kind, crate::ast::types::IntegerVectorType::Bit);
                         Some(if out_dir {
-                            DpiArgKind::VecLogicOut(w)
+                            if is_2state {
+                                DpiArgKind::VecBitOut(w)
+                            } else {
+                                DpiArgKind::VecLogicOut(w)
+                            }
                         } else {
-                            DpiArgKind::VecLogicIn(w)
+                            if is_2state {
+                                DpiArgKind::VecBitIn(w)
+                            } else {
+                                DpiArgKind::VecLogicIn(w)
+                            }
                         })
                     }
                 }
@@ -4827,6 +4848,8 @@ impl Simulator {
                 DpiArgKind::OpenArrayI32Out => Type::pointer(),
                 DpiArgKind::VecLogicIn(_) => Type::pointer(),
                 DpiArgKind::VecLogicOut(_) => Type::pointer(),
+                DpiArgKind::VecBitIn(_) => Type::pointer(),
+                DpiArgKind::VecBitOut(_) => Type::pointer(),
             })
             .collect();
         let ret_type = match ret {
@@ -4998,6 +5021,7 @@ impl Simulator {
             self.try_bind_dpi(sv_name, &spec);
         }
         if self.dpi_unsupported.contains(sv_name) {
+            ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
             return Some(Value::zero(32));
         }
         let Some(binding) = self.dpi_bindings.get(sv_name) else {
@@ -5007,6 +5031,7 @@ impl Simulator {
                     sv_name, spec.c_name
                 );
             }
+            ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
             return Some(Value::zero(32));
         };
         let ret_kind = binding.ret;
@@ -5015,17 +5040,20 @@ impl Simulator {
         let fn_ptr = binding.fn_ptr;
 
         let mut arg_refs = Vec::with_capacity(arg_kinds.len());
-        let mut i32_vals: Vec<Box<i32>> = Vec::new();
-        let mut i64_vals: Vec<Box<i64>> = Vec::new();
-        let mut f32_vals: Vec<Box<f32>> = Vec::new();
-        let mut f64_vals: Vec<Box<f64>> = Vec::new();
-        let mut ptr_vals: Vec<Box<*mut c_void>> = Vec::new();
-        let mut string_ptr_cells: Vec<Box<*const i8>> = Vec::new();
-        let mut open_i32_vals: Vec<Vec<i32>> = Vec::new();
-        let mut cstrings: Vec<CString> = Vec::new();
-        let mut logic_aval: Vec<Vec<u32>> = Vec::new();
-        let mut logic_bval: Vec<Vec<u32>> = Vec::new();
-        let mut logic_hdrs: Vec<Box<DpiLogicVecVal>> = Vec::new();
+        let mut i32_vals: Vec<Box<i32>> = Vec::with_capacity(arg_kinds.len());
+        let mut i64_vals: Vec<Box<i64>> = Vec::with_capacity(arg_kinds.len());
+        let mut f32_vals: Vec<Box<f32>> = Vec::with_capacity(arg_kinds.len());
+        let mut f64_vals: Vec<Box<f64>> = Vec::with_capacity(arg_kinds.len());
+        // CRITICAL: ptr_vals, logic_aval, logic_bval must never reallocate
+        // after the loop, because arg_refs holds references into their Box
+        // contents. Pre-allocate capacity to prevent mid-loop reallocation.
+        let mut ptr_vals: Vec<Box<*mut c_void>> = Vec::with_capacity(arg_kinds.len());
+        let mut string_ptr_cells: Vec<Box<*const i8>> = Vec::with_capacity(arg_kinds.len());
+        let mut open_i32_vals: Vec<Vec<i32>> = Vec::with_capacity(arg_kinds.len());
+        let mut cstrings: Vec<CString> = Vec::with_capacity(arg_kinds.len());
+        let mut logic_aval: Vec<Vec<u32>> = Vec::with_capacity(arg_kinds.len());
+        let mut logic_bval: Vec<Vec<u32>> = Vec::with_capacity(arg_kinds.len());
+        let mut logic_hdrs: Vec<Box<DpiLogicVecVal>> = Vec::with_capacity(arg_kinds.len());
         let mut writebacks: Vec<(usize, DpiArgKind, Expression)> = Vec::new();
 
         for (i, kind) in arg_kinds.iter().enumerate() {
@@ -5146,15 +5174,17 @@ impl Simulator {
                         .map(|e| self.eval_expr(e))
                         .unwrap_or_else(|| Value::zero(*width));
                     let (mut aval, mut bval) = Self::dpi_value_to_logic_words(&vv, *width);
+                    // CRITICAL: store in Vec FIRST, then capture pointer.
+                    // Otherwise Vec push may reallocate, invalidating the pointer.
+                    logic_aval.push(aval);
+                    logic_bval.push(bval);
                     let hdr = Box::new(DpiLogicVecVal {
-                        aval: aval.as_mut_ptr(),
-                        bval: bval.as_mut_ptr(),
+                        aval: logic_aval.last_mut().unwrap().as_mut_ptr(),
+                        bval: logic_bval.last_mut().unwrap().as_mut_ptr(),
                     });
                     let p = Box::new(
                         (&*hdr as *const DpiLogicVecVal as *mut DpiLogicVecVal).cast::<c_void>(),
                     );
-                    logic_aval.push(aval);
-                    logic_bval.push(bval);
                     logic_hdrs.push(hdr);
                     ptr_vals.push(p);
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
@@ -5165,20 +5195,51 @@ impl Simulator {
                         .map(|e| self.eval_expr(e))
                         .unwrap_or_else(|| Value::zero(*width));
                     let (mut aval, mut bval) = Self::dpi_value_to_logic_words(&init, *width);
+                    // CRITICAL: store in Vec FIRST, then capture pointer (see VecLogicIn).
+                    logic_aval.push(aval);
+                    logic_bval.push(bval);
                     let hdr = Box::new(DpiLogicVecVal {
-                        aval: aval.as_mut_ptr(),
-                        bval: bval.as_mut_ptr(),
+                        aval: logic_aval.last_mut().unwrap().as_mut_ptr(),
+                        bval: logic_bval.last_mut().unwrap().as_mut_ptr(),
                     });
                     let p = Box::new(
                         (&*hdr as *const DpiLogicVecVal as *mut DpiLogicVecVal).cast::<c_void>(),
                     );
-                    logic_aval.push(aval);
-                    logic_bval.push(bval);
                     logic_hdrs.push(hdr);
                     ptr_vals.push(p);
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                     if let Some(expr) = args.get(i) {
                         writebacks.push((logic_hdrs.len() - 1, *kind, expr.clone()));
+                    }
+                }
+                DpiArgKind::VecBitIn(width) => {
+                    // 2-state `bit [N]` -> svBitVecVal* (just uint32_t*).
+                    // ABI differs from VecLogicIn: no bval field.
+                    let vv = args
+                        .get(i)
+                        .map(|e| self.eval_expr(e))
+                        .unwrap_or_else(|| Value::zero(*width));
+                    let (aval, _bval) = Self::dpi_value_to_logic_words(&vv, *width);
+                    // Store in a dedicated Vec<Vec<u32>> to keep storage stable.
+                    logic_aval.push(aval);
+                    let raw_ptr = logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>();
+                    // Put the actual data pointer (not a pointer-to-pointer) in the Box.
+                    ptr_vals.push(Box::new(raw_ptr));
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                }
+                DpiArgKind::VecBitOut(width) => {
+                    let init = args
+                        .get(i)
+                        .map(|e| self.eval_expr(e))
+                        .unwrap_or_else(|| Value::zero(*width));
+                    let (aval, _bval) = Self::dpi_value_to_logic_words(&init, *width);
+                    logic_aval.push(aval);
+                    let p = Box::new(logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>());
+                    ptr_vals.push(p);
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    if let Some(expr) = args.get(i) {
+                        // Track which logical_aval slot to read back.
+                        writebacks.push((logic_aval.len() - 1, *kind, expr.clone()));
                     }
                 }
                 DpiArgKind::Int32Out => {
@@ -5254,6 +5315,10 @@ impl Simulator {
                 }
             }
         }
+
+        // Set active simulator for VPI callbacks
+        let self_ptr = self as *mut Simulator;
+        ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
 
         let mut result = match ret_kind {
             DpiRetKind::Void => {
@@ -5355,6 +5420,18 @@ impl Simulator {
                         self.assign_value(&expr, &out.resize(w));
                     }
                 }
+                DpiArgKind::VecBitOut(width) => {
+                    if idx < logic_aval.len() {
+                        // 2-state: only aval, no bval
+                        let out = Self::dpi_logic_words_to_value(
+                            &logic_aval[idx],
+                            &[],
+                            width,
+                        );
+                        let w = self.infer_lhs_width(&expr);
+                        self.assign_value(&expr, &out.resize(w));
+                    }
+                }
                 _ => {}
             }
         }
@@ -5363,6 +5440,8 @@ impl Simulator {
             // No side effects expected; kept for future optimization hooks.
             let _ = &mut result;
         }
+        // Clear active simulator after DPI call
+        ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
         Some(result)
     }
 
@@ -6572,39 +6651,45 @@ impl Simulator {
         match &self.comb_entries[eidx].item {
             CombItem::Noop => true,
             CombItem::FastDirectCopy { dst_id, src_id } => {
-                let (sv, sx) = view[*src_id].raw_bits();
-                let (dv, dx) = view[*dst_id].raw_bits();
-                if (sv != dv || sx != dx) && view[*dst_id].set_inline_bits(sv, sx) {
-                    dirtied.push(*dst_id as u32);
+                // LRM §9.3.1: skip if the destination is forced
+                if !self.forced_signals.contains_key(dst_id) {
+                    let (sv, sx) = view[*src_id].raw_bits();
+                    let (dv, dx) = view[*dst_id].raw_bits();
+                    if (sv != dv || sx != dx) && view[*dst_id].set_inline_bits(sv, sx) {
+                        dirtied.push(*dst_id as u32);
+                    }
                 }
                 true
             }
             CombItem::DirectCopy { dst_id, src_id, width } => {
-                let dst_w = self.signal_widths[*dst_id];
-                let mut handled = false;
-                // Inline raw-bit copy only when src and dst widths match;
-                // set_inline_bits does not mask, so narrowing must go through
-                // the resize branch below (pr2224949).
-                if *width <= 64 && dst_w == *width && self.signal_widths[*src_id] == *width {
-                    let (sv, sx) = view[*src_id].raw_bits();
-                    let (dv, dx) = view[*dst_id].raw_bits();
-                    if sv == dv && sx == dx {
-                        handled = true;
-                    } else if view[*dst_id].set_inline_bits(sv, sx) {
-                        dirtied.push(*dst_id as u32);
-                        handled = true;
+                // LRM §9.3.1: skip if the destination is forced
+                if !self.forced_signals.contains_key(dst_id) {
+                    let dst_w = self.signal_widths[*dst_id];
+                    let mut handled = false;
+                    // Inline raw-bit copy only when src and dst widths match;
+                    // set_inline_bits does not mask, so narrowing must go through
+                    // the resize branch below (pr2224949).
+                    if *width <= 64 && dst_w == *width && self.signal_widths[*src_id] == *width {
+                        let (sv, sx) = view[*src_id].raw_bits();
+                        let (dv, dx) = view[*dst_id].raw_bits();
+                        if sv == dv && sx == dx {
+                            handled = true;
+                        } else if view[*dst_id].set_inline_bits(sv, sx) {
+                            dirtied.push(*dst_id as u32);
+                            handled = true;
+                        }
                     }
-                }
-                if !handled {
-                    let src_val = view[*src_id].clone();
-                    let resized = if src_val.width != *width {
-                        src_val.resize(*width)
-                    } else {
-                        src_val
-                    };
-                    if view[*dst_id] != resized {
-                        view[*dst_id] = resized;
-                        dirtied.push(*dst_id as u32);
+                    if !handled {
+                        let src_val = view[*src_id].clone();
+                        let resized = if src_val.width != *width {
+                            src_val.resize(*width)
+                        } else {
+                            src_val
+                        };
+                        if view[*dst_id] != resized {
+                            view[*dst_id] = resized;
+                            dirtied.push(*dst_id as u32);
+                        }
                     }
                 }
                 true
@@ -17781,30 +17866,33 @@ impl Simulator {
                 match &entries[eidx].item {
                     CombItem::Noop => {}
                     CombItem::FastDirectCopy { dst_id, src_id } => {
-                        let (sv, sx) = self.signal_table[*src_id].raw_bits();
-                        let (dv, dx) = self.signal_table[*dst_id].raw_bits();
-                        if (sv != dv || sx != dx)
-                            && self.signal_table[*dst_id].set_inline_bits(sv, sx)
-                        {
-                            self.table_modified = true;
-                            self.after_signal_write(*dst_id);
-                            if self.activity_mon {
-                                if self.signal_toggle_counts.len() != self.signal_table.len() {
-                                    self.signal_toggle_counts.resize(self.signal_table.len(), 0);
+                        // LRM §9.3.1: skip if the destination is forced
+                        if !self.forced_signals.contains_key(dst_id) {
+                            let (sv, sx) = self.signal_table[*src_id].raw_bits();
+                            let (dv, dx) = self.signal_table[*dst_id].raw_bits();
+                            if (sv != dv || sx != dx)
+                                && self.signal_table[*dst_id].set_inline_bits(sv, sx)
+                            {
+                                self.table_modified = true;
+                                self.after_signal_write(*dst_id);
+                                if self.activity_mon {
+                                    if self.signal_toggle_counts.len() != self.signal_table.len() {
+                                        self.signal_toggle_counts.resize(self.signal_table.len(), 0);
+                                    }
+                                    self.signal_toggle_counts[*dst_id] += 1;
                                 }
-                                self.signal_toggle_counts[*dst_id] += 1;
-                            }
-                            if *dst_id + 1 < dep_offsets.len() {
-                                let lo = dep_offsets[*dst_id] as usize;
-                                let hi = dep_offsets[*dst_id + 1] as usize;
-                                for &dep_eidx_u32 in &dep_entries[lo..hi] {
-                                    let dep_eidx = dep_eidx_u32 as usize;
-                                    if !self.settle_triggered[dep_eidx] {
-                                        self.settle_triggered[dep_eidx] = true;
-                                        if dep_eidx > eidx {
-                                            cur_list.push(dep_eidx);
-                                        } else {
-                                            self.settle_triggered_list.push(dep_eidx);
+                                if *dst_id + 1 < dep_offsets.len() {
+                                    let lo = dep_offsets[*dst_id] as usize;
+                                    let hi = dep_offsets[*dst_id + 1] as usize;
+                                    for &dep_eidx_u32 in &dep_entries[lo..hi] {
+                                        let dep_eidx = dep_eidx_u32 as usize;
+                                        if !self.settle_triggered[dep_eidx] {
+                                            self.settle_triggered[dep_eidx] = true;
+                                            if dep_eidx > eidx {
+                                                cur_list.push(dep_eidx);
+                                            } else {
+                                                self.settle_triggered_list.push(dep_eidx);
+                                            }
                                         }
                                     }
                                 }
@@ -23978,10 +24066,17 @@ impl Simulator {
             StatementKind::ProceduralContinuous(pc) => match pc {
                 ProceduralContinuous::Assign { lvalue, rvalue }
                 | ProceduralContinuous::Force { lvalue, rvalue } => {
+                    // LRM §9.3.1: force/assign inserts into forced_signals and
+                    // updates the signal regardless of comb drivers.
                     let v = self.eval_expr(rvalue);
                     self.assign_value(lvalue, &v);
                 }
-                _ => {}
+                ProceduralContinuous::Release(_lvalue)
+                | ProceduralContinuous::Deassign(_lvalue) => {
+                    // Native force/release from SystemVerilog code: 
+                    // mark all comb entries as dirty so they re-evaluate.
+                    self.dirty_any = true;
+                }
             },
             StatementKind::VarDecl {
                 data_type,
@@ -37003,4 +37098,266 @@ impl SendExecContext {
     pub fn signal_count(&self) -> usize {
         self.signal_widths.len()
     }
+}
+
+// ============================================================================
+// VPI (Verification Procedural Interface) Support
+// ============================================================================
+
+// VPI types matching vpi_user.h
+#[repr(C)]
+struct s_vpi_vecval {
+    aval: u32,
+    bval: u32,
+}
+
+#[repr(C)]
+union s_vpi_value_union {
+    integer: libc::c_int,
+    real: libc::c_double,
+    time: u64,
+    str: *mut libc::c_char,
+    vector: *mut s_vpi_vecval,
+    scalar: u32,
+    longint: i64,
+}
+
+#[repr(C)]
+struct s_vpi_value {
+    format: libc::c_int,
+    value: s_vpi_value_union,
+}
+
+#[repr(C)]
+struct s_vpi_time {
+    type_: libc::c_int,
+    high: u32,
+    low: u32,
+    real: libc::c_double,
+}
+
+/// Thread-local pointer to the current simulator instance.
+/// Set during DPI import calls so VPI C callbacks can access it.
+thread_local! {
+    static ACTIVE_SIMULATOR: std::cell::Cell<*mut Simulator> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// Wrapper for VPI handles stored as raw pointers.
+#[repr(C)]
+struct VpiHandle {
+    signal_id: usize,
+}
+
+/// Execute a callback with access to the active simulator.
+fn with_active_sim<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut Simulator) -> R,
+{
+    let sim_ptr = ACTIVE_SIMULATOR.with(|cell| cell.get());
+    if sim_ptr.is_null() {
+        panic!("[VPI] No active simulator - VPI call outside DPI context?");
+    }
+    f(unsafe { &mut *sim_ptr })
+}
+
+/// Get signal ID by hierarchical name.
+#[no_mangle]
+pub extern "C" fn vpi_handle_by_name(
+    name: *mut libc::c_char,
+    _scope: *mut libc::c_void,
+) -> *mut libc::c_void {
+    if name.is_null() {
+        return std::ptr::null_mut();
+    }
+    let full_name = unsafe { std::ffi::CStr::from_ptr(name) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+
+    with_active_sim(|sim| {
+        // Try full name first
+        if let Some(&id) = sim.signal_name_to_id.get(full_name.as_str()) {
+            let handle = Box::into_raw(Box::new(VpiHandle { signal_id: id }));
+            return handle as *mut libc::c_void;
+        }
+        // Try stripping module prefix
+        if let Some(dot_pos) = full_name.rfind('.') {
+            let short_name = &full_name[dot_pos + 1..];
+            if let Some(&id) = sim.signal_name_to_id.get(short_name) {
+                let handle = Box::into_raw(Box::new(VpiHandle { signal_id: id }));
+                return handle as *mut libc::c_void;
+            }
+        }
+        std::ptr::null_mut()
+    })
+}
+
+/// Free a VPI handle.
+#[no_mangle]
+pub extern "C" fn vpi_free_object(handle: *mut libc::c_void) -> libc::c_int {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle as *mut VpiHandle) });
+    }
+    0
+}
+
+/// Get a VPI property value.
+#[no_mangle]
+pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> libc::c_int {
+    if handle.is_null() {
+        return 0;
+    }
+    let h = unsafe { &*(handle as *const VpiHandle) };
+    let sig_id = h.signal_id;
+    with_active_sim(|sim| {
+        match property {
+            1 /* vpiType */ => 31 /* vpiReg */,
+            4 /* vpiSize */ => sim.signal_widths.get(sig_id).copied().unwrap_or(32) as libc::c_int,
+            _ => 0,
+        }
+    })
+}
+
+/// Read a signal value via VPI.
+#[no_mangle]
+pub extern "C" fn vpi_get_value(
+    handle: *mut libc::c_void,
+    value_p: *mut s_vpi_value,
+) -> *mut libc::c_void {
+    if handle.is_null() || value_p.is_null() {
+        return std::ptr::null_mut();
+    }
+    with_active_sim(|sim| {
+        let h = unsafe { &*(handle as *const VpiHandle) };
+        let sig_id = h.signal_id;
+        let vp = unsafe { &mut *value_p };
+
+        let val = if sig_id < sim.signal_table.len() {
+            &sim.signal_table[sig_id]
+        } else {
+            return std::ptr::null_mut();
+        };
+
+        match vp.format {
+            10 /* vpiIntVal */ => {
+                vp.value.integer = val.to_i64().unwrap_or(0) as libc::c_int;
+            }
+            6 /* vpiRealVal */ => {
+                vp.value.real = val.to_f64();
+            }
+            _ => {}
+        }
+        std::ptr::null_mut()
+    })
+}
+
+// VPI value format constants
+const VPI_FORCE_FLAG: libc::c_int = 4;       // vpiForceFlag
+const VPI_RELEASE_FLAG: libc::c_int = 5;     // vpiReleaseFlag
+
+/// Write a signal value via VPI (supports force/release).
+#[no_mangle]
+pub extern "C" fn vpi_put_value(
+    handle: *mut libc::c_void,
+    value_p: *mut s_vpi_value,
+    _time_p: *mut s_vpi_time,
+    flags: libc::c_int,
+) -> *mut libc::c_void {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    with_active_sim(|sim| {
+        let h = unsafe { &*(handle as *const VpiHandle) };
+        let sig_id = h.signal_id;
+
+        if flags == VPI_RELEASE_FLAG {
+            // Release: remove from forced_signals and trigger settle
+            sim.forced_signals.remove(&sig_id);
+            // Find comb entries that write to this signal and add their source
+            // signals to dirty_list. This ensures settle sees the source as dirty
+            // and triggers the comb entry through the dep_entries mechanism.
+            for entry in sim.comb_entries.iter() {
+                if entry.write_signal_ids.contains(&sig_id) {
+                    for &src_id in &entry.read_signal_ids {
+                        if src_id < sim.dirty_signals.len() && !sim.dirty_signals[src_id] {
+                            sim.dirty_signals[src_id] = true;
+                            sim.dirty_list.push(src_id);
+                        }
+                    }
+                }
+            }
+            sim.dirty_any = true;
+            return std::ptr::null_mut();
+        }
+
+        let value = if !value_p.is_null() {
+            let vp = unsafe { &*value_p };
+            match vp.format {
+                10 /* vpiIntVal */ => {
+                    let ival = unsafe { vp.value.integer } as i64;
+                    let w = sim.signal_widths.get(sig_id).copied().unwrap_or(32);
+                    let mut v = Value::from_u64(ival as u64, w);
+                    v.is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
+                    v
+                }
+                6 /* vpiRealVal */ => Value::from_f64(unsafe { vp.value.real }),
+                7 /* vpiVectorVal */ => {
+                    // Read vector value (for wide signals up to 128 bits)
+                    let w = sim.signal_widths.get(sig_id).copied().unwrap_or(32);
+                    let vec_ptr = unsafe { vp.value.vector };
+                    if !vec_ptr.is_null() && w > 64 {
+                        let num_words = ((w + 31) / 32) as usize;
+                        let vec = unsafe { std::slice::from_raw_parts(vec_ptr, num_words) };
+                        // Combine aval/bval into a u128
+                        let mut val128: u128 = 0;
+                        for (i, vv) in vec.iter().enumerate().take(4) {
+                            // Use only non-X/non-Z bits (a AND NOT b)
+                            let bits = vv.aval & !vv.bval;
+                            val128 |= (bits as u128) << (i as u128 * 32);
+                        }
+                        let mut v = Value::from_u128(val128, w);
+                        v.is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
+                        v
+                    } else if !vec_ptr.is_null() {
+                        let num_words = ((w + 31) / 32) as usize;
+                        let vec = unsafe { std::slice::from_raw_parts(vec_ptr, num_words) };
+                        let mut v = Value::from_u64(vec[0].aval as u64, w);
+                        v.is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
+                        v
+                    } else {
+                        Value::zero(w)
+                    }
+                }
+                _ => {
+                    // Default: read current value
+                    sim.signal_table.get(sig_id).cloned().unwrap_or_else(|| Value::zero(32))
+                }
+            }
+        } else {
+            sim.signal_table.get(sig_id).cloned().unwrap_or_else(|| Value::zero(32))
+        };
+
+        // For force: write value first, THEN add to forced_signals
+        if flags == VPI_FORCE_FLAG {
+            // Write directly to signal_table (bypass write_sig! which would skip)
+            if sig_id < sim.signal_table.len() {
+                sim.signal_table[sig_id] = value.clone();
+                if sig_id < sim.signal_has_xz.len() {
+                    sim.signal_has_xz[sig_id] = if value.raw_bits().1 != 0 { 1u8 } else { 0u8 };
+                }
+                if sig_id < sim.signal_inline_bits.len() {
+                    let (v, x) = value.raw_bits();
+                    sim.signal_inline_bits[sig_id] = [v, x];
+                }
+            }
+            // Now mark as forced (after the write succeeded)
+            sim.forced_signals.insert(sig_id, value);
+        } else {
+            // Normal write - write_sig! will skip if signal is forced
+            write_sig!(sim, sig_id, value);
+        }
+
+        std::ptr::null_mut()
+    })
 }
