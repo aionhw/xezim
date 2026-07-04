@@ -16,7 +16,7 @@ wire the SystemVerilog side to it.
 
 ```bash
 # xezim/tests/dpi/simple_dpi.c  ->  simple_dpi.so
-cc -shared -fPIC -I path/to/xezim simple_dpi.c -o simple_dpi.so
+cc -shared -fPIC -I path/to/xezim/include simple_dpi.c -o simple_dpi.so
 
 # Run
 xezim --dpi-lib ./simple_dpi.so simple_dpi_test.sv
@@ -41,8 +41,10 @@ The minimum is:
 | The `.so` / `.dylib` / `.dll` itself | You build it (this guide) |
 | `import "DPI-C" function …` declarations | Inside your SV source |
 | The matching exported C symbols | The `.so` |
-| (Optional) `svdpi.h` for type/macro helpers | xezim ships it at `<repo>/svdpi.h` |
-| (Optional) `vpi_user.h` for VPI calls | xezim ships it at `<repo>/vpi_user.h` |
+| (Optional) `svdpi.h` for type/macro helpers | xezim ships it at `<repo>/include/svdpi.h` |
+| (Optional) `vpi_user.h` for VPI calls | xezim ships it at `<repo>/include/vpi_user.h` |
+| (Optional) `sv_vpi_user.h` for 4-state vectors and SV scope primitives | xezim ships it at `<repo>/include/sv_vpi_user.h` |
+| (Optional) `veriuser.h` for legacy PLI v1.0 typedefs | xezim ships it at `<repo>/include/veriuser.h` |
 
 The two headers are **minimal** — they're enough for the test suite and for the
 non-vendor DPI subset used by Accellera UVM (`uvm_core/src/dpi/`). They're not a full
@@ -65,8 +67,12 @@ installing a vendor simulator first:
   `vpiModule` / `vpiReg` / `vpiMemory` type codes, etc.). Used by the
   HDL-backdoor family of DPI exports (`vpi_backdoor_compliance.c`).
 
-The canonical include incantation is `-I <path/to/xezim>` so both headers are
-found by their unqualified `#include "svdpi.h"` / `#include "vpi_user.h"`.
+The canonical include incantation is `-I <path/to/xezim/include>` so all four
+headers are found by their unqualified `#include "svdpi.h"` /
+`#include "vpi_user.h"` / `#include "sv_vpi_user.h"` /
+`#include "veriuser.h"`. The `include/` subdirectory keeps them separate
+from xezim's own source tree so a wide `-I path/to/xezim/include` can't accidentally
+shadow anything else.
 
 ---
 
@@ -120,7 +126,7 @@ This is the exact recipe used by
 Same flags, swap the compiler and add `-std=c++17` (or whatever you need):
 
 ```bash
-g++ -shared -fPIC -std=c++17 -I path/to/xezim dpi_module.cc -o dpi_module.so
+g++ -shared -fPIC -std=c++17 -I path/to/xezim/include dpi_module.cc -o dpi_module.so
 ```
 
 The `extern "C"` wrapper that surrounds your `import "DPI-C"` implementations is the
@@ -144,11 +150,11 @@ in the upstream kit — the consumer compiles them. The recipe is just:
 # All C files compile as C, all .cc files as C++.
 # Link them all into one .so.
 
-cc  -shared -fPIC -I path/to/xezim \
+cc  -shared -fPIC -I path/to/xezim/include \
     uvm_common.c uvm_hdl.c uvm_svcmd_dpi.c uvm_hdl_polling.c \
     -c -o uvm_c.o
 
-g++ -shared -fPIC -std=c++17 -fno-inline -I path/to/xezim \
+g++ -shared -fPIC -std=c++17 -fno-inline -I path/to/xezim/include \
     -I path/to/uvm-core/src/dpi \
     uvm_dpi.cc uvm_regex.cc \
     -c -o uvm_cc.o    # only if you don't use uvm_dpi.cc's own #include chain
@@ -160,15 +166,43 @@ g++ -shared -fPIC \
 ```
 
 > **Practical note:** `uvm_dpi.cc` already `#include`s every `.c` and `.cc` source
-> from `uvm-core/src/dpi/` inside its own `extern "C" { … }` block. That means a
-> **single-file compile** works for the whole kit:
+> from `uvm-core/src/dpi/` inside its own `extern "C" { … }` block. The catch is
+> that `uvm_dpi.cc` unconditionally `#include "uvm_hdl.c"`, and that file has a
+> `#ifdef VCS / #elif QUESTA / #elif XCELIUM / #else #error "hdl vendor backend
+> is missing"` chain that requires a proprietary vendor header. xezim doesn't
+> ship those vendor headers because none of them are open source.
+>
+> Use `include/uvm_dpi_xezim.cc` instead — a single driver that mirrors
+> `uvm_dpi.cc`'s include chain but skips `uvm_hdl.c` and provides the
+> `uvm_hdl_*` surface itself per IEEE 1800.2-2017 Annex C (return 1 on
+> success, 0 on failure). It uses only standard `vpi_handle_by_name` +
+> `vpi_get_value` + `vpi_put_value` — no vendor extensions, no VHPI, no
+> M-HPI. Questa's `uvm_is_vhdl_path` and `uvm_register_*_vhdl` helpers are
+> NOT part of IEEE 1800.2 and are intentionally not provided.
 >
 > ```bash
-> g++ -shared -fPIC -std=c++17 \
->     -I path/to/xezim -I path/to/uvm-core/src/dpi \
->     path/to/uvm-core/src/dpi/uvm_dpi.cc \
->     -o libuvm_dpi.so
+> g++ -shared -fPIC -std=c++17 -Wno-format-security \
+>     -I path/to/xezim/include -I path/to/uvm-core/src/dpi \
+>     path/to/xezim/include/uvm_dpi_xezim.cc \
+>     -o uvm.so
 > ```
+>
+> Or use the shipped wrapper from inside any directory:
+>
+> ```bash
+> /path/to/xezim/scripts/build_uvm_so.sh
+> ```
+>
+> Override paths via env vars: `UVM=…` `XEZIM_INCLUDE=…` `OUT=…`. The script
+> auto-detects the canonical xezim/uvm-core layout but accepts any layout.
+>
+> The `-Wno-format-security` flag silences a long-standing warning from
+> `uvm_hdl_polling.c` lines 526/533/534 where the Accellera UVM reference
+> uses `sprintf(buf, str, name)` with a non-literal "format" string.
+> That's technically UB if `str`/`name` ever contains `%`, but patching
+> it in upstream `uvm-core` would be reverted on the next submodule
+> update. Every commercial simulator's UVM build applies the same
+> suppression.
 >
 > xezim ships with `-DUVM_NO_DPI` so the UVM SV source itself never calls into
 > this `.so` (UVM reporting / cmdline is serviced by the Rust core), but having
@@ -185,7 +219,7 @@ a regex engine, a compression codec. Pattern:
 ```bash
 # 1) Compile your shim to an object file
 g++ -shared -fPIC -std=c++17 -fPIC -DXEZIM_SPIKE_REAL=1 \
-    -I path/to/xezim -I $SPIKE_PREFIX/include \
+    -I path/to/xezim/include -I $SPIKE_PREFIX/include \
     -c xezim_spike_dpi.cpp -o xezim_spike_dpi.o
 
 # 2) Link the shim + the external library into one .so
@@ -238,7 +272,7 @@ my_project/
 ```
 
 ```bash
-cc -shared -fPIC -I path/to/xezim -I . my_dpi.c -o my_dpi.so
+cc -shared -fPIC -I path/to/xezim/include -I . my_dpi.c -o my_dpi.so
 xezim --dpi-lib ./my_dpi.so -I . tb_my_dpi.sv
 ```
 
@@ -252,7 +286,7 @@ dpi/
 ```
 
 ```bash
-g++ -shared -fPIC -I path/to/xezim -I dpi/include uvm_dpi.cc -o dpi/lib/libuvm_dpi.so
+g++ -shared -fPIC -I path/to/xezim/include -I dpi/include uvm_dpi.cc -o dpi/lib/libuvm_dpi.so
 xezim --dpi-lib dpi/lib/libuvm_dpi.so -I dpi/include tb.sv
 ```
 
