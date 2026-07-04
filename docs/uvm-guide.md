@@ -71,6 +71,10 @@ If you give only one `-s`, behavior is exactly as before (no wrapper synthesized
   (drain time honored), then extract/check/report/final run, then `$finish`.
 - **Report summary** — `--- UVM Report Summary ---` with counts by severity and by id.
 
+For UVM extensions that need their own DPI-C (e.g. a custom HDL backdoor, a cocotb
+bridge, or an ISS shim), see [`dpi-guide.md`](dpi-guide.md) — the same `--dpi-lib`
+mechanism works for UVM-side code as for plain SV testbenches.
+
 ---
 
 ## Supported

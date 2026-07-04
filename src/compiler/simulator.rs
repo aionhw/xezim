@@ -18262,6 +18262,43 @@ impl Simulator {
                     } else {
                         self.get_signal_value_by_name(obj_name)
                     };
+                    // Mirror SV writes to the unpacked-struct member signal
+                    // (e.g. `t_unpacked_struct.val_i`) so VPI-forced values
+                    // and SV reads stay in sync. Both storage locations
+                    // (heap property and separate signal) are written; the
+                    // read path prefers the separate signal.
+                    if hier.path.len() == 2 {
+                        let dotted = format!(
+                            "{}.{}",
+                            hier.path[0].name.name, hier.path[1].name.name
+                        );
+                        if self.signal_name_to_id.contains_key(dotted.as_str()) {
+                            if let Some(id) =
+                                self.signal_name_to_id.get(dotted.as_str()).copied()
+                            {
+                                let width = self.signal_widths[id];
+                                let mut resized = if self.signal_real[id] {
+                                    if val.is_real {
+                                        val.clone()
+                                    } else {
+                                        Value::from_f64(val.to_f64())
+                                    }
+                                } else {
+                                    if val.is_real {
+                                        Value::from_u64(val.to_f64() as u64, width)
+                                    } else {
+                                        val.resize(width)
+                                    }
+                                };
+                                resized.is_signed = self.signal_signed[id];
+                                self.set_signal_value_by_name(&dotted, resized);
+                                // Fall through to also update the heap so any
+                                // existing read path that looks there stays
+                                // consistent. Don't `return` — let the heap
+                                // write happen too.
+                            }
+                        }
+                    }
                     if let Some(v) = obj_val {
                         let mut cur_handle = v.to_u64().unwrap_or(0) as usize;
                         for i in 1..hier.path.len() {
@@ -19562,6 +19599,39 @@ impl Simulator {
                 }
                 let base = self.eval_expr(expr);
                 let handle = base.to_u64().unwrap_or(0) as usize;
+                // Mirror writes to the unpacked-struct member signal
+                // (e.g. `t_unpacked_struct.val_i`) so VPI-forced values
+                // and SV reads stay in sync. Both the heap property and the
+                // separate signal are written; the read path prefers the
+                // separate signal.
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if hier.path.len() == 1 {
+                        let dotted = format!(
+                            "{}.{}",
+                            hier.path[0].name.name, member.name
+                        );
+                        if let Some(id) = self.signal_name_to_id.get(dotted.as_str()).copied() {
+                            let width = self.signal_widths[id];
+                            let mut resized = if self.signal_real[id] {
+                                if val.is_real {
+                                    val.clone()
+                                } else {
+                                    Value::from_f64(val.to_f64())
+                                }
+                            } else {
+                                if val.is_real {
+                                    Value::from_u64(val.to_f64() as u64, width)
+                                } else {
+                                    val.resize(width)
+                                }
+                            };
+                            resized.is_signed = self.signal_signed[id];
+                            self.set_signal_value_by_name(&dotted, resized);
+                            // Fall through to also update the heap so existing
+                            // read paths that look there stay consistent.
+                        }
+                    }
+                }
                 if handle != 0 && handle < self.heap.len() {
                     if let Some(instance) = &mut self.heap[handle] {
                         let changed = instance.properties.get(&member.name) != Some(val);
@@ -19621,6 +19691,20 @@ impl Simulator {
                 val
             }
             ExprKind::Ident(hier) => {
+                // Unpacked-struct member path (e.g. `t_unpacked_struct.val_r`)
+                // is pre-registered as a separate signal by elaboration.
+                // Prefer the separate-signal read so VPI-forced values stay
+                // in sync with the SV-visible value. Skip short idents and
+                // the dotted name `Class::static_prop` (handled below).
+                if hier.path.len() == 2 {
+                    let dotted = format!(
+                        "{}.{}",
+                        hier.path[0].name.name, hier.path[1].name.name
+                    );
+                    if let Some(v) = self.get_signal_value_by_name(&dotted) {
+                        return v;
+                    }
+                }
                 // LRM §14.3 clocking-block input read — `cb.<sig>`
                 // returns the snapshot taken at the most recent posedge
                 // of the cb's clock (`#1step` input skew). Falls through
@@ -19967,6 +20051,21 @@ impl Simulator {
                         }
                     }
                     // Handle hierarchical ident that might be class member access: obj.prop
+                    // Unpacked-struct member paths (e.g. `t_unpacked_struct.val_r`)
+                    // are pre-registered as separate signals by elaboration.
+                    // Prefer the separate-signal read so VPI-forced values stay
+                    // in sync with the SV-visible value.
+                    {
+                        let full_path = hier
+                            .path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        if let Some(v) = self.get_signal_value_by_name(&full_path) {
+                            return v;
+                        }
+                    }
                     let val = if let Some(locals) = self.local_stack.last() {
                         locals.get(obj_name).cloned()
                     } else {
@@ -21695,6 +21794,17 @@ impl Simulator {
                                 }
                             }
                         }
+                    }
+                }
+                // Unpacked-struct member access where the member was pre-registered
+                // as its own signal (e.g. `t_unpacked_struct.val_r`). Prefer
+                // reading the member signal so VPI-forced values stay in
+                // sync with the SV-visible value.
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    let base_name = self.resolve_hier_name(hier);
+                    let qualified = format!("{}.{}", base_name, member.name);
+                    if let Some(v) = self.lookup_signal_value(&qualified) {
+                        return v;
                     }
                 }
                 let base = self.eval_expr(expr);
@@ -37175,15 +37285,24 @@ pub extern "C" fn vpi_handle_by_name(
         .to_string();
 
     with_active_sim(|sim| {
-        // Try full name first
+        // Try progressively stripping leftmost scope segments until we
+        // either resolve the name or exhaust prefixes. Handles:
+        //   - full hier name:           "top.mod.signal"
+        //   - module-prefix stripped:   "mod.signal"   (e.g. for VPI backdoor)
+        //   - leaf only:                "signal"
+        // For member paths like "top.mod.unpacked_struct.val_i" we register
+        // "unpacked_struct.val_i" in `signal_name_to_id`, so the second
+        // variant above is what resolves.
         if let Some(&id) = sim.signal_name_to_id.get(full_name.as_str()) {
             let handle = Box::into_raw(Box::new(VpiHandle { signal_id: id }));
             return handle as *mut libc::c_void;
         }
-        // Try stripping module prefix
-        if let Some(dot_pos) = full_name.rfind('.') {
-            let short_name = &full_name[dot_pos + 1..];
-            if let Some(&id) = sim.signal_name_to_id.get(short_name) {
+        // Try progressively shorter prefixes from the left.
+        let mut start = 0usize;
+        while let Some(dot_pos) = full_name[start..].find('.') {
+            let abs_dot = start + dot_pos;
+            let candidate = &full_name[abs_dot + 1..];
+            if let Some(&id) = sim.signal_name_to_id.get(candidate) {
                 let handle = Box::into_raw(Box::new(VpiHandle { signal_id: id }));
                 return handle as *mut libc::c_void;
             }

@@ -34,7 +34,7 @@ fn compile_dpi_lib(c_file: &str, stem: &str) -> PathBuf {
 }
 
 fn run_xezim_with_dpi(so_path: &Path, sv_file: &str) -> String {
-    let bin = std::env::var("CARGO_BIN_EXE_xezim").unwrap_or_else(|_| "xezim".to_string());
+    let bin = env!("CARGO_BIN_EXE_xezim");
     let sv_path = manifest_path(sv_file);
     let out = Command::new(bin)
         .arg("--dpi-lib")

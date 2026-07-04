@@ -49,6 +49,11 @@ Current capabilities include:
 * Event-driven edge gating (`XEZIM_EVENT_EDGE=1`) — opt-in skip of clocked
   flop fires whose data inputs haven't changed; 1.13-1.30× wall on the C910 /
   C906 hello / memcpy / cmark benchmarks, correct-by-construction
+* **DPI-C loading** via `--dpi-lib <path>` — load shared libraries of
+  `import "DPI-C"` implementations written in C or C++ (e.g. an ISS shim, a
+  custom HDL-backdoor force/release layer, or your own UVM extensions). The
+  repo ships minimal `svdpi.h` and `vpi_user.h` so DPI code compiles without a
+  vendor install. See [docs/dpi-guide.md](docs/dpi-guide.md).
 
 ---
 
@@ -177,6 +182,7 @@ Common options:
 | `-I<dir>` | Add an include directory |
 | `--simulate` | Run the simulation (vs `--parse` / `--compile` / `--preprocess`) |
 | `-s <module>` | Select a top-level module. Repeat for multiple roots (e.g. `-s hdl_top -s hvl_top`); xezim elaborates them all under a synthetic wrapper |
+| `--dpi-lib <path>` | Load a DPI-C shared library (`.so`/`.dylib`/`.dll`). Repeatable. See [docs/dpi-guide.md](docs/dpi-guide.md). |
 | `--max-time <N>` | Stop simulation at time `N` |
 | `+trace`, `+<plusarg>` | Passed through to `$value$plusargs` / `$test$plusargs` |
 | `--sdf <file>` `--sdf-{min,typ,max}` | Annotate standard delays |
