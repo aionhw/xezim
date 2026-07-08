@@ -1777,6 +1777,14 @@ pub struct Simulator {
     process_parents: HashMap<usize, usize>,
     /// Per-process execution context for scheduled class/task processes.
     process_contexts: HashMap<usize, ProcessContext>,
+    /// Instance scope (e.g. `"TB.p1"`) for a scheduled process, set from the
+    /// originating initial block. `run_scheduled_process` installs it as the
+    /// name-resolution hint so AST-evaluated bare names in a multiply-
+    /// instantiated module resolve to THIS instance's signals.
+    process_scope_hint: HashMap<usize, String>,
+    /// Stable instance scope of the process currently running (for `%m`).
+    /// Unlike `name_resolve_hint`, this is not mutated by name resolution.
+    current_scope: String,
     /// Return value from last function call.
     return_value: Option<Value>,
     /// Random number generator for randomization.
@@ -3086,6 +3094,8 @@ impl Simulator {
             join_waiters: Vec::new(),
             process_parents: HashMap::default(),
             process_contexts: HashMap::default(),
+            process_scope_hint: HashMap::default(),
+            current_scope: String::new(),
             return_value: None,
             rng: rand::rngs::StdRng::from_entropy(),
             settling: false,
@@ -6117,6 +6127,7 @@ impl Simulator {
             .map(|p| p.materialize())
             .chain(initial_blocks.into_iter())
         {
+            let scope = ib.scope;
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
                 other => vec![Statement::new(other, ib.stmt.span)],
@@ -6133,6 +6144,9 @@ impl Simulator {
             }
             let pid = self.next_pid;
             self.next_pid += 1;
+            if !scope.is_empty() {
+                self.process_scope_hint.insert(pid, scope);
+            }
             self.event_queue.schedule(0, pid, stmts);
         }
         // LRM §24: `program` initial blocks execute in the reactive region.
@@ -14278,6 +14292,16 @@ impl Simulator {
         // Save + clear it for the run, restore on EVERY exit path so the hint
         // never leaks across scheduled processes (or back to the caller).
         let saved_hint = self.name_resolve_hint.borrow_mut().take();
+        // Install the process's instance scope (from its initial block) as the
+        // resolution hint so AST-evaluated bare names — e.g. a
+        // `std::randomize(sig)` target — resolve to THIS instance's signals in
+        // a multiply-instantiated module, not the first instance's.
+        if let Some(scope) = self.process_scope_hint.get(&pid).cloned() {
+            *self.name_resolve_hint.borrow_mut() = Some(scope.clone());
+            self.current_scope = scope;
+        } else {
+            self.current_scope.clear();
+        }
         // Fast path: if we have no saved process context for this pid AND
         // the caller's execution context is empty, skip the full snapshot /
         // restore dance. Forever-loop bodies like `jclk = ~jclk` that run
@@ -25509,7 +25533,19 @@ impl Simulator {
                                         result.push(b as char);
                                     }
                                     'm' | 'M' => {
-                                        result.push_str(&self.module.name);
+                                        // %m: hierarchical name of the current
+                                        // scope. Qualify the top module with the
+                                        // running process's instance scope so a
+                                        // multiply-instantiated module reports
+                                        // `TB.p1` rather than just `TB`.
+                                        if self.current_scope.is_empty() {
+                                            result.push_str(&self.module.name);
+                                        } else {
+                                            result.push_str(&format!(
+                                                "{}.{}",
+                                                self.module.name, self.current_scope
+                                            ));
+                                        }
                                         ai -= 1;
                                     }
                                     _ => {
