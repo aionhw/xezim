@@ -1589,6 +1589,10 @@ pub struct Simulator {
     /// wired up); drain is a no-op when empty, so behavior is unchanged.
     pending_reactive: Vec<crate::ast::stmt::Statement>,
     pub monitor_prev: HashMap<String, Value>,
+    /// Previously-printed values of the active `$monitor`'s non-`$time`
+    /// arguments. `$monitor` re-prints only when one of these changes
+    /// (LRM §21.2.3); `None` forces a print (fresh registration).
+    monitor_arg_prev: Option<Vec<Value>>,
     /// Active tag for a tagged union variable: signal name → tag name.
     pub active_union_tag: HashMap<String, String>,
     pub max_time: u64,
@@ -3014,6 +3018,7 @@ impl Simulator {
             compiled: false,
             monitor: None,
             monitor_prev: HashMap::default(),
+            monitor_arg_prev: None,
             pending_strobes: Vec::new(),
             pending_observed: Vec::new(),
             sva_sites: Vec::new(),
@@ -25153,6 +25158,7 @@ impl Simulator {
             }
             "$monitor" | "$monitorb" | "$monitorh" | "$monitoro" => {
                 self.monitor = Some((name.to_string(), args.to_vec()));
+                self.monitor_arg_prev = None; // fresh arm ⇒ print immediately
                 self.check_monitor();
             }
             "$monitoroff" => {
@@ -25982,23 +25988,31 @@ impl Simulator {
         }
     }
 
+    /// A `$monitor`/`$fmonitor` argument that must NOT drive re-printing:
+    /// `$time`, `$stime`, `$realtime` change every step (LRM §21.2.3).
+    fn is_monitor_time_arg(e: &Expression) -> bool {
+        matches!(&e.kind, ExprKind::SystemCall { name, .. }
+            if matches!(name.as_str(), "$time" | "$stime" | "$realtime"))
+    }
+
     fn check_monitor(&mut self) {
         if let Some((tn, args)) = self.monitor.clone() {
             self.sync_table_to_hashmap();
-            let m = self.format_args(&args, &tn);
-            let mut changed = self.monitor_prev.is_empty();
-            for (n, v) in &self.signals {
-                if let Some(p) = self.monitor_prev.get(n) {
-                    if p != v {
-                        changed = true;
-                        break;
-                    }
-                }
-            }
+            // LRM §21.2.3: $monitor prints once when armed, then again only
+            // when one of its monitored arguments changes — EXCLUDING the time
+            // functions (otherwise it would print every time step). Snapshot
+            // the non-time argument values and compare against the last print.
+            let cur: Vec<Value> = args
+                .iter()
+                .filter(|a| !Self::is_monitor_time_arg(a))
+                .map(|a| self.eval_expr(a))
+                .collect();
+            let changed = self.monitor_arg_prev.as_deref() != Some(cur.as_slice());
             if changed {
+                let m = self.format_args(&args, &tn);
                 self.record_output(m.clone());
                 self.stdout_writeln(&m);
-                self.monitor_prev = self.signals.clone();
+                self.monitor_arg_prev = Some(cur);
             }
         }
     }
@@ -26584,8 +26598,15 @@ impl Simulator {
             let mut reads: Vec<u32> = Vec::new();
             let mut seen: HashSet<u32> = HashSet::default();
             let mut dynamic = false;
+            // A block that escapes to the AST interpreter (`StmtFallback`, e.g.
+            // its only effect is `$display`/`$monitor`) has side effects and
+            // reads the bytecode can't see. Gating it on "no tracked data-input
+            // change" would drop every fire after the first (its read set is
+            // empty), so such a block must never be gateable.
+            let mut opaque = false;
             for insn in &cb.instructions {
                 match insn {
+                    Insn::StmtFallback(..) => opaque = true,
                     Insn::LoadSignal(_, s) | Insn::LoadSignalSigned(_, s) => {
                         if seen.insert(*s as u32) {
                             reads.push(*s as u32);
@@ -26624,7 +26645,7 @@ impl Simulator {
             let has_wide = reads
                 .iter()
                 .any(|&s| self.signal_widths[s as usize] > 64);
-            gateable[bi] = !dynamic && !has_wide;
+            gateable[bi] = !dynamic && !has_wide && !opaque;
             data_reads[bi] = reads;
         }
         self.edge_block_data_reads = data_reads;
@@ -28991,16 +29012,17 @@ impl Simulator {
                     if let ExprKind::Ident(h) = &expr.kind {
                         if h.path.len() == 1 && h.path[0].name.name == "std" {
                             self.exec_std_randomize(args);
-                            // Collect the randomize target lvalues by name.
-                            let targets: Vec<(String, Expression)> = args
-                                .iter()
-                                .filter_map(|a| match &a.kind {
-                                    ExprKind::Ident(hh) => {
-                                        Some((self.resolve_hier_name(hh), a.clone()))
-                                    }
-                                    _ => None,
-                                })
-                                .collect();
+                            // Collect the randomize target lvalues by name. A
+                            // struct arg expands to its per-field lvalues so
+                            // field-level constraints (`pkt.f < N`) match.
+                            let mut targets: Vec<(String, Expression)> = Vec::new();
+                            for a in args {
+                                if let Some(fields) = self.expand_struct_target(a) {
+                                    targets.extend(fields);
+                                } else if let ExprKind::Ident(hh) = &a.kind {
+                                    targets.push((self.resolve_hier_name(hh), a.clone()));
+                                }
+                            }
                             // Relational items (`t > e`, `t <= e`, …): narrow a
                             // [lo, hi] interval per target across the WHOLE
                             // constraint set, then pick uniformly inside it.
@@ -29280,10 +29302,8 @@ impl Simulator {
                     ) {
                         return;
                     }
-                    let on_left = matches!(&left.kind,
-                        ExprKind::Ident(h) if self.resolve_hier_name(h) == name);
-                    let on_right = matches!(&right.kind,
-                        ExprKind::Ident(h) if self.resolve_hier_name(h) == name);
+                    let on_left = self.constraint_operand_name(left).as_deref() == Some(name);
+                    let on_right = self.constraint_operand_name(right).as_deref() == Some(name);
                     if on_left == on_right {
                         return;
                     }
@@ -29342,17 +29362,46 @@ impl Simulator {
 
     /// Match `expr` (a constraint operand) to one of the randomize targets,
     /// returning its lvalue expression.
+    /// Canonical name of a constraint operand that is a scalar variable (`x`)
+    /// or a struct member (`pkt.field`), matching how scope-randomize field
+    /// targets are named (see `expand_struct_target`). A struct member parses
+    /// as a `MemberAccess`, so without this an inline constraint like
+    /// `pkt.data < 100` would never bind to the `pkt.data` field target.
+    /// Returns `None` for anything else.
+    fn constraint_operand_name(&self, e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+            ExprKind::MemberAccess { expr, member } => {
+                if let ExprKind::Ident(bh) = &expr.kind {
+                    if bh.path.len() == 1 {
+                        let mut fh = bh.clone();
+                        fh.path.push(crate::ast::expr::HierPathSegment {
+                            name: crate::ast::Identifier {
+                                name: member.name.clone(),
+                                span: member.span,
+                            },
+                            selects: Vec::new(),
+                        });
+                        fh.cached_signal_id = std::cell::Cell::new(None);
+                        fh.cached_resolved_name = std::cell::OnceCell::new();
+                        return Some(self.resolve_hier_name(&fh));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     fn target_for(
         &mut self,
         expr: &Expression,
         targets: &[(String, Expression)],
     ) -> Option<Expression> {
-        if let ExprKind::Ident(h) = &expr.kind {
-            let n = self.resolve_hier_name(h);
-            for (name, lv) in targets {
-                if *name == n {
-                    return Some(lv.clone());
-                }
+        let n = self.constraint_operand_name(expr)?;
+        for (name, lv) in targets {
+            if *name == n {
+                return Some(lv.clone());
             }
         }
         None
@@ -29490,12 +29539,82 @@ impl Simulator {
         }
     }
 
+    /// Expand a scope-randomize target that names a struct variable into its
+    /// per-field targets `(resolved_name, field_lvalue)`; returns `None` for a
+    /// non-struct target. A single flat assign can't reach an *unpacked*
+    /// struct's members (no contiguous bit layout), and a *local* packed
+    /// struct's whole/field views aren't aliased — so scope randomize operates
+    /// per field. It also lets field-level inline constraints (`pkt.f < N`)
+    /// match, since each field target resolves to the same name the constraint
+    /// LHS does.
+    fn expand_struct_target(&self, a: &Expression) -> Option<Vec<(String, Expression)>> {
+        let ExprKind::Ident(h) = &a.kind else { return None };
+        if h.path.len() != 1 {
+            return None;
+        }
+        let vname = h.path[0].name.name.clone();
+        // Field names: a packed struct is registered in `packed_struct_fields`;
+        // an unpacked struct's members exist only as individual signals named
+        // `<var>.<field>`, so discover those by a direct-child prefix scan.
+        let field_names: Vec<String> =
+            if let Some(fields) = self.module.packed_struct_fields.get(&vname) {
+                if fields.is_empty() {
+                    return None;
+                }
+                fields.iter().map(|(f, _, _)| f.clone()).collect()
+            } else {
+                let prefix = format!("{}.", vname);
+                let mut fs: Vec<String> = self
+                    .signal_name_to_id
+                    .keys()
+                    .filter_map(|k| k.strip_prefix(&prefix))
+                    .filter(|rest| !rest.contains('.') && !rest.contains('['))
+                    .map(|rest| rest.to_string())
+                    .collect();
+                fs.sort();
+                fs.dedup();
+                if fs.is_empty() {
+                    return None;
+                }
+                fs
+            };
+        let mut out = Vec::with_capacity(field_names.len());
+        for fname in &field_names {
+            let mut fh = h.clone();
+            fh.path.push(crate::ast::expr::HierPathSegment {
+                name: crate::ast::Identifier { name: fname.clone(), span: h.span },
+                selects: Vec::new(),
+            });
+            fh.cached_signal_id = std::cell::Cell::new(None);
+            fh.cached_resolved_name = std::cell::OnceCell::new();
+            let name = self.resolve_hier_name(&fh);
+            let fexpr = Expression { kind: ExprKind::Ident(fh), span: a.span };
+            out.push((name, fexpr));
+        }
+        Some(out)
+    }
+
     /// `std::randomize(v1, v2, ...)` — assign each listed lvalue a fresh random
-    /// value sized to its inferred width. Best-effort: inline `with` constraints
-    /// are not solved. Always reports success.
+    /// value sized to its inferred width. Struct targets are randomized member
+    /// by member. Best-effort: inline `with` constraints are solved separately
+    /// in `eval_randomize_with`. Always reports success.
     fn exec_std_randomize(&mut self, args: &[Expression]) -> Value {
         use rand::Rng;
         for a in args {
+            // Struct target: randomize each field individually.
+            if let Some(fields) = self.expand_struct_target(a) {
+                for (_name, fexpr) in &fields {
+                    let w = self.infer_lhs_width(fexpr).max(1);
+                    let rv = if w <= 64 {
+                        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                        Value::from_u64(self.rng.gen::<u64>() & mask, w)
+                    } else {
+                        Value::zero(w)
+                    };
+                    self.assign_value(fexpr, &rv);
+                }
+                continue;
+            }
             // Array/queue target: randomize each element (a scalar assign to the
             // array name would corrupt it). A `with { foreach … inside {…} }`
             // clause, if present, then refines each element via Foreach below.
