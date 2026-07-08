@@ -25423,6 +25423,18 @@ impl Simulator {
                                         continue;
                                     }
                                 }
+                                // §21.2.1.7: a struct prints in assignment-pattern
+                                // form `'{member, member, ...}`. Needed for
+                                // unpacked structs (no flat value ⇒ plain eval is
+                                // X) and nicer than a flattened decimal for packed.
+                                if let Some(fields) = self.expand_struct_target(arg) {
+                                    let mut parts = Vec::with_capacity(fields.len());
+                                    for (_n, fexpr) in &fields {
+                                        parts.push(self.eval_expr(fexpr).to_dec_string());
+                                    }
+                                    result.push_str(&format!("'{{{}}}", parts.join(", ")));
+                                    continue;
+                                }
                                 let v = self.eval_expr(arg);
                                 result.push_str(&v.to_dec_string());
                             }
