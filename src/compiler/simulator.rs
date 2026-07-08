@@ -726,12 +726,19 @@ struct EdgeSensitiveBlock {
 struct SensitivityId {
     signal_id: usize,
     edge: EdgeKind,
+    /// LRM §9.4.2.3 `iff` guard for this event term: the edge only counts
+    /// when this expression is true at edge time. `None` for an unguarded
+    /// term. Consulted by the procedural `@`-event wake path; the always-
+    /// block edge paths carry it but do not yet evaluate it.
+    iff: Option<Expression>,
 }
 
 #[derive(Debug, Clone)]
 struct Sensitivity {
     signal_name: String,
     edge: EdgeKind,
+    /// See `SensitivityId::iff` — carried through name→id resolution.
+    iff: Option<Expression>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1509,6 +1516,16 @@ pub struct Simulator {
     /// signals (typically ~100s on c910: clk, rst_b, a few enables) instead
     /// of all edge_blocks (10K+), yielding 50-100× faster edge detection.
     edge_blocks_by_sig: Vec<EdgeFanout>,
+    /// Indices (into `edge_blocks`) of edge-sensitive always blocks that
+    /// carry at least one `iff` guard on a sensitivity term (LRM §9.4.2.3).
+    /// Built alongside `edge_blocks_by_sig`; empty for the common
+    /// guard-free design, so `check_edges` skips the guard pass entirely.
+    edge_blocks_with_iff: Vec<usize>,
+    /// Per-block scratch bitmap (indexed by edge-block index) marking blocks
+    /// whose `iff` guard denies firing this delta-cycle. Rebuilt each
+    /// `check_edges` before the detection loop so the hot loop can skip a
+    /// denied block with a single array read.
+    edge_iff_denied: Vec<bool>,
     pub time: u64,
     pub output: Vec<SimOutput>,
     capture_output: bool,
@@ -2969,6 +2986,8 @@ impl Simulator {
             edge_signal_names: HashSet::default(),
             edge_signal_ids: Vec::new(),
             edge_blocks_by_sig: Vec::new(),
+            edge_blocks_with_iff: Vec::new(),
+            edge_iff_denied: Vec::new(),
             signals,
             widths,
             signed_signals,
@@ -5997,6 +6016,15 @@ impl Simulator {
             .iter()
             .map(|sid| by_sid.remove(sid).unwrap_or_default())
             .collect();
+        // Record which edge blocks carry an `iff` guard so check_edges can
+        // evaluate it (LRM §9.4.2.3) without scanning every block each tick.
+        self.edge_blocks_with_iff = self
+            .edge_blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.resolved_sensitivities.iter().any(|s| s.iff.is_some()))
+            .map(|(i, _)| i)
+            .collect();
         // IEEE 1800: at time 0, always_comb blocks execute unconditionally.
         // always @* blocks do NOT execute at time 0 unless inputs change.
         // Only seed dirty IDs that have combinational dependents. Large
@@ -8893,6 +8921,7 @@ impl Simulator {
                             return Some(SensitivityId {
                                 signal_id: id,
                                 edge: s.edge,
+                                iff: s.iff.clone(),
                             });
                         }
                         if let Some(stripped) = s.signal_name.strip_prefix(&top_prefix) {
@@ -8900,6 +8929,7 @@ impl Simulator {
                                 return Some(SensitivityId {
                                     signal_id: id,
                                     edge: s.edge,
+                                    iff: s.iff.clone(),
                                 });
                             }
                         }
@@ -12806,6 +12836,7 @@ impl Simulator {
                         out.push(Sensitivity {
                             signal_name: sig,
                             edge,
+                            iff: ee.iff.clone(),
                         });
                     }
                     // P6: `@(posedge vif.clk)` — a virtual-interface member is a
@@ -12835,6 +12866,7 @@ impl Simulator {
                                         out.push(Sensitivity {
                                             signal_name: format!("{}.{}", b, member.name),
                                             edge,
+                                            iff: ee.iff.clone(),
                                         });
                                     }
                                 }
@@ -12847,12 +12879,14 @@ impl Simulator {
             EventControl::Identifier(id) => vec![Sensitivity {
                 signal_name: id.name.clone(),
                 edge: EdgeKind::AnyEdge,
+                iff: None,
             }],
             EventControl::HierIdentifier(expr) => {
                 if let ExprKind::Ident(h) = &expr.kind {
                     vec![Sensitivity {
                         signal_name: self.resolve_hier_name(h),
                         edge: EdgeKind::AnyEdge,
+                        iff: None,
                     }]
                 } else {
                     Vec::new()
@@ -12877,6 +12911,7 @@ impl Simulator {
                     .map(|&id| SensitivityId {
                         signal_id: id,
                         edge: s.edge,
+                        iff: s.iff.clone(),
                     })
             })
             .collect();
@@ -14763,6 +14798,7 @@ impl Simulator {
                         .map(|name| Sensitivity {
                             signal_name: name,
                             edge: EdgeKind::AnyEdge,
+                            iff: None,
                         })
                         .collect();
                     if !sens.is_empty() {
@@ -15912,6 +15948,50 @@ impl Simulator {
         let blocks = std::mem::take(&mut self.edge_blocks);
         self.in_edge_block = true;
 
+        // Honor `iff` guards on edge-sensitive always blocks (LRM §9.4.2.3).
+        // Evaluate each guarded block's terms up front — here `eval_expr` can
+        // borrow `&mut self` freely, whereas the detection loop below holds
+        // the trigger bitmap borrow and cannot. A block is DENIED this
+        // delta-cycle when every sensitivity term that fired an edge has a
+        // guard that is currently false; the hot loop then skips it. The
+        // whole pass is skipped when no edge block carries a guard.
+        let iff_active = !self.edge_blocks_with_iff.is_empty();
+        let mut iff_denied = std::mem::take(&mut self.edge_iff_denied);
+        iff_denied.clear();
+        if iff_active {
+            iff_denied.resize(blocks.len(), false);
+            let guarded = std::mem::take(&mut self.edge_blocks_with_iff);
+            for &bi in &guarded {
+                if bi >= blocks.len() {
+                    continue;
+                }
+                let mut any_fire = false;
+                let mut allow = false;
+                for s in &blocks[bi].resolved_sensitivities {
+                    if !self.check_edge_id(s.signal_id, s.edge) {
+                        continue;
+                    }
+                    any_fire = true;
+                    match &s.iff {
+                        Some(g) => {
+                            if self.eval_expr(g).is_true() {
+                                allow = true;
+                                break;
+                            }
+                        }
+                        None => {
+                            allow = true;
+                            break;
+                        }
+                    }
+                }
+                if any_fire && !allow {
+                    iff_denied[bi] = true;
+                }
+            }
+            self.edge_blocks_with_iff = guarded;
+        }
+
         // Phase 1: detect which blocks trigger.
         //
         // Inverted iteration: walk the (usually small) list of edge-sensitive
@@ -16028,7 +16108,10 @@ impl Simulator {
             let mut woke_any = false;
             if fires_pos {
                 for &block_idx in &fanout.posedge {
-                    if block_idx < triggered_bitmap.len() && !triggered_bitmap[block_idx] {
+                    if block_idx < triggered_bitmap.len()
+                        && !triggered_bitmap[block_idx]
+                        && !(iff_active && iff_denied[block_idx])
+                    {
                         triggered_bitmap[block_idx] = true;
                         triggered.push(block_idx);
                         woke_any = true;
@@ -16042,7 +16125,10 @@ impl Simulator {
             }
             if fires_neg {
                 for &block_idx in &fanout.negedge {
-                    if block_idx < triggered_bitmap.len() && !triggered_bitmap[block_idx] {
+                    if block_idx < triggered_bitmap.len()
+                        && !triggered_bitmap[block_idx]
+                        && !(iff_active && iff_denied[block_idx])
+                    {
                         triggered_bitmap[block_idx] = true;
                         triggered.push(block_idx);
                         woke_any = true;
@@ -16056,7 +16142,10 @@ impl Simulator {
             }
             if fires_any {
                 for &block_idx in &fanout.anyedge {
-                    if block_idx < triggered_bitmap.len() && !triggered_bitmap[block_idx] {
+                    if block_idx < triggered_bitmap.len()
+                        && !triggered_bitmap[block_idx]
+                        && !(iff_active && iff_denied[block_idx])
+                    {
                         triggered_bitmap[block_idx] = true;
                         triggered.push(block_idx);
                         woke_any = true;
@@ -16077,6 +16166,8 @@ impl Simulator {
         }
         self.prof_edge_detect += t0.elapsed().as_nanos() as u64;
         self.prof_edges_fired += triggered.len() as u64;
+        // Return the iff-denial scratch buffer for reuse next delta-cycle.
+        self.edge_iff_denied = iff_denied;
         // O1 MEASUREMENT (timestamp-based, gating-agnostic): for every gateable
         // flop firing this tick, it would be SKIPPABLE iff none of its data
         // inputs changed since the flop's previous fire. No behavior change.
@@ -16762,8 +16853,21 @@ impl Simulator {
             }
             let mut triggered = false;
             for sid in &waiter.resolved_sensitivities {
-                triggered = self.check_edge_id(sid.signal_id, sid.edge);
-                if triggered {
+                if !self.check_edge_id(sid.signal_id, sid.edge) {
+                    continue;
+                }
+                // LRM §9.4.2.3: `@(posedge clk iff g)` only fires when the
+                // guard `g` holds at edge time. A false guard re-arms the
+                // waiter (it stays in event_waiters for the next edge)
+                // rather than resuming the process. Evaluated in the module
+                // scope the signal table exposes — sufficient for the usual
+                // reset/enable guards (`iff rst_l === 1'b1`, `iff en`).
+                let guard_ok = match &sid.iff {
+                    Some(g) => self.eval_expr(g).is_true(),
+                    None => true,
+                };
+                if guard_ok {
+                    triggered = true;
                     break;
                 }
             }
@@ -33256,6 +33360,7 @@ impl Simulator {
                         .map(|&id| SensitivityId {
                             signal_id: id,
                             edge: s.edge,
+                            iff: s.iff.clone(),
                         })
                 })
                 .collect();
