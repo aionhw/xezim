@@ -17142,7 +17142,7 @@ impl Simulator {
                         Value::from_f64(val.to_f64())
                     }
                 } else if val.is_real {
-                    Value::from_u64(val.to_f64() as u64, width)
+                    Self::real_to_int(val.to_f64(), width)
                 } else {
                     val.resize(width)
                 };
@@ -18022,7 +18022,7 @@ impl Simulator {
                             Value::from_f64(val.to_f64())
                         }
                     } else if val.is_real {
-                        Value::from_u64(val.to_f64() as u64, width)
+                        Self::real_to_int(val.to_f64(), width)
                     } else {
                         val.resize(width)
                     };
@@ -18711,7 +18711,7 @@ impl Simulator {
                                     }
                                 } else {
                                     if val.is_real {
-                                        Value::from_u64(val.to_f64() as u64, width)
+                                        Self::real_to_int(val.to_f64(), width)
                                     } else {
                                         val.resize(width)
                                     }
@@ -18766,7 +18766,7 @@ impl Simulator {
                             }
                         } else {
                             if val.is_real {
-                                Value::from_u64(val.to_f64() as u64, width)
+                                Self::real_to_int(val.to_f64(), width)
                             } else {
                                 val.resize(width)
                             }
@@ -18798,7 +18798,7 @@ impl Simulator {
                         val.clone()
                     } else {
                         if val.is_real {
-                            Value::from_u64(val.to_f64() as u64, width)
+                            Self::real_to_int(val.to_f64(), width)
                         } else {
                             val.resize(width)
                         }
@@ -18856,7 +18856,7 @@ impl Simulator {
                     }
                 } else {
                     if val.is_real {
-                        Value::from_u64(val.to_f64() as u64, width)
+                        Self::real_to_int(val.to_f64(), width)
                     } else {
                         val.resize(width)
                     }
@@ -19828,7 +19828,7 @@ impl Simulator {
                         let mut resized = if self.signal_real[id] {
                             if val.is_real { val.clone() } else { Value::from_f64(val.to_f64()) }
                         } else if val.is_real {
-                            Value::from_u64(val.to_f64() as u64, width)
+                            Self::real_to_int(val.to_f64(), width)
                         } else {
                             val.resize(width)
                         };
@@ -20125,7 +20125,7 @@ impl Simulator {
                                 }
                             } else {
                                 if val.is_real {
-                                    Value::from_u64(val.to_f64() as u64, width)
+                                    Self::real_to_int(val.to_f64(), width)
                                 } else {
                                     val.resize(width)
                                 }
@@ -21811,7 +21811,7 @@ impl Simulator {
                         .first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
-                    Value::from_u64(v.to_f64() as u64, 32)
+                    Self::real_trunc_to_int(v.to_f64(), 32)
                 }
                 "$ceil" => {
                     let v = args
@@ -24292,13 +24292,22 @@ impl Simulator {
                             continue;
                         }
                         for pat in &item.patterns {
-                            let pv = self.eval_expr(pat);
-                            let eq = match kind {
-                                CaseKind::Casez => val.casez_eq(&pv),
-                                CaseKind::Casex => val.casex_eq(&pv),
-                                _ => val.case_eq(&pv),
+                            let hit = match kind {
+                                CaseKind::CaseInside => self.case_inside_match(&val, pat),
+                                CaseKind::Casez => {
+                                    let pv = self.eval_expr(pat);
+                                    val.casez_eq(&pv).is_true()
+                                }
+                                CaseKind::Casex => {
+                                    let pv = self.eval_expr(pat);
+                                    val.casex_eq(&pv).is_true()
+                                }
+                                _ => {
+                                    let pv = self.eval_expr(pat);
+                                    val.case_eq(&pv).is_true()
+                                }
                             };
-                            if eq.is_true() {
+                            if hit {
                                 match_count += 1;
                                 break;
                             }
@@ -24335,13 +24344,22 @@ impl Simulator {
                         continue;
                     }
                     for pat in &item.patterns {
-                        let pv = self.eval_expr(pat);
-                        let eq = match kind {
-                            CaseKind::Casez => val.casez_eq(&pv),
-                            CaseKind::Casex => val.casex_eq(&pv),
-                            _ => val.case_eq(&pv),
+                        let hit = match kind {
+                            CaseKind::CaseInside => self.case_inside_match(&val, pat),
+                            CaseKind::Casez => {
+                                let pv = self.eval_expr(pat);
+                                val.casez_eq(&pv).is_true()
+                            }
+                            CaseKind::Casex => {
+                                let pv = self.eval_expr(pat);
+                                val.casex_eq(&pv).is_true()
+                            }
+                            _ => {
+                                let pv = self.eval_expr(pat);
+                                val.case_eq(&pv).is_true()
+                            }
                         };
-                        if eq.is_true() {
+                        if hit {
                             self.exec_statement(&item.stmt);
                             matched = true;
                             break;
@@ -30458,7 +30476,7 @@ impl Simulator {
             let mut resized = if self.signal_real[id] {
                 if val.is_real { val } else { Value::from_f64(val.to_f64()) }
             } else if val.is_real {
-                Value::from_u64(val.to_f64() as u64, width)
+                Self::real_to_int(val.to_f64(), width)
             } else {
                 val.resize(width)
             };
@@ -35217,6 +35235,51 @@ impl Simulator {
                 ..
             }
         )
+    }
+
+    /// IEEE 1800-2017 §12.5.4 `case (e) inside`: an item is a range, a value or
+    /// an array, matched with the same rules as the `inside` OPERATOR — ranges
+    /// are inclusive and x/z in an item are wildcards. `CaseInside` fell through
+    /// to exact `case_eq`, so a range item compared against a garbage value and
+    /// a wildcard item never matched: both silently took `default`.
+    fn case_inside_match(&mut self, val: &Value, pat: &Expression) -> bool {
+        if let ExprKind::Range(lo, hi) = &pat.kind {
+            let l = self.eval_expr(lo);
+            let h = self.eval_expr(hi);
+            return val.greater_equal(&l).is_true() && val.less_equal(&h).is_true();
+        }
+        if let Some(nm) = self.array_operand_name(pat) {
+            let sz = self.get_queue_size(&nm);
+            for i in 0..sz {
+                if let Some(ev) = self.get_signal_value_by_name(&format!("{}[{}]", nm, i)) {
+                    if val.wildcard_eq(&ev).is_true() {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        let pv = self.eval_expr(pat);
+        val.wildcard_eq(&pv).is_true()
+    }
+
+    /// IEEE 1800-2017 §6.12.2: converting a real to an integral type ROUNDS to
+    /// the nearest, ties away from zero. `f64 as u64` both truncated AND
+    /// saturated a negative value to 0, so `int i = -5.0;` silently yielded 0.
+    fn real_to_int(f: f64, width: u32) -> Value {
+        if !f.is_finite() {
+            return Value::zero(width.max(1));
+        }
+        // `f64::round` is already ties-away-from-zero.
+        Value::from_u64(f.round() as i64 as u64, width.max(1))
+    }
+
+    /// `$rtoi` TRUNCATES toward zero rather than rounding (§20.5).
+    fn real_trunc_to_int(f: f64, width: u32) -> Value {
+        if !f.is_finite() {
+            return Value::zero(width.max(1));
+        }
+        Value::from_u64(f.trunc() as i64 as u64, width.max(1))
     }
 
     /// Copy a fixed unpacked ARRAY actual into the formal's element signals and
