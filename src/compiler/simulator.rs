@@ -1687,6 +1687,13 @@ pub struct Simulator {
     /// consults the top frame so `vif.member` resolves to `bus.member`.
     /// Popped at task return.
     local_iface_aliases: Vec<HashMap<String, String>>,
+    /// While a `with (item...)` filter is being evaluated over a queue whose
+    /// elements are unpacked STRUCTS, `item` names no value — the element's
+    /// members live in separate signals. Bind it to the element's flat name
+    /// (`q[3]`) so `item.field` reads `q[3].field`. Checked at the eval sites,
+    /// before `resolve_hier_name`, whose per-node cache would freeze the first
+    /// element's binding for the whole sort.
+    item_alias: Option<String>,
     /// LRM §18.5.4 dist-pick-once tracking (per-randomize scope). Records
     /// `(handle, prop_name)` pairs for which a weighted `dist` constraint
     /// has already drawn one sample in the current randomize call. The
@@ -3093,6 +3100,7 @@ impl Simulator {
             uvm_id_counts: std::collections::BTreeMap::new(),
             tlm_connections: HashMap::default(),
             local_iface_aliases: Vec::new(),
+            item_alias: None,
             dist_picked_once: HashSet::default(),
             class_statics: HashMap::default(),
             current_spec: None,
@@ -20185,6 +20193,23 @@ impl Simulator {
                 val
             }
             ExprKind::Ident(hier) => {
+                // `item.field` inside a `with` filter over a struct queue.
+                if hier.path.len() >= 2 {
+                    if let Some(alias) = self.item_alias.clone() {
+                        if hier.path[0].name.name == "item" {
+                            let rest = hier.path[1..]
+                                .iter()
+                                .map(|s| s.name.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(".");
+                            if let Some(v) =
+                                self.get_signal_value_by_name(&format!("{}.{}", alias, rest))
+                            {
+                                return v;
+                            }
+                        }
+                    }
+                }
                 // Unpacked-struct member path (e.g. `t_unpacked_struct.val_r`)
                 // is pre-registered as a separate signal by elaboration.
                 // Prefer the separate-signal read so VPI-forced values stay
@@ -22074,6 +22099,20 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // `item.field` / `item.inner.field` inside a `with` filter over a
+                // struct queue. Fold the whole receiver chain, then swap the
+                // `item` prefix for the element's flat name.
+                if let Some(alias) = self.item_alias.clone() {
+                    if let Some(base_flat) = self.flat_member_name(expr) {
+                        if base_flat == "item" || base_flat.starts_with("item.") {
+                            let rest = &base_flat["item".len()..];
+                            let name = format!("{}{}.{}", alias, rest, member.name);
+                            if let Some(v) = self.get_signal_value_by_name(&name) {
+                                return v;
+                            }
+                        }
+                    }
+                }
                 // Mirror of the unpacked-aggregate write path in `assign_value`:
                 // a flattened leaf (`arr[i].m`, `c.nodes[i].m`) reads its own
                 // signal; a nested PACKED member (`arr[i].tag.vlan`) slices its
@@ -31346,11 +31385,19 @@ impl Simulator {
     /// LRM §7.12.2: in-place sort/rsort/unique on `arr` with the
     /// per-element key expression `filter` (binds `item` to each
     /// element). Mirrors `reduce_with`'s `item` plumbing.
+    /// LRM §7.12.2: `q.sort()/.rsort()/.unique() with (item.field)`.
+    ///
+    /// Computes each element's key, then permutes the queue by INDEX rather
+    /// than by value — an unpacked-struct element has no packed value to carry
+    /// around, so the old "collect values, reorder, write back" shape reordered
+    /// nothing. `item` binds to the element's value for scalars and to its flat
+    /// name for structs (see `item_alias`).
     fn sort_with(&mut self, arr: &str, method: &str, filter: &Expression) {
-        let size = self.get_queue_size(arr);
+        let size = self.get_queue_size(arr) as usize;
         if size == 0 {
             return;
         }
+        let elem_su = self.queue_elem_struct(arr);
         let pushed_frame = if self.local_stack.is_empty() {
             self.local_stack.push(HashMap::default());
             true
@@ -31361,19 +31408,24 @@ impl Simulator {
             .local_stack
             .last()
             .and_then(|f| f.get("item").cloned());
-        // Compute key for each element.
-        let mut pairs: Vec<(i64, Value)> = Vec::with_capacity(size as usize);
+        let saved_alias = self.item_alias.take();
+
+        let mut keys: Vec<i64> = Vec::with_capacity(size);
         for i in 0..size {
-            let elem = self
-                .get_signal_value_by_name(&format!("{}[{}]", arr, i))
+            let elem = format!("{}[{}]", arr, i);
+            if elem_su.is_some() {
+                self.item_alias = Some(elem.clone());
+            }
+            let v = self
+                .get_signal_value_by_name(&elem)
                 .unwrap_or_else(|| Value::zero(32));
             if let Some(f) = self.local_stack.last_mut() {
-                f.insert("item".to_string(), elem.clone());
+                f.insert("item".to_string(), v);
             }
-            let key = self.eval_expr(filter).to_i64().unwrap_or(0);
-            pairs.push((key, elem));
+            keys.push(self.eval_expr(filter).to_i64().unwrap_or(0));
         }
-        // Restore item binding.
+
+        self.item_alias = saved_alias;
         if let Some(f) = self.local_stack.last_mut() {
             match saved_item {
                 Some(v) => {
@@ -31387,42 +31439,26 @@ impl Simulator {
         if pushed_frame {
             self.local_stack.pop();
         }
-        // Apply the requested mutation.
-        let new_elems: Vec<Value> = match method {
-            "sort" => {
-                pairs.sort_by_key(|(k, _)| *k);
-                pairs.into_iter().map(|(_, v)| v).collect()
-            }
-            "rsort" => {
-                pairs.sort_by(|a, b| b.0.cmp(&a.0));
-                pairs.into_iter().map(|(_, v)| v).collect()
-            }
+
+        let mut order: Vec<usize> = (0..size).collect();
+        match method {
+            // `sort_by_key` is stable, so equal keys keep their order.
+            "sort" => order.sort_by_key(|&i| keys[i]),
+            "rsort" => order.sort_by_key(|&i| std::cmp::Reverse(keys[i])),
             "unique" => {
-                let mut seen: std::collections::HashSet<i64> =
-                    std::collections::HashSet::new();
-                pairs
-                    .into_iter()
-                    .filter_map(|(k, v)| {
-                        if seen.insert(k) {
-                            Some(v)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
+                let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+                order.retain(|&i| seen.insert(keys[i]));
             }
             _ => return,
-        };
-        let new_size = new_elems.len() as u64;
-        for (i, v) in new_elems.into_iter().enumerate() {
-            self.set_signal_value_by_name(&format!("{}[{}]", arr, i), v);
         }
-        // For unique (which may shrink the array), update the queue
-        // size. sort/rsort preserve length so this is a no-op there.
-        if new_size != size {
+
+        self.queue_permute(arr, &order);
+
+        // `unique` may shrink the queue; sort/rsort preserve its length.
+        let new_size = order.len() as u64;
+        if new_size != size as u64 {
             self.set_queue_size(arr, new_size);
-            // Clear trailing stale slots.
-            for i in new_size..size {
+            for i in new_size..size as u64 {
                 self.signals.remove(&format!("{}[{}]", arr, i));
             }
         }
