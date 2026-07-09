@@ -21879,17 +21879,28 @@ impl Simulator {
                     if let Some(arg) = args.first() {
                         if let ExprKind::Ident(hier) = &arg.kind {
                             let aname = self.resolve_hier_name(hier);
-                            let unpacked = self.module.arrays.get(&aname).cloned();
-                            let packed_w = if let Some((_, _, w)) = unpacked {
+                            // Every unpacked dimension, outermost first. Only the
+                            // 1-D table was consulted, so `$size(m, 2)` — and even
+                            // `$size(m)` on a 2-D/N-D array — returned 0.
+                            let dims = self.foreach_dims(&aname);
+                            let elem_w = self
+                                .module
+                                .arrays
+                                .get(&aname)
+                                .map(|&(_, _, w)| w)
+                                .or_else(|| self.module.arrays_2d.get(&aname).map(|&(_, _, w)| w))
+                                .or_else(|| self.module.arrays_nd.get(&aname).map(|(_, w)| *w));
+                            let packed_w = if let Some(w) = elem_w {
                                 w
                             } else if let Some(&id) = self.signal_name_to_id.get(aname.as_str()) {
                                 self.signal_widths[id]
                             } else {
                                 0
                             };
-                            let (lo, hi, descending) = if unpacked.is_some() && dim == 1 {
-                                let (l, h, _) = unpacked.unwrap();
-                                let desc = self.module.descending_arrays.contains(&aname);
+                            let sel = dims.as_ref().and_then(|d| d.get(dim.saturating_sub(1)));
+                            let (lo, hi, descending) = if let Some(&(l, h)) = sel {
+                                let desc = dim == 1
+                                    && self.module.descending_arrays.contains(&aname);
                                 (l, h, desc)
                             } else {
                                 (0i64, packed_w as i64 - 1, true)
@@ -22684,6 +22695,79 @@ impl Simulator {
                             self.settle_combinatorial();
                         }
                         return;
+                    }
+                }
+                // `d[i] = new[n]` on an array of dynamic arrays (§7.5.1): the
+                // ELEMENT is the dynamic array. Only a bare-identifier lvalue ever
+                // got its size shadow written, so `d[i].size()` reported the
+                // backing buffer instead of `n`.
+                // `d[i] = new[n]` on an array of dynamic arrays (§7.5.1): the
+                // ELEMENT is the dynamic array. Only a bare-identifier lvalue ever
+                // got its size shadow written, so `d[i].size()` reported the
+                // 64-slot backing buffer instead of `n`.
+                if let ExprKind::Call { func, args: nargs } = &rvalue.kind {
+                    let is_new = matches!(&func.kind,
+                        ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new");
+                    if is_new && !nargs.is_empty() {
+                        if let Some(name) = self.flat_member_name(lvalue) {
+                            if name.ends_with(']') && self.module.dynamic_arrays.contains(&name) {
+                                let n = self.eval_expr(&nargs[0]).to_u64().unwrap_or(0);
+                                self.set_queue_size(&name, n);
+                                for i in 0..n {
+                                    self.set_signal_value_by_name(
+                                        &format!("{}[{}]", name, i),
+                                        Value::zero(32),
+                                    );
+                                }
+                                if !self.in_edge_block {
+                                    self.settle_combinatorial();
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+                // `s = q.pop_front()` on a queue of unpacked structs: the popped
+                // element's members must reach `s` before the queue shifts — a
+                // packed return value cannot carry them.
+                if let Some(dst) = self.flat_member_name(lvalue) {
+                    if let Some((obj, pop)) = self.queue_pop_call(rvalue) {
+                        if let Some(su) = self.queue_elem_struct(&obj) {
+                            let sz = self.get_queue_size(&obj);
+                            if sz > 0 {
+                                let idx = if pop == "pop_front" { 0 } else { sz - 1 };
+                                let src = format!("{}[{}]", obj, idx);
+                                self.copy_unpacked_struct(&dst, &src, &su);
+                            }
+                            self.eval_builtin_method(&obj, &pop, &[]);
+                            if !self.in_edge_block {
+                                self.settle_combinatorial();
+                            }
+                            return;
+                        }
+                    }
+                }
+                // IEEE 1800-2017 §7.2: assigning one unpacked struct to another
+                // copies every member. Their leaves live in separate signals, so
+                // evaluating the RHS to a packed value and storing it writes a
+                // container nobody ever reads — `y = x` left every member of `y`
+                // at X. Covers struct variables, array/queue elements and
+                // struct members, in any combination.
+                if let Some(dst) = self.flat_member_name(lvalue) {
+                    if let Some(dt) = self.p_elem_type(&dst) {
+                        if let DataType::Struct(su) = self.resolve_dt(&dt) {
+                            if Self::spreads_member_wise(&su) {
+                                if let Some(src) = self.flat_member_name(rvalue) {
+                                    if src != dst && self.struct_storage_exists(&src, &su) {
+                                        self.copy_unpacked_struct(&dst, &src, &su.clone());
+                                        if !self.in_edge_block {
+                                            self.settle_combinatorial();
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 // `collection[key] = new(...)`: a bare `new` assigned to an
@@ -23612,8 +23696,19 @@ impl Simulator {
                                     // Could be dynamic array new[size]
                                     if let Some(arg) = args.first() {
                                         let size = self.eval_expr(arg);
-                                        if let ExprKind::Ident(lhier) = &lvalue.kind {
-                                            let name = self.resolve_hier_name(lhier);
+                                        // `d = new[n]` and also `d[i] = new[n]` on an
+                                        // array of dynamic arrays — the element is the
+                                        // dynamic array, named flat as `d[i]`.
+                                        let target = match &lvalue.kind {
+                                            ExprKind::Ident(lhier) => {
+                                                Some(self.resolve_hier_name(lhier))
+                                            }
+                                            _ => {
+                                                let f = self.flat_member_name(lvalue);
+                                                f.filter(|n| self.module.dynamic_arrays.contains(n))
+                                            }
+                                        };
+                                        if let Some(name) = target {
                                             self.signals
                                                 .insert(format!("{}.size", name), size.clone());
                                         }
@@ -30380,6 +30475,18 @@ impl Simulator {
         }
     }
 
+    /// Whether `src` actually has per-member storage for `su` — guards against
+    /// treating an unrelated same-named scalar as a struct source.
+    fn struct_storage_exists(&self, src: &str, su: &crate::ast::types::StructUnionType) -> bool {
+        su.members.iter().any(|m| {
+            m.declarators.iter().any(|md| {
+                let leaf = format!("{}.{}", src, md.name.name);
+                self.signal_name_to_id.contains_key(leaf.as_str())
+                    || self.signals.contains_key(&leaf)
+            })
+        })
+    }
+
     /// Copy every leaf of an unpacked struct from `src` to `dst`.
     fn copy_unpacked_struct(
         &mut self,
@@ -30410,6 +30517,61 @@ impl Simulator {
                     }
                 }
             }
+        }
+    }
+
+    /// The unpacked-struct element type of queue `obj_name`, if it has one.
+    fn queue_elem_struct(&self, obj_name: &str) -> Option<crate::ast::types::StructUnionType> {
+        let dt = self.p_elem_type(obj_name)?;
+        match self.resolve_dt(&dt) {
+            DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
+            _ => None,
+        }
+    }
+
+    /// Move queue element `from` to `to`, member-wise when the element is an
+    /// unpacked struct (a single packed copy would lose every member).
+    fn queue_move_elem(&mut self, obj_name: &str, from: u64, to: u64) {
+        let (src, dst) = (
+            format!("{}[{}]", obj_name, from),
+            format!("{}[{}]", obj_name, to),
+        );
+        if let Some(su) = self.queue_elem_struct(obj_name) {
+            self.copy_unpacked_struct(&dst, &src, &su);
+            return;
+        }
+        if let Some(v) = self.get_signal_value_by_name(&src) {
+            self.set_signal_value_by_name(&dst, v);
+        }
+    }
+
+    /// `q.pop_front()` / `q.pop_back()` — the queue name and which end.
+    fn queue_pop_call(&mut self, e: &Expression) -> Option<(String, String)> {
+        let ExprKind::Call { func, .. } = &e.kind else { return None };
+        // `q.pop_front()` parses either as MemberAccess or — for a plain
+        // variable receiver — as a 2-segment hierarchical identifier.
+        let (obj, mname) = match &func.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                (self.flat_member_name(expr)?, member.name.clone())
+            }
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let mname = h.path.last()?.name.name.clone();
+                let obj = h.path[..h.path.len() - 1]
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                (obj, mname)
+            }
+            _ => return None,
+        };
+        if mname != "pop_front" && mname != "pop_back" {
+            return None;
+        }
+        if self.module.dynamic_arrays.contains(&obj) {
+            Some((obj, mname))
+        } else {
+            None
         }
     }
 
@@ -30624,6 +30786,24 @@ impl Simulator {
         Some((dt, arr))
     }
 
+    /// Remaining dimensions of a partially indexed multi-dimensional array
+    /// (`m[1]` of `int m[2][3]` still has one dimension left).
+    fn partial_index_dims(&self, name: &str) -> Option<Vec<(i64, i64)>> {
+        if !name.ends_with(']') {
+            return None;
+        }
+        let segs = Self::split_flat_path(name);
+        if segs.len() != 1 {
+            return None;
+        }
+        let (base, nidx) = &segs[0];
+        let dims = self.foreach_dims(base)?;
+        if *nidx == 0 || *nidx >= dims.len() {
+            return None;
+        }
+        Some(dims[*nidx..].to_vec())
+    }
+
     /// Element type recorded for `name`, or derived from its base when `name`
     /// is a flattened sub-path (`q[i]`, which has no declaration of its own).
     fn p_elem_type(&self, name: &str) -> Option<DataType> {
@@ -30673,6 +30853,12 @@ impl Simulator {
         // 1-D case was handled, so `int m[2][3]` printed `'{x, x}`.
         if self.module.arrays_2d.contains_key(name) || self.module.arrays_nd.contains_key(name) {
             let dims = self.foreach_dims(name)?;
+            let dt = self.p_elem_type(name)?;
+            return Some(self.render_p_dims(name, &dims, &dt));
+        }
+        // A PARTIAL index into one (`q3[1]` of `int q3[2][2][$]`) still names a
+        // sub-array: render the dimensions it has left.
+        if let Some(dims) = self.partial_index_dims(name) {
             let dt = self.p_elem_type(name)?;
             return Some(self.render_p_dims(name, &dims, &dt));
         }
@@ -31559,7 +31745,6 @@ impl Simulator {
         }
         if mname == "push_front" {
             if let Some(arg) = args.first() {
-                let val = self.queue_eval_arg(obj_name, arg);
                 let cur_size = self.get_queue_size(obj_name);
                 if let Some(&max) = self.module.queue_max_sizes.get(obj_name) {
                     if cur_size >= max as u64 {
@@ -31567,12 +31752,10 @@ impl Simulator {
                     }
                 }
                 for i in (0..cur_size).rev() {
-                    if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i))
-                    {
-                        self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i + 1), v);
-                    }
+                    self.queue_move_elem(obj_name, i, i + 1);
                 }
-                self.set_signal_value_by_name(&format!("{}[0]", obj_name), val);
+                let head = format!("{}[0]", obj_name);
+                self.queue_store_elem(obj_name, &head, arg);
                 self.set_queue_size(obj_name, cur_size + 1);
             }
             return Some(Value::zero(32));
@@ -31584,10 +31767,7 @@ impl Simulator {
                     .get_signal_value_by_name(&format!("{}[0]", obj_name))
                     .unwrap_or_else(|| Value::zero(32));
                 for i in 1..cur_size {
-                    if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i))
-                    {
-                        self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i - 1), v);
-                    }
+                    self.queue_move_elem(obj_name, i, i - 1);
                 }
                 self.set_queue_size(obj_name, cur_size - 1);
                 return Some(val);
