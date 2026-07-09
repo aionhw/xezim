@@ -2822,6 +2822,17 @@ impl Simulator {
         // instead. Clearing it here (rather than at end of construction) keeps
         // its ~one-long-name-string-plus-Signal-per-entry footprint out of the
         // peak-RSS window during the big array reserve.
+        // Snapshot array-element values before the map is dropped: the array
+        // builder below re-registers these names onto freshly zeroed slots.
+        let array_elem_inits: Vec<(String, Value)> = module
+            .signals
+            .iter()
+            .filter(|(k, _)| k.ends_with(']'))
+            .filter(|(k, _)| {
+                k.rsplit_once('[').map_or(false, |(b, _)| module.arrays.contains_key(b))
+            })
+            .map(|(k, s)| (k.clone(), s.value.clone()))
+            .collect();
         module.signals = Default::default();
         signal_table.reserve(array_elem_count);
         signal_widths_vec.reserve(array_elem_count);
@@ -2886,6 +2897,17 @@ impl Simulator {
                 signal_widths_vec.extend(std::iter::repeat(w).take(count));
                 signal_signed_vec.extend(std::iter::repeat(false).take(count));
                 signal_real_vec.extend(std::iter::repeat(false).take(count));
+            }
+        }
+        // An array whose elements already carry values from elaboration — an
+        // unpacked-array PARAMETER (`u32_t A[N] = {a, b}`, §6.20.2) — must keep
+        // them: the loops above zero-fill every element they create.
+        // Elements the loop above just zero-filled, but which carry a value from
+        // elaboration (an unpacked-array PARAMETER, §6.20.2): restore them. Their
+        // names were re-pointed at fresh array slots when the array was built.
+        for (nm, v) in array_elem_inits {
+            if let Some(&id) = signal_name_to_id.get(nm.as_str()) {
+                signal_table[id] = v;
             }
         }
         let arrays_1d_ms = phase_arrays_1d.elapsed().as_secs_f64() * 1000.0;
@@ -29978,13 +30000,20 @@ impl Simulator {
         for r in ranges {
             match &r.kind {
                 ExprKind::Range(lo, hi) => {
-                    let l = self.eval_expr(lo).to_i64().unwrap_or(0);
-                    let h = self.eval_expr(hi).to_i64().unwrap_or(l);
+                    let lov = self.eval_expr(lo);
+                    let hiv = self.eval_expr(hi);
+                    let l = lov.to_i64().unwrap_or(0);
+                    let h = hiv.to_i64().unwrap_or(l);
                     if h >= l {
-                        // Cap enumeration to keep it bounded.
-                        let n = (h - l + 1).min(4096);
-                        let pick = l + (self.rng.gen::<u64>() % n as u64) as i64;
-                        candidates.push(Value::from_u64(pick as u64, 32));
+                        // Pick uniformly over the WHOLE range. This is one
+                        // modulo, not an enumeration: a cap here would silently
+                        // shrink the legal value set (`[32'he000_0000 :
+                        // 32'he000_2000]` could never yield anything above
+                        // 32'he000_0fff).
+                        let span = (h as i128) - (l as i128) + 1;
+                        let pick = (l as i128) + (self.rng.gen::<u64>() as i128) % span;
+                        let w = lov.width.max(hiv.width).max(32);
+                        candidates.push(Value::from_u64(pick as u64, w));
                     }
                 }
                 ExprKind::Ident(h) => {
