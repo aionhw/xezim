@@ -29975,6 +29975,13 @@ impl Simulator {
         dims: &[crate::ast::types::UnpackedDimension],
     ) -> Option<Vec<i64>> {
         use crate::ast::types::UnpackedDimension as UD;
+        // `m[N]` (N a parameter) parses as an associative dim keyed by "type" N.
+        let dims = super::elaborate::normalize_unpacked_dims(
+            dims,
+            &self.module.parameters,
+            &self.module.typedef_types,
+        );
+        let dims = &dims[..];
         let p = Some(&self.module.parameters);
         match dims.first()? {
             UD::Expression { expr, .. } => {
