@@ -763,6 +763,15 @@ enum EdgeKind {
 /// mailbox. The next `put` drains this waiter, assigns its value into
 /// `lvalue`, and reschedules `cont` under `pid` at the current time.
 #[derive(Debug, Clone)]
+/// A process blocked in `semaphore.get(n)` because the count was below `n`
+/// (IEEE 1800-2017 §15.3.3). Woken by a `put` that raises the count enough.
+struct SemGetWaiter {
+    pid: usize,
+    /// Keys still required.
+    n: i64,
+    cont: Vec<Statement>,
+}
+
 struct MailboxGetWaiter {
     pid: usize,
     lvalue: Expression,
@@ -1988,6 +1997,8 @@ pub struct Simulator {
     /// statements. `put` drains a waiter, assigns the value into its lvalue,
     /// and re-schedules the continuation at the current time.
     mailbox_get_waiters: HashMap<usize, std::collections::VecDeque<MailboxGetWaiter>>,
+    /// Processes blocked in `semaphore.get()` on an under-full semaphore.
+    semaphore_get_waiters: HashMap<usize, std::collections::VecDeque<SemGetWaiter>>,
     /// LRM §15.5.3: per-named-event last-trigger time. `e.triggered`
     /// returns 1 iff this map's `time` matches the current simulation time
     /// (i.e. the event has been triggered in the same time slot as the
@@ -3211,6 +3222,7 @@ impl Simulator {
             cond_progress: 0,
             real_time: 0.0,
             mailbox_get_waiters: HashMap::default(),
+            semaphore_get_waiters: HashMap::default(),
             event_triggered_time: HashMap::default(),
             event_waiters: Vec::new(),
             cg_event_waiters: Vec::new(),
@@ -14870,7 +14882,7 @@ impl Simulator {
                         _ => (None, String::new()),
                     };
                     if (method == "get" || method == "peek") && !args.is_empty() {
-                        if let Some(recv) = recv_expr_opt {
+                        if let Some(recv) = recv_expr_opt.clone() {
                             let recv_val = self.eval_expr(&recv);
                             let handle = recv_val.to_u64().unwrap_or(0) as usize;
                             if let Some(q) = self.mailboxes.get(&handle) {
@@ -14892,6 +14904,30 @@ impl Simulator {
                                             cont,
                                             is_peek: method == "peek",
                                         });
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    // §15.3.3: blocking `semaphore.get(n)` on an under-full
+                    // semaphore. Park until a `put` raises the count enough; the
+                    // decrement happens at wake. A get that CAN proceed falls
+                    // through to the method handler, which decrements there.
+                    if method == "get" {
+                        if let Some(recv) = recv_expr_opt {
+                            let recv_val = self.eval_expr(&recv);
+                            let handle = recv_val.to_u64().unwrap_or(0) as usize;
+                            if let Some(&count) = self.semaphores.get(&handle) {
+                                let n = args
+                                    .first()
+                                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
+                                    .unwrap_or(1) as i64;
+                                if count < n {
+                                    let cont: Vec<Statement> = stmts[i + 1..].to_vec();
+                                    self.semaphore_get_waiters
+                                        .entry(handle)
+                                        .or_insert_with(std::collections::VecDeque::new)
+                                        .push_back(SemGetWaiter { pid, n, cont });
                                     return;
                                 }
                             }
@@ -25339,6 +25375,9 @@ impl Simulator {
                         for q in self.mailbox_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
                         }
+                        for q in self.semaphore_get_waiters.values_mut() {
+                            q.retain(|w| !to_kill.contains(&w.pid));
+                        }
                         self.release_killed_from_join_waiters(&to_kill);
                         return;
                     }
@@ -25352,6 +25391,9 @@ impl Simulator {
                         self.process_contexts.remove(&pid);
                         self.event_waiters.retain(|w| w.pid != pid);
                         for q in self.mailbox_get_waiters.values_mut() {
+                            q.retain(|w| w.pid != pid);
+                        }
+                        for q in self.semaphore_get_waiters.values_mut() {
                             q.retain(|w| w.pid != pid);
                         }
                         let mut killed: HashSet<usize> = HashSet::default();
@@ -25383,6 +25425,9 @@ impl Simulator {
                 }
                 self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
                 for q in self.mailbox_get_waiters.values_mut() {
+                    q.retain(|w| !to_kill.contains(&w.pid));
+                }
+                for q in self.semaphore_get_waiters.values_mut() {
                     q.retain(|w| !to_kill.contains(&w.pid));
                 }
                 // A killed process must no longer hold back a join waiter: drop
@@ -29077,6 +29122,38 @@ impl Simulator {
     /// putter's context writes the wrong frame, so the waiter reads a stale/null
     /// handle (item data=0). Swap to the waiter's saved context, assign, re-save,
     /// restore the putter's context, then schedule the continuation.
+    /// Wake processes parked in `semaphore.get()` now that the count rose,
+    /// FIFO and in order (§15.3.3): a waiter is served only when the FULL
+    /// count it needs is available, and it is NOT skipped in favour of a
+    /// later, smaller request — that would starve a large getter.
+    fn wake_semaphore_waiters(&mut self, handle: usize) {
+        loop {
+            let count = self.semaphores.get(&handle).copied().unwrap_or(0);
+            let next_n = self
+                .semaphore_get_waiters
+                .get(&handle)
+                .and_then(|q| q.front())
+                .map(|w| w.n);
+            match next_n {
+                Some(n) if count >= n => {
+                    let w = self
+                        .semaphore_get_waiters
+                        .get_mut(&handle)
+                        .unwrap()
+                        .pop_front()
+                        .unwrap();
+                    *self.semaphores.get_mut(&handle).unwrap() = count - n;
+                    if w.cont.is_empty() {
+                        self.child_finished(w.pid);
+                    } else {
+                        self.event_queue.schedule(self.time, w.pid, w.cont);
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+
     fn deliver_to_mailbox_waiter(
         &mut self,
         pid: usize,
@@ -37741,6 +37818,7 @@ impl Simulator {
                         .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
                         .unwrap_or(1) as i64;
                     *self.semaphores.get_mut(&handle).unwrap() += n;
+                    self.wake_semaphore_waiters(handle);
                     return Value::zero(32);
                 }
                 "get" => {

@@ -127,3 +127,47 @@ fn a_named_fork_block_can_be_disabled_from_another_process() {
     assert_eq!(u(&sim, "worker_finished") & 1, 0, "the worker was not disabled");
     assert_eq!(u(&sim, "end_time"), 200);
 }
+
+/// §15.3.3 — `semaphore.get(n)` on an under-full semaphore must BLOCK until a
+/// `put` supplies the keys. It used to return immediately having removed
+/// nothing, so a fork/join semaphore handoff never synchronised.
+const SEMAPHORE_BLOCK: &str = r#"
+module tb;
+  semaphore sem = new(0);
+  int got_time;
+  logic got;
+  initial begin got = 0; #10; sem.put(1); end
+  initial begin sem.get(1); got = 1; got_time = $time; end
+endmodule
+"#;
+
+/// A get that CAN proceed must not block; FIFO ordering among waiters.
+const SEMAPHORE_ORDER: &str = r#"
+module tb;
+  semaphore sem = new(2);
+  int a_time, b_time;
+  logic a_done, b_done;
+  initial begin
+    a_done = 0; b_done = 0;
+    // Two immediate gets: 2 keys available, both proceed at t=0.
+    sem.get(1); a_done = 1; a_time = $time;
+    sem.get(1); b_done = 1; b_time = $time;
+  end
+endmodule
+"#;
+
+#[test]
+fn semaphore_get_blocks_until_keys_are_available() {
+    let sim = simulate(SEMAPHORE_BLOCK, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "got") & 1, 1, "the blocking get never completed");
+    assert_eq!(u(&sim, "got_time"), 10, "get returned before the put supplied a key");
+}
+
+#[test]
+fn semaphore_get_does_not_block_when_keys_are_available() {
+    let sim = simulate(SEMAPHORE_ORDER, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "a_done") & 1, 1);
+    assert_eq!(u(&sim, "b_done") & 1, 1, "the second available get blocked");
+    assert_eq!(u(&sim, "a_time"), 0);
+    assert_eq!(u(&sim, "b_time"), 0, "an available get must proceed at once");
+}
