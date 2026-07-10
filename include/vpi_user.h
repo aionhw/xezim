@@ -1,244 +1,348 @@
 #ifndef VPI_USER_H
 #define VPI_USER_H
 
+/* VPI (Verilog Procedural Interface) — IEEE 1800-2017 Annex K.
+ *
+ * Every constant below is the value the standard assigns it, so a C
+ * file compiled against a vendor `vpi_user.h` and linked to xezim
+ * agrees with xezim about what `vpiIntVal` or `cbValueChange` means.
+ * An earlier version of this header invented its own numbering, which
+ * meant any such file silently took the wrong branch.
+ *
+ * xezim implements the subset declared at the bottom of this file.
+ * Functions the standard defines but xezim does not implement are NOT
+ * declared here: a call to one is a compile error, which is the loud
+ * failure we want, rather than a link-time surprise or a stub that
+ * silently returns nothing. Still absent: vpi_put_userdata /
+ * vpi_get_userdata, vpi_get_systf_info, vpi_handle_multi, the strength
+ * value format, and the delay/timing relations.
+ *
+ * A VPI module is loaded with `--vpi-lib <so>` (or `-m`), after which its
+ * `vlog_startup_routines` run once, before simulation. VPI is also callable
+ * from a DPI shared object loaded with `--dpi-lib`.
+ */
+
 #include <stdint.h>
 #include <stddef.h>
+#include <stdarg.h>
 
-/* Basic VPI types */
-typedef uint32_t VPI_UINT32;
-typedef int32_t VPI_INT32;
-typedef uint64_t VPI_UINT64;
-typedef int64_t VPI_INT64;
+/* PLI type definitions (IEEE 1800-2017 Annex K.1). */
+typedef int32_t  PLI_INT32;
+typedef uint32_t PLI_UINT32;
+typedef int64_t  PLI_INT64;
+typedef uint64_t PLI_UINT64;
+typedef char     PLI_BYTE8;
+typedef short    PLI_INT16;
+typedef unsigned short PLI_UINT16;
 
-/* Object types */
-#define vpiModule 1
-#define vpiPort 2
-#define vpiWire 3
-#define vpiReg 4
-#define vpiIntegerVar 5
-#define vpiRealVar 6
-#define vpiTimeVar 7
-#define vpiShortRealVar 8
-#define vpiMemoryWord 9
-#define vpiMemory 10
-#define vpiParameter 11
-#define vpiStructVar 12
-#define vpiUnionVar 13
-#define vpiClassVar 14
-#define vpiEnumVar 15
-#define vpiPackedArrayVar 16
-#define vpiArray 17
-#define vpiNet 18
-#define vpiBitVar 19
+/* vpiHandle — opaque handle to a simulation object. */
+typedef PLI_UINT32 *vpiHandle;
 
-/* vpiNetBit / vpiRegBit / vpiPartSelect / vpiBitSelect are the
- * indexed-element variants used by UVM's HDL polling to descend
- * into packed arrays and bit-selects of a parent vpiReg/vpiNet. */
-#ifndef vpiNetBit
-#define vpiNetBit       20
-#endif
-#ifndef vpiRegBit
-#define vpiRegBit       21
-#endif
-#ifndef vpiPartSelect
-#define vpiPartSelect   22
-#endif
-#ifndef vpiBitSelect
-#define vpiBitSelect    23
-#endif
+/* --- vpi_get(vpiType, ...) object types (Annex K, "Object types") ------
+ * Only the codes xezim can actually return are listed. `vpiLogicVar` is
+ * an alias of `vpiReg`, exactly as in the standard header. */
+#define vpiIntegerVar         25   /* integer variable */
+#define vpiIterator           27   /* iterator (vpi_iterate result) */
+#define vpiMemory             29   /* unpacked array */
+#define vpiMemoryWord         30   /* one word of an unpacked array */
+#define vpiModule             32
+#define vpiNet                36   /* scalar or vector net */
+#define vpiNetBit             37
+#define vpiParameter          41
+#define vpiPartSelect         42   /* part-select / packed-struct member */
+#define vpiRealVar            47   /* real variable */
+#define vpiReg                48   /* scalar or vector reg (4-state) */
+#define vpiRegBit             49
+#define vpiTimeVar            63
 
-/* vpiIntVar / vpiLongIntVar / vpiShortIntVar / vpiByteVar — the
- * `vpi_get(vpiType, ...)` codes returned for the corresponding
- * SystemVerilog variable types. Used by UVM's HDL polling to choose
- * its read-modify-write word size. */
-#ifndef vpiIntVar
-#define vpiIntVar       24
-#endif
-#ifndef vpiLongIntVar
-#define vpiLongIntVar   25
-#endif
-#ifndef vpiShortIntVar
-#define vpiShortIntVar  26
-#endif
-#ifndef vpiByteVar
-#define vpiByteVar      27
-#endif
-#ifndef vpiArrayVar
-#define vpiArrayVar     28
-#endif
-#ifndef vpiArrayNet
-#define vpiArrayNet     29
-#endif
-#ifndef vpiClassVar
-#define vpiClassVar     30
-#endif
+#define vpiConstant            7   /* a literal / computed argument value */
+#define vpiSysFuncCall        56
+#define vpiSysTaskCall        57
 
-/* Format codes for vpi_get_value / vpi_put_value */
-#define vpiBinStrVal    1
-#define vpiOctStrVal    2
-#define vpiDecStrVal    3
-#define vpiHexStrVal    4
-#define vpiStringVal    5
-#define vpiRealVal      6
-#define vpiVectorVal    7
-#define vpiNullVal      8
-#define vpiScalarVal    9
-#define vpiIntVal       10
-#define vpiLogicVal     11
-#define vpiObjTypeVal   12
-#define vpiVector4Val   13
-#define vpiSmallIntVal  14
-#define vpiLongIntVal   15
-#define vpiShortIntVal  16
-#define vpiByteVal      17
-#define vpiWordVal      18
-#define vpiShortWordVal 19
+/* Traversal relations. */
+#define vpiScope              84   /* containing scope */
+#define vpiSysTfCall          85   /* the $systf call now executing */
+#define vpiArgument           89   /* argument of a $systf call */
+#define vpiInternalScope      92   /* internal scopes of a module */
+#define vpiVariables         100   /* variables declared in a module */
 
-/* Flags for vpi_put_value (IEEE 1800-2017 Table 38-44). */
-#define vpiNoDelay              1
-#define vpiInertialDelay        2
-#define vpiTransportDelay       3
-#define vpiPureTransportDelay   4
-#define vpiForceFlag            5
-#define vpiReleaseFlag          6
-#define vpiCancelForce          7
+/* vpi_get(vpiFuncType, sysTfCallHandle) -> the sysfunctype it was registered with. */
+#define vpiFuncType           44
+#define vpiSysFuncType        vpiFuncType
+/* SystemVerilog object types (IEEE 1800-2017 sv_vpi_user.h). */
+#define vpiLongIntVar        610
+#define vpiShortIntVar       611
+#define vpiIntVar            612
+#define vpiShortRealVar      613
+#define vpiByteVar           614
+#define vpiStringVar         616
+#define vpiEnumVar           617
+#define vpiStructVar         618
+#define vpiUnionVar          619
+#define vpiBitVar            620   /* 2-state bit variable */
+#define vpiLogicVar         vpiReg /* 4-state logic variable */
 
-/* vpi_get codes */
-#define vpiType               1
-#define vpiName               2
-#define vpiFullName           3
-#define vpiSize               4
-#define vpiSigned             5
-#define vpiLeftRange          6
-#define vpiRightRange         7
-#define vpiHighConn           8
-#define vpiLowConn            9
-#define vpiScalar             10
-#define vpiVector             11
-#define vpiTableEntry         13
+/* --- vpi_get_value / vpi_put_value format codes (Table 38-44) --------- */
+#define vpiBinStrVal           1
+#define vpiOctStrVal           2
+#define vpiDecStrVal           3
+#define vpiHexStrVal           4
+#define vpiScalarVal           5
+#define vpiIntVal              6
+#define vpiRealVal             7
+#define vpiStringVal           8
+#define vpiVectorVal           9
+#define vpiStrengthVal        10   /* not supported by xezim */
+#define vpiTimeVal            11
+#define vpiObjTypeVal         12
+#define vpiSuppressVal        13
 
-/* VPI time types */
-#define vpiSimTime            0
-#define vpiScaledRealTime     1
-#define vpiSuppressTime       2
+/* --- vpiScalarVal codes ----------------------------------------------- */
+#define vpi0                   0
+#define vpi1                   1
+#define vpiZ                   2
+#define vpiX                   3
+#define vpiH                   4
+#define vpiL                   5
+#define vpiDontCare            6
 
-/* s_vpi_vecval - vector value representation. Layout-compatible
- * with svLogicVecVal (IEEE 1800 §35.5.5) so UVM's HDL backdoor can
- * memcpy between the two without per-field translation. */
+/* --- vpi_put_value flags ---------------------------------------------- */
+#define vpiNoDelay             1
+#define vpiInertialDelay       2
+#define vpiTransportDelay      3
+#define vpiPureTransportDelay  4
+#define vpiForceFlag           5
+#define vpiReleaseFlag         6
+
+/* --- vpi_get properties ----------------------------------------------- */
+#define vpiUndefined         (-1)
+#define vpiType                1
+#define vpiName                2
+#define vpiFullName            3
+#define vpiSize                4
+#define vpiDefName             9   /* module definition name */
+#define vpiScalar             17
+#define vpiVector             18
+#define vpiSigned             65
+
+/* --- vpi_time types --------------------------------------------------- */
+#define vpiScaledRealTime      1
+#define vpiSimTime             2
+#define vpiSuppressTime        3
+
+/* --- vpi_control operations ------------------------------------------- */
+#define vpiStop               66   /* ends the run, like $stop */
+#define vpiFinish             67   /* ends the run, like $finish */
+#define vpiReset              68   /* NOT supported: xezim cannot rewind */
+
+/* --- vpi_chk_error severity levels and states ------------------------- */
+#define vpiNotice              1
+#define vpiWarning             2
+#define vpiError               3
+#define vpiSystem              4
+#define vpiInternal            5
+#define vpiCompile             1
+#define vpiPLI                 2
+#define vpiRun                 3
+
+/* --- callback reasons (Table 38-49) ----------------------------------- */
+#define cbValueChange          1
+#define cbStartOfReset        19
+#define cbEndOfReset          20
+
+/* s_vpi_vecval — 4-state vector element (IEEE 1800-2017 §38.10.1).
+ * Layout-compatible with svLogicVecVal (§35.5.5), so UVM's HDL backdoor
+ * can assign between the two without translation.
+ *
+ * Bit encoding, per element bit i:
+ *     aval bval   value
+ *       0    0      0
+ *       1    0      1
+ *       0    1      Z
+ *       1    1      X
+ */
 typedef struct t_vpi_vecval {
-    VPI_UINT32 aval;
-    VPI_UINT32 bval;
+    PLI_INT32 aval;
+    PLI_INT32 bval;
 } s_vpi_vecval, *p_vpi_vecval;
 
-/* vpiSuppressVal — "don't actually write; just compute". UVM's
- * vpi_get_value call uses this to fetch the current 4-state vector
- * without forcing a recompute. */
-#ifndef vpiSuppressVal
-#define vpiSuppressVal  1
-#endif
-
-/* vpi0 / vpi1 — 4-state scalar values used in vpi_get_value with
- * vpiScalarVal format (returned by vpi_get with vpiScalar property).
- * UVM's HDL polling toggle detector compares against these. */
-#ifndef vpi0
-#define vpi0  0
-#endif
-#ifndef vpi1
-#define vpi1  1
-#endif
-#ifndef vpiX
-#define vpiX  2
-#endif
-#ifndef vpiZ
-#define vpiZ  3
-#endif
-
-/* s_vpi_value - value structure */
-typedef struct t_vpi_value {
-    int format;
-    union {
-        VPI_INT32 integer;
-        double real;
-        VPI_UINT64 time;
-        char* str;
-        struct t_vpi_vecval* vector;
-        VPI_UINT32 scalar;
-        VPI_INT64 longint;
-    } value;
-} s_vpi_value, *p_vpi_value;
-
-/* s_vpi_time - time structure */
+/* s_vpi_time — time value. */
 typedef struct t_vpi_time {
-    int type;
-    VPI_UINT32 high;
-    VPI_UINT32 low;
+    PLI_INT32 type;    /* vpiSimTime / vpiScaledRealTime / vpiSuppressTime */
+    PLI_UINT32 high;
+    PLI_UINT32 low;
     double real;
 } s_vpi_time, *p_vpi_time;
 
-/* vpiHandle - opaque handle to simulation objects */
-typedef void* vpiHandle;
+/* s_vpi_value — value in one of the formats above. */
+typedef struct t_vpi_value {
+    PLI_INT32 format;
+    union {
+        PLI_BYTE8            *str;
+        PLI_INT32             scalar;
+        PLI_INT32             integer;
+        double                real;
+        struct t_vpi_time    *time;
+        struct t_vpi_vecval  *vector;
+        PLI_BYTE8            *misc;
+    } value;
+} s_vpi_value, *p_vpi_value;
 
-/* VPI function declarations */
-vpiHandle vpi_handle_by_name(char* name, void* scope);
-/* PLI typedefs — IEEE 1800 §38 uses these for portable integer widths.
- * xezim's Rust side stores them as plain `isize`/`i64`, so we mirror
- * them to the host's natural widths. */
-#ifndef PLI_INT32
-#define PLI_INT32 int
-#endif
-#ifndef PLI_INT64
-#define PLI_INT64 long long
-#endif
-#ifndef PLI_UINT32
-#define PLI_UINT32 unsigned int
-#endif
-#ifndef PLI_BYTE8
-#define PLI_BYTE8 signed char
-#endif
-
-/* --- minimal s_vpi_vlog_info for vpi_get_vlog_info --- */
+/* s_vpi_vlog_info — tool identification, filled by vpi_get_vlog_info. */
 typedef struct t_vpi_vlog_info {
-    int argc;
-    char **argv;
-    char *product;
-    char *version;
+    PLI_INT32   argc;
+    PLI_BYTE8 **argv;
+    PLI_BYTE8  *product;
+    PLI_BYTE8  *version;
 } s_vpi_vlog_info, *p_vpi_vlog_info;
 
-/* VPI callback reason codes (subset). */
-#define cbValueChange        6
-#define cbStartOfReset      15
-
-/* s_cb_data - matches IEEE 1800 §38.7. Used by vpi_register_cb and
- * by the value-change dispatcher in simulator.rs. The cb_rtn
- * signature is `PLI_INT32 (*)(p_cb_data)` per the IEEE standard
- * (UVM's polling framework relies on the cb_data argument).
- * Forward-declare to allow the function pointer field to reference
- * p_cb_data without an ordering trap. */
+/* s_cb_data — callback registration and dispatch (IEEE 1800-2017 §38.7). */
 typedef struct t_cb_data s_cb_data, *p_cb_data;
 struct t_cb_data {
-    int           reason;
-    PLI_INT32   (*cb_rtn)(p_cb_data cb_data_p);
-    vpiHandle     obj;
-    p_vpi_time    time;
-    p_vpi_value   value;
-    void         *user_data;
+    PLI_INT32    reason;
+    PLI_INT32  (*cb_rtn)(p_cb_data cb_data_p);
+    vpiHandle    obj;
+    p_vpi_time   time;
+    p_vpi_value  value;
+    PLI_INT32    index;
+    PLI_BYTE8   *user_data;
 };
 
-vpiHandle vpi_handle(vpiHandle object, int type);
-int vpi_get(int property, vpiHandle object);
-void vpi_get_value(vpiHandle object, p_vpi_value value_p);
-vpiHandle vpi_put_value(vpiHandle object, p_vpi_value value_p, p_vpi_time time_p, int flags);
-int vpi_free_object(vpiHandle object);
-void *vpi_register_cb(p_cb_data cb_data_p);
-int vpi_remove_cb(void *cb);
-int vpi_get_vlog_info(p_vpi_vlog_info info_p);
+/* ---------------------------------------------------------------------
+ * Implemented by xezim. Signatures match IEEE 1800-2017 Annex K exactly.
+ * ------------------------------------------------------------------ */
 
-/* DPI scope/runtime primitives are declared in svdpi.h with their
- * proper `svScope` opaque-pointer type. vpi_user.h historically
- * forward-declared them as `void *` (a holdover from the Accellera
- * vpi_compatibility.h shim) but those older declarations conflict
- * with svdpi.h's typed ones when both are included. Including
- * svdpi.h here resolves the symbol with the correct type. */
+/* Resolve a hierarchical name. `scope` is ignored (xezim resolves against
+ * the flat signal table); pass NULL. Returns NULL if the name does not
+ * name a signal. Tries the full name, then each successively shorter
+ * suffix, so "top.dut.sig", "dut.sig" and "sig" all resolve. */
+vpiHandle vpi_handle_by_name(PLI_BYTE8 *name, vpiHandle scope);
+
+/* One-to-one traversal. Only vpiScope is modelled: the containing scope of
+ * an object, or the parent of a module. As an xezim extension,
+ * vpi_handle(vpiScope, NULL) returns the top module — the standard route is
+ * vpi_scan(vpi_iterate(vpiModule, NULL)), but enough code spells it the
+ * short way that supporting it is worth more than returning NULL. Any other
+ * relation returns NULL. */
+vpiHandle vpi_handle(PLI_INT32 type, vpiHandle refHandle);
+
+/* One-to-many traversal. Returns NULL when the relation yields nothing.
+ * Supported for a module reference: vpiModule and vpiInternalScope (child
+ * instances), vpiNet, vpiReg, vpiVariables, vpiParameter, vpiMemory.
+ * With a NULL reference, vpiModule yields the single top module. */
+vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle refHandle);
+
+/* Hand out the next object. When the iterator is exhausted it returns NULL
+ * and FREES the iterator (IEEE 1800-2017 section 38.32) — do not free it
+ * yourself. */
+vpiHandle vpi_scan(vpiHandle iterator);
+
+/* Select one word of a vpiMemory object. NULL if out of range. */
+vpiHandle vpi_handle_by_index(vpiHandle object, PLI_INT32 index);
+
+/* vpiName, vpiFullName, and vpiDefName (modules only). Returns NULL for any
+ * other property. The string is simulator-owned and valid until the next
+ * vpi_get_str call on this thread. */
+PLI_BYTE8 *vpi_get_str(PLI_INT32 property, vpiHandle object);
+
+/* Formatted output, interleaved with $display. */
+int vpi_printf(PLI_BYTE8 *format, ...);
+int vpi_vprintf(PLI_BYTE8 *format, va_list ap);
+int vpi_mcd_printf(PLI_UINT32 mcd, PLI_BYTE8 *format, ...);
+
+/* Register a system task or function. `tfname` must begin with '$', and
+ * `type` must be vpiSysTask or vpiSysFunc. `compiletf` runs immediately
+ * before `calltf` on each call — xezim has no separate compile phase for it.
+ *
+ * A vpiSysFunc is dispatched when its `$name` appears in an expression. It
+ * returns whatever it deposits with vpi_put_value on its own call handle
+ * (vpi_handle(vpiSysTfCall, NULL)); a function that deposits nothing returns
+ * 0. `sizetf` is called once per invocation for vpiSizedFunc/vpiSizedSignedFunc
+ * to learn the return width; the other sysfunctypes size themselves. */
+typedef struct t_vpi_systf_data {
+    PLI_INT32   type;         /* vpiSysTask or vpiSysFunc */
+    PLI_INT32   sysfunctype;  /* vpi[Int,Real,Time,Sized,SizedSigned]Func */
+    PLI_BYTE8  *tfname;       /* first character must be '$' */
+    PLI_INT32 (*calltf)(PLI_BYTE8 *);
+    PLI_INT32 (*compiletf)(PLI_BYTE8 *);
+    PLI_INT32 (*sizetf)(PLI_BYTE8 *);
+    PLI_BYTE8  *user_data;
+} s_vpi_systf_data, *p_vpi_systf_data;
+
+#define vpiSysTask             1
+#define vpiSysFunc             2
+#define vpiIntFunc             1
+#define vpiRealFunc            2
+#define vpiTimeFunc            3
+#define vpiSizedFunc           4
+#define vpiSizedSignedFunc     5
+
+vpiHandle vpi_register_systf(p_vpi_systf_data systf_data_p);
+
+/* s_vpi_error_info — filled by vpi_chk_error. `message` and `product` point at
+ * simulator-owned storage valid until the next vpi_chk_error call. */
+typedef struct t_vpi_error_info {
+    PLI_INT32  state;    /* vpiCompile / vpiPLI / vpiRun */
+    PLI_INT32  level;    /* vpiNotice / vpiWarning / vpiError / ... */
+    PLI_BYTE8 *message;
+    PLI_BYTE8 *product;
+    PLI_BYTE8 *code;
+    PLI_BYTE8 *file;
+    PLI_INT32  line;
+} s_vpi_error_info, *p_vpi_error_info;
+
+/* Reports the last VPI diagnostic and CLEARS it, returning its severity level,
+ * or 0 when nothing has failed since the previous call. `error_info_p` may be
+ * NULL if you only want the level. This is the way to notice that a
+ * vpi_get_value / vpi_put_value / vpi_register_* call did not do what you
+ * asked — most of them cannot report failure any other way. */
+PLI_INT32 vpi_chk_error(p_vpi_error_info error_info_p);
+
+/* vpiStop and vpiFinish end the run, like $stop / $finish; both accept the
+ * usual diagnostic-level argument, which xezim ignores. vpiReset is rejected.
+ * Returns 1 on success, 0 on failure (see vpi_chk_error). */
+PLI_INT32 vpi_control(PLI_INT32 operation, ...);
+
+/* The entry point xezim calls for every `--vpi-lib` module: a NULL-terminated
+ * array of registration routines (IEEE 1800-2017 section 38.2). Define it in
+ * your VPI module; do not call it yourself. */
+extern void (*vlog_startup_routines[])(void);
+
+/* Returns vpiUndefined (-1) for a property xezim does not model.
+ * Supported: vpiType, vpiSize, vpiSigned, vpiScalar, vpiVector. */
+PLI_INT32 vpi_get(PLI_INT32 property, vpiHandle object);
+
+/* On success, fills *value_p in the requested format. On failure — a bad
+ * handle, or a format xezim cannot supply — sets value_p->format to
+ * vpiSuppressVal and writes nothing else (IEEE 1800-2017 §38.16), which
+ * is the ONLY way a caller can detect the failure. Always check it.
+ *
+ * For vpiVectorVal, vpiStringVal, the *StrVal formats and vpiTimeVal, the
+ * returned pointer addresses simulator-owned storage that is valid only
+ * until the next vpi_get_value call on this thread. Copy it out. */
+void vpi_get_value(vpiHandle expr, p_vpi_value value_p);
+
+/* Writes value_p to the object. flags selects vpiNoDelay (immediate),
+ * vpiForceFlag or vpiReleaseFlag; the delay flags behave as vpiNoDelay
+ * because xezim has no VPI event scheduling. Returns NULL. A format
+ * xezim cannot decode writes nothing and warns. */
+vpiHandle vpi_put_value(vpiHandle object, p_vpi_value value_p,
+                        p_vpi_time time_p, PLI_INT32 flags);
+
+PLI_INT32 vpi_free_object(vpiHandle object);
+PLI_INT32 vpi_release_handle(vpiHandle object);
+PLI_INT32 vpi_get_vlog_info(p_vpi_vlog_info vlog_info_p);
+
+/* Only cbValueChange and cbStartOfReset are dispatched. Any other reason
+ * is rejected with a NULL return rather than silently accepted. When a
+ * cbValueChange fires, cb_data_p->obj, ->time and ->value are populated;
+ * ->value uses the format of the value struct supplied at registration
+ * (vpiIntVal if none was given). */
+vpiHandle vpi_register_cb(p_cb_data cb_data_p);
+PLI_INT32 vpi_remove_cb(vpiHandle cb_obj);
+
+/* DPI scope/runtime primitives live in svdpi.h with their proper
+ * `svScope` type. Included here so both are visible together. */
 #include "svdpi.h"
 
 #endif /* VPI_USER_H */

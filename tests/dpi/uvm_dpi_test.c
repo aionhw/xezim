@@ -149,7 +149,7 @@ void *uvm_dpi_test_register_value_change(const char *signal_name,
     cb.reason = cbValueChange;
     cb.cb_rtn = uvm_dpi_test_value_change_cb;
     cb.obj = h;
-    cb.user_data = cookie;
+    cb.user_data = (PLI_BYTE8 *)cookie;
     void *reg = vpi_register_cb(&cb);
     // We intentionally keep `h` and `cookie` alive for the duration
     // of the test; in real UVM these are owned by the polling

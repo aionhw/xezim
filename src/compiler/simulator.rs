@@ -72,6 +72,24 @@ pub fn set_dpi_libs(paths: &[String]) {
     }
 }
 
+fn vpi_lib_paths() -> &'static Mutex<Vec<String>> {
+    static VPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    VPI_LIB_PATHS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// `--vpi-lib`: shared objects loaded as VPI modules. Each one's
+/// `vlog_startup_routines` runs once, before simulation, so it can
+/// register system tasks with `vpi_register_systf`.
+pub fn set_vpi_libs(paths: &[String]) {
+    if let Ok(mut guard) = vpi_lib_paths().lock() {
+        *guard = paths.to_vec();
+    }
+}
+
+fn configured_vpi_libs() -> Vec<String> {
+    vpi_lib_paths().lock().map(|g| g.clone()).unwrap_or_default()
+}
+
 fn configured_dpi_libs() -> Vec<String> {
     dpi_lib_paths()
         .lock()
@@ -234,28 +252,14 @@ macro_rules! write_sig {
                 __list.filter(|v| !v.is_empty()).cloned()
             };
             if let Some(__cbs) = __maybe_cbs {
-                // ACTIVE_SIMULATOR is a thread-local; we set it for
-                // any VPI code that re-enters the simulator (none
-                // currently does, but the convention is preserved).
-                // Extract the pointer BEFORE entering the closure so
-                // the borrow checker doesn't see the closure capture
-                // as a second self-borrow.
-                ACTIVE_SIMULATOR.with(|cell| {
-                    cell.set(std::ptr::null_mut()); // see below
-                });
-                for __cb in __cbs {
-                    type __CbFn = extern "C" fn(*mut s_cb_data);
-                    let __cb_routine = __cb.cb_routine as *const ();
-                    let __cb_fn: __CbFn = unsafe { std::mem::transmute(__cb_routine) };
-                    let __cb_data = s_cb_data {
-                        reason: 6, /* cbValueChange */
-                        cb_rtn: std::ptr::null_mut(),
-                        obj: std::ptr::null_mut(),
-                        time: std::ptr::null_mut(),
-                        value: std::ptr::null_mut(),
-                        user_data: __cb.user_data as *mut libc::c_void,
-                    };
-                    __cb_fn(&__cb_data as *const s_cb_data as *mut s_cb_data);
+                // Each of these is a read of a DISTINCT field, so they
+                // coexist with whatever mutable field-borrow the expansion
+                // site already holds. Re-borrowing `$self` whole would not.
+                let __sim_ptr: *mut Simulator = $self.vpi_self_ptr;
+                let __now: u64 = $self.time;
+                let __val: Option<Value> = $self.signal_table.get(__wsig_id).cloned();
+                for __cb in &__cbs {
+                    dispatch_vpi_cb(__sim_ptr, __now, __val.clone(), __cb, vpi::CB_VALUE_CHANGE);
                 }
             }
         }
@@ -760,6 +764,15 @@ enum EdgeKind {
 /// mailbox. The next `put` drains this waiter, assigns its value into
 /// `lvalue`, and reschedules `cont` under `pid` at the current time.
 #[derive(Debug, Clone)]
+/// A process blocked in `semaphore.get(n)` because the count was below `n`
+/// (IEEE 1800-2017 §15.3.3). Woken by a `put` that raises the count enough.
+struct SemGetWaiter {
+    pid: usize,
+    /// Keys still required.
+    n: i64,
+    cont: Vec<Statement>,
+}
+
 struct MailboxGetWaiter {
     pid: usize,
     lvalue: Expression,
@@ -1217,6 +1230,9 @@ struct TaskCleanup {
     output_bindings: Vec<(String, crate::ast::expr::Expression)>,
     assoc_params: Vec<(String, String)>,
     array_params: Vec<String>,
+    /// `(formal, actual, lo, hi)` for an `output`/`inout`/`ref` ARRAY formal:
+    /// its elements are copied back to the caller's array on return.
+    array_writebacks: Vec<(String, String, i64, i64)>,
     saved_break: bool,
     saved_continue: bool,
     saved_return: bool,
@@ -1688,6 +1704,13 @@ pub struct Simulator {
     /// consults the top frame so `vif.member` resolves to `bus.member`.
     /// Popped at task return.
     local_iface_aliases: Vec<HashMap<String, String>>,
+    /// While a `with (item...)` filter is being evaluated over a queue whose
+    /// elements are unpacked STRUCTS, `item` names no value — the element's
+    /// members live in separate signals. Bind it to the element's flat name
+    /// (`q[3]`) so `item.field` reads `q[3].field`. Checked at the eval sites,
+    /// before `resolve_hier_name`, whose per-node cache would freeze the first
+    /// element's binding for the whole sort.
+    item_alias: Option<String>,
     /// LRM §18.5.4 dist-pick-once tracking (per-randomize scope). Records
     /// `(handle, prop_name)` pairs for which a weighted `dist` constraint
     /// has already drawn one sample in the current randomize call. The
@@ -1929,6 +1952,16 @@ pub struct Simulator {
     rs_return_flag: bool,
     /// SV-2023: target named block for `disable <name>` propagation.
     disable_target: Option<String>,
+    /// Label of a process-level named block (`initial begin : worker`) -> its
+    /// pid, so `disable worker` from another process can terminate it.
+    disable_labels: HashMap<String, usize>,
+    /// A named `fork : blk ... join*` maps to the processes it spawned, so
+    /// `disable blk` can terminate them (§9.6.2). Without this, disabling a
+    /// join_none fork block — which has already returned — unwound the
+    /// DISABLING process instead, dropping its continuation.
+    fork_block_children: HashMap<String, HashSet<usize>>,
+    /// Associative arrays already warned about an x/z index.
+    warned_assoc_index: HashSet<String>,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
     killed_pids: HashSet<usize>,
     /// Names of init-declared (automatic) `for`-loop variables that — because
@@ -1965,6 +1998,8 @@ pub struct Simulator {
     /// statements. `put` drains a waiter, assigns the value into its lvalue,
     /// and re-schedules the continuation at the current time.
     mailbox_get_waiters: HashMap<usize, std::collections::VecDeque<MailboxGetWaiter>>,
+    /// Processes blocked in `semaphore.get()` on an under-full semaphore.
+    semaphore_get_waiters: HashMap<usize, std::collections::VecDeque<SemGetWaiter>>,
     /// LRM §15.5.3: per-named-event last-trigger time. `e.triggered`
     /// returns 1 iff this map's `time` matches the current simulation time
     /// (i.e. the event has been triggered in the same time slot as the
@@ -2335,6 +2370,14 @@ pub struct Simulator {
     dpi_value_change_cbs: HashMap<usize, Vec<DpiCbHandle>>,
     /// Registered start-of-reset callbacks. Fired at simulation start.
     dpi_reset_cbs: Vec<DpiCbHandle>,
+    /// Self-pointer, installed once at the top of `simulate()`. The
+    /// `write_sig!` macro needs a `*mut Simulator` to hand the VPI
+    /// callback dispatcher, but it expands in contexts that already hold
+    /// a mutable borrow of another field, so it cannot re-borrow `self`.
+    /// Reading this field is disjoint from those borrows. Without it the
+    /// macro used to install a NULL `ACTIVE_SIMULATOR`, so a callback that
+    /// called back into VPI aborted the process.
+    vpi_self_ptr: *mut Simulator,
     /// Callback cursor for the per-callback iteration loop
     /// (`vpi_register_cb` may also be called with `cbValueChange` to
     /// mark a scope's reset triggers; we keep a flag set for that).
@@ -2823,6 +2866,17 @@ impl Simulator {
         // instead. Clearing it here (rather than at end of construction) keeps
         // its ~one-long-name-string-plus-Signal-per-entry footprint out of the
         // peak-RSS window during the big array reserve.
+        // Snapshot array-element values before the map is dropped: the array
+        // builder below re-registers these names onto freshly zeroed slots.
+        let array_elem_inits: Vec<(String, Value)> = module
+            .signals
+            .iter()
+            .filter(|(k, _)| k.ends_with(']'))
+            .filter(|(k, _)| {
+                k.rsplit_once('[').map_or(false, |(b, _)| module.arrays.contains_key(b))
+            })
+            .map(|(k, s)| (k.clone(), s.value.clone()))
+            .collect();
         module.signals = Default::default();
         signal_table.reserve(array_elem_count);
         signal_widths_vec.reserve(array_elem_count);
@@ -2887,6 +2941,17 @@ impl Simulator {
                 signal_widths_vec.extend(std::iter::repeat(w).take(count));
                 signal_signed_vec.extend(std::iter::repeat(false).take(count));
                 signal_real_vec.extend(std::iter::repeat(false).take(count));
+            }
+        }
+        // An array whose elements already carry values from elaboration — an
+        // unpacked-array PARAMETER (`u32_t A[N] = {a, b}`, §6.20.2) — must keep
+        // them: the loops above zero-fill every element they create.
+        // Elements the loop above just zero-filled, but which carry a value from
+        // elaboration (an unpacked-array PARAMETER, §6.20.2): restore them. Their
+        // names were re-pointed at fresh array slots when the array was built.
+        for (nm, v) in array_elem_inits {
+            if let Some(&id) = signal_name_to_id.get(nm.as_str()) {
+                signal_table[id] = v;
             }
         }
         let arrays_1d_ms = phase_arrays_1d.elapsed().as_secs_f64() * 1000.0;
@@ -3072,6 +3137,7 @@ impl Simulator {
             uvm_id_counts: std::collections::BTreeMap::new(),
             tlm_connections: HashMap::default(),
             local_iface_aliases: Vec::new(),
+            item_alias: None,
             dist_picked_once: HashSet::default(),
             class_statics: HashMap::default(),
             current_spec: None,
@@ -3146,6 +3212,9 @@ impl Simulator {
             return_flag: false,
             rs_return_flag: false,
             disable_target: None,
+            disable_labels: HashMap::default(),
+            fork_block_children: HashMap::default(),
+            warned_assoc_index: HashSet::default(),
             killed_pids: HashSet::default(),
             auto_loop_vars: Vec::new(),
             ref_binding_stack: Vec::new(),
@@ -3154,6 +3223,7 @@ impl Simulator {
             cond_progress: 0,
             real_time: 0.0,
             mailbox_get_waiters: HashMap::default(),
+            semaphore_get_waiters: HashMap::default(),
             event_triggered_time: HashMap::default(),
             event_waiters: Vec::new(),
             cg_event_waiters: Vec::new(),
@@ -3306,6 +3376,7 @@ impl Simulator {
             dpi_scopes: HashMap::default(),
             dpi_value_change_cbs: HashMap::default(),
             dpi_reset_cbs: Vec::new(),
+            vpi_self_ptr: std::ptr::null_mut(),
             dpi_pending_reset_fired: false,
             file_handles: HashMap::default(),
             ungetc_buf: HashMap::default(),
@@ -3332,6 +3403,18 @@ impl Simulator {
         }
         sim.load_dpi_libraries();
         sim.bind_all_dpi_imports();
+        // VPI modules register their $systf's before simulation starts. The
+        // startup routines run with ACTIVE_SIMULATOR set, so a routine that
+        // resolves a handle sees a built design.
+        let vpi_paths = configured_vpi_libs();
+        if !vpi_paths.is_empty() {
+            let self_ptr = &mut sim as *mut Simulator;
+            ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
+            let mut libs = std::mem::take(&mut sim.dpi_libraries);
+            vpi_run_startup_routines(&mut libs, &vpi_paths);
+            sim.dpi_libraries = libs;
+            ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
+        }
         sim
     }
 
@@ -6175,6 +6258,10 @@ impl Simulator {
             .chain(initial_blocks.into_iter())
         {
             let scope = ib.scope;
+            let block_label = match &ib.stmt.kind {
+                StatementKind::SeqBlock { name, .. } => name.as_ref().map(|n| n.name.clone()),
+                _ => None,
+            };
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
                 other => vec![Statement::new(other, ib.stmt.span)],
@@ -6193,6 +6280,9 @@ impl Simulator {
             self.next_pid += 1;
             if !scope.is_empty() {
                 self.process_scope_hint.insert(pid, scope);
+            }
+            if let Some(l) = block_label {
+                self.disable_labels.insert(l, pid);
             }
             self.event_queue.schedule(0, pid, stmts);
         }
@@ -8662,6 +8752,7 @@ impl Simulator {
         if !self.compiled {
             self.compile();
         }
+        self.vpi_self_ptr = self as *mut Simulator;
         // Fire cbStartOfReset callbacks exactly once at simulation
         // start. UVM's polling framework uses this hook to clear its
         // pending-change lists; we expose it because the upstream
@@ -8669,20 +8760,9 @@ impl Simulator {
         // call expects a fire at simulation time 0.
         if !self.dpi_reset_cbs.is_empty() && !self.dpi_pending_reset_fired {
             let self_ptr = self as *mut Simulator;
-            ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
-            for cb in self.dpi_reset_cbs.clone() {
-                type CbFn = extern "C" fn(*mut s_cb_data);
-                let cb_routine = cb.cb_routine as *const ();
-                let cb_fn: CbFn = unsafe { std::mem::transmute(cb_routine) };
-                let cb_data = s_cb_data {
-                    reason: 15, /* cbStartOfReset */
-                    cb_rtn: std::ptr::null_mut(),
-                    obj: std::ptr::null_mut(),
-                    time: std::ptr::null_mut(),
-                    value: std::ptr::null_mut(),
-                    user_data: cb.user_data as *mut libc::c_void,
-                };
-                cb_fn(&cb_data as *const s_cb_data as *mut s_cb_data);
+            let now = self.time;
+            for cb in &self.dpi_reset_cbs.clone() {
+                dispatch_vpi_cb(self_ptr, now, None, cb, vpi::CB_START_OF_RESET);
             }
             self.dpi_pending_reset_fired = true;
         }
@@ -8954,6 +9034,77 @@ impl Simulator {
     /// from `classify_always_blocks` so the lazy-prefix streaming path (#7)
     /// can materialize one PendingAlways at a time and feed it through here
     /// without staging the full materialized vec.
+    /// Whether a body READS something it also WRITES (`cnt++`, `x = x + 1`).
+    /// Such a block is not idempotent, so re-running it on every settle
+    /// iteration — as the comb path does — diverges: each run dirties its own
+    /// input and schedules another, up to `settle_limit`.
+    fn body_is_self_referential(stmt: &Statement) -> bool {
+        fn base_of(e: &Expression) -> Option<&str> {
+            match &e.kind {
+                ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => base_of(expr),
+                _ => None,
+            }
+        }
+        /// Does `e` read a variable whose base name is `target`?
+        fn reads_name(e: &Expression, target: &str) -> bool {
+            match &e.kind {
+                ExprKind::Ident(h) => h.path.last().map_or(false, |s| s.name.name == target),
+                ExprKind::Paren(i) => reads_name(i, target),
+                ExprKind::Unary { operand, .. } => reads_name(operand, target),
+                ExprKind::Binary { left, right, .. } => {
+                    reads_name(left, target) || reads_name(right, target)
+                }
+                ExprKind::Conditional { condition, then_expr, else_expr } => {
+                    reads_name(condition, target)
+                        || reads_name(then_expr, target)
+                        || reads_name(else_expr, target)
+                }
+                ExprKind::Index { expr, index } => {
+                    reads_name(expr, target) || reads_name(index, target)
+                }
+                ExprKind::RangeSelect { expr, left, right, .. } => {
+                    reads_name(expr, target)
+                        || reads_name(left, target)
+                        || reads_name(right, target)
+                }
+                ExprKind::MemberAccess { expr, .. } => reads_name(expr, target),
+                ExprKind::Concatenation(parts) => parts.iter().any(|p| reads_name(p, target)),
+                ExprKind::Replication { count, exprs } => {
+                    reads_name(count, target) || exprs.iter().any(|p| reads_name(p, target))
+                }
+                ExprKind::Call { args, .. } => args.iter().any(|a| reads_name(a, target)),
+                ExprKind::SystemCall { args, .. } => args.iter().any(|a| reads_name(a, target)),
+                _ => false,
+            }
+        }
+        fn walk(st: &Statement) -> bool {
+            match &st.kind {
+                // `cnt++` / `--cnt` read and write the same variable.
+                StatementKind::Expr(e) => matches!(
+                    &e.kind,
+                    ExprKind::Unary { op, .. }
+                        if matches!(op, UnaryOp::PreIncr | UnaryOp::PreDecr
+                                       | UnaryOp::PostIncr | UnaryOp::PostDecr)
+                ),
+                StatementKind::BlockingAssign { lvalue, rvalue }
+                | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+                    let Some(target) = base_of(lvalue) else { return false };
+                    reads_name(rvalue, target)
+                }
+                StatementKind::SeqBlock { stmts, .. } => stmts.iter().any(walk),
+                StatementKind::If { then_stmt, else_stmt, .. } => {
+                    walk(then_stmt) || else_stmt.as_ref().map_or(false, |e| walk(e))
+                }
+                StatementKind::TimingControl { stmt, .. } => walk(stmt),
+                _ => false,
+            }
+        }
+        walk(stmt)
+    }
+
     fn classify_one_always_block(&mut self, ab: AlwaysBlock) -> Option<AlwaysBlock> {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
@@ -8974,7 +9125,14 @@ impl Simulator {
                         || n.strip_prefix(&top_prefix)
                             .map_or(false, |b| self.module.events.contains(b))
                 });
-                if all_level && !has_named_event {
+                // A body that reads what it writes (`always @(s) cnt++;`) is
+                // not idempotent: the comb-settle path re-runs it on every
+                // settle iteration, including the ones its own writes caused, so
+                // it executed settle_limit (100) times instead of once per
+                // change of `s`. Route those through the edge path, which fires
+                // exactly on a change of a listed signal.
+                let self_ref = Self::body_is_self_referential(&body);
+                if all_level && !has_named_event && !self_ref {
                     return Some(AlwaysBlock {
                         kind: ab.kind,
                         stmt: body,
@@ -14814,7 +14972,7 @@ impl Simulator {
                         _ => (None, String::new()),
                     };
                     if (method == "get" || method == "peek") && !args.is_empty() {
-                        if let Some(recv) = recv_expr_opt {
+                        if let Some(recv) = recv_expr_opt.clone() {
                             let recv_val = self.eval_expr(&recv);
                             let handle = recv_val.to_u64().unwrap_or(0) as usize;
                             if let Some(q) = self.mailboxes.get(&handle) {
@@ -14836,6 +14994,30 @@ impl Simulator {
                                             cont,
                                             is_peek: method == "peek",
                                         });
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    // §15.3.3: blocking `semaphore.get(n)` on an under-full
+                    // semaphore. Park until a `put` raises the count enough; the
+                    // decrement happens at wake. A get that CAN proceed falls
+                    // through to the method handler, which decrements there.
+                    if method == "get" {
+                        if let Some(recv) = recv_expr_opt {
+                            let recv_val = self.eval_expr(&recv);
+                            let handle = recv_val.to_u64().unwrap_or(0) as usize;
+                            if let Some(&count) = self.semaphores.get(&handle) {
+                                let n = args
+                                    .first()
+                                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
+                                    .unwrap_or(1) as i64;
+                                if count < n {
+                                    let cont: Vec<Statement> = stmts[i + 1..].to_vec();
+                                    self.semaphore_get_waiters
+                                        .entry(handle)
+                                        .or_insert_with(std::collections::VecDeque::new)
+                                        .push_back(SemGetWaiter { pid, n, cont });
                                     return;
                                 }
                             }
@@ -14997,43 +15179,36 @@ impl Simulator {
                 ..
             } = &stmt.kind
             {
-                // Evaluate the condition ONCE. The chosen branch is cloned so
-                // no borrow into `stmt` is held past this point (we may call
-                // &mut self below). Crucially, if the branch is non-blocking we
-                // must execute it here and advance — NOT fall through to the
-                // generic `exec_statement(stmt)` at the bottom of the loop,
-                // which would re-evaluate `condition` and re-run any
-                // side-effecting call it contains. This is what broke UVM
-                // 2020.3.1's uvm_sequence_base::start: its re-entry guard
-                //   if (m_sequence_state_mutex.try_get(1) == 0) ...
-                // was evaluated twice (1st procured the semaphore, 2nd found
-                // it empty) → false SEQ_NOT_DONE "already started" fatal at
-                // t=0, killing the whole simulation before the first clock.
-                let cond_true = self.eval_expr(condition).is_true();
-                let chosen: Option<Statement> = if cond_true {
-                    Some((**then_stmt).clone())
-                } else {
-                    else_stmt.as_ref().map(|b| (**b).clone())
-                };
-                if let Some(branch) = chosen {
-                    if self.stmt_is_blocking(&branch) {
-                        let branch_stmts: Vec<Statement> = match &branch.kind {
-                            StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
-                            _ => vec![branch.clone()],
-                        };
-                        let mut cont = branch_stmts;
-                        cont.extend_from_slice(&stmts[i + 1..]);
-                        self.run_process_stmts(pid, &cont);
-                        return;
+                // `if (e matches p)` binds pattern variables, which only
+                // `exec_statement` does; evaluating it here would produce the
+                // match result without the bindings. Leave it alone.
+                if !matches!(condition.kind, ExprKind::Matches { .. }) {
+                    // The condition is evaluated EXACTLY ONCE. Deciding whether
+                    // the chosen branch blocks used to evaluate it here and then
+                    // fall through to `exec_statement`, which evaluated it again
+                    // — so any side effect in an `if` condition (`$random()`,
+                    // `$urandom()`, a VPI `$systf`, `i++`) happened twice.
+                    let chosen: Option<&Statement> = if self.eval_expr(condition).is_true() {
+                        Some(then_stmt.as_ref())
                     } else {
-                        // Non-blocking branch: condition already evaluated,
-                        // run it synchronously and advance.
-                        self.exec_statement(&branch);
-                        i += 1;
-                        continue;
+                        else_stmt.as_ref().map(|b| b.as_ref())
+                    };
+                    match chosen {
+                        Some(branch) if self.stmt_is_blocking(branch) => {
+                            let branch_stmts: Vec<Statement> = match &branch.kind {
+                                StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                                _ => vec![branch.clone()],
+                            };
+                            let mut cont = branch_stmts;
+                            cont.extend_from_slice(&stmts[i + 1..]);
+                            self.run_process_stmts(pid, &cont);
+                            return;
+                        }
+                        // Run the branch we already selected, rather than
+                        // re-entering the whole `if`.
+                        Some(branch) => self.exec_statement(branch),
+                        None => {}
                     }
-                } else {
-                    // Condition false with no else: nothing to execute.
                     i += 1;
                     continue;
                 }
@@ -15153,11 +15328,15 @@ impl Simulator {
             if let StatementKind::ParBlock {
                 stmts: sub_stmts,
                 join_type,
+                name: block_name,
                 ..
             } = &stmt.kind
             {
+                // Fork-block declarations run in THIS process first (§9.3.2), so
+                // the children snapshot them instead of racing over them.
+                let (spawnable, saved_auto_len) = self.exec_fork_block_decls(sub_stmts);
                 let mut child_pids = HashSet::default();
-                for s in sub_stmts {
+                for s in spawnable {
                     let pid_child = self.next_pid;
                     self.next_pid += 1;
                     self.process_parents.insert(pid_child, pid);
@@ -15167,8 +15346,18 @@ impl Simulator {
                         .schedule(self.time, pid_child, vec![s.clone()]);
                     child_pids.insert(pid_child);
                 }
+                self.auto_loop_vars.truncate(saved_auto_len);
+                if let Some(nm) = block_name {
+                    self.fork_block_children.insert(nm.name.clone(), child_pids.clone());
+                }
 
-                if *join_type == JoinType::JoinNone {
+                // An empty fork (or one whose only items were declarations)
+                // has nothing to wait for and completes at once, whatever the
+                // join type. A JoinWaiter is re-checked only when a child
+                // finishes, so a waiter with no children would never fire —
+                // `fork join` with an empty body used to drop the entire
+                // continuation.
+                if *join_type == JoinType::JoinNone || child_pids.is_empty() {
                     // Continue immediately
                     i += 1;
                     continue;
@@ -17223,7 +17412,7 @@ impl Simulator {
                         Value::from_f64(val.to_f64())
                     }
                 } else if val.is_real {
-                    Value::from_u64(val.to_f64() as u64, width)
+                    Self::real_to_int(val.to_f64(), width)
                 } else {
                     val.resize(width)
                 };
@@ -18103,7 +18292,7 @@ impl Simulator {
                             Value::from_f64(val.to_f64())
                         }
                     } else if val.is_real {
-                        Value::from_u64(val.to_f64() as u64, width)
+                        Self::real_to_int(val.to_f64(), width)
                     } else {
                         val.resize(width)
                     };
@@ -18707,9 +18896,16 @@ impl Simulator {
                     }
                     // Check 'this' properties
                     if let Some(Some(handle)) = self.this_stack.last() {
-                        if let Some(Some(instance)) = self.heap.get_mut(*handle) {
-                            if instance.properties.contains_key(name) {
-                                instance.properties.insert(name.clone(), val.clone());
+                        let handle = *handle;
+                        let holds = self
+                            .heap
+                            .get(handle)
+                            .and_then(|o| o.as_ref())
+                            .is_some_and(|i| i.properties.contains_key(name));
+                        if holds {
+                            let fitted = self.fit_class_prop(handle, name, val);
+                            if let Some(Some(instance)) = self.heap.get_mut(handle) {
+                                instance.properties.insert(name.clone(), fitted);
                                 return true;
                             }
                         }
@@ -18748,7 +18944,10 @@ impl Simulator {
                             if let Some((_, off, w)) =
                                 fields.iter().find(|(m, _, _)| m == &sub).cloned()
                             {
-                                if let Some(cur_sig) = self.get_signal_value_by_name(obj_name) {
+                                // The container may be a procedural LOCAL (a
+                                // packed struct declared inside a task), which
+                                // `get/set_signal_value_by_name` cannot see.
+                                if let Some(cur_sig) = self.get_local_or_signal(obj_name) {
                                     let total_w = cur_sig.width;
                                     let mut cur = cur_sig.resize(total_w);
                                     let piece = val.resize(w);
@@ -18756,9 +18955,9 @@ impl Simulator {
                                         let bit = piece.get_bit(i as usize);
                                         cur.set_bit((off + i) as usize, bit);
                                     }
-                                    let prev = self.get_signal_value_by_name(obj_name);
+                                    let prev = self.get_local_or_signal(obj_name);
                                     let changed = prev.as_ref() != Some(&cur);
-                                    self.set_signal_value_by_name(obj_name, cur);
+                                    self.set_local_or_signal(obj_name, cur);
                                     return changed;
                                 }
                             }
@@ -18792,7 +18991,7 @@ impl Simulator {
                                     }
                                 } else {
                                     if val.is_real {
-                                        Value::from_u64(val.to_f64() as u64, width)
+                                        Self::real_to_int(val.to_f64(), width)
                                     } else {
                                         val.resize(width)
                                     }
@@ -18814,9 +19013,15 @@ impl Simulator {
                             }
                             let member_name = &hier.path[i].name.name;
                             if i == hier.path.len() - 1 {
-                                if let Some(Some(inst)) = self.heap.get_mut(cur_handle) {
-                                    if inst.properties.contains_key(member_name) {
-                                        inst.properties.insert(member_name.clone(), val.clone());
+                                let holds = self
+                                    .heap
+                                    .get(cur_handle)
+                                    .and_then(|o| o.as_ref())
+                                    .is_some_and(|inst| inst.properties.contains_key(member_name));
+                                if holds {
+                                    let fitted = self.fit_class_prop(cur_handle, member_name, val);
+                                    if let Some(Some(inst)) = self.heap.get_mut(cur_handle) {
+                                        inst.properties.insert(member_name.clone(), fitted);
                                         return true;
                                     }
                                 }
@@ -18880,7 +19085,7 @@ impl Simulator {
                             }
                         } else {
                             if val.is_real {
-                                Value::from_u64(val.to_f64() as u64, width)
+                                Self::real_to_int(val.to_f64(), width)
                             } else {
                                 val.resize(width)
                             }
@@ -18912,7 +19117,7 @@ impl Simulator {
                         val.clone()
                     } else {
                         if val.is_real {
-                            Value::from_u64(val.to_f64() as u64, width)
+                            Self::real_to_int(val.to_f64(), width)
                         } else {
                             val.resize(width)
                         }
@@ -18970,7 +19175,7 @@ impl Simulator {
                     }
                 } else {
                     if val.is_real {
-                        Value::from_u64(val.to_f64() as u64, width)
+                        Self::real_to_int(val.to_f64(), width)
                     } else {
                         val.resize(width)
                     }
@@ -19006,6 +19211,23 @@ impl Simulator {
                 changed
             }
             ExprKind::Index { expr, index } => {
+                // Element of an unpacked ARRAY OF QUEUES: `q[i][k] = v` writes
+                // element k of the queue `q[i]` (§7.4.5), not a bit of a scalar.
+                if let Some(qn) = self.indexed_queue_base(expr) {
+                    let k = self.eval_expr(index).to_i64().unwrap_or(0);
+                    let elem = format!("{}[{}]", qn, k);
+                    let prev = self.get_signal_value_by_name(&elem);
+                    let changed = prev.as_ref() != Some(val);
+                    self.set_signal_value_by_name(&elem, val.clone());
+                    return changed;
+                }
+                // `a[i][key] = v` on an array of associative arrays.
+                if let Some(elem) = self.indexed_assoc_elem(expr, index) {
+                    let prev = self.get_signal_value_by_name(&elem);
+                    let changed = prev.as_ref() != Some(val);
+                    self.set_signal_value_by_name(&elem, val.clone());
+                    return changed;
+                }
                 // Ascending packed vector bit-write (`logic [0:7] pa; pa[i]=b`):
                 // label i targets internal bit (W-1)-i (LRM §7.4.1, §11.5.1).
                 if let ExprKind::Ident(h) = &expr.kind {
@@ -19163,6 +19385,13 @@ impl Simulator {
                         name = scoped;
                     }
                     let idx_val = self.eval_expr(index);
+                    // §7.8.2: an associative index containing x/z is invalid.
+                    // The write is ignored (with a warning) — it must not fold
+                    // the unknown bits away and clobber a real element.
+                    if self.is_associative_array(&name) && idx_val.has_xz() {
+                        self.warn_invalid_assoc_index(&name);
+                        return false;
+                    }
                     let idx_str = if self.is_associative_array(&name) {
                         self.assoc_key_str(&name, &idx_val)
                     } else {
@@ -19925,7 +20154,7 @@ impl Simulator {
                         let mut resized = if self.signal_real[id] {
                             if val.is_real { val.clone() } else { Value::from_f64(val.to_f64()) }
                         } else if val.is_real {
-                            Value::from_u64(val.to_f64() as u64, width)
+                            Self::real_to_int(val.to_f64(), width)
                         } else {
                             val.resize(width)
                         };
@@ -19943,15 +20172,19 @@ impl Simulator {
                         if let Some((_, off, w)) =
                             fields.iter().find(|(m, _, _)| *m == member.name).cloned()
                         {
-                            if let Some(cur_sig) = self.get_signal_value_by_name(&pflat) {
+                            // The container may be a procedural LOCAL: a packed
+                            // struct declared inside a task lives in the call
+                            // frame, not the signal table, so a member write
+                            // reached nothing and the struct read back as X.
+                            if let Some(cur_sig) = self.get_local_or_signal(&pflat) {
                                 let total_w = cur_sig.width;
                                 let mut cur = cur_sig.resize(total_w);
                                 let piece = val.resize(w);
                                 for i in 0..w {
                                     cur.set_bit((off + i) as usize, piece.get_bit(i as usize));
                                 }
-                                let changed = Some(&cur) != Some(&cur_sig);
-                                self.set_signal_value_by_name(&pflat, cur);
+                                let changed = cur != cur_sig;
+                                self.set_local_or_signal(&pflat, cur);
                                 return changed;
                             }
                         }
@@ -20256,7 +20489,7 @@ impl Simulator {
                                 }
                             } else {
                                 if val.is_real {
-                                    Value::from_u64(val.to_f64() as u64, width)
+                                    Self::real_to_int(val.to_f64(), width)
                                 } else {
                                     val.resize(width)
                                 }
@@ -20327,6 +20560,34 @@ impl Simulator {
                 val
             }
             ExprKind::Ident(hier) => {
+                // §7.3.2 tagged-union member read (`t.Valid`).
+                if hier.path.len() == 2 {
+                    let base = hier.path[0].name.name.as_str();
+                    if self.active_union_tag.contains_key(base) {
+                        let (base, member) =
+                            (base.to_string(), hier.path[1].name.name.clone());
+                        if let Some(v) = self.tagged_union_member(&base, &member) {
+                            return v;
+                        }
+                    }
+                }
+                // `item.field` inside a `with` filter over a struct queue.
+                if hier.path.len() >= 2 {
+                    if let Some(alias) = self.item_alias.clone() {
+                        if hier.path[0].name.name == "item" {
+                            let rest = hier.path[1..]
+                                .iter()
+                                .map(|s| s.name.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(".");
+                            if let Some(v) =
+                                self.get_signal_value_by_name(&format!("{}.{}", alias, rest))
+                            {
+                                return v;
+                            }
+                        }
+                    }
+                }
                 // Unpacked-struct member path (e.g. `t_unpacked_struct.val_r`)
                 // is pre-registered as a separate signal by elaboration.
                 // Prefer the separate-signal read so VPI-forced values stay
@@ -20829,6 +21090,20 @@ impl Simulator {
                 }
             }
             ExprKind::Binary { op, left, right } => {
+                // §11.4.5: equality on unpacked structs is member-wise.
+                if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
+                    if let Some(v) = self.compare_unpacked_structs(left, right) {
+                        return if matches!(op, BinaryOp::Eq) {
+                            v
+                        } else if v.has_unknown() {
+                            v
+                        } else if v.to_u64() == Some(1) {
+                            Value::zero(1)
+                        } else {
+                            Value::ones(1)
+                        };
+                    }
+                }
                 // Short-circuit evaluation for logical operators (IEEE §11.3.5)
                 if matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr) {
                     let l = self.eval_expr_ctx(left, ctx_width);
@@ -21187,6 +21462,22 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // Element of an unpacked ARRAY OF QUEUES: `q[i][k]` selects
+                // element k of the queue `q[i]` (§7.4.5). Without this the base
+                // resolves to a scalar and `[k]` becomes a bit-select.
+                if let Some(qn) = self.indexed_queue_base(expr) {
+                    let k = self.eval_expr(index).to_i64().unwrap_or(0);
+                    return self
+                        .get_signal_value_by_name(&format!("{}[{}]", qn, k))
+                        .unwrap_or_else(|| Value::new(32));
+                }
+                // Element of an unpacked array of ASSOCIATIVE arrays:
+                // `a[i][key]` looks the key up in the assoc array `a[i]`.
+                if let Some(elem) = self.indexed_assoc_elem(expr, index) {
+                    return self
+                        .get_signal_value_by_name(&elem)
+                        .unwrap_or_else(|| Value::new(32));
+                }
                 // Ascending packed vector bit-select (`logic [0:7] pa; pa[i]`):
                 // label i is the MSB end, so it reads internal bit (W-1)-i
                 // (LRM §7.4.1, §11.5.1). Whole-value storage is normal.
@@ -21334,6 +21625,12 @@ impl Simulator {
                                     return v;
                                 }
                             }
+                        }
+                        // §7.8.2: reading with an x/z index yields the element
+                        // type's default rather than folding to another key.
+                        if self.is_associative_array(&name) && idx_val.has_xz() {
+                            self.warn_invalid_assoc_index(&name);
+                            return Value::zero(ctx_width.max(1));
                         }
                         let idx_str = if self.is_associative_array(&name) {
                             self.assoc_key_str(&name, &idx_val)
@@ -21519,6 +21816,12 @@ impl Simulator {
                 };
                 result
             }
+            // §12.6 `e matches p` used as a plain boolean.
+            ExprKind::Matches { expr, pattern } => {
+                let mut binds: Vec<(String, Value)> = Vec::new();
+                let ok = self.match_pattern(expr, pattern, &mut binds);
+                return if ok { Value::ones(1) } else { Value::zero(1) };
+            }
             ExprKind::Inside { expr, ranges } => {
                 let val = self.eval_expr(expr);
                 for r in ranges {
@@ -21540,14 +21843,19 @@ impl Simulator {
                                     if let Some(ev) = self
                                         .get_signal_value_by_name(&format!("{}[{}]", nm, i))
                                     {
-                                        if val == ev {
+                                        if val.wildcard_eq(&ev).is_true() {
                                             return Value::from_u64(1, 1);
                                         }
                                     }
                                 }
                                 continue;
                             }
-                            if val == self.eval_expr(r) {
+                            // §11.4.13: a set element is compared with the
+                            // tested expression using WILDCARD equality, so x/z
+                            // bits in the element are don't-cares — exactly what
+                            // `==?` does. Plain `==` missed `v inside {4'b10xx}`.
+                            let ev = self.eval_expr(r);
+                            if val.wildcard_eq(&ev).is_true() {
                                 return Value::from_u64(1, 1);
                             }
                         }
@@ -21719,6 +22027,67 @@ impl Simulator {
                     } else {
                         Value::zero(32)
                     }
+                }
+                // §28.8 internal helpers emitted by `resolve_bidirectional_switches`.
+                //
+                // `$__wres(a, b)` — wired-net resolution, bit by bit: a `z`
+                // yields to a driven value, equal values pass through, and
+                // anything else (a 0/1 conflict, or an `x`) gives `x`.
+                "$__wres" => {
+                    if args.len() < 2 {
+                        return Value::new(1);
+                    }
+                    let a = self.eval_expr(&args[0]);
+                    let b = self.eval_expr(&args[1]);
+                    let w = a.width.max(b.width).max(1);
+                    let mut out = Value::zero(w);
+                    for i in 0..w as usize {
+                        out.set_bit(i, Self::wire_resolve_bit(a.get_bit(i), b.get_bit(i)));
+                    }
+                    return out;
+                }
+                // `$__tranif(own_self, own_other, ctl, active)` — the value of
+                // THIS terminal of a bidirectional switch.
+                "$__tranif" => {
+                    if args.len() < 4 {
+                        return Value::new(1);
+                    }
+                    let me = self.eval_expr(&args[0]);
+                    let other = self.eval_expr(&args[1]);
+                    let ctl = self.eval_expr(&args[2]);
+                    let active_high = self.eval_expr(&args[3]).get_bit(0) == LogicBit::One;
+                    let w = me.width.max(other.width).max(1);
+                    // The switch conducts when the control matches its polarity.
+                    let cb = ctl.get_bit(0);
+                    let conducting = match (cb, active_high) {
+                        (LogicBit::One, true) | (LogicBit::Zero, false) => Some(true),
+                        (LogicBit::Zero, true) | (LogicBit::One, false) => Some(false),
+                        _ => None, // x/z control
+                    };
+                    let mut out = Value::zero(w);
+                    for i in 0..w as usize {
+                        let (m, o) = (me.get_bit(i), other.get_bit(i));
+                        let bit = match conducting {
+                            Some(true) => Self::wire_resolve_bit(m, o),
+                            Some(false) => m,
+                            // An unknown control isolates or connects: a bit
+                            // that agrees either way passes, one that differs
+                            // is unknown.
+                            None => {
+                                if m == o {
+                                    m
+                                } else if m == LogicBit::Z {
+                                    // z here means "whatever the other side is,
+                                    // if connected" -> unknown.
+                                    LogicBit::X
+                                } else {
+                                    LogicBit::X
+                                }
+                            }
+                        };
+                        out.set_bit(i, bit);
+                    }
+                    return out;
                 }
                 "$signed" => {
                     let mut v = args
@@ -21930,7 +22299,7 @@ impl Simulator {
                         .first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
-                    Value::from_u64(v.to_f64() as u64, 32)
+                    Self::real_trunc_to_int(v.to_f64(), 32)
                 }
                 "$ceil" => {
                     let v = args
@@ -22028,19 +22397,28 @@ impl Simulator {
                     if let Some(arg) = args.first() {
                         if let ExprKind::Ident(hier) = &arg.kind {
                             let aname = self.resolve_hier_name(hier);
-                            let has_unpacked = self.module.arrays.contains_key(&aname);
-                            let packed_w = if has_unpacked {
-                                self.module.arrays[&aname].2
-                            } else if let Some(&id) = self.signal_name_to_id.get(aname.as_str()) {
-                                self.signal_widths[id]
-                            } else {
-                                0
-                            };
+                            // §20.7: EVERY unpacked dimension counts, not just
+                            // the first — `int m[2][3]` has two, `int n[2][3][4]`
+                            // three. Only the 1-D table was consulted.
+                            let unpacked_dim =
+                                self.foreach_dims(&aname).map_or(0, |d| d.len()) as u64;
                             if name == "$unpacked_dimensions" {
-                                return Value::from_u64(if has_unpacked { 1 } else { 0 }, 32);
+                                return Value::from_u64(unpacked_dim, 32);
                             }
-                            let packed_dim: u64 = if packed_w > 1 { 1 } else { 0 };
-                            let unpacked_dim: u64 = if has_unpacked { 1 } else { 0 };
+                            let elem_w = self
+                                .module
+                                .arrays
+                                .get(&aname)
+                                .map(|&(_, _, w)| w)
+                                .or_else(|| self.module.arrays_2d.get(&aname).map(|&(_, _, w)| w))
+                                .or_else(|| self.module.arrays_nd.get(&aname).map(|(_, w)| *w))
+                                .or_else(|| {
+                                    self.signal_name_to_id
+                                        .get(aname.as_str())
+                                        .map(|&id| self.signal_widths[id])
+                                })
+                                .unwrap_or(0);
+                            let packed_dim: u64 = if elem_w > 1 { 1 } else { 0 };
                             let total = packed_dim + unpacked_dim;
                             return Value::from_u64(total.max(1), 32);
                         }
@@ -22056,17 +22434,28 @@ impl Simulator {
                     if let Some(arg) = args.first() {
                         if let ExprKind::Ident(hier) = &arg.kind {
                             let aname = self.resolve_hier_name(hier);
-                            let unpacked = self.module.arrays.get(&aname).cloned();
-                            let packed_w = if let Some((_, _, w)) = unpacked {
+                            // Every unpacked dimension, outermost first. Only the
+                            // 1-D table was consulted, so `$size(m, 2)` — and even
+                            // `$size(m)` on a 2-D/N-D array — returned 0.
+                            let dims = self.foreach_dims(&aname);
+                            let elem_w = self
+                                .module
+                                .arrays
+                                .get(&aname)
+                                .map(|&(_, _, w)| w)
+                                .or_else(|| self.module.arrays_2d.get(&aname).map(|&(_, _, w)| w))
+                                .or_else(|| self.module.arrays_nd.get(&aname).map(|(_, w)| *w));
+                            let packed_w = if let Some(w) = elem_w {
                                 w
                             } else if let Some(&id) = self.signal_name_to_id.get(aname.as_str()) {
                                 self.signal_widths[id]
                             } else {
                                 0
                             };
-                            let (lo, hi, descending) = if unpacked.is_some() && dim == 1 {
-                                let (l, h, _) = unpacked.unwrap();
-                                let desc = self.module.descending_arrays.contains(&aname);
+                            let sel = dims.as_ref().and_then(|d| d.get(dim.saturating_sub(1)));
+                            let (lo, hi, descending) = if let Some(&(l, h)) = sel {
+                                let desc = dim == 1
+                                    && self.module.descending_arrays.contains(&aname);
                                 (l, h, desc)
                             } else {
                                 (0i64, packed_w as i64 - 1, true)
@@ -22230,6 +22619,12 @@ impl Simulator {
                     }
                     Value::zero(32)
                 }
+                // A `$name` a VPI module registered as a system FUNCTION.
+                // Checked last so a builtin always wins.
+                _ if vpi_systf_is_func(name) => {
+                    let self_ptr = self as *mut Simulator;
+                    vpi_call_systf(self_ptr, name, args).unwrap_or_else(|| Value::zero(32))
+                }
                 _ => Value::zero(32),
             },
             ExprKind::This => {
@@ -22240,16 +22635,41 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // §7.3.2 tagged-union member read (`t.Valid`).
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 && self.active_union_tag.contains_key(&h.path[0].name.name)
+                    {
+                        let (base, m) = (h.path[0].name.name.clone(), member.name.clone());
+                        if let Some(v) = self.tagged_union_member(&base, &m) {
+                            return v;
+                        }
+                    }
+                }
+                // `item.field` / `item.inner.field` inside a `with` filter over a
+                // struct queue. Fold the whole receiver chain, then swap the
+                // `item` prefix for the element's flat name.
+                if let Some(alias) = self.item_alias.clone() {
+                    if let Some(base_flat) = self.flat_member_name(expr) {
+                        if base_flat == "item" || base_flat.starts_with("item.") {
+                            let rest = &base_flat["item".len()..];
+                            let name = format!("{}{}.{}", alias, rest, member.name);
+                            if let Some(v) = self.get_signal_value_by_name(&name) {
+                                return v;
+                            }
+                        }
+                    }
+                }
                 // Mirror of the unpacked-aggregate write path in `assign_value`:
                 // a flattened leaf (`arr[i].m`, `c.nodes[i].m`) reads its own
                 // signal; a nested PACKED member (`arr[i].tag.vlan`) slices its
                 // parent's signal. Packed scalars keep the bit-slice paths below.
                 if let Some(base_flat) = self.flat_member_name(expr) {
                     let flat = format!("{}.{}", base_flat, member.name);
-                    if self.signal_name_to_id.contains_key(flat.as_str()) {
-                        if let Some(v) = self.get_signal_value_by_name(&flat) {
-                            return v;
-                        }
+                    // A leaf may live in the compact table OR the runtime map (a
+                    // LOCAL unpacked-struct array element is only in the latter),
+                    // so consult both — `sa[1].a` read 0 while `%p` showed 2.
+                    if let Some(v) = self.get_signal_value_by_name(&flat) {
+                        return v;
                     }
                     if let Some(fields) =
                         self.module.packed_struct_fields.get(&base_flat).cloned()
@@ -22257,7 +22677,7 @@ impl Simulator {
                         if let Some((_, off, w)) =
                             fields.iter().find(|(m, _, _)| *m == member.name).cloned()
                         {
-                            if let Some(cur) = self.get_signal_value_by_name(&base_flat) {
+                            if let Some(cur) = self.get_local_or_signal(&base_flat) {
                                 let mut out = Value::zero(w.max(1));
                                 for i in 0..w {
                                     out.set_bit(i as usize, cur.get_bit((off + i) as usize));
@@ -22606,7 +23026,7 @@ impl Simulator {
                         if let Some((_, off, w)) =
                             fields.iter().find(|(m, _, _)| m == &member.name).cloned()
                         {
-                            if let Some(sig) = self.get_signal_value_by_name(&name) {
+                            if let Some(sig) = self.get_local_or_signal(&name) {
                                 return sig.range_select((off + w - 1) as usize, off as usize);
                             }
                         }
@@ -22916,8 +23336,27 @@ impl Simulator {
                 let b = self.eval_expr(e);
                 a.case_eq(&b).is_true()
             }
-            // Structure patterns (`'{…}`) are not modelled yet.
-            Pattern::Struct(_) => false,
+            // §12.6 structure pattern `'{a: .x, b: 3}`: members bind by name
+            // when named, positionally otherwise.
+            Pattern::Struct(members) => {
+                let Some(ordered) = self.struct_members_ordered(subject) else {
+                    return false;
+                };
+                for (i, (name, sub)) in members.iter().enumerate() {
+                    let target = match name {
+                        Some(id) => ordered
+                            .iter()
+                            .find(|(n, _)| *n == id.name)
+                            .map(|(_, e)| e.clone()),
+                        None => ordered.get(i).map(|(_, e)| e.clone()),
+                    };
+                    let Some(t) = target else { return false };
+                    if !self.match_pattern(&t, sub, binds) {
+                        return false;
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -22992,6 +23431,46 @@ impl Simulator {
         }
     }
 
+    /// IEEE 1800-2017 §9.3.2. A declaration at the head of a `fork` belongs to
+    /// the fork BLOCK, not to a spawned process. Execute those in the forking
+    /// process, then return only the statements that are actually processes.
+    ///
+    /// Every top-level item between `fork` and `join*` used to be spawned,
+    /// declarations included. So `fork automatic int j = i; begin ... j ... end
+    /// join_none` spawned two siblings with independently cloned frames: the
+    /// declaration landed in one frame and the body read `j` from the other,
+    /// as X. It appeared to work outside a loop only because a process with no
+    /// captured loop variable gets no local frame at all, and the declaration
+    /// then fell through to the global signal map, which the sibling shared.
+    ///
+    /// Running them here, BEFORE `inherit_fork_child_context` snapshots the
+    /// context, gives each child its own copy at fork time — the per-spawn
+    /// capture the construct exists for.
+    /// Returns the statements to spawn. The declared names are appended to
+    /// `auto_loop_vars` for the caller's spawn loop, which is what makes
+    /// `inherit_fork_child_context` copy them into each child's frame by value.
+    /// The caller must truncate `auto_loop_vars` back afterwards.
+    ///
+    /// Without that, a declaration executed in a process that has no local
+    /// frame lands in the shared `signals` map, so every child reads whatever
+    /// the LAST fork iteration wrote — the exact capture bug the construct
+    /// exists to avoid (all five children saw `local_i == 4`).
+    fn exec_fork_block_decls<'a>(&mut self, stmts: &'a [Statement]) -> (Vec<&'a Statement>, usize) {
+        let saved_auto_len = self.auto_loop_vars.len();
+        let mut processes = Vec::with_capacity(stmts.len());
+        for s in stmts {
+            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                self.exec_statement(s);
+                for d in declarators {
+                    self.auto_loop_vars.push(d.name.name.clone());
+                }
+            } else {
+                processes.push(s);
+            }
+        }
+        (processes, saved_auto_len)
+    }
+
     pub fn exec_statement(&mut self, stmt: &Statement) {
         if self.finished || self.time > self.max_time || self.break_flag || self.continue_flag
             || self.return_flag
@@ -23041,6 +23520,124 @@ impl Simulator {
                             self.settle_combinatorial();
                         }
                         return;
+                    }
+                }
+                // `d[i] = new[n]` on an array of dynamic arrays (§7.5.1): the
+                // ELEMENT is the dynamic array. Only a bare-identifier lvalue ever
+                // got its size shadow written, so `d[i].size()` reported the
+                // backing buffer instead of `n`.
+                // §7.5.1 dynamic-array `new[n]` / `new[n](src)`.
+                //   - `new[n](src)` copies min(n, src.size()) elements from `src`
+                //     and default-initialises the rest. It was ignored entirely:
+                //     the size came out as 1 and the data was lost.
+                //   - `d[i] = new[n]` on an array of dynamic arrays sizes the
+                //     ELEMENT; only a bare-identifier lvalue ever got a size.
+                // §7.5.1 dynamic-array `new[n]` and `new[n](src)`.
+                //   `new[n]`      parses as Call{Ident(new), [n]}
+                //   `new[n](src)` parses as Call{Call{Ident(new), [n]}, [src]}
+                // The second form was never recognised: the size came out as 1
+                // and the source data was lost. `new[n](src)` copies
+                // min(n, src.size()) elements and default-initialises the rest.
+                // A `d[i] = new[n]` lvalue sizes the ELEMENT of an array of
+                // dynamic arrays.
+                {
+                    let is_new = |e: &Expression| {
+                        matches!(&e.kind,
+                            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new")
+                    };
+                    let sized_new: Option<(&Expression, Option<&Expression>)> = match &rvalue.kind {
+                        ExprKind::Call { func, args } if is_new(func) && !args.is_empty() => {
+                            Some((&args[0], None))
+                        }
+                        ExprKind::Call { func, args } => match &func.kind {
+                            ExprKind::Call { func: inner, args: iargs }
+                                if is_new(inner) && !iargs.is_empty() =>
+                            {
+                                Some((&iargs[0], args.first()))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((n_expr, src_expr)) = sized_new {
+                        let target = match &lvalue.kind {
+                            ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh)),
+                            _ => self.flat_member_name(lvalue),
+                        };
+                        if let Some(name) = target.filter(|n| self.module.dynamic_arrays.contains(n))
+                        {
+                            let n = self.eval_expr(n_expr).to_u64().unwrap_or(0);
+                            // The source may be any array or queue. A self-copy
+                            // (`d = new[n](d)`) is index-preserving, so no
+                            // snapshot is needed.
+                            let src = src_expr.and_then(|e| match &e.kind {
+                                ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+                                _ => None,
+                            });
+                            let keep = match &src {
+                                Some(sn) => self.get_queue_size(sn).min(n),
+                                None => 0,
+                            };
+                            if let Some(sn) = src {
+                                for i in 0..keep {
+                                    self.queue_copy_elem(&sn, i, &name, i);
+                                }
+                            }
+                            for i in keep..n {
+                                self.set_signal_value_by_name(
+                                    &format!("{}[{}]", name, i),
+                                    Value::zero(32),
+                                );
+                            }
+                            self.set_queue_size(&name, n);
+                            if !self.in_edge_block {
+                                self.settle_combinatorial();
+                            }
+                            return;
+                        }
+                    }
+                }
+                // `s = q.pop_front()` on a queue of unpacked structs: the popped
+                // element's members must reach `s` before the queue shifts — a
+                // packed return value cannot carry them.
+                if let Some(dst) = self.flat_member_name(lvalue) {
+                    if let Some((obj, pop)) = self.queue_pop_call(rvalue) {
+                        if let Some(su) = self.queue_elem_struct(&obj) {
+                            let sz = self.get_queue_size(&obj);
+                            if sz > 0 {
+                                let idx = if pop == "pop_front" { 0 } else { sz - 1 };
+                                let src = format!("{}[{}]", obj, idx);
+                                self.copy_unpacked_struct(&dst, &src, &su);
+                            }
+                            self.eval_builtin_method(&obj, &pop, &[]);
+                            if !self.in_edge_block {
+                                self.settle_combinatorial();
+                            }
+                            return;
+                        }
+                    }
+                }
+                // IEEE 1800-2017 §7.2: assigning one unpacked struct to another
+                // copies every member. Their leaves live in separate signals, so
+                // evaluating the RHS to a packed value and storing it writes a
+                // container nobody ever reads — `y = x` left every member of `y`
+                // at X. Covers struct variables, array/queue elements and
+                // struct members, in any combination.
+                if let Some(dst) = self.flat_member_name(lvalue) {
+                    if let Some(dt) = self.p_elem_type(&dst) {
+                        if let DataType::Struct(su) = self.resolve_dt(&dt) {
+                            if Self::spreads_member_wise(&su) {
+                                if let Some(src) = self.flat_member_name(rvalue) {
+                                    if src != dst && self.struct_storage_exists(&src, &su) {
+                                        self.copy_unpacked_struct(&dst, &src, &su.clone());
+                                        if !self.in_edge_block {
+                                            self.settle_combinatorial();
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 // `collection[key] = new(...)`: a bare `new` assigned to an
@@ -23102,6 +23699,35 @@ impl Simulator {
                                     ExprKind::Call { args, .. } => args,
                                     _ => &[],
                                 };
+                                // `arr[i] = new src` is the §8.12 SHALLOW COPY
+                                // constructor, not construction. This block used
+                                // to match any `new` and hand the source to
+                                // `instantiate_class` as a constructor argument,
+                                // where it was ignored: the element became a
+                                // freshly default-constructed object, with newly
+                                // allocated nested handles instead of the
+                                // source's. The same guards as the plain-handle
+                                // path (`h = new src`): exactly one argument,
+                                // and it must be a handle expression naming a
+                                // live object — never `new(size)`.
+                                let arg_could_be_handle = ctor_args
+                                    .first()
+                                    .map(|a| matches!(
+                                        &a.kind,
+                                        ExprKind::Ident(_)
+                                            | ExprKind::MemberAccess { .. }
+                                            | ExprKind::Index { .. }
+                                    ))
+                                    .unwrap_or(false);
+                                if ctor_args.len() == 1 && arg_could_be_handle {
+                                    let src_h =
+                                        self.eval_expr(&ctor_args[0]).to_u64().unwrap_or(0) as usize;
+                                    if src_h != 0 && matches!(self.heap.get(src_h), Some(Some(_))) {
+                                        let h = self.copy_construct(src_h);
+                                        self.assign_value(lvalue, &h);
+                                        return;
+                                    }
+                                }
                                 if let Some(cd) = self.module.classes.get(&cn).cloned() {
                                     let v = self.instantiate_class(&cd, ctor_args);
                                     self.assign_value(lvalue, &v);
@@ -23530,6 +24156,23 @@ impl Simulator {
                     return;
                 }
                 // Handle array locator methods with `with` clause: qs = arr.find with (filter)
+                // §7.12.1 array locator methods (`find`, `min`, `max`, `unique`,
+                // and the `_index` forms), with or without a `with (...)`
+                // clause. They RETURN a queue and never modify the source.
+                // `q.min()` parses as a Call, which the old match missed, so the
+                // result was a packed scalar written to a queue container signal
+                // that nothing reads — the destination came back as X.
+                if let Some((arr_name, mname, filter)) = self.locator_call(rvalue) {
+                    if let ExprKind::Ident(lhier) = &lvalue.kind {
+                        let lname = self.resolve_hier_name(lhier);
+                        let idxs = self.locator_indices(&arr_name, &mname, filter.as_ref());
+                        self.materialize_locator(&lname, &arr_name, &mname, &idxs);
+                        if !self.in_edge_block {
+                            self.settle_combinatorial();
+                        }
+                        return;
+                    }
+                }
                 if let ExprKind::WithClause {
                     expr: wexpr,
                     filter,
@@ -23681,101 +24324,7 @@ impl Simulator {
                 }
                 // Handle queue = array.locator_method (no with clause)
                 // Detect via MemberAccess or hierarchical ident (e.g. s.unique_index)
-                let locator_info: Option<(String, &str)> = if let ExprKind::MemberAccess {
-                    expr: arr_expr,
-                    member,
-                } = &rvalue.kind
-                {
-                    let mname = member.name.as_str();
-                    if matches!(mname, "min" | "max" | "unique" | "unique_index") {
-                        if let ExprKind::Ident(ahier) = &arr_expr.kind {
-                            Some((self.resolve_hier_name(ahier), mname))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else if let ExprKind::Ident(rhier) = &rvalue.kind {
-                    if rhier.path.len() == 2 {
-                        let arr_name = &rhier.path[0].name.name;
-                        let mname = rhier.path[1].name.name.as_str();
-                        if matches!(mname, "min" | "max" | "unique" | "unique_index")
-                            && self.module.arrays.contains_key(arr_name)
-                        {
-                            Some((arr_name.clone(), mname))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                if let Some((arr_name, mname)) = locator_info {
-                    if let ExprKind::Ident(lhier) = &lvalue.kind {
-                        let lname = self.resolve_hier_name(lhier);
-                        if self.module.arrays.contains_key(&arr_name) {
-                            let cur_size = self.get_queue_size(&arr_name) as usize;
-                            let mut results: Vec<Value> = Vec::new();
-                            if mname == "unique" || mname == "unique_index" {
-                                let mut seen = std::collections::HashSet::new();
-                                for i in 0..cur_size {
-                                    if let Some(v) = self
-                                        .get_signal_value_by_name(&format!("{}[{}]", arr_name, i))
-                                    {
-                                        let key = v.to_u64().unwrap_or(0);
-                                        if seen.insert(key) {
-                                            if mname == "unique_index" {
-                                                results.push(Value::from_u64(i as u64, 32));
-                                            } else {
-                                                results.push(v);
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if mname == "min" || mname == "max" {
-                                let mut best: Option<Value> = None;
-                                for i in 0..cur_size {
-                                    if let Some(v) = self
-                                        .get_signal_value_by_name(&format!("{}[{}]", arr_name, i))
-                                    {
-                                        let keep = match &best {
-                                            None => true,
-                                            Some(b) => {
-                                                if mname == "min" {
-                                                    v.to_u64().unwrap_or(u64::MAX)
-                                                        < b.to_u64().unwrap_or(u64::MAX)
-                                                } else {
-                                                    v.to_u64().unwrap_or(0)
-                                                        > b.to_u64().unwrap_or(0)
-                                                }
-                                            }
-                                        };
-                                        if keep {
-                                            best = Some(v);
-                                        }
-                                    }
-                                }
-                                if let Some(b) = best {
-                                    results.push(b);
-                                }
-                            }
-                            for (i, v) in results.iter().enumerate() {
-                                self.set_signal_value_by_name(
-                                    &format!("{}[{}]", lname, i),
-                                    v.clone(),
-                                );
-                            }
-                            self.set_queue_size(&lname, results.len() as u64);
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
-                            return;
-                        }
-                    }
-                }
+
                 // An untracked lvalue (e.g. a module-scope class handle like
                 // `uvm_component c;`) infers width 0; assigning then truncates
                 // the RHS to 0 bits — wrong for a handle. Default unknown width
@@ -24071,8 +24620,19 @@ impl Simulator {
                                     // Could be dynamic array new[size]
                                     if let Some(arg) = args.first() {
                                         let size = self.eval_expr(arg);
-                                        if let ExprKind::Ident(lhier) = &lvalue.kind {
-                                            let name = self.resolve_hier_name(lhier);
+                                        // `d = new[n]` and also `d[i] = new[n]` on an
+                                        // array of dynamic arrays — the element is the
+                                        // dynamic array, named flat as `d[i]`.
+                                        let target = match &lvalue.kind {
+                                            ExprKind::Ident(lhier) => {
+                                                Some(self.resolve_hier_name(lhier))
+                                            }
+                                            _ => {
+                                                let f = self.flat_member_name(lvalue);
+                                                f.filter(|n| self.module.dynamic_arrays.contains(n))
+                                            }
+                                        };
+                                        if let Some(name) = target {
                                             self.signals
                                                 .insert(format!("{}.size", name), size.clone());
                                         }
@@ -24149,6 +24709,20 @@ impl Simulator {
                 {
                     let lname = self.resolve_hier_name(lhier);
                     let rname = self.resolve_hier_name(rhier);
+                    // `r = q` between queues / dynamic arrays (§7.6): copy every
+                    // element and the size. Nothing did this — the RHS was read as
+                    // a scalar container signal that queues do not have, so the
+                    // destination stayed empty whatever its element type.
+                    if lname != rname
+                        && self.module.dynamic_arrays.contains(&lname)
+                        && self.module.dynamic_arrays.contains(&rname)
+                    {
+                        self.copy_whole_queue(&lname, &rname);
+                        if !self.in_edge_block {
+                            self.settle_combinatorial();
+                        }
+                        return;
+                    }
                     if self.is_associative_array(&lname) && self.is_associative_array(&rname) {
                         let prefix = format!("{}[", rname);
                         let entries: Vec<(String, Value)> = self
@@ -24551,6 +25125,20 @@ impl Simulator {
                 else_stmt,
                 ..
             } => {
+                // §12.6: `if (e matches p) ...` — the pattern's `.name` bindings
+                // are visible in the then-branch. The parser used to discard the
+                // pattern and yield a literal 0, so the branch never ran.
+                if let ExprKind::Matches { expr, pattern } = &condition.kind {
+                    let mut binds: Vec<(String, Value)> = Vec::new();
+                    if self.match_pattern(expr, pattern, &mut binds) {
+                        let st = self.push_pattern_bindings(&binds);
+                        self.exec_statement(then_stmt);
+                        self.pop_pattern_bindings(st);
+                    } else if let Some(el) = else_stmt {
+                        self.exec_statement(el);
+                    }
+                    return;
+                }
                 if self.eval_expr(condition).is_true() {
                     self.exec_statement(then_stmt);
                 } else if let Some(el) = else_stmt {
@@ -24583,13 +25171,22 @@ impl Simulator {
                             continue;
                         }
                         for pat in &item.patterns {
-                            let pv = self.eval_expr(pat);
-                            let eq = match kind {
-                                CaseKind::Casez => val.casez_eq(&pv),
-                                CaseKind::Casex => val.casex_eq(&pv),
-                                _ => val.case_eq(&pv),
+                            let hit = match kind {
+                                CaseKind::CaseInside => self.case_inside_match(&val, pat),
+                                CaseKind::Casez => {
+                                    let pv = self.eval_expr(pat);
+                                    val.casez_eq(&pv).is_true()
+                                }
+                                CaseKind::Casex => {
+                                    let pv = self.eval_expr(pat);
+                                    val.casex_eq(&pv).is_true()
+                                }
+                                _ => {
+                                    let pv = self.eval_expr(pat);
+                                    val.case_eq(&pv).is_true()
+                                }
                             };
-                            if eq.is_true() {
+                            if hit {
                                 match_count += 1;
                                 break;
                             }
@@ -24626,13 +25223,22 @@ impl Simulator {
                         continue;
                     }
                     for pat in &item.patterns {
-                        let pv = self.eval_expr(pat);
-                        let eq = match kind {
-                            CaseKind::Casez => val.casez_eq(&pv),
-                            CaseKind::Casex => val.casex_eq(&pv),
-                            _ => val.case_eq(&pv),
+                        let hit = match kind {
+                            CaseKind::CaseInside => self.case_inside_match(&val, pat),
+                            CaseKind::Casez => {
+                                let pv = self.eval_expr(pat);
+                                val.casez_eq(&pv).is_true()
+                            }
+                            CaseKind::Casex => {
+                                let pv = self.eval_expr(pat);
+                                val.casex_eq(&pv).is_true()
+                            }
+                            _ => {
+                                let pv = self.eval_expr(pat);
+                                val.case_eq(&pv).is_true()
+                            }
                         };
-                        if eq.is_true() {
+                        if hit {
                             self.exec_statement(&item.stmt);
                             matched = true;
                             break;
@@ -24752,7 +25358,11 @@ impl Simulator {
                     self.continue_flag = false;
                     self.exec_statement(body);
                     if self.break_flag {
-                        self.break_flag = false;
+                        // Keep the flag set while a `disable` unwinds to an
+                        // enclosing named block.
+                        if self.disable_target.is_none() {
+                            self.break_flag = false;
+                        }
                         break;
                     }
                     self.continue_flag = false;
@@ -24865,6 +25475,19 @@ impl Simulator {
                     let mut name = self.resolve_hier_name(hier);
                     if let Some(scoped) = self.instance_assoc_member(&name) {
                         name = scoped;
+                    }
+                    // IEEE 1800-2017 §12.7.3: one loop variable per leading
+                    // dimension — `foreach (m[i, j])`. A null entry (`m[, j]`)
+                    // skips that dimension. Only `vars[0]` was ever bound, so
+                    // `j` stayed X and the loop ran over the first dim alone.
+                    if vars.len() >= 2 {
+                        if let Some(dims) = self.foreach_dims(&name) {
+                            if dims.len() >= vars.len() {
+                                self.exec_foreach_nested(&dims[..vars.len()], vars, body);
+                                self.restore_loop_vars(&fe_saved);
+                                return;
+                            }
+                        }
                     }
                     if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
                         self.widths.insert(var.name.clone(), 32);
@@ -25005,7 +25628,11 @@ impl Simulator {
                     self.break_flag = false;
                     self.exec_statement(body);
                     if self.break_flag {
-                        self.break_flag = false;
+                        // Keep the flag set while a `disable` unwinds to an
+                        // enclosing named block.
+                        if self.disable_target.is_none() {
+                            self.break_flag = false;
+                        }
                         break;
                     }
                 }
@@ -25024,7 +25651,11 @@ impl Simulator {
                     self.break_flag = false;
                     self.exec_statement(body);
                     if self.break_flag {
-                        self.break_flag = false;
+                        // Keep the flag set while a `disable` unwinds to an
+                        // enclosing named block.
+                        if self.disable_target.is_none() {
+                            self.break_flag = false;
+                        }
                         break;
                     }
                     if !self.eval_expr(condition).is_true() {
@@ -25042,7 +25673,11 @@ impl Simulator {
                     self.continue_flag = false;
                     self.exec_statement(body);
                     if self.break_flag {
-                        self.break_flag = false;
+                        // Keep the flag set while a `disable` unwinds to an
+                        // enclosing named block.
+                        if self.disable_target.is_none() {
+                            self.break_flag = false;
+                        }
                         break;
                     }
                     self.continue_flag = false;
@@ -25058,16 +25693,25 @@ impl Simulator {
                     self.exec_statement(body);
                 }
             }
-            StatementKind::SeqBlock { stmts, .. } => {
+            StatementKind::SeqBlock { stmts, name } => {
                 for s in stmts {
                     if self.finished || self.break_flag || self.continue_flag {
                         break;
                     }
                     self.exec_statement(s);
                 }
+                // A `disable` naming THIS block ends here; execution resumes
+                // after it (§9.6.2).
+                if let (Some(target), Some(n)) = (self.disable_target.as_deref(), name.as_ref()) {
+                    if target == n.name {
+                        self.disable_target = None;
+                        self.break_flag = false;
+                        self.continue_flag = false;
+                    }
+                }
             }
             StatementKind::ParBlock {
-                stmts, join_type, ..
+                stmts, join_type, name: block_name, ..
             } => {
                 // Mirror the suspend-aware path (run_process_stmts): children are
                 // parented to the CURRENT pid (not 0) and inherit a *snapshot* of
@@ -25076,8 +25720,11 @@ impl Simulator {
                 // canonical `for (int i…) fork … join_none` idiom captures the
                 // per-iteration `i` instead of the parent's post-loop value
                 // (LRM §9.3.2 automatic-variable semantics).
+                // As in run_process_stmts: fork-block declarations are not
+                // processes; run them here so each child snapshots them.
+                let (spawnable, saved_auto_len) = self.exec_fork_block_decls(stmts);
                 let mut child_set = HashSet::default();
-                for s in stmts {
+                for s in spawnable {
                     let pid = self.next_pid;
                     self.next_pid += 1;
                     self.process_parents.insert(pid, self.current_pid);
@@ -25085,10 +25732,16 @@ impl Simulator {
                     self.event_queue.schedule(self.time, pid, vec![s.clone()]);
                     child_set.insert(pid);
                 }
+                self.auto_loop_vars.truncate(saved_auto_len);
+                if let Some(nm) = block_name {
+                    self.fork_block_children.insert(nm.name.clone(), child_set.clone());
+                }
                 match join_type {
                     // `join` waits for all, `join_any` for the first; both suspend
                     // the forking process via a JoinWaiter. `join_none` continues.
-                    JoinType::Join | JoinType::JoinAny => {
+                    // An empty fork has no children to wait for, so it must NOT
+                    // suspend — a childless waiter is never re-checked.
+                    JoinType::Join | JoinType::JoinAny if !child_set.is_empty() => {
                         self.join_waiters.push(JoinWaiter {
                             parent_pid: self.current_pid,
                             child_pids: child_set,
@@ -25099,7 +25752,7 @@ impl Simulator {
                         });
                         self.break_flag = true; // Suspend current execution
                     }
-                    JoinType::JoinNone => {}
+                    _ => {}
                 }
             }
             StatementKind::TimingControl { control, stmt } => {
@@ -25183,6 +25836,68 @@ impl Simulator {
                 self.return_flag = true;
             }
             StatementKind::Disable(name) => {
+                // IEEE 1800-2017 §9.6.2. `disable_target` was set but never
+                // read: the only effect was `break_flag`, a GLOBAL flag. So a
+                // `disable` broke the innermost loop instead of terminating the
+                // named block, truncated the disabling process, and leaked into
+                // unrelated processes.
+                //
+                // A named `fork : blk ... join*` block: terminate the processes
+                // it spawned (and their descendants), and CONTINUE. A join_none
+                // fork block has already returned, so trying to unwind to it
+                // below would run off the end of the disabling process and drop
+                // its continuation — which is exactly what used to happen.
+                if let Some(children) = self.fork_block_children.get(&name.name).cloned() {
+                    let mut to_kill: HashSet<usize> = HashSet::default();
+                    for &c in &children {
+                        to_kill.insert(c);
+                        to_kill.extend(self.collect_fork_descendants(c));
+                    }
+                    // If the disabling process is itself one of them (disabling
+                    // the block it is currently inside), fall through to the
+                    // unwind path rather than killing itself here.
+                    if !to_kill.contains(&self.current_pid) {
+                        for &pid in &to_kill {
+                            self.killed_pids.insert(pid);
+                            self.process_parents.remove(&pid);
+                            self.process_contexts.remove(&pid);
+                        }
+                        self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                        for q in self.mailbox_get_waiters.values_mut() {
+                            q.retain(|w| !to_kill.contains(&w.pid));
+                        }
+                        for q in self.semaphore_get_waiters.values_mut() {
+                            q.retain(|w| !to_kill.contains(&w.pid));
+                        }
+                        self.release_killed_from_join_waiters(&to_kill);
+                        return;
+                    }
+                }
+                // A label naming ANOTHER process's top-level block terminates
+                // that process; the disabling process carries on.
+                if let Some(&pid) = self.disable_labels.get(&name.name) {
+                    if pid != self.current_pid {
+                        self.killed_pids.insert(pid);
+                        self.process_parents.remove(&pid);
+                        self.process_contexts.remove(&pid);
+                        self.event_waiters.retain(|w| w.pid != pid);
+                        for q in self.mailbox_get_waiters.values_mut() {
+                            q.retain(|w| w.pid != pid);
+                        }
+                        for q in self.semaphore_get_waiters.values_mut() {
+                            q.retain(|w| w.pid != pid);
+                        }
+                        let mut killed: HashSet<usize> = HashSet::default();
+                        killed.insert(pid);
+                        self.release_killed_from_join_waiters(&killed);
+                        return;
+                    }
+                }
+                // Otherwise unwind this process to the end of the named block
+                // (or the named task): the SeqBlock / task-call arm clears the
+                // flags when it sees its own name, so execution resumes after
+                // it. For a loop-body block that is `continue`; for a block
+                // enclosing the loop it is `break`.
                 self.disable_target = Some(name.name.clone());
                 self.break_flag = true;
             }
@@ -25201,6 +25916,9 @@ impl Simulator {
                 }
                 self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
                 for q in self.mailbox_get_waiters.values_mut() {
+                    q.retain(|w| !to_kill.contains(&w.pid));
+                }
+                for q in self.semaphore_get_waiters.values_mut() {
                     q.retain(|w| !to_kill.contains(&w.pid));
                 }
                 // A killed process must no longer hold back a join waiter: drop
@@ -25440,6 +26158,9 @@ impl Simulator {
                             &self.module.typedef_types,
                         ) {
                             if !fields.is_empty() {
+                                if std::env::var("XEZIM_PSDBG").is_ok() {
+                                    eprintln!("[PSDBG] register packed local {}", d.name.name);
+                                }
                                 self.module
                                     .packed_struct_fields
                                     .insert(d.name.name.clone(), fields);
@@ -25458,6 +26179,94 @@ impl Simulator {
                         }
                     }
                     let dims = &d.dimensions;
+                    // A local MULTI-dimensional array was registered from its
+                    // first dimension only, so `int n[2][2]` became a 1-D array
+                    // of double-width elements: `n[1][0]` read 0 and the
+                    // declaration initializer could not be spread.
+                    if dims.len() >= 2 {
+                        use crate::ast::types::UnpackedDimension as UD;
+                        let shape: Option<Vec<(i64, i64)>> = dims
+                            .iter()
+                            .map(|dim| match dim {
+                                UD::Range { left, right, .. } => {
+                                    let l = super::elaborate::const_eval_i64_with_params(left, None)?;
+                                    let r = super::elaborate::const_eval_i64_with_params(right, None)?;
+                                    Some((l.min(r), l.max(r)))
+                                }
+                                UD::Expression { expr, .. } => {
+                                    let n = super::elaborate::const_eval_i64_with_params(expr, None)?;
+                                    if n > 0 { Some((0, n - 1)) } else { None }
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if let Some(shape) = shape.filter(|sh| {
+                            sh.iter().map(|&(lo, hi)| (hi - lo + 1).max(0)).product::<i64>() <= (1 << 20)
+                        }) {
+                            let name = d.name.name.clone();
+                            match shape.len() {
+                                2 => {
+                                    self.module
+                                        .arrays_2d
+                                        .insert(name.clone(), (shape[0], shape[1], w));
+                                }
+                                _ => {
+                                    self.module
+                                        .arrays_nd
+                                        .insert(name.clone(), (shape.clone(), w));
+                                }
+                            }
+                            // Every element, row-major.
+                            let mut suffixes: Vec<String> = vec![String::new()];
+                            for &(lo, hi) in &shape {
+                                let mut next = Vec::new();
+                                for pre in &suffixes {
+                                    for i in lo..=hi {
+                                        next.push(format!("{}[{}]", pre, i));
+                                    }
+                                }
+                                suffixes = next;
+                            }
+                            for sfx in suffixes {
+                                let elem = format!("{}{}", name, sfx);
+                                self.signals.insert(elem.clone(), default_v.clone());
+                                self.widths.insert(elem, w);
+                            }
+                            self.widths.insert(name.clone(), w);
+                            self.module
+                                .var_decl_types
+                                .insert(name.clone(), data_type.clone());
+                            if let Some(init) = &d.init {
+                                let lvalue = crate::ast::expr::Expression::new(
+                                    crate::ast::expr::ExprKind::Ident(
+                                        crate::ast::expr::HierarchicalIdentifier {
+                                            root: None,
+                                            path: vec![crate::ast::expr::HierPathSegment {
+                                                name: crate::ast::Identifier {
+                                                    name: name.clone(),
+                                                    span: d.name.span,
+                                                },
+                                                selects: Vec::new(),
+                                            }],
+                                            span: d.name.span,
+                                            cached_signal_id: std::cell::Cell::new(None),
+                                            cached_resolved_name: std::cell::OnceCell::new(),
+                                        },
+                                    ),
+                                    d.name.span,
+                                );
+                                let assign = crate::ast::stmt::Statement::new(
+                                    crate::ast::stmt::StatementKind::BlockingAssign {
+                                        lvalue,
+                                        rvalue: init.clone(),
+                                    },
+                                    d.name.span,
+                                );
+                                self.exec_statement(&assign);
+                            }
+                            continue;
+                        }
+                    }
                     let mut range: Option<(i64, i64)> = None;
                     let mut descending = false;
                     if let Some(first) = dims.first() {
@@ -25585,6 +26394,45 @@ impl Simulator {
                             self.widths.insert(elem, w);
                         }
                         self.widths.insert(name.clone(), w);
+                        // Element type of a LOCAL array: the pattern spread and
+                        // the type-directed `%p` renderer both need it, and only
+                        // module-scope declarations recorded one.
+                        self.module
+                            .var_decl_types
+                            .insert(name.clone(), data_type.clone());
+                        // A local FIXED array's declaration initializer was
+                        // dropped, so `int a[4] = '{10,20,30,40};` inside a block
+                        // read back all zeros. Route it through an assignment,
+                        // as the queue branch above already does — the pattern
+                        // spread then applies every §10.9.1 form.
+                        if let Some(init) = &d.init {
+                            let lvalue = crate::ast::expr::Expression::new(
+                                crate::ast::expr::ExprKind::Ident(
+                                    crate::ast::expr::HierarchicalIdentifier {
+                                        root: None,
+                                        path: vec![crate::ast::expr::HierPathSegment {
+                                            name: crate::ast::Identifier {
+                                                name: name.clone(),
+                                                span: d.name.span,
+                                            },
+                                            selects: Vec::new(),
+                                        }],
+                                        span: d.name.span,
+                                        cached_signal_id: std::cell::Cell::new(None),
+                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                    },
+                                ),
+                                d.name.span,
+                            );
+                            let assign = crate::ast::stmt::Statement::new(
+                                crate::ast::stmt::StatementKind::BlockingAssign {
+                                    lvalue,
+                                    rvalue: init.clone(),
+                                },
+                                d.name.span,
+                            );
+                            self.exec_statement(&assign);
+                        }
                     } else {
                         if let Some(task_name) = self.current_static_task.clone() {
                             let key = format!("{}.{}", task_name, d.name.name);
@@ -25829,6 +26677,104 @@ impl Simulator {
             }
             StatementKind::Coverpoint { .. } | StatementKind::Cross { .. } => {}
         }
+    }
+
+    /// IEEE 1800-2017 §6.16 string methods that MUTATE the receiver
+    /// (`putc`, `itoa`, `hextoa`, `octtoa`, `bintoa`, `realtoa`) plus `atoreal`.
+    /// Every one of them was a silent no-op / returned 0.
+    ///
+    /// `recv` is the receiver expression; it is assigned back in place. Called
+    /// from both the `MemberAccess` dispatch and the flattened `Ident([s, m])`
+    /// one, which is how a statement like `s.putc(0, "J");` actually parses.
+    fn string_method(
+        &mut self,
+        recv: &Expression,
+        mname: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
+            // §6.16.4 `s.putc(i, c)` and §6.16.10 `s.itoa/hextoa/octtoa/bintoa/
+        // realtoa(v)` MODIFY the receiver in place. Every one of them was a
+        // silent no-op.
+        if mname == "putc" && args.len() == 2 {
+            let cur = self.eval_expr(recv).to_sv_string();
+            let idx = self.eval_expr(&args[0]).to_i64().unwrap_or(-1);
+            let ch = (self.eval_expr(&args[1]).to_u64().unwrap_or(0) & 0xFF) as u8;
+            // §6.16.4: an out-of-range index or a null character leaves the
+            // string unchanged.
+            if idx >= 0 && (idx as usize) < cur.len() && ch != 0 {
+                let mut b = cur.into_bytes();
+                b[idx as usize] = ch;
+                let out = String::from_utf8_lossy(&b).into_owned();
+                let v = Value::from_string(&out);
+                self.assign_value(recv, &v);
+            }
+            return Some(Value::zero(1));
+        }
+        if matches!(mname, "itoa" | "hextoa" | "octtoa" | "bintoa" | "realtoa")
+            && args.len() == 1
+        {
+            let v = self.eval_expr(&args[0]);
+            let text = match mname {
+                // `itoa` renders a SIGNED decimal; the others are unsigned
+                // radix conversions of the bit pattern.
+                "itoa" => {
+                    if v.width > 32 {
+                        format!("{}", v.to_i64().unwrap_or(0))
+                    } else {
+                        format!("{}", v.to_u64().unwrap_or(0) as u32 as i32)
+                    }
+                }
+                "hextoa" => format!("{:x}", v.to_u64().unwrap_or(0)),
+                "octtoa" => format!("{:o}", v.to_u64().unwrap_or(0)),
+                "bintoa" => format!("{:b}", v.to_u64().unwrap_or(0)),
+                _ => format!("{:.6}", v.to_f64()),
+            };
+            let sv = Value::from_string(&text);
+            self.assign_value(recv, &sv);
+            return Some(Value::zero(1));
+        }
+        // §6.16.9 `atoreal` — the longest valid real prefix, 0.0 on no match.
+        if mname == "atoreal" && args.is_empty() {
+            let raw = self.eval_expr(recv).to_sv_string();
+            let t = raw.trim();
+            let b = t.as_bytes();
+            let mut i = 0usize;
+            let mut end = 0usize;
+            if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+                i += 1;
+            }
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+                end = i;
+            }
+            if i < b.len() && b[i] == b'.' {
+                i += 1;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                    end = i;
+                }
+            }
+            if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+                let save = i;
+                i += 1;
+                if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+                    i += 1;
+                }
+                let ds = i;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i > ds {
+                    end = i;
+                } else {
+                    i = save;
+                    let _ = i;
+                }
+            }
+            let val: f64 = t.get(..end).and_then(|p| p.parse().ok()).unwrap_or(0.0);
+            return Some(Value::from_f64(val));
+        }
+        None
     }
 
     fn exec_expr_stmt(&mut self, expr: &Expression) {
@@ -26131,6 +27077,12 @@ impl Simulator {
                         }
                     }
                 }
+            }
+            // A `$name` a VPI module registered with `vpi_register_systf`.
+            // Checked last so a builtin always wins.
+            _ if vpi_systf_registered(name) => {
+                let self_ptr = self as *mut Simulator;
+                vpi_call_systf(self_ptr, name, args);
             }
             _ => {}
         }
@@ -27015,6 +27967,18 @@ impl Simulator {
         if hier.path.len() >= 2 && self.packed_leaf_of_hier(&raw).is_some() {
             return raw;
         }
+        // `p.a` where `p` is an unpacked STRUCT variable: the dotted name is a
+        // member access, not a hierarchical instance path. The suffix scan below
+        // would collapse it to the last segment, so `p.a = 5` silently wrote an
+        // unrelated module-scope signal that happened to be called `a`.
+        if hier.path.len() >= 2
+            && self
+                .module
+                .struct_members
+                .contains_key(&hier.path[0].name.name)
+        {
+            return raw;
+        }
         // LRM §25.9: if the leading segment names a virtual-interface
         // formal-arg alias in the current task call frame, rewrite the
         // path to use the bound interface instance name. Has to fire
@@ -27515,20 +28479,10 @@ impl Simulator {
             _ => return,
         };
         let self_ptr = self as *mut Simulator;
-        ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
-        for cb in cbs {
-            type CbFn = extern "C" fn(*mut s_cb_data);
-            let cb_routine = cb.cb_routine as *const ();
-            let cb_fn: CbFn = unsafe { std::mem::transmute(cb_routine) };
-            let cb_data = s_cb_data {
-                reason: 6, /* cbValueChange */
-                cb_rtn: std::ptr::null_mut(),
-                obj: std::ptr::null_mut(),
-                time: std::ptr::null_mut(),
-                value: std::ptr::null_mut(),
-                user_data: cb.user_data as *mut libc::c_void,
-            };
-            cb_fn(&cb_data as *const s_cb_data as *mut s_cb_data);
+        let now = self.time;
+        let val = self.signal_table.get(id).cloned();
+        for cb in &cbs {
+            dispatch_vpi_cb(self_ptr, now, val.clone(), cb, vpi::CB_VALUE_CHANGE);
         }
     }
 
@@ -28156,9 +29110,51 @@ impl Simulator {
                 else_expr,
                 ..
             } => self.infer_width(then_expr).max(self.infer_width(else_expr)),
+            // A VPI system function has a declared return width. The fallback
+            // below infers a width by EVALUATING, which for a `$systf` means
+            // running its calltf — twice, once here and once for the value.
+            ExprKind::SystemCall { name, .. } if vpi_systf_is_func(name) => {
+                vpi_sysfunc_ret_width(name)
+            }
+            // Same for a user function: its width comes from its declared
+            // return type, never from calling it. `f() + 1` used to call `f`
+            // once for the width and once for the value, so any function with
+            // a side effect ran twice.
+            ExprKind::Call { func, .. } => {
+                if let Some(w) = self.call_return_width(func) {
+                    w
+                } else {
+                    self.eval_expr(expr).width
+                }
+            }
             _ => self.eval_expr(expr).width,
         }
     }
+    /// Declared return width of the function `func` names, without calling it.
+    /// `None` when the callee is not a plain module-scope function (a method,
+    /// a class constructor, an array builtin), where the caller falls back to
+    /// evaluation.
+    fn call_return_width(&mut self, func: &Expression) -> Option<u32> {
+        let ExprKind::Ident(h) = &func.kind else { return None };
+        if h.path.len() != 1 {
+            return None;
+        }
+        let name = &h.path[0].name.name;
+        let fd = self.module.functions.get(name)?;
+        if matches!(fd.return_type, DataType::Void { .. }) {
+            return None;
+        }
+        if matches!(fd.return_type, DataType::Real { .. }) {
+            return Some(64);
+        }
+        let w = super::elaborate::resolve_type_width(
+            &fd.return_type,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        (w > 0).then_some(w)
+    }
+
     fn infer_lhs_width(&mut self, expr: &Expression) -> u32 {
         match &expr.kind {
             ExprKind::Concatenation(p) => {
@@ -28192,6 +29188,15 @@ impl Simulator {
                 if let Some(&id) = self.signal_name_to_id.get(leaf) {
                     h.cached_signal_id.set(Some(id));
                     return self.signal_widths[id];
+                }
+                // A class property lives on the heap, not in the flat signal
+                // maps, so without this it fell through to the 32-bit default
+                // and `std::randomize(prop)` drew a full 32-bit value into a
+                // 2-bit property.
+                if let Some(&Some(handle)) = self.this_stack.last() {
+                    if let Some(w) = self.heap_prop_width(handle, leaf) {
+                        return w;
+                    }
                 }
                 self.widths
                     .get(leaf)
@@ -28608,6 +29613,38 @@ impl Simulator {
     /// putter's context writes the wrong frame, so the waiter reads a stale/null
     /// handle (item data=0). Swap to the waiter's saved context, assign, re-save,
     /// restore the putter's context, then schedule the continuation.
+    /// Wake processes parked in `semaphore.get()` now that the count rose,
+    /// FIFO and in order (§15.3.3): a waiter is served only when the FULL
+    /// count it needs is available, and it is NOT skipped in favour of a
+    /// later, smaller request — that would starve a large getter.
+    fn wake_semaphore_waiters(&mut self, handle: usize) {
+        loop {
+            let count = self.semaphores.get(&handle).copied().unwrap_or(0);
+            let next_n = self
+                .semaphore_get_waiters
+                .get(&handle)
+                .and_then(|q| q.front())
+                .map(|w| w.n);
+            match next_n {
+                Some(n) if count >= n => {
+                    let w = self
+                        .semaphore_get_waiters
+                        .get_mut(&handle)
+                        .unwrap()
+                        .pop_front()
+                        .unwrap();
+                    *self.semaphores.get_mut(&handle).unwrap() = count - n;
+                    if w.cont.is_empty() {
+                        self.child_finished(w.pid);
+                    } else {
+                        self.event_queue.schedule(self.time, w.pid, w.cont);
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+
     fn deliver_to_mailbox_waiter(
         &mut self,
         pid: usize,
@@ -29439,6 +30476,29 @@ impl Simulator {
             .unwrap_or(false)
     }
 
+    /// Warn once per associative array about an invalid (x/z) index.
+    fn warn_invalid_assoc_index(&mut self, name: &str) {
+        if self.warned_assoc_index.insert(name.to_string()) {
+            eprintln!(
+                "[xezim][warning] associative array '{}' indexed with an unknown (x/z) \
+                 value — the access is ignored (IEEE 1800-2017 §7.8.2)",
+                name
+            );
+        }
+    }
+
+    /// IEEE 1800-2017 Table 28-1 wired-net resolution for one bit: `z` yields
+    /// to a driven value, equal values pass, everything else is `x`.
+    fn wire_resolve_bit(a: LogicBit, b: LogicBit) -> LogicBit {
+        match (a, b) {
+            (LogicBit::Z, x) => x,
+            (x, LogicBit::Z) => x,
+            (LogicBit::X, _) | (_, LogicBit::X) => LogicBit::X,
+            (x, y) if x == y => x,
+            _ => LogicBit::X,
+        }
+    }
+
     fn assoc_key_str(&self, name: &str, idx_val: &Value) -> String {
         if self.is_string_keyed_array(name) {
             idx_val.to_sv_string()
@@ -29625,6 +30685,20 @@ impl Simulator {
     /// string/scalar PARAMETERS and locals live) over the global signal table.
     /// String built-ins like `.len()`/`.substr()` need this — a `string` formal
     /// (e.g. `format_string(string str, …)`) is not in `self.signals`.
+    /// Write a variable that may be a procedural LOCAL (a task/function frame)
+    /// rather than a signal. A packed struct declared inside a task lives in the
+    /// local frame, so slicing a member into it through `set_signal_value_by_name`
+    /// wrote nothing and the whole struct read back as X.
+    fn set_local_or_signal(&mut self, name: &str, v: Value) {
+        if let Some(frame) = self.local_stack.last_mut() {
+            if frame.contains_key(name) {
+                frame.insert(name.to_string(), v);
+                return;
+            }
+        }
+        self.set_signal_value_by_name(name, v);
+    }
+
     fn get_local_or_signal(&self, name: &str) -> Option<Value> {
         if let Some(m) = self.local_stack.last() {
             if let Some(v) = m.get(name) {
@@ -30114,6 +31188,105 @@ impl Simulator {
     /// `instr_category[category][$]`), return the compound storage base
     /// `assoc[<keyval>]`. The nested collection then lives under that name and
     /// reuses the ordinary queue/array machinery (`<base>.size`, `<base>[i]`).
+    /// Declared index bounds of `name`, outermost dimension first.
+    fn foreach_dims(&self, name: &str) -> Option<Vec<(i64, i64)>> {
+        if let Some((shape, _)) = self.module.arrays_nd.get(name) {
+            return Some(shape.clone());
+        }
+        if let Some(&(d1, d2, _)) = self.module.arrays_2d.get(name) {
+            return Some(vec![d1, d2]);
+        }
+        self.module.arrays.get(name).map(|&(lo, hi, _)| vec![(lo, hi)])
+    }
+
+    /// Run `body` once per index tuple, last dimension varying fastest.
+    /// IEEE 1800-2017 §12.7.3: a dimension whose loop variable is OMITTED
+    /// (`foreach (m[, j])`) is not traversed at all — only the named ones are.
+    fn exec_foreach_nested(
+        &mut self,
+        all_dims: &[(i64, i64)],
+        vars: &[Option<crate::ast::Identifier>],
+        body: &Statement,
+    ) {
+        let iterated: Vec<((i64, i64), &crate::ast::Identifier)> = all_dims
+            .iter()
+            .zip(vars)
+            .filter_map(|(d, v)| v.as_ref().map(|id| (*d, id)))
+            .collect();
+        if iterated.is_empty() || iterated.iter().any(|((lo, hi), _)| hi < lo) {
+            return;
+        }
+        let dims: Vec<(i64, i64)> = iterated.iter().map(|(d, _)| *d).collect();
+        for (_, id) in &iterated {
+            self.widths.insert(id.name.clone(), 32);
+        }
+        let n = dims.len();
+        let mut idx: Vec<i64> = dims.iter().map(|d| d.0).collect();
+        loop {
+            if self.finished {
+                return;
+            }
+            for (k, (_, id)) in iterated.iter().enumerate() {
+                self.set_loop_var(&id.name, Value::from_u64(idx[k] as u64, 32));
+            }
+            self.continue_flag = false;
+            self.exec_statement(body);
+            if self.break_flag {
+                return;
+            }
+            self.continue_flag = false;
+            // Odometer: advance the innermost dimension first.
+            let mut k = n;
+            loop {
+                if k == 0 {
+                    return;
+                }
+                k -= 1;
+                idx[k] += 1;
+                if idx[k] <= dims[k].1 {
+                    break;
+                }
+                idx[k] = dims[k].0;
+            }
+        }
+    }
+
+    /// `q[i]` / `q[i][j]` naming an ELEMENT of an unpacked array of queues —
+    /// the element is itself a queue stored under that flat name (§7.4.5).
+    fn indexed_queue_base(&mut self, base: &Expression) -> Option<String> {
+        if !matches!(base.kind, ExprKind::Index { .. }) {
+            return None;
+        }
+        let n = self.flat_member_name(base)?;
+        if self.module.dynamic_arrays.contains(&n) {
+            Some(n)
+        } else {
+            None
+        }
+    }
+
+    /// `a[i]` naming an ELEMENT of an unpacked array of ASSOCIATIVE arrays
+    /// (`int a[2][u8_t]`): the element is itself an associative array.
+    fn indexed_assoc_base(&mut self, base: &Expression) -> Option<String> {
+        if !matches!(base.kind, ExprKind::Index { .. }) {
+            return None;
+        }
+        let n = self.flat_member_name(base)?;
+        if self.module.associative_arrays.contains_key(&n) {
+            Some(n)
+        } else {
+            None
+        }
+    }
+
+    /// Flat storage name of `<assoc>[key]` for such an element.
+    fn indexed_assoc_elem(&mut self, base: &Expression, index: &Expression) -> Option<String> {
+        let an = self.indexed_assoc_base(base)?;
+        let kv = self.eval_expr(index);
+        let key = self.assoc_key_str(&an, &kv);
+        Some(format!("{}[{}]", an, key))
+    }
+
     fn nested_index_name(&mut self, expr: &Expression) -> Option<String> {
         if let ExprKind::Index { expr: base, index } = &expr.kind {
             if let ExprKind::Ident(bh) = &base.kind {
@@ -30448,8 +31621,13 @@ impl Simulator {
                     buckets.push((v, w * scaler));
                 }
                 ConstraintRange::Range { lo, hi } => {
-                    let l = self.eval_expr(lo).to_i64().unwrap_or(0);
-                    let h = self.eval_expr(hi).to_i64().unwrap_or(l);
+                    let lov = self.eval_expr(lo);
+                    let hiv = self.eval_expr(hi);
+                    // A bucket must be as wide as its bounds: `[64'h1_0000_0000 :
+                    // 64'h1_0000_00FF]` truncated to 32 bits and produced 0.
+                    let bw = lov.width.max(hiv.width).max(32);
+                    let l = lov.to_i64().unwrap_or(0);
+                    let h = hiv.to_i64().unwrap_or(l);
                     if h < l { continue; }
                     let span = (h - l + 1).min(MAX_BUCKETS) as u64;
                     if span == 0 { continue; }
@@ -30468,7 +31646,7 @@ impl Simulator {
                     let mut v = l;
                     let mut emitted = 0u64;
                     while v <= h && emitted < span {
-                        buckets.push((Value::from_u64(v as u64, 32), per_value_weight.max(1)));
+                        buckets.push((Value::from_u64(v as u64, bw), per_value_weight.max(1)));
                         v = v.saturating_add(stride as i64);
                         emitted += 1;
                     }
@@ -30492,13 +31670,20 @@ impl Simulator {
         for r in ranges {
             match &r.kind {
                 ExprKind::Range(lo, hi) => {
-                    let l = self.eval_expr(lo).to_i64().unwrap_or(0);
-                    let h = self.eval_expr(hi).to_i64().unwrap_or(l);
+                    let lov = self.eval_expr(lo);
+                    let hiv = self.eval_expr(hi);
+                    let l = lov.to_i64().unwrap_or(0);
+                    let h = hiv.to_i64().unwrap_or(l);
                     if h >= l {
-                        // Cap enumeration to keep it bounded.
-                        let n = (h - l + 1).min(4096);
-                        let pick = l + (self.rng.gen::<u64>() % n as u64) as i64;
-                        candidates.push(Value::from_u64(pick as u64, 32));
+                        // Pick uniformly over the WHOLE range. This is one
+                        // modulo, not an enumeration: a cap here would silently
+                        // shrink the legal value set (`[32'he000_0000 :
+                        // 32'he000_2000]` could never yield anything above
+                        // 32'he000_0fff).
+                        let span = (h as i128) - (l as i128) + 1;
+                        let pick = (l as i128) + (self.rng.gen::<u64>() as i128) % span;
+                        let w = lov.width.max(hiv.width).max(32);
+                        candidates.push(Value::from_u64(pick as u64, w));
                     }
                 }
                 ExprKind::Ident(h) => {
@@ -30533,6 +31718,85 @@ impl Simulator {
 
     /// Class type of a variable, if it is a class-handle variable. Guards `%p`
     /// against treating a plain integer as an object handle.
+    /// Declared type NAME of a variable, whatever its storage. Unlike
+    /// `class_of_var` this does not require the name to be a known class, so an
+    /// enum-typed destination can be recognised too.
+    fn type_name_of_var(&self, vname: &str) -> Option<String> {
+        if let Some(c) = self.var_class_types.get(vname) {
+            return Some(c.clone());
+        }
+        if let Some(sig) = self.module.signals.get(vname) {
+            if let Some(tn) = &sig.type_name {
+                return Some(tn.clone());
+            }
+        }
+        if let Some(&id) = self.signal_name_to_id.get(vname) {
+            if let Some(tn) = self.signal_type_names.get(&id) {
+                return Some(tn.clone());
+            }
+        }
+        None
+    }
+
+    /// Build the VPI object for one `$systf` argument.
+    ///
+    /// A signal-backed argument gets a real signal handle, so a systf can
+    /// `vpi_put_value` into it — that is how an `output` argument works.
+    /// Anything else (a literal, a concatenation, a computed expression) is
+    /// evaluated once and handed over as a read-only `vpiConstant`.
+    fn vpi_arg_handle(&mut self, e: &Expression) -> VpiHandle {
+        if let ExprKind::Ident(h) = &e.kind {
+            let name = self.resolve_hier_name(h);
+            if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                let ty = vpi_type_of(self, &name, id);
+                let leaf = name.rsplit('.').next().unwrap_or(&name).to_string();
+                let full = vpi_full_name(self, &name);
+                return VpiHandle::signal(id, ty, &leaf, &full);
+            }
+        }
+        VpiHandle::constant(self.eval_expr(e))
+    }
+
+    /// Declared width of property `prop` on `class_name` or any ancestor.
+    ///
+    /// A class property is stored as a bare `Value` in `ClassInstance`, which
+    /// carries no declared width of its own. Every write therefore has to
+    /// consult the class definition, or a wide value lands in a narrow
+    /// property intact: `u2_t v; v = 32'hDEADBEEF;` kept all 32 bits.
+    /// `None` for reals, class handles and strings, which must not be resized.
+    fn class_prop_width(&self, class_name: &str, prop: &str) -> Option<u32> {
+        let mut cur = Some(class_name.to_string());
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(sig) = cd.properties.get(prop) {
+                if sig.is_real || sig.type_name.as_ref().is_some_and(|t| self.module.classes.contains_key(t)) {
+                    return None;
+                }
+                if cd.string_properties.contains(prop) {
+                    return None;
+                }
+                return Some(sig.width).filter(|w| *w > 0);
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// Declared width of `prop` on the object `handle` points at.
+    fn heap_prop_width(&self, handle: usize, prop: &str) -> Option<u32> {
+        let inst = self.heap.get(handle)?.as_ref()?;
+        self.class_prop_width(&inst.class_name, prop)
+    }
+
+    /// Clamp `val` to a class property's declared width. Values that already
+    /// fit are returned unchanged, so nothing is disturbed for the common case.
+    fn fit_class_prop(&self, handle: usize, prop: &str, val: &Value) -> Value {
+        match self.heap_prop_width(handle, prop) {
+            Some(w) if w != val.width && !val.is_real => val.resize_for_assign(w),
+            _ => val.clone(),
+        }
+    }
+
     fn class_of_var(&self, vname: &str) -> Option<String> {
         // Procedural locals record their class at VarDecl exec time.
         if let Some(c) = self.var_class_types.get(vname) {
@@ -30613,7 +31877,7 @@ impl Simulator {
             let mut resized = if self.signal_real[id] {
                 if val.is_real { val } else { Value::from_f64(val.to_f64()) }
             } else if val.is_real {
-                Value::from_u64(val.to_f64() as u64, width)
+                Self::real_to_int(val.to_f64(), width)
             } else {
                 val.resize(width)
             };
@@ -30649,6 +31913,14 @@ impl Simulator {
             }
         }
         let v = self.eval_expr(e);
+        // A `real` leaf keeps its real value even when the element signal was
+        // never flagged real (array elements are synthesized without the flag);
+        // otherwise `real m[3] = '{1.5, ...}` truncates to integers.
+        if matches!(self.resolve_dt(dt), DataType::Real { .. }) {
+            let rv = if v.is_real { v } else { Value::from_f64(v.to_f64()) };
+            self.set_signal_value_by_name(target, rv);
+            return;
+        }
         self.write_leaf_by_name(target, v);
     }
 
@@ -30683,6 +31955,15 @@ impl Simulator {
                 }
                 AssignmentPatternItem::Default(e) => default = Some(e),
                 AssignmentPatternItem::Ordered(e) => ordered.push(e),
+                // §10.9.2 `type:value` — binds every member of that type. A
+                // `name:` key still wins over it, and `default:` fills the rest.
+                AssignmentPatternItem::Typed(key_dt, e) => {
+                    for (i, (_, mdt, _)) in members.iter().enumerate() {
+                        if by_name[i].is_none() && self.pattern_type_matches(mdt, key_dt) {
+                            by_name[i] = Some(e);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -30720,6 +32001,342 @@ impl Simulator {
         }
     }
 
+    /// Whether `src` actually has per-member storage for `su` — guards against
+    /// treating an unrelated same-named scalar as a struct source.
+    fn struct_storage_exists(&self, src: &str, su: &crate::ast::types::StructUnionType) -> bool {
+        su.members.iter().any(|m| {
+            m.declarators.iter().any(|md| {
+                let leaf = format!("{}.{}", src, md.name.name);
+                self.signal_name_to_id.contains_key(leaf.as_str())
+                    || self.signals.contains_key(&leaf)
+            })
+        })
+    }
+
+    /// Copy every leaf of an unpacked struct from `src` to `dst`.
+    fn copy_unpacked_struct(
+        &mut self,
+        dst: &str,
+        src: &str,
+        su: &crate::ast::types::StructUnionType,
+    ) {
+        for m in &su.members {
+            for md in &m.declarators {
+                let d = format!("{}.{}", dst, md.name.name);
+                let sname = format!("{}.{}", src, md.name.name);
+                if md.dimensions.is_empty() {
+                    if let DataType::Struct(inner) = self.resolve_dt(&m.data_type) {
+                        if Self::spreads_member_wise(&inner) {
+                            self.copy_unpacked_struct(&d, &sname, &inner);
+                            continue;
+                        }
+                    }
+                    if let Some(v) = self.get_signal_value_by_name(&sname) {
+                        self.write_leaf_by_name(&d, v);
+                    }
+                } else if let Some(idxs) = self.member_dim_indices(&md.dimensions) {
+                    for i in idxs {
+                        let (di, si) = (format!("{}[{}]", d, i), format!("{}[{}]", sname, i));
+                        if let Some(v) = self.get_signal_value_by_name(&si) {
+                            self.write_leaf_by_name(&di, v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The unpacked-struct element type of queue `obj_name`, if it has one.
+    fn queue_elem_struct(&self, obj_name: &str) -> Option<crate::ast::types::StructUnionType> {
+        let dt = self.p_elem_type(obj_name)?;
+        match self.resolve_dt(&dt) {
+            DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
+            _ => None,
+        }
+    }
+
+    /// Copy element `si` of queue `src_obj` onto element `di` of `dst_obj`,
+    /// member-wise when the element is an unpacked struct (a single packed copy
+    /// would lose every member — the struct has no container signal).
+    fn queue_copy_elem(&mut self, src_obj: &str, si: u64, dst_obj: &str, di: u64) {
+        let (src, dst) = (
+            format!("{}[{}]", src_obj, si),
+            format!("{}[{}]", dst_obj, di),
+        );
+        if let Some(su) = self.queue_elem_struct(src_obj) {
+            self.copy_unpacked_struct(&dst, &src, &su);
+            return;
+        }
+        if let Some(v) = self.get_signal_value_by_name(&src) {
+            self.set_signal_value_by_name(&dst, v);
+        }
+    }
+
+    /// Move queue element `from` to `to` within one queue.
+    fn queue_move_elem(&mut self, obj_name: &str, from: u64, to: u64) {
+        self.queue_copy_elem(obj_name, from, obj_name, to);
+    }
+
+    /// Copy every element of `src` onto `dst` and set its size (`r = q`).
+    fn copy_whole_queue(&mut self, dst: &str, src: &str) {
+        let n = self.get_queue_size(src);
+        for i in 0..n {
+            self.queue_copy_elem(src, i, dst, i);
+        }
+        self.set_queue_size(dst, n);
+    }
+
+    /// Relative leaf paths of an unpacked struct (`a`, `inner.b`, `arr[0]`).
+    fn struct_leaf_suffixes(&self, su: &crate::ast::types::StructUnionType) -> Vec<String> {
+        let mut out = Vec::new();
+        for m in &su.members {
+            for md in &m.declarators {
+                let base = md.name.name.clone();
+                if md.dimensions.is_empty() {
+                    if let DataType::Struct(inner) = self.resolve_dt(&m.data_type) {
+                        if Self::spreads_member_wise(&inner) {
+                            for sfx in self.struct_leaf_suffixes(&inner) {
+                                out.push(format!("{}.{}", base, sfx));
+                            }
+                            continue;
+                        }
+                    }
+                    out.push(base);
+                } else if let Some(idxs) = self.member_dim_indices(&md.dimensions) {
+                    for i in idxs {
+                        out.push(format!("{}[{}]", base, i));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Rearrange a queue so that position `i` holds what used to be at
+    /// `order[i]`. Snapshots first: an in-place shuffle would overwrite an
+    /// element it still has to read. Struct elements move leaf by leaf.
+    fn queue_permute(&mut self, obj_name: &str, order: &[usize]) {
+        if let Some(su) = self.queue_elem_struct(obj_name) {
+            let sfxs = self.struct_leaf_suffixes(&su);
+            let mut snap: Vec<Vec<Option<Value>>> = Vec::with_capacity(order.len());
+            for &old in order {
+                let mut row = Vec::with_capacity(sfxs.len());
+                for sfx in &sfxs {
+                    row.push(self.get_signal_value_by_name(&format!(
+                        "{}[{}].{}",
+                        obj_name, old, sfx
+                    )));
+                }
+                snap.push(row);
+            }
+            for (newi, row) in snap.into_iter().enumerate() {
+                for (sfx, v) in sfxs.iter().zip(row) {
+                    if let Some(v) = v {
+                        self.write_leaf_by_name(&format!("{}[{}].{}", obj_name, newi, sfx), v);
+                    }
+                }
+            }
+            return;
+        }
+        let mut snap: Vec<Option<Value>> = Vec::with_capacity(order.len());
+        for &old in order {
+            snap.push(self.get_signal_value_by_name(&format!("{}[{}]", obj_name, old)));
+        }
+        for (newi, v) in snap.into_iter().enumerate() {
+            if let Some(v) = v {
+                self.set_signal_value_by_name(&format!("{}[{}]", obj_name, newi), v);
+            }
+        }
+    }
+
+    /// `q.pop_front()` / `q.pop_back()` — the queue name and which end.
+    fn queue_pop_call(&mut self, e: &Expression) -> Option<(String, String)> {
+        let ExprKind::Call { func, .. } = &e.kind else { return None };
+        // `q.pop_front()` parses either as MemberAccess or — for a plain
+        // variable receiver — as a 2-segment hierarchical identifier.
+        let (obj, mname) = match &func.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                (self.flat_member_name(expr)?, member.name.clone())
+            }
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let mname = h.path.last()?.name.name.clone();
+                let obj = h.path[..h.path.len() - 1]
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                (obj, mname)
+            }
+            _ => return None,
+        };
+        if mname != "pop_front" && mname != "pop_back" {
+            return None;
+        }
+        if self.module.dynamic_arrays.contains(&obj) {
+            Some((obj, mname))
+        } else {
+            None
+        }
+    }
+
+    /// Store `arg` into queue element `elem`. An UNPACKED-STRUCT element keeps
+    /// each member in its own signal, so writing one packed value (what
+    /// `push_back` used to do) loses every member.
+    fn queue_store_elem(&mut self, obj_name: &str, elem: &str, arg: &Expression) {
+        if let Some(dt) = self.p_elem_type(obj_name) {
+            if let DataType::Struct(su) = self.resolve_dt(&dt) {
+                if Self::spreads_member_wise(&su) {
+                    if let ExprKind::AssignmentPattern(items) = &arg.kind {
+                        if !items.is_empty() {
+                            self.assign_pattern_into_struct(elem, &su, items);
+                            return;
+                        }
+                    }
+                    if let Some(src) = self.flat_member_name(arg) {
+                        self.copy_unpacked_struct(elem, &src, &su.clone());
+                        return;
+                    }
+                }
+            }
+        }
+        let val = self.queue_eval_arg(obj_name, arg);
+        self.set_signal_value_by_name(elem, val);
+    }
+
+    /// Whether a struct member's declared type matches a `type:value` key of an
+    /// assignment pattern (§10.9.2), after resolving typedefs on both sides.
+    fn pattern_type_matches(&self, member_dt: &DataType, key_dt: &DataType) -> bool {
+        use crate::ast::types::DataType as D;
+        match (self.resolve_dt(member_dt), self.resolve_dt(key_dt)) {
+            (D::IntegerAtom { kind: a, .. }, D::IntegerAtom { kind: b, .. }) => a == b,
+            (D::IntegerVector { kind: a, .. }, D::IntegerVector { kind: b, .. }) => a == b,
+            (D::Real { kind: a, .. }, D::Real { kind: b, .. }) => a == b,
+            (D::Simple { kind: a, .. }, D::Simple { kind: b, .. }) => a == b,
+            (D::TypeReference { name: a, .. }, D::TypeReference { name: b, .. }) => {
+                a.name.name == b.name.name
+            }
+            _ => false,
+        }
+    }
+
+    /// Element expressions of ONE array dimension, in the order of `indices`.
+    /// Resolves the §10.9.1 forms: positional items, `N{expr}` replication,
+    /// `index:expr` keys, and `default:expr` for whatever is left over.
+    fn pattern_elems<'a>(
+        &mut self,
+        items: &'a [AssignmentPatternItem],
+        indices: &[i64],
+    ) -> Vec<Option<&'a Expression>> {
+        let n = indices.len();
+        let mut out: Vec<Option<&Expression>> = vec![None; n];
+        let mut default: Option<&Expression> = None;
+        let mut pos = 0usize;
+        for item in items {
+            match item {
+                AssignmentPatternItem::Default(e) => default = Some(e),
+                AssignmentPatternItem::Keyed(k, v) => {
+                    let ki = self.eval_expr(k).to_i64().unwrap_or(0);
+                    if let Some(p) = indices.iter().position(|&i| i == ki) {
+                        out[p] = Some(v);
+                    }
+                }
+                AssignmentPatternItem::Ordered(e) => {
+                    if let ExprKind::Replication { count, exprs } = &e.kind {
+                        let c = self.eval_expr(count).to_u64().unwrap_or(0) as usize;
+                        for _ in 0..c {
+                            for sub in exprs {
+                                if pos < n {
+                                    out[pos] = Some(sub);
+                                    pos += 1;
+                                }
+                            }
+                        }
+                    } else if pos < n {
+                        out[pos] = Some(e);
+                        pos += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for slot in out.iter_mut() {
+            if slot.is_none() {
+                *slot = default;
+            }
+        }
+        out
+    }
+
+    /// Assign `e` to every leaf of the sub-array `base` spanning `dims`
+    /// (`m = '{default:0}` on a multi-dimensional array).
+    fn fill_dims(&mut self, base: &str, dims: &[(i64, i64)], dt: &DataType, e: &Expression) {
+        if dims.is_empty() {
+            self.assign_pattern_or_leaf(base, dt, e);
+            return;
+        }
+        let (lo, hi) = dims[0];
+        for i in lo..=hi {
+            let target = format!("{}[{}]", base, i);
+            self.fill_dims(&target, &dims[1..], dt, e);
+        }
+    }
+
+    /// Spread an assignment pattern across a FIXED unpacked array of any rank
+    /// (§10.9.1). A nested pattern descends one dimension; anything else fills
+    /// the whole sub-array.
+    fn assign_pattern_array(
+        &mut self,
+        base: &str,
+        dims: &[(i64, i64)],
+        dt: &DataType,
+        items: &[AssignmentPatternItem],
+        descending: bool,
+    ) {
+        let (lo, hi) = dims[0];
+        let indices: Vec<i64> = if descending && dims.len() == 1 {
+            (lo..=hi).rev().collect()
+        } else {
+            (lo..=hi).collect()
+        };
+        let elems = self.pattern_elems(items, &indices);
+        for (k, e) in elems.into_iter().enumerate() {
+            let Some(e) = e else { continue };
+            let target = format!("{}[{}]", base, indices[k]);
+            if dims.len() > 1 {
+                match &e.kind {
+                    ExprKind::AssignmentPattern(sub) if !sub.is_empty() => {
+                        self.assign_pattern_array(&target, &dims[1..], dt, sub, descending);
+                    }
+                    _ => self.fill_dims(&target, &dims[1..], dt, e),
+                }
+            } else {
+                self.assign_pattern_or_leaf(&target, dt, e);
+            }
+        }
+    }
+
+    /// Positional element expressions after expanding `N{expr}` replication —
+    /// what a queue / dynamic array pattern (`q = '{3{5}}`) yields.
+    fn pattern_ordered<'a>(
+        &mut self,
+        items: &'a [AssignmentPatternItem],
+    ) -> Vec<&'a Expression> {
+        let mut out: Vec<&Expression> = Vec::new();
+        for item in items {
+            if let AssignmentPatternItem::Ordered(e) = item {
+                if let ExprKind::Replication { count, exprs } = &e.kind {
+                    let c = self.eval_expr(count).to_u64().unwrap_or(0) as usize;
+                    for _ in 0..c {
+                        out.extend(exprs.iter());
+                    }
+                } else {
+                    out.push(e);
+                }
+            }
+        }
+        out
+    }
+
     /// IEEE 1800-2017 §10.9.2 / §10.10: an assignment pattern assigned to an
     /// aggregate whose leaves each live in their OWN signal — an unpacked
     /// struct, an unpacked array of unpacked structs, or an associative array —
@@ -30751,27 +32368,30 @@ impl Simulator {
             return wrote;
         }
 
-        let elem_is_unpacked_struct = matches!(
-            self.resolve_dt(&dt), DataType::Struct(ref su) if Self::spreads_member_wise(su));
+        // Queue / dynamic array: the pattern's positional items ARE the
+        // elements, and they set its size. `'{3{5}}` replication expands here.
+        if self.module.dynamic_arrays.contains(base) {
+            let exprs = self.pattern_ordered(items);
+            if exprs.is_empty() {
+                return false;
+            }
+            for (i, e) in exprs.iter().enumerate() {
+                self.assign_pattern_or_leaf(&format!("{}[{}]", base, i), &dt, e);
+            }
+            self.set_queue_size(base, exprs.len() as u64);
+            return true;
+        }
 
-        // Fixed unpacked array of unpacked structs: `'{'{...}, '{...}}`.
-        // Queues and dynamic arrays keep the existing (size-tracking) path.
-        if let Some(&(lo, hi, _)) = self.module.arrays.get(base) {
-            if !elem_is_unpacked_struct
-                || hi < lo
-                || self.module.dynamic_arrays.contains(base)
-                || !items.iter().all(|i| matches!(i, AssignmentPatternItem::Ordered(_)))
-            {
+        // Fixed unpacked array of any rank (§10.9.1): positional items,
+        // `N{expr}` replication, `index:expr` keys and `default:expr`, with
+        // nested patterns descending one dimension at a time.
+        if let Some(dims) = self.foreach_dims(base) {
+            let cells: i64 = dims.iter().map(|&(lo, hi)| (hi - lo + 1).max(0)).product();
+            if cells <= 0 || cells > (1 << 20) {
                 return false;
             }
             let descending = self.module.descending_arrays.contains(base);
-            for (i, item) in items.iter().enumerate() {
-                let idx = if descending { hi - i as i64 } else { lo + i as i64 };
-                if idx < lo || idx > hi {
-                    break;
-                }
-                self.assign_pattern_or_leaf(&format!("{}[{}]", base, idx), &dt, item.expr());
-            }
+            self.assign_pattern_array(base, &dims, &dt, items, descending);
             return true;
         }
 
@@ -30907,10 +32527,82 @@ impl Simulator {
         Some((dt, arr))
     }
 
+    /// Remaining dimensions of a partially indexed multi-dimensional array
+    /// (`m[1]` of `int m[2][3]` still has one dimension left).
+    fn partial_index_dims(&self, name: &str) -> Option<Vec<(i64, i64)>> {
+        if !name.ends_with(']') {
+            return None;
+        }
+        let segs = Self::split_flat_path(name);
+        if segs.len() != 1 {
+            return None;
+        }
+        let (base, nidx) = &segs[0];
+        let dims = self.foreach_dims(base)?;
+        if *nidx == 0 || *nidx >= dims.len() {
+            return None;
+        }
+        Some(dims[*nidx..].to_vec())
+    }
+
+    /// Element type recorded for `name`, or derived from its base when `name`
+    /// is a flattened sub-path (`q[i]`, which has no declaration of its own).
+    fn p_elem_type(&self, name: &str) -> Option<DataType> {
+        self.module
+            .var_decl_types
+            .get(name)
+            .cloned()
+            .or_else(|| self.flat_path_type(name).map(|(d, _)| d))
+    }
+
+    /// Nested element list for a multi-dimensional unpacked array. The innermost
+    /// element may itself be a collection (an array of queues), so it goes back
+    /// through `render_p_var` first.
+    fn render_p_dims(&mut self, base: &str, dims: &[(i64, i64)], dt: &DataType) -> String {
+        let (lo, hi) = dims[0];
+        let mut parts: Vec<String> = Vec::new();
+        for i in lo..=hi {
+            let elem = format!("{}[{}]", base, i);
+            if dims.len() == 1 {
+                let rendered = self
+                    .render_p_var(&elem)
+                    .unwrap_or_else(|| self.render_p_typed(&elem, dt));
+                parts.push(rendered);
+            } else {
+                parts.push(self.render_p_dims(&elem, &dims[1..], dt));
+            }
+        }
+        format!("'{{{}}}", parts.join(", "))
+    }
+
     /// LRM §21.2.1.7 `%p` on the variable `name`: recursively render nested
     /// structs, unpacked arrays, enums, strings and reals in assignment-pattern
     /// form. `None` if neither the variable nor its base has a declared type.
     fn render_p_var(&mut self, name: &str) -> Option<String> {
+        // A queue / dynamic array prints exactly its `size()` elements — not the
+        // fixed 64-slot buffer it is backed by. Its ELEMENTS (`q[i]` of an
+        // array of queues) have no declared type of their own.
+        if self.module.dynamic_arrays.contains(name) {
+            let dt = self.p_elem_type(name)?;
+            let sz = self.get_queue_size(name);
+            let parts: Vec<String> = (0..sz)
+                .map(|i| self.render_p_typed(&format!("{}[{}]", name, i), &dt))
+                .collect();
+            return Some(format!("'{{{}}}", parts.join(", ")));
+        }
+        // A MULTI-dimensional unpacked array is a nested element list; only the
+        // 1-D case was handled, so `int m[2][3]` printed `'{x, x}`.
+        if self.module.arrays_2d.contains_key(name) || self.module.arrays_nd.contains_key(name) {
+            let dims = self.foreach_dims(name)?;
+            let dt = self.p_elem_type(name)?;
+            return Some(self.render_p_dims(name, &dims, &dt));
+        }
+        // A PARTIAL index into one (`q3[1]` of `int q3[2][2][$]`) still names a
+        // sub-array: render the dimensions it has left.
+        if let Some(dims) = self.partial_index_dims(name) {
+            let dt = self.p_elem_type(name)?;
+            return Some(self.render_p_dims(name, &dims, &dt));
+        }
         let Some(dt) = self.module.var_decl_types.get(name).cloned() else {
             let (dt, arr) = self.flat_path_type(name)?;
             if let Some(idxs) = arr {
@@ -30958,13 +32650,11 @@ impl Simulator {
                 .collect();
             return Some(format!("'{{{}}}", parts.join(", ")));
         }
-        // Fixed unpacked array -> element list.
+        // Fixed unpacked array -> element list. An element may itself be a
+        // collection (`int q[3][$]`), so it goes back through `render_p_var`.
         if let Some(&(lo, hi, _)) = self.module.arrays.get(name) {
             if hi >= lo && (hi - lo) < 4096 {
-                let parts: Vec<String> = (lo..=hi)
-                    .map(|i| self.render_p_typed(&format!("{}[{}]", name, i), &dt))
-                    .collect();
-                return Some(format!("'{{{}}}", parts.join(", ")));
+                return Some(self.render_p_dims(name, &[(lo, hi)], &dt));
             }
             return None;
         }
@@ -31300,34 +32990,151 @@ impl Simulator {
     /// LRM §7.12.2: in-place sort/rsort/unique on `arr` with the
     /// per-element key expression `filter` (binds `item` to each
     /// element). Mirrors `reduce_with`'s `item` plumbing.
-    fn sort_with(&mut self, arr: &str, method: &str, filter: &Expression) {
-        let size = self.get_queue_size(arr);
-        if size == 0 {
-            return;
+    /// IEEE 1800-2017 §11.4.5 / §7.2: `==` and `!=` on unpacked structs compare
+    /// them member by member. Their leaves live in separate signals, so the
+    /// packed-value path compared two container signals that do not exist and
+    /// always yielded X. An X in any leaf makes the result X, as for vectors.
+    /// `None` when either side is not an unpacked struct with storage.
+    fn compare_unpacked_structs(&mut self, lhs: &Expression, rhs: &Expression) -> Option<Value> {
+        let (a, b) = (self.flat_member_name(lhs)?, self.flat_member_name(rhs)?);
+        let dt = self.p_elem_type(&a)?;
+        let DataType::Struct(su) = self.resolve_dt(&dt) else { return None };
+        if !Self::spreads_member_wise(&su) {
+            return None;
         }
+        if !self.struct_storage_exists(&a, &su) || !self.struct_storage_exists(&b, &su) {
+            return None;
+        }
+        let mut equal = true;
+        for sfx in self.struct_leaf_suffixes(&su) {
+            let av = self.get_signal_value_by_name(&format!("{}.{}", a, sfx));
+            let bv = self.get_signal_value_by_name(&format!("{}.{}", b, sfx));
+            match (av, bv) {
+                (Some(x), Some(y)) => {
+                    if x.has_unknown() || y.has_unknown() {
+                        return Some(Value::new(1)); // X
+                    }
+                    if x != y {
+                        equal = false;
+                    }
+                }
+                _ => return Some(Value::new(1)),
+            }
+        }
+        Some(if equal { Value::ones(1) } else { Value::zero(1) })
+    }
+
+    /// IEEE 1800-2017 §7.3.2: a tagged union stores ONE member at a time. A
+    /// member expression yields the stored value only when that member is the
+    /// active one; reading any other member is not valid and yields X.
+    fn tagged_union_member(&mut self, base: &str, member: &str) -> Option<Value> {
+        let tag = self.active_union_tag.get(base)?.clone();
+        let w = self.lookup_signal_width(base).unwrap_or(32);
+        if tag == member {
+            Some(
+                self.get_signal_value_by_name(base)
+                    .unwrap_or_else(|| Value::new(w)),
+            )
+        } else {
+            Some(Value::new(w))
+        }
+    }
+
+    /// IEEE 1800-2017 §7.12.1 array LOCATOR methods. They select elements and
+    /// RETURN a queue — none of them modifies the source array.
+    fn is_locator_method(m: &str) -> bool {
+        matches!(
+            m,
+            "find" | "find_index" | "find_first" | "find_first_index"
+                | "find_last" | "find_last_index" | "min" | "max"
+                | "unique" | "unique_index"
+        )
+    }
+
+    /// `(array, method, filter)` when `e` is a locator call on an array/queue,
+    /// with or without a `with (...)` clause. `q.min()` parses as a Call, while
+    /// `q.min` (no parens) parses as a 2-segment identifier.
+    fn locator_call(&mut self, e: &Expression) -> Option<(String, String, Option<Expression>)> {
+        let (inner, filter) = match &e.kind {
+            ExprKind::WithClause { expr, filter } => (expr.as_ref(), Some((**filter).clone())),
+            _ => (e, None),
+        };
+        let target = match &inner.kind {
+            ExprKind::Call { func, .. } => func.as_ref(),
+            _ => inner,
+        };
+        let (arr, mname) = match &target.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                let ExprKind::Ident(h) = &expr.kind else { return None };
+                (self.resolve_hier_name(h), member.name.clone())
+            }
+            ExprKind::Ident(h) if h.path.len() == 2 => (
+                h.path[0].name.name.clone(),
+                h.path[1].name.name.clone(),
+            ),
+            _ => return None,
+        };
+        if !Self::is_locator_method(&mname) {
+            return None;
+        }
+        if self.module.arrays.contains_key(&arr) || self.module.dynamic_arrays.contains(&arr) {
+            Some((arr, mname, filter))
+        } else {
+            None
+        }
+    }
+
+    /// Indices of the elements a locator method selects. `item` binds to each
+    /// element — by value for scalars and class handles, by NAME for unpacked
+    /// structs (see `item_alias`). Without a `with` clause the element's own
+    /// value is the key.
+    fn locator_indices(
+        &mut self,
+        arr: &str,
+        method: &str,
+        filter: Option<&Expression>,
+    ) -> Vec<usize> {
+        let size = self.get_queue_size(arr) as usize;
+        if size == 0 {
+            return Vec::new();
+        }
+        let elem_su = self.queue_elem_struct(arr);
         let pushed_frame = if self.local_stack.is_empty() {
             self.local_stack.push(HashMap::default());
             true
         } else {
             false
         };
-        let saved_item = self
-            .local_stack
-            .last()
-            .and_then(|f| f.get("item").cloned());
-        // Compute key for each element.
-        let mut pairs: Vec<(i64, Value)> = Vec::with_capacity(size as usize);
+        let saved_item = self.local_stack.last().and_then(|f| f.get("item").cloned());
+        let saved_alias = self.item_alias.take();
+
+        let mut keys: Vec<i64> = Vec::with_capacity(size);
+        let mut truth: Vec<bool> = Vec::with_capacity(size);
         for i in 0..size {
-            let elem = self
-                .get_signal_value_by_name(&format!("{}[{}]", arr, i))
+            let elem = format!("{}[{}]", arr, i);
+            if elem_su.is_some() {
+                self.item_alias = Some(elem.clone());
+            }
+            let v = self
+                .get_signal_value_by_name(&elem)
                 .unwrap_or_else(|| Value::zero(32));
             if let Some(f) = self.local_stack.last_mut() {
-                f.insert("item".to_string(), elem.clone());
+                f.insert("item".to_string(), v.clone());
             }
-            let key = self.eval_expr(filter).to_i64().unwrap_or(0);
-            pairs.push((key, elem));
+            match filter {
+                Some(f) => {
+                    let fv = self.eval_expr(f);
+                    truth.push(fv.is_true());
+                    keys.push(fv.to_i64().unwrap_or(0));
+                }
+                None => {
+                    truth.push(true);
+                    keys.push(v.to_i64().unwrap_or(0));
+                }
+            }
         }
-        // Restore item binding.
+
+        self.item_alias = saved_alias;
         if let Some(f) = self.local_stack.last_mut() {
             match saved_item {
                 Some(v) => {
@@ -31341,42 +33148,115 @@ impl Simulator {
         if pushed_frame {
             self.local_stack.pop();
         }
-        // Apply the requested mutation.
-        let new_elems: Vec<Value> = match method {
-            "sort" => {
-                pairs.sort_by_key(|(k, _)| *k);
-                pairs.into_iter().map(|(_, v)| v).collect()
+
+        match method {
+            "find" | "find_index" => (0..size).filter(|&i| truth[i]).collect(),
+            "find_first" | "find_first_index" => {
+                (0..size).find(|&i| truth[i]).into_iter().collect()
             }
-            "rsort" => {
-                pairs.sort_by(|a, b| b.0.cmp(&a.0));
-                pairs.into_iter().map(|(_, v)| v).collect()
+            "find_last" | "find_last_index" => {
+                (0..size).rev().find(|&i| truth[i]).into_iter().collect()
             }
-            "unique" => {
-                let mut seen: std::collections::HashSet<i64> =
-                    std::collections::HashSet::new();
-                pairs
-                    .into_iter()
-                    .filter_map(|(k, v)| {
-                        if seen.insert(k) {
-                            Some(v)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
+            "min" => (0..size).min_by_key(|&i| keys[i]).into_iter().collect(),
+            "max" => (0..size).max_by_key(|&i| keys[i]).into_iter().collect(),
+            "unique" | "unique_index" => {
+                let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+                (0..size).filter(|&i| seen.insert(keys[i])).collect()
             }
-            _ => return,
-        };
-        let new_size = new_elems.len() as u64;
-        for (i, v) in new_elems.into_iter().enumerate() {
-            self.set_signal_value_by_name(&format!("{}[{}]", arr, i), v);
+            _ => Vec::new(),
         }
-        // For unique (which may shrink the array), update the queue
-        // size. sort/rsort preserve length so this is a no-op there.
-        if new_size != size {
+    }
+
+    /// Write a locator result into the destination queue `dst`. The `_index`
+    /// forms yield the indices themselves; the rest copy the elements
+    /// (member-wise for unpacked structs).
+    fn materialize_locator(&mut self, dst: &str, arr: &str, method: &str, idxs: &[usize]) {
+        let index_form = method.ends_with("_index");
+        for (i, &src_i) in idxs.iter().enumerate() {
+            if index_form {
+                self.set_signal_value_by_name(
+                    &format!("{}[{}]", dst, i),
+                    Value::from_u64(src_i as u64, 32),
+                );
+            } else {
+                self.queue_copy_elem(arr, src_i as u64, dst, i as u64);
+            }
+        }
+        self.set_queue_size(dst, idxs.len() as u64);
+    }
+
+    /// LRM §7.12.2: `q.sort()/.rsort()/.unique() with (item.field)`.
+    ///
+    /// Computes each element's key, then permutes the queue by INDEX rather
+    /// than by value — an unpacked-struct element has no packed value to carry
+    /// around, so the old "collect values, reorder, write back" shape reordered
+    /// nothing. `item` binds to the element's value for scalars and to its flat
+    /// name for structs (see `item_alias`).
+    fn sort_with(&mut self, arr: &str, method: &str, filter: &Expression) {
+        let size = self.get_queue_size(arr) as usize;
+        if size == 0 {
+            return;
+        }
+        let elem_su = self.queue_elem_struct(arr);
+        let pushed_frame = if self.local_stack.is_empty() {
+            self.local_stack.push(HashMap::default());
+            true
+        } else {
+            false
+        };
+        let saved_item = self
+            .local_stack
+            .last()
+            .and_then(|f| f.get("item").cloned());
+        let saved_alias = self.item_alias.take();
+
+        let mut keys: Vec<i64> = Vec::with_capacity(size);
+        for i in 0..size {
+            let elem = format!("{}[{}]", arr, i);
+            if elem_su.is_some() {
+                self.item_alias = Some(elem.clone());
+            }
+            let v = self
+                .get_signal_value_by_name(&elem)
+                .unwrap_or_else(|| Value::zero(32));
+            if let Some(f) = self.local_stack.last_mut() {
+                f.insert("item".to_string(), v);
+            }
+            keys.push(self.eval_expr(filter).to_i64().unwrap_or(0));
+        }
+
+        self.item_alias = saved_alias;
+        if let Some(f) = self.local_stack.last_mut() {
+            match saved_item {
+                Some(v) => {
+                    f.insert("item".to_string(), v);
+                }
+                None => {
+                    f.remove("item");
+                }
+            }
+        }
+        if pushed_frame {
+            self.local_stack.pop();
+        }
+
+        let mut order: Vec<usize> = (0..size).collect();
+        match method {
+            // `sort_by_key` is stable, so equal keys keep their order.
+            "sort" => order.sort_by_key(|&i| keys[i]),
+            "rsort" => order.sort_by_key(|&i| std::cmp::Reverse(keys[i])),
+            // `unique` is a LOCATOR (§7.12.1): it returns a queue and must not
+            // reorder or shrink the source. Handled by the locator path.
+            _ => return,
+        }
+
+        self.queue_permute(arr, &order);
+
+        // `unique` may shrink the queue; sort/rsort preserve its length.
+        let new_size = order.len() as u64;
+        if new_size != size as u64 {
             self.set_queue_size(arr, new_size);
-            // Clear trailing stale slots.
-            for i in new_size..size {
+            for i in new_size..size as u64 {
                 self.signals.remove(&format!("{}[{}]", arr, i));
             }
         }
@@ -31813,21 +33693,20 @@ impl Simulator {
                 // class instead of `eval_expr`-ing the call (which
                 // returns 0 because the bare `new` has no class
                 // context). The resulting handle is what gets pushed.
-                let val = self.queue_eval_arg(obj_name, arg);
                 let cur_size = self.get_queue_size(obj_name);
                 if let Some(&max) = self.module.queue_max_sizes.get(obj_name) {
                     if cur_size >= max as u64 {
                         return Some(Value::zero(32));
                     }
                 }
-                self.set_signal_value_by_name(&format!("{}[{}]", obj_name, cur_size), val);
+                let elem = format!("{}[{}]", obj_name, cur_size);
+                self.queue_store_elem(obj_name, &elem, arg);
                 self.set_queue_size(obj_name, cur_size + 1);
             }
             return Some(Value::zero(32));
         }
         if mname == "push_front" {
             if let Some(arg) = args.first() {
-                let val = self.queue_eval_arg(obj_name, arg);
                 let cur_size = self.get_queue_size(obj_name);
                 if let Some(&max) = self.module.queue_max_sizes.get(obj_name) {
                     if cur_size >= max as u64 {
@@ -31835,12 +33714,10 @@ impl Simulator {
                     }
                 }
                 for i in (0..cur_size).rev() {
-                    if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i))
-                    {
-                        self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i + 1), v);
-                    }
+                    self.queue_move_elem(obj_name, i, i + 1);
                 }
-                self.set_signal_value_by_name(&format!("{}[0]", obj_name), val);
+                let head = format!("{}[0]", obj_name);
+                self.queue_store_elem(obj_name, &head, arg);
                 self.set_queue_size(obj_name, cur_size + 1);
             }
             return Some(Value::zero(32));
@@ -31852,10 +33729,7 @@ impl Simulator {
                     .get_signal_value_by_name(&format!("{}[0]", obj_name))
                     .unwrap_or_else(|| Value::zero(32));
                 for i in 1..cur_size {
-                    if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i))
-                    {
-                        self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i - 1), v);
-                    }
+                    self.queue_move_elem(obj_name, i, i - 1);
                 }
                 self.set_queue_size(obj_name, cur_size - 1);
                 return Some(val);
@@ -31910,17 +33784,8 @@ impl Simulator {
         if mname == "reverse" {
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 0 {
-                let mut elements = Vec::new();
-                for i in 0..cur_size {
-                    if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i))
-                    {
-                        elements.push(v);
-                    }
-                }
-                elements.reverse();
-                for (i, v) in elements.into_iter().enumerate() {
-                    self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i), v);
-                }
+                let order: Vec<usize> = (0..cur_size).rev().collect();
+                self.queue_permute(obj_name, &order);
             }
             return Some(Value::zero(32));
         }
@@ -31930,32 +33795,27 @@ impl Simulator {
             use rand::Rng;
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 1 {
-                let mut elements: Vec<Value> = (0..cur_size)
-                    .filter_map(|i| self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)))
-                    .collect();
-                // Fisher-Yates
-                for i in (1..elements.len()).rev() {
+                let mut order: Vec<usize> = (0..cur_size).collect();
+                // Fisher-Yates over the index order, then move the elements.
+                for i in (1..cur_size).rev() {
                     let j = self.rng.gen_range(0..=i);
-                    elements.swap(i, j);
+                    order.swap(i, j);
                 }
-                for (i, v) in elements.into_iter().enumerate() {
-                    self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i), v);
-                }
+                self.queue_permute(obj_name, &order);
             }
             return Some(Value::zero(32));
         }
         if mname == "insert" {
             if args.len() >= 2 {
                 let idx = self.eval_expr(&args[0]).to_u64().unwrap_or(0);
-                let val = self.eval_expr(&args[1]);
                 let cur_size = self.get_queue_size(obj_name);
+                // Move elements member-wise: an unpacked-struct element has no
+                // container signal, so a packed copy shifts nothing at all.
                 for i in (idx..cur_size).rev() {
-                    if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i))
-                    {
-                        self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i + 1), v);
-                    }
+                    self.queue_move_elem(obj_name, i, i + 1);
                 }
-                self.set_signal_value_by_name(&format!("{}[{}]", obj_name, idx), val);
+                let slot = format!("{}[{}]", obj_name, idx);
+                self.queue_store_elem(obj_name, &slot, &args[1]);
                 self.set_queue_size(obj_name, cur_size + 1);
             }
             return Some(Value::zero(32));
@@ -32051,21 +33911,9 @@ impl Simulator {
             return Some(max_val.unwrap_or(Value::zero(32)));
         }
         if mname == "unique" {
-            let cur_size = self.get_queue_size(obj_name) as usize;
-            let mut seen = std::collections::HashSet::new();
-            let mut result = Vec::new();
-            for i in 0..cur_size {
-                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
-                    let key = v.to_u64().unwrap_or(0);
-                    if seen.insert(key) {
-                        result.push(v);
-                    }
-                }
-            }
-            for (i, v) in result.iter().enumerate() {
-                self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i), v.clone());
-            }
-            self.set_queue_size(obj_name, result.len() as u64);
+            // §7.12.1: a locator method RETURNS a queue; it must not modify the
+            // source. `r = q.unique()` is handled by the locator path in
+            // BlockingAssign; a bare `q.unique();` is simply a no-op.
             return Some(Value::zero(32));
         }
         if mname == "unique_index" {
@@ -32180,14 +34028,9 @@ impl Simulator {
                     let idx = self.eval_expr(arg).to_u64().unwrap_or(0) as usize;
                     let cur_size = self.get_queue_size(obj_name) as usize;
                     if idx < cur_size {
+                        // Member-wise, for the same reason as `insert`.
                         for i in idx..cur_size - 1 {
-                            let next_val = self
-                                .get_signal_value_by_name(&format!("{}[{}]", obj_name, i + 1))
-                                .unwrap_or(Value::zero(32));
-                            self.set_signal_value_by_name(
-                                &format!("{}[{}]", obj_name, i),
-                                next_val,
-                            );
+                            self.queue_move_elem(obj_name, (i + 1) as u64, i as u64);
                         }
                         self.set_queue_size(obj_name, (cur_size - 1) as u64);
                     }
@@ -33133,6 +34976,21 @@ impl Simulator {
     /// so only a definite type mismatch fails — the case UVM's
     /// `if (!$cast(seq, item))` relies on.
     fn cast_type_ok(&self, dest: &Expression, src: &Value) -> bool {
+        // §6.24.1: casting to an ENUM succeeds only when the value is one of
+        // its members. Checked before the class logic, whose "not a live class
+        // object" escape hatch would otherwise wave every integer through.
+        if let ExprKind::Ident(hh) = &dest.kind {
+            if hh.path.len() == 1 {
+                if let Some(tn) = self.type_name_of_var(&hh.path[0].name.name) {
+                    if let Some(members) = self.module.enum_members.get(&tn) {
+                        return match src.to_u64() {
+                            Some(x) => members.iter().any(|(_, mv)| *mv == x),
+                            None => false,
+                        };
+                    }
+                }
+            }
+        }
         let h = src.to_u64().unwrap_or(0) as usize;
         if h == 0 {
             return true; // null assigns through
@@ -33141,9 +34999,12 @@ impl Simulator {
             Some(i) => i.class_name.clone(),
             None => return true, // not a live class object — don't enforce
         };
+        // A module-scope class handle is not in `var_class_types` (only
+        // procedural locals are), so it used to fall into the permissive
+        // `None` branch and EVERY downcast reported success.
         let dest_type = match &dest.kind {
             ExprKind::Ident(hh) if hh.path.len() == 1 => {
-                self.var_class_types.get(&hh.path[0].name.name).cloned()
+                self.class_of_var(&hh.path[0].name.name)
             }
             _ => None,
         };
@@ -33607,6 +35468,31 @@ impl Simulator {
                 }
             }
 
+            // Element of an unpacked ARRAY OF QUEUES (IEEE 1800-2017 §7.4.5):
+            // `q[i].push_back(x)`, `q[i][j].size()`. The element IS a queue,
+            // stored flat under `q[i]` / `q[i][j]`. The bare-array dispatch
+            // below only accepts an `Ident` receiver, so this would otherwise
+            // fall through and silently do nothing.
+            if matches!(&expr.kind, ExprKind::Index { .. })
+                && (Self::is_array_builtin_method(mname)
+                    || matches!(
+                        mname,
+                        "push_back" | "push_front" | "pop_front" | "pop_back"
+                            | "insert" | "delete" | "sort" | "rsort"
+                            | "reverse" | "shuffle"
+                    ))
+            {
+                if let Some(qn) = self.flat_member_name(expr) {
+                    if self.module.dynamic_arrays.contains(&qn)
+                        || self.module.associative_arrays.contains_key(&qn)
+                    {
+                        if let Some(res) = self.eval_builtin_method(&qn, mname, args) {
+                            return res;
+                        }
+                    }
+                }
+            }
+
             // Class-property collection accessed EXTERNALLY
             // (`obj.member.num()/.exists()/.size()/...`): resolve the
             // instance-scoped storage name (`<handle>#member`) up front, before
@@ -33718,6 +35604,10 @@ impl Simulator {
                 let s = self.eval_expr(expr).to_sv_string();
                 let r = if mname == "tolower" { s.to_lowercase() } else { s.to_uppercase() };
                 return Value::from_string(&r);
+            }
+            // §6.16.4 putc / §6.16.10 itoa-family / §6.16.9 atoreal.
+            if let Some(v) = self.string_method(expr, mname, args) {
+                return v;
             }
             // String-to-number conversions (IEEE 1800-2023 §6.16.9). Parse the
             // longest valid numeric prefix in the given radix; 0 on no match.
@@ -34290,6 +36180,29 @@ impl Simulator {
             // receiver flattened into the ident path (`v.name()` ->
             // Ident([v, name])). The MemberAccess form is handled earlier; this
             // covers the common local-variable case.
+            //
+            // §6.16 string methods on a flattened receiver — `s.putc(0, "J");`
+            // as a statement parses this way, which is why the mutators looked
+            // like no-ops even though the MemberAccess path handled them.
+            if len >= 2
+                && matches!(
+                    path[len - 1].name.name.as_str(),
+                    "putc" | "itoa" | "hextoa" | "octtoa" | "bintoa" | "realtoa" | "atoreal"
+                )
+            {
+                let m = path[len - 1].name.name.clone();
+                let base = HierarchicalIdentifier {
+                    root: hier.root.clone(),
+                    path: path[..len - 1].to_vec(),
+                    span: hier.span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                };
+                let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
+                if let Some(v) = self.string_method(&base_expr, &m, args) {
+                    return v;
+                }
+            }
             if len >= 2 && args.is_empty()
                 && matches!(
                     path[len - 1].name.name.as_str(),
@@ -34882,7 +36795,265 @@ impl Simulator {
         )
     }
 
+    /// IEEE 1800-2017 §12.5.4 `case (e) inside`: an item is a range, a value or
+    /// an array, matched with the same rules as the `inside` OPERATOR — ranges
+    /// are inclusive and x/z in an item are wildcards. `CaseInside` fell through
+    /// to exact `case_eq`, so a range item compared against a garbage value and
+    /// a wildcard item never matched: both silently took `default`.
+    fn case_inside_match(&mut self, val: &Value, pat: &Expression) -> bool {
+        if let ExprKind::Range(lo, hi) = &pat.kind {
+            let l = self.eval_expr(lo);
+            let h = self.eval_expr(hi);
+            return val.greater_equal(&l).is_true() && val.less_equal(&h).is_true();
+        }
+        if let Some(nm) = self.array_operand_name(pat) {
+            let sz = self.get_queue_size(&nm);
+            for i in 0..sz {
+                if let Some(ev) = self.get_signal_value_by_name(&format!("{}[{}]", nm, i)) {
+                    if val.wildcard_eq(&ev).is_true() {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        let pv = self.eval_expr(pat);
+        val.wildcard_eq(&pv).is_true()
+    }
+
+    /// IEEE 1800-2017 §6.12.2: converting a real to an integral type ROUNDS to
+    /// the nearest, ties away from zero. `f64 as u64` both truncated AND
+    /// saturated a negative value to 0, so `int i = -5.0;` silently yielded 0.
+    fn real_to_int(f: f64, width: u32) -> Value {
+        if !f.is_finite() {
+            return Value::zero(width.max(1));
+        }
+        // `f64::round` is already ties-away-from-zero.
+        Value::from_u64(f.round() as i64 as u64, width.max(1))
+    }
+
+    /// `$rtoi` TRUNCATES toward zero rather than rounding (§20.5).
+    fn real_trunc_to_int(f: f64, width: u32) -> Value {
+        if !f.is_finite() {
+            return Value::zero(width.max(1));
+        }
+        Value::from_u64(f.trunc() as i64 as u64, width.max(1))
+    }
+
+    /// Bind an ASSOCIATIVE-array actual to a formal: copy the caller's entries to
+    /// `<formal>[key]` and register the formal so `.size()`/`.exists()`/indexing
+    /// work inside the body. Returns `(formal, actual)`.
+    ///
+    /// Only tasks did this; functions bound nothing, so `arr.size()` on an assoc
+    /// formal read 0.
+    fn bind_assoc_param(
+        &mut self,
+        port: &crate::ast::decl::FunctionPort,
+        arg: &Expression,
+    ) -> Option<(String, String)> {
+        use crate::ast::types::UnpackedDimension as UD;
+        if !port
+            .dimensions
+            .iter()
+            .any(|d| matches!(d, UD::Associative { .. }))
+        {
+            return None;
+        }
+        let ExprKind::Ident(hier) = &arg.kind else { return None };
+        let caller = self.resolve_hier_name(hier);
+        let param = port.name.name.clone();
+        let prefix = format!("{}[", caller);
+        let entries: Vec<(String, Value)> = self
+            .signals
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix) && k.ends_with(']'))
+            .map(|(k, v)| {
+                let key = &k[prefix.len()..k.len() - 1];
+                (format!("{}[{}]", param, key), v.clone())
+            })
+            .collect();
+        for (k, v) in entries {
+            self.signals.insert(k, v);
+        }
+        let is_string_key = self.is_string_keyed_array(&caller);
+        self.module
+            .associative_arrays
+            .insert(param.clone(), is_string_key);
+        Some((param, caller))
+    }
+
+    /// Drop a formal associative array's entries and registration.
+    fn purge_assoc_param(&mut self, param: &str) {
+        let prefix = format!("{}[", param);
+        let keys: Vec<String> = self
+            .signals
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for k in keys {
+            self.signals.remove(&k);
+        }
+        self.module.associative_arrays.remove(param);
+    }
+
+    /// Copy a `ref`/`output`/`inout` associative formal back onto the caller's
+    /// array, replacing its contents.
+    fn writeback_assoc_param(&mut self, param: &str, caller: &str) {
+        let cprefix = format!("{}[", caller);
+        let old: Vec<String> = self
+            .signals
+            .keys()
+            .filter(|k| k.starts_with(&cprefix))
+            .cloned()
+            .collect();
+        for k in old {
+            self.signals.remove(&k);
+        }
+        let pprefix = format!("{}[", param);
+        let entries: Vec<(String, Value)> = self
+            .signals
+            .iter()
+            .filter(|(k, _)| k.starts_with(&pprefix) && k.ends_with(']'))
+            .map(|(k, v)| {
+                let key = &k[pprefix.len()..k.len() - 1];
+                (format!("{}[{}]", caller, key), v.clone())
+            })
+            .collect();
+        for (k, v) in entries {
+            self.signals.insert(k, v);
+        }
+    }
+
+    /// Copy a fixed unpacked ARRAY actual into the formal's element signals and
+    /// register the formal as an array so `a[i]` resolves inside the body.
+    /// Returns `(formal, actual, lo, hi)` so an `output`/`inout`/`ref` formal
+    /// can be copied back on return (§13.5.2).
+    ///
+    /// Only `[lo:hi]` range dimensions were handled, and only for tasks, so the
+    /// far commoner `int a[3]` size form silently passed nothing: the body read
+    /// X and a `ref` write never reached the caller.
+    fn bind_array_arg(
+        &mut self,
+        port: &crate::ast::decl::FunctionPort,
+        arg: &Expression,
+    ) -> Option<(String, String, i64, i64)> {
+        use crate::ast::types::UnpackedDimension as UD;
+        if port.dimensions.is_empty() {
+            return None;
+        }
+        let dims = super::elaborate::normalize_unpacked_dims(
+            &port.dimensions,
+            &self.module.parameters,
+            &self.module.typedef_types,
+        );
+        let params = Some(&self.module.parameters);
+        let (lo, hi) = match dims.first()? {
+            UD::Range { left, right, .. } => {
+                let l = super::elaborate::const_eval_i64_with_params(left, params)?;
+                let r = super::elaborate::const_eval_i64_with_params(right, params)?;
+                (l.min(r), l.max(r))
+            }
+            UD::Expression { expr, .. } => {
+                let n = super::elaborate::const_eval_i64_with_params(expr, params)?;
+                if n <= 0 {
+                    return None;
+                }
+                (0, n - 1)
+            }
+            _ => return None,
+        };
+        let ExprKind::Ident(h) = &arg.kind else { return None };
+        let caller = self.resolve_hier_name(h);
+        if !self.module.arrays.contains_key(&caller) {
+            return None;
+        }
+        let param = port.name.name.clone();
+        for idx in lo..=hi {
+            if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", caller, idx)) {
+                self.signals.insert(format!("{}[{}]", param, idx), v);
+            }
+        }
+        let w = self.module.arrays.get(&caller).map(|t| t.2).unwrap_or(32);
+        self.module.arrays.insert(param.clone(), (lo, hi, w));
+        Some((param, caller, lo, hi))
+    }
+
+    /// Copy an array formal's elements back onto the caller's array, then drop
+    /// the formal's element signals.
+    fn writeback_array_args(&mut self, wb: &[(String, String, i64, i64)]) {
+        for (param, caller, lo, hi) in wb {
+            for idx in *lo..=*hi {
+                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", param, idx)) {
+                    self.set_signal_value_by_name(&format!("{}[{}]", caller, idx), v);
+                }
+            }
+        }
+    }
+
+    /// IEEE 1800-2017 §13.5.4 named arguments (`f(.b(2), .a(1))`) and §13.5.3
+    /// default arguments. Reorders the actuals into FORMAL order and fills any
+    /// omitted formal from its default. Returns `None` when there are no named
+    /// arguments, so callers keep their original slice.
+    ///
+    /// Argument binding is positional everywhere in the simulator, so without
+    /// this a `.name(expr)` actual was evaluated as an opaque expression in
+    /// whatever position it happened to occupy — silently binding the wrong
+    /// formal, or nothing at all.
+    fn normalize_call_args(
+        ports: &[crate::ast::decl::FunctionPort],
+        args: &[Expression],
+    ) -> Option<Vec<Expression>> {
+        if !args.iter().any(|a| matches!(a.kind, ExprKind::NamedArg { .. })) {
+            return None;
+        }
+        let mut bound: Vec<Option<Expression>> = vec![None; ports.len()];
+        let mut pos = 0usize;
+        for a in args {
+            if let ExprKind::NamedArg { name, expr } = &a.kind {
+                if let Some(i) = ports.iter().position(|p| p.name.name == name.name) {
+                    if let Some(e) = expr {
+                        bound[i] = Some((**e).clone());
+                    }
+                }
+            } else if pos < ports.len() {
+                bound[pos] = Some(a.clone());
+                pos += 1;
+            }
+        }
+        // Everything up to the last bound formal must be supplied; a gap is
+        // filled from the formal's default.
+        let last = bound
+            .iter()
+            .enumerate()
+            .filter(|(i, b)| b.is_some() || ports[*i].default.is_some())
+            .map(|(i, _)| i)
+            .max()?;
+        let zero = || {
+            Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: "0".to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                }),
+                crate::ast::Span::dummy(),
+            )
+        };
+        let mut out = Vec::with_capacity(last + 1);
+        for (i, p) in ports.iter().enumerate().take(last + 1) {
+            out.push(match bound[i].take() {
+                Some(e) => e,
+                None => p.default.clone().unwrap_or_else(zero),
+            });
+        }
+        Some(out)
+    }
+
     fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
+        let normalized = Self::normalize_call_args(&fd.ports, args);
+        let args: &[Expression] = normalized.as_deref().unwrap_or(args);
         // Serve UVM's command-line iterator from `plusargs` regardless of the
         // (stubbed under `-DUVM_NO_DPI`) library body, so `uvm_cmdline_processor`
         // sees the real `+arg=val` list (`+num_of_tests=`, etc.).
@@ -34916,16 +37087,36 @@ impl Simulator {
         // `output`/`inout`/`ref` formals copy back to the caller's actual on
         // return (e.g. `get_int_arg_value(string s, ref int val)`).
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
+        let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
+        let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
         for (i, port) in fd.ports.iter().enumerate() {
-            if matches!(
+            let is_out = matches!(
                 port.direction,
                 PortDirection::Output | PortDirection::Inout | PortDirection::Ref
-            ) && i < args.len()
-            {
-                output_bindings.push((port.name.name.clone(), args[i].clone()));
+            );
+            // An ASSOCIATIVE-array formal: functions bound nothing at all, so
+            // `arr.size()` inside the body read 0.
+            if i < args.len() {
+                if let Some((param, caller)) = self.bind_assoc_param(port, &args[i]) {
+                    assoc_params.push((param, caller, is_out));
+                    continue;
+                }
             }
             if i < args.len() && self.bind_queue_param(&port.name.name, &port.dimensions, &args[i], &port.data_type) {
                 continue;
+            }
+            // Unpacked ARRAY formal: functions never bound one, so the body read
+            // X and a `ref` write never reached the caller (§13.5.2).
+            if i < args.len() {
+                if let Some(info) = self.bind_array_arg(port, &args[i]) {
+                    if is_out {
+                        array_writebacks.push(info);
+                    }
+                    continue;
+                }
+            }
+            if is_out && i < args.len() {
+                output_bindings.push((port.name.name.clone(), args[i].clone()));
             }
             let val = if i < args.len() {
                 self.eval_expr(&args[i])
@@ -34972,6 +37163,27 @@ impl Simulator {
                 .and_then(|l| l.get(&ret_name).cloned())
                 .unwrap_or(Value::zero(32))
         };
+        // Array formals copy element-wise; scalars go through `output_bindings`.
+        for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
+            if is_out {
+                self.writeback_assoc_param(&param, &caller);
+            }
+            self.purge_assoc_param(&param);
+        }
+        self.writeback_array_args(&array_writebacks);
+        for (param, ..) in &array_writebacks {
+            let prefix = format!("{}[", param);
+            let keys: Vec<String> = self
+                .signals
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for k in keys {
+                self.signals.remove(&k);
+            }
+            self.module.arrays.remove(param);
+        }
         // Copy `output`/`inout`/`ref` formals back to the caller's actuals
         // before popping this frame's locals.
         let writebacks: Vec<(Value, Expression)> = output_bindings
@@ -35002,9 +37214,16 @@ impl Simulator {
         // Execute task body
         for stmt in &td.items {
             self.exec_statement(stmt);
-            if self.return_value.is_some() || self.return_flag {
+            if self.return_value.is_some() || self.return_flag || self.break_flag {
                 break;
             }
+        }
+        // §9.6.2: `disable <task>` terminates this invocation and no more —
+        // the caller resumes. Clear the unwind signal here, or it would leak
+        // out and keep later loops from clearing `break_flag`.
+        if self.disable_target.as_deref() == Some(td.name.name.name.as_str()) {
+            self.disable_target = None;
+            self.break_flag = false;
         }
         self.unwind_task_frame(cleanup);
     }
@@ -35027,6 +37246,8 @@ impl Simulator {
                 self.assign_value(caller_expr, val);
             }
         }
+        let wb = c.array_writebacks.clone();
+        self.writeback_array_args(&wb);
         for (param_name, _caller_name) in &c.assoc_params {
             let prefix = format!("{}[", param_name);
             let keys: Vec<String> = self
@@ -35060,44 +37281,28 @@ impl Simulator {
 
     fn bind_task_frame(&mut self, td: &TaskDeclaration, args: &[Expression]) -> TaskCleanup {
         use crate::ast::types::PortDirection;
+        let normalized = Self::normalize_call_args(&td.ports, args);
+        let args: &[Expression] = normalized.as_deref().unwrap_or(args);
         // Evaluate input args and collect output/ref arg expressions
         let mut locals = HashMap::default();
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
         let mut assoc_params: Vec<(String, String)> = Vec::new(); // (param_name, caller_array_name)
         let mut array_params: Vec<String> = Vec::new(); // param names with unpacked Range dim
         self.push_queue_frame();
+        let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         for (i, port) in td.ports.iter().enumerate() {
-            // Unpacked array parameter (e.g. `int a [2:0]`): copy caller's
-            // array elements into `param[idx]` signals so `a[0]` resolves.
-            if let Some(crate::ast::types::UnpackedDimension::Range { left, right, .. }) =
-                port.dimensions.first()
-            {
-                if i < args.len() {
-                    if let ExprKind::Ident(hier) = &args[i].kind {
-                        let caller_name = self.resolve_hier_name(hier);
-                        let param_name = port.name.name.clone();
-                        let l =
-                            super::elaborate::const_eval_i64_with_params(left, None).unwrap_or(0);
-                        let r =
-                            super::elaborate::const_eval_i64_with_params(right, None).unwrap_or(0);
-                        let (lo, hi) = (l.min(r), l.max(r));
-                        for idx in lo..=hi {
-                            let caller_elem = format!("{}[{}]", caller_name, idx);
-                            let param_elem = format!("{}[{}]", param_name, idx);
-                            if let Some(v) = self.get_signal_value_by_name(&caller_elem) {
-                                self.signals.insert(param_elem, v);
-                            }
-                        }
-                        let w = self
-                            .module
-                            .arrays
-                            .get(&caller_name)
-                            .map(|t| t.2)
-                            .unwrap_or(32);
-                        self.module.arrays.insert(param_name.clone(), (lo, hi, w));
-                        array_params.push(param_name);
-                        continue;
+            // Unpacked array formal (`int a[2:0]` or `int a[3]`): copy the
+            // caller's elements in, and copy them back for an out/inout/ref.
+            if i < args.len() {
+                if let Some(info) = self.bind_array_arg(port, &args[i]) {
+                    if matches!(
+                        port.direction,
+                        PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+                    ) {
+                        array_writebacks.push(info.clone());
                     }
+                    array_params.push(info.0);
+                    continue;
                 }
             }
             let is_assoc = port
@@ -35216,6 +37421,7 @@ impl Simulator {
             self.current_static_task = Some(td.name.name.name.clone());
         }
         TaskCleanup {
+            array_writebacks,
             output_bindings,
             assoc_params,
             array_params,
@@ -36239,6 +38445,7 @@ impl Simulator {
                         .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
                         .unwrap_or(1) as i64;
                     *self.semaphores.get_mut(&handle).unwrap() += n;
+                    self.wake_semaphore_waiters(handle);
                     return Value::zero(32);
                 }
                 "get" => {
@@ -39491,22 +41698,139 @@ impl SendExecContext {
 // VPI (Verification Procedural Interface) Support
 // ============================================================================
 
-// VPI types matching vpi_user.h
+// VPI constants. Every value is the one IEEE 1800-2017 Annex K assigns
+// it, and matches `include/vpi_user.h` symbol for symbol. These are not
+// free parameters: a C file compiled against a vendor `vpi_user.h` and
+// linked to xezim agrees with the numbers below or it silently takes the
+// wrong branch.
+mod vpi {
+    use libc::c_int;
+
+    // Value formats (Table 38-44).
+    pub const BIN_STR_VAL: c_int = 1;
+    pub const OCT_STR_VAL: c_int = 2;
+    pub const DEC_STR_VAL: c_int = 3;
+    pub const HEX_STR_VAL: c_int = 4;
+    pub const SCALAR_VAL: c_int = 5;
+    pub const INT_VAL: c_int = 6;
+    pub const REAL_VAL: c_int = 7;
+    pub const STRING_VAL: c_int = 8;
+    pub const VECTOR_VAL: c_int = 9;
+    pub const TIME_VAL: c_int = 11;
+    pub const OBJ_TYPE_VAL: c_int = 12;
+    /// Set into `value_p->format` when a value cannot be supplied
+    /// (§38.16). This is the only failure channel `vpi_get_value` has.
+    pub const SUPPRESS_VAL: c_int = 13;
+
+    // vpiScalarVal codes.
+    pub const SCALAR_0: c_int = 0;
+    pub const SCALAR_1: c_int = 1;
+    pub const SCALAR_Z: c_int = 2;
+    pub const SCALAR_X: c_int = 3;
+
+    // vpi_put_value flags.
+    pub const FORCE_FLAG: c_int = 5;
+    pub const RELEASE_FLAG: c_int = 6;
+
+    // vpi_get properties.
+    pub const UNDEFINED: c_int = -1;
+    pub const TYPE: c_int = 1;
+    pub const NAME: c_int = 2;
+    pub const FULL_NAME: c_int = 3;
+    pub const SIZE: c_int = 4;
+    pub const DEF_NAME: c_int = 9;
+    pub const SCALAR: c_int = 17;
+    pub const VECTOR: c_int = 18;
+    pub const SIGNED: c_int = 65;
+
+    // vpi_control operations.
+    pub const STOP: c_int = 66;
+    pub const FINISH: c_int = 67;
+    pub const RESET: c_int = 68;
+
+    // vpi_chk_error levels and states.
+    pub const NOTICE: c_int = 1;
+    pub const WARNING: c_int = 2;
+    pub const ERROR: c_int = 3;
+    pub const RUN_STATE: c_int = 3;
+
+    // System-function return kinds (`s_vpi_systf_data.sysfunctype`).
+    pub const INT_FUNC: c_int = 1;
+    pub const REAL_FUNC: c_int = 2;
+    pub const TIME_FUNC: c_int = 3;
+    pub const SIZED_FUNC: c_int = 4;
+    pub const SIZED_SIGNED_FUNC: c_int = 5;
+
+    // Object types returned by vpi_get(vpiType), and traversal relations.
+    pub const CONSTANT: c_int = 7;
+    pub const ITERATOR: c_int = 27;
+    pub const FUNC_TYPE: c_int = 44;
+    pub const SYS_FUNC_CALL: c_int = 56;
+    pub const SYS_TASK_CALL: c_int = 57;
+    pub const SYS_TF_CALL: c_int = 85;
+    pub const ARGUMENT: c_int = 89;
+    pub const MEMORY: c_int = 29;
+    pub const MODULE: c_int = 32;
+    pub const PARAMETER: c_int = 41;
+    pub const PART_SELECT: c_int = 42;
+    pub const SCOPE: c_int = 84;
+    pub const INTERNAL_SCOPE: c_int = 92;
+    pub const VARIABLES: c_int = 100;
+    pub const INTEGER_VAR: c_int = 25;
+    pub const NET: c_int = 36;
+    pub const REAL_VAR: c_int = 47;
+    /// Also `vpiLogicVar` — the standard aliases them.
+    pub const REG: c_int = 48;
+    pub const TIME_VAR: c_int = 63;
+    pub const LONG_INT_VAR: c_int = 610;
+    pub const SHORT_INT_VAR: c_int = 611;
+    pub const INT_VAR: c_int = 612;
+    pub const SHORT_REAL_VAR: c_int = 613;
+    pub const BYTE_VAR: c_int = 614;
+    pub const STRING_VAR: c_int = 616;
+    pub const ENUM_VAR: c_int = 617;
+    pub const STRUCT_VAR: c_int = 618;
+    pub const UNION_VAR: c_int = 619;
+    pub const BIT_VAR: c_int = 620;
+
+    // Time types.
+    pub const SIM_TIME: c_int = 2;
+
+    // s_vpi_systf_data.type
+    pub const SYS_TASK: c_int = 1;
+    pub const SYS_FUNC: c_int = 2;
+
+    // Callback reasons (Table 38-49).
+    pub const CB_VALUE_CHANGE: c_int = 1;
+    pub const CB_START_OF_RESET: c_int = 19;
+}
+
+// VPI types matching vpi_user.h. `aval`/`bval` are PLI_INT32 (signed) in
+// the standard header, so mirror that exactly — the bit patterns are what
+// matter, but the sizes must agree.
+//
+// Per-bit encoding (§38.10.1):
+//     aval bval   value
+//       0    0      0
+//       1    0      1
+//       0    1      Z
+//       1    1      X
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct s_vpi_vecval {
-    aval: u32,
-    bval: u32,
+    aval: i32,
+    bval: i32,
 }
 
 #[repr(C)]
 union s_vpi_value_union {
+    str: *mut libc::c_char,
+    scalar: libc::c_int,
     integer: libc::c_int,
     real: libc::c_double,
-    time: u64,
-    str: *mut libc::c_char,
+    time: *mut s_vpi_time,
     vector: *mut s_vpi_vecval,
-    scalar: u32,
-    longint: i64,
+    misc: *mut libc::c_char,
 }
 
 #[repr(C)]
@@ -39516,11 +41840,131 @@ struct s_vpi_value {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct s_vpi_time {
     type_: libc::c_int,
     high: u32,
     low: u32,
     real: libc::c_double,
+}
+
+// Scratch storage handed back to C by `vpi_get_value` for the formats
+// whose value is a pointer (vectors, strings, time). IEEE 1800-2017
+// §38.16 lets the simulator own this memory and only guarantees it
+// until the next `vpi_get_value` call, which is exactly what these
+// give: each call overwrites the previous contents.
+thread_local! {
+    static VPI_VEC_SCRATCH: std::cell::RefCell<Vec<s_vpi_vecval>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static VPI_STR_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    // vpi_get_str() rotates through a pool rather than reusing one buffer.
+    // `vpi_printf("%s %s", vpi_get_str(vpiName, h), vpi_get_str(vpiDefName, h))`
+    // is idiomatic VPI: both pointers are live at once, and C leaves the
+    // argument evaluation order unspecified. A single shared buffer makes
+    // both strings read as whichever call happened to run last.
+    static VPI_STR2_SCRATCH: std::cell::RefCell<(usize, Vec<Vec<u8>>)> =
+        std::cell::RefCell::new((0, vec![Vec::new(); 8]));
+    static VPI_TIME_SCRATCH: std::cell::RefCell<s_vpi_time> =
+        const { std::cell::RefCell::new(s_vpi_time { type_: 2, high: 0, low: 0, real: 0.0 }) };
+}
+
+/// `Value` bit code (0=0, 1=1, 2=X, 3=Z) -> one `(aval, bval)` bit pair.
+#[inline]
+fn bit_code_to_ab(code: u8) -> (u32, u32) {
+    match code {
+        0 => (0, 0),
+        1 => (1, 0),
+        2 => (1, 1), // X
+        _ => (0, 1), // Z
+    }
+}
+
+/// One `(aval, bval)` bit pair -> `Value` bit code.
+#[inline]
+fn ab_to_bit_code(a: u32, b: u32) -> u8 {
+    match (a, b) {
+        (0, 0) => 0,
+        (1, 0) => 1,
+        (1, 1) => 2, // X
+        _ => 3,      // Z
+    }
+}
+
+/// Render a `Value` into `s_vpi_vecval` words, preserving X and Z.
+fn value_to_vecval(v: &Value, out: &mut Vec<s_vpi_vecval>) {
+    let w = v.width.max(1) as usize;
+    let words = w.div_ceil(32);
+    out.clear();
+    out.resize(words, s_vpi_vecval { aval: 0, bval: 0 });
+    let mut aval = vec![0u32; words];
+    let mut bval = vec![0u32; words];
+    for i in 0..w {
+        let (a, b) = bit_code_to_ab(v.get_bit_code(i));
+        if a != 0 {
+            aval[i / 32] |= 1u32 << (i % 32);
+        }
+        if b != 0 {
+            bval[i / 32] |= 1u32 << (i % 32);
+        }
+    }
+    for i in 0..words {
+        out[i] = s_vpi_vecval { aval: aval[i] as i32, bval: bval[i] as i32 };
+    }
+}
+
+/// Build a `Value` of `width` bits from `s_vpi_vecval` words, preserving
+/// X and Z. Words beyond the slice read as zero.
+fn vecval_to_value(vec: &[s_vpi_vecval], width: u32, is_signed: bool) -> Value {
+    let mut v = Value::zero(width);
+    for i in 0..width as usize {
+        let w = i / 32;
+        if w >= vec.len() {
+            break;
+        }
+        let a = (vec[w].aval as u32 >> (i % 32)) & 1;
+        let b = (vec[w].bval as u32 >> (i % 32)) & 1;
+        v.set_bit_code(i, ab_to_bit_code(a, b));
+    }
+    v.is_signed = is_signed;
+    v
+}
+
+/// Radix string with 4-state digits, `bits_per_digit` of 1, 3 or 4.
+/// A digit is `z` when every bit in it is Z, otherwise `x` when any bit
+/// is unknown — the Verilog display rule.
+fn vpi_radix_string(v: &Value, bits_per_digit: usize) -> String {
+    let w = v.width.max(1) as usize;
+    let ndigits = w.div_ceil(bits_per_digit);
+    let mut s = String::with_capacity(ndigits);
+    for d in (0..ndigits).rev() {
+        let mut digit = 0u32;
+        let (mut xs, mut zs, mut n) = (0usize, 0usize, 0usize);
+        for b in 0..bits_per_digit {
+            let idx = d * bits_per_digit + b;
+            if idx >= w {
+                continue;
+            }
+            n += 1;
+            match v.get_bit_code(idx) {
+                1 => digit |= 1 << b,
+                2 => xs += 1,
+                3 => zs += 1,
+                _ => {}
+            }
+        }
+        if n > 0 && zs == n {
+            s.push('z');
+        } else if xs + zs > 0 {
+            s.push('x');
+        } else {
+            s.push(char::from_digit(digit, 1u32 << bits_per_digit).unwrap_or('0'));
+        }
+    }
+    if s.is_empty() {
+        s.push('0');
+    }
+    s
 }
 
 /// Thread-local pointer to the current simulator instance.
@@ -39533,29 +41977,231 @@ thread_local! {
     static ACTIVE_SCOPE: std::cell::Cell<*mut libc::c_void> = const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 
+/// What a `vpiHandle` points at. `vpiHandle` is `void *` to C, so this is
+/// entirely private; every entry point checks `kind` before using the
+/// fields that only some kinds populate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VpiKind {
+    /// A whole signal in the flat signal table.
+    Signal,
+    /// A bit range of a signal — a packed-struct member or part-select.
+    Slice,
+    /// A module instance. `inst_idx == -1` is the top module.
+    Module,
+    /// An unpacked array. `vpi_handle_by_index` selects a word.
+    Memory,
+    /// The result of `vpi_iterate`, consumed by `vpi_scan`.
+    Iterator,
+    /// A read-only value: a `$systf` argument that is not signal-backed
+    /// (a literal, or any computed expression).
+    Constant,
+    /// The `$systf` call currently executing. `vpi_iterate(vpiArgument, ..)`
+    /// walks its arguments; `vpi_put_value` on it sets a system function's
+    /// return value.
+    SysTfCall,
+}
+
 /// Wrapper for VPI handles stored as raw pointers.
-#[repr(C)]
+#[derive(Clone)]
 struct VpiHandle {
+    kind: VpiKind,
+    /// Signal / Slice / Memory: index into the signal table. For Memory this
+    /// is the id of element 0.
     signal_id: usize,
+    /// `vpi_get(vpiType)` answer, resolved from the DECLARED type when the
+    /// handle is created. It must not be derived from the current value:
+    /// a `logic` signal is a `vpiReg` whether or not it happens to hold X.
+    type_code: libc::c_int,
+    /// Slice only: bit range within `signal_id`.
+    lsb: u32,
+    width: u32,
+    /// Module only: index into `module.instances`, or -1 for the top module.
+    inst_idx: isize,
+    /// Local name (`data_bus`) and hierarchical name (`tb_top.u_sub.data_bus`).
+    name: String,
+    full_name: String,
+    /// Module only: the definition this instantiates (`vpiDefName`).
+    def_name: String,
+    /// Iterator only: the objects still to be handed out by `vpi_scan`.
+    items: Vec<VpiHandle>,
+    pos: usize,
+    /// Constant only: the argument's value, captured at call time.
+    value: Option<Value>,
+    /// SysTfCall only: depth of the frame in `VPI_SYSTF_STACK`, so a handle
+    /// held across a nested `$systf` call still names its own frame.
+    frame: usize,
+}
+
+impl VpiHandle {
+    fn signal(id: usize, type_code: libc::c_int, name: &str, full: &str) -> Self {
+        VpiHandle {
+            kind: VpiKind::Signal,
+            signal_id: id,
+            type_code,
+            lsb: 0,
+            width: 0,
+            inst_idx: -1,
+            name: name.to_string(),
+            full_name: full.to_string(),
+            def_name: String::new(),
+            items: Vec::new(),
+            pos: 0,
+            value: None,
+            frame: 0,
+        }
+    }
+
+    fn into_raw(self) -> *mut libc::c_void {
+        Box::into_raw(Box::new(self)) as *mut libc::c_void
+    }
+
+    /// A read-only `$systf` argument that is not signal-backed.
+    fn constant(v: Value) -> Self {
+        VpiHandle {
+            kind: VpiKind::Constant,
+            signal_id: 0,
+            type_code: vpi::CONSTANT,
+            lsb: 0,
+            width: v.width,
+            inst_idx: -1,
+            name: String::new(),
+            full_name: String::new(),
+            def_name: String::new(),
+            items: Vec::new(),
+            pos: 0,
+            value: Some(v),
+            frame: 0,
+        }
+    }
+
+    /// The `$systf` call at `frame` (an index into `VPI_SYSTF_STACK`).
+    fn systf_call(frame: usize, name: &str, is_func: bool, ret_width: u32) -> Self {
+        VpiHandle {
+            kind: VpiKind::SysTfCall,
+            signal_id: 0,
+            type_code: if is_func { vpi::SYS_FUNC_CALL } else { vpi::SYS_TASK_CALL },
+            lsb: 0,
+            width: ret_width,
+            inst_idx: -1,
+            name: name.to_string(),
+            full_name: name.to_string(),
+            def_name: String::new(),
+            items: Vec::new(),
+            pos: 0,
+            value: None,
+            frame,
+        }
+    }
+}
+
+/// Borrow a handle, returning None for NULL.
+///
+/// # Safety
+/// `handle` must be NULL or a pointer returned by one of the VPI handle
+/// constructors and not yet freed.
+unsafe fn vpi_deref<'a>(handle: *mut libc::c_void) -> Option<&'a VpiHandle> {
+    if handle.is_null() {
+        None
+    } else {
+        Some(&*(handle as *const VpiHandle))
+    }
+}
+
+/// The `$systf` invocation currently on the stack. `vpi_handle(vpiSysTfCall,
+/// NULL)` names the innermost one; `vpi_iterate(vpiArgument, ..)` walks its
+/// arguments; `vpi_put_value` on it sets a system function's return value.
+struct VpiSystfFrame {
+    /// The `$name`, as `vpi_get_str(vpiName, ..)` reports it.
+    name: String,
+    /// Argument objects, resolved once at call time. A signal-backed argument
+    /// is writable (an `output` argument); the rest are `Constant`.
+    args: Vec<VpiHandle>,
+    /// Return value deposited by `vpi_put_value` on the call handle.
+    ret: Option<Value>,
+    /// Width the return value is resized to.
+    ret_width: u32,
+    /// vpiSysTask or vpiSysFunc.
+    tf_type: libc::c_int,
+    /// `sysfunctype`, for a function.
+    func_type: libc::c_int,
+}
+
+// Innermost frame last: a `$systf` may invoke another.
+thread_local! {
+    static VPI_SYSTF_STACK: std::cell::RefCell<Vec<VpiSystfFrame>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The last diagnostic, for `vpi_chk_error`. Cleared once reported.
+    static VPI_LAST_ERROR: std::cell::RefCell<Option<(libc::c_int, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record a diagnostic so `vpi_chk_error` can report it, and echo it to stderr.
+///
+/// Every VPI failure path routes through here. Without it `vpi_chk_error`
+/// would always answer "no error", and a caller that checks it — which is the
+/// only reason to call it — would sail straight past a failed call.
+fn vpi_error(level: libc::c_int, msg: String) {
+    eprintln!("[VPI] {}", msg);
+    VPI_LAST_ERROR.with(|c| *c.borrow_mut() = Some((level, msg)));
+}
+
+/// A `$systf` registered from a VPI module via `vpi_register_systf`.
+#[derive(Clone, Copy)]
+struct VpiSystf {
+    /// `PLI_INT32 (*calltf)(PLI_BYTE8 *user_data)`, as a `usize` so the
+    /// struct stays `Copy` and can live in a thread-local map.
+    calltf: usize,
+    compiletf: usize,
+    /// Called once per invocation of a `vpiSizedFunc` to learn its return width.
+    sizetf: usize,
+    user_data: usize,
+    /// vpiSysTask (1) or vpiSysFunc (2).
+    tf_type: libc::c_int,
+    /// `sysfunctype`: vpiIntFunc / vpiRealFunc / vpiTimeFunc / vpiSizedFunc /
+    /// vpiSizedSignedFunc. Meaningless for a task.
+    func_type: libc::c_int,
+}
+
+// System tasks and functions registered by a VPI module's
+// `vlog_startup_routines`. Registration happens before the Simulator is
+// built, so this cannot hang off it. Single-threaded, like the rest of the
+// VPI surface.
+thread_local! {
+    static VPI_SYSTFS: std::cell::RefCell<HashMap<String, VpiSystf>> =
+        std::cell::RefCell::new(HashMap::default());
+}
+
+/// Mirror of `s_vpi_systf_data` from `vpi_user.h` (IEEE 1800-2017 §38.36).
+#[repr(C)]
+struct s_vpi_systf_data {
+    type_: libc::c_int,
+    sysfunctype: libc::c_int,
+    tfname: *mut libc::c_char,
+    calltf: *mut libc::c_void,
+    compiletf: *mut libc::c_void,
+    sizetf: *mut libc::c_void,
+    user_data: *mut libc::c_char,
 }
 
 /// Mirror of `s_cb_data` from `vpi_user.h` — the value-change dispatcher
 /// builds one of these on the stack and hands its address to the C
-/// callback. Fields match the IEEE 1800 §38.7 layout exactly; the C
-/// type is `t_cb_data`.
+/// callback. Fields match the IEEE 1800-2017 §38.7 layout exactly.
+///
+/// `index` sits between `value` and `user_data` in the standard struct.
+/// It was missing here, so every field after it was read from the wrong
+/// offset by any C code compiled against a conforming `vpi_user.h` —
+/// `user_data` in particular.
 #[repr(C)]
 struct s_cb_data {
     reason: libc::c_int,
-    /// C function pointer (`PLI_INT32 (*cb_rtn)()`). Stored as the
-    /// destination type of the callback; unused when the callback is
-    /// invoked directly with its `user_data` cookie.
+    /// C function pointer (`PLI_INT32 (*cb_rtn)(p_cb_data)`).
     cb_rtn: *mut libc::c_void,
-    /// Object the callback was registered against (e.g. a signal
-    /// handle for cbValueChange). xezim passes null — callers that
-    /// need it recover it via `vpi_handle_by_name` from `user_data`.
+    /// Object the callback was registered against (the signal handle for
+    /// cbValueChange). Passed back to the callback on each fire.
     obj: *mut libc::c_void,
     time: *mut s_vpi_time,
     value: *mut s_vpi_value,
+    index: libc::c_int,
     user_data: *mut libc::c_void,
 }
 
@@ -39578,8 +42224,8 @@ struct DpiScope {
     name_len: usize,
 }
 
-/// Opaque VPI callback handle. The `cb_type` and `user_data` are passed
-/// to the C callback when the trigger fires.
+/// Opaque VPI callback handle. Everything the dispatcher needs to rebuild
+/// a conforming `s_cb_data` when the trigger fires.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DpiCbHandle {
@@ -39593,9 +42239,34 @@ struct DpiCbHandle {
     cb_routine: usize,
     /// User-supplied data passed to the callback as `cb_data_p->user_data`.
     user_data: usize,
+    /// The `obj` handle supplied at registration, passed back on each
+    /// fire as `cb_data_p->obj` (§38.7 requires it).
+    obj: usize,
+    /// Format of the value struct supplied at registration, used to fill
+    /// `cb_data_p->value`. `vpiIntVal` when the caller supplied none.
+    value_format: libc::c_int,
 }
 
-/// Execute a callback with access to the active simulator.
+/// Execute a closure with access to the active simulator.
+///
+/// Returns `None` when there is no active simulator — a VPI call from
+/// outside a DPI context. This used to `panic!`, which unwinds across an
+/// `extern "C"` boundary and therefore aborts the process; every VPI
+/// entry point now degrades to its documented failure value instead.
+fn try_active_sim<F, R>(who: &str, f: F) -> Option<R>
+where
+    F: FnOnce(&mut Simulator) -> R,
+{
+    let sim_ptr = ACTIVE_SIMULATOR.with(|cell| cell.get());
+    if sim_ptr.is_null() {
+        eprintln!("[VPI] {}: no active simulator (call from outside a DPI context)", who);
+        return None;
+    }
+    Some(f(unsafe { &mut *sim_ptr }))
+}
+
+/// Execute a closure with access to the active simulator, for the DPI
+/// scope primitives, which have no way to report failure.
 fn with_active_sim<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Simulator) -> R,
@@ -39607,7 +42278,189 @@ where
     f(unsafe { &mut *sim_ptr })
 }
 
+/// The `vpi_get(vpiType)` code for a signal, from its DECLARED type.
+///
+/// Falls back to `vpiReg` — a 4-state vector variable — for anything whose
+/// declaration we cannot see, which is the safe answer: a caller that
+/// believes a signal may hold X will read it with a 4-state format.
+fn vpi_type_of(sim: &Simulator, name: &str, id: usize) -> libc::c_int {
+    use xezim_core::ast::types::{DataType, IntegerAtomType, IntegerVectorType, RealType, SimpleType, StructUnionKind};
+
+    // A parameter is also stored as a signal, so this must come first or
+    // every parameter reports vpiReg.
+    if sim.module.parameters.contains_key(name) {
+        return vpi::PARAMETER;
+    }
+    if sim.module.nets.contains(name) {
+        return vpi::NET;
+    }
+    // The signal table's `is_real` covers reals reached through a path we
+    // have no declaration for.
+    let looks_real = sim.signal_table.get(id).map(|v| v.is_real).unwrap_or(false);
+
+    let dt = sim
+        .module
+        .var_decl_types
+        .get(name)
+        .or_else(|| name.rsplit('.').next().and_then(|leaf| sim.module.var_decl_types.get(leaf)));
+
+    match dt {
+        Some(DataType::IntegerVector { kind, .. }) => match kind {
+            IntegerVectorType::Bit => vpi::BIT_VAR,
+            IntegerVectorType::Logic | IntegerVectorType::Reg => vpi::REG,
+        },
+        Some(DataType::IntegerAtom { kind, .. }) => match kind {
+            IntegerAtomType::Byte => vpi::BYTE_VAR,
+            IntegerAtomType::ShortInt => vpi::SHORT_INT_VAR,
+            IntegerAtomType::Int => vpi::INT_VAR,
+            IntegerAtomType::LongInt => vpi::LONG_INT_VAR,
+            IntegerAtomType::Integer => vpi::INTEGER_VAR,
+            IntegerAtomType::Time => vpi::TIME_VAR,
+        },
+        Some(DataType::Real { kind, .. }) => match kind {
+            RealType::ShortReal => vpi::SHORT_REAL_VAR,
+            _ => vpi::REAL_VAR,
+        },
+        Some(DataType::Simple { kind: SimpleType::String, .. }) => vpi::STRING_VAR,
+        Some(DataType::Enum(_)) => vpi::ENUM_VAR,
+        Some(DataType::Struct(su)) => match su.kind {
+            StructUnionKind::Union => vpi::UNION_VAR,
+            _ => vpi::STRUCT_VAR,
+        },
+        _ if looks_real => vpi::REAL_VAR,
+        _ => vpi::REG,
+    }
+}
+
+fn new_vpi_handle(sim: &Simulator, name: &str, id: usize) -> *mut libc::c_void {
+    let type_code = vpi_type_of(sim, name, id);
+    let leaf = name.rsplit('.').next().unwrap_or(name);
+    VpiHandle::signal(id, type_code, leaf, &vpi_full_name(sim, name)).into_raw()
+}
+
+/// Prefix a design-relative name with the top module, the way
+/// `vpi_get_str(vpiFullName, ..)` must report it.
+fn vpi_full_name(sim: &Simulator, name: &str) -> String {
+    if name.is_empty() {
+        sim.module.name.clone()
+    } else {
+        format!("{}.{}", sim.module.name, name)
+    }
+}
+
+/// Strip a leading `<top>.` from a hierarchical name. Signal-table names
+/// are stored relative to the top module, but VPI callers write the full
+/// path.
+fn vpi_strip_top<'a>(sim: &Simulator, name: &'a str) -> &'a str {
+    let top = sim.module.name.as_str();
+    if let Some(rest) = name.strip_prefix(top) {
+        if let Some(rest) = rest.strip_prefix('.') {
+            return rest;
+        }
+        if rest.is_empty() {
+            return "";
+        }
+    }
+    name
+}
+
+/// A module handle for `inst_idx` (-1 = the top module).
+fn vpi_module_handle(sim: &Simulator, inst_idx: isize) -> *mut libc::c_void {
+    let (name, full, def) = if inst_idx < 0 {
+        (sim.module.name.clone(), sim.module.name.clone(), sim.module.name.clone())
+    } else {
+        let inst = &sim.module.instances[inst_idx as usize];
+        let leaf = inst.path.rsplit('.').next().unwrap_or(&inst.path).to_string();
+        (leaf, vpi_full_name(sim, &inst.path), inst.def_name.clone())
+    };
+    VpiHandle {
+        kind: VpiKind::Module,
+        signal_id: 0,
+        type_code: vpi::MODULE,
+        lsb: 0,
+        width: 0,
+        inst_idx,
+        name,
+        full_name: full,
+        def_name: def,
+        items: Vec::new(),
+        pos: 0,
+        value: None,
+        frame: 0,
+    }
+    .into_raw()
+}
+
+/// The design-relative path of a module handle ("" for the top module).
+fn vpi_scope_path(sim: &Simulator, h: &VpiHandle) -> String {
+    if h.inst_idx < 0 {
+        String::new()
+    } else {
+        sim.module.instances[h.inst_idx as usize].path.clone()
+    }
+}
+
+/// True when `name` is a signal the elaborator invented for an instance
+/// (a 1-bit placeholder so validation recognises the name). Those must not
+/// appear as VPI signal objects — they are module instances.
+fn vpi_is_instance_name(sim: &Simulator, name: &str) -> bool {
+    sim.module.instances.iter().any(|i| i.path == name)
+}
+
+/// Resolve a packed-struct member path (`pixel_data.r`) to its bit range.
+fn vpi_slice_of(sim: &Simulator, name: &str) -> Option<VpiHandle> {
+    let (base, member) = name.rsplit_once('.')?;
+    let fields = sim.module.packed_struct_fields.get(base)?;
+    let &(_, lsb, width) = fields.iter().find(|(m, _, _)| m == member)?;
+    let &id = sim.signal_name_to_id.get(base)?;
+    Some(VpiHandle {
+        kind: VpiKind::Slice,
+        signal_id: id,
+        type_code: vpi::PART_SELECT,
+        lsb,
+        width,
+        inst_idx: -1,
+        name: member.to_string(),
+        full_name: vpi_full_name(sim, name),
+        def_name: String::new(),
+        items: Vec::new(),
+        pos: 0,
+        value: None,
+        frame: 0,
+    })
+}
+
+/// Read a slice out of its parent signal.
+fn vpi_slice_read(sim: &Simulator, h: &VpiHandle) -> Option<Value> {
+    let parent = sim.signal_table.get(h.signal_id)?;
+    let mut v = Value::zero(h.width);
+    for i in 0..h.width as usize {
+        v.set_bit_code(i, parent.get_bit_code(h.lsb as usize + i));
+    }
+    Some(v)
+}
+
+/// Write a slice back into its parent signal.
+fn vpi_slice_write(sim: &Simulator, h: &VpiHandle, val: &Value) -> Option<Value> {
+    let mut parent = sim.signal_table.get(h.signal_id)?.clone();
+    for i in 0..h.width as usize {
+        parent.set_bit_code(h.lsb as usize + i, val.get_bit_code(i));
+    }
+    Some(parent)
+}
+
 /// Get signal ID by hierarchical name.
+///
+/// Tries the full name, then each successively shorter suffix, so
+/// `top.dut.sig`, `dut.sig` and `sig` all resolve. Member paths like
+/// `top.dut.some_struct.val_i` are registered as `some_struct.val_i`, so
+/// the suffix walk is what finds them.
+///
+/// The previous loop never advanced its cursor: it only ever tested the
+/// name with its first segment stripped, and when that missed it spun
+/// forever. Any unresolvable dotted name hung the simulator — reachable
+/// straight from `uvm_hdl_check_path`, whose whole job is to ask about
+/// paths that may not exist.
 #[no_mangle]
 pub extern "C" fn vpi_handle_by_name(
     name: *mut libc::c_char,
@@ -39621,31 +42474,593 @@ pub extern "C" fn vpi_handle_by_name(
         .trim()
         .to_string();
 
-    with_active_sim(|sim| {
-        // Try progressively stripping leftmost scope segments until we
-        // either resolve the name or exhaust prefixes. Handles:
-        //   - full hier name:           "top.mod.signal"
-        //   - module-prefix stripped:   "mod.signal"   (e.g. for VPI backdoor)
-        //   - leaf only:                "signal"
-        // For member paths like "top.mod.unpacked_struct.val_i" we register
-        // "unpacked_struct.val_i" in `signal_name_to_id`, so the second
-        // variant above is what resolves.
-        if let Some(&id) = sim.signal_name_to_id.get(full_name.as_str()) {
-            let handle = Box::into_raw(Box::new(VpiHandle { signal_id: id }));
-            return handle as *mut libc::c_void;
+    try_active_sim("vpi_handle_by_name", |sim| {
+        // The top module itself, and any instance in the hierarchy.
+        let rel = vpi_strip_top(sim, &full_name);
+        if rel.is_empty() {
+            return vpi_module_handle(sim, -1);
         }
-        // Try progressively shorter prefixes from the left.
-        let mut start = 0usize;
-        while let Some(dot_pos) = full_name[start..].find('.') {
-            let abs_dot = start + dot_pos;
-            let candidate = &full_name[abs_dot + 1..];
-            if let Some(&id) = sim.signal_name_to_id.get(candidate) {
-                let handle = Box::into_raw(Box::new(VpiHandle { signal_id: id }));
-                return handle as *mut libc::c_void;
+        if let Some(i) = sim.module.instances.iter().position(|i| i.path == rel) {
+            return vpi_module_handle(sim, i as isize);
+        }
+
+        let mut rest: &str = full_name.as_str();
+        loop {
+            // An instance's 1-bit placeholder signal must not be handed out
+            // as a signal object.
+            if !vpi_is_instance_name(sim, rest) {
+                if let Some(&id) = sim.signal_name_to_id.get(rest) {
+                    return new_vpi_handle(sim, rest, id);
+                }
+                if let Some(h) = vpi_slice_of(sim, rest) {
+                    return h.into_raw();
+                }
+                if let Some(h) = vpi_memory_of(sim, rest) {
+                    return h.into_raw();
+                }
+            }
+            match rest.find('.') {
+                Some(dot) => rest = &rest[dot + 1..],
+                None => return std::ptr::null_mut(),
             }
         }
-        std::ptr::null_mut()
     })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// An unpacked array (`int mem [0:3]`) as a `vpiMemory` object. Its words
+/// are separate signals named `mem[0]`..`mem[n-1]`; `vpi_handle_by_index`
+/// selects one.
+fn vpi_memory_of(sim: &Simulator, name: &str) -> Option<VpiHandle> {
+    let &(lo, hi, _w) = sim.module.arrays.get(name)?;
+    let count = (hi - lo).unsigned_abs() as u32 + 1;
+    let id = *sim.signal_name_to_id.get(format!("{}[{}]", name, lo).as_str())?;
+    Some(VpiHandle {
+        kind: VpiKind::Memory,
+        signal_id: id,
+        type_code: vpi::MEMORY,
+        lsb: lo.min(hi) as u32,
+        width: count,
+        inst_idx: -1,
+        name: name.rsplit('.').next().unwrap_or(name).to_string(),
+        full_name: vpi_full_name(sim, name),
+        def_name: String::new(),
+        items: Vec::new(),
+        pos: 0,
+        value: None,
+        frame: 0,
+    })
+}
+
+/// Select one word of a `vpiMemory`.
+#[no_mangle]
+pub extern "C" fn vpi_handle_by_index(
+    handle: *mut libc::c_void,
+    index: libc::c_int,
+) -> *mut libc::c_void {
+    let Some(h) = (unsafe { vpi_deref(handle) }) else { return std::ptr::null_mut() };
+    if h.kind != VpiKind::Memory {
+        return std::ptr::null_mut();
+    }
+    let full = h.full_name.clone();
+    try_active_sim("vpi_handle_by_index", |sim| {
+        let rel = vpi_strip_top(sim, &full).to_string();
+        let elem = format!("{}[{}]", rel, index);
+        match sim.signal_name_to_id.get(elem.as_str()) {
+            Some(&id) => {
+                let ty = vpi_type_of(sim, &elem, id);
+                VpiHandle::signal(id, ty, &elem, &vpi_full_name(sim, &elem)).into_raw()
+            }
+            None => std::ptr::null_mut(),
+        }
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Traverse a one-to-one relationship. Only `vpiScope` is modelled.
+///
+/// `vpi_handle(vpiScope, NULL)` returns the top module. That is an xezim
+/// extension — the standard route to the top is
+/// `vpi_scan(vpi_iterate(vpiModule, NULL))` — but enough VPI code in the
+/// wild spells it this way that supporting it is worth more than the
+/// purity of returning NULL.
+#[no_mangle]
+pub extern "C" fn vpi_handle(type_: libc::c_int, refh: *mut libc::c_void) -> *mut libc::c_void {
+    // The currently executing $systf. A `NULL` reference is the idiomatic
+    // spelling; the standard also allows passing the call handle itself.
+    if type_ == vpi::SYS_TF_CALL {
+        return VPI_SYSTF_STACK.with(|st| {
+            let st = st.borrow();
+            match st.last() {
+                Some(f) => VpiHandle::systf_call(
+                    st.len() - 1,
+                    &f.name,
+                    f.tf_type == vpi::SYS_FUNC,
+                    f.ret_width,
+                )
+                .into_raw(),
+                None => {
+                    vpi_error(
+                        vpi::ERROR,
+                        "vpi_handle(vpiSysTfCall): no $systf is executing".to_string(),
+                    );
+                    std::ptr::null_mut()
+                }
+            }
+        });
+    }
+    try_active_sim("vpi_handle", |sim| {
+        if type_ != vpi::SCOPE {
+            return std::ptr::null_mut();
+        }
+        let Some(h) = (unsafe { vpi_deref(refh) }) else {
+            return vpi_module_handle(sim, -1);
+        };
+        match h.kind {
+            // The scope containing a module is its parent.
+            VpiKind::Module => {
+                if h.inst_idx < 0 {
+                    return std::ptr::null_mut(); // the top has no parent
+                }
+                let parent = sim.module.instances[h.inst_idx as usize].parent.clone();
+                if parent.is_empty() {
+                    vpi_module_handle(sim, -1)
+                } else {
+                    match sim.module.instances.iter().position(|i| i.path == parent) {
+                        Some(i) => vpi_module_handle(sim, i as isize),
+                        None => std::ptr::null_mut(),
+                    }
+                }
+            }
+            // The scope containing an object is the instance it is declared in.
+            _ => {
+                let rel = vpi_strip_top(sim, &h.full_name).to_string();
+                match rel.rsplit_once('.') {
+                    Some((scope, _)) => match sim.module.instances.iter().position(|i| i.path == scope) {
+                        Some(i) => vpi_module_handle(sim, i as isize),
+                        None => vpi_module_handle(sim, -1),
+                    },
+                    None => vpi_module_handle(sim, -1),
+                }
+            }
+        }
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Objects declared DIRECTLY in `scope` (no deeper dotted component), in
+/// sorted order so iteration is deterministic.
+fn vpi_scope_members(sim: &Simulator, scope: &str) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for (name, &id) in sim.signal_name_to_id.iter() {
+        let name: &str = name;
+        let leaf = if scope.is_empty() {
+            if name.contains('.') {
+                continue;
+            }
+            name
+        } else {
+            match name.strip_prefix(scope).and_then(|r| r.strip_prefix('.')) {
+                Some(r) if !r.contains('.') => r,
+                _ => continue,
+            }
+        };
+        // Array words (`mem[0]`) are reached through their vpiMemory parent,
+        // and an instance placeholder is not a signal.
+        if leaf.contains('[') || vpi_is_instance_name(sim, name) {
+            continue;
+        }
+        out.push((name.to_string(), id));
+    }
+    // Unpacked arrays have no whole-array signal; surface them as vpiMemory.
+    for name in sim.module.arrays.keys() {
+        let matches_scope = if scope.is_empty() {
+            !name.contains('.')
+        } else {
+            name.strip_prefix(scope).and_then(|r| r.strip_prefix('.')).map(|r| !r.contains('.')).unwrap_or(false)
+        };
+        if matches_scope && !out.iter().any(|(n, _)| n == name) {
+            out.push((name.clone(), usize::MAX));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Iterate a one-to-many relationship. Returns NULL when the relationship
+/// yields nothing, as the standard requires (callers test for it).
+#[no_mangle]
+pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *mut libc::c_void {
+    // The arguments of a $systf call. Handled before the design traversal
+    // below because it needs no simulator, only the call frame.
+    if type_ == vpi::ARGUMENT {
+        let Some(h) = (unsafe { vpi_deref(refh) }) else { return std::ptr::null_mut() };
+        if h.kind != VpiKind::SysTfCall {
+            return std::ptr::null_mut();
+        }
+        let items = VPI_SYSTF_STACK.with(|st| {
+            st.borrow().get(h.frame).map(|f| f.args.clone()).unwrap_or_default()
+        });
+        return vpi_make_iterator(items);
+    }
+    try_active_sim("vpi_iterate", |sim| {
+        let scope_h = unsafe { vpi_deref(refh) };
+
+        // A NULL reference means "the whole design": the only top-level
+        // module is the one we elaborated.
+        let scope_path = match scope_h {
+            None => {
+                if type_ == vpi::MODULE {
+                    let items = vec![unsafe { *Box::from_raw(vpi_module_handle(sim, -1) as *mut VpiHandle) }];
+                    return vpi_make_iterator(items);
+                }
+                return std::ptr::null_mut();
+            }
+            Some(h) if h.kind == VpiKind::Module => vpi_scope_path(sim, h),
+            Some(_) => return std::ptr::null_mut(),
+        };
+
+        // Child scopes / instances.
+        if type_ == vpi::MODULE || type_ == vpi::INTERNAL_SCOPE {
+            let items: Vec<VpiHandle> = sim
+                .module
+                .instances
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.parent == scope_path)
+                .map(|(idx, _)| unsafe { *Box::from_raw(vpi_module_handle(sim, idx as isize) as *mut VpiHandle) })
+                .collect();
+            return vpi_make_iterator(items);
+        }
+
+        // Declared objects, filtered by what the caller asked for.
+        let want = |ty: libc::c_int| -> bool {
+            match type_ {
+                vpi::NET => ty == vpi::NET,
+                vpi::REG => ty == vpi::REG || ty == vpi::BIT_VAR,
+                vpi::PARAMETER => ty == vpi::PARAMETER,
+                vpi::MEMORY => ty == vpi::MEMORY,
+                vpi::VARIABLES => {
+                    ty != vpi::NET && ty != vpi::PARAMETER && ty != vpi::MEMORY
+                }
+                _ => false,
+            }
+        };
+
+        let mut items: Vec<VpiHandle> = Vec::new();
+        for (name, id) in vpi_scope_members(sim, &scope_path) {
+            if id == usize::MAX {
+                if let Some(m) = vpi_memory_of(sim, &name) {
+                    if want(vpi::MEMORY) {
+                        items.push(m);
+                    }
+                }
+                continue;
+            }
+            let ty = vpi_type_of(sim, &name, id);
+            if want(ty) {
+                let leaf = name.rsplit('.').next().unwrap_or(&name);
+                items.push(VpiHandle::signal(id, ty, leaf, &vpi_full_name(sim, &name)));
+            }
+        }
+        vpi_make_iterator(items)
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+fn vpi_make_iterator(items: Vec<VpiHandle>) -> *mut libc::c_void {
+    if items.is_empty() {
+        return std::ptr::null_mut();
+    }
+    VpiHandle {
+        kind: VpiKind::Iterator,
+        signal_id: 0,
+        type_code: vpi::ITERATOR,
+        lsb: 0,
+        width: 0,
+        inst_idx: -1,
+        name: String::new(),
+        full_name: String::new(),
+        def_name: String::new(),
+        items,
+        pos: 0,
+        value: None,
+        frame: 0,
+    }
+    .into_raw()
+}
+
+/// Hand out the next object of an iterator. When the iterator is exhausted
+/// it is FREED and NULL returned — the caller must not free it itself, per
+/// IEEE 1800-2017 §38.32.
+#[no_mangle]
+pub extern "C" fn vpi_scan(iter: *mut libc::c_void) -> *mut libc::c_void {
+    if iter.is_null() {
+        return std::ptr::null_mut();
+    }
+    let h = unsafe { &mut *(iter as *mut VpiHandle) };
+    if h.kind != VpiKind::Iterator {
+        return std::ptr::null_mut();
+    }
+    if h.pos >= h.items.len() {
+        drop(unsafe { Box::from_raw(iter as *mut VpiHandle) });
+        return std::ptr::null_mut();
+    }
+    let next = h.items[h.pos].clone();
+    h.pos += 1;
+    next.into_raw()
+}
+
+/// String-valued properties. The returned pointer addresses simulator-owned
+/// storage valid until the next `vpi_get_str` call on this thread.
+#[no_mangle]
+pub extern "C" fn vpi_get_str(property: libc::c_int, handle: *mut libc::c_void) -> *mut libc::c_char {
+    let Some(h) = (unsafe { vpi_deref(handle) }) else { return std::ptr::null_mut() };
+    let s = match property {
+        vpi::NAME => h.name.clone(),
+        vpi::FULL_NAME => h.full_name.clone(),
+        vpi::DEF_NAME if h.kind == VpiKind::Module => h.def_name.clone(),
+        _ => {
+            vpi_error(vpi::WARNING, format!("vpi_get_str: property {} not modelled", property));
+            return std::ptr::null_mut();
+        }
+    };
+    VPI_STR2_SCRATCH.with(|cell| {
+        let mut pool = cell.borrow_mut();
+        let slot = pool.0;
+        pool.0 = (slot + 1) % 8;
+        let buf = &mut pool.1[slot];
+        buf.clear();
+        buf.extend_from_slice(s.as_bytes());
+        buf.push(0);
+        buf.as_mut_ptr() as *mut libc::c_char
+    })
+}
+
+/// Register a system task or function implemented in a VPI module.
+#[no_mangle]
+pub extern "C" fn vpi_register_systf(data: *mut s_vpi_systf_data) -> *mut libc::c_void {
+    if data.is_null() {
+        return std::ptr::null_mut();
+    }
+    let d = unsafe { &*data };
+    if d.tfname.is_null() || d.calltf.is_null() {
+        vpi_error(vpi::ERROR, "vpi_register_systf: tfname and calltf are required".into());
+        return std::ptr::null_mut();
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(d.tfname) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    if !name.starts_with('$') {
+        vpi_error(vpi::ERROR, format!("vpi_register_systf: tfname '{}' must start with '$'", name));
+        return std::ptr::null_mut();
+    }
+    if d.type_ != vpi::SYS_TASK && d.type_ != vpi::SYS_FUNC {
+        vpi_error(vpi::ERROR, format!("vpi_register_systf: '{}' has type {}, expected vpiSysTask or vpiSysFunc", name, d.type_));
+        return std::ptr::null_mut();
+    }
+    let entry = VpiSystf {
+        calltf: d.calltf as usize,
+        compiletf: d.compiletf as usize,
+        sizetf: d.sizetf as usize,
+        user_data: d.user_data as usize,
+        tf_type: d.type_,
+        func_type: d.sysfunctype,
+    };
+    VPI_SYSTFS.with(|m| m.borrow_mut().insert(name, entry));
+    // The returned handle is only compared against NULL in practice.
+    VpiHandle::signal(0, vpi::UNDEFINED, "", "").into_raw()
+}
+
+/// Call a registered `$systf`. Returns false when `name` is not registered,
+/// so the caller can fall through to its own diagnostic.
+/// Width of a system function's return value, per its `sysfunctype`.
+/// `vpiSizedFunc` asks the module via `sizetf`.
+fn vpi_sysfunc_width(entry: &VpiSystf) -> u32 {
+    type TfFn = extern "C" fn(*mut libc::c_char) -> libc::c_int;
+    match entry.func_type {
+        vpi::REAL_FUNC => 64,
+        vpi::TIME_FUNC => 64,
+        vpi::SIZED_FUNC | vpi::SIZED_SIGNED_FUNC if entry.sizetf != 0 => {
+            let f: TfFn = unsafe { std::mem::transmute(entry.sizetf as *const ()) };
+            let w = f(entry.user_data as *mut libc::c_char);
+            if w > 0 { w as u32 } else { 32 }
+        }
+        _ => 32,
+    }
+}
+
+/// Invoke a registered `$systf` with a frame carrying its arguments, so the
+/// C side can reach them through `vpi_handle(vpiSysTfCall, NULL)` and
+/// `vpi_iterate(vpiArgument, ..)`, and deposit a return value.
+///
+/// Returns the function's return value; `None` for a task, or when `name` is
+/// not registered (so the caller can fall through to its own diagnostic).
+fn vpi_call_systf(sim: *mut Simulator, name: &str, args: &[Expression]) -> Option<Value> {
+    let entry = VPI_SYSTFS.with(|m| m.borrow().get(name).copied())?;
+
+    let is_func = entry.tf_type == vpi::SYS_FUNC;
+    let ret_width = if is_func { vpi_sysfunc_width(&entry) } else { 0 };
+
+    // Resolve the arguments BEFORE the frame is pushed: building a handle
+    // evaluates expressions, which can itself invoke a nested $systf.
+    let arg_handles: Vec<VpiHandle> = unsafe {
+        let s = &mut *sim;
+        args.iter().map(|a| s.vpi_arg_handle(a)).collect()
+    };
+
+    VPI_SYSTF_STACK.with(|st| {
+        st.borrow_mut().push(VpiSystfFrame {
+            name: name.to_string(),
+            args: arg_handles,
+            ret: None,
+            ret_width,
+            tf_type: entry.tf_type,
+            func_type: entry.func_type,
+        })
+    });
+
+    ACTIVE_SIMULATOR.with(|cell| cell.set(sim));
+    type TfFn = extern "C" fn(*mut libc::c_char) -> libc::c_int;
+    if entry.compiletf != 0 {
+        let f: TfFn = unsafe { std::mem::transmute(entry.compiletf as *const ()) };
+        f(entry.user_data as *mut libc::c_char);
+    }
+    let f: TfFn = unsafe { std::mem::transmute(entry.calltf as *const ()) };
+    f(entry.user_data as *mut libc::c_char);
+
+    let frame = VPI_SYSTF_STACK.with(|st| st.borrow_mut().pop());
+    if !is_func {
+        return None;
+    }
+    // A function that never deposited a value returns 0, as the LRM's own
+    // system functions do.
+    let mut v = frame
+        .and_then(|f| f.ret)
+        .unwrap_or_else(|| Value::zero(ret_width.max(1)));
+    if entry.func_type == vpi::REAL_FUNC {
+        v.is_real = true;
+    } else if entry.func_type == vpi::SIZED_SIGNED_FUNC {
+        v.is_signed = true;
+    }
+    Some(v)
+}
+
+/// True when a VPI module registered `name`. Lets the caller distinguish a
+/// user-defined `$task` from a genuinely unknown one.
+pub fn vpi_systf_registered(name: &str) -> bool {
+    VPI_SYSTFS.with(|m| m.borrow().contains_key(name))
+}
+
+/// Return width of a registered system function, without invoking it.
+pub fn vpi_sysfunc_ret_width(name: &str) -> u32 {
+    VPI_SYSTFS
+        .with(|m| m.borrow().get(name).map(|e| vpi_sysfunc_width(&e)))
+        .unwrap_or(32)
+}
+
+/// True when `name` was registered as a system FUNCTION (`vpiSysFunc`).
+pub fn vpi_systf_is_func(name: &str) -> bool {
+    VPI_SYSTFS.with(|m| m.borrow().get(name).is_some_and(|e| e.tf_type == vpi::SYS_FUNC))
+}
+
+/// Mirror of `s_vpi_error_info` (IEEE 1800-2017 §38.4).
+#[repr(C)]
+struct s_vpi_error_info {
+    state: libc::c_int,
+    level: libc::c_int,
+    message: *mut libc::c_char,
+    product: *mut libc::c_char,
+    code: *mut libc::c_char,
+    file: *mut libc::c_char,
+    line: libc::c_int,
+}
+
+/// Report the last VPI diagnostic, and clear it. Returns the severity level,
+/// or 0 when nothing has gone wrong since the previous call.
+///
+/// `error_info_p` may be NULL — callers often use `vpi_chk_error(NULL)` purely
+/// as a "did anything fail?" probe.
+#[no_mangle]
+pub extern "C" fn vpi_chk_error(error_info_p: *mut s_vpi_error_info) -> libc::c_int {
+    let taken = VPI_LAST_ERROR.with(|c| c.borrow_mut().take());
+    let Some((level, msg)) = taken else { return 0 };
+    if !error_info_p.is_null() {
+        let info = unsafe { &mut *error_info_p };
+        info.state = vpi::RUN_STATE;
+        info.level = level;
+        info.message = vpi_err_scratch(&msg);
+        info.product = b"xezim\0".as_ptr() as *mut libc::c_char;
+        info.code = b"\0".as_ptr() as *mut libc::c_char;
+        info.file = std::ptr::null_mut();
+        info.line = 0;
+    }
+    level
+}
+
+fn vpi_err_scratch(s: &str) -> *mut libc::c_char {
+    thread_local! {
+        static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    BUF.with(|cell| {
+        let mut b = cell.borrow_mut();
+        b.clear();
+        b.extend_from_slice(s.as_bytes());
+        b.push(0);
+        b.as_mut_ptr() as *mut libc::c_char
+    })
+}
+
+/// Backend for `vpi_control`, which is C-variadic and therefore lives in
+/// `src/vpi_printf_shim.c`. `arg` is the `$finish`/`$stop` diagnostic level.
+///
+/// Only vpiStop and vpiFinish do anything: both end the run, exactly as the
+/// corresponding system tasks do. vpiReset is rejected rather than silently
+/// ignored — xezim cannot rewind a simulation.
+#[no_mangle]
+pub extern "C" fn xezim_vpi_control(operation: libc::c_int, _arg: libc::c_int) -> libc::c_int {
+    match operation {
+        vpi::STOP | vpi::FINISH => try_active_sim("vpi_control", |sim| {
+            sim.finished = true;
+            1
+        })
+        .unwrap_or(0),
+        vpi::RESET => {
+            vpi_error(vpi::ERROR, "vpi_control(vpiReset): xezim cannot reset a running simulation".into());
+            0
+        }
+        other => {
+            vpi_error(vpi::ERROR, format!("vpi_control: operation {} not supported", other));
+            0
+        }
+    }
+}
+
+/// Load each `--vpi-lib` and run its `vlog_startup_routines`, the standard
+/// entry point for a VPI module (IEEE 1800-2017 §38.2).
+pub fn vpi_run_startup_routines(libs: &mut Vec<Library>, paths: &[String]) {
+    for path in paths {
+        // SAFETY: loading a dynamic library is inherently unsafe; the handle
+        // is kept alive for the simulator's lifetime.
+        let lib = match unsafe { Library::new(path) } {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[VPI] failed to load '{}': {}", path, e);
+                continue;
+            }
+        };
+        type StartupFn = unsafe extern "C" fn();
+        // `vlog_startup_routines` is a NULL-terminated array of function
+        // pointers, not a function.
+        let routines: *const Option<StartupFn> = match unsafe {
+            lib.get::<*const Option<StartupFn>>(b"vlog_startup_routines\0")
+        } {
+            Ok(sym) => unsafe { *sym },
+            Err(_) => {
+                eprintln!(
+                    "[VPI] '{}' has no vlog_startup_routines; nothing to register",
+                    path
+                );
+                libs.push(lib);
+                continue;
+            }
+        };
+        if routines.is_null() {
+            libs.push(lib);
+            continue;
+        }
+        let mut i = 0isize;
+        loop {
+            let slot = unsafe { *routines.offset(i) };
+            match slot {
+                Some(f) => unsafe { f() },
+                None => break,
+            }
+            i += 1;
+        }
+        libs.push(lib);
+    }
 }
 
 /// Free a VPI handle.
@@ -39657,84 +43072,264 @@ pub extern "C" fn vpi_free_object(handle: *mut libc::c_void) -> libc::c_int {
     0
 }
 
-/// Get a VPI property value.
+/// Get a VPI property value. Returns `vpiUndefined` (-1) for a property
+/// xezim does not model, rather than a plausible-looking 0.
 #[no_mangle]
 pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> libc::c_int {
-    if handle.is_null() {
-        return 0;
+    let Some(h) = (unsafe { vpi_deref(handle) }) else { return vpi::UNDEFINED };
+    if property == vpi::TYPE {
+        return h.type_code;
     }
-    let h = unsafe { &*(handle as *const VpiHandle) };
+    // vpiFuncType of a system function call is its `sysfunctype`.
+    if h.kind == VpiKind::SysTfCall {
+        return match property {
+            vpi::SIZE => h.width as libc::c_int,
+            vpi::FUNC_TYPE => VPI_SYSTF_STACK
+                .with(|st| st.borrow().get(h.frame).map(|f| f.func_type))
+                .unwrap_or(vpi::UNDEFINED),
+            _ => vpi::UNDEFINED,
+        };
+    }
+    if h.kind == VpiKind::Constant {
+        let w = h.width as libc::c_int;
+        return match property {
+            vpi::SIZE => w,
+            vpi::SIGNED => i32::from(h.value.as_ref().is_some_and(|v| v.is_signed)),
+            vpi::SCALAR => i32::from(w == 1),
+            vpi::VECTOR => i32::from(w > 1),
+            _ => vpi::UNDEFINED,
+        };
+    }
+    // A module or an iterator has no width, sign or scalar-ness.
+    match h.kind {
+        VpiKind::Module | VpiKind::Iterator => return vpi::UNDEFINED,
+        // vpiSize of a memory is its number of words; of a slice, its bits.
+        VpiKind::Memory | VpiKind::Slice if property == vpi::SIZE => return h.width as libc::c_int,
+        _ => {}
+    }
     let sig_id = h.signal_id;
-    with_active_sim(|sim| {
+    try_active_sim("vpi_get", |sim| {
+        let width = sim.signal_widths.get(sig_id).copied().unwrap_or(32) as libc::c_int;
         match property {
-            1 /* vpiType */ => {
-                // 2-state variables -> vpiBitVar (620), 4-state -> vpiReg (31).
-                // UVM's HDL backdoor uses vpi_get to decide whether to
-                // call vpi_get_value with vpiIntVal (2-state) or
-                // vpiVectorVal (4-state). We default to 2-state for
-                // ordinary signals (UVM's uvm_hdl_data_t is packed logic,
-                // but the read API works either way).
-                let is_2state = sim
-                    .signal_has_xz
-                    .get(sig_id)
-                    .copied()
-                    .unwrap_or(0)
-                    == 0;
-                if is_2state {
-                    620 /* vpiBitVar */
-                } else {
-                    31 /* vpiReg */
-                }
-            }
-            4 /* vpiSize */ => sim.signal_widths.get(sig_id).copied().unwrap_or(32) as libc::c_int,
-            5 /* vpiSigned */ => {
-                if sim.signal_signed.get(sig_id).copied().unwrap_or(false) {
-                    1
-                } else {
-                    0
-                }
-            }
-            _ => 0,
+            vpi::SIZE => width,
+            vpi::SIGNED => i32::from(sim.signal_signed.get(sig_id).copied().unwrap_or(false)),
+            vpi::SCALAR => i32::from(width == 1),
+            vpi::VECTOR => i32::from(width > 1),
+            _ => vpi::UNDEFINED,
         }
+    })
+    .unwrap_or(vpi::UNDEFINED)
+}
+
+/// Store `s` into the thread-local string scratch as a NUL-terminated C
+/// string and return a pointer to it.
+fn vpi_str_scratch(s: &str) -> *mut libc::c_char {
+    VPI_STR_SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        buf.extend_from_slice(s.as_bytes());
+        buf.push(0);
+        buf.as_mut_ptr() as *mut libc::c_char
     })
 }
 
 /// Read a signal value via VPI.
+///
+/// On any failure — bad handle, out-of-range signal, or a format xezim
+/// cannot supply — sets `value_p->format` to `vpiSuppressVal` and writes
+/// nothing else. IEEE 1800-2017 §38.16 makes that the caller's only way
+/// to detect the failure, and `vpi_get_value` returns `void`, so there is
+/// nowhere else to say so.
+///
+/// This used to handle exactly two formats and silently ignore the rest.
+/// `vpiVectorVal` was among the ignored ones, which is the format UVM's
+/// HDL backdoor reads with: `uvm_hdl_read` returned success having
+/// written nothing into the caller's buffer.
 #[no_mangle]
-pub extern "C" fn vpi_get_value(
-    handle: *mut libc::c_void,
-    value_p: *mut s_vpi_value,
-) -> *mut libc::c_void {
-    if handle.is_null() || value_p.is_null() {
-        return std::ptr::null_mut();
+pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_value) {
+    if value_p.is_null() {
+        return;
     }
-    with_active_sim(|sim| {
-        let h = unsafe { &*(handle as *const VpiHandle) };
-        let sig_id = h.signal_id;
-        let vp = unsafe { &mut *value_p };
-
-        let val = if sig_id < sim.signal_table.len() {
-            &sim.signal_table[sig_id]
-        } else {
-            return std::ptr::null_mut();
+    let vp = unsafe { &mut *value_p };
+    let Some(h) = (unsafe { vpi_deref(handle) }) else {
+        vpi_error(vpi::ERROR, "vpi_get_value: null handle".into());
+        vp.format = vpi::SUPPRESS_VAL;
+        return;
+    };
+    // A constant argument carries its own value and needs no simulator.
+    if h.kind == VpiKind::Constant {
+        let ok = match &h.value {
+            Some(v) => fill_vpi_value(v, 0, vp),
+            None => false,
         };
-
-        match vp.format {
-            10 /* vpiIntVal */ => {
-                vp.value.integer = val.to_i64().unwrap_or(0) as libc::c_int;
-            }
-            6 /* vpiRealVal */ => {
-                vp.value.real = val.to_f64();
-            }
-            _ => {}
+        if !ok {
+            vpi_error(vpi::ERROR, format!("vpi_get_value: cannot supply format {} for a constant", vp.format));
+            vp.format = vpi::SUPPRESS_VAL;
         }
-        std::ptr::null_mut()
+        return;
+    }
+    // Modules, memories, iterators and call handles have no readable value.
+    if matches!(
+        h.kind,
+        VpiKind::Module | VpiKind::Iterator | VpiKind::Memory | VpiKind::SysTfCall
+    ) {
+        vpi_error(vpi::ERROR, "vpi_get_value: this object has no readable value".into());
+        vp.format = vpi::SUPPRESS_VAL;
+        return;
+    }
+    let sig_id = h.signal_id;
+
+    let ok = try_active_sim("vpi_get_value", |sim| {
+        let val = if h.kind == VpiKind::Slice {
+            match vpi_slice_read(sim, h) {
+                Some(v) => v,
+                None => return false,
+            }
+        } else {
+            match sim.signal_table.get(sig_id) {
+                Some(v) => v.clone(),
+                None => return false,
+            }
+        };
+        let current_time = sim.time;
+        fill_vpi_value(&val, current_time, vp)
     })
+    .unwrap_or(false);
+
+    if !ok {
+        // vpiSuppressVal is the only failure channel this function has, and a
+        // caller that never checks `format` needs vpi_chk_error to notice.
+        vpi_error(
+            vpi::ERROR,
+            format!("vpi_get_value: cannot supply format {}", vp.format),
+        );
+        vp.format = vpi::SUPPRESS_VAL;
+    }
 }
 
-// VPI value-format constants. IEEE 1800-2017 Table 38-44.
-const VPI_FORCE_FLAG: libc::c_int = 5;       // vpiForceFlag
-const VPI_RELEASE_FLAG: libc::c_int = 6;     // vpiReleaseFlag
+/// Render `val` into `vp` using `vp.format`. Returns false when the
+/// format cannot be supplied; the caller then sets `vpiSuppressVal`.
+///
+/// Shared by `vpi_get_value` and the value-change dispatcher, so a
+/// callback sees its trigger object's value in exactly the format a
+/// direct read would have produced.
+fn fill_vpi_value(val: &Value, current_time: u64, vp: &mut s_vpi_value) -> bool {
+    {
+        // vpiObjTypeVal: the simulator picks the object's natural format
+        // and reports which one it chose in `format`.
+        let mut format = vp.format;
+        if format == vpi::OBJ_TYPE_VAL {
+            format = if val.is_real {
+                vpi::REAL_VAL
+            } else if val.width <= 32 {
+                vpi::INT_VAL
+            } else {
+                vpi::VECTOR_VAL
+            };
+            vp.format = format;
+        }
+
+        match format {
+            vpi::INT_VAL => {
+                // PLI_INT32: the low 32 bits, X/Z read as 0. Callers that
+                // need the full width must use vpiVectorVal; vpiSize tells
+                // them whether they do.
+                vp.value.integer = (val.to_u64().unwrap_or(0) & 0xFFFF_FFFF) as u32 as libc::c_int;
+            }
+            vpi::REAL_VAL => vp.value.real = val.to_f64(),
+            vpi::SCALAR_VAL => {
+                vp.value.scalar = match val.get_bit_code(0) {
+                    0 => vpi::SCALAR_0,
+                    1 => vpi::SCALAR_1,
+                    2 => vpi::SCALAR_X,
+                    _ => vpi::SCALAR_Z,
+                };
+            }
+            vpi::VECTOR_VAL => {
+                let ptr = VPI_VEC_SCRATCH.with(|cell| {
+                    let mut buf = cell.borrow_mut();
+                    value_to_vecval(val, &mut buf);
+                    buf.as_mut_ptr()
+                });
+                vp.value.vector = ptr;
+            }
+            vpi::BIN_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_radix_string(val, 1)),
+            vpi::OCT_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_radix_string(val, 3)),
+            vpi::HEX_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_radix_string(val, 4)),
+            vpi::DEC_STR_VAL => vp.value.str = vpi_str_scratch(&val.to_dec_string()),
+            vpi::STRING_VAL => vp.value.str = vpi_str_scratch(&val.to_sv_string()),
+            vpi::TIME_VAL => {
+                let t = val.to_u64().unwrap_or(0);
+                let ptr = VPI_TIME_SCRATCH.with(|cell| {
+                    let mut slot = cell.borrow_mut();
+                    *slot = s_vpi_time {
+                        type_: vpi::SIM_TIME,
+                        high: (t >> 32) as u32,
+                        low: (t & 0xFFFF_FFFF) as u32,
+                        real: current_time as f64,
+                    };
+                    cell.as_ptr()
+                });
+                vp.value.time = ptr;
+            }
+            vpi::SUPPRESS_VAL => {} // caller explicitly wants no value
+            _ => return false,      // vpiStrengthVal and anything unknown
+        }
+        true
+    }
+}
+
+/// Invoke one registered C callback with a conforming `s_cb_data`.
+///
+/// `obj`, `time` and `value` are all populated: the standard requires it
+/// for `cbValueChange`, and a callback that dereferences `cb_data_p->value`
+/// used to segfault because xezim passed null for every one of them.
+///
+/// `ACTIVE_SIMULATOR` is set before the call so the callback may itself
+/// call back into VPI. It used to be cleared to null here, which meant any
+/// such re-entry aborted the process.
+fn dispatch_vpi_cb(
+    sim_ptr: *mut Simulator,
+    current_time: u64,
+    signal_val: Option<Value>,
+    cb: &DpiCbHandle,
+    reason: libc::c_int,
+) {
+    ACTIVE_SIMULATOR.with(|cell| cell.set(sim_ptr));
+
+    let mut value = s_vpi_value {
+        format: cb.value_format,
+        value: s_vpi_value_union { integer: 0 },
+    };
+    let filled = match (reason, &signal_val) {
+        (vpi::CB_VALUE_CHANGE, Some(v)) => fill_vpi_value(v, current_time, &mut value),
+        _ => false,
+    };
+    if !filled {
+        value.format = vpi::SUPPRESS_VAL;
+    }
+
+    let mut time = s_vpi_time {
+        type_: vpi::SIM_TIME,
+        high: (current_time >> 32) as u32,
+        low: (current_time & 0xFFFF_FFFF) as u32,
+        real: current_time as f64,
+    };
+
+    let cb_data = s_cb_data {
+        reason,
+        cb_rtn: std::ptr::null_mut(),
+        obj: cb.obj as *mut libc::c_void,
+        time: &mut time,
+        value: &mut value,
+        index: 0,
+        user_data: cb.user_data as *mut libc::c_void,
+    };
+
+    type CbFn = extern "C" fn(*mut s_cb_data);
+    let cb_fn: CbFn = unsafe { std::mem::transmute(cb.cb_routine as *const ()) };
+    cb_fn(&cb_data as *const s_cb_data as *mut s_cb_data);
+}
 
 /// Write a signal value via VPI (supports force/release).
 #[no_mangle]
@@ -39748,11 +43343,65 @@ pub extern "C" fn vpi_put_value(
         return std::ptr::null_mut();
     }
 
-    with_active_sim(|sim| {
+    // Depositing into the call handle sets a system function's return value
+    // (IEEE 1800-2017 §38.33). Handled before the simulator lookup because it
+    // touches only the call frame.
+    {
+        let Some(h) = (unsafe { vpi_deref(handle) }) else { return std::ptr::null_mut() };
+        if h.kind == VpiKind::SysTfCall {
+            if value_p.is_null() {
+                vpi_error(vpi::ERROR, "vpi_put_value: null value on a $systf call".into());
+                return std::ptr::null_mut();
+            }
+            let w = h.width.max(1);
+            let vp = unsafe { &*value_p };
+            let v = match vp.format {
+                vpi::INT_VAL => Value::from_u64(unsafe { vp.value.integer } as i64 as u64, w),
+                vpi::REAL_VAL => Value::from_f64(unsafe { vp.value.real }),
+                vpi::VECTOR_VAL => {
+                    let ptr = unsafe { vp.value.vector };
+                    if ptr.is_null() {
+                        vpi_error(vpi::ERROR, "vpi_put_value: null vector on a $systf call".into());
+                        return std::ptr::null_mut();
+                    }
+                    let words = (w as usize).div_ceil(32);
+                    vecval_to_value(unsafe { std::slice::from_raw_parts(ptr, words) }, w, false)
+                }
+                other => {
+                    vpi_error(
+                        vpi::ERROR,
+                        format!("vpi_put_value: format {} unsupported on a $systf call", other),
+                    );
+                    return std::ptr::null_mut();
+                }
+            };
+            let frame = h.frame;
+            VPI_SYSTF_STACK.with(|st| {
+                if let Some(f) = st.borrow_mut().get_mut(frame) {
+                    if f.tf_type == vpi::SYS_FUNC {
+                        f.ret = Some(v);
+                    } else {
+                        vpi_error(vpi::ERROR, "vpi_put_value: a $systf TASK has no return value".into());
+                    }
+                }
+            });
+            return std::ptr::null_mut();
+        }
+        if h.kind == VpiKind::Constant {
+            vpi_error(vpi::ERROR, "vpi_put_value: a vpiConstant argument is read-only".into());
+            return std::ptr::null_mut();
+        }
+    }
+
+    try_active_sim("vpi_put_value", |sim| {
         let h = unsafe { &*(handle as *const VpiHandle) };
+        if matches!(h.kind, VpiKind::Module | VpiKind::Iterator | VpiKind::Memory) {
+            vpi_error(vpi::ERROR, "vpi_put_value: this object has no value; ignored".into());
+            return std::ptr::null_mut();
+        }
         let sig_id = h.signal_id;
 
-        if flags == VPI_RELEASE_FLAG {
+        if flags == vpi::RELEASE_FLAG {
             // Release: remove from forced_signals and trigger settle
             sim.forced_signals.remove(&sig_id);
             // Find comb entries that write to this signal and add their source
@@ -39772,55 +43421,83 @@ pub extern "C" fn vpi_put_value(
             return std::ptr::null_mut();
         }
 
-        let value = if !value_p.is_null() {
-            let vp = unsafe { &*value_p };
-            match vp.format {
-                10 /* vpiIntVal */ => {
-                    let ival = unsafe { vp.value.integer } as i64;
-                    let w = sim.signal_widths.get(sig_id).copied().unwrap_or(32);
-                    let mut v = Value::from_u64(ival as u64, w);
-                    v.is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
-                    v
-                }
-                6 /* vpiRealVal */ => Value::from_f64(unsafe { vp.value.real }),
-                7 /* vpiVectorVal */ => {
-                    // Read vector value (for wide signals up to 128 bits)
-                    let w = sim.signal_widths.get(sig_id).copied().unwrap_or(32);
-                    let vec_ptr = unsafe { vp.value.vector };
-                    if !vec_ptr.is_null() && w > 64 {
-                        let num_words = ((w + 31) / 32) as usize;
-                        let vec = unsafe { std::slice::from_raw_parts(vec_ptr, num_words) };
-                        // Combine aval/bval into a u128
-                        let mut val128: u128 = 0;
-                        for (i, vv) in vec.iter().enumerate().take(4) {
-                            // Use only non-X/non-Z bits (a AND NOT b)
-                            let bits = vv.aval & !vv.bval;
-                            val128 |= (bits as u128) << (i as u128 * 32);
-                        }
-                        let mut v = Value::from_u128(val128, w);
-                        v.is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
-                        v
-                    } else if !vec_ptr.is_null() {
-                        let num_words = ((w + 31) / 32) as usize;
-                        let vec = unsafe { std::slice::from_raw_parts(vec_ptr, num_words) };
-                        let mut v = Value::from_u64(vec[0].aval as u64, w);
-                        v.is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
-                        v
-                    } else {
-                        Value::zero(w)
+        if value_p.is_null() {
+            vpi_error(vpi::ERROR, "vpi_put_value: null value_p with a write flag; ignored".into());
+            return std::ptr::null_mut();
+        }
+
+        // A slice decodes at its own width, then splices back into its parent.
+        let w = if h.kind == VpiKind::Slice {
+            h.width
+        } else {
+            sim.signal_widths.get(sig_id).copied().unwrap_or(32)
+        };
+        let is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
+        let vp = unsafe { &*value_p };
+
+        // A format we cannot decode writes NOTHING. The old code fell
+        // through to "read the current value and write it back", which
+        // looks like a successful no-op and hides the unsupported format.
+        let value = match vp.format {
+            vpi::INT_VAL => {
+                // PLI_INT32 is signed; widen through i64 so a negative
+                // integer sign-extends into a wider signal.
+                let ival = unsafe { vp.value.integer } as i64;
+                let mut v = Value::from_u64(ival as u64, w);
+                v.is_signed = is_signed;
+                v
+            }
+            vpi::REAL_VAL => Value::from_f64(unsafe { vp.value.real }),
+            vpi::SCALAR_VAL => {
+                let mut v = Value::zero(w);
+                let code = match unsafe { vp.value.scalar } {
+                    vpi::SCALAR_0 => 0,
+                    vpi::SCALAR_1 => 1,
+                    vpi::SCALAR_X => 2,
+                    vpi::SCALAR_Z => 3,
+                    other => {
+                        vpi_error(vpi::ERROR, format!("vpi_put_value: unsupported vpiScalarVal code {}", other));
+                        return std::ptr::null_mut();
                     }
+                };
+                v.set_bit_code(0, code);
+                v.is_signed = is_signed;
+                v
+            }
+            vpi::VECTOR_VAL => {
+                // Every word of the signal's width, and both aval and
+                // bval, so X and Z survive a deposit. The old code read
+                // only `vec[0].aval` for a signal of 64 bits or fewer —
+                // dropping the upper word of anything wider than 32 —
+                // masked X/Z away as `aval & !bval`, and capped the wide
+                // path at four words (128 bits).
+                let vec_ptr = unsafe { vp.value.vector };
+                if vec_ptr.is_null() {
+                    vpi_error(vpi::ERROR, "vpi_put_value: vpiVectorVal with a null vector; ignored".into());
+                    return std::ptr::null_mut();
                 }
-                _ => {
-                    // Default: read current value
-                    sim.signal_table.get(sig_id).cloned().unwrap_or_else(|| Value::zero(32))
-                }
+                let num_words = (w as usize).div_ceil(32);
+                let vec = unsafe { std::slice::from_raw_parts(vec_ptr, num_words) };
+                vecval_to_value(vec, w, is_signed)
+            }
+            other => {
+                vpi_error(vpi::ERROR, format!("vpi_put_value: unsupported format {} (nothing written)", other));
+                return std::ptr::null_mut();
+            }
+        };
+
+        // Splice a slice back into its parent before it hits the signal table.
+        let value = if h.kind == VpiKind::Slice {
+            match vpi_slice_write(sim, h, &value) {
+                Some(v) => v,
+                None => return std::ptr::null_mut(),
             }
         } else {
-            sim.signal_table.get(sig_id).cloned().unwrap_or_else(|| Value::zero(32))
+            value
         };
 
         // For force: write value first, THEN add to forced_signals
-        if flags == VPI_FORCE_FLAG {
+        if flags == vpi::FORCE_FLAG {
             // Write directly to signal_table (bypass write_sig! which would skip)
             if sig_id < sim.signal_table.len() {
                 sim.signal_table[sig_id] = value.clone();
@@ -39841,6 +43518,7 @@ pub extern "C" fn vpi_put_value(
 
         std::ptr::null_mut()
     })
+    .unwrap_or(std::ptr::null_mut())
 }
 
 // ============================================================================
@@ -39873,15 +43551,18 @@ pub extern "C" fn vpi_get_vlog_info(info_p: *mut s_vpi_vlog_info) -> libc::c_int
     info.argc = 0;
     info.argv = std::ptr::null_mut();
     info.product = b"xezim\0".as_ptr() as *mut libc::c_char;
-    info.version = b"0.9.0-uvm\0".as_ptr() as *mut libc::c_char;
+    // The crate version, so this never drifts from the binary again. The
+    // NUL is appended by concat! since env! is a &'static str.
+    info.version = concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *mut libc::c_char;
 
-    with_active_sim(|sim| {
+    try_active_sim("vpi_get_vlog_info", |sim| {
         info.argc = sim.vpi_argv.len() as libc::c_int;
         if !sim.vpi_argv.is_empty() {
             info.argv = sim.vpi_argv.as_mut_ptr();
         }
         1
     })
+    .unwrap_or(0)
 }
 
 // --- vpi_release_handle -----------------------------------------------------
@@ -39916,43 +43597,60 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
     // The signal being watched (cbValueChange only). For other reasons
     // we record 0 — those callbacks fire once per simulator session
     // regardless of the target.
-    let signal_id = if !cb_data.obj.is_null() {
-        unsafe { &*(cb_data.obj as *const VpiHandle) }.signal_id
-    } else {
-        0
+    let signal_id = match unsafe { vpi_deref(cb_data.obj) } {
+        Some(h) if h.kind == VpiKind::Signal => h.signal_id,
+        Some(_) => {
+            vpi_error(vpi::ERROR, "vpi_register_cb: obj is not a signal (not registered)".into());
+            return std::ptr::null_mut();
+        }
+        None => 0,
     };
+    // The format the caller wants `cb_data_p->value` filled in on each
+    // fire. `vpiIntVal` when no value struct was supplied.
+    let value_format = if cb_data.value.is_null() {
+        vpi::INT_VAL
+    } else {
+        unsafe { (*cb_data.value).format }
+    };
+
+    // Reject a reason we will never dispatch rather than handing back a
+    // handle that quietly never fires.
+    if reason != vpi::CB_VALUE_CHANGE && reason != vpi::CB_START_OF_RESET {
+        vpi_error(vpi::ERROR, format!("vpi_register_cb: unsupported reason {} (not registered)", reason));
+        return std::ptr::null_mut();
+    }
+    if reason == vpi::CB_VALUE_CHANGE && cb_data.obj.is_null() {
+        vpi_error(vpi::ERROR, "vpi_register_cb: cbValueChange with a null obj (not registered)".into());
+        return std::ptr::null_mut();
+    }
 
     let handle = Box::into_raw(Box::new(DpiCbHandle {
         cb_type: reason,
         signal_id,
         cb_routine,
         user_data,
+        obj: cb_data.obj as usize,
+        value_format,
     }));
 
-    with_active_sim(|sim| {
+    let registered = try_active_sim("vpi_register_cb", |sim| {
         match reason {
-            6 /* cbValueChange */ => {
-                // `signal_id == 0` is a valid signal index — it's the
-                // typical value for the first signal in `signal_table`.
-                // Use `cb_data.obj.is_null()` as the "no target signal"
-                // sentinel instead.
-                if !cb_data.obj.is_null() {
-                    sim.dpi_value_change_cbs
-                        .entry(signal_id)
-                        .or_insert_with(Vec::new)
-                        .push(unsafe { *handle });
-                }
+            vpi::CB_VALUE_CHANGE => {
+                sim.dpi_value_change_cbs
+                    .entry(signal_id)
+                    .or_default()
+                    .push(unsafe { *handle });
             }
-            15 /* cbStartOfReset */ => {
-                sim.dpi_reset_cbs.push(unsafe { *handle });
-            }
-            _ => {
-                // Unknown reason — accept the registration (so UVM's
-                // bookkeeping stays consistent) but don't track the
-                // callback for firing.
-            }
+            _ => sim.dpi_reset_cbs.push(unsafe { *handle }),
         }
-    });
+        true
+    })
+    .unwrap_or(false);
+
+    if !registered {
+        drop(unsafe { Box::from_raw(handle) });
+        return std::ptr::null_mut();
+    }
 
     handle as *mut libc::c_void
 }
@@ -39974,9 +43672,9 @@ pub extern "C" fn vpi_remove_cb(cb: *mut libc::c_void) -> libc::c_int {
     let cb_type = removed.cb_type;
 
     let mut rc = 0;
-    with_active_sim(|sim| {
+    try_active_sim("vpi_remove_cb", |sim| {
         match cb_type {
-            6 /* cbValueChange */ => {
+            vpi::CB_VALUE_CHANGE => {
                 if let Some(list) = sim.dpi_value_change_cbs.get_mut(&signal_id) {
                     list.retain(|cb| {
                         cb.cb_routine != removed.cb_routine
@@ -39985,7 +43683,7 @@ pub extern "C" fn vpi_remove_cb(cb: *mut libc::c_void) -> libc::c_int {
                     rc = 1;
                 }
             }
-            15 /* cbStartOfReset */ => {
+            vpi::CB_START_OF_RESET => {
                 let before = sim.dpi_reset_cbs.len();
                 sim.dpi_reset_cbs.retain(|cb| {
                     cb.cb_routine != removed.cb_routine

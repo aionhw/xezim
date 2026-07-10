@@ -648,6 +648,13 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit_fallback(stmt)
             }
             StatementKind::If { condition, then_stmt, else_stmt, .. } => {
+                // §12.6 `if (e matches p)` binds the pattern's `.name`s for the
+                // then-branch. That needs the AST interpreter — compiling it to
+                // a conditional jump would evaluate the match but drop the
+                // bindings, so the branch ran with `n` unset.
+                if matches!(condition.kind, ExprKind::Matches { .. }) {
+                    return false;
+                }
                 if let Some(cond_reg) = self.compile_expr(condition, 0) {
                     let branch_idx = self.insns.len();
                     self.emit(Insn::BranchIfFalse(cond_reg, 0)); // placeholder target

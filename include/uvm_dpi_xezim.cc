@@ -88,31 +88,57 @@ static int uvm_hdl_set_vlog(char *path, p_vpi_vecval value, int flag) {
         return 1;
     }
 
+    // vpi_get_value points value_s.value.vector at SIMULATOR-owned
+    // storage, valid only until the next vpi_get_value call. Copy it out
+    // before touching it, and before vpi_put_value can reuse the buffer.
     s_vpi_vecval cur[XEZIM_VECVAL_MAX_WORDS];
     memset(cur, 0, sizeof(cur));
     value_s.format = vpiVectorVal;
-    value_s.value.vector = cur;
     vpi_get_value(h, &value_s);
+    if (value_s.format == vpiVectorVal && value_s.value.vector != NULL) {
+        memcpy(cur, value_s.value.vector, (size_t)words * sizeof(s_vpi_vecval));
+    }
 
     for (int i = 0; i < words; i++) {
         cur[i].aval = value[i].aval;
         cur[i].bval = value[i].bval;
     }
 
+    value_s.format = vpiVectorVal;
+    value_s.value.vector = cur;
     vpi_put_value(h, &value_s, NULL, flag);
     vpi_free_object(h);
     return 1;
 }
 
 // Read the vector at `path` into `value`.
+//
+// vpi_get_value does NOT fill a caller-supplied buffer: it points
+// value_s.value.vector at its own storage (IEEE 1800-2017 §38.16). This
+// used to assign `value` into that field and then return success without
+// reading anything back, so uvm_hdl_read reported success while leaving
+// the caller's buffer exactly as it found it.
 static int uvm_hdl_get_vlog(char *path, p_vpi_vecval value) {
     vpiHandle h = vpi_handle_by_name(path, NULL);
     if (h == NULL) return 0;
 
+    PLI_INT32 size = vpi_get(vpiSize, h);
+    int words = (size + 31) / 32;
+    if (size <= 0 || words > XEZIM_VECVAL_MAX_WORDS) {
+        vpi_free_object(h);
+        return 0;
+    }
+
     s_vpi_value value_s;
     value_s.format = vpiVectorVal;
-    value_s.value.vector = value;
     vpi_get_value(h, &value_s);
+
+    // vpiSuppressVal is the only failure channel vpi_get_value has.
+    if (value_s.format != vpiVectorVal || value_s.value.vector == NULL) {
+        vpi_free_object(h);
+        return 0;
+    }
+    memcpy(value, value_s.value.vector, (size_t)words * sizeof(s_vpi_vecval));
     vpi_free_object(h);
     return 1;
 }
