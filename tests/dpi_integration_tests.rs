@@ -58,6 +58,55 @@ fn run_xezim_with_dpi(so_path: &Path, sv_file: &str) -> String {
     text
 }
 
+/// Like `run_xezim_with_dpi`, but kills the run after `secs` and fails.
+///
+/// `vpi_handle_by_name` used to spin forever on any dotted name that did
+/// not resolve on the first try. A regression of that bug HANGS rather
+/// than failing an assertion, which would wedge the test run instead of
+/// reporting. Anything exercising VPI name resolution goes through here.
+fn run_xezim_with_dpi_timeout(so_path: &Path, sv_file: &str, secs: u64) -> String {
+    use std::io::Read;
+    let bin = env!("CARGO_BIN_EXE_xezim");
+    let sv_path = manifest_path(sv_file);
+    let mut child = Command::new(bin)
+        .arg("--dpi-lib")
+        .arg(so_path)
+        .arg("--max-time")
+        .arg("1000")
+        .arg(&sv_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn xezim");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        match child.try_wait().expect("try_wait failed") {
+            Some(status) => {
+                let mut text = String::new();
+                if let Some(mut o) = child.stdout.take() {
+                    let _ = o.read_to_string(&mut text);
+                }
+                if let Some(mut e) = child.stderr.take() {
+                    let _ = e.read_to_string(&mut text);
+                }
+                assert!(status.success(), "xezim failed for {}:\n{}", sv_path.display(), text);
+                return text;
+            }
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "xezim did not finish within {}s for {} — a VPI hang regression?",
+                    secs,
+                    sv_path.display()
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+}
+
 fn assert_dpi_pass(c_file: &str, stem: &str, sv_file: &str) {
     let so = compile_dpi_lib(c_file, stem);
     let log = run_xezim_with_dpi(&so, sv_file);
@@ -133,6 +182,33 @@ fn dpi_uvm_test() {
     assert!(
         log.contains("RESULT: PASSED"),
         "uvm_dpi_test missing RESULT: PASSED:\n{}",
+        log
+    );
+}
+
+/// IEEE 1800-2017 clause 38 (VPI) conformance. Guards the audit's findings:
+/// the `vpi_handle_by_name` infinite loop, `vpi_get_value` silently ignoring
+/// every format but two (including the `vpiVectorVal` UVM's HDL backdoor
+/// reads with) and never reporting failure, `vpi_put_value` dropping the
+/// upper word and the X/Z bits of a vector deposit, and `vpi_get(vpiType)`
+/// answering from the current value rather than the declared type.
+#[test]
+fn vpi_conformance_test() {
+    let so = compile_dpi_lib("tests/dpi/vpi_conformance.c", "vpi_conformance");
+    // Timeout-guarded: a regression of the name-resolution hang would
+    // otherwise wedge the run instead of failing it.
+    let log = run_xezim_with_dpi_timeout(&so, "tests/dpi/vpi_conformance.sv", 60);
+    assert!(
+        log.contains("RESULT: PASSED"),
+        "vpi_conformance missing RESULT: PASSED:\n{}",
+        log
+    );
+    // vpi_get_vlog_info used to hand back a hardcoded "0.9.0-uvm".
+    let want = format!("VLOG_VERSION: {}", env!("CARGO_PKG_VERSION"));
+    assert!(
+        log.contains(&want),
+        "vpi_get_vlog_info must report the crate version ({}):\n{}",
+        env!("CARGO_PKG_VERSION"),
         log
     );
 }

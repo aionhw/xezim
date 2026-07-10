@@ -22,6 +22,9 @@ int backdoor_read_int(const char* path, int* val) {
     s_vpi_value value_s;
     value_s.format = vpiIntVal;
     vpi_get_value(h, &value_s);
+    // vpiSuppressVal is the ONLY failure channel vpi_get_value has
+    // (IEEE 1800-2017 section 38.16); the function itself returns void.
+    if (value_s.format != vpiIntVal) { vpi_free_object(h); return 0; }
     *val = value_s.value.integer;
     vpi_free_object(h);
     return 1;
@@ -48,6 +51,7 @@ int backdoor_read_real(const char* path, double* val) {
     s_vpi_value value_s;
     value_s.format = vpiRealVal;
     vpi_get_value(h, &value_s);
+    if (value_s.format != vpiRealVal) { vpi_free_object(h); return 0; }
     *val = value_s.value.real;
     vpi_free_object(h);
     return 1;
@@ -68,17 +72,25 @@ int backdoor_force_real(const char* path, double val) {
 // ----------------------------------------------------
 // VECTOR APIs (covers logic/bit vectors up to 128-bit)
 // ----------------------------------------------------
+// vpi_get_value does NOT fill a caller-supplied buffer for vpiVectorVal:
+// it points value_s.value.vector at SIMULATOR-owned storage that is valid
+// only until the next vpi_get_value call (IEEE 1800-2017 section 38.16).
+// Copy out of it; never assume the caller's pointer was used.
 int backdoor_read_vec128(const char* path, svBitVecVal* val) {
     vpiHandle h = get_handle(path);
     if (!h) return 0;
     s_vpi_value value_s;
     value_s.format = vpiVectorVal;
     vpi_get_value(h, &value_s);
-    
+    if (value_s.format != vpiVectorVal || value_s.value.vector == NULL) {
+        vpi_free_object(h);
+        return 0;
+    }
+
     int size = vpi_get(vpiSize, h);
     int num_words = (size + 31) / 32;
     for (int i = 0; i < num_words; i++) {
-        val[i] = value_s.value.vector[i].aval;
+        val[i] = (svBitVecVal)value_s.value.vector[i].aval;
     }
     vpi_free_object(h);
     return 1;

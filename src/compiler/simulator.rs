@@ -233,28 +233,14 @@ macro_rules! write_sig {
                 __list.filter(|v| !v.is_empty()).cloned()
             };
             if let Some(__cbs) = __maybe_cbs {
-                // ACTIVE_SIMULATOR is a thread-local; we set it for
-                // any VPI code that re-enters the simulator (none
-                // currently does, but the convention is preserved).
-                // Extract the pointer BEFORE entering the closure so
-                // the borrow checker doesn't see the closure capture
-                // as a second self-borrow.
-                ACTIVE_SIMULATOR.with(|cell| {
-                    cell.set(std::ptr::null_mut()); // see below
-                });
-                for __cb in __cbs {
-                    type __CbFn = extern "C" fn(*mut s_cb_data);
-                    let __cb_routine = __cb.cb_routine as *const ();
-                    let __cb_fn: __CbFn = unsafe { std::mem::transmute(__cb_routine) };
-                    let __cb_data = s_cb_data {
-                        reason: 6, /* cbValueChange */
-                        cb_rtn: std::ptr::null_mut(),
-                        obj: std::ptr::null_mut(),
-                        time: std::ptr::null_mut(),
-                        value: std::ptr::null_mut(),
-                        user_data: __cb.user_data as *mut libc::c_void,
-                    };
-                    __cb_fn(&__cb_data as *const s_cb_data as *mut s_cb_data);
+                // Each of these is a read of a DISTINCT field, so they
+                // coexist with whatever mutable field-borrow the expansion
+                // site already holds. Re-borrowing `$self` whole would not.
+                let __sim_ptr: *mut Simulator = $self.vpi_self_ptr;
+                let __now: u64 = $self.time;
+                let __val: Option<Value> = $self.signal_table.get(__wsig_id).cloned();
+                for __cb in &__cbs {
+                    dispatch_vpi_cb(__sim_ptr, __now, __val.clone(), __cb, vpi::CB_VALUE_CHANGE);
                 }
             }
         }
@@ -2349,6 +2335,14 @@ pub struct Simulator {
     dpi_value_change_cbs: HashMap<usize, Vec<DpiCbHandle>>,
     /// Registered start-of-reset callbacks. Fired at simulation start.
     dpi_reset_cbs: Vec<DpiCbHandle>,
+    /// Self-pointer, installed once at the top of `simulate()`. The
+    /// `write_sig!` macro needs a `*mut Simulator` to hand the VPI
+    /// callback dispatcher, but it expands in contexts that already hold
+    /// a mutable borrow of another field, so it cannot re-borrow `self`.
+    /// Reading this field is disjoint from those borrows. Without it the
+    /// macro used to install a NULL `ACTIVE_SIMULATOR`, so a callback that
+    /// called back into VPI aborted the process.
+    vpi_self_ptr: *mut Simulator,
     /// Callback cursor for the per-callback iteration loop
     /// (`vpi_register_cb` may also be called with `cbValueChange` to
     /// mark a scope's reset triggers; we keep a flag set for that).
@@ -3345,6 +3339,7 @@ impl Simulator {
             dpi_scopes: HashMap::default(),
             dpi_value_change_cbs: HashMap::default(),
             dpi_reset_cbs: Vec::new(),
+            vpi_self_ptr: std::ptr::null_mut(),
             dpi_pending_reset_fired: false,
             file_handles: HashMap::default(),
             ungetc_buf: HashMap::default(),
@@ -8662,6 +8657,7 @@ impl Simulator {
         if !self.compiled {
             self.compile();
         }
+        self.vpi_self_ptr = self as *mut Simulator;
         // Fire cbStartOfReset callbacks exactly once at simulation
         // start. UVM's polling framework uses this hook to clear its
         // pending-change lists; we expose it because the upstream
@@ -8669,20 +8665,9 @@ impl Simulator {
         // call expects a fire at simulation time 0.
         if !self.dpi_reset_cbs.is_empty() && !self.dpi_pending_reset_fired {
             let self_ptr = self as *mut Simulator;
-            ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
-            for cb in self.dpi_reset_cbs.clone() {
-                type CbFn = extern "C" fn(*mut s_cb_data);
-                let cb_routine = cb.cb_routine as *const ();
-                let cb_fn: CbFn = unsafe { std::mem::transmute(cb_routine) };
-                let cb_data = s_cb_data {
-                    reason: 15, /* cbStartOfReset */
-                    cb_rtn: std::ptr::null_mut(),
-                    obj: std::ptr::null_mut(),
-                    time: std::ptr::null_mut(),
-                    value: std::ptr::null_mut(),
-                    user_data: cb.user_data as *mut libc::c_void,
-                };
-                cb_fn(&cb_data as *const s_cb_data as *mut s_cb_data);
+            let now = self.time;
+            for cb in &self.dpi_reset_cbs.clone() {
+                dispatch_vpi_cb(self_ptr, now, None, cb, vpi::CB_START_OF_RESET);
             }
             self.dpi_pending_reset_fired = true;
         }
@@ -27761,20 +27746,10 @@ impl Simulator {
             _ => return,
         };
         let self_ptr = self as *mut Simulator;
-        ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
-        for cb in cbs {
-            type CbFn = extern "C" fn(*mut s_cb_data);
-            let cb_routine = cb.cb_routine as *const ();
-            let cb_fn: CbFn = unsafe { std::mem::transmute(cb_routine) };
-            let cb_data = s_cb_data {
-                reason: 6, /* cbValueChange */
-                cb_rtn: std::ptr::null_mut(),
-                obj: std::ptr::null_mut(),
-                time: std::ptr::null_mut(),
-                value: std::ptr::null_mut(),
-                user_data: cb.user_data as *mut libc::c_void,
-            };
-            cb_fn(&cb_data as *const s_cb_data as *mut s_cb_data);
+        let now = self.time;
+        let val = self.signal_table.get(id).cloned();
+        for cb in &cbs {
+            dispatch_vpi_cb(self_ptr, now, val.clone(), cb, vpi::CB_VALUE_CHANGE);
         }
     }
 
@@ -40711,22 +40686,100 @@ impl SendExecContext {
 // VPI (Verification Procedural Interface) Support
 // ============================================================================
 
-// VPI types matching vpi_user.h
+// VPI constants. Every value is the one IEEE 1800-2017 Annex K assigns
+// it, and matches `include/vpi_user.h` symbol for symbol. These are not
+// free parameters: a C file compiled against a vendor `vpi_user.h` and
+// linked to xezim agrees with the numbers below or it silently takes the
+// wrong branch.
+mod vpi {
+    use libc::c_int;
+
+    // Value formats (Table 38-44).
+    pub const BIN_STR_VAL: c_int = 1;
+    pub const OCT_STR_VAL: c_int = 2;
+    pub const DEC_STR_VAL: c_int = 3;
+    pub const HEX_STR_VAL: c_int = 4;
+    pub const SCALAR_VAL: c_int = 5;
+    pub const INT_VAL: c_int = 6;
+    pub const REAL_VAL: c_int = 7;
+    pub const STRING_VAL: c_int = 8;
+    pub const VECTOR_VAL: c_int = 9;
+    pub const TIME_VAL: c_int = 11;
+    pub const OBJ_TYPE_VAL: c_int = 12;
+    /// Set into `value_p->format` when a value cannot be supplied
+    /// (§38.16). This is the only failure channel `vpi_get_value` has.
+    pub const SUPPRESS_VAL: c_int = 13;
+
+    // vpiScalarVal codes.
+    pub const SCALAR_0: c_int = 0;
+    pub const SCALAR_1: c_int = 1;
+    pub const SCALAR_Z: c_int = 2;
+    pub const SCALAR_X: c_int = 3;
+
+    // vpi_put_value flags.
+    pub const FORCE_FLAG: c_int = 5;
+    pub const RELEASE_FLAG: c_int = 6;
+
+    // vpi_get properties.
+    pub const UNDEFINED: c_int = -1;
+    pub const TYPE: c_int = 1;
+    pub const SIZE: c_int = 4;
+    pub const SCALAR: c_int = 17;
+    pub const VECTOR: c_int = 18;
+    pub const SIGNED: c_int = 65;
+
+    // Object types returned by vpi_get(vpiType).
+    pub const INTEGER_VAR: c_int = 25;
+    pub const NET: c_int = 36;
+    pub const REAL_VAR: c_int = 47;
+    /// Also `vpiLogicVar` — the standard aliases them.
+    pub const REG: c_int = 48;
+    pub const TIME_VAR: c_int = 63;
+    pub const LONG_INT_VAR: c_int = 610;
+    pub const SHORT_INT_VAR: c_int = 611;
+    pub const INT_VAR: c_int = 612;
+    pub const SHORT_REAL_VAR: c_int = 613;
+    pub const BYTE_VAR: c_int = 614;
+    pub const STRING_VAR: c_int = 616;
+    pub const ENUM_VAR: c_int = 617;
+    pub const STRUCT_VAR: c_int = 618;
+    pub const UNION_VAR: c_int = 619;
+    pub const BIT_VAR: c_int = 620;
+
+    // Time types.
+    pub const SIM_TIME: c_int = 2;
+
+    // Callback reasons (Table 38-49).
+    pub const CB_VALUE_CHANGE: c_int = 1;
+    pub const CB_START_OF_RESET: c_int = 19;
+}
+
+// VPI types matching vpi_user.h. `aval`/`bval` are PLI_INT32 (signed) in
+// the standard header, so mirror that exactly — the bit patterns are what
+// matter, but the sizes must agree.
+//
+// Per-bit encoding (§38.10.1):
+//     aval bval   value
+//       0    0      0
+//       1    0      1
+//       0    1      Z
+//       1    1      X
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct s_vpi_vecval {
-    aval: u32,
-    bval: u32,
+    aval: i32,
+    bval: i32,
 }
 
 #[repr(C)]
 union s_vpi_value_union {
+    str: *mut libc::c_char,
+    scalar: libc::c_int,
     integer: libc::c_int,
     real: libc::c_double,
-    time: u64,
-    str: *mut libc::c_char,
+    time: *mut s_vpi_time,
     vector: *mut s_vpi_vecval,
-    scalar: u32,
-    longint: i64,
+    misc: *mut libc::c_char,
 }
 
 #[repr(C)]
@@ -40736,11 +40789,124 @@ struct s_vpi_value {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct s_vpi_time {
     type_: libc::c_int,
     high: u32,
     low: u32,
     real: libc::c_double,
+}
+
+// Scratch storage handed back to C by `vpi_get_value` for the formats
+// whose value is a pointer (vectors, strings, time). IEEE 1800-2017
+// §38.16 lets the simulator own this memory and only guarantees it
+// until the next `vpi_get_value` call, which is exactly what these
+// give: each call overwrites the previous contents.
+thread_local! {
+    static VPI_VEC_SCRATCH: std::cell::RefCell<Vec<s_vpi_vecval>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static VPI_STR_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static VPI_TIME_SCRATCH: std::cell::RefCell<s_vpi_time> =
+        const { std::cell::RefCell::new(s_vpi_time { type_: 2, high: 0, low: 0, real: 0.0 }) };
+}
+
+/// `Value` bit code (0=0, 1=1, 2=X, 3=Z) -> one `(aval, bval)` bit pair.
+#[inline]
+fn bit_code_to_ab(code: u8) -> (u32, u32) {
+    match code {
+        0 => (0, 0),
+        1 => (1, 0),
+        2 => (1, 1), // X
+        _ => (0, 1), // Z
+    }
+}
+
+/// One `(aval, bval)` bit pair -> `Value` bit code.
+#[inline]
+fn ab_to_bit_code(a: u32, b: u32) -> u8 {
+    match (a, b) {
+        (0, 0) => 0,
+        (1, 0) => 1,
+        (1, 1) => 2, // X
+        _ => 3,      // Z
+    }
+}
+
+/// Render a `Value` into `s_vpi_vecval` words, preserving X and Z.
+fn value_to_vecval(v: &Value, out: &mut Vec<s_vpi_vecval>) {
+    let w = v.width.max(1) as usize;
+    let words = w.div_ceil(32);
+    out.clear();
+    out.resize(words, s_vpi_vecval { aval: 0, bval: 0 });
+    let mut aval = vec![0u32; words];
+    let mut bval = vec![0u32; words];
+    for i in 0..w {
+        let (a, b) = bit_code_to_ab(v.get_bit_code(i));
+        if a != 0 {
+            aval[i / 32] |= 1u32 << (i % 32);
+        }
+        if b != 0 {
+            bval[i / 32] |= 1u32 << (i % 32);
+        }
+    }
+    for i in 0..words {
+        out[i] = s_vpi_vecval { aval: aval[i] as i32, bval: bval[i] as i32 };
+    }
+}
+
+/// Build a `Value` of `width` bits from `s_vpi_vecval` words, preserving
+/// X and Z. Words beyond the slice read as zero.
+fn vecval_to_value(vec: &[s_vpi_vecval], width: u32, is_signed: bool) -> Value {
+    let mut v = Value::zero(width);
+    for i in 0..width as usize {
+        let w = i / 32;
+        if w >= vec.len() {
+            break;
+        }
+        let a = (vec[w].aval as u32 >> (i % 32)) & 1;
+        let b = (vec[w].bval as u32 >> (i % 32)) & 1;
+        v.set_bit_code(i, ab_to_bit_code(a, b));
+    }
+    v.is_signed = is_signed;
+    v
+}
+
+/// Radix string with 4-state digits, `bits_per_digit` of 1, 3 or 4.
+/// A digit is `z` when every bit in it is Z, otherwise `x` when any bit
+/// is unknown — the Verilog display rule.
+fn vpi_radix_string(v: &Value, bits_per_digit: usize) -> String {
+    let w = v.width.max(1) as usize;
+    let ndigits = w.div_ceil(bits_per_digit);
+    let mut s = String::with_capacity(ndigits);
+    for d in (0..ndigits).rev() {
+        let mut digit = 0u32;
+        let (mut xs, mut zs, mut n) = (0usize, 0usize, 0usize);
+        for b in 0..bits_per_digit {
+            let idx = d * bits_per_digit + b;
+            if idx >= w {
+                continue;
+            }
+            n += 1;
+            match v.get_bit_code(idx) {
+                1 => digit |= 1 << b,
+                2 => xs += 1,
+                3 => zs += 1,
+                _ => {}
+            }
+        }
+        if n > 0 && zs == n {
+            s.push('z');
+        } else if xs + zs > 0 {
+            s.push('x');
+        } else {
+            s.push(char::from_digit(digit, 1u32 << bits_per_digit).unwrap_or('0'));
+        }
+    }
+    if s.is_empty() {
+        s.push('0');
+    }
+    s
 }
 
 /// Thread-local pointer to the current simulator instance.
@@ -40757,25 +40923,31 @@ thread_local! {
 #[repr(C)]
 struct VpiHandle {
     signal_id: usize,
+    /// `vpi_get(vpiType)` answer, resolved from the DECLARED type when the
+    /// handle is created. It must not be derived from the current value:
+    /// a `logic` signal is a `vpiReg` whether or not it happens to hold X.
+    type_code: libc::c_int,
 }
 
 /// Mirror of `s_cb_data` from `vpi_user.h` — the value-change dispatcher
 /// builds one of these on the stack and hands its address to the C
-/// callback. Fields match the IEEE 1800 §38.7 layout exactly; the C
-/// type is `t_cb_data`.
+/// callback. Fields match the IEEE 1800-2017 §38.7 layout exactly.
+///
+/// `index` sits between `value` and `user_data` in the standard struct.
+/// It was missing here, so every field after it was read from the wrong
+/// offset by any C code compiled against a conforming `vpi_user.h` —
+/// `user_data` in particular.
 #[repr(C)]
 struct s_cb_data {
     reason: libc::c_int,
-    /// C function pointer (`PLI_INT32 (*cb_rtn)()`). Stored as the
-    /// destination type of the callback; unused when the callback is
-    /// invoked directly with its `user_data` cookie.
+    /// C function pointer (`PLI_INT32 (*cb_rtn)(p_cb_data)`).
     cb_rtn: *mut libc::c_void,
-    /// Object the callback was registered against (e.g. a signal
-    /// handle for cbValueChange). xezim passes null — callers that
-    /// need it recover it via `vpi_handle_by_name` from `user_data`.
+    /// Object the callback was registered against (the signal handle for
+    /// cbValueChange). Passed back to the callback on each fire.
     obj: *mut libc::c_void,
     time: *mut s_vpi_time,
     value: *mut s_vpi_value,
+    index: libc::c_int,
     user_data: *mut libc::c_void,
 }
 
@@ -40798,8 +40970,8 @@ struct DpiScope {
     name_len: usize,
 }
 
-/// Opaque VPI callback handle. The `cb_type` and `user_data` are passed
-/// to the C callback when the trigger fires.
+/// Opaque VPI callback handle. Everything the dispatcher needs to rebuild
+/// a conforming `s_cb_data` when the trigger fires.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DpiCbHandle {
@@ -40813,9 +40985,34 @@ struct DpiCbHandle {
     cb_routine: usize,
     /// User-supplied data passed to the callback as `cb_data_p->user_data`.
     user_data: usize,
+    /// The `obj` handle supplied at registration, passed back on each
+    /// fire as `cb_data_p->obj` (§38.7 requires it).
+    obj: usize,
+    /// Format of the value struct supplied at registration, used to fill
+    /// `cb_data_p->value`. `vpiIntVal` when the caller supplied none.
+    value_format: libc::c_int,
 }
 
-/// Execute a callback with access to the active simulator.
+/// Execute a closure with access to the active simulator.
+///
+/// Returns `None` when there is no active simulator — a VPI call from
+/// outside a DPI context. This used to `panic!`, which unwinds across an
+/// `extern "C"` boundary and therefore aborts the process; every VPI
+/// entry point now degrades to its documented failure value instead.
+fn try_active_sim<F, R>(who: &str, f: F) -> Option<R>
+where
+    F: FnOnce(&mut Simulator) -> R,
+{
+    let sim_ptr = ACTIVE_SIMULATOR.with(|cell| cell.get());
+    if sim_ptr.is_null() {
+        eprintln!("[VPI] {}: no active simulator (call from outside a DPI context)", who);
+        return None;
+    }
+    Some(f(unsafe { &mut *sim_ptr }))
+}
+
+/// Execute a closure with access to the active simulator, for the DPI
+/// scope primitives, which have no way to report failure.
 fn with_active_sim<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Simulator) -> R,
@@ -40827,7 +41024,72 @@ where
     f(unsafe { &mut *sim_ptr })
 }
 
+/// The `vpi_get(vpiType)` code for a signal, from its DECLARED type.
+///
+/// Falls back to `vpiReg` — a 4-state vector variable — for anything whose
+/// declaration we cannot see, which is the safe answer: a caller that
+/// believes a signal may hold X will read it with a 4-state format.
+fn vpi_type_of(sim: &Simulator, name: &str, id: usize) -> libc::c_int {
+    use xezim_core::ast::types::{DataType, IntegerAtomType, IntegerVectorType, RealType, SimpleType, StructUnionKind};
+
+    if sim.module.nets.contains(name) {
+        return vpi::NET;
+    }
+    // The signal table's `is_real` covers reals reached through a path we
+    // have no declaration for.
+    let looks_real = sim.signal_table.get(id).map(|v| v.is_real).unwrap_or(false);
+
+    let dt = sim
+        .module
+        .var_decl_types
+        .get(name)
+        .or_else(|| name.rsplit('.').next().and_then(|leaf| sim.module.var_decl_types.get(leaf)));
+
+    match dt {
+        Some(DataType::IntegerVector { kind, .. }) => match kind {
+            IntegerVectorType::Bit => vpi::BIT_VAR,
+            IntegerVectorType::Logic | IntegerVectorType::Reg => vpi::REG,
+        },
+        Some(DataType::IntegerAtom { kind, .. }) => match kind {
+            IntegerAtomType::Byte => vpi::BYTE_VAR,
+            IntegerAtomType::ShortInt => vpi::SHORT_INT_VAR,
+            IntegerAtomType::Int => vpi::INT_VAR,
+            IntegerAtomType::LongInt => vpi::LONG_INT_VAR,
+            IntegerAtomType::Integer => vpi::INTEGER_VAR,
+            IntegerAtomType::Time => vpi::TIME_VAR,
+        },
+        Some(DataType::Real { kind, .. }) => match kind {
+            RealType::ShortReal => vpi::SHORT_REAL_VAR,
+            _ => vpi::REAL_VAR,
+        },
+        Some(DataType::Simple { kind: SimpleType::String, .. }) => vpi::STRING_VAR,
+        Some(DataType::Enum(_)) => vpi::ENUM_VAR,
+        Some(DataType::Struct(su)) => match su.kind {
+            StructUnionKind::Union => vpi::UNION_VAR,
+            _ => vpi::STRUCT_VAR,
+        },
+        _ if looks_real => vpi::REAL_VAR,
+        _ => vpi::REG,
+    }
+}
+
+fn new_vpi_handle(sim: &Simulator, name: &str, id: usize) -> *mut libc::c_void {
+    let type_code = vpi_type_of(sim, name, id);
+    Box::into_raw(Box::new(VpiHandle { signal_id: id, type_code })) as *mut libc::c_void
+}
+
 /// Get signal ID by hierarchical name.
+///
+/// Tries the full name, then each successively shorter suffix, so
+/// `top.dut.sig`, `dut.sig` and `sig` all resolve. Member paths like
+/// `top.dut.some_struct.val_i` are registered as `some_struct.val_i`, so
+/// the suffix walk is what finds them.
+///
+/// The previous loop never advanced its cursor: it only ever tested the
+/// name with its first segment stripped, and when that missed it spun
+/// forever. Any unresolvable dotted name hung the simulator — reachable
+/// straight from `uvm_hdl_check_path`, whose whole job is to ask about
+/// paths that may not exist.
 #[no_mangle]
 pub extern "C" fn vpi_handle_by_name(
     name: *mut libc::c_char,
@@ -40841,31 +41103,28 @@ pub extern "C" fn vpi_handle_by_name(
         .trim()
         .to_string();
 
-    with_active_sim(|sim| {
-        // Try progressively stripping leftmost scope segments until we
-        // either resolve the name or exhaust prefixes. Handles:
-        //   - full hier name:           "top.mod.signal"
-        //   - module-prefix stripped:   "mod.signal"   (e.g. for VPI backdoor)
-        //   - leaf only:                "signal"
-        // For member paths like "top.mod.unpacked_struct.val_i" we register
-        // "unpacked_struct.val_i" in `signal_name_to_id`, so the second
-        // variant above is what resolves.
-        if let Some(&id) = sim.signal_name_to_id.get(full_name.as_str()) {
-            let handle = Box::into_raw(Box::new(VpiHandle { signal_id: id }));
-            return handle as *mut libc::c_void;
-        }
-        // Try progressively shorter prefixes from the left.
-        let mut start = 0usize;
-        while let Some(dot_pos) = full_name[start..].find('.') {
-            let abs_dot = start + dot_pos;
-            let candidate = &full_name[abs_dot + 1..];
-            if let Some(&id) = sim.signal_name_to_id.get(candidate) {
-                let handle = Box::into_raw(Box::new(VpiHandle { signal_id: id }));
-                return handle as *mut libc::c_void;
+    try_active_sim("vpi_handle_by_name", |sim| {
+        let mut rest: &str = full_name.as_str();
+        loop {
+            if let Some(&id) = sim.signal_name_to_id.get(rest) {
+                return new_vpi_handle(sim, rest, id);
+            }
+            match rest.find('.') {
+                Some(dot) => rest = &rest[dot + 1..],
+                None => return std::ptr::null_mut(),
             }
         }
-        std::ptr::null_mut()
     })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// xezim models no object relationships, so there is nothing to return.
+/// NULL is the standard's answer for "that relationship does not exist";
+/// the symbol exists so C code that probes for one links and takes its
+/// NULL path instead of failing to load.
+#[no_mangle]
+pub extern "C" fn vpi_handle(_type: libc::c_int, _refh: *mut libc::c_void) -> *mut libc::c_void {
+    std::ptr::null_mut()
 }
 
 /// Free a VPI handle.
@@ -40877,84 +41136,204 @@ pub extern "C" fn vpi_free_object(handle: *mut libc::c_void) -> libc::c_int {
     0
 }
 
-/// Get a VPI property value.
+/// Get a VPI property value. Returns `vpiUndefined` (-1) for a property
+/// xezim does not model, rather than a plausible-looking 0.
 #[no_mangle]
 pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> libc::c_int {
     if handle.is_null() {
-        return 0;
+        return vpi::UNDEFINED;
     }
     let h = unsafe { &*(handle as *const VpiHandle) };
     let sig_id = h.signal_id;
-    with_active_sim(|sim| {
+    try_active_sim("vpi_get", |sim| {
+        let width = sim.signal_widths.get(sig_id).copied().unwrap_or(32) as libc::c_int;
         match property {
-            1 /* vpiType */ => {
-                // 2-state variables -> vpiBitVar (620), 4-state -> vpiReg (31).
-                // UVM's HDL backdoor uses vpi_get to decide whether to
-                // call vpi_get_value with vpiIntVal (2-state) or
-                // vpiVectorVal (4-state). We default to 2-state for
-                // ordinary signals (UVM's uvm_hdl_data_t is packed logic,
-                // but the read API works either way).
-                let is_2state = sim
-                    .signal_has_xz
-                    .get(sig_id)
-                    .copied()
-                    .unwrap_or(0)
-                    == 0;
-                if is_2state {
-                    620 /* vpiBitVar */
-                } else {
-                    31 /* vpiReg */
-                }
-            }
-            4 /* vpiSize */ => sim.signal_widths.get(sig_id).copied().unwrap_or(32) as libc::c_int,
-            5 /* vpiSigned */ => {
-                if sim.signal_signed.get(sig_id).copied().unwrap_or(false) {
-                    1
-                } else {
-                    0
-                }
-            }
-            _ => 0,
+            vpi::TYPE => h.type_code,
+            vpi::SIZE => width,
+            vpi::SIGNED => i32::from(sim.signal_signed.get(sig_id).copied().unwrap_or(false)),
+            vpi::SCALAR => i32::from(width == 1),
+            vpi::VECTOR => i32::from(width > 1),
+            _ => vpi::UNDEFINED,
         }
+    })
+    .unwrap_or(vpi::UNDEFINED)
+}
+
+/// Store `s` into the thread-local string scratch as a NUL-terminated C
+/// string and return a pointer to it.
+fn vpi_str_scratch(s: &str) -> *mut libc::c_char {
+    VPI_STR_SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        buf.extend_from_slice(s.as_bytes());
+        buf.push(0);
+        buf.as_mut_ptr() as *mut libc::c_char
     })
 }
 
 /// Read a signal value via VPI.
+///
+/// On any failure — bad handle, out-of-range signal, or a format xezim
+/// cannot supply — sets `value_p->format` to `vpiSuppressVal` and writes
+/// nothing else. IEEE 1800-2017 §38.16 makes that the caller's only way
+/// to detect the failure, and `vpi_get_value` returns `void`, so there is
+/// nowhere else to say so.
+///
+/// This used to handle exactly two formats and silently ignore the rest.
+/// `vpiVectorVal` was among the ignored ones, which is the format UVM's
+/// HDL backdoor reads with: `uvm_hdl_read` returned success having
+/// written nothing into the caller's buffer.
 #[no_mangle]
-pub extern "C" fn vpi_get_value(
-    handle: *mut libc::c_void,
-    value_p: *mut s_vpi_value,
-) -> *mut libc::c_void {
-    if handle.is_null() || value_p.is_null() {
-        return std::ptr::null_mut();
+pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_value) {
+    if value_p.is_null() {
+        return;
     }
-    with_active_sim(|sim| {
-        let h = unsafe { &*(handle as *const VpiHandle) };
-        let sig_id = h.signal_id;
-        let vp = unsafe { &mut *value_p };
+    let vp = unsafe { &mut *value_p };
+    if handle.is_null() {
+        vp.format = vpi::SUPPRESS_VAL;
+        return;
+    }
+    let h = unsafe { &*(handle as *const VpiHandle) };
+    let sig_id = h.signal_id;
 
-        let val = if sig_id < sim.signal_table.len() {
-            &sim.signal_table[sig_id]
-        } else {
-            return std::ptr::null_mut();
+    let ok = try_active_sim("vpi_get_value", |sim| {
+        let val = match sim.signal_table.get(sig_id) {
+            Some(v) => v.clone(),
+            None => return false,
         };
-
-        match vp.format {
-            10 /* vpiIntVal */ => {
-                vp.value.integer = val.to_i64().unwrap_or(0) as libc::c_int;
-            }
-            6 /* vpiRealVal */ => {
-                vp.value.real = val.to_f64();
-            }
-            _ => {}
-        }
-        std::ptr::null_mut()
+        let current_time = sim.time;
+        fill_vpi_value(&val, current_time, vp)
     })
+    .unwrap_or(false);
+
+    if !ok {
+        vp.format = vpi::SUPPRESS_VAL;
+    }
 }
 
-// VPI value-format constants. IEEE 1800-2017 Table 38-44.
-const VPI_FORCE_FLAG: libc::c_int = 5;       // vpiForceFlag
-const VPI_RELEASE_FLAG: libc::c_int = 6;     // vpiReleaseFlag
+/// Render `val` into `vp` using `vp.format`. Returns false when the
+/// format cannot be supplied; the caller then sets `vpiSuppressVal`.
+///
+/// Shared by `vpi_get_value` and the value-change dispatcher, so a
+/// callback sees its trigger object's value in exactly the format a
+/// direct read would have produced.
+fn fill_vpi_value(val: &Value, current_time: u64, vp: &mut s_vpi_value) -> bool {
+    {
+        // vpiObjTypeVal: the simulator picks the object's natural format
+        // and reports which one it chose in `format`.
+        let mut format = vp.format;
+        if format == vpi::OBJ_TYPE_VAL {
+            format = if val.is_real {
+                vpi::REAL_VAL
+            } else if val.width <= 32 {
+                vpi::INT_VAL
+            } else {
+                vpi::VECTOR_VAL
+            };
+            vp.format = format;
+        }
+
+        match format {
+            vpi::INT_VAL => {
+                // PLI_INT32: the low 32 bits, X/Z read as 0. Callers that
+                // need the full width must use vpiVectorVal; vpiSize tells
+                // them whether they do.
+                vp.value.integer = (val.to_u64().unwrap_or(0) & 0xFFFF_FFFF) as u32 as libc::c_int;
+            }
+            vpi::REAL_VAL => vp.value.real = val.to_f64(),
+            vpi::SCALAR_VAL => {
+                vp.value.scalar = match val.get_bit_code(0) {
+                    0 => vpi::SCALAR_0,
+                    1 => vpi::SCALAR_1,
+                    2 => vpi::SCALAR_X,
+                    _ => vpi::SCALAR_Z,
+                };
+            }
+            vpi::VECTOR_VAL => {
+                let ptr = VPI_VEC_SCRATCH.with(|cell| {
+                    let mut buf = cell.borrow_mut();
+                    value_to_vecval(val, &mut buf);
+                    buf.as_mut_ptr()
+                });
+                vp.value.vector = ptr;
+            }
+            vpi::BIN_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_radix_string(val, 1)),
+            vpi::OCT_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_radix_string(val, 3)),
+            vpi::HEX_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_radix_string(val, 4)),
+            vpi::DEC_STR_VAL => vp.value.str = vpi_str_scratch(&val.to_dec_string()),
+            vpi::STRING_VAL => vp.value.str = vpi_str_scratch(&val.to_sv_string()),
+            vpi::TIME_VAL => {
+                let t = val.to_u64().unwrap_or(0);
+                let ptr = VPI_TIME_SCRATCH.with(|cell| {
+                    let mut slot = cell.borrow_mut();
+                    *slot = s_vpi_time {
+                        type_: vpi::SIM_TIME,
+                        high: (t >> 32) as u32,
+                        low: (t & 0xFFFF_FFFF) as u32,
+                        real: current_time as f64,
+                    };
+                    cell.as_ptr()
+                });
+                vp.value.time = ptr;
+            }
+            vpi::SUPPRESS_VAL => {} // caller explicitly wants no value
+            _ => return false,      // vpiStrengthVal and anything unknown
+        }
+        true
+    }
+}
+
+/// Invoke one registered C callback with a conforming `s_cb_data`.
+///
+/// `obj`, `time` and `value` are all populated: the standard requires it
+/// for `cbValueChange`, and a callback that dereferences `cb_data_p->value`
+/// used to segfault because xezim passed null for every one of them.
+///
+/// `ACTIVE_SIMULATOR` is set before the call so the callback may itself
+/// call back into VPI. It used to be cleared to null here, which meant any
+/// such re-entry aborted the process.
+fn dispatch_vpi_cb(
+    sim_ptr: *mut Simulator,
+    current_time: u64,
+    signal_val: Option<Value>,
+    cb: &DpiCbHandle,
+    reason: libc::c_int,
+) {
+    ACTIVE_SIMULATOR.with(|cell| cell.set(sim_ptr));
+
+    let mut value = s_vpi_value {
+        format: cb.value_format,
+        value: s_vpi_value_union { integer: 0 },
+    };
+    let filled = match (reason, &signal_val) {
+        (vpi::CB_VALUE_CHANGE, Some(v)) => fill_vpi_value(v, current_time, &mut value),
+        _ => false,
+    };
+    if !filled {
+        value.format = vpi::SUPPRESS_VAL;
+    }
+
+    let mut time = s_vpi_time {
+        type_: vpi::SIM_TIME,
+        high: (current_time >> 32) as u32,
+        low: (current_time & 0xFFFF_FFFF) as u32,
+        real: current_time as f64,
+    };
+
+    let cb_data = s_cb_data {
+        reason,
+        cb_rtn: std::ptr::null_mut(),
+        obj: cb.obj as *mut libc::c_void,
+        time: &mut time,
+        value: &mut value,
+        index: 0,
+        user_data: cb.user_data as *mut libc::c_void,
+    };
+
+    type CbFn = extern "C" fn(*mut s_cb_data);
+    let cb_fn: CbFn = unsafe { std::mem::transmute(cb.cb_routine as *const ()) };
+    cb_fn(&cb_data as *const s_cb_data as *mut s_cb_data);
+}
 
 /// Write a signal value via VPI (supports force/release).
 #[no_mangle]
@@ -40968,11 +41347,11 @@ pub extern "C" fn vpi_put_value(
         return std::ptr::null_mut();
     }
 
-    with_active_sim(|sim| {
+    try_active_sim("vpi_put_value", |sim| {
         let h = unsafe { &*(handle as *const VpiHandle) };
         let sig_id = h.signal_id;
 
-        if flags == VPI_RELEASE_FLAG {
+        if flags == vpi::RELEASE_FLAG {
             // Release: remove from forced_signals and trigger settle
             sim.forced_signals.remove(&sig_id);
             // Find comb entries that write to this signal and add their source
@@ -40992,55 +41371,71 @@ pub extern "C" fn vpi_put_value(
             return std::ptr::null_mut();
         }
 
-        let value = if !value_p.is_null() {
-            let vp = unsafe { &*value_p };
-            match vp.format {
-                10 /* vpiIntVal */ => {
-                    let ival = unsafe { vp.value.integer } as i64;
-                    let w = sim.signal_widths.get(sig_id).copied().unwrap_or(32);
-                    let mut v = Value::from_u64(ival as u64, w);
-                    v.is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
-                    v
-                }
-                6 /* vpiRealVal */ => Value::from_f64(unsafe { vp.value.real }),
-                7 /* vpiVectorVal */ => {
-                    // Read vector value (for wide signals up to 128 bits)
-                    let w = sim.signal_widths.get(sig_id).copied().unwrap_or(32);
-                    let vec_ptr = unsafe { vp.value.vector };
-                    if !vec_ptr.is_null() && w > 64 {
-                        let num_words = ((w + 31) / 32) as usize;
-                        let vec = unsafe { std::slice::from_raw_parts(vec_ptr, num_words) };
-                        // Combine aval/bval into a u128
-                        let mut val128: u128 = 0;
-                        for (i, vv) in vec.iter().enumerate().take(4) {
-                            // Use only non-X/non-Z bits (a AND NOT b)
-                            let bits = vv.aval & !vv.bval;
-                            val128 |= (bits as u128) << (i as u128 * 32);
-                        }
-                        let mut v = Value::from_u128(val128, w);
-                        v.is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
-                        v
-                    } else if !vec_ptr.is_null() {
-                        let num_words = ((w + 31) / 32) as usize;
-                        let vec = unsafe { std::slice::from_raw_parts(vec_ptr, num_words) };
-                        let mut v = Value::from_u64(vec[0].aval as u64, w);
-                        v.is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
-                        v
-                    } else {
-                        Value::zero(w)
-                    }
-                }
-                _ => {
-                    // Default: read current value
-                    sim.signal_table.get(sig_id).cloned().unwrap_or_else(|| Value::zero(32))
-                }
+        if value_p.is_null() {
+            eprintln!("[VPI] vpi_put_value: null value_p with a write flag; ignored");
+            return std::ptr::null_mut();
+        }
+
+        let w = sim.signal_widths.get(sig_id).copied().unwrap_or(32);
+        let is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
+        let vp = unsafe { &*value_p };
+
+        // A format we cannot decode writes NOTHING. The old code fell
+        // through to "read the current value and write it back", which
+        // looks like a successful no-op and hides the unsupported format.
+        let value = match vp.format {
+            vpi::INT_VAL => {
+                // PLI_INT32 is signed; widen through i64 so a negative
+                // integer sign-extends into a wider signal.
+                let ival = unsafe { vp.value.integer } as i64;
+                let mut v = Value::from_u64(ival as u64, w);
+                v.is_signed = is_signed;
+                v
             }
-        } else {
-            sim.signal_table.get(sig_id).cloned().unwrap_or_else(|| Value::zero(32))
+            vpi::REAL_VAL => Value::from_f64(unsafe { vp.value.real }),
+            vpi::SCALAR_VAL => {
+                let mut v = Value::zero(w);
+                let code = match unsafe { vp.value.scalar } {
+                    vpi::SCALAR_0 => 0,
+                    vpi::SCALAR_1 => 1,
+                    vpi::SCALAR_X => 2,
+                    vpi::SCALAR_Z => 3,
+                    other => {
+                        eprintln!("[VPI] vpi_put_value: unsupported vpiScalarVal code {}", other);
+                        return std::ptr::null_mut();
+                    }
+                };
+                v.set_bit_code(0, code);
+                v.is_signed = is_signed;
+                v
+            }
+            vpi::VECTOR_VAL => {
+                // Every word of the signal's width, and both aval and
+                // bval, so X and Z survive a deposit. The old code read
+                // only `vec[0].aval` for a signal of 64 bits or fewer —
+                // dropping the upper word of anything wider than 32 —
+                // masked X/Z away as `aval & !bval`, and capped the wide
+                // path at four words (128 bits).
+                let vec_ptr = unsafe { vp.value.vector };
+                if vec_ptr.is_null() {
+                    eprintln!("[VPI] vpi_put_value: vpiVectorVal with a null vector; ignored");
+                    return std::ptr::null_mut();
+                }
+                let num_words = (w as usize).div_ceil(32);
+                let vec = unsafe { std::slice::from_raw_parts(vec_ptr, num_words) };
+                vecval_to_value(vec, w, is_signed)
+            }
+            other => {
+                eprintln!(
+                    "[VPI] vpi_put_value: unsupported format {} (nothing written)",
+                    other
+                );
+                return std::ptr::null_mut();
+            }
         };
 
         // For force: write value first, THEN add to forced_signals
-        if flags == VPI_FORCE_FLAG {
+        if flags == vpi::FORCE_FLAG {
             // Write directly to signal_table (bypass write_sig! which would skip)
             if sig_id < sim.signal_table.len() {
                 sim.signal_table[sig_id] = value.clone();
@@ -41061,6 +41456,7 @@ pub extern "C" fn vpi_put_value(
 
         std::ptr::null_mut()
     })
+    .unwrap_or(std::ptr::null_mut())
 }
 
 // ============================================================================
@@ -41093,15 +41489,18 @@ pub extern "C" fn vpi_get_vlog_info(info_p: *mut s_vpi_vlog_info) -> libc::c_int
     info.argc = 0;
     info.argv = std::ptr::null_mut();
     info.product = b"xezim\0".as_ptr() as *mut libc::c_char;
-    info.version = b"0.9.0-uvm\0".as_ptr() as *mut libc::c_char;
+    // The crate version, so this never drifts from the binary again. The
+    // NUL is appended by concat! since env! is a &'static str.
+    info.version = concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *mut libc::c_char;
 
-    with_active_sim(|sim| {
+    try_active_sim("vpi_get_vlog_info", |sim| {
         info.argc = sim.vpi_argv.len() as libc::c_int;
         if !sim.vpi_argv.is_empty() {
             info.argv = sim.vpi_argv.as_mut_ptr();
         }
         1
     })
+    .unwrap_or(0)
 }
 
 // --- vpi_release_handle -----------------------------------------------------
@@ -41141,38 +41540,52 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
     } else {
         0
     };
+    // The format the caller wants `cb_data_p->value` filled in on each
+    // fire. `vpiIntVal` when no value struct was supplied.
+    let value_format = if cb_data.value.is_null() {
+        vpi::INT_VAL
+    } else {
+        unsafe { (*cb_data.value).format }
+    };
+
+    // Reject a reason we will never dispatch rather than handing back a
+    // handle that quietly never fires.
+    if reason != vpi::CB_VALUE_CHANGE && reason != vpi::CB_START_OF_RESET {
+        eprintln!("[VPI] vpi_register_cb: unsupported reason {} (not registered)", reason);
+        return std::ptr::null_mut();
+    }
+    if reason == vpi::CB_VALUE_CHANGE && cb_data.obj.is_null() {
+        eprintln!("[VPI] vpi_register_cb: cbValueChange with a null obj (not registered)");
+        return std::ptr::null_mut();
+    }
 
     let handle = Box::into_raw(Box::new(DpiCbHandle {
         cb_type: reason,
         signal_id,
         cb_routine,
         user_data,
+        obj: cb_data.obj as usize,
+        value_format,
     }));
 
-    with_active_sim(|sim| {
+    let registered = try_active_sim("vpi_register_cb", |sim| {
         match reason {
-            6 /* cbValueChange */ => {
-                // `signal_id == 0` is a valid signal index — it's the
-                // typical value for the first signal in `signal_table`.
-                // Use `cb_data.obj.is_null()` as the "no target signal"
-                // sentinel instead.
-                if !cb_data.obj.is_null() {
-                    sim.dpi_value_change_cbs
-                        .entry(signal_id)
-                        .or_insert_with(Vec::new)
-                        .push(unsafe { *handle });
-                }
+            vpi::CB_VALUE_CHANGE => {
+                sim.dpi_value_change_cbs
+                    .entry(signal_id)
+                    .or_default()
+                    .push(unsafe { *handle });
             }
-            15 /* cbStartOfReset */ => {
-                sim.dpi_reset_cbs.push(unsafe { *handle });
-            }
-            _ => {
-                // Unknown reason — accept the registration (so UVM's
-                // bookkeeping stays consistent) but don't track the
-                // callback for firing.
-            }
+            _ => sim.dpi_reset_cbs.push(unsafe { *handle }),
         }
-    });
+        true
+    })
+    .unwrap_or(false);
+
+    if !registered {
+        drop(unsafe { Box::from_raw(handle) });
+        return std::ptr::null_mut();
+    }
 
     handle as *mut libc::c_void
 }
@@ -41194,9 +41607,9 @@ pub extern "C" fn vpi_remove_cb(cb: *mut libc::c_void) -> libc::c_int {
     let cb_type = removed.cb_type;
 
     let mut rc = 0;
-    with_active_sim(|sim| {
+    try_active_sim("vpi_remove_cb", |sim| {
         match cb_type {
-            6 /* cbValueChange */ => {
+            vpi::CB_VALUE_CHANGE => {
                 if let Some(list) = sim.dpi_value_change_cbs.get_mut(&signal_id) {
                     list.retain(|cb| {
                         cb.cb_routine != removed.cb_routine
@@ -41205,7 +41618,7 @@ pub extern "C" fn vpi_remove_cb(cb: *mut libc::c_void) -> libc::c_int {
                     rc = 1;
                 }
             }
-            15 /* cbStartOfReset */ => {
+            vpi::CB_START_OF_RESET => {
                 let before = sim.dpi_reset_cbs.len();
                 sim.dpi_reset_cbs.retain(|cb| {
                     cb.cb_routine != removed.cb_routine

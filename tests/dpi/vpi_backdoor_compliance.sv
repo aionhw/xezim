@@ -19,6 +19,7 @@ module vpi_backdoor_compliance;
   real               t_real;
   shortreal          t_shortreal;
   bit [127:0]        t_vec128;
+  bit [127:0]        read_vec128;
   wire [31:0]        t_net32;
   reg [31:0]         t_net32_driver;
   
@@ -132,8 +133,17 @@ module vpi_backdoor_compliance;
     // ----------------------------------------------------
     t_vec128 = 128'h0123456789ABCDEF_FEDCBA9876543210;
     #1;
+    // Read it back through vpiVectorVal. This was imported but never
+    // called, which is why vpi_get_value silently ignoring vpiVectorVal
+    // went unnoticed — the very format UVM's HDL backdoor reads with.
+    read_vec128 = 128'hDEAD_BEEF;   // poison, so a no-op read is visible
+    if (!backdoor_read_vec128("vpi_backdoor_compliance.t_vec128", read_vec128)) errors = errors + 1;
+    `assert_eq(read_vec128, 128'h0123456789ABCDEF_FEDCBA9876543210, "vec128 read")
+
     if (!backdoor_force_vec128("vpi_backdoor_compliance.t_vec128", 128'h5A5A5A5A5A5A5A5A_A5A5A5A5A5A5A5A5)) errors = errors + 1;
     #1;
+    if (!backdoor_read_vec128("vpi_backdoor_compliance.t_vec128", read_vec128)) errors = errors + 1;
+    `assert_eq(read_vec128, 128'h5A5A5A5A5A5A5A5A_A5A5A5A5A5A5A5A5, "vec128 read after force")
     `assert_eq(t_vec128, 128'h5A5A5A5A5A5A5A5A_A5A5A5A5A5A5A5A5, "vec128 force")
 
     t_vec128 = 128'h0;
