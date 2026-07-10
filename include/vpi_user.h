@@ -13,15 +13,18 @@
  * Functions the standard defines but xezim does not implement are NOT
  * declared here: a call to one is a compile error, which is the loud
  * failure we want, rather than a link-time surprise or a stub that
- * silently returns nothing. Notably absent: vpi_iterate / vpi_scan
- * (object traversal), vpi_get_str, vpi_printf, vpi_control,
- * vpi_chk_error, vpi_register_systf, and `vlog_startup_routines`.
- * There is no VPI module loading path — xezim's VPI is reachable only
+ * silently returns nothing. Notably absent: vpi_control, vpi_chk_error,
+ * vpi_put_userdata, vpi_get_userdata, and the vpiSysTfCall / vpiArgument
+ * relations (so a registered $systf cannot read its own arguments yet).
+ *
+ * A VPI module is loaded with `--vpi-lib <so>` (or `-m`), after which its
+ * `vlog_startup_routines` run once, before simulation. VPI is also callable
  * from a DPI shared object loaded with `--dpi-lib`.
  */
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdarg.h>
 
 /* PLI type definitions (IEEE 1800-2017 Annex K.1). */
 typedef int32_t  PLI_INT32;
@@ -39,12 +42,23 @@ typedef PLI_UINT32 *vpiHandle;
  * Only the codes xezim can actually return are listed. `vpiLogicVar` is
  * an alias of `vpiReg`, exactly as in the standard header. */
 #define vpiIntegerVar         25   /* integer variable */
+#define vpiIterator           27   /* iterator (vpi_iterate result) */
+#define vpiMemory             29   /* unpacked array */
+#define vpiMemoryWord         30   /* one word of an unpacked array */
 #define vpiModule             32
 #define vpiNet                36   /* scalar or vector net */
+#define vpiNetBit             37
 #define vpiParameter          41
+#define vpiPartSelect         42   /* part-select / packed-struct member */
 #define vpiRealVar            47   /* real variable */
 #define vpiReg                48   /* scalar or vector reg (4-state) */
+#define vpiRegBit             49
 #define vpiTimeVar            63
+
+/* Traversal relations. */
+#define vpiScope              84   /* containing scope */
+#define vpiInternalScope      92   /* internal scopes of a module */
+#define vpiVariables         100   /* variables declared in a module */
 /* SystemVerilog object types (IEEE 1800-2017 sv_vpi_user.h). */
 #define vpiLongIntVar        610
 #define vpiShortIntVar       611
@@ -96,6 +110,7 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiName                2
 #define vpiFullName            3
 #define vpiSize                4
+#define vpiDefName             9   /* module definition name */
 #define vpiScalar             17
 #define vpiVector             18
 #define vpiSigned             65
@@ -178,11 +193,66 @@ struct t_cb_data {
  * suffix, so "top.dut.sig", "dut.sig" and "sig" all resolve. */
 vpiHandle vpi_handle_by_name(PLI_BYTE8 *name, vpiHandle scope);
 
-/* xezim models no object relationships, so this always returns NULL —
- * the standard's answer for "that relationship does not exist". It is
- * declared so that code which probes for a relationship links and takes
- * its NULL path rather than failing to load. */
+/* One-to-one traversal. Only vpiScope is modelled: the containing scope of
+ * an object, or the parent of a module. As an xezim extension,
+ * vpi_handle(vpiScope, NULL) returns the top module — the standard route is
+ * vpi_scan(vpi_iterate(vpiModule, NULL)), but enough code spells it the
+ * short way that supporting it is worth more than returning NULL. Any other
+ * relation returns NULL. */
 vpiHandle vpi_handle(PLI_INT32 type, vpiHandle refHandle);
+
+/* One-to-many traversal. Returns NULL when the relation yields nothing.
+ * Supported for a module reference: vpiModule and vpiInternalScope (child
+ * instances), vpiNet, vpiReg, vpiVariables, vpiParameter, vpiMemory.
+ * With a NULL reference, vpiModule yields the single top module. */
+vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle refHandle);
+
+/* Hand out the next object. When the iterator is exhausted it returns NULL
+ * and FREES the iterator (IEEE 1800-2017 section 38.32) — do not free it
+ * yourself. */
+vpiHandle vpi_scan(vpiHandle iterator);
+
+/* Select one word of a vpiMemory object. NULL if out of range. */
+vpiHandle vpi_handle_by_index(vpiHandle object, PLI_INT32 index);
+
+/* vpiName, vpiFullName, and vpiDefName (modules only). Returns NULL for any
+ * other property. The string is simulator-owned and valid until the next
+ * vpi_get_str call on this thread. */
+PLI_BYTE8 *vpi_get_str(PLI_INT32 property, vpiHandle object);
+
+/* Formatted output, interleaved with $display. */
+int vpi_printf(PLI_BYTE8 *format, ...);
+int vpi_vprintf(PLI_BYTE8 *format, va_list ap);
+int vpi_mcd_printf(PLI_UINT32 mcd, PLI_BYTE8 *format, ...);
+
+/* Register a system task or function. `tfname` must begin with '$'.
+ * `compiletf` runs immediately before `calltf` on each call — xezim has no
+ * separate compile phase for it. `sizetf` is accepted and ignored: system
+ * FUNCTIONS registered this way are not yet dispatched, only tasks. */
+typedef struct t_vpi_systf_data {
+    PLI_INT32   type;         /* vpiSysTask or vpiSysFunc */
+    PLI_INT32   sysfunctype;  /* vpi[Int,Real,Time,Sized,SizedSigned]Func */
+    PLI_BYTE8  *tfname;       /* first character must be '$' */
+    PLI_INT32 (*calltf)(PLI_BYTE8 *);
+    PLI_INT32 (*compiletf)(PLI_BYTE8 *);
+    PLI_INT32 (*sizetf)(PLI_BYTE8 *);
+    PLI_BYTE8  *user_data;
+} s_vpi_systf_data, *p_vpi_systf_data;
+
+#define vpiSysTask             1
+#define vpiSysFunc             2
+#define vpiIntFunc             1
+#define vpiRealFunc            2
+#define vpiTimeFunc            3
+#define vpiSizedFunc           4
+#define vpiSizedSignedFunc     5
+
+vpiHandle vpi_register_systf(p_vpi_systf_data systf_data_p);
+
+/* The entry point xezim calls for every `--vpi-lib` module: a NULL-terminated
+ * array of registration routines (IEEE 1800-2017 section 38.2). Define it in
+ * your VPI module; do not call it yourself. */
+extern void (*vlog_startup_routines[])(void);
 
 /* Returns vpiUndefined (-1) for a property xezim does not model.
  * Supported: vpiType, vpiSize, vpiSigned, vpiScalar, vpiVector. */

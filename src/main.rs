@@ -75,6 +75,7 @@ fn print_usage() {
     eprintln!("  --max-time <n>   Set maximum simulation time (default: 100000)");
     eprintln!("  --sim_debug      Enable simulator [DEBUG]/[OPT] output");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
+    eprintln!("  --vpi-lib <so>   Load a VPI module and run its vlog_startup_routines (-m)");
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
     eprintln!("                   n>=2 offloads stdout writes to a background thread.");
     eprintln!("  --xtrace <file>  Emit XTrace v1.0 dump to <file>");
@@ -430,6 +431,7 @@ fn main() {
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
     let mut dpi_libs: Vec<String> = Vec::new();
+    let mut vpi_libs: Vec<String> = Vec::new();
     let mut plusargs: Vec<String> = Vec::new();
     let mut threads: usize = 1;
     let mut emit_hypergraph: Option<String> = None;
@@ -799,6 +801,14 @@ fn main() {
                     dpi_libs.push(args[i].clone());
                 }
             }
+            // A VPI module: loaded, then its `vlog_startup_routines` runs so
+            // it can register system tasks (IEEE 1800-2017 §38.2).
+            "--vpi-lib" | "-m" => {
+                i += 1;
+                if i < args.len() {
+                    vpi_libs.push(args[i].clone());
+                }
+            }
             _ if arg.starts_with('-') => {
                 eprintln!("Warning: unknown flag '{}' (ignored)", arg);
             }
@@ -840,6 +850,7 @@ fn main() {
                         let total_start = std::time::Instant::now();
                         xezim::compiler::simulator::set_sim_debug(sim_debug);
                         xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
+                        xezim::compiler::simulator::set_vpi_libs(&vpi_libs);
                         let mut sim = xezim::compiler::Simulator::new(elab, max_time);
                         if let Some(limit) = settle_limit {
                             sim.settle_limit = limit;
@@ -1097,6 +1108,7 @@ fn main() {
     println!("------------------------------");
     xezim::compiler::simulator::set_sim_debug(sim_debug);
     xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
+    xezim::compiler::simulator::set_vpi_libs(&vpi_libs);
 
     // PDES c910 stub mode: parse + elaborate + compile, then run the
     // PdesCoordinator with stub blocks for `pdes_c910_ticks` ticks.

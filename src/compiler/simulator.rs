@@ -71,6 +71,24 @@ pub fn set_dpi_libs(paths: &[String]) {
     }
 }
 
+fn vpi_lib_paths() -> &'static Mutex<Vec<String>> {
+    static VPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    VPI_LIB_PATHS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// `--vpi-lib`: shared objects loaded as VPI modules. Each one's
+/// `vlog_startup_routines` runs once, before simulation, so it can
+/// register system tasks with `vpi_register_systf`.
+pub fn set_vpi_libs(paths: &[String]) {
+    if let Ok(mut guard) = vpi_lib_paths().lock() {
+        *guard = paths.to_vec();
+    }
+}
+
+fn configured_vpi_libs() -> Vec<String> {
+    vpi_lib_paths().lock().map(|g| g.clone()).unwrap_or_default()
+}
+
 fn configured_dpi_libs() -> Vec<String> {
     dpi_lib_paths()
         .lock()
@@ -3366,6 +3384,18 @@ impl Simulator {
         }
         sim.load_dpi_libraries();
         sim.bind_all_dpi_imports();
+        // VPI modules register their $systf's before simulation starts. The
+        // startup routines run with ACTIVE_SIMULATOR set, so a routine that
+        // resolves a handle sees a built design.
+        let vpi_paths = configured_vpi_libs();
+        if !vpi_paths.is_empty() {
+            let self_ptr = &mut sim as *mut Simulator;
+            ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
+            let mut libs = std::mem::take(&mut sim.dpi_libraries);
+            vpi_run_startup_routines(&mut libs, &vpi_paths);
+            sim.dpi_libraries = libs;
+            ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
+        }
         sim
     }
 
@@ -26351,6 +26381,12 @@ impl Simulator {
                     }
                 }
             }
+            // A `$name` a VPI module registered with `vpi_register_systf`.
+            // Checked last so a builtin always wins.
+            _ if vpi_systf_registered(name) => {
+                let self_ptr = self as *mut Simulator;
+                vpi_call_systf(self_ptr, name);
+            }
             _ => {}
         }
     }
@@ -40723,12 +40759,23 @@ mod vpi {
     // vpi_get properties.
     pub const UNDEFINED: c_int = -1;
     pub const TYPE: c_int = 1;
+    pub const NAME: c_int = 2;
+    pub const FULL_NAME: c_int = 3;
     pub const SIZE: c_int = 4;
+    pub const DEF_NAME: c_int = 9;
     pub const SCALAR: c_int = 17;
     pub const VECTOR: c_int = 18;
     pub const SIGNED: c_int = 65;
 
-    // Object types returned by vpi_get(vpiType).
+    // Object types returned by vpi_get(vpiType), and traversal relations.
+    pub const ITERATOR: c_int = 27;
+    pub const MEMORY: c_int = 29;
+    pub const MODULE: c_int = 32;
+    pub const PARAMETER: c_int = 41;
+    pub const PART_SELECT: c_int = 42;
+    pub const SCOPE: c_int = 84;
+    pub const INTERNAL_SCOPE: c_int = 92;
+    pub const VARIABLES: c_int = 100;
     pub const INTEGER_VAR: c_int = 25;
     pub const NET: c_int = 36;
     pub const REAL_VAR: c_int = 47;
@@ -40807,6 +40854,13 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     static VPI_STR_SCRATCH: std::cell::RefCell<Vec<u8>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    // vpi_get_str() rotates through a pool rather than reusing one buffer.
+    // `vpi_printf("%s %s", vpi_get_str(vpiName, h), vpi_get_str(vpiDefName, h))`
+    // is idiomatic VPI: both pointers are live at once, and C leaves the
+    // argument evaluation order unspecified. A single shared buffer makes
+    // both strings read as whichever call happened to run last.
+    static VPI_STR2_SCRATCH: std::cell::RefCell<(usize, Vec<Vec<u8>>)> =
+        std::cell::RefCell::new((0, vec![Vec::new(); 8]));
     static VPI_TIME_SCRATCH: std::cell::RefCell<s_vpi_time> =
         const { std::cell::RefCell::new(s_vpi_time { type_: 2, high: 0, low: 0, real: 0.0 }) };
 }
@@ -40919,14 +40973,115 @@ thread_local! {
     static ACTIVE_SCOPE: std::cell::Cell<*mut libc::c_void> = const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 
+/// What a `vpiHandle` points at. `vpiHandle` is `void *` to C, so this is
+/// entirely private; every entry point checks `kind` before using the
+/// fields that only some kinds populate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VpiKind {
+    /// A whole signal in the flat signal table.
+    Signal,
+    /// A bit range of a signal — a packed-struct member or part-select.
+    Slice,
+    /// A module instance. `inst_idx == -1` is the top module.
+    Module,
+    /// An unpacked array. `vpi_handle_by_index` selects a word.
+    Memory,
+    /// The result of `vpi_iterate`, consumed by `vpi_scan`.
+    Iterator,
+}
+
 /// Wrapper for VPI handles stored as raw pointers.
-#[repr(C)]
+#[derive(Clone)]
 struct VpiHandle {
+    kind: VpiKind,
+    /// Signal / Slice / Memory: index into the signal table. For Memory this
+    /// is the id of element 0.
     signal_id: usize,
     /// `vpi_get(vpiType)` answer, resolved from the DECLARED type when the
     /// handle is created. It must not be derived from the current value:
     /// a `logic` signal is a `vpiReg` whether or not it happens to hold X.
     type_code: libc::c_int,
+    /// Slice only: bit range within `signal_id`.
+    lsb: u32,
+    width: u32,
+    /// Module only: index into `module.instances`, or -1 for the top module.
+    inst_idx: isize,
+    /// Local name (`data_bus`) and hierarchical name (`tb_top.u_sub.data_bus`).
+    name: String,
+    full_name: String,
+    /// Module only: the definition this instantiates (`vpiDefName`).
+    def_name: String,
+    /// Iterator only: the objects still to be handed out by `vpi_scan`.
+    items: Vec<VpiHandle>,
+    pos: usize,
+}
+
+impl VpiHandle {
+    fn signal(id: usize, type_code: libc::c_int, name: &str, full: &str) -> Self {
+        VpiHandle {
+            kind: VpiKind::Signal,
+            signal_id: id,
+            type_code,
+            lsb: 0,
+            width: 0,
+            inst_idx: -1,
+            name: name.to_string(),
+            full_name: full.to_string(),
+            def_name: String::new(),
+            items: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    fn into_raw(self) -> *mut libc::c_void {
+        Box::into_raw(Box::new(self)) as *mut libc::c_void
+    }
+}
+
+/// Borrow a handle, returning None for NULL.
+///
+/// # Safety
+/// `handle` must be NULL or a pointer returned by one of the VPI handle
+/// constructors and not yet freed.
+unsafe fn vpi_deref<'a>(handle: *mut libc::c_void) -> Option<&'a VpiHandle> {
+    if handle.is_null() {
+        None
+    } else {
+        Some(&*(handle as *const VpiHandle))
+    }
+}
+
+/// A `$systf` registered from a VPI module via `vpi_register_systf`.
+#[derive(Clone, Copy)]
+struct VpiSystf {
+    /// `PLI_INT32 (*calltf)(PLI_BYTE8 *user_data)`, as a `usize` so the
+    /// struct stays `Copy` and can live in a thread-local map.
+    calltf: usize,
+    compiletf: usize,
+    user_data: usize,
+    /// vpiSysTask (1) or vpiSysFunc (2).
+    tf_type: libc::c_int,
+}
+
+// System tasks and functions registered by a VPI module's
+// `vlog_startup_routines`. Registration happens before the Simulator is
+// built, so this cannot hang off it. Single-threaded, like the rest of the
+// VPI surface.
+thread_local! {
+    static VPI_SYSTFS: std::cell::RefCell<HashMap<String, VpiSystf>> =
+        std::cell::RefCell::new(HashMap::default());
+}
+
+/// Mirror of `s_vpi_systf_data` from `vpi_user.h` (IEEE 1800-2017 §38.36).
+#[repr(C)]
+struct s_vpi_systf_data {
+    type_: libc::c_int,
+    sysfunctype: libc::c_int,
+    tfname: *mut libc::c_char,
+    calltf: *mut libc::c_void,
+    compiletf: *mut libc::c_void,
+    sizetf: *mut libc::c_void,
+    user_data: *mut libc::c_char,
 }
 
 /// Mirror of `s_cb_data` from `vpi_user.h` — the value-change dispatcher
@@ -41032,6 +41187,11 @@ where
 fn vpi_type_of(sim: &Simulator, name: &str, id: usize) -> libc::c_int {
     use xezim_core::ast::types::{DataType, IntegerAtomType, IntegerVectorType, RealType, SimpleType, StructUnionKind};
 
+    // A parameter is also stored as a signal, so this must come first or
+    // every parameter reports vpiReg.
+    if sim.module.parameters.contains_key(name) {
+        return vpi::PARAMETER;
+    }
     if sim.module.nets.contains(name) {
         return vpi::NET;
     }
@@ -41075,7 +41235,115 @@ fn vpi_type_of(sim: &Simulator, name: &str, id: usize) -> libc::c_int {
 
 fn new_vpi_handle(sim: &Simulator, name: &str, id: usize) -> *mut libc::c_void {
     let type_code = vpi_type_of(sim, name, id);
-    Box::into_raw(Box::new(VpiHandle { signal_id: id, type_code })) as *mut libc::c_void
+    let leaf = name.rsplit('.').next().unwrap_or(name);
+    VpiHandle::signal(id, type_code, leaf, &vpi_full_name(sim, name)).into_raw()
+}
+
+/// Prefix a design-relative name with the top module, the way
+/// `vpi_get_str(vpiFullName, ..)` must report it.
+fn vpi_full_name(sim: &Simulator, name: &str) -> String {
+    if name.is_empty() {
+        sim.module.name.clone()
+    } else {
+        format!("{}.{}", sim.module.name, name)
+    }
+}
+
+/// Strip a leading `<top>.` from a hierarchical name. Signal-table names
+/// are stored relative to the top module, but VPI callers write the full
+/// path.
+fn vpi_strip_top<'a>(sim: &Simulator, name: &'a str) -> &'a str {
+    let top = sim.module.name.as_str();
+    if let Some(rest) = name.strip_prefix(top) {
+        if let Some(rest) = rest.strip_prefix('.') {
+            return rest;
+        }
+        if rest.is_empty() {
+            return "";
+        }
+    }
+    name
+}
+
+/// A module handle for `inst_idx` (-1 = the top module).
+fn vpi_module_handle(sim: &Simulator, inst_idx: isize) -> *mut libc::c_void {
+    let (name, full, def) = if inst_idx < 0 {
+        (sim.module.name.clone(), sim.module.name.clone(), sim.module.name.clone())
+    } else {
+        let inst = &sim.module.instances[inst_idx as usize];
+        let leaf = inst.path.rsplit('.').next().unwrap_or(&inst.path).to_string();
+        (leaf, vpi_full_name(sim, &inst.path), inst.def_name.clone())
+    };
+    VpiHandle {
+        kind: VpiKind::Module,
+        signal_id: 0,
+        type_code: vpi::MODULE,
+        lsb: 0,
+        width: 0,
+        inst_idx,
+        name,
+        full_name: full,
+        def_name: def,
+        items: Vec::new(),
+        pos: 0,
+    }
+    .into_raw()
+}
+
+/// The design-relative path of a module handle ("" for the top module).
+fn vpi_scope_path(sim: &Simulator, h: &VpiHandle) -> String {
+    if h.inst_idx < 0 {
+        String::new()
+    } else {
+        sim.module.instances[h.inst_idx as usize].path.clone()
+    }
+}
+
+/// True when `name` is a signal the elaborator invented for an instance
+/// (a 1-bit placeholder so validation recognises the name). Those must not
+/// appear as VPI signal objects — they are module instances.
+fn vpi_is_instance_name(sim: &Simulator, name: &str) -> bool {
+    sim.module.instances.iter().any(|i| i.path == name)
+}
+
+/// Resolve a packed-struct member path (`pixel_data.r`) to its bit range.
+fn vpi_slice_of(sim: &Simulator, name: &str) -> Option<VpiHandle> {
+    let (base, member) = name.rsplit_once('.')?;
+    let fields = sim.module.packed_struct_fields.get(base)?;
+    let &(_, lsb, width) = fields.iter().find(|(m, _, _)| m == member)?;
+    let &id = sim.signal_name_to_id.get(base)?;
+    Some(VpiHandle {
+        kind: VpiKind::Slice,
+        signal_id: id,
+        type_code: vpi::PART_SELECT,
+        lsb,
+        width,
+        inst_idx: -1,
+        name: member.to_string(),
+        full_name: vpi_full_name(sim, name),
+        def_name: String::new(),
+        items: Vec::new(),
+        pos: 0,
+    })
+}
+
+/// Read a slice out of its parent signal.
+fn vpi_slice_read(sim: &Simulator, h: &VpiHandle) -> Option<Value> {
+    let parent = sim.signal_table.get(h.signal_id)?;
+    let mut v = Value::zero(h.width);
+    for i in 0..h.width as usize {
+        v.set_bit_code(i, parent.get_bit_code(h.lsb as usize + i));
+    }
+    Some(v)
+}
+
+/// Write a slice back into its parent signal.
+fn vpi_slice_write(sim: &Simulator, h: &VpiHandle, val: &Value) -> Option<Value> {
+    let mut parent = sim.signal_table.get(h.signal_id)?.clone();
+    for i in 0..h.width as usize {
+        parent.set_bit_code(h.lsb as usize + i, val.get_bit_code(i));
+    }
+    Some(parent)
 }
 
 /// Get signal ID by hierarchical name.
@@ -41104,10 +41372,29 @@ pub extern "C" fn vpi_handle_by_name(
         .to_string();
 
     try_active_sim("vpi_handle_by_name", |sim| {
+        // The top module itself, and any instance in the hierarchy.
+        let rel = vpi_strip_top(sim, &full_name);
+        if rel.is_empty() {
+            return vpi_module_handle(sim, -1);
+        }
+        if let Some(i) = sim.module.instances.iter().position(|i| i.path == rel) {
+            return vpi_module_handle(sim, i as isize);
+        }
+
         let mut rest: &str = full_name.as_str();
         loop {
-            if let Some(&id) = sim.signal_name_to_id.get(rest) {
-                return new_vpi_handle(sim, rest, id);
+            // An instance's 1-bit placeholder signal must not be handed out
+            // as a signal object.
+            if !vpi_is_instance_name(sim, rest) {
+                if let Some(&id) = sim.signal_name_to_id.get(rest) {
+                    return new_vpi_handle(sim, rest, id);
+                }
+                if let Some(h) = vpi_slice_of(sim, rest) {
+                    return h.into_raw();
+                }
+                if let Some(h) = vpi_memory_of(sim, rest) {
+                    return h.into_raw();
+                }
             }
             match rest.find('.') {
                 Some(dot) => rest = &rest[dot + 1..],
@@ -41118,13 +41405,370 @@ pub extern "C" fn vpi_handle_by_name(
     .unwrap_or(std::ptr::null_mut())
 }
 
-/// xezim models no object relationships, so there is nothing to return.
-/// NULL is the standard's answer for "that relationship does not exist";
-/// the symbol exists so C code that probes for one links and takes its
-/// NULL path instead of failing to load.
+/// An unpacked array (`int mem [0:3]`) as a `vpiMemory` object. Its words
+/// are separate signals named `mem[0]`..`mem[n-1]`; `vpi_handle_by_index`
+/// selects one.
+fn vpi_memory_of(sim: &Simulator, name: &str) -> Option<VpiHandle> {
+    let &(lo, hi, _w) = sim.module.arrays.get(name)?;
+    let count = (hi - lo).unsigned_abs() as u32 + 1;
+    let id = *sim.signal_name_to_id.get(format!("{}[{}]", name, lo).as_str())?;
+    Some(VpiHandle {
+        kind: VpiKind::Memory,
+        signal_id: id,
+        type_code: vpi::MEMORY,
+        lsb: lo.min(hi) as u32,
+        width: count,
+        inst_idx: -1,
+        name: name.rsplit('.').next().unwrap_or(name).to_string(),
+        full_name: vpi_full_name(sim, name),
+        def_name: String::new(),
+        items: Vec::new(),
+        pos: 0,
+    })
+}
+
+/// Select one word of a `vpiMemory`.
 #[no_mangle]
-pub extern "C" fn vpi_handle(_type: libc::c_int, _refh: *mut libc::c_void) -> *mut libc::c_void {
-    std::ptr::null_mut()
+pub extern "C" fn vpi_handle_by_index(
+    handle: *mut libc::c_void,
+    index: libc::c_int,
+) -> *mut libc::c_void {
+    let Some(h) = (unsafe { vpi_deref(handle) }) else { return std::ptr::null_mut() };
+    if h.kind != VpiKind::Memory {
+        return std::ptr::null_mut();
+    }
+    let full = h.full_name.clone();
+    try_active_sim("vpi_handle_by_index", |sim| {
+        let rel = vpi_strip_top(sim, &full).to_string();
+        let elem = format!("{}[{}]", rel, index);
+        match sim.signal_name_to_id.get(elem.as_str()) {
+            Some(&id) => {
+                let ty = vpi_type_of(sim, &elem, id);
+                VpiHandle::signal(id, ty, &elem, &vpi_full_name(sim, &elem)).into_raw()
+            }
+            None => std::ptr::null_mut(),
+        }
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Traverse a one-to-one relationship. Only `vpiScope` is modelled.
+///
+/// `vpi_handle(vpiScope, NULL)` returns the top module. That is an xezim
+/// extension — the standard route to the top is
+/// `vpi_scan(vpi_iterate(vpiModule, NULL))` — but enough VPI code in the
+/// wild spells it this way that supporting it is worth more than the
+/// purity of returning NULL.
+#[no_mangle]
+pub extern "C" fn vpi_handle(type_: libc::c_int, refh: *mut libc::c_void) -> *mut libc::c_void {
+    try_active_sim("vpi_handle", |sim| {
+        if type_ != vpi::SCOPE {
+            return std::ptr::null_mut();
+        }
+        let Some(h) = (unsafe { vpi_deref(refh) }) else {
+            return vpi_module_handle(sim, -1);
+        };
+        match h.kind {
+            // The scope containing a module is its parent.
+            VpiKind::Module => {
+                if h.inst_idx < 0 {
+                    return std::ptr::null_mut(); // the top has no parent
+                }
+                let parent = sim.module.instances[h.inst_idx as usize].parent.clone();
+                if parent.is_empty() {
+                    vpi_module_handle(sim, -1)
+                } else {
+                    match sim.module.instances.iter().position(|i| i.path == parent) {
+                        Some(i) => vpi_module_handle(sim, i as isize),
+                        None => std::ptr::null_mut(),
+                    }
+                }
+            }
+            // The scope containing an object is the instance it is declared in.
+            _ => {
+                let rel = vpi_strip_top(sim, &h.full_name).to_string();
+                match rel.rsplit_once('.') {
+                    Some((scope, _)) => match sim.module.instances.iter().position(|i| i.path == scope) {
+                        Some(i) => vpi_module_handle(sim, i as isize),
+                        None => vpi_module_handle(sim, -1),
+                    },
+                    None => vpi_module_handle(sim, -1),
+                }
+            }
+        }
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Objects declared DIRECTLY in `scope` (no deeper dotted component), in
+/// sorted order so iteration is deterministic.
+fn vpi_scope_members(sim: &Simulator, scope: &str) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for (name, &id) in sim.signal_name_to_id.iter() {
+        let name: &str = name;
+        let leaf = if scope.is_empty() {
+            if name.contains('.') {
+                continue;
+            }
+            name
+        } else {
+            match name.strip_prefix(scope).and_then(|r| r.strip_prefix('.')) {
+                Some(r) if !r.contains('.') => r,
+                _ => continue,
+            }
+        };
+        // Array words (`mem[0]`) are reached through their vpiMemory parent,
+        // and an instance placeholder is not a signal.
+        if leaf.contains('[') || vpi_is_instance_name(sim, name) {
+            continue;
+        }
+        out.push((name.to_string(), id));
+    }
+    // Unpacked arrays have no whole-array signal; surface them as vpiMemory.
+    for name in sim.module.arrays.keys() {
+        let matches_scope = if scope.is_empty() {
+            !name.contains('.')
+        } else {
+            name.strip_prefix(scope).and_then(|r| r.strip_prefix('.')).map(|r| !r.contains('.')).unwrap_or(false)
+        };
+        if matches_scope && !out.iter().any(|(n, _)| n == name) {
+            out.push((name.clone(), usize::MAX));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Iterate a one-to-many relationship. Returns NULL when the relationship
+/// yields nothing, as the standard requires (callers test for it).
+#[no_mangle]
+pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *mut libc::c_void {
+    try_active_sim("vpi_iterate", |sim| {
+        let scope_h = unsafe { vpi_deref(refh) };
+
+        // A NULL reference means "the whole design": the only top-level
+        // module is the one we elaborated.
+        let scope_path = match scope_h {
+            None => {
+                if type_ == vpi::MODULE {
+                    let items = vec![unsafe { *Box::from_raw(vpi_module_handle(sim, -1) as *mut VpiHandle) }];
+                    return vpi_make_iterator(items);
+                }
+                return std::ptr::null_mut();
+            }
+            Some(h) if h.kind == VpiKind::Module => vpi_scope_path(sim, h),
+            Some(_) => return std::ptr::null_mut(),
+        };
+
+        // Child scopes / instances.
+        if type_ == vpi::MODULE || type_ == vpi::INTERNAL_SCOPE {
+            let items: Vec<VpiHandle> = sim
+                .module
+                .instances
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.parent == scope_path)
+                .map(|(idx, _)| unsafe { *Box::from_raw(vpi_module_handle(sim, idx as isize) as *mut VpiHandle) })
+                .collect();
+            return vpi_make_iterator(items);
+        }
+
+        // Declared objects, filtered by what the caller asked for.
+        let want = |ty: libc::c_int| -> bool {
+            match type_ {
+                vpi::NET => ty == vpi::NET,
+                vpi::REG => ty == vpi::REG || ty == vpi::BIT_VAR,
+                vpi::PARAMETER => ty == vpi::PARAMETER,
+                vpi::MEMORY => ty == vpi::MEMORY,
+                vpi::VARIABLES => {
+                    ty != vpi::NET && ty != vpi::PARAMETER && ty != vpi::MEMORY
+                }
+                _ => false,
+            }
+        };
+
+        let mut items: Vec<VpiHandle> = Vec::new();
+        for (name, id) in vpi_scope_members(sim, &scope_path) {
+            if id == usize::MAX {
+                if let Some(m) = vpi_memory_of(sim, &name) {
+                    if want(vpi::MEMORY) {
+                        items.push(m);
+                    }
+                }
+                continue;
+            }
+            let ty = vpi_type_of(sim, &name, id);
+            if want(ty) {
+                let leaf = name.rsplit('.').next().unwrap_or(&name);
+                items.push(VpiHandle::signal(id, ty, leaf, &vpi_full_name(sim, &name)));
+            }
+        }
+        vpi_make_iterator(items)
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+fn vpi_make_iterator(items: Vec<VpiHandle>) -> *mut libc::c_void {
+    if items.is_empty() {
+        return std::ptr::null_mut();
+    }
+    VpiHandle {
+        kind: VpiKind::Iterator,
+        signal_id: 0,
+        type_code: vpi::ITERATOR,
+        lsb: 0,
+        width: 0,
+        inst_idx: -1,
+        name: String::new(),
+        full_name: String::new(),
+        def_name: String::new(),
+        items,
+        pos: 0,
+    }
+    .into_raw()
+}
+
+/// Hand out the next object of an iterator. When the iterator is exhausted
+/// it is FREED and NULL returned — the caller must not free it itself, per
+/// IEEE 1800-2017 §38.32.
+#[no_mangle]
+pub extern "C" fn vpi_scan(iter: *mut libc::c_void) -> *mut libc::c_void {
+    if iter.is_null() {
+        return std::ptr::null_mut();
+    }
+    let h = unsafe { &mut *(iter as *mut VpiHandle) };
+    if h.kind != VpiKind::Iterator {
+        return std::ptr::null_mut();
+    }
+    if h.pos >= h.items.len() {
+        drop(unsafe { Box::from_raw(iter as *mut VpiHandle) });
+        return std::ptr::null_mut();
+    }
+    let next = h.items[h.pos].clone();
+    h.pos += 1;
+    next.into_raw()
+}
+
+/// String-valued properties. The returned pointer addresses simulator-owned
+/// storage valid until the next `vpi_get_str` call on this thread.
+#[no_mangle]
+pub extern "C" fn vpi_get_str(property: libc::c_int, handle: *mut libc::c_void) -> *mut libc::c_char {
+    let Some(h) = (unsafe { vpi_deref(handle) }) else { return std::ptr::null_mut() };
+    let s = match property {
+        vpi::NAME => h.name.clone(),
+        vpi::FULL_NAME => h.full_name.clone(),
+        vpi::DEF_NAME if h.kind == VpiKind::Module => h.def_name.clone(),
+        _ => return std::ptr::null_mut(),
+    };
+    VPI_STR2_SCRATCH.with(|cell| {
+        let mut pool = cell.borrow_mut();
+        let slot = pool.0;
+        pool.0 = (slot + 1) % 8;
+        let buf = &mut pool.1[slot];
+        buf.clear();
+        buf.extend_from_slice(s.as_bytes());
+        buf.push(0);
+        buf.as_mut_ptr() as *mut libc::c_char
+    })
+}
+
+/// Register a system task or function implemented in a VPI module.
+#[no_mangle]
+pub extern "C" fn vpi_register_systf(data: *mut s_vpi_systf_data) -> *mut libc::c_void {
+    if data.is_null() {
+        return std::ptr::null_mut();
+    }
+    let d = unsafe { &*data };
+    if d.tfname.is_null() || d.calltf.is_null() {
+        eprintln!("[VPI] vpi_register_systf: tfname and calltf are required");
+        return std::ptr::null_mut();
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(d.tfname) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    if !name.starts_with('$') {
+        eprintln!("[VPI] vpi_register_systf: tfname '{}' must start with '$'", name);
+        return std::ptr::null_mut();
+    }
+    let entry = VpiSystf {
+        calltf: d.calltf as usize,
+        compiletf: d.compiletf as usize,
+        user_data: d.user_data as usize,
+        tf_type: d.type_,
+    };
+    VPI_SYSTFS.with(|m| m.borrow_mut().insert(name, entry));
+    // The returned handle is only compared against NULL in practice.
+    VpiHandle::signal(0, vpi::UNDEFINED, "", "").into_raw()
+}
+
+/// Call a registered `$systf`. Returns false when `name` is not registered,
+/// so the caller can fall through to its own diagnostic.
+fn vpi_call_systf(sim: *mut Simulator, name: &str) -> bool {
+    let Some(entry) = VPI_SYSTFS.with(|m| m.borrow().get(name).copied()) else {
+        return false;
+    };
+    ACTIVE_SIMULATOR.with(|cell| cell.set(sim));
+    type TfFn = extern "C" fn(*mut libc::c_char) -> libc::c_int;
+    if entry.compiletf != 0 {
+        let f: TfFn = unsafe { std::mem::transmute(entry.compiletf as *const ()) };
+        f(entry.user_data as *mut libc::c_char);
+    }
+    let f: TfFn = unsafe { std::mem::transmute(entry.calltf as *const ()) };
+    f(entry.user_data as *mut libc::c_char);
+    true
+}
+
+/// True when a VPI module registered `name`. Lets the caller distinguish a
+/// user-defined `$task` from a genuinely unknown one.
+pub fn vpi_systf_registered(name: &str) -> bool {
+    VPI_SYSTFS.with(|m| m.borrow().contains_key(name))
+}
+
+/// Load each `--vpi-lib` and run its `vlog_startup_routines`, the standard
+/// entry point for a VPI module (IEEE 1800-2017 §38.2).
+pub fn vpi_run_startup_routines(libs: &mut Vec<Library>, paths: &[String]) {
+    for path in paths {
+        // SAFETY: loading a dynamic library is inherently unsafe; the handle
+        // is kept alive for the simulator's lifetime.
+        let lib = match unsafe { Library::new(path) } {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[VPI] failed to load '{}': {}", path, e);
+                continue;
+            }
+        };
+        type StartupFn = unsafe extern "C" fn();
+        // `vlog_startup_routines` is a NULL-terminated array of function
+        // pointers, not a function.
+        let routines: *const Option<StartupFn> = match unsafe {
+            lib.get::<*const Option<StartupFn>>(b"vlog_startup_routines\0")
+        } {
+            Ok(sym) => unsafe { *sym },
+            Err(_) => {
+                eprintln!(
+                    "[VPI] '{}' has no vlog_startup_routines; nothing to register",
+                    path
+                );
+                libs.push(lib);
+                continue;
+            }
+        };
+        if routines.is_null() {
+            libs.push(lib);
+            continue;
+        }
+        let mut i = 0isize;
+        loop {
+            let slot = unsafe { *routines.offset(i) };
+            match slot {
+                Some(f) => unsafe { f() },
+                None => break,
+            }
+            i += 1;
+        }
+        libs.push(lib);
+    }
 }
 
 /// Free a VPI handle.
@@ -41140,15 +41784,21 @@ pub extern "C" fn vpi_free_object(handle: *mut libc::c_void) -> libc::c_int {
 /// xezim does not model, rather than a plausible-looking 0.
 #[no_mangle]
 pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> libc::c_int {
-    if handle.is_null() {
-        return vpi::UNDEFINED;
+    let Some(h) = (unsafe { vpi_deref(handle) }) else { return vpi::UNDEFINED };
+    if property == vpi::TYPE {
+        return h.type_code;
     }
-    let h = unsafe { &*(handle as *const VpiHandle) };
+    // A module or an iterator has no width, sign or scalar-ness.
+    match h.kind {
+        VpiKind::Module | VpiKind::Iterator => return vpi::UNDEFINED,
+        // vpiSize of a memory is its number of words; of a slice, its bits.
+        VpiKind::Memory | VpiKind::Slice if property == vpi::SIZE => return h.width as libc::c_int,
+        _ => {}
+    }
     let sig_id = h.signal_id;
     try_active_sim("vpi_get", |sim| {
         let width = sim.signal_widths.get(sig_id).copied().unwrap_or(32) as libc::c_int;
         match property {
-            vpi::TYPE => h.type_code,
             vpi::SIZE => width,
             vpi::SIGNED => i32::from(sim.signal_signed.get(sig_id).copied().unwrap_or(false)),
             vpi::SCALAR => i32::from(width == 1),
@@ -41189,17 +41839,28 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
         return;
     }
     let vp = unsafe { &mut *value_p };
-    if handle.is_null() {
+    let Some(h) = (unsafe { vpi_deref(handle) }) else {
+        vp.format = vpi::SUPPRESS_VAL;
+        return;
+    };
+    // Modules, memories and iterators have no value.
+    if matches!(h.kind, VpiKind::Module | VpiKind::Iterator | VpiKind::Memory) {
         vp.format = vpi::SUPPRESS_VAL;
         return;
     }
-    let h = unsafe { &*(handle as *const VpiHandle) };
     let sig_id = h.signal_id;
 
     let ok = try_active_sim("vpi_get_value", |sim| {
-        let val = match sim.signal_table.get(sig_id) {
-            Some(v) => v.clone(),
-            None => return false,
+        let val = if h.kind == VpiKind::Slice {
+            match vpi_slice_read(sim, h) {
+                Some(v) => v,
+                None => return false,
+            }
+        } else {
+            match sim.signal_table.get(sig_id) {
+                Some(v) => v.clone(),
+                None => return false,
+            }
         };
         let current_time = sim.time;
         fill_vpi_value(&val, current_time, vp)
@@ -41349,6 +42010,10 @@ pub extern "C" fn vpi_put_value(
 
     try_active_sim("vpi_put_value", |sim| {
         let h = unsafe { &*(handle as *const VpiHandle) };
+        if matches!(h.kind, VpiKind::Module | VpiKind::Iterator | VpiKind::Memory) {
+            eprintln!("[VPI] vpi_put_value: this object has no value; ignored");
+            return std::ptr::null_mut();
+        }
         let sig_id = h.signal_id;
 
         if flags == vpi::RELEASE_FLAG {
@@ -41376,7 +42041,12 @@ pub extern "C" fn vpi_put_value(
             return std::ptr::null_mut();
         }
 
-        let w = sim.signal_widths.get(sig_id).copied().unwrap_or(32);
+        // A slice decodes at its own width, then splices back into its parent.
+        let w = if h.kind == VpiKind::Slice {
+            h.width
+        } else {
+            sim.signal_widths.get(sig_id).copied().unwrap_or(32)
+        };
         let is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
         let vp = unsafe { &*value_p };
 
@@ -41432,6 +42102,16 @@ pub extern "C" fn vpi_put_value(
                 );
                 return std::ptr::null_mut();
             }
+        };
+
+        // Splice a slice back into its parent before it hits the signal table.
+        let value = if h.kind == VpiKind::Slice {
+            match vpi_slice_write(sim, h, &value) {
+                Some(v) => v,
+                None => return std::ptr::null_mut(),
+            }
+        } else {
+            value
         };
 
         // For force: write value first, THEN add to forced_signals
@@ -41535,10 +42215,13 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
     // The signal being watched (cbValueChange only). For other reasons
     // we record 0 — those callbacks fire once per simulator session
     // regardless of the target.
-    let signal_id = if !cb_data.obj.is_null() {
-        unsafe { &*(cb_data.obj as *const VpiHandle) }.signal_id
-    } else {
-        0
+    let signal_id = match unsafe { vpi_deref(cb_data.obj) } {
+        Some(h) if h.kind == VpiKind::Signal => h.signal_id,
+        Some(_) => {
+            eprintln!("[VPI] vpi_register_cb: obj is not a signal (not registered)");
+            return std::ptr::null_mut();
+        }
+        None => 0,
     };
     // The format the caller wants `cb_data_p->value` filled in on each
     // fire. `vpiIntVal` when no value struct was supplied.

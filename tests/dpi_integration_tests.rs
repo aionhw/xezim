@@ -107,6 +107,46 @@ fn run_xezim_with_dpi_timeout(so_path: &Path, sv_file: &str, secs: u64) -> Strin
     }
 }
 
+/// Run a VPI module (`--vpi-lib`) rather than a DPI one, under a timeout.
+fn run_xezim_with_vpi_timeout(so_path: &Path, sv_file: &str, secs: u64) -> String {
+    use std::io::Read;
+    let bin = env!("CARGO_BIN_EXE_xezim");
+    let sv_path = manifest_path(sv_file);
+    let mut child = Command::new(bin)
+        .arg("--vpi-lib")
+        .arg(so_path)
+        .arg("--max-time")
+        .arg("1000")
+        .arg(&sv_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn xezim");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        match child.try_wait().expect("try_wait failed") {
+            Some(status) => {
+                let mut text = String::new();
+                if let Some(mut o) = child.stdout.take() {
+                    let _ = o.read_to_string(&mut text);
+                }
+                if let Some(mut e) = child.stderr.take() {
+                    let _ = e.read_to_string(&mut text);
+                }
+                assert!(status.success(), "xezim failed for {}:\n{}", sv_path.display(), text);
+                return text;
+            }
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("xezim did not finish within {}s for {}", secs, sv_path.display());
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+}
+
 fn assert_dpi_pass(c_file: &str, stem: &str, sv_file: &str) {
     let so = compile_dpi_lib(c_file, stem);
     let log = run_xezim_with_dpi(&so, sv_file);
@@ -209,6 +249,32 @@ fn vpi_conformance_test() {
         log.contains(&want),
         "vpi_get_vlog_info must report the crate version ({}):\n{}",
         env!("CARGO_PKG_VERSION"),
+        log
+    );
+}
+
+/// The classic VPI surface (IEEE 1800-2017 clause 38): a module loaded with
+/// `--vpi-lib`, registering a $systf via `vlog_startup_routines`, then
+/// walking the flattened design with `vpi_iterate`/`vpi_scan`/`vpi_get_str`.
+///
+/// Also pins three things the object model got wrong on first contact: an
+/// instance name must be a `vpiModule` rather than the 1-bit placeholder
+/// signal elaboration invents for it, a parameter must report
+/// `vpiParameter` rather than `vpiReg`, and two live `vpi_get_str` results
+/// must not alias the same buffer (the idiomatic
+/// `vpi_printf("%s %s", get_str(vpiName), get_str(vpiDefName))` needs both).
+#[test]
+fn vpi_object_model_test() {
+    let so = compile_dpi_lib("tests/dpi/vpi_object_model.c", "vpi_object_model");
+    let log = run_xezim_with_vpi_timeout(&so, "tests/dpi/vpi_object_model.sv", 60);
+    assert!(
+        log.contains("OM_ERRORS: 0"),
+        "vpi_object_model reported failures:\n{}",
+        log
+    );
+    assert!(
+        log.contains("RESULT: PASSED"),
+        "vpi_object_model missing RESULT: PASSED:\n{}",
         log
     );
 }
