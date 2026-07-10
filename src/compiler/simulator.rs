@@ -4805,6 +4805,9 @@ impl Simulator {
         dims: &[crate::ast::types::UnpackedDimension],
         dir: PortDirection,
     ) -> Option<DpiArgKind> {
+        // Resolve typedefs (e.g. `uvm_hdl_data_t` -> `logic [1023:0]`) so
+        // that DPI imports using named types map to the right arg kind.
+        let dt = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
         let out_dir = matches!(
             dir,
             PortDirection::Output | PortDirection::Ref | PortDirection::Inout
@@ -5407,7 +5410,7 @@ impl Simulator {
                         .get(i)
                         .map(|e| self.eval_expr(e))
                         .unwrap_or_else(|| Value::zero(*width));
-                    let (mut aval, mut bval) = Self::dpi_value_to_logic_words(&init, *width);
+                    let (aval, bval) = Self::dpi_value_to_logic_words(&init, *width);
                     // CRITICAL: store in Vec FIRST, then capture pointer (see VecLogicIn).
                     logic_aval.push(aval);
                     logic_bval.push(bval);
@@ -5658,10 +5661,12 @@ impl Simulator {
                         let out = Self::dpi_logic_words_to_value(
                             &logic_aval[idx],
                             &logic_bval[idx],
-                            width,
+                        width,
                         );
                         let w = self.infer_lhs_width(&expr);
                         self.assign_value(&expr, &out.resize(w));
+                    } else {
+                        eprintln!("[DBG-WB] VecLogicOut idx={} OUT OF RANGE aval.len={} bval.len={}", idx, logic_aval.len(), logic_bval.len());
                     }
                 }
                 DpiArgKind::VecBitOut(width) => {
@@ -30954,7 +30959,13 @@ impl Simulator {
         let mut cur = Some(start_class.to_string());
         while let Some(cname) = cur {
             if let Some(cd) = self.module.classes.get(&cname) {
-                if cd.static_properties.contains(prop) {
+                if cd.static_properties.contains(prop)
+                    // Class `localparam` constants (e.g. UVM 2020.3.1's
+                    // `localparam string prefix = "+uvm_set_verbosity="`) are
+                    // accessible as static class members even though they're
+                    // stored in `param_defaults`, not `properties`.
+                    || cd.param_defaults.iter().any(|(name, _)| name == prop)
+                {
                     // Per-specialization keying: when a `C#(params)::...` access
                     // is active, each specialization gets its own static cell.
                     return Some(match &self.current_spec {
@@ -30981,17 +30992,40 @@ impl Simulator {
             // suffix to find the class whose initial value seeds the cell.
             let head = key.split("::").next().unwrap_or("");
             let decl_class = head.split('#').next().unwrap_or(head);
-            let init = self
-                .module
-                .classes
-                .get(decl_class)
-                .and_then(|cd| cd.properties.get(prop))
-                .map(|sig| sig.value.clone())
-                .unwrap_or_else(|| Value::zero(32));
+            // Collect the initial value: first try `properties` (static
+            // class members), then `param_defaults` (class localparam
+            // constants like UVM's `localparam string prefix = "..."`).
+            // We must extract any expression clone before eval_expr to
+            // avoid borrowing self.module and self simultaneously.
+            let init_val: Option<Value> = {
+                let cd = self.module.classes.get(decl_class);
+                if let Some(cd) = cd {
+                    if let Some(sig) = cd.properties.get(prop) {
+                        Some(sig.value.clone())
+                    } else {
+                        // Look for class localparam constants (UVM 2020.3.1+
+                        // `localparam string prefix = "+uvm_set_verbosity="`).
+                        let pd_expr = cd.param_defaults
+                            .iter()
+                            .find(|(name, _)| name == prop)
+                            .and_then(|(_, e)| e.clone());
+                        if let Some(init_expr) = pd_expr {
+                            Some(self.eval_expr(&init_expr))
+                        } else {
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            };
+            let init = init_val.unwrap_or_else(|| Value::zero(32));
             self.class_statics.insert(key.clone(), init);
         }
         self.class_statics.get(&key).cloned()
     }
+
+
 
     /// Write a static class property's shared cell. Returns false if
     /// `prop` is not a static property of `start_class` or an ancestor.
@@ -33496,8 +33530,17 @@ impl Simulator {
             if reset {
                 self.dpi_arg_cursor = 0;
             }
-            if self.dpi_arg_cursor < self.plusargs.len() {
-                let s = self.plusargs[self.dpi_arg_cursor].clone();
+            // UVM's uvm_cmdline_processor::new() iterates over ALL argv entries
+            // (binary name, flags, and plusargs) via uvm_dpi_get_next_arg.
+            // The C implementation uses vpi_get_vlog_info which returns the
+            // full argv. We must do the same — iterate over vpi_arg_cstrings
+            // (set by set_args), not just plusargs, so that m_argv,
+            // m_plus_argv, and m_uvm_argv are populated correctly.
+            if self.dpi_arg_cursor < self.vpi_arg_cstrings.len() {
+                let s = self.vpi_arg_cstrings[self.dpi_arg_cursor]
+                    .to_str()
+                    .unwrap_or("")
+                    .to_string();
                 self.dpi_arg_cursor += 1;
                 return Value::from_string(&s);
             }
@@ -34648,8 +34691,9 @@ impl Simulator {
         }
         // `uvm_cmdline_processor` arg queries. UVM normally fills its arg list
         // via DPI (stubbed empty under `-DUVM_NO_DPI`), so serve these directly
-        // from `plusargs` — riscv-dv's `+num_of_tests=`/`+instr_cnt=`/etc. flow
-        // through `get_arg_value`.
+        // from the full argv — `m_argv` in UVM contains ALL args (binary name,
+        // flags, plusargs), not just the `+` prefixed ones. UVM's get_arg_values
+        // searches m_argv; get_plusargs returns m_plus_argv.
         if matches!(
             method_name,
             "get_arg_value" | "get_arg_values" | "get_args" | "get_plusargs"
@@ -34661,12 +34705,21 @@ impl Simulator {
                 .map(|i| i.class_name.clone())
                 .unwrap_or_default();
             if cname == "uvm_cmdline_processor" {
+                // Build m_argv (all args) and m_plus_argv (only + prefixed)
+                // from vpi_arg_cstrings, mirroring uvm_cmdline_processor::new().
+                let m_argv: Vec<String> = self
+                    .vpi_arg_cstrings
+                    .iter()
+                    .map(|cs| cs.to_str().unwrap_or("").to_string())
+                    .collect();
+                let m_plus_argv: Vec<String> =
+                    m_argv.iter().filter(|a| a.starts_with('+')).cloned().collect();
                 match method_name {
                     "get_arg_value" => {
                         let m = self.eval_expr(&args[0]).to_sv_string();
                         let mut count = 0u64;
                         let mut first_val: Option<String> = None;
-                        for a in &self.plusargs.clone() {
+                        for a in &m_argv {
                             if a.starts_with(&m) {
                                 count += 1;
                                 if first_val.is_none() {
@@ -34681,9 +34734,7 @@ impl Simulator {
                     }
                     "get_arg_values" => {
                         let m = self.eval_expr(&args[0]).to_sv_string();
-                        let vals: Vec<String> = self
-                            .plusargs
-                            .clone()
+                        let vals: Vec<String> = m_argv
                             .iter()
                             .filter(|a| a.starts_with(&m))
                             .map(|a| a[m.len()..].to_string())
@@ -34702,25 +34753,32 @@ impl Simulator {
                         }
                         return Value::from_u64(vals.len() as u64, 32);
                     }
-                    "get_args" | "get_plusargs" => {
-                        let want_plus = method_name == "get_plusargs";
-                        let vals: Vec<String> = self
-                            .plusargs
-                            .clone()
-                            .iter()
-                            .filter(|a| !want_plus || a.starts_with('+'))
-                            .cloned()
-                            .collect();
+                    "get_args" => {
                         if let Some(dst) = args.first() {
                             if let ExprKind::Ident(h) = &dst.kind {
                                 let nm = self.resolve_hier_name(h);
-                                for (i, v) in vals.iter().enumerate() {
+                                for (i, v) in m_argv.iter().enumerate() {
                                     self.set_signal_value_by_name(
                                         &format!("{}[{}]", nm, i),
                                         Value::from_string(v),
                                     );
                                 }
-                                self.set_queue_size(&nm, vals.len() as u64);
+                                self.set_queue_size(&nm, m_argv.len() as u64);
+                            }
+                        }
+                        return Value::zero(32);
+                    }
+                    "get_plusargs" => {
+                        if let Some(dst) = args.first() {
+                            if let ExprKind::Ident(h) = &dst.kind {
+                                let nm = self.resolve_hier_name(h);
+                                for (i, v) in m_plus_argv.iter().enumerate() {
+                                    self.set_signal_value_by_name(
+                                        &format!("{}[{}]", nm, i),
+                                        Value::from_string(v),
+                                    );
+                                }
+                                self.set_queue_size(&nm, m_plus_argv.len() as u64);
                             }
                         }
                         return Value::zero(32);

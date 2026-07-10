@@ -1271,3 +1271,74 @@ fn test_fork_join_none_shared_locals() {
     assert!(out.contains("PASS"), "expected PASS, got:\n{}", out);
     assert!(!out.contains("FAIL"), "unexpected FAIL (deadlock), got:\n{}", out);
 }
+
+// ---------------------------------------------------------------------
+// Class-body `localparam` must resolve as a static constant.
+// Regression for UVM 1800.2-2020.3.1's uvm_cmdline_report classes which
+// declare `localparam string prefix = "+uvm_set_verbosity="` and reference
+// it from a static `init` method. Before the fix the name resolved to an
+// empty string, so `get_arg_values("", ...)` matched every CLI argument
+// and produced spurious INVLCMDARGS warnings.
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_class_localparam_string_from_static_method() {
+    let sim = sim_ok(r#"
+        class C;
+            localparam string prefix = "hello_world";
+            static function string get_prefix();
+                return prefix;
+            endfunction
+        endclass
+        module top;
+            initial begin
+                $display("RESULT=%s", C::get_prefix());
+                $finish;
+            end
+        endmodule
+    "#);
+    let m = &sim.output[0].message;
+    assert!(m.contains("RESULT=hello_world"), "got: {}", m);
+}
+
+#[test]
+fn test_class_localparam_int_from_static_method() {
+    let sim = sim_ok(r#"
+        class C;
+            localparam int WIDTH = 42;
+            static function int get_width();
+                return WIDTH;
+            endfunction
+        endclass
+        module top;
+            initial begin
+                $display("WIDTH=%0d", C::get_width());
+                $finish;
+            end
+        endmodule
+    "#);
+    let m = &sim.output[0].message;
+    assert!(m.contains("WIDTH=42"), "got: {}", m);
+}
+
+#[test]
+fn test_class_localparam_from_instance_method() {
+    let sim = sim_ok(r#"
+        class C;
+            localparam int W = 7;
+            function int get_w();
+                return W;
+            endfunction
+        endclass
+        module top;
+            C c;
+            initial begin
+                c = new();
+                $display("IW=%0d", c.get_w());
+                $finish;
+            end
+        endmodule
+    "#);
+    let m = &sim.output[0].message;
+    assert!(m.contains("IW=7"), "got: {}", m);
+}

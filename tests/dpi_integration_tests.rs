@@ -136,3 +136,18 @@ fn dpi_uvm_test() {
         log
     );
 }
+
+// Regression: a DPI-C import using a typedef name for a packed logic
+// vector (the UVM `uvm_hdl_data_t` pattern) must resolve to a
+// svLogicVecVal* argument. Before the fix this emitted
+// `[DPI] unsupported prototype for '...'` because dpi_atom_kind()
+// did not resolve DataType::TypeReference to the underlying
+// IntegerVector, so the import was never bound.
+#[test]
+fn dpi_typedef_vec_test() {
+    assert_dpi_pass(
+        "tests/dpi/typedef_dpi.c",
+        "typedef_dpi",
+        "tests/dpi/typedef_dpi_test.sv",
+    );
+}
