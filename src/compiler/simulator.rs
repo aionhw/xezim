@@ -1938,6 +1938,9 @@ pub struct Simulator {
     rs_return_flag: bool,
     /// SV-2023: target named block for `disable <name>` propagation.
     disable_target: Option<String>,
+    /// Label of a process-level named block (`initial begin : worker`) -> its
+    /// pid, so `disable worker` from another process can terminate it.
+    disable_labels: HashMap<String, usize>,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
     killed_pids: HashSet<usize>,
     /// Names of init-declared (automatic) `for`-loop variables that — because
@@ -3178,6 +3181,7 @@ impl Simulator {
             return_flag: false,
             rs_return_flag: false,
             disable_target: None,
+            disable_labels: HashMap::default(),
             killed_pids: HashSet::default(),
             auto_loop_vars: Vec::new(),
             ref_binding_stack: Vec::new(),
@@ -6161,6 +6165,10 @@ impl Simulator {
             .chain(initial_blocks.into_iter())
         {
             let scope = ib.scope;
+            let block_label = match &ib.stmt.kind {
+                StatementKind::SeqBlock { name, .. } => name.as_ref().map(|n| n.name.clone()),
+                _ => None,
+            };
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
                 other => vec![Statement::new(other, ib.stmt.span)],
@@ -6179,6 +6187,9 @@ impl Simulator {
             self.next_pid += 1;
             if !scope.is_empty() {
                 self.process_scope_hint.insert(pid, scope);
+            }
+            if let Some(l) = block_label {
+                self.disable_labels.insert(l, pid);
             }
             self.event_queue.schedule(0, pid, stmts);
         }
@@ -24479,7 +24490,11 @@ impl Simulator {
                     self.continue_flag = false;
                     self.exec_statement(body);
                     if self.break_flag {
-                        self.break_flag = false;
+                        // Keep the flag set while a `disable` unwinds to an
+                        // enclosing named block.
+                        if self.disable_target.is_none() {
+                            self.break_flag = false;
+                        }
                         break;
                     }
                     self.continue_flag = false;
@@ -24745,7 +24760,11 @@ impl Simulator {
                     self.break_flag = false;
                     self.exec_statement(body);
                     if self.break_flag {
-                        self.break_flag = false;
+                        // Keep the flag set while a `disable` unwinds to an
+                        // enclosing named block.
+                        if self.disable_target.is_none() {
+                            self.break_flag = false;
+                        }
                         break;
                     }
                 }
@@ -24764,7 +24783,11 @@ impl Simulator {
                     self.break_flag = false;
                     self.exec_statement(body);
                     if self.break_flag {
-                        self.break_flag = false;
+                        // Keep the flag set while a `disable` unwinds to an
+                        // enclosing named block.
+                        if self.disable_target.is_none() {
+                            self.break_flag = false;
+                        }
                         break;
                     }
                     if !self.eval_expr(condition).is_true() {
@@ -24782,7 +24805,11 @@ impl Simulator {
                     self.continue_flag = false;
                     self.exec_statement(body);
                     if self.break_flag {
-                        self.break_flag = false;
+                        // Keep the flag set while a `disable` unwinds to an
+                        // enclosing named block.
+                        if self.disable_target.is_none() {
+                            self.break_flag = false;
+                        }
                         break;
                     }
                     self.continue_flag = false;
@@ -24798,12 +24825,21 @@ impl Simulator {
                     self.exec_statement(body);
                 }
             }
-            StatementKind::SeqBlock { stmts, .. } => {
+            StatementKind::SeqBlock { stmts, name } => {
                 for s in stmts {
                     if self.finished || self.break_flag || self.continue_flag {
                         break;
                     }
                     self.exec_statement(s);
+                }
+                // A `disable` naming THIS block ends here; execution resumes
+                // after it (§9.6.2).
+                if let (Some(target), Some(n)) = (self.disable_target.as_deref(), name.as_ref()) {
+                    if target == n.name {
+                        self.disable_target = None;
+                        self.break_flag = false;
+                        self.continue_flag = false;
+                    }
                 }
             }
             StatementKind::ParBlock {
@@ -24923,6 +24959,34 @@ impl Simulator {
                 self.return_flag = true;
             }
             StatementKind::Disable(name) => {
+                // IEEE 1800-2017 §9.6.2. `disable_target` was set but never
+                // read: the only effect was `break_flag`, a GLOBAL flag. So a
+                // `disable` broke the innermost loop instead of terminating the
+                // named block, truncated the disabling process, and leaked into
+                // unrelated processes.
+                //
+                // A label naming ANOTHER process's top-level block terminates
+                // that process; the disabling process carries on.
+                if let Some(&pid) = self.disable_labels.get(&name.name) {
+                    if pid != self.current_pid {
+                        self.killed_pids.insert(pid);
+                        self.process_parents.remove(&pid);
+                        self.process_contexts.remove(&pid);
+                        self.event_waiters.retain(|w| w.pid != pid);
+                        for q in self.mailbox_get_waiters.values_mut() {
+                            q.retain(|w| w.pid != pid);
+                        }
+                        let mut killed: HashSet<usize> = HashSet::default();
+                        killed.insert(pid);
+                        self.release_killed_from_join_waiters(&killed);
+                        return;
+                    }
+                }
+                // Otherwise unwind this process to the end of the named block
+                // (or the named task): the SeqBlock / task-call arm clears the
+                // flags when it sees its own name, so execution resumes after
+                // it. For a loop-body block that is `continue`; for a block
+                // enclosing the loop it is `break`.
                 self.disable_target = Some(name.name.clone());
                 self.break_flag = true;
             }
@@ -35547,9 +35611,16 @@ impl Simulator {
         // Execute task body
         for stmt in &td.items {
             self.exec_statement(stmt);
-            if self.return_value.is_some() || self.return_flag {
+            if self.return_value.is_some() || self.return_flag || self.break_flag {
                 break;
             }
+        }
+        // §9.6.2: `disable <task>` terminates this invocation and no more —
+        // the caller resumes. Clear the unwind signal here, or it would leak
+        // out and keep later loops from clearing `break_flag`.
+        if self.disable_target.as_deref() == Some(td.name.name.name.as_str()) {
+            self.disable_target = None;
+            self.break_flag = false;
         }
         self.unwind_task_frame(cleanup);
     }
