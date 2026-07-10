@@ -54,6 +54,32 @@ Current capabilities include:
   custom HDL-backdoor force/release layer, or your own UVM extensions). The
   repo ships minimal `svdpi.h` and `vpi_user.h` so DPI code compiles without a
   vendor install. See [docs/dpi-guide.md](docs/dpi-guide.md).
+* **Event-control `iff` guards** (LRM §9.4.2.3) — `@(posedge clk iff rst_n)`
+  is honored in both procedural `@` waits and edge-sensitive `always` blocks:
+  the process resumes only on an edge where the guard holds.
+
+---
+
+# What's new in 0.8.1
+
+* **Event-control `iff` guards** are now evaluated (`@(posedge clk iff cond)`),
+  in both procedural waits and `always` blocks — previously the guard was
+  parsed but silently dropped, so the block fired on every clock edge.
+* **Wide-value `%0d` printing fixed** — `to_dec_string` no longer overflows for
+  values wider than 128 bits (UVM prints the 4096-bit `uvm_bitstream_t`); it now
+  uses an arbitrary-width decimal conversion.
+* **Duplicate DPI import** of the same foreign function is tolerated when the C
+  binding and property match (LRM §35.5.2), erroring only on a real conflict.
+* **Duplicate same-scope declaration** is now a hard error under strict mode
+  (the default), a warning under `--no-strict`.
+* **`+seed=<n>`** plusarg is documented in `-h` — seeds the RNG for a
+  reproducible run (same seed ⇒ byte-identical output).
+* **Library-directory (`-I`) scan tightened** — `resolve_library_modules` now
+  adopts only the library modules reachable from the compiled design (§23.3.2),
+  instead of every definition in the directory. Fixes typedef/enum leakage from
+  unrelated sibling files; lifted the sv-tests score from 52 % to 91 %.
+* **sv-tests compliance measured** — see [Compliance](#compliance) below and
+  `reports/`.
 
 ---
 
@@ -114,6 +140,32 @@ UVM 1800.2-2017 run-phase (see [docs/uvm-guide.md](docs/uvm-guide.md)):
 |---|---|
 | GettingVerilatorStartedWithUVM (`data0`/`data1`/`random`/`many_random`) | 4/4 — exact Verilator parity (monitors agree, `UVM_ERROR`/`UVM_FATAL` = 0) |
 | sv-tests UVM 1800.2-2017 example suite | 32/35 pass (3 out of scope: deprecated UVM-1.0 macros, DPI backdoor) |
+
+---
+
+# Compliance
+
+Full [sv-tests](https://github.com/chipsalliance/sv-tests) run with the
+suite's own `xezim` runner (`make report RUNNERS=Xezim`), xezim 0.8.1. The
+generated HTML report and per-test CSV are checked in under `reports/`
+(`svtests_index.html`, `svtests_report.csv`, and `sv-tests-compliance.md`).
+
+| Category | Pass / Total | Rate |
+|---|---|---|
+| **All tests** | **4354 / 4768** | **91.3 %** |
+| &nbsp;&nbsp;UVM (1800.2-2017) | 484 / 487 | 99.4 % |
+| &nbsp;&nbsp;non-`ivtest` | 2153 / 2237 | 96.2 % |
+| &nbsp;&nbsp;Icarus `ivtest` suite | 2201 / 2531 | 87.0 % |
+
+An earlier run scored only 52 % because a `-I` library directory
+(`ivtest/ivltests/`, ~1000 mutually independent single-file tests) was scanned
+too eagerly: xezim honors IEEE §23.3.2 library semantics — an `-I` dir supplies
+module definitions to satisfy unresolved instantiations — but it was adopting
+*every* definition in the directory, so typedefs/enums from unrelated sibling
+files leaked into the primary design and failed a spurious §6.18 base-type
+check. `resolve_library_modules` now pulls in only the library modules actually
+reachable from the compiled design (transitively), which reclaimed ~1870
+`ivtest` cases with no change to the native LRM/UVM results.
 
 ---
 
@@ -185,6 +237,7 @@ Common options:
 | `--dpi-lib <path>` | Load a DPI-C shared library (`.so`/`.dylib`/`.dll`). Repeatable. See [docs/dpi-guide.md](docs/dpi-guide.md). |
 | `--max-time <N>` | Stop simulation at time `N` |
 | `+trace`, `+<plusarg>` | Passed through to `$value$plusargs` / `$test$plusargs` |
+| `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects) |
 | `--sdf <file>` `--sdf-{min,typ,max}` | Annotate standard delays |
 | `--sim_debug` | Print `[DEBUG]` / `[OPT]` diagnostics |
 | `--log <file>` | Redirect stdout/stderr to a log file |

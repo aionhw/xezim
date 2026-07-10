@@ -95,6 +95,9 @@ fn print_usage() {
     eprintln!("  -Ifoo, -DNAME=V  Accepted");
     eprintln!("  +incdir+dir1+dir2 / +define+FOO=1+BAR Accepted");
     eprintln!("  +NAME / +NAME=VALUE passed to $test$plusargs/$value$plusargs");
+    eprintln!("  +seed=<n>        Seed the RNG for reproducible randomization");
+    eprintln!("                   (same seed -> byte-identical run; affects e.g. the");
+    eprintln!("                   number of packets a random UVM test collects)");
     eprintln!("  -f/-c filelist   Recursive; options inside filelist are supported");
 }
 
@@ -830,7 +833,7 @@ fn main() {
             if head.len() == 8 && &head[..] == xezim::XEZIM_BYTECODE_MAGIC {
                 match xezim::read_compiled(sf) {
                     Ok(Some(elab)) => {
-                        println!("=== xezim ===");
+                        println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
                         println!("Loaded compiled: {}", sf);
                         println!("Max time: {}", max_time);
                         println!("------------------------------");
@@ -1089,7 +1092,7 @@ fn main() {
         return;
     }
 
-    println!("=== xezim ===");
+    println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
     println!("Max time: {}", max_time);
     println!("------------------------------");
     xezim::compiler::simulator::set_sim_debug(sim_debug);
