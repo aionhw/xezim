@@ -1214,3 +1214,131 @@ fn test_sv2023_inferred_clock_disable() {
     let m = &sim.output[0].message;
     assert!(m.contains("c=0 d=0"), "{}", m);
 }
+
+#[test]
+fn test_fork_join_none_shared_locals() {
+    // Regression test for the fork-local variable sharing fix.
+    //
+    // Per IEEE 1800-2023 §9.3.2, fork children SHARE automatic variables
+    // with the parent scope. Before the fix, xezim gave each child a COPY
+    // (inherit_fork_child_context → snapshot_process_context), so writes
+    // in the child never reached the parent. This broke UVM 2020's
+    // m_safe_select_item idiom:
+    //
+    //   process select_process;              // task-local
+    //   fork begin select_process = process::self(); end join_none
+    //   wait(select_process != null);         // deadlocked!
+    //
+    // The test uses a task-local int (not a module-level signal) so the
+    // bug is exercised. Without the fix the wait deadlocks and the
+    // watchdog fires at t=1000. With the fix the parent wakes at t=1.
+    let sim = sim_ok(r#"
+        module top;
+           bit done;
+
+           task automatic handshake();
+              int local_flag;
+              begin
+                 local_flag = 0;
+                 fork
+                    begin
+                       #1;
+                       local_flag = 42;
+                       $display("[T1] child wrote local_flag = %0d", local_flag);
+                    end
+                 join_none
+                 wait(local_flag != 0);
+                 $display("[T0] parent woke — local_flag = %0d", local_flag);
+                 done = 1;
+              end
+           endtask
+
+           initial begin
+              handshake();
+              #10;
+              $display("PASS: fork-local variable sharing works");
+              $finish;
+           end
+
+           initial begin
+              #1000;
+              $display("FAIL: wait(local_flag != 0) never woke — fork-local deadlock");
+              $finish;
+           end
+        endmodule
+    "#);
+    let out: String = sim.output.iter().map(|o| o.message.clone() + "\n").collect();
+    assert!(out.contains("PASS"), "expected PASS, got:\n{}", out);
+    assert!(!out.contains("FAIL"), "unexpected FAIL (deadlock), got:\n{}", out);
+}
+
+// ---------------------------------------------------------------------
+// Class-body `localparam` must resolve as a static constant.
+// Regression for UVM 1800.2-2020.3.1's uvm_cmdline_report classes which
+// declare `localparam string prefix = "+uvm_set_verbosity="` and reference
+// it from a static `init` method. Before the fix the name resolved to an
+// empty string, so `get_arg_values("", ...)` matched every CLI argument
+// and produced spurious INVLCMDARGS warnings.
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_class_localparam_string_from_static_method() {
+    let sim = sim_ok(r#"
+        class C;
+            localparam string prefix = "hello_world";
+            static function string get_prefix();
+                return prefix;
+            endfunction
+        endclass
+        module top;
+            initial begin
+                $display("RESULT=%s", C::get_prefix());
+                $finish;
+            end
+        endmodule
+    "#);
+    let m = &sim.output[0].message;
+    assert!(m.contains("RESULT=hello_world"), "got: {}", m);
+}
+
+#[test]
+fn test_class_localparam_int_from_static_method() {
+    let sim = sim_ok(r#"
+        class C;
+            localparam int WIDTH = 42;
+            static function int get_width();
+                return WIDTH;
+            endfunction
+        endclass
+        module top;
+            initial begin
+                $display("WIDTH=%0d", C::get_width());
+                $finish;
+            end
+        endmodule
+    "#);
+    let m = &sim.output[0].message;
+    assert!(m.contains("WIDTH=42"), "got: {}", m);
+}
+
+#[test]
+fn test_class_localparam_from_instance_method() {
+    let sim = sim_ok(r#"
+        class C;
+            localparam int W = 7;
+            function int get_w();
+                return W;
+            endfunction
+        endclass
+        module top;
+            C c;
+            initial begin
+                c = new();
+                $display("IW=%0d", c.get_w());
+                $finish;
+            end
+        endmodule
+    "#);
+    let m = &sim.output[0].message;
+    assert!(m.contains("IW=7"), "got: {}", m);
+}
