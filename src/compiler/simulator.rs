@@ -8954,6 +8954,77 @@ impl Simulator {
     /// from `classify_always_blocks` so the lazy-prefix streaming path (#7)
     /// can materialize one PendingAlways at a time and feed it through here
     /// without staging the full materialized vec.
+    /// Whether a body READS something it also WRITES (`cnt++`, `x = x + 1`).
+    /// Such a block is not idempotent, so re-running it on every settle
+    /// iteration — as the comb path does — diverges: each run dirties its own
+    /// input and schedules another, up to `settle_limit`.
+    fn body_is_self_referential(stmt: &Statement) -> bool {
+        fn base_of(e: &Expression) -> Option<&str> {
+            match &e.kind {
+                ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => base_of(expr),
+                _ => None,
+            }
+        }
+        /// Does `e` read a variable whose base name is `target`?
+        fn reads_name(e: &Expression, target: &str) -> bool {
+            match &e.kind {
+                ExprKind::Ident(h) => h.path.last().map_or(false, |s| s.name.name == target),
+                ExprKind::Paren(i) => reads_name(i, target),
+                ExprKind::Unary { operand, .. } => reads_name(operand, target),
+                ExprKind::Binary { left, right, .. } => {
+                    reads_name(left, target) || reads_name(right, target)
+                }
+                ExprKind::Conditional { condition, then_expr, else_expr } => {
+                    reads_name(condition, target)
+                        || reads_name(then_expr, target)
+                        || reads_name(else_expr, target)
+                }
+                ExprKind::Index { expr, index } => {
+                    reads_name(expr, target) || reads_name(index, target)
+                }
+                ExprKind::RangeSelect { expr, left, right, .. } => {
+                    reads_name(expr, target)
+                        || reads_name(left, target)
+                        || reads_name(right, target)
+                }
+                ExprKind::MemberAccess { expr, .. } => reads_name(expr, target),
+                ExprKind::Concatenation(parts) => parts.iter().any(|p| reads_name(p, target)),
+                ExprKind::Replication { count, exprs } => {
+                    reads_name(count, target) || exprs.iter().any(|p| reads_name(p, target))
+                }
+                ExprKind::Call { args, .. } => args.iter().any(|a| reads_name(a, target)),
+                ExprKind::SystemCall { args, .. } => args.iter().any(|a| reads_name(a, target)),
+                _ => false,
+            }
+        }
+        fn walk(st: &Statement) -> bool {
+            match &st.kind {
+                // `cnt++` / `--cnt` read and write the same variable.
+                StatementKind::Expr(e) => matches!(
+                    &e.kind,
+                    ExprKind::Unary { op, .. }
+                        if matches!(op, UnaryOp::PreIncr | UnaryOp::PreDecr
+                                       | UnaryOp::PostIncr | UnaryOp::PostDecr)
+                ),
+                StatementKind::BlockingAssign { lvalue, rvalue }
+                | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+                    let Some(target) = base_of(lvalue) else { return false };
+                    reads_name(rvalue, target)
+                }
+                StatementKind::SeqBlock { stmts, .. } => stmts.iter().any(walk),
+                StatementKind::If { then_stmt, else_stmt, .. } => {
+                    walk(then_stmt) || else_stmt.as_ref().map_or(false, |e| walk(e))
+                }
+                StatementKind::TimingControl { stmt, .. } => walk(stmt),
+                _ => false,
+            }
+        }
+        walk(stmt)
+    }
+
     fn classify_one_always_block(&mut self, ab: AlwaysBlock) -> Option<AlwaysBlock> {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
@@ -8974,7 +9045,14 @@ impl Simulator {
                         || n.strip_prefix(&top_prefix)
                             .map_or(false, |b| self.module.events.contains(b))
                 });
-                if all_level && !has_named_event {
+                // A body that reads what it writes (`always @(s) cnt++;`) is
+                // not idempotent: the comb-settle path re-runs it on every
+                // settle iteration, including the ones its own writes caused, so
+                // it executed settle_limit (100) times instead of once per
+                // change of `s`. Route those through the edge path, which fires
+                // exactly on a change of a listed signal.
+                let self_ref = Self::body_is_self_referential(&body);
+                if all_level && !has_named_event && !self_ref {
                     return Some(AlwaysBlock {
                         kind: ab.kind,
                         stmt: body,
@@ -22205,10 +22283,11 @@ impl Simulator {
                 // parent's signal. Packed scalars keep the bit-slice paths below.
                 if let Some(base_flat) = self.flat_member_name(expr) {
                     let flat = format!("{}.{}", base_flat, member.name);
-                    if self.signal_name_to_id.contains_key(flat.as_str()) {
-                        if let Some(v) = self.get_signal_value_by_name(&flat) {
-                            return v;
-                        }
+                    // A leaf may live in the compact table OR the runtime map (a
+                    // LOCAL unpacked-struct array element is only in the latter),
+                    // so consult both — `sa[1].a` read 0 while `%p` showed 2.
+                    if let Some(v) = self.get_signal_value_by_name(&flat) {
+                        return v;
                     }
                     if let Some(fields) =
                         self.module.packed_struct_fields.get(&base_flat).cloned()
@@ -25288,6 +25367,94 @@ impl Simulator {
                         }
                     }
                     let dims = &d.dimensions;
+                    // A local MULTI-dimensional array was registered from its
+                    // first dimension only, so `int n[2][2]` became a 1-D array
+                    // of double-width elements: `n[1][0]` read 0 and the
+                    // declaration initializer could not be spread.
+                    if dims.len() >= 2 {
+                        use crate::ast::types::UnpackedDimension as UD;
+                        let shape: Option<Vec<(i64, i64)>> = dims
+                            .iter()
+                            .map(|dim| match dim {
+                                UD::Range { left, right, .. } => {
+                                    let l = super::elaborate::const_eval_i64_with_params(left, None)?;
+                                    let r = super::elaborate::const_eval_i64_with_params(right, None)?;
+                                    Some((l.min(r), l.max(r)))
+                                }
+                                UD::Expression { expr, .. } => {
+                                    let n = super::elaborate::const_eval_i64_with_params(expr, None)?;
+                                    if n > 0 { Some((0, n - 1)) } else { None }
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if let Some(shape) = shape.filter(|sh| {
+                            sh.iter().map(|&(lo, hi)| (hi - lo + 1).max(0)).product::<i64>() <= (1 << 20)
+                        }) {
+                            let name = d.name.name.clone();
+                            match shape.len() {
+                                2 => {
+                                    self.module
+                                        .arrays_2d
+                                        .insert(name.clone(), (shape[0], shape[1], w));
+                                }
+                                _ => {
+                                    self.module
+                                        .arrays_nd
+                                        .insert(name.clone(), (shape.clone(), w));
+                                }
+                            }
+                            // Every element, row-major.
+                            let mut suffixes: Vec<String> = vec![String::new()];
+                            for &(lo, hi) in &shape {
+                                let mut next = Vec::new();
+                                for pre in &suffixes {
+                                    for i in lo..=hi {
+                                        next.push(format!("{}[{}]", pre, i));
+                                    }
+                                }
+                                suffixes = next;
+                            }
+                            for sfx in suffixes {
+                                let elem = format!("{}{}", name, sfx);
+                                self.signals.insert(elem.clone(), default_v.clone());
+                                self.widths.insert(elem, w);
+                            }
+                            self.widths.insert(name.clone(), w);
+                            self.module
+                                .var_decl_types
+                                .insert(name.clone(), data_type.clone());
+                            if let Some(init) = &d.init {
+                                let lvalue = crate::ast::expr::Expression::new(
+                                    crate::ast::expr::ExprKind::Ident(
+                                        crate::ast::expr::HierarchicalIdentifier {
+                                            root: None,
+                                            path: vec![crate::ast::expr::HierPathSegment {
+                                                name: crate::ast::Identifier {
+                                                    name: name.clone(),
+                                                    span: d.name.span,
+                                                },
+                                                selects: Vec::new(),
+                                            }],
+                                            span: d.name.span,
+                                            cached_signal_id: std::cell::Cell::new(None),
+                                            cached_resolved_name: std::cell::OnceCell::new(),
+                                        },
+                                    ),
+                                    d.name.span,
+                                );
+                                let assign = crate::ast::stmt::Statement::new(
+                                    crate::ast::stmt::StatementKind::BlockingAssign {
+                                        lvalue,
+                                        rvalue: init.clone(),
+                                    },
+                                    d.name.span,
+                                );
+                                self.exec_statement(&assign);
+                            }
+                            continue;
+                        }
+                    }
                     let mut range: Option<(i64, i64)> = None;
                     let mut descending = false;
                     if let Some(first) = dims.first() {
@@ -25415,6 +25582,45 @@ impl Simulator {
                             self.widths.insert(elem, w);
                         }
                         self.widths.insert(name.clone(), w);
+                        // Element type of a LOCAL array: the pattern spread and
+                        // the type-directed `%p` renderer both need it, and only
+                        // module-scope declarations recorded one.
+                        self.module
+                            .var_decl_types
+                            .insert(name.clone(), data_type.clone());
+                        // A local FIXED array's declaration initializer was
+                        // dropped, so `int a[4] = '{10,20,30,40};` inside a block
+                        // read back all zeros. Route it through an assignment,
+                        // as the queue branch above already does — the pattern
+                        // spread then applies every §10.9.1 form.
+                        if let Some(init) = &d.init {
+                            let lvalue = crate::ast::expr::Expression::new(
+                                crate::ast::expr::ExprKind::Ident(
+                                    crate::ast::expr::HierarchicalIdentifier {
+                                        root: None,
+                                        path: vec![crate::ast::expr::HierPathSegment {
+                                            name: crate::ast::Identifier {
+                                                name: name.clone(),
+                                                span: d.name.span,
+                                            },
+                                            selects: Vec::new(),
+                                        }],
+                                        span: d.name.span,
+                                        cached_signal_id: std::cell::Cell::new(None),
+                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                    },
+                                ),
+                                d.name.span,
+                            );
+                            let assign = crate::ast::stmt::Statement::new(
+                                crate::ast::stmt::StatementKind::BlockingAssign {
+                                    lvalue,
+                                    rvalue: init.clone(),
+                                },
+                                d.name.span,
+                            );
+                            self.exec_statement(&assign);
+                        }
                     } else {
                         if let Some(task_name) = self.current_static_task.clone() {
                             let key = format!("{}.{}", task_name, d.name.name);
