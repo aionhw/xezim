@@ -6,6 +6,7 @@
 //!   Reactive:       edge-triggered always_ff/always_latch blocks
 
 use super::elaborate::{AlwaysBlock, DpiImportSpec, ElaboratedModule, Signal};
+use xezim_core::elaborate::resolve_type_width;
 use super::value::{LogicBit, Value};
 use crate::ast::decl::{
     AlwaysKind, ClassConstraint, ConstraintItem, ConstraintRange, CovergroupDeclaration,
@@ -4872,6 +4873,47 @@ impl Simulator {
         for (sv_name, spec) in self.module.dpi_imports.clone() {
             self.try_bind_dpi(&sv_name, &spec);
         }
+    }
+
+    /// Internal typedef-chain resolver for DataType (cloned).
+    /// Follows TypeReference chains to get the underlying type.
+    fn resolve_type_ref(dt: &DataType, typedef_types: &HashMap<String, DataType>) -> DataType {
+        let mut cur = dt.clone();
+        for _ in 0..64 {
+            match &cur {
+                DataType::TypeReference { name, .. } => {
+                    if let Some(next) = typedef_types.get(&name.name.name) {
+                        cur = next.clone();
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        cur
+    }
+
+    /// Given a resolved struct DataType, return a list of (field_name, bit_offset, width)
+    /// for each member. Walks members in reverse (last member at LSB, matching SV packing).
+    /// Returns `(field_name, bit_offset, width, is_real)` per member.
+    /// Last member at LSB (matches SV packing).
+    fn struct_field_layout(dt: &DataType) -> Option<Vec<(String, u32, u32, bool)>> {
+        let su = match dt {
+            DataType::Struct(su) if !su.packed => su,
+            _ => return None,
+        };
+        let mut fields = Vec::new();
+        let mut offset: u32 = 0;
+        for m in su.members.iter().rev() {
+            let fw = resolve_type_width(&m.data_type, None, None);
+            let fr = super::elaborate::is_type_real(&m.data_type);
+            for d in &m.declarators {
+                fields.push((d.name.name.clone(), offset, fw, fr));
+                offset += fw;
+            }
+        }
+        Some(fields)
     }
 
     fn dpi_atom_kind(
@@ -11489,14 +11531,14 @@ impl Simulator {
             };
             let item = if explicit_delay > 0 {
                 CombItem::ContAssign {
-                    lhs: ca.lhs,
-                    rhs: ca.rhs,
+                    lhs: ca.lhs.clone(),
+                    rhs: ca.rhs.clone(),
                     delay: explicit_delay,
                 }
             } else if let Some(op) = fused {
                 CombItem::FusedGate { op }
-            } else if let Some(dc) = direct_copy {
-                dc
+            } else if let Some(dc_val) = direct_copy {
+                dc_val
             } else if wids.len() == 1 && lhs_is_bare_ident {
                 let dst_id = wids[0];
                 let width = self.signal_widths[dst_id];
@@ -18947,6 +18989,39 @@ impl Simulator {
                             }
                         }
                     }
+                    // FALLBACK: If the full dotted name exists as a separate signal
+                    // (xezim's elaboration scheme for unpacked struct members),
+                    // write to it directly.
+                    let dotted_name = hier
+                        .path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    if let Some(existing_val) = self.signals.get(&dotted_name).cloned() {
+                        let w = existing_val.width;
+                        let is_real = self.real_signals.contains(&dotted_name) || existing_val.is_real;
+                        let mut resized = if is_real {
+                            if val.is_real {
+                                val.clone()
+                            } else {
+                                Value::from_f64(val.to_f64())
+                            }
+                        } else {
+                            if val.is_real {
+                                Value::from_u64(val.to_f64() as u64, w)
+                            } else {
+                                val.resize(w)
+                            }
+                        };
+                        resized.is_signed = self.signed_signals.contains(&dotted_name);
+                        let changed = existing_val != resized;
+                        if changed {
+                            self.mark_dirty(&dotted_name);
+                        }
+                        self.signals.insert(dotted_name, resized);
+                        return changed;
+                    }
                 }
                 let is_ambiguous_leaf =
                     hier.path.len() == 1 && !hier.path[0].name.name.contains('.');
@@ -20213,6 +20288,40 @@ impl Simulator {
                         }
                     }
                 }
+                // Local struct variable member write: `result.field1 = ...`
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if hier.path.len() == 1 {
+                        let base_name = hier.path[0].name.name.as_str();
+                        if !self.local_stack.is_empty() {
+                            let last_idx = self.local_stack.len() - 1;
+                            if self.local_stack[last_idx].contains_key(base_name) {
+                                let type_name = self.var_typedef_types.get(base_name)
+                                    .map(|s| s.as_str());
+                                let dt: Option<DataType> = type_name
+                                    .and_then(|tn| self.module.typedef_types.get(tn).cloned());
+                                if let Some(dt) = dt {
+                                    let resolved = Self::resolve_type_ref(&dt, &self.module.typedef_types);
+                                    if let Some(fields) = Self::struct_field_layout(&resolved) {
+                                        if let Some((_, off, w, _real)) =
+                                            fields.iter().find(|(m, _, _, _)| m == &member.name).cloned()
+                                        {
+                                            let mut cur = self.local_stack[last_idx]
+                                                .get(base_name).cloned().unwrap_or_else(|| Value::zero(65));
+                                            let piece = val.resize(w);
+                                            for i in 0..w {
+                                                let bit = piece.get_bit(i as usize);
+                                                cur.set_bit((off + i) as usize, bit);
+                                            }
+                                            self.local_stack[last_idx].insert(base_name.to_string(), cur);
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // packed_struct_fields for signal-based structs
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
                     if let Some(fields) = self.module.packed_struct_fields.get(&name).cloned() {
@@ -20787,6 +20896,57 @@ impl Simulator {
                             return self
                                 .eval_builtin_method(obj_name, mname, &[])
                                 .unwrap_or(Value::zero(32));
+                        }
+                    }
+                    // Local struct variable field read: `t.field1` where `t` is a
+                    // local var of unpacked-struct typedef type. Extract the field
+                    // from the local's whole Value via the struct layout.
+                    // Also handles signal-stored whole-value structs (initial-block
+                    // locals and module signals without per-field member signals).
+                    if hier.path.len() == 2 {
+                        let member_name = hier.path[1].name.name.as_str();
+                        let tn = self.var_typedef_types.get(obj_name).cloned();
+                        let layout = tn.as_ref()
+                            .and_then(|t| self.module.typedef_types.get(t.as_str()))
+                            .and_then(|dt| {
+                                let resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
+                                Self::struct_field_layout(&resolved)
+                            })
+                            .or_else(|| {
+                                // Signal-stored struct: resolve type via
+                                // signal_name_to_id → signal_type_names.
+                                let sig_tn = self
+                                    .signal_name_to_id
+                                    .get(obj_name.as_str())
+                                    .and_then(|id| self.signal_type_names.get(id).cloned());
+                                sig_tn.as_ref()
+                                    .and_then(|t| self.module.typedef_types.get(t.as_str()))
+                                    .and_then(|dt| {
+                                        let resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
+                                        Self::struct_field_layout(&resolved)
+                                    })
+                            });
+                        if let Some(fields) = layout {
+                            // Only take this path if there is NO separate
+                            // `<obj>.<member>` signal (the per-field scheme has
+                            // its own signal and should be preferred).
+                            let dotted = format!("{}.{}", obj_name, member_name);
+                            let has_sep_sig = self.signal_name_to_id.contains_key(dotted.as_str())
+                                || self.signals.contains_key(&dotted);
+                            if !has_sep_sig {
+                                let base_val = self.local_stack.last()
+                                    .and_then(|f| f.get(obj_name).cloned())
+                                    .or_else(|| self.get_signal_value_by_name(obj_name));
+                                if let Some(base_val) = base_val {
+                                    if let Some((_, off, w, fr)) =
+                                        fields.iter().find(|(m, _, _, _)| m == member_name).cloned()
+                                    {
+                                        let mut v = base_val.range_select((off + w - 1) as usize, off as usize);
+                                        if fr { v.is_real = true; }
+                                        return v;
+                                    }
+                                }
+                            }
                         }
                     }
                     // Handle hierarchical ident that might be class member access: obj.prop
@@ -22478,6 +22638,177 @@ impl Simulator {
                         }
                     }
                 }
+                // FALLBACK: check if `base.member` is a separate signal
+                // (xezim's unpacked-struct member signal scheme for unpacked
+                // structs) stored in `self.signals`. Catches dynamically named
+                // leaves (e.g. queue/assoc members) not present in
+                // `signal_name_to_id`. (From `nettype`.)
+                {
+                    let base_name = match &expr.kind {
+                        ExprKind::Ident(h) => Some(self.resolve_hier_name(h).clone()),
+                        ExprKind::Index { expr: base, .. } => {
+                            if let ExprKind::Ident(h) = &base.kind {
+                                Some(self.resolve_hier_name(h).clone())
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(base) = base_name {
+                        let dotted = format!("{}.{}", base, member.name);
+                        if let Some(v) = self.signals.get(&dotted).cloned() {
+                            return v;
+                        }
+                    }
+                }
+                // Handle MemberAccess where the base evaluates to a struct Value
+                // (e.g., Tsum(...).field1 or driver[i].field1). We need to
+                // extract the field from the returned value using the struct
+                // layout (packed_struct_fields[base_name]). (From `nettype`:
+                // covers struct values returned by calls / nettype resolver
+                // functions, which have no flattened leaf signal.)
+                {
+                    let base_val = self.eval_expr(expr);
+                    // Try to find struct layout for the base.
+                    // For `Ident.field`: look up packed_struct_fields[Ident]
+                    // For `Index.field`: look up packed_struct_fields[base_arr_name]
+                    // For `Call.field`: try the function's return type layout
+                    let struct_base_name: Option<String> = match &expr.kind {
+                        ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+                        ExprKind::Index { expr: base, .. } => {
+                            if let ExprKind::Ident(h) = &base.kind {
+                                Some(self.resolve_hier_name(h))
+                            } else {
+                                None
+                            }
+                        }
+                        // For Call base, try the function's return type name
+                        ExprKind::Call { func, .. } => {
+                            if let ExprKind::Ident(h) = &func.kind {
+                                // Look up function return type from packed_struct_fields
+                                // (we register it there for nettype resolver functions)
+                                let fn_name = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                                Some(fn_name.to_string())
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(base_name) = struct_base_name {
+                        // First try packed_struct_fields directly (packed structs:
+                        // 3-tuple without is_real). Augment is_real by resolving
+                        // the base's struct typedef members. Then fall back to
+                        // `struct_field_layout` for unpacked structs.
+                        let real_fields: std::collections::HashMap<String, bool> = {
+                            // Resolve the base's element/member type to a struct
+                            // typedef and map field name → is_real.
+                            let dt_opt = self.module.typedef_types.get(&base_name).cloned()
+                                .or_else(|| {
+                                    self.var_typedef_types.get(&base_name).cloned()
+                                        .and_then(|tn| self.module.typedef_types.get(tn.as_str()).cloned())
+                                })
+                                .or_else(|| {
+                                    self.signal_name_to_id.get(base_name.as_str())
+                                        .and_then(|id| self.signal_type_names.get(id).cloned())
+                                        .and_then(|tn| self.module.typedef_types.get(tn.as_str()).cloned())
+                                });
+                            let mut m = std::collections::HashMap::new();
+                            if let Some(dt) = dt_opt {
+                                let resolved = Self::resolve_type_ref(&dt, &self.module.typedef_types);
+                                if let Some(fs) = Self::struct_field_layout(&resolved) {
+                                    for (fn_, _, _, fr) in fs { m.insert(fn_, fr); }
+                                }
+                            }
+                            m
+                        };
+                        let from_packed = self.module.packed_struct_fields.get(&base_name).cloned()
+                            .map(|fs| fs.into_iter().map(|(n, o, w)| {
+                                let fr = *real_fields.get(&n).unwrap_or(&false);
+                                (n, o, w, fr)
+                            }).collect());
+                        let fields_opt: Option<Vec<(String, u32, u32, bool)>> = from_packed
+                            .or_else(|| {
+                                // For Call base: resolve the function's return type
+                                if let ExprKind::Call { func, .. } = &expr.kind {
+                                    if let ExprKind::Ident(h) = &func.kind {
+                                        let fn_name = h.path.last()?.name.name.as_str();
+                                        let fd = self.module.functions.get(fn_name)?;
+                                        let resolved = Self::resolve_type_ref(
+                                            &fd.return_type, &self.module.typedef_types);
+                                        Self::struct_field_layout(&resolved)
+                                    } else {
+                                        None
+                                    }
+                                } else if let Some(type_name) = self.var_typedef_types.get(&base_name) {
+                                    // Local variable/parameter with typedef type
+                                    let dt = self.module.typedef_types.get(type_name.as_str())?;
+                                    let resolved = Self::resolve_type_ref(
+                                        dt, &self.module.typedef_types);
+                                    Self::struct_field_layout(&resolved)
+                                } else {
+                                    // Module-level signal with a typedef'd struct
+                                    // type: resolve via signal_name_to_id →
+                                    // signal_type_names → typedef_types.
+                                    let sig_tn = self
+                                        .signal_name_to_id
+                                        .get(base_name.as_str())
+                                        .and_then(|id| self.signal_type_names.get(id).cloned());
+                                    if let Some(tn) = sig_tn {
+                                        let dt = self.module.typedef_types.get(tn.as_str())?;
+                                        let resolved = Self::resolve_type_ref(
+                                            dt, &self.module.typedef_types);
+                                        Self::struct_field_layout(&resolved)
+                                    } else {
+                                        // Try resolving base_name as a typedef
+                                        let dt = self.module.typedef_types.get(&base_name)?;
+                                        let resolved = Self::resolve_type_ref(
+                                            dt, &self.module.typedef_types);
+                                        Self::struct_field_layout(&resolved)
+                                    }
+                                }
+                            });
+                        if let Some(fields) = fields_opt {
+                            // Only trust this layout if it actually describes
+                            // `base_val` (total width matches). Otherwise we'd
+                            // slice a field out of a value that doesn't carry it
+                            // — e.g. an unpacked-aggregate element whose members
+                            // live in separate flattened signals, for which
+                            // `eval_expr(expr)` returns a narrow value. Let it
+                            // fall through to the flat-signal / later handlers.
+                            let layout_w: u32 = fields.iter().map(|(_, _, w, _)| *w).sum();
+                            if layout_w == base_val.width {
+                                if let Some((_, off, w, fr)) =
+                                    fields.iter().find(|(m, _, _, _)| m == &member.name).cloned()
+                                {
+                                    let mut v = base_val.range_select((off + w - 1) as usize, off as usize);
+                                    if fr { v.is_real = true; }
+                                    return v;
+                                }
+                            }
+                        }
+                        // Last resort: scan all typedef_types for a struct layout
+                        // matching the base_val width (handles queue elements
+                        // where the element type isn't directly registered for
+                        // the queue variable name).
+                        for (td_name, td) in &self.module.typedef_types {
+                            let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
+                            if let Some(fields) = Self::struct_field_layout(&resolved) {
+                                let total_w: u32 = fields.iter().map(|(_, _, w, _)| w).sum();
+                                if total_w == base_val.width {
+                                    if let Some((_, off, w, fr)) =
+                                        fields.iter().find(|(m, _, _, _)| m == &member.name).cloned()
+                                    {
+                                        let mut v = base_val.range_select((off + w - 1) as usize, off as usize);
+                                        if fr { v.is_real = true; }
+                                        return v;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // LRM §15.5.3: `<event>.triggered` — returns 1 iff the
                 // named event was triggered in the same simulation time
                 // slot as this query. `EventTrigger` stamps
@@ -22546,6 +22877,26 @@ impl Simulator {
                         if let Some(locals) = self.local_stack.last() {
                             if let Some(v) = locals.get(&dotted) {
                                 return v.clone();
+                            }
+                        }
+                    }
+                }
+                // Check if base_name is a local struct variable (read its value
+                // via packed_struct_fields offsets).
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if hier.path.len() == 1 {
+                        let base_name = &hier.path[0].name.name;
+                        if !self.local_stack.is_empty() {
+                            if let Some(locals) = self.local_stack.last() {
+                                if let Some(struct_val) = locals.get(base_name) {
+                                    if let Some(fields) = self.module.packed_struct_fields.get(base_name).cloned() {
+                                        if let Some((_, off, w)) =
+                                            fields.iter().find(|(m, _, _)| m == &member.name).cloned()
+                                        {
+                                            return struct_val.range_select((off + w - 1) as usize, off as usize);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -22741,25 +23092,26 @@ impl Simulator {
                         .as_ref()
                         .and_then(|i| i.properties.get(&member.name).cloned());
                     if let Some(v) = prop {
-                        v
-                    } else {
-                        // SV §13.4.1: `obj.f` with no parens calls a
-                        // no-argument function `f`. The member matched no
-                        // property, so dispatch to a same-named parameterless
-                        // function if the class declares one (UVM uvm_driver:
-                        // `if(seq_item_port.size<1)`).
-                        let cls = self.heap[handle]
-                            .as_ref()
-                            .map(|i| i.class_name.clone());
-                        match cls {
-                            Some(cn)
-                                if self.class_parameterless_function(&cn, &member.name) =>
-                            {
-                                self.exec_method_call(handle, &member.name, &[])
-                            }
-                            _ => Value::zero(32),
-                        }
+                        return v;
                     }
+                    // SV §13.4.1: `obj.f` with no parens calls a
+                    // no-argument function `f`. The member matched no
+                    // property, so dispatch to a same-named parameterless
+                    // function if the class declares one (UVM uvm_driver:
+                    // `if(seq_item_port.size<1)`).
+                    let cls = self.heap[handle]
+                        .as_ref()
+                        .map(|i| i.class_name.clone());
+                    match cls {
+                        Some(cn)
+                            if self.class_parameterless_function(&cn, &member.name) =>
+                        {
+                            self.exec_method_call(handle, &member.name, &[]);
+                            return Value::zero(32);
+                        }
+                        _ => {}
+                    }
+                    Value::zero(32)
                 }
             }
             ExprKind::Call { func, args } => self.eval_call(func, args),
@@ -23994,6 +24346,108 @@ impl Simulator {
                                 self.settle_combinatorial();
                             }
                             return;
+                        }
+                    }
+                }
+                // Struct assignment-pattern decomposition for UNPACKED structs.
+                // xezim stores unpacked-struct members as separate signals
+                // (`LHS.field1`, `LHS.field2`). A whole-struct assignment
+                // `t = '{1.5, 1'b1}` must therefore write each pattern element
+                // to its per-field signal — building a single packed blob and
+                // storing it under `t` would leave `t.field1` stale.
+                //
+                // Fires only when (a) RHS is an ordered AssignmentPattern and
+                // (b) the LHS resolves to an unpacked struct typedef whose
+                // members each have a registered `<lhs>.<member>` signal.
+                // Ordered patterns align positionally with declaration order.
+                if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
+                    if items.iter().all(|it| matches!(it, AssignmentPatternItem::Ordered(_))) {
+                        let lhs_name_opt = if let ExprKind::Ident(lh) = &lvalue.kind {
+                            Some(self.resolve_hier_name(lh))
+                        } else { None };
+                        if let Some(lhs_name) = lhs_name_opt {
+                            let tname = self.get_expr_type_name(lvalue);
+                            let struct_members: Option<Vec<(String, u32, u32, bool)>> = tname
+                                .as_ref()
+                                .and_then(|tn| self.module.typedef_types.get(tn.as_str()))
+                                .and_then(|dt| {
+                                    let resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
+                                    Self::struct_field_layout(&resolved)
+                                });
+                            if let Some(members) = struct_members {
+                                // Declaration order = reverse of struct_field_layout
+                                // (which packs the last member at the LSB).
+                                let mut decl_order = members.clone();
+                                decl_order.reverse();
+                                let n_match = decl_order.len() == items.len();
+                                // Storage model detection:
+                                //  - whole-value local (initial/method local stored in
+                                //    a call frame, or a signal var WITHOUT per-field
+                                //    signals) → update field bits in the whole Value.
+                                //  - per-field signals (`<lhs>.<field>` exist, the
+                                //    unpacked-struct elaboration scheme) → write each
+                                //    field to its own signal.
+                                let is_frame_local = self.local_stack.last()
+                                    .map_or(false, |f| f.contains_key(&lhs_name));
+                                let has_field_sigs = decl_order.iter().all(|(fn_, _, _, _)| {
+                                    let dotted = format!("{}.{}", lhs_name, fn_);
+                                    self.signals.contains_key(&dotted)
+                                        || self.signal_name_to_id.contains_key(dotted.as_str())
+                                });
+                                let whole_value_store = is_frame_local || !has_field_sigs;
+                                if n_match {
+                                    if whole_value_store {
+                                        // Update field bits in the whole Value.
+                                        let cur = if is_frame_local {
+                                            self.local_stack.last().unwrap()
+                                                .get(&lhs_name).cloned()
+                                                .unwrap_or_else(|| Value::zero(65))
+                                        } else {
+                                            self.get_signal_value_by_name(&lhs_name)
+                                                .unwrap_or_else(|| Value::zero(65))
+                                        };
+                                        let mut cur = cur;
+                                        // Ensure cur is wide enough for the struct.
+                                        let total: u32 = decl_order.iter().map(|(_, _, w, _)| *w).sum();
+                                        if cur.width < total { cur = cur.resize(total); }
+                                        for ((fn_, off, w, fr), item) in decl_order.iter().zip(items.iter()) {
+                                            let fr = *fr;
+                                            let w = *w;
+                                            let off = *off;
+                                            let fv = self.eval_expr(item.expr());
+                                            let mut piece = if fr && !fv.is_real {
+                                                Value::from_f64(fv.to_f64())
+                                            } else { fv };
+                                            let _ = fr;
+                                            piece = piece.resize(w);
+                                            for b in 0..w {
+                                                cur.set_bit((off + b) as usize, piece.get_bit(b as usize));
+                                            }
+                                        }
+                                        if is_frame_local {
+                                            self.local_stack.last_mut().unwrap().insert(lhs_name.clone(), cur);
+                                        } else {
+                                            self.set_signal_value_by_name(&lhs_name, cur);
+                                        }
+                                    } else {
+                                        // Per-field separate signals.
+                                        for ((fn_, _off, fw, fr), item) in decl_order.iter().zip(items.iter()) {
+                                            let fr = *fr;
+                                            let fw = *fw;
+                                            let fv = self.eval_expr(item.expr());
+                                            let dotted = format!("{}.{}", lhs_name, fn_);
+                                            let mut fv = fv;
+                                            if fr && !fv.is_real { fv = Value::from_f64(fv.to_f64()); }
+                                            let _ = fw;
+                                            self.set_signal_value_by_name(&dotted, fv);
+                                        }
+                                    }
+                                    if !self.in_edge_block {
+                                        self.settle_combinatorial();
+                                    }
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
@@ -32858,8 +33312,9 @@ impl Simulator {
         pname: &str,
         dims: &[crate::ast::types::UnpackedDimension],
         arg: &Expression,
+        queue_data_type: &crate::ast::types::DataType,
     ) -> bool {
-        use crate::ast::types::UnpackedDimension;
+        use crate::ast::types::{DataType, UnpackedDimension};
         if !matches!(
             dims.first(),
             Some(UnpackedDimension::Queue { .. }) | Some(UnpackedDimension::Unsized(_))
@@ -32871,11 +33326,41 @@ impl Simulator {
         // entry. Without this the param falls back to a scalar bind while a
         // stale same-named queue registration from a prior call survives, so
         // `foreach(param[i])` iterates phantom (unset → garbage) elements.
+
         let literal_elems: Option<Vec<&Expression>> = match &arg.kind {
             ExprKind::Concatenation(parts) => Some(parts.iter().collect()),
             ExprKind::AssignmentPattern(items) => Some(items.iter().map(|it| it.expr()).collect()),
             _ => None,
         };
+        // When the queue's element type is a struct, copy the struct's
+        // packed_struct_fields layout to the queue's name so that
+        // `driver[i].field` MemberAccess on queue elements works.
+        let resolved_dt = Self::resolve_type_ref(queue_data_type, &self.module.typedef_types);
+        if matches!(resolved_dt, DataType::Struct(_)) {
+        }
+        if let crate::ast::types::DataType::Struct(su) = resolved_dt {
+            if !su.packed {
+                // Record the element typedef name so MemberAccess reads can
+                // recover per-field `is_real` (real fields) via struct_field_layout.
+                if let crate::ast::types::DataType::TypeReference { name: tn, .. } = queue_data_type {
+                    self.var_typedef_types.insert(pname.to_string(), tn.name.name.clone());
+                }
+                // Collect struct fields with cumulative offsets. SV packs
+                // struct members with the LAST member at the LSB.
+                let mut offset: u32 = 0;
+                let mut fields: Vec<(String, u32, u32)> = Vec::new();
+                for m in su.members.iter().rev() {
+                    let fw = resolve_type_width(&m.data_type, Some(&self.module.parameters), Some(&self.module.typedefs));
+                    for d in &m.declarators {
+                        fields.push((d.name.name.clone(), offset, fw));
+                        offset += fw;
+                    }
+                }
+                self.module
+                    .packed_struct_fields
+                    .insert(pname.to_string(), fields);
+            }
+        }
         if let Some(parts) = literal_elems {
             // Clear any stale storage/registration for this bare param name.
             let stale: Vec<String> = self
@@ -36490,7 +36975,7 @@ impl Simulator {
                     continue;
                 }
             }
-            if i < args.len() && self.bind_queue_param(&port.name.name, &port.dimensions, &args[i]) {
+            if i < args.len() && self.bind_queue_param(&port.name.name, &port.dimensions, &args[i], &port.data_type) {
                 continue;
             }
             // Unpacked ARRAY formal: functions never bound one, so the body read
@@ -40206,7 +40691,7 @@ impl Simulator {
                             output_bindings.push((port.name.name.clone(), args[i].clone()));
                         }
                         if i < args.len()
-                            && self.bind_queue_param(&port.name.name, &port.dimensions, &args[i])
+                            && self.bind_queue_param(&port.name.name, &port.dimensions, &args[i], &port.data_type)
                         {
                             continue;
                         }

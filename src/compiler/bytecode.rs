@@ -472,6 +472,10 @@ impl<'a> BytecodeCompiler<'a> {
         None
     }
 
+    fn lookup_signal_id_by_name(&self, name: &str) -> Option<usize> {
+        self.signal_name_to_id.get(name).copied()
+    }
+
     fn lookup_param_value(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
         let params = self.params?;
         let raw = Self::hier_raw_name(hier);
@@ -1398,7 +1402,11 @@ impl<'a> BytecodeCompiler<'a> {
                     ExprKind::AssignmentPattern(_) => "Expr_AssignmentPattern",
                     ExprKind::Call { .. } => "Expr_Call",
                     ExprKind::Inside { .. } => "Expr_Inside",
-                    ExprKind::MemberAccess { .. } => "Expr_MemberAccess",
+                    ExprKind::MemberAccess { expr, member } => {
+                        let _ = expr;
+                        let _ = member;
+                        "Expr_MemberAccess"
+                    }
                     ExprKind::Range(..) => "Expr_Range",
                     ExprKind::NamedArg { .. } => "Expr_NamedArg",
                     _ => "Expr_other",
@@ -1663,6 +1671,22 @@ impl<'a> BytecodeCompiler<'a> {
 
     fn compile_blocking_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
         match &lhs.kind {
+            // Handle `base.field` for unpacked struct member signals.
+            // e.g. `a.field1 = Tsum(...).field1;` where `a.field1` is a separate signal.
+            ExprKind::MemberAccess { expr, member } => {
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if hier.path.len() == 1 {
+                        let base_name = hier.path[0].name.name.as_str();
+                        let dotted = format!("{}.{}", base_name, member.name);
+                        if let Some(id) = self.lookup_signal_id_by_name(&dotted) {
+                            self.emit(Insn::BlockingAssign(id, val_reg, width));
+                            return true;
+                        }
+                    }
+                }
+                self.bail("blocking_target_member_access");
+                false
+            }
             ExprKind::Ident(hier) => {
                 if let Some(id) = self.lookup_signal_id(hier) {
                     self.emit(Insn::BlockingAssign(id, val_reg, width));
