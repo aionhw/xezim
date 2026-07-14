@@ -3,7 +3,24 @@ use std::process::Command;
 
 fn main() {
     // VPI symbols must be resolvable by dlopen'd DPI/VPI modules.
-    println!("cargo:rustc-link-arg=-Wl,-export-dynamic");
+    //
+    // The flag is spelled differently per linker: GNU/ELF ld takes
+    // `-export-dynamic` (hyphen), Apple's ld takes `-export_dynamic`
+    // (underscore) and — since the Xcode linker rewrite — rejects unknown
+    // options as a hard error rather than warning, so the wrong spelling
+    // breaks the build outright on macOS.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    match target_os.as_str() {
+        "macos" | "ios" => {
+            println!("cargo:rustc-link-arg=-Wl,-export_dynamic");
+        }
+        // Windows has no equivalent (symbols are exported via a .def /
+        // dllexport), and passing an unknown flag would fail the link.
+        "windows" => {}
+        _ => {
+            println!("cargo:rustc-link-arg=-Wl,-export-dynamic");
+        }
+    }
 
     // vpi_printf and friends are C-variadic, which Rust cannot define on
     // stable (`c_variadic` is unstable). Compile a small C shim and link it

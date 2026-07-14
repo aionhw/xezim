@@ -86,10 +86,13 @@ for pkg in git pkg-config libffi; do
     fi
 done
 
-# Set libffi env vars
-export LDFLAGS="-L/usr/local/opt/libffi/lib"
-export CPPFLAGS="-I/usr/local/opt/libffi/include"
-export PKG_CONFIG_PATH="/usr/local/opt/libffi/lib/pkgconfig"
+# Set libffi env vars. The Homebrew prefix differs by architecture
+# (/usr/local on Intel, /opt/homebrew on Apple Silicon), so ask brew rather
+# than hardcoding it.
+LIBFFI_PREFIX="$(brew --prefix libffi 2>/dev/null || echo /usr/local/opt/libffi)"
+export LDFLAGS="-L${LIBFFI_PREFIX}/lib"
+export CPPFLAGS="-I${LIBFFI_PREFIX}/include"
+export PKG_CONFIG_PATH="${LIBFFI_PREFIX}/lib/pkgconfig"
 
 # Persist libffi env to ~/.zshrc if not already there
 if ! grep -q 'libffi/lib' ~/.zshrc 2>/dev/null; then
@@ -97,9 +100,9 @@ if ! grep -q 'libffi/lib' ~/.zshrc 2>/dev/null; then
     {
         echo ''
         echo '# --- xezim: libffi paths ---'
-        echo 'export LDFLAGS="-L/usr/local/opt/libffi/lib"'
-        echo 'export CPPFLAGS="-I/usr/local/opt/libffi/include"'
-        echo 'export PKG_CONFIG_PATH="/usr/local/opt/libffi/lib/pkgconfig"'
+        echo "export LDFLAGS=\"-L${LIBFFI_PREFIX}/lib\""
+        echo "export CPPFLAGS=\"-I${LIBFFI_PREFIX}/include\""
+        echo "export PKG_CONFIG_PATH=\"${LIBFFI_PREFIX}/lib/pkgconfig\""
     } >> ~/.zshrc
     log "libffi paths added to ~/.zshrc"
 else

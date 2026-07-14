@@ -254,6 +254,88 @@ pub fn defer_static_syscall_inits(
     elab.static_init_blocks.extend(out);
 }
 
+/// IEEE 1800-2017 §18.5.1 — re-install out-of-class constraint bodies
+/// (`constraint ClassName::name { … }`) that elaboration lost.
+///
+/// Elaboration DOES install those bodies into the class's constraint
+/// prototype, but `inline_instantiations` afterwards repopulates the class
+/// table from the raw AST (`elab.classes.insert(name, elaborate_class(c))`),
+/// and the AST `ClassDeclaration` carries only the empty `constraint c;`
+/// prototype — so the body is dropped again and the constraint never reaches
+/// the solver (an `unique_a inside {[1:10]}` written out-of-class simply did
+/// not constrain anything).
+///
+/// The bodies only exist in the parsed descriptions, which elaboration
+/// consumes, so recover them by re-parsing. Gated on the design actually
+/// having an out-of-class constraint whose class-side prototype is still
+/// body-less, so the common case pays nothing.
+fn reinstall_ooc_constraint_bodies(
+    sources: &[String],
+    source_paths: &[String],
+    include_dirs: &[String],
+    defines: &[(String, Option<String>)],
+    elab: &mut elaborate::ElaboratedModule,
+) {
+    let needed: Vec<(String, String)> = elab
+        .out_of_class_constraints
+        .iter()
+        .filter(|(cn, nn)| {
+            elab.classes
+                .get(cn)
+                .and_then(|cd| cd.constraints.get(nn))
+                .map_or(false, |c| c.items.is_empty())
+        })
+        .cloned()
+        .collect();
+    if needed.is_empty() {
+        return;
+    }
+    let mut pp = preprocessor::Preprocessor::new();
+    for dir in include_dirs {
+        pp.add_include_dir(std::path::PathBuf::from(dir));
+    }
+    for (name, val) in defines {
+        pp.define(
+            name.clone(),
+            preprocessor::MacroDef {
+                name: name.clone(),
+                params: None,
+                body: val.clone().unwrap_or_default(),
+            },
+        );
+    }
+    for (i, source) in sources.iter().enumerate() {
+        let path = source_paths.get(i).map(std::path::PathBuf::from);
+        let pre = pp.preprocess_file(source, path.as_deref());
+        let tokens = lexer::Lexer::new(&pre).tokenize();
+        let mut parser = sv_parser::parse::Parser::new(tokens);
+        let src_ast = parser.parse_source_text();
+        for d in &src_ast.descriptions {
+            let ast::Description::OutOfClassConstraint {
+                class_name,
+                constraint_name,
+                items,
+            } = d
+            else {
+                continue;
+            };
+            if items.is_empty()
+                || !needed
+                    .iter()
+                    .any(|(cn, nn)| cn == class_name && nn == constraint_name)
+            {
+                continue;
+            }
+            if let Some(cd) = elab.classes.get_mut(class_name) {
+                if let Some(con) = cd.constraints.get_mut(constraint_name) {
+                    con.items = items.clone();
+                    con.has_body = true;
+                }
+            }
+        }
+    }
+}
+
 /// Simulate a single source string.
 pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, String> {
     simulate_multi(
@@ -326,6 +408,10 @@ pub fn simulate_multi(
         source_paths,
         defines,
     )?;
+
+    // §18.5.1: recover any out-of-class constraint body that the class-table
+    // repopulation in `inline_instantiations` dropped.
+    reinstall_ooc_constraint_bodies(&sources, source_paths, include_dirs, defines, &mut elab);
 
     // Second-pass `should_fail` lint (additive — reuses the elaboration above,
     // no extra cost; does not alter elaborate/simulate behavior). Rejecting
