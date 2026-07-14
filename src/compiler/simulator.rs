@@ -1724,6 +1724,16 @@ pub struct Simulator {
     /// consults the top frame so `vif.member` resolves to `bus.member`.
     /// Popped at task return.
     local_iface_aliases: Vec<HashMap<String, String>>,
+    /// LRM §25.9: name aliases for PLAIN variables declared `virtual
+    /// <iface>` (block-local or module-scope, not class properties and
+    /// not subroutine formals). `vif = bus;` records `vif -> bus` here;
+    /// the same resolve sites that consult the top
+    /// `local_iface_aliases` frame fall back to this map, so
+    /// `vif.member` reads/writes and `vif.f()` calls dispatch to the
+    /// bound instance. `vif = null` removes the entry. Keyed by bare
+    /// variable name (consistent with the simulator's global-by-bare-
+    /// name treatment of subroutine locals).
+    viface_var_aliases: HashMap<String, String>,
     /// While a `with (item...)` filter is being evaluated over a queue whose
     /// elements are unpacked STRUCTS, `item` names no value — the element's
     /// members live in separate signals. Bind it to the element's flat name
@@ -3268,6 +3278,7 @@ impl Simulator {
             uvm_id_counts: std::collections::BTreeMap::new(),
             tlm_connections: HashMap::default(),
             local_iface_aliases: Vec::new(),
+            viface_var_aliases: HashMap::default(),
             item_alias: None,
             dist_picked_once: HashSet::default(),
             class_statics: HashMap::default(),
@@ -4722,6 +4733,152 @@ impl Simulator {
             ExprKind::StringLiteral(s) => s.clone(),
             _ => self.eval_expr(expr).to_sv_string(),
         }
+    }
+
+    /// Read one line (through '\n', included) from `fd`, honoring the
+    /// ungetc pushback buffer. None at EOF.
+    fn sv_read_line(&mut self, fd: i32) -> Option<String> {
+        use std::io::Read;
+        let mut out = String::new();
+        loop {
+            let mut got: Option<u8> = None;
+            if let Some(buf) = self.ungetc_buf.get_mut(&fd) {
+                if let Some(c) = buf.pop() {
+                    got = Some(c);
+                }
+            }
+            if got.is_none() {
+                if let Some(f) = self.file_handles.get_mut(&fd) {
+                    let mut b = [0u8; 1];
+                    if f.read(&mut b).unwrap_or(0) == 1 {
+                        got = Some(b[0]);
+                    }
+                }
+            }
+            match got {
+                Some(c) => {
+                    out.push(c as char);
+                    if c == b'\n' {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    /// §21.3.4 formatted input: match `fmt` against `src`, assigning matched
+    /// conversions to `outs` in order (C-scanf semantics — stops at the
+    /// first mismatch). Returns the number of conversions assigned.
+    fn sv_sscanf(&mut self, src: &str, fmt: &str, outs: &[Expression]) -> i64 {
+        let s: Vec<char> = src.chars().collect();
+        let mut si = 0usize;
+        let mut oi = 0usize;
+        let mut assigned = 0i64;
+        let mut fi = fmt.chars().peekable();
+        fn skip_ws(s: &[char], mut i: usize) -> usize {
+            while i < s.len() && s[i].is_whitespace() { i += 1; }
+            i
+        }
+        while let Some(fc) = fi.next() {
+            if fc == '%' {
+                let mut width = String::new();
+                while fi.peek().map_or(false, |c| c.is_ascii_digit()) {
+                    width.push(fi.next().unwrap());
+                }
+                let w: usize = width.parse().unwrap_or(usize::MAX);
+                let Some(spec) = fi.next() else { break };
+                if spec == '%' {
+                    si = skip_ws(&s, si);
+                    if si < s.len() && s[si] == '%' { si += 1; continue; }
+                    break;
+                }
+                if spec == 'c' {
+                    if si >= s.len() { break; }
+                    let v = Value::from_u64(s[si] as u64, 8);
+                    si += 1;
+                    if oi < outs.len() {
+                        self.assign_value(&outs[oi], &v);
+                        oi += 1;
+                        assigned += 1;
+                    }
+                    continue;
+                }
+                si = skip_ws(&s, si);
+                let start = si;
+                match spec {
+                    's' => {
+                        while si < s.len() && !s[si].is_whitespace() && si - start < w { si += 1; }
+                        if si == start { break; }
+                        let text: String = s[start..si].iter().collect();
+                        if oi < outs.len() {
+                            self.assign_value(&outs[oi], &Value::from_string(&text));
+                            oi += 1;
+                            assigned += 1;
+                        }
+                    }
+                    'f' | 'e' | 'g' => {
+                        while si < s.len()
+                            && (s[si].is_ascii_digit() || "+-.eE".contains(s[si]))
+                            && si - start < w
+                        { si += 1; }
+                        let text: String = s[start..si].iter().collect();
+                        match text.parse::<f64>() {
+                            Ok(f) => {
+                                if oi < outs.len() {
+                                    self.assign_value(&outs[oi], &Value::from_f64(f));
+                                    oi += 1;
+                                    assigned += 1;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    'd' | 'i' | 'h' | 'x' | 'X' | 'o' | 'b' => {
+                        let radix: u32 = match spec {
+                            'h' | 'x' | 'X' => 16,
+                            'o' => 8,
+                            'b' => 2,
+                            _ => 10,
+                        };
+                        let signed = matches!(spec, 'd' | 'i');
+                        let mut si2 = si;
+                        let mut neg = false;
+                        if signed && si2 < s.len() && (s[si2] == '-' || s[si2] == '+') {
+                            neg = s[si2] == '-';
+                            si2 += 1;
+                        }
+                        let dstart = si2;
+                        while si2 < s.len()
+                            && (s[si2].is_digit(radix) || s[si2] == '_')
+                            && si2 - dstart < w
+                        { si2 += 1; }
+                        if si2 == dstart { break; }
+                        let text: String =
+                            s[dstart..si2].iter().filter(|c| **c != '_').collect();
+                        match i64::from_str_radix(&text, radix) {
+                            Ok(mut n) => {
+                                if neg { n = -n; }
+                                si = si2;
+                                if oi < outs.len() {
+                                    self.assign_value(&outs[oi], &Value::from_u64(n as u64, 32));
+                                    oi += 1;
+                                    assigned += 1;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    _ => break,
+                }
+            } else if fc.is_whitespace() {
+                si = skip_ws(&s, si);
+            } else {
+                if si < s.len() && s[si] == fc { si += 1; } else { break; }
+            }
+        }
+        assigned
     }
 
     fn eval_file_handle_arg(&mut self, expr: &Expression) -> i32 {
@@ -15860,6 +16017,10 @@ impl Simulator {
         match &stmt.kind {
             StatementKind::TimingControl { .. } => true,
             StatementKind::Wait { .. } => true,
+            // §9.6.1: `wait fork` suspends until all descendants finish —
+            // inside a begin-block it must route through the suspend-aware
+            // runner (the plain exec arm is a no-op).
+            StatementKind::WaitFork => true,
             // §9.4.5 intra-assignment delay suspends the process for `#d`.
             StatementKind::BlockingAssign { rvalue, .. } => {
                 Self::intra_delay_marker(rvalue).is_some()
@@ -19329,15 +19490,15 @@ impl Simulator {
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
-                // LRM §25.9: virtual-interface formal-arg alias —
-                // rewrite `vif.member` to `<bound>.member` when `vif`
-                // is in the current task call's alias frame. Must fire
+                // LRM §25.9: virtual-interface alias (task/function
+                // formal frame, or a plain `virtual <iface>` variable) —
+                // rewrite `vif.member` to `<bound>.member`. Must fire
                 // before the local-stack/class-prop checks so `vif`
                 // doesn't shadow a same-named local of unrelated type.
                 if hier.path.len() >= 2 {
-                    if let Some(frame) = self.local_iface_aliases.last() {
+                    {
                         let first = hier.path[0].name.name.as_str();
-                        if let Some(bound) = frame.get(first).cloned() {
+                        if let Some(bound) = self.iface_alias_for(first) {
                             let rest = hier
                                 .path
                                 .iter()
@@ -20649,14 +20810,14 @@ impl Simulator {
                 changed
             }
             ExprKind::MemberAccess { expr, member } => {
-                // LRM §25.9: virtual-interface formal-arg alias —
-                // task-local. Same as the hier-Ident path above but
-                // for the MemberAccess parse shape.
+                // LRM §25.9: virtual-interface alias (formal frame or
+                // plain `virtual <iface>` variable). Same as the
+                // hier-Ident path above but for the MemberAccess shape.
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if hier.path.len() == 1 {
-                        if let Some(frame) = self.local_iface_aliases.last() {
+                        {
                             let first = hier.path[0].name.name.as_str();
-                            if let Some(bound) = frame.get(first).cloned() {
+                            if let Some(bound) = self.iface_alias_for(first) {
                                 let target = format!("{}.{}", bound, member.name);
                                 let prev = self.get_signal_value_by_name(&target);
                                 let w = prev.as_ref().map(|v| v.width).unwrap_or(val.width);
@@ -21931,19 +22092,13 @@ impl Simulator {
                     }
                     out
                 };
-                // When RHS stream is assigned/evaluated in a wider context,
-                // pad on the LSB side (stream sits at the MSB of the target).
-                if ctx_width > streamed.width {
-                    let target_w = ctx_width as usize;
-                    let mut padded = Value::zero(ctx_width);
-                    let shift = target_w - streamed.width as usize;
-                    for b in 0..streamed.width as usize {
-                        padded.set_bit(b + shift, streamed.get_bit(b));
-                    }
-                    padded
-                } else {
-                    streamed
-                }
+                // §11.4.14: as a plain RHS the stream is a self-determined
+                // expression — a wider PACKED target zero-extends it like any
+                // assignment (w = {<<4{16'hABCD}} gives 0000_dcba, matching
+                // the commercial consensus). Left-justification applies only
+                // when the STREAM is the assignment TARGET (handled in the
+                // unpack path), not here.
+                streamed
             }
             ExprKind::Replication { count, exprs } => {
                 // Replication evaluation. Two correctness/perf fixes vs. the
@@ -22572,6 +22727,16 @@ impl Simulator {
                 }
                 "$bits" => {
                     if let Some(arg) = args.first() {
+                        // §20.6.2: `$bits(logic [7:0])` — a TYPE operand.
+                        if let ExprKind::TypeLiteral(dt) = &arg.kind {
+                            let w = super::elaborate::resolve_type_width(
+                                dt,
+                                Some(&self.module.parameters),
+                                Some(&self.module.typedefs),
+                            )
+                            .max(1);
+                            return Value::from_u64(w as u64, 32);
+                        }
                         if let ExprKind::Ident(hier) = &arg.kind {
                             let name = self.resolve_hier_name(hier);
                             // Unpacked array: $bits = element_bits * product of
@@ -22811,6 +22976,69 @@ impl Simulator {
                         .unwrap_or(0);
                     self.ungetc_buf.entry(fd).or_default().push(ch);
                     Value::from_u64(ch as u64, 32)
+                }
+                "$fgets" => {
+                    let fd = args
+                        .get(1)
+                        .map(|a| self.eval_file_handle_arg(a))
+                        .unwrap_or(0);
+                    match self.sv_read_line(fd) {
+                        Some(line) => {
+                            let n = line.len() as u64;
+                            if let Some(dst) = args.first() {
+                                self.assign_value(dst, &Value::from_string(&line));
+                            }
+                            Value::from_u64(n, 32)
+                        }
+                        None => Value::zero(32),
+                    }
+                }
+                "$fscanf" => {
+                    let fd = args
+                        .first()
+                        .map(|a| self.eval_file_handle_arg(a))
+                        .unwrap_or(0);
+                    let fmt = args
+                        .get(1)
+                        .map(|a| {
+                            if let ExprKind::StringLiteral(f) = &a.kind {
+                                f.clone()
+                            } else {
+                                self.eval_expr(a).to_sv_string()
+                            }
+                        })
+                        .unwrap_or_default();
+                    match self.sv_read_line(fd) {
+                        Some(line) => {
+                            let n = self.sv_sscanf(&line, &fmt, &args[2..]);
+                            Value::from_u64(n as u64, 32)
+                        }
+                        None => Value::from_u64(u32::MAX as u64, 32), // EOF = -1
+                    }
+                }
+                "$feof" => {
+                    use std::io::Read;
+                    let fd = args
+                        .first()
+                        .map(|a| self.eval_file_handle_arg(a))
+                        .unwrap_or(0);
+                    let buffered = self
+                        .ungetc_buf
+                        .get(&fd)
+                        .map_or(false, |b| !b.is_empty());
+                    if buffered {
+                        Value::zero(32)
+                    } else if let Some(f) = self.file_handles.get_mut(&fd) {
+                        let mut b = [0u8; 1];
+                        if f.read(&mut b).unwrap_or(0) == 1 {
+                            self.ungetc_buf.entry(fd).or_default().push(b[0]);
+                            Value::zero(32)
+                        } else {
+                            Value::from_u64(1, 32)
+                        }
+                    } else {
+                        Value::from_u64(1, 32)
+                    }
                 }
                 "$fgetc" => {
                     use std::io::Read;
@@ -23172,6 +23400,24 @@ impl Simulator {
                 }
                 sn @ ("$left" | "$high" | "$right" | "$low" | "$size" | "$increment") => {
                     let sn = sn.to_string();
+                    // §20.7: a TYPE operand — the query describes the type's
+                    // packed dimension (`$size(logic [7:0])` == 8).
+                    if let Some(ExprKind::TypeLiteral(dt)) = args.first().map(|a| &a.kind) {
+                        let w = super::elaborate::resolve_type_width(
+                            dt,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        )
+                        .max(1);
+                        let r = match sn.as_str() {
+                            "$size" => w as u64,
+                            "$left" | "$high" => (w - 1) as u64,
+                            "$right" | "$low" => 0,
+                            "$increment" => 1,
+                            _ => 0,
+                        };
+                        return Value::from_u64(r, 32);
+                    }
                     let dim = args
                         .get(1)
                         .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
@@ -23369,27 +23615,20 @@ impl Simulator {
                     Value::from_u64(if count <= 1 { 1 } else { 0 }, 1)
                 }
                 "$sscanf" => {
-                    if args.len() >= 3 {
-                        if let ExprKind::StringLiteral(src) = &args[0].kind {
-                            if let ExprKind::StringLiteral(fmt) = &args[1].kind {
-                                if fmt.contains("%d") || fmt.contains("%i") {
-                                    if let Ok(n) = src.trim().parse::<i64>() {
-                                        self.assign_value(&args[2], &Value::from_u64(n as u64, 32));
-                                        return Value::from_u64(1, 32);
-                                    }
-                                }
-                            }
-                        }
-                        let src_val = self.eval_expr(&args[0]);
-                        let src_str = src_val.to_sv_string();
-                        if let ExprKind::StringLiteral(fmt) = &args[1].kind {
-                            if fmt.contains("%d") || fmt.contains("%i") {
-                                if let Ok(n) = src_str.trim().parse::<i64>() {
-                                    self.assign_value(&args[2], &Value::from_u64(n as u64, 32));
-                                    return Value::from_u64(1, 32);
-                                }
-                            }
-                        }
+                    // §21.3.4 — full conversion walk, not just a lone %d.
+                    if args.len() >= 2 {
+                        let src_str = if let ExprKind::StringLiteral(t) = &args[0].kind {
+                            t.clone()
+                        } else {
+                            self.eval_expr(&args[0]).to_sv_string()
+                        };
+                        let fmt = if let ExprKind::StringLiteral(f) = &args[1].kind {
+                            f.clone()
+                        } else {
+                            self.eval_expr(&args[1]).to_sv_string()
+                        };
+                        let n = self.sv_sscanf(&src_str, &fmt, &args[2..]);
+                        return Value::from_u64(n as u64, 32);
                     }
                     Value::zero(32)
                 }
@@ -23875,14 +24114,10 @@ impl Simulator {
                 if let ExprKind::Ident(vh) = &expr.kind {
                     if vh.path.len() == 1 {
                         let seg0 = &vh.path[0].name.name;
-                        // (a) virtual-interface formal arg aliased into this call
-                        // frame (LRM §25.9: `task f(virtual if av); ...av.sig`).
-                        if let Some(bound) = self
-                            .local_iface_aliases
-                            .last()
-                            .and_then(|f| f.get(seg0))
-                            .cloned()
-                        {
+                        // (a) virtual-interface alias — a formal arg in this
+                        // call frame (LRM §25.9: `task f(virtual if av);
+                        // ...av.sig`) or a plain `virtual <iface>` variable.
+                        if let Some(bound) = self.iface_alias_for(seg0) {
                             let resolved = format!("{}.{}", bound, member.name);
                             if let Some(v) = self.lookup_signal_value(&resolved) {
                                 return v;
@@ -23966,6 +24201,16 @@ impl Simulator {
             }
             ExprKind::Null => Value::zero(32),
             ExprKind::Empty => Value::zero(1),
+            // §20.6: a type used as an operand carries only its width.
+            ExprKind::TypeLiteral(dt) => {
+                let w = super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+                .max(1);
+                Value::zero(w)
+            }
             ExprKind::RandomizeWith { call, constraints } => {
                 self.eval_randomize_with(call, constraints)
             }
@@ -27755,32 +28000,35 @@ impl Simulator {
                         let v = if let Some(init_expr) = d.init.as_ref() {
                             let mut produced: Option<Value> = None;
                             if let Some(cn) = &class_name {
-                                if let Some(class_def) = self.module.classes.get(cn).cloned() {
-                                    let is_new = match &init_expr.kind {
-                                        ExprKind::Call { func, args } => {
-                                            if let ExprKind::Ident(h) = &func.kind {
-                                                if h.path
-                                                    .last()
-                                                    .map_or(false, |s| s.name.name == "new")
-                                                {
-                                                    Some(args.clone())
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
-                                        }
-                                        ExprKind::Ident(h) => {
-                                            if h.path.last().map_or(false, |s| s.name.name == "new")
+                                // `T x = new(...);` / `T x = new;` — detect the
+                                // constructor form once; consumed by both the
+                                // class and covergroup branches below.
+                                let is_new = match &init_expr.kind {
+                                    ExprKind::Call { func, args } => {
+                                        if let ExprKind::Ident(h) = &func.kind {
+                                            if h.path
+                                                .last()
+                                                .map_or(false, |s| s.name.name == "new")
                                             {
-                                                Some(vec![])
+                                                Some(args.clone())
                                             } else {
                                                 None
                                             }
+                                        } else {
+                                            None
                                         }
-                                        _ => None,
-                                    };
+                                    }
+                                    ExprKind::Ident(h) => {
+                                        if h.path.last().map_or(false, |s| s.name.name == "new")
+                                        {
+                                            Some(vec![])
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(class_def) = self.module.classes.get(cn).cloned() {
                                     if let Some(call_args) = is_new {
                                         // Pass the declared type's `#(...)` args
                                         // (e.g. `uvm_resource#(int) r = new()`) so
@@ -27802,6 +28050,25 @@ impl Simulator {
                                             &call_args,
                                             ta,
                                         ));
+                                    }
+                                } else if let Some(cg_def) =
+                                    self.module.covergroups.get(cn).cloned()
+                                {
+                                    // IEEE 1800-2017 §19.8: a covergroup-typed
+                                    // LOCAL `cg c = new();` (declared inside a
+                                    // procedural block) must allocate a real
+                                    // covergroup instance. This branch only
+                                    // handled classes, so the initializer fell
+                                    // through to generic eval, `c` never got a
+                                    // cg_heap handle, and sample() /
+                                    // get_inst_coverage() (and the @(event)
+                                    // clocking registration done inside
+                                    // instantiate_covergroup) were silent
+                                    // no-ops — coverage always read 0.
+                                    if let Some(call_args) = is_new {
+                                        produced = Some(
+                                            self.instantiate_covergroup(&cg_def, &call_args),
+                                        );
                                     }
                                 }
                             }
@@ -27876,8 +28143,16 @@ impl Simulator {
                         }
                         // Record a class-typed local's type so a later
                         // separate `name = new();` knows what to construct.
+                        // Covergroup-typed locals (§19.8) are recorded too:
+                        // get_expr_type_name consults this map, and both the
+                        // bare `c = new;` and `c = new();` assignment paths
+                        // already route a covergroup type name to
+                        // instantiate_covergroup — they just never saw it
+                        // for a procedural local.
                         if let Some(cn) = &class_name {
-                            if self.module.classes.contains_key(cn) {
+                            if self.module.classes.contains_key(cn)
+                                || self.module.covergroups.contains_key(cn)
+                            {
                                 self.var_class_types
                                     .insert(d.name.name.clone(), cn.clone());
                             } else if self.pure_sv_lrm
@@ -28622,31 +28897,18 @@ impl Simulator {
                 self.vcd_flush();
             }
             "$sscanf" => {
-                if args.len() >= 3 {
-                    let src_str = if let ExprKind::StringLiteral(s) = &args[0].kind {
-                        s.clone()
+                if args.len() >= 2 {
+                    let src_str = if let ExprKind::StringLiteral(t) = &args[0].kind {
+                        t.clone()
                     } else {
                         self.eval_expr(&args[0]).to_sv_string()
                     };
-                    if let ExprKind::StringLiteral(fmt) = &args[1].kind {
-                        if fmt.contains("%d") || fmt.contains("%i") {
-                            if let Ok(n) = src_str.trim().parse::<i64>() {
-                                self.assign_value(&args[2], &Value::from_u64(n as u64, 32));
-                            }
-                        } else if fmt.contains("%s") {
-                            self.assign_value(&args[2], &Value::from_string(&src_str));
-                        } else if fmt.contains("%h") || fmt.contains("%x") {
-                            if let Ok(n) = u64::from_str_radix(
-                                src_str
-                                    .trim()
-                                    .trim_start_matches("0x")
-                                    .trim_start_matches("0X"),
-                                16,
-                            ) {
-                                self.assign_value(&args[2], &Value::from_u64(n, 32));
-                            }
-                        }
-                    }
+                    let fmt = if let ExprKind::StringLiteral(f) = &args[1].kind {
+                        f.clone()
+                    } else {
+                        self.eval_expr(&args[1]).to_sv_string()
+                    };
+                    let _ = self.sv_sscanf(&src_str, &fmt, &args[2..]);
                 }
             }
             // §20.15 stochastic-analysis tasks. All four write an output status
@@ -29996,23 +30258,22 @@ impl Simulator {
             return raw;
         }
         // LRM §25.9: if the leading segment names a virtual-interface
-        // formal-arg alias in the current task call frame, rewrite the
+        // alias — a formal arg in the current task call frame, or a
+        // plain `virtual <iface>` variable (`vif = bus;`) — rewrite the
         // path to use the bound interface instance name. Has to fire
         // before the class-property dispatch below so a task formal
         // `vif` doesn't get shadowed by a same-named class prop.
-        if let Some(frame) = self.local_iface_aliases.last() {
-            if !frame.is_empty() && hier.path.len() >= 2 {
-                let first = hier.path[0].name.name.as_str();
-                if let Some(bound) = frame.get(first) {
-                    let rest = hier
-                        .path
-                        .iter()
-                        .skip(1)
-                        .map(|s| s.name.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    return format!("{}.{}", bound, rest);
-                }
+        if hier.path.len() >= 2 {
+            let first = hier.path[0].name.name.as_str();
+            if let Some(bound) = self.iface_alias_for(first) {
+                let rest = hier
+                    .path
+                    .iter()
+                    .skip(1)
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                return format!("{}.{}", bound, rest);
             }
         }
         // LRM §25.8 virtual-interface late-dispatch. When the inner
@@ -37357,6 +37618,62 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) -> bool {
+        // LRM §25.9: a PLAIN variable declared `virtual <iface>` (a
+        // block-local `virtual bus_if vif;` or a module-scope one — not
+        // a class property, which the (handle, prop) binding below
+        // owns) assigned an interface instance is a name alias, not a
+        // value copy: record `vif -> bus` in `viface_var_aliases` so
+        // subsequent `vif.member` reads/writes and `vif.f()` calls
+        // dispatch to the bound instance. `vif = null` clears it.
+        if let ExprKind::Ident(h) = &lvalue.kind {
+            if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                let name = h.path[0].name.name.as_str();
+                let is_viface_var = self
+                    .module
+                    .var_decl_types
+                    .get(name)
+                    .map_or(false, |dt| self.is_virtual_iface_type(dt));
+                // A same-named class vif PROPERTY written bare inside a
+                // method takes the binding path below, not the var alias.
+                let shadows_class_prop = self
+                    .this_stack
+                    .last()
+                    .copied()
+                    .flatten()
+                    .and_then(|hd| self.heap.get(hd).and_then(|o| o.as_ref()))
+                    .map(|i| i.class_name.clone())
+                    .and_then(|cn| self.module.classes.get(&cn))
+                    .map_or(false, |cd| cd.virtual_iface_properties.contains_key(name));
+                if is_viface_var && !shadows_class_prop {
+                    if matches!(&rvalue.kind, ExprKind::Null) {
+                        // Clear the alias, then FALL THROUGH so the normal
+                        // value path stores the null handle — keeping a
+                        // later `vif == null` true.
+                        self.viface_var_aliases.remove(name);
+                    } else if let Some(bound) = self.resolve_vif_rhs_name(rvalue) {
+                        // Only a resolved interface INSTANCE (directly, or
+                        // through another vif's current binding) may bind.
+                        if self.is_interface_instance(&bound) {
+                            let name = name.to_string();
+                            // Store a non-null sentinel VALUE in the variable
+                            // too (same FNV hash the config_db vif path uses)
+                            // so `vif != null` existence checks pass.
+                            let mut hsh: u64 = 0xcbf29ce484222325;
+                            for b in bound.bytes() {
+                                hsh ^= b as u64;
+                                hsh = hsh.wrapping_mul(0x100000001b3);
+                            }
+                            self.viface_var_aliases.insert(name, bound);
+                            self.assign_value(
+                                lvalue,
+                                &Value::from_u64((hsh & 0x7FFF_FFFF) | 1, 32),
+                            );
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
         // (handle, prop) for the target. `prop` for arrays encodes the
         // index as `"vif_arr[<idx>]"` so existing single-key storage
         // can stash per-index bindings (LRM §25.10).
@@ -37616,13 +37933,17 @@ impl Simulator {
 
     fn resolve_vif_rhs_name(&self, rvalue: &Expression) -> Option<String> {
         match &rvalue.kind {
-            // `v` — a bound vif of the current `this`, else a direct instance.
+            // `v` — a bound vif of the current `this`, else a vif
+            // formal/local alias (LRM §25.9), else a direct instance.
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 let raw = h.path[0].name.name.clone();
                 if let Some(th) = self.this_stack.last().copied().flatten() {
                     if let Some((b, _)) = self.virtual_iface_bindings.get(&(th, raw.clone())) {
                         return Some(b.clone());
                     }
+                }
+                if let Some(b) = self.iface_alias_for(&raw) {
+                    return Some(b);
                 }
                 Some(raw)
             }
@@ -37670,19 +37991,56 @@ impl Simulator {
         formal: &str,
         arg: &Expression,
     ) -> Option<(String, String)> {
+        if !self.is_virtual_iface_type(dt) {
+            return None;
+        }
+        self.resolve_vif_rhs_name(arg)
+            .map(|bound| (formal.to_string(), bound))
+    }
+
+    /// LRM §25.9: resolve a leading identifier through the active
+    /// virtual-interface alias scope. The innermost task/function call
+    /// frame (vif FORMALS) wins; a plain `virtual <iface>` VARIABLE
+    /// alias (`vif = bus;` — see `viface_var_aliases`) is the
+    /// fallback. Returns the bound interface instance name.
+    fn iface_alias_for(&self, name: &str) -> Option<String> {
+        if let Some(b) = self
+            .local_iface_aliases
+            .last()
+            .and_then(|frame| frame.get(name))
+        {
+            return Some(b.clone());
+        }
+        if self.viface_var_aliases.is_empty() {
+            return None; // fast path: no vif variables bound anywhere
+        }
+        self.viface_var_aliases.get(name).cloned()
+    }
+
+    /// Is `path` an elaborated INTERFACE instance (e.g. `bus` of
+    /// definition `bus_if`)? Used to validate the RHS of a
+    /// `vif = <instance>` alias assignment (LRM §25.9) so an unrelated
+    /// value assignment never records a bogus alias.
+    fn is_interface_instance(&self, path: &str) -> bool {
+        self.module
+            .instances
+            .iter()
+            .any(|i| i.path == path && self.module.interfaces.contains(&i.def_name))
+    }
+
+    /// Is `dt` a virtual-interface variable type — the `virtual <iface>`
+    /// form (`DataType::Interface`) or a TypeReference naming a known
+    /// interface definition? Mirrors the formal-arg check in
+    /// `vif_formal_alias` (LRM §25.9).
+    fn is_virtual_iface_type(&self, dt: &crate::ast::types::DataType) -> bool {
         use crate::ast::types::DataType;
-        let is_iface_formal = match dt {
+        match dt {
             DataType::Interface { .. } => true,
             DataType::TypeReference { name, .. } => {
                 self.module.interfaces.contains(&name.name.name)
             }
             _ => false,
-        };
-        if !is_iface_formal {
-            return None;
         }
-        self.resolve_vif_rhs_name(arg)
-            .map(|bound| (formal.to_string(), bound))
     }
 
     /// Resolve a `(handle, prop)` virtual-interface binding to its bound
@@ -40012,6 +40370,41 @@ impl Simulator {
                     }
                 }
             }
+            // LRM §25.5.4: a subroutine of an interface INSTANCE called
+            // through the instance — `bus.snoop()` flattens to
+            // Ident([bus, snoop]) while elaboration inlined the
+            // interface's function under the instance-prefixed key
+            // ("bus.snoop"). Look the FULL dotted name up; the inlined
+            // body still names interface members bare (`data`), so run
+            // it with the instance path as the name-resolve hint (the
+            // sibling-scope mechanism scoped hierarchical reads already
+            // use) so `data` resolves to `bus.data`. A leading
+            // virtual-interface alias (`vif.snoop()`, LRM §25.9) is
+            // rewritten to its bound instance first, giving per-instance
+            // dispatch when the vif is re-bound.
+            if hier.path.len() >= 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                let head = hier.path[0].name.name.as_str();
+                let head_owned =
+                    self.iface_alias_for(head).unwrap_or_else(|| head.to_string());
+                let mut segs: Vec<&str> = vec![head_owned.as_str()];
+                segs.extend(hier.path[1..].iter().map(|s| s.name.name.as_str()));
+                let full = segs.join(".");
+                let scope = full.rsplit_once('.').map(|(s, _)| s.to_string());
+                if let Some(fd) = self.module.functions.get(&full).cloned() {
+                    let saved = self.name_resolve_hint.borrow().clone();
+                    *self.name_resolve_hint.borrow_mut() = scope;
+                    let r = self.exec_function_call(&fd, args);
+                    *self.name_resolve_hint.borrow_mut() = saved;
+                    return r;
+                }
+                if let Some(td) = self.module.tasks.get(&full).cloned() {
+                    let saved = self.name_resolve_hint.borrow().clone();
+                    *self.name_resolve_hint.borrow_mut() = scope;
+                    self.exec_task_call(&td, args);
+                    *self.name_resolve_hint.borrow_mut() = saved;
+                    return Value::zero(32);
+                }
+            }
             // Handle static/constructor call: class_name::f() or new()
             let name = &hier.path.last().unwrap().name.name;
             if let Some(class_def) = self.module.classes.get(name).cloned() {
@@ -40833,10 +41226,28 @@ impl Simulator {
         _args: &[Expression],
     ) -> Value {
         match method_name {
-            "get_inst_coverage" | "get_coverage" => {
-                let coverage = self.calculate_coverage(handle);
-                // Return real as u64 bits (simplified: return as integer percentage for now)
-                Value::from_u64(coverage as u64, 64)
+            // IEEE 1800-2017 §19.8: both coverage queries return a REAL
+            // percentage. This used to return the number as an INTEGER
+            // Value (from_u64), so `%f`-family display reinterpreted the
+            // integer's bits as an f64 and printed 0.0 even when the
+            // computed coverage was 100.
+            "get_inst_coverage" => {
+                // §19.8 get_inst_coverage(): coverage of THIS instance.
+                Value::from_f64(self.calculate_coverage(handle))
+            }
+            "get_coverage" => {
+                // §19.8/§19.11 get_coverage(): TYPE coverage — the merge
+                // of every instance of this covergroup type (a bin is
+                // covered if any instance hit it).
+                let cg_name = self
+                    .cg_heap
+                    .get(handle)
+                    .and_then(|x| x.as_ref())
+                    .map(|i| i.cg_name.clone());
+                match cg_name {
+                    Some(n) => Value::from_f64(self.calculate_type_coverage(&n)),
+                    None => Value::from_f64(0.0),
+                }
             }
             "sample" => {
                 self.sample_covergroup(handle);
@@ -40846,38 +41257,122 @@ impl Simulator {
         }
     }
 
+    /// §19.8 get_inst_coverage(): coverage of a single instance.
     fn calculate_coverage(&self, handle: usize) -> f64 {
         let inst = if let Some(Some(i)) = self.cg_heap.get(handle) {
             i
         } else {
             return 0.0;
         };
-        let def = if let Some(d) = self.module.covergroups.get(&inst.cg_name) {
+        self.coverage_over_instances(&inst.cg_name, std::slice::from_ref(&inst))
+    }
+
+    /// §19.8/§19.11 get_coverage(): TYPE coverage — merged over every
+    /// live instance of the covergroup type (a bin counts as covered
+    /// when ANY instance hit it).
+    fn calculate_type_coverage(&self, cg_name: &str) -> f64 {
+        let insts: Vec<&CovergroupInstance> = self
+            .cg_heap
+            .iter()
+            .flatten()
+            .filter(|i| i.cg_name == cg_name)
+            .collect();
+        if insts.is_empty() {
+            return 0.0;
+        }
+        self.coverage_over_instances(cg_name, &insts)
+    }
+
+    /// IEEE 1800-2017 §19.8/§19.11 coverage computation, shared by
+    /// get_inst_coverage (one instance) and get_coverage (all instances
+    /// of the type).
+    ///
+    /// Per §19.8, a coverpoint's coverage is the fraction of its bins
+    /// that were hit: with explicit bins, `100 * (#bins hit / #bins)`,
+    /// counting only `bins` proper — `ignore_bins`, `illegal_bins`, and
+    /// `default` bins are EXCLUDED from the calculation (§19.5/§19.5.6).
+    /// This replaces the old any-value-sampled → 100% shortcut, which
+    /// reported full coverage when only one of several bins was hit.
+    /// A coverpoint with no explicit bins uses auto-bins; we approximate
+    /// that as covered once any value has been sampled (preserving prior
+    /// behavior for auto-binned points). A cross with body bins uses the
+    /// same hit-fraction rule over its bins; a bare cross is covered
+    /// once any tuple was sampled.
+    ///
+    /// Per §19.11, the covergroup number is the weighted average of its
+    /// items' coverages; with the default `option.weight = 1` for every
+    /// item that is the unweighted mean, which is what we compute.
+    fn coverage_over_instances(
+        &self,
+        cg_name: &str,
+        insts: &[&CovergroupInstance],
+    ) -> f64 {
+        let def = if let Some(d) = self.module.covergroups.get(cg_name) {
             d
         } else {
             return 0.0;
         };
 
-        let mut total_items = 0;
-        let mut covered_items = 0;
+        // Is the (non-array) bin `key` hit in any instance? For the
+        // `bins name[]` array form, hits are recorded per sub-bin as
+        // `cp.name[<val>]`, so match on the `cp.name[` prefix.
+        let bin_hit = |key: &str, array_form: bool| -> bool {
+            insts.iter().any(|inst| {
+                if array_form {
+                    let pre = format!("{}[", key);
+                    inst.bin_hits
+                        .iter()
+                        .any(|(k, &c)| c > 0 && k.starts_with(&pre))
+                } else {
+                    inst.bin_hits.get(key).map_or(false, |&c| c > 0)
+                }
+            })
+        };
+
+        let mut total_items = 0usize;
+        let mut coverage_sum = 0.0f64;
 
         for item in &def.items {
             match item {
                 CovergroupItem::Coverpoint(cp) => {
-                    total_items += 1;
                     let cp_name = cp
                         .name
                         .as_ref()
                         .map(|n| n.name.clone())
                         .unwrap_or_else(|| format!("{:?}", cp.expr));
-                    if let Some(hits) = inst.point_hits.get(&cp_name) {
-                        if !hits.is_empty() {
-                            covered_items += 1;
-                        }
-                    }
+                    // §19.5: only `bins` proper participate in coverage.
+                    let explicit: Vec<&crate::ast::decl::CoverBin> = cp
+                        .bins
+                        .iter()
+                        .filter(|b| {
+                            matches!(b.kind, crate::ast::decl::CoverBinKind::Bins)
+                        })
+                        .collect();
+                    let cov = if explicit.is_empty() {
+                        // Auto-binned coverpoint: covered once anything
+                        // was sampled.
+                        let sampled = insts.iter().any(|i| {
+                            i.point_hits
+                                .get(&cp_name)
+                                .map_or(false, |h| !h.is_empty())
+                        });
+                        if sampled { 1.0 } else { 0.0 }
+                    } else {
+                        let hit = explicit
+                            .iter()
+                            .filter(|b| {
+                                bin_hit(
+                                    &format!("{}.{}", cp_name, b.name.name),
+                                    b.array_form,
+                                )
+                            })
+                            .count();
+                        hit as f64 / explicit.len() as f64
+                    };
+                    total_items += 1;
+                    coverage_sum += cov;
                 }
                 CovergroupItem::Cross(cr) => {
-                    total_items += 1;
                     let cr_name = cr.name.as_ref().map(|n| n.name.clone()).unwrap_or_else(|| {
                         cr.items
                             .iter()
@@ -40885,20 +41380,40 @@ impl Simulator {
                             .collect::<Vec<_>>()
                             .join("_")
                     });
-                    if let Some(hits) = inst.cross_hits.get(&cr_name) {
-                        if !hits.is_empty() {
-                            covered_items += 1;
-                        }
-                    }
+                    let cov = if cr.bins.is_empty() {
+                        let sampled = insts.iter().any(|i| {
+                            i.cross_hits
+                                .get(&cr_name)
+                                .map_or(false, |h| !h.is_empty())
+                        });
+                        if sampled { 1.0 } else { 0.0 }
+                    } else {
+                        let hit = cr
+                            .bins
+                            .iter()
+                            .filter(|b| {
+                                let key = format!("{}.{}", cr_name, b.name.name);
+                                insts.iter().any(|i| {
+                                    i.cross_bin_hits
+                                        .get(&key)
+                                        .map_or(false, |&c| c > 0)
+                                })
+                            })
+                            .count();
+                        hit as f64 / cr.bins.len() as f64
+                    };
+                    total_items += 1;
+                    coverage_sum += cov;
                 }
                 _ => {}
             }
         }
 
         if total_items == 0 {
+            // §19.11: a covergroup with no items has 100% coverage.
             100.0
         } else {
-            (covered_items as f64 / total_items as f64) * 100.0
+            (coverage_sum / total_items as f64) * 100.0
         }
     }
 
