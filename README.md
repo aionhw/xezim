@@ -34,8 +34,9 @@ Current capabilities include:
 * Combinational logic simulation
 * Sequential simulation infrastructure
 * Test execution framework
-* Waveform / trace dumps — VCD (`$dumpfile`/`$dumpvars`), XTrace v1.0 (`--xtrace`,
-  optional zstd compression + scope filtering), and AITRACE-T (`--aitrace`)
+* Waveform / trace dumps — VCD (`$dumpfile`/`$dumpvars`; IEEE 1800-2017 §21.7, and
+  matches Verilator/Icarus in GTKWave) and XTrace v1.0 (`--xtrace`, optional zstd
+  compression + scope filtering)
 * **UVM run-phase execution** (Accellera **1800.2-2017 and 1800.2-2020.3.1**, with
   `-DUVM_NO_DPI`) — a real UVM testbench runs end-to-end: build → connect → topology →
   `run_phase` stimulus → sequencer↔driver TLM handshake → packet collection →
@@ -260,10 +261,8 @@ Common options:
 | `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects) |
 | `--sdf <file>` `--sdf-{min,typ,max}` | Annotate standard delays |
 | `--sim_debug` | Print `[DEBUG]` / `[OPT]` diagnostics |
-| `--log <file>` | Redirect stdout/stderr to a log file |
 | `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
-| `--aitrace` | Make `$dumpfile`/`$dumpvars` emit AITRACE-T text instead of VCD |
 
 Selected env knobs (off by default unless noted):
 
