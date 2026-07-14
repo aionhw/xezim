@@ -153,14 +153,13 @@ if have B2; then
   # measurement (the bytecode VM actually runs; `insns` is non-zero).
   XEZIM_NO_PARALLEL=1 run B2 dispatch_branchy 1 4096 "$GEN/b2b_vm_branchy.sv" --max-time 120000
 
-  # Same design with xezim's automatic parallel edge dispatch left ON. It kicks
-  # in at >=10k bytecode insns per tick, forks/joins per clock edge, and on this
-  # box is ~6x SLOWER than sequential for these fine-grained blocks. The ratio
-  # (branchy_par / branchy_seq) is therefore a direct measure of thread
-  # fork/join + sync cost — which is exactly what differs between x86 and
-  # Graviton, so it is worth carrying as its own number.
-  ( unset XEZIM_NO_PARALLEL
-    run B2 dispatch_branchy_par 1 4096 "$GEN/b2b_vm_branchy.sv" --max-time 120000 )
+  # Same design with the parallel edge path FORCED on. xezim now calibrates at
+  # run time and (on machines where threading loses) picks sequential by itself,
+  # so the parallel path has to be forced to be measured at all. The ratio
+  # (branchy_par / branchy_seq) is a direct measure of thread fork/join + NBA
+  # merge cost — which is exactly what differs between x86 and Graviton, and it
+  # also tells you whether xezim's calibration made the right call on this host.
+  XEZIM_FORCE_PARALLEL=1 run B2 dispatch_branchy_par 1 4096 "$GEN/b2b_vm_branchy.sv" --max-time 120000
 fi
 
 # ---------------------------------------------------------------- B3

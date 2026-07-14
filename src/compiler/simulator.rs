@@ -2529,6 +2529,26 @@ pub struct Simulator {
     prof_waiter_iters: u64,
     prof_edges_fired: u64,
     prof_insns_executed: u64,
+    /// Auto-calibration of the parallel edge-dispatch path (see the gate in
+    /// `check_edges_inner`). The old gate assumed threading always pays once a
+    /// tick carries >=10k insns, but whether it pays at all depends on the
+    /// machine (thread handoff + NBA merge cost vs core count) and on the
+    /// block SHAPE (many tiny blocks amortize nothing). Rather than guess a
+    /// constant, measure: run the first qualifying ticks each way and keep
+    /// whichever is faster. 0 = still calibrating sequentially, 1 = calibrating
+    /// in parallel, 2 = locked.
+    par_cal_phase: u8,
+    par_cal_ticks: u32,
+    par_cal_seq_ns: u128,
+    par_cal_seq_insns: u64,
+    par_cal_par_ns: u128,
+    par_cal_par_insns: u64,
+    par_cal_use_parallel: bool,
+    /// Ticks dispatched through the parallel edge path, and blocks so
+    /// dispatched. Reported in `[PROF]` because those blocks' instructions are
+    /// executed on worker threads and are NOT included in `insns=`.
+    prof_par_ticks: u64,
+    prof_par_blocks: u64,
     prof_fallback_insns: u64,
     prof_fallback_by_reason: HashMap<&'static str, (u64, u64)>,
     prof_settle_dc_ns: u64,
@@ -3757,6 +3777,15 @@ impl Simulator {
             prof_waiter_iters: 0,
             prof_edges_fired: 0,
             prof_insns_executed: 0,
+            par_cal_phase: 0,
+            par_cal_ticks: 0,
+            par_cal_seq_ns: 0,
+            par_cal_seq_insns: 0,
+            par_cal_par_ns: 0,
+            par_cal_par_insns: 0,
+            par_cal_use_parallel: false,
+            prof_par_ticks: 0,
+            prof_par_blocks: 0,
             prof_fallback_insns: 0,
             prof_fallback_by_reason: HashMap::default(),
             prof_settle_dc_ns: 0,
@@ -14339,6 +14368,12 @@ impl Simulator {
             self.prof_clocks_only_detect,
             self.prof_nba_elided
         );
+        if self.prof_par_ticks > 0 {
+            eprintln!(
+                "[PROF] parallel_dispatch ticks={} blocks={} (their insns are NOT counted in insns= below — they run on worker threads)",
+                self.prof_par_ticks, self.prof_par_blocks
+            );
+        }
         eprintln!("[PROF] edge_detect={:.1}ms edge_exec={:.1}ms edges_fired={} insns={} ns_per_insn={:.1} fallbacks={}",
             self.prof_edge_detect as f64/1e6, self.prof_edge_exec as f64/1e6, self.prof_edges_fired,
             self.prof_insns_executed,
@@ -17414,14 +17449,42 @@ impl Simulator {
                 }
             }
 
-            // Phase 2a: execute parallel-eligible blocks with thread::scope
-            // Only parallelize when total instruction count justifies threading
-            // overhead (~5µs per spawn). Threshold: 10k+ total instructions.
-            // XEZIM_NO_PARALLEL=1 disables the parallel edge-block path —
-            // useful for ruling out thread-isolation race conditions when
-            // bisecting a CPU-stall on a deep design.
+            // Phase 2a: execute parallel-eligible blocks with thread::scope.
+            //
+            // Whether threading pays is NOT a property of the instruction count
+            // alone — it depends on the machine (thread handoff + NBA merge cost
+            // vs core count) and on the block SHAPE: 512 blocks of 40 insns each
+            // clear a 10k total easily, yet each block is far too small to
+            // amortize a hand-off, and the old fixed gate made such designs ~6x
+            // SLOWER than sequential. So instead of guessing a constant, measure
+            // it on this machine: spend the first `PAR_CAL_TICKS` qualifying ticks
+            // sequential, the next `PAR_CAL_TICKS` parallel, compare ns/insn, and
+            // keep the winner for the rest of the run.
+            //
+            // XEZIM_NO_PARALLEL=1 forces sequential; XEZIM_FORCE_PARALLEL=1 skips
+            // calibration and always threads (for A/B measurement).
+            const PAR_CAL_TICKS: u32 = 64;
             let parallel_disabled = parallel_disabled_by_env();
-            if !parallel_disabled && parallel_blocks.len() >= 2 && parallel_insn_count >= 10_000 {
+            let qualifies = parallel_blocks.len() >= 2 && parallel_insn_count >= 10_000;
+            let use_parallel = if parallel_disabled {
+                false
+            } else if std::env::var("XEZIM_FORCE_PARALLEL").ok().as_deref() == Some("1") {
+                qualifies
+            } else if !qualifies {
+                false
+            } else {
+                match self.par_cal_phase {
+                    0 => false, // measuring the sequential baseline
+                    1 => true,  // measuring the parallel path
+                    _ => self.par_cal_use_parallel,
+                }
+            };
+            let cal_t0 = if qualifies && !parallel_disabled && self.par_cal_phase < 2 {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            if use_parallel {
                 let signal_table = &self.signal_table;
                 let signal_signed = &self.signal_signed;
                 let signal_name_to_id = &self.signal_name_to_id;
@@ -17887,7 +17950,8 @@ impl Simulator {
                     }
                 }
             } else {
-                // Too few blocks for threading overhead to pay off
+                // Sequential: either the tick is too small to be worth threading,
+                // or calibration found threading to be a net loss on this machine.
                 for &bi in &parallel_blocks {
                     let t = if self.edge_block_stats_enabled {
                         Some(std::time::Instant::now())
@@ -17899,6 +17963,67 @@ impl Simulator {
                         if let Some(slot) = self.edge_block_exec_ns.get_mut(bi) {
                             *slot += t.elapsed().as_nanos() as u64;
                         }
+                    }
+                }
+            }
+
+            // The parallel path executes bytecode on worker threads, which
+            // cannot touch `prof_insns_executed` — so `insns=0`/`ns_per_insn=0`
+            // used to be reported for the very path that was running, and a
+            // profile that reads zero is worse than one that reads nothing.
+            // The workers' EXECUTED count is not recoverable without threading
+            // a counter through the whole worker protocol (and a block's static
+            // length is NOT its executed length — a `case` runs one arm), so
+            // record the dispatch itself and let the PROF line say so.
+            if use_parallel {
+                self.prof_par_ticks += 1;
+                self.prof_par_blocks += parallel_blocks.len() as u64;
+            }
+
+            // Calibration bookkeeping: fold this tick's cost into whichever
+            // phase we are measuring, and lock in the winner once both are
+            // sampled. ns/insn is the comparison metric so an uneven tick size
+            // between the two phases cannot skew the decision.
+            if let Some(t0) = cal_t0 {
+                let ns = t0.elapsed().as_nanos();
+                match self.par_cal_phase {
+                    0 => {
+                        self.par_cal_seq_ns += ns;
+                        self.par_cal_seq_insns += parallel_insn_count as u64;
+                    }
+                    1 => {
+                        self.par_cal_par_ns += ns;
+                        self.par_cal_par_insns += parallel_insn_count as u64;
+                    }
+                    _ => {}
+                }
+                self.par_cal_ticks += 1;
+                if self.par_cal_ticks >= PAR_CAL_TICKS {
+                    self.par_cal_ticks = 0;
+                    if self.par_cal_phase == 0 {
+                        self.par_cal_phase = 1;
+                    } else if self.par_cal_phase == 1 {
+                        let seq = if self.par_cal_seq_insns > 0 {
+                            self.par_cal_seq_ns as f64 / self.par_cal_seq_insns as f64
+                        } else {
+                            f64::INFINITY
+                        };
+                        let par = if self.par_cal_par_insns > 0 {
+                            self.par_cal_par_ns as f64 / self.par_cal_par_insns as f64
+                        } else {
+                            f64::INFINITY
+                        };
+                        // Require a real margin (>10%) before paying the
+                        // threading cost — a coin-flip difference is not worth
+                        // the nondeterminism.
+                        self.par_cal_use_parallel = par * 1.10 < seq;
+                        self.par_cal_phase = 2;
+                        sim_dbg_eprintln!(
+                            "[OPT] parallel edge dispatch calibrated: seq={:.1} ns/insn par={:.1} ns/insn -> {}",
+                            seq,
+                            par,
+                            if self.par_cal_use_parallel { "PARALLEL" } else { "SEQUENTIAL" }
+                        );
                     }
                 }
             }

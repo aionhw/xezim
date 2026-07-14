@@ -93,15 +93,29 @@ memory story. Without counters you can only observe the gap.
   | `dispatch_branchy` | 11,904 | 2.23 | 0.51% | 0.65% |
   | `dispatch_branchy_par` | 1,695 | 0.93 | 1.60% | 0.86% |
 
-* **A real xezim performance bug fell out of this.** xezim automatically enables
-  parallel edge dispatch once a tick has >=10k bytecode insns across
-  parallel-eligible blocks (`parallel_blocks >= 2 && parallel_insn_count >=
-  10_000`). For many small blocks it then forks/joins **per clock edge**, and on
-  this box that is **~6x SLOWER than sequential** for the identical design
-  (total 10.3s vs 1.8s; `edge_exec` 9.8s vs 1.36s), while IPC collapses to 0.93.
-  It also silently reports `insns=0`/`ns_per_insn=0`, because the parallel path
-  does not increment those counters. `XEZIM_NO_PARALLEL=1` restores the fast
-  path. This is very likely why B4 shows no scaling, and it is worth fixing in
-  xezim (the heuristic should weigh per-block work, not the tick's total insns).
+* **A real xezim performance bug fell out of this — and it is now fixed.**
+  xezim used to enable parallel edge dispatch on a fixed rule (`>= 2 blocks and
+  >= 10k bytecode insns in the tick`). That rule ignores block SHAPE: 512 blocks
+  of ~40 insns clear 10k easily, yet each is far too small to amortize a thread
+  hand-off, so xezim forked/joined **per clock edge** and ran **~6x SLOWER than
+  sequential** on the identical design (10.3s vs 1.8s). It also reported
+  `insns=0`/`ns_per_insn=0`, because worker threads never touched those counters
+  — the profile was silently lying about the very path that was running.
+
+  The gate is now **self-calibrating**: the first 64 qualifying ticks run
+  sequential, the next 64 run parallel, ns/insn is compared, and the winner is
+  locked for the rest of the run (parallel must win by >10% to be worth the
+  nondeterminism). That is also the right answer for a cross-platform suite —
+  the correct choice genuinely differs between a 6-core x86 and a 64-core
+  Graviton, and now each machine decides for itself. `XEZIM_NO_PARALLEL=1`
+  forces sequential; `XEZIM_FORCE_PARALLEL=1` forces threading (which is how
+  B2c measures thread cost). `[PROF]` now also prints
+  `parallel_dispatch ticks=… blocks=…` so the parallel path can never again
+  masquerade as zero work.
+
+  On this box calibration picks SEQUENTIAL for every design in the suite,
+  including the one shape parallelism should suit (8 blocks x ~6k insns) — so
+  xezim's parallel edge path is currently not profitable here at all. Whether
+  that holds on many-core Graviton is exactly what B2c/B4 are for.
 * For contrast, B5 (the constraint solver) runs at IPC 2.25 with a 1.1%
   branch-miss rate: it *is* the branchy, unpredictable workload of the set.
