@@ -2549,6 +2549,21 @@ pub struct Simulator {
     /// executed on worker threads and are NOT included in `insns=`.
     prof_par_ticks: u64,
     prof_par_blocks: u64,
+    /// Zero-delay (delta) livelock detection: how many event-loop iterations
+    /// have run at the CURRENT simulation time without it advancing. A design
+    /// whose processes keep re-arming at the same timestamp (`forever #0;`, a
+    /// zero-delay event ping-pong, a `wait` on an already-true condition inside
+    /// a `forever`) can never advance, and xezim used to spin silently forever
+    /// — the user just saw the sim "stuck at time 0".
+    stall_iters: u64,
+    stall_time: u64,
+    /// Process activations at the current timestamp — the accurate signal for
+    /// "who is spinning" (the event queue's own pid_counts is reset per drain).
+    stall_pid_hits: HashMap<usize, u64>,
+    /// Delta cycles allowed at one timestamp before the run is declared a
+    /// zero-delay livelock. Generous by default (real designs settle in a
+    /// handful); tune with XEZIM_STALL_LIMIT, 0 disables the check.
+    stall_limit: u64,
     prof_fallback_insns: u64,
     prof_fallback_by_reason: HashMap<&'static str, (u64, u64)>,
     prof_settle_dc_ns: u64,
@@ -3786,6 +3801,13 @@ impl Simulator {
             par_cal_use_parallel: false,
             prof_par_ticks: 0,
             prof_par_blocks: 0,
+            stall_iters: 0,
+            stall_time: 0,
+            stall_pid_hits: HashMap::default(),
+            stall_limit: std::env::var("XEZIM_STALL_LIMIT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(100_000),
             prof_fallback_insns: 0,
             prof_fallback_by_reason: HashMap::default(),
             prof_settle_dc_ns: 0,
@@ -13921,6 +13943,47 @@ impl Simulator {
     /// disabled by the LLVM threshold drop).  See diff against the
     /// pre-Phase-3 inline body for context.
     #[inline(always)]
+    /// A zero-delay livelock: `self.stall_limit` delta cycles have run at one
+    /// timestamp and time never moved. Rather than spin forever (the user just
+    /// sees "stuck at time 0"), say so and name the processes responsible —
+    /// the ones the scheduler keeps re-arming.
+    fn report_zero_delay_stall(&mut self) {
+        let mut top: Vec<(usize, u64)> =
+            self.stall_pid_hits.iter().map(|(p, c)| (*p, *c)).collect();
+        top.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        top.truncate(5);
+
+        eprintln!(
+            "[xezim][error] simulation STALLED at time {} — {} delta cycles with no time advance.",
+            self.time, self.stall_iters
+        );
+        eprintln!(
+            "               This is a zero-delay (delta) livelock: one or more processes keep"
+        );
+        eprintln!(
+            "               re-arming at the same timestamp, so simulated time can never move."
+        );
+        if !top.is_empty() {
+            eprintln!("               Most frequently scheduled processes:");
+            for (pid, count) in &top {
+                let scope = self
+                    .process_scope_hint
+                    .get(pid)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!(" in {}", s))
+                    .unwrap_or_default();
+                eprintln!("                 process {}{} — ran {} times at this timestamp", pid, scope, count);
+            }
+        }
+        eprintln!("               Common causes:");
+        eprintln!("                 * `forever` / `always` with `#0` or no timing control at all");
+        eprintln!("                 * two processes triggering each other's events with no delay");
+        eprintln!("                 * `wait (cond)` inside a `forever` where cond is already true");
+        eprintln!(
+            "               Raise or disable the check with XEZIM_STALL_LIMIT=<n> (0 = never stall-check)."
+        );
+    }
+
     fn run_one_tick(
         &mut self,
         accum: &mut PerTickAccum,
@@ -14305,6 +14368,23 @@ impl Simulator {
             }
             if next_time > self.time {
                 self.time = next_time;
+                self.stall_iters = 0;
+                self.stall_time = next_time;
+                self.stall_pid_hits.clear();
+            } else {
+                // Time did NOT advance this iteration. That is normal for a few
+                // delta cycles; it is a livelock if it never ends.
+                if self.time == self.stall_time {
+                    self.stall_iters += 1;
+                } else {
+                    self.stall_time = self.time;
+                    self.stall_iters = 1;
+                }
+                if self.stall_limit > 0 && self.stall_iters > self.stall_limit {
+                    self.report_zero_delay_stall();
+                    self.finished = true;
+                    break;
+                }
             }
 
             // Per-LP harness (step 1): rendezvous with persistent workers at
@@ -15393,6 +15473,9 @@ impl Simulator {
             RPS_DEPTH.with(|c| c.set(c.get() + 1));
             DepthGuard
         };
+        if self.stall_limit > 0 {
+            *self.stall_pid_hits.entry(pid).or_insert(0) += 1;
+        }
         sim_dbg_eprintln!(
             "[DEBUG] running process {} ({} stmts) at time {}",
             pid,
