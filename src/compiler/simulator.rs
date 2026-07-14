@@ -1889,6 +1889,15 @@ pub struct Simulator {
     /// §18.13 constraint_mode: per-instance set of constraint names that
     /// are currently disabled. `obj.cb.constraint_mode(0)` adds "cb".
     constraint_mode_disabled: HashMap<usize, HashSet<String>>,
+    /// §18.5.9/§18.6 recursion guard: depth of nested `randomize()` calls made
+    /// for `rand` class-handle members (a cyclic object graph would otherwise
+    /// recurse forever).
+    randomize_depth: usize,
+    /// IEEE 1800-2017 §18.5.11 — a `static constraint` block is SHARED by every
+    /// instance of the class: `constraint_mode()` on it through ANY instance
+    /// (or through the class scope) sets one class-wide flag. Keyed by
+    /// (declaring class, constraint name); membership == disabled.
+    static_constraint_disabled: HashSet<(String, String)>,
     /// §18.4.3 randc cycles: per-(instance, prop) set of values already
     /// drawn in the current cycle. Each randomize call must pick a value
     /// not in this set; once every value in the prop's range has been
@@ -3354,6 +3363,8 @@ impl Simulator {
             mailboxes: HashMap::default(),
             rand_mode_disabled: HashMap::default(),
             constraint_mode_disabled: HashMap::default(),
+            static_constraint_disabled: HashSet::default(),
+            randomize_depth: 0,
             randc_used: HashMap::default(),
             randc_pending: HashMap::default(),
             dist_decks: HashMap::default(),
@@ -22163,6 +22174,18 @@ impl Simulator {
                         .get_signal_value_by_name(&elem)
                         .unwrap_or_else(|| Value::new(32));
                 }
+                // §7.4.2 element of a DYNAMIC ARRAY OF DYNAMIC ARRAYS reached
+                // through a class member (`m[i][j]`, `obj.m[i][j]`): the base
+                // `m[i]` is itself a dynamic array, stored flat under the
+                // instance-scoped row name `<h>#m[i]`.
+                if let Some(row) = self.coll_elem_expr_key(expr) {
+                    if self.module.dynamic_arrays.contains(&row) {
+                        let j = self.eval_expr(index).to_i64().unwrap_or(0);
+                        return self
+                            .get_signal_value_by_name(&format!("{}[{}]", row, j))
+                            .unwrap_or_else(|| Value::zero(32));
+                    }
+                }
                 // Ascending packed vector bit-select (`logic [0:7] pa; pa[i]`):
                 // label i is the MSB end, so it reads internal bit (W-1)-i
                 // (LRM §7.4.1, §11.5.1). Whole-value storage is normal.
@@ -26444,6 +26467,47 @@ impl Simulator {
                 // Ident `b.edges` or a MemberAccess).
                 {
                     if let Some(an) = self.expr_assoc_name(array) {
+                        // §12.7.3 `foreach (m[i, j])` over a DYNAMIC ARRAY OF
+                        // DYNAMIC ARRAYS member: the inner bound is per-row
+                        // (`<h>#m[i].size`), so the two dimensions cannot be
+                        // iterated as a rectangle.
+                        if vars.len() >= 2
+                            && self.signals.contains_key(&format!("{}.size", an))
+                            && self.module.dynamic_arrays.contains(&format!("{}[0]", an))
+                        {
+                            let outer = self.get_queue_size(&an);
+                            let iv = vars[0].as_ref().map(|v| v.name.clone());
+                            let jv = vars[1].as_ref().map(|v| v.name.clone());
+                            if let Some(n) = &iv {
+                                self.widths.insert(n.clone(), 32);
+                            }
+                            if let Some(n) = &jv {
+                                self.widths.insert(n.clone(), 32);
+                            }
+                            'rows: for i in 0..outer {
+                                let inner = self.get_queue_size(&format!("{}[{}]", an, i));
+                                for j in 0..inner {
+                                    if self.finished {
+                                        break 'rows;
+                                    }
+                                    if let Some(n) = &iv {
+                                        self.set_loop_var(n, Value::from_u64(i, 32));
+                                    }
+                                    if let Some(n) = &jv {
+                                        self.set_loop_var(n, Value::from_u64(j, 32));
+                                    }
+                                    self.continue_flag = false;
+                                    self.exec_statement(body);
+                                    if self.break_flag {
+                                        break 'rows;
+                                    }
+                                    self.continue_flag = false;
+                                }
+                            }
+                            self.auto_loop_vars.truncate(fe_auto_len);
+                            self.restore_loop_vars(&fe_saved);
+                            return;
+                        }
                         if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
                             // A queue / dynamic array carries an authoritative
                             // `<name>.size` shadow and is DENSE: iterate the
@@ -33133,8 +33197,10 @@ impl Simulator {
                             return Value::from_u64(1, 32);
                         }
                     }
-                    // obj.randomize() with {...} — randomize the object, then
-                    // best-effort apply the inline constraints to its members.
+                    // §18.7 `obj.randomize() with {…}` — the inline constraints
+                    // join the class's constraint set for this call, so they
+                    // take part in sizing, element solving and the acceptance
+                    // check rather than being patched on afterwards.
                     let handle = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
                     if handle != 0 {
                         // §18.7.1 `local::` — must be bound in the CALLER's
@@ -33148,15 +33214,11 @@ impl Simulator {
                         if Self::is_randomize_check_args(args) {
                             return self.exec_randomize_check(handle, items);
                         }
-                        let r = self.exec_method_call(handle, "randomize", &[]);
-                        self.this_stack.push(Some(handle));
-                        let rand_set = self.object_rand_set(handle);
-                        for _ in 0..8 {
-                            for c in items {
-                                self.solve_forced(handle, c, &rand_set);
-                            }
-                        }
-                        self.this_stack.pop();
+                        // §18.7: the inline constraints join the class's set
+                        // for this call (sizing, element solving, acceptance).
+                        self.obj_rng_stack.push(handle);
+                        let r = self.exec_randomize_inner(handle, items);
+                        self.obj_rng_stack.pop();
                         return r;
                     }
                     return Value::zero(32);
@@ -38675,6 +38737,19 @@ impl Simulator {
                     _ => (None, None),
                 };
                 if let Some(h) = handle_opt {
+                    // §18.5.11: a static constraint block's mode is class-wide.
+                    if mname == "constraint_mode" {
+                        let en = if args.is_empty() {
+                            None
+                        } else {
+                            Some(self.eval_expr(&args[0]).to_u64().unwrap_or(0) != 0)
+                        };
+                        if let Some(v) =
+                            self.static_constraint_mode(h, target_name.as_deref(), en)
+                        {
+                            return v;
+                        }
+                    }
                     let enable = if args.is_empty() {
                         // Query form: return current state.
                         let table = if mname == "rand_mode" {
@@ -38848,6 +38923,17 @@ impl Simulator {
                         || self.module.associative_arrays.contains_key(&qn)
                     {
                         if let Some(res) = self.eval_builtin_method(&qn, mname, args) {
+                            return res;
+                        }
+                    }
+                }
+                // §7.4.2 row of a class-member DYNAMIC ARRAY OF DYNAMIC ARRAYS:
+                // `m[i].size()`. `flat_member_name` yields the unscoped
+                // `m[i]` / `obj.m[i]`, which is not the storage name — resolve
+                // the instance-scoped row (`<h>#m[i]`) instead.
+                if let Some(row) = self.coll_elem_expr_key(expr) {
+                    if self.module.dynamic_arrays.contains(&row) {
+                        if let Some(res) = self.eval_builtin_method(&row, mname, args) {
                             return res;
                         }
                     }
@@ -40062,6 +40148,21 @@ impl Simulator {
                                 .collect::<Vec<_>>()
                                 .join("."))
                         } else { None };
+                        // §18.5.11: a static constraint block's mode is shared
+                        // by every instance of the class — route it to the
+                        // class-wide flag, not this instance's set.
+                        if mname == "constraint_mode" {
+                            let en = if args.is_empty() {
+                                None
+                            } else {
+                                Some(self.eval_expr(&args[0]).to_u64().unwrap_or(0) != 0)
+                            };
+                            if let Some(v) =
+                                self.static_constraint_mode(h_val, target_name.as_deref(), en)
+                            {
+                                return v;
+                            }
+                        }
                         if args.is_empty() {
                             let table = if mname == "rand_mode" {
                                 &self.rand_mode_disabled
@@ -42861,8 +42962,6 @@ impl Simulator {
         pick
     }
 
-    /// §18.4: return a tentatively-drawn randc value to its cycle (the trial
-    /// that drew it was retried or abandoned).
     fn randc_rollback(&mut self, key: &(usize, String)) {
         if let Some((pick, prev)) = self.randc_pending.remove(key) {
             if let Some(p) = prev {
@@ -42873,8 +42972,6 @@ impl Simulator {
         }
     }
 
-    /// §18.4: give back every randc value tentatively drawn by the in-flight
-    /// randomize() call (used when randomize() fails outright).
     fn randc_rollback_all(&mut self) {
         let keys: Vec<(usize, String)> = self.randc_pending.keys().cloned().collect();
         for k in &keys {
@@ -42882,21 +42979,1452 @@ impl Simulator {
         }
     }
 
+    // =====================================================================
+    // IEEE 1800-2017 §18.4 / §18.5.9 / §18.5.10 / §18.5.11 — randomization of
+    // COLLECTION members (dynamic arrays, queues, associative arrays, and
+    // dynamic arrays of dynamic arrays), `unique {}` over them, cross-object
+    // (`rand` handle) constraints, static constraint blocks, and `solve …
+    // before …` variable ordering.
+    //
+    // Storage model (matches the rest of the simulator): a collection member
+    // `m` of the object at `h` lives in `self.signals` under the scoped names
+    //     <h>#m.size          element count (dynamic array / queue)
+    //     <h>#m[i]            element i
+    //     <h>#m[i].size       element count of the inner array (2-D dynamic)
+    //     <h>#m[i][j]         element j of inner array i
+    // Associative arrays are sparse: only the populated `<h>#m[key]` keys
+    // exist (there is no `.size` shadow).
+    // =====================================================================
 
-    /// IEEE 1800-2023 §18.14.1: `obj.randomize()` draws from the OBJECT's random
-    /// stream. Mark the object as the active stream owner for the whole solve
-    /// (constraints, dist picks, randc, pre/post_randomize) so every draw inside
-    /// `exec_randomize_solve` routes through `cur_rng()` → this object's stream
-    /// when it has been seeded (`srandom`/`set_randstate`). Nested randomize
-    /// calls stack, so an inner object still uses its own stream.
+    /// §18.5.11: when `name` is a STATIC constraint block of `handle`'s class
+    /// chain, return the class that DECLARES it. A static constraint block is
+    /// shared by every instance, so its `constraint_mode()` state is one
+    /// class-wide flag rather than a per-instance one.
+    fn static_constraint_owner(&self, handle: usize, name: &str) -> Option<String> {
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(c) = cd.constraints.get(name) {
+                return if c.is_static { Some(cn) } else { None };
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// §18.5.11 helper shared by both `constraint_mode` receiver shapes:
+    /// route a static constraint block's mode to the class-wide flag.
+    /// Returns `Some(query_result)` when the target was a static block.
+    fn static_constraint_mode(
+        &mut self,
+        handle: usize,
+        target: Option<&str>,
+        enable: Option<bool>,
+    ) -> Option<Value> {
+        let name = target?;
+        let owner = self.static_constraint_owner(handle, name)?;
+        let key = (owner, name.to_string());
+        match enable {
+            None => {
+                let disabled = self.static_constraint_disabled.contains(&key);
+                Some(Value::from_u64(if disabled { 0 } else { 1 }, 32))
+            }
+            Some(true) => {
+                self.static_constraint_disabled.remove(&key);
+                Some(Value::zero(32))
+            }
+            Some(false) => {
+                self.static_constraint_disabled.insert(key);
+                Some(Value::zero(32))
+            }
+        }
+    }
+
+    /// Declared class name of a class property, if the property is a class
+    /// HANDLE (`rand SubObject sub_inst;`). §18.5.9/§18.6: a rand handle is
+    /// not a random *value* — the object it points at is randomized, and the
+    /// enclosing object's constraints may refer to its members.
+    fn prop_class_type(&self, handle: usize, prop: &str) -> Option<String> {
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(sig) = cd.properties.get(prop) {
+                return sig
+                    .type_name
+                    .clone()
+                    .filter(|tn| self.module.classes.contains_key(tn));
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// Every rand collection member of `handle`'s class chain (skipping any
+    /// with `rand_mode(0)`), classified by kind. Fixed unpacked arrays are
+    /// included so `unique {}` / strict checking can see them, but their
+    /// element seeding stays with the legacy enum-pool pass.
+    fn collect_rand_colls(
+        &self,
+        handle: usize,
+        rand_disabled: &HashSet<String>,
+        rand_all_off: bool,
+        constraints: &[ClassConstraint],
+    ) -> Vec<RandColl> {
+        let mut out: Vec<RandColl> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::default();
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(&cn) else { break };
+            for prop in &cd.random_properties {
+                if rand_all_off || rand_disabled.contains(prop) || !seen.insert(prop.clone()) {
+                    continue;
+                }
+                let scoped = format!("{}#{}", handle, prop);
+                if let Some(&(lo, hi, w)) = cd.array_properties.get(prop) {
+                    out.push(RandColl {
+                        prop: prop.clone(),
+                        scoped,
+                        kind: CollKind::Fixed,
+                        width: w.max(1),
+                        lo,
+                        hi,
+                        nested: false,
+                    });
+                } else if cd.assoc_properties.contains_key(prop) {
+                    let w = cd.properties.get(prop).map_or(32, |s| s.width).max(1);
+                    out.push(RandColl {
+                        prop: prop.clone(),
+                        scoped,
+                        kind: CollKind::Assoc,
+                        width: w,
+                        lo: 0,
+                        hi: 0,
+                        nested: false,
+                    });
+                } else if let Some(&(w, _cap)) = cd.queue_properties.get(prop) {
+                    let nested = Self::coll_is_nested(prop, constraints);
+                    out.push(RandColl {
+                        prop: prop.clone(),
+                        scoped,
+                        kind: CollKind::Dyn,
+                        width: w.max(1),
+                        lo: 0,
+                        hi: 0,
+                        nested,
+                    });
+                }
+            }
+            cur = cd.extends.clone();
+        }
+        out
+    }
+
+    /// A dynamic array is 2-D (`bit [7:0] m[][]`) when the constraints iterate
+    /// it with two loop variables (`foreach (m[i, j])`) or size its rows
+    /// (`foreach (m[i]) m[i].size() == …`). Class elaboration only records the
+    /// OUTER unpacked dimension, so the constraint set is the shape oracle.
+    fn coll_is_nested(prop: &str, constraints: &[ClassConstraint]) -> bool {
+        fn base_name(e: &Expression) -> Option<String> {
+            match &e.kind {
+                ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
+                ExprKind::Index { expr, .. } => base_name(expr),
+                ExprKind::MemberAccess { expr, .. } => base_name(expr),
+                _ => None,
+            }
+        }
+        // A `.size()` call whose receiver is an ELEMENT of `prop` (`prop[i]`).
+        fn row_size_call(e: &Expression, prop: &str) -> bool {
+            match &e.kind {
+                ExprKind::Call { func, .. } => match &func.kind {
+                    ExprKind::MemberAccess { expr, member } => {
+                        member.name == "size"
+                            && matches!(&expr.kind, ExprKind::Index { expr: b, .. }
+                                if base_name(b).as_deref() == Some(prop))
+                    }
+                    _ => false,
+                },
+                ExprKind::Binary { left, right, .. } => {
+                    row_size_call(left, prop) || row_size_call(right, prop)
+                }
+                ExprKind::Paren(i) => row_size_call(i, prop),
+                _ => false,
+            }
+        }
+        fn walk(item: &ConstraintItem, prop: &str) -> bool {
+            match item {
+                ConstraintItem::Foreach { array, vars, item: body, .. } => {
+                    if base_name(array).as_deref() == Some(prop) && vars.len() >= 2 {
+                        return true;
+                    }
+                    walk(body, prop)
+                }
+                ConstraintItem::Expr(e) => row_size_call(e, prop),
+                ConstraintItem::Inside { expr, .. } => row_size_call(expr, prop),
+                ConstraintItem::Block(items) => items.iter().any(|i| walk(i, prop)),
+                ConstraintItem::Soft(i) => walk(i, prop),
+                ConstraintItem::Implication { constraint, .. } => walk(constraint, prop),
+                ConstraintItem::IfElse { then_item, else_item, .. } => {
+                    walk(then_item, prop)
+                        || else_item.as_ref().map_or(false, |e| walk(e, prop))
+                }
+                _ => false,
+            }
+        }
+        constraints
+            .iter()
+            .any(|c| c.items.iter().any(|i| walk(i, prop)))
+    }
+
+    /// Outer element count of a collection in its CURRENT state.
+    fn coll_outer_size(&self, c: &RandColl) -> u64 {
+        match c.kind {
+            CollKind::Fixed => (c.hi - c.lo + 1).max(0) as u64,
+            CollKind::Dyn => self.get_queue_size(&c.scoped),
+            CollKind::Assoc => self.assoc_key_strs(&c.scoped).len() as u64,
+        }
+    }
+
+    /// The populated keys of an associative-array member, in numeric (or
+    /// lexicographic, for string keys) order — the §7.8.4 iteration order.
+    fn assoc_key_strs(&self, scoped: &str) -> Vec<String> {
+        let prefix = format!("{}[", scoped);
+        let mut keys: Vec<String> = self
+            .signals
+            .keys()
+            .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
+            .map(|k| k[prefix.len()..k.len() - 1].to_string())
+            // A nested inner element (`m[0][1]`) or row-size shadow is not a key.
+            .filter(|k| !k.contains('[') && !k.contains(']'))
+            .collect();
+        if self.is_string_keyed_array(scoped) {
+            keys.sort();
+        } else {
+            keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
+        }
+        keys
+    }
+
+    /// Every element storage key of a collection, in index order.
+    fn coll_elem_keys(&self, c: &RandColl) -> Vec<String> {
+        match c.kind {
+            CollKind::Fixed => (c.lo..=c.hi)
+                .map(|i| format!("{}[{}]", c.scoped, i))
+                .collect(),
+            CollKind::Assoc => self
+                .assoc_key_strs(&c.scoped)
+                .into_iter()
+                .map(|k| format!("{}[{}]", c.scoped, k))
+                .collect(),
+            CollKind::Dyn => {
+                let n = self.get_queue_size(&c.scoped);
+                if !c.nested {
+                    return (0..n).map(|i| format!("{}[{}]", c.scoped, i)).collect();
+                }
+                let mut out = Vec::new();
+                for i in 0..n {
+                    let row = format!("{}[{}]", c.scoped, i);
+                    let m = self.get_queue_size(&row);
+                    for j in 0..m {
+                        out.push(format!("{}[{}]", row, j));
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Resolve an expression that names a collection ELEMENT (`m[i]`,
+    /// `m[i][j]`, `obj.m[k]`) to its scoped storage key. Loop variables must
+    /// already be bound on `local_stack`. Returns None when the base is not a
+    /// collection.
+    fn coll_elem_expr_key(&mut self, e: &Expression) -> Option<String> {
+        let ExprKind::Index { expr: base, index } = &e.kind else {
+            return None;
+        };
+        // Row of a 2-D dynamic array: the base is itself an element key.
+        if let Some(row) = self.coll_elem_expr_key(base) {
+            if self.module.dynamic_arrays.contains(&row) {
+                let i = self.eval_expr(index).to_i64().unwrap_or(0);
+                return Some(format!("{}[{}]", row, i));
+            }
+            return None;
+        }
+        let bn = self.expr_assoc_name(base)?;
+        let idx_val = self.eval_expr(index);
+        let key = if self.is_associative_array(&bn) {
+            self.assoc_key_str(&bn, &idx_val)
+        } else {
+            idx_val.to_i64().unwrap_or(0).to_string()
+        };
+        Some(format!("{}[{}]", bn, key))
+    }
+
+    /// Write one collection element. The instance-scoped key (`<h>#m[i]`) is
+    /// the storage of record; an ALREADY-EXISTING compact-table alias
+    /// (`m[i]`, for an array that was also materialised there) is kept in step.
+    /// A missing alias is never created — that would shadow an unrelated
+    /// module-scope array of the same name.
+    fn write_coll_elem(&mut self, key: &str, val: Value) {
+        self.signals.insert(key.to_string(), val.clone());
+        if let Some((_h, bare)) = key.split_once('#') {
+            if self.signal_name_to_id.contains_key(bare) {
+                self.set_signal_value_by_name(bare, val);
+            }
+        }
+    }
+
+    fn read_coll_elem(&self, key: &str) -> Option<Value> {
+        self.signals.get(key).cloned()
+    }
+
+    /// §18.5 — solve the `.size()` constraints of every rand dynamic array /
+    /// queue, BEFORE any element is solved: the element set does not exist
+    /// until the array has a length. Rows of a 2-D dynamic array are sized
+    /// from the `foreach (m[i]) m[i].size() == …` body.
+    fn solve_array_sizes(
+        &mut self,
+        colls: &[RandColl],
+        constraints: &[ClassConstraint],
+    ) {
+        for c in colls {
+            if c.kind != CollKind::Dyn {
+                continue;
+            }
+            let cur = self.get_queue_size(&c.scoped);
+            let n = match self.pick_size(&c.prop, None, constraints) {
+                Some(n) => n,
+                None => cur,
+            };
+            self.resize_coll(&c.scoped, n);
+            self.module.dynamic_arrays.insert(c.scoped.clone());
+            if c.nested {
+                for i in 0..n {
+                    let row = format!("{}[{}]", c.scoped, i);
+                    let cur_row = self.get_queue_size(&row);
+                    let m = self
+                        .pick_size(&c.prop, Some(i as i64), constraints)
+                        .unwrap_or(cur_row);
+                    self.resize_coll(&row, m);
+                    self.module.dynamic_arrays.insert(row);
+                }
+            }
+        }
+    }
+
+    /// Set a dynamic array's length, dropping any element storage past the
+    /// new end (a stale key would otherwise resurface as a phantom element).
+    fn resize_coll(&mut self, scoped: &str, n: u64) {
+        let old = self.get_queue_size(scoped);
+        if old > n {
+            for i in n..old {
+                self.signals.remove(&format!("{}[{}]", scoped, i));
+            }
+        }
+        self.set_queue_size(scoped, n);
+    }
+
+    /// Pick a length for `prop` (or for row `row` of it) from the constraint
+    /// set. `None` when the array's size is unconstrained — the caller keeps
+    /// the current length (§18.4: an unconstrained rand dynamic array is not
+    /// re-shaped by xezim; only its elements are drawn).
+    fn pick_size(
+        &mut self,
+        prop: &str,
+        row: Option<i64>,
+        constraints: &[ClassConstraint],
+    ) -> Option<u64> {
+        use rand::Rng;
+        let mut exact: Option<u64> = None;
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        let mut lo_b: u64 = 0;
+        let mut hi_b: u64 = 64;
+        let mut bounded = false;
+        // Every size expression is evaluated WHILE the foreach index of a row
+        // constraint is still bound, so `m[i].size() == i + 2` resolves.
+        let items = self.size_constraint_items(prop, row, constraints);
+        for kind in items {
+            match kind {
+                SizeCon::Eq(n) => exact = Some(n),
+                SizeCon::In(rs) => ranges.extend(rs),
+                SizeCon::Rel(op, v) => {
+                    bounded = true;
+                    match op {
+                        BinaryOp::Lt => hi_b = hi_b.min(v.saturating_sub(1)),
+                        BinaryOp::Leq => hi_b = hi_b.min(v),
+                        BinaryOp::Gt => lo_b = lo_b.max(v + 1),
+                        BinaryOp::Geq => lo_b = lo_b.max(v),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(n) = exact {
+            return Some(n.min(1 << 16));
+        }
+        if !ranges.is_empty() {
+            let (l, h) = ranges[self.rng.gen_range(0..ranges.len())];
+            return Some(if h > l { self.rng.gen_range(l..=h) } else { l });
+        }
+        if bounded && lo_b <= hi_b {
+            return Some(if hi_b > lo_b {
+                self.rng.gen_range(lo_b..=hi_b)
+            } else {
+                lo_b
+            });
+        }
+        None
+    }
+
+    /// Collect the `.size()` constraints that apply to `prop` (when `row` is
+    /// None) or to row `row` of it (when Some — the `foreach (m[i])
+    /// m[i].size() == …` shape, evaluated with `i` bound).
+    fn size_constraint_items(
+        &mut self,
+        prop: &str,
+        row: Option<i64>,
+        constraints: &[ClassConstraint],
+    ) -> Vec<SizeCon> {
+        let mut out: Vec<SizeCon> = Vec::new();
+        // Snapshot the items to walk without borrowing self.
+        let mut work: Vec<(ConstraintItem, Option<i64>)> = Vec::new();
+        for con in constraints {
+            for it in &con.items {
+                work.push((it.clone(), None));
+            }
+        }
+        while let Some((item, _bind)) = work.pop() {
+            match item {
+                ConstraintItem::Block(items) => {
+                    for i in items {
+                        work.push((i, None));
+                    }
+                }
+                ConstraintItem::Soft(i) => work.push((*i, None)),
+                ConstraintItem::Foreach { array, vars, item: body, .. } => {
+                    // Row sizing lives inside `foreach (m[i]) m[i].size() …`.
+                    if row.is_none() {
+                        continue;
+                    }
+                    if Self::foreach_base_name(&array).as_deref() != Some(prop) {
+                        continue;
+                    }
+                    let Some(idx_name) =
+                        vars.first().and_then(|v| v.as_ref().map(|i| i.name.clone()))
+                    else {
+                        continue;
+                    };
+                    let mut frame: HashMap<String, Value> = HashMap::default();
+                    frame.insert(idx_name, Value::from_u64(row.unwrap() as u64, 32));
+                    self.local_stack.push(frame);
+                    let mut inner = self.size_cons_in_item(&body, prop, true);
+                    self.local_stack.pop();
+                    out.append(&mut inner);
+                }
+                other => {
+                    if row.is_none() {
+                        let mut got = self.size_cons_in_item(&other, prop, false);
+                        out.append(&mut got);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Extract size constraints from one (non-foreach) item. `row` selects
+    /// between a whole-array receiver (`m.size()`) and a row receiver
+    /// (`m[i].size()`).
+    fn size_cons_in_item(
+        &mut self,
+        item: &ConstraintItem,
+        prop: &str,
+        row: bool,
+    ) -> Vec<SizeCon> {
+        let mut out: Vec<SizeCon> = Vec::new();
+        match item {
+            ConstraintItem::Block(items) => {
+                for i in items {
+                    out.append(&mut self.size_cons_in_item(i, prop, row));
+                }
+            }
+            ConstraintItem::Soft(i) => out.append(&mut self.size_cons_in_item(i, prop, row)),
+            ConstraintItem::Inside { expr, range, is_dist, .. } => {
+                if !*is_dist && Self::is_size_call(expr, prop, row) {
+                    let rs = range.clone();
+                    out.push(SizeCon::In(self.eval_range_list(&rs)));
+                }
+            }
+            ConstraintItem::Expr(e) => match &e.kind {
+                ExprKind::Binary { op, left, right } => {
+                    let (sz_side, other, flip) = if Self::is_size_call(left, prop, row) {
+                        (true, right, false)
+                    } else if Self::is_size_call(right, prop, row) {
+                        (true, left, true)
+                    } else {
+                        (false, right, false)
+                    };
+                    if sz_side {
+                        let eff = if flip {
+                            match op {
+                                BinaryOp::Lt => BinaryOp::Gt,
+                                BinaryOp::Gt => BinaryOp::Lt,
+                                BinaryOp::Leq => BinaryOp::Geq,
+                                BinaryOp::Geq => BinaryOp::Leq,
+                                o => *o,
+                            }
+                        } else {
+                            *op
+                        };
+                        let other = (**other).clone();
+                        match eff {
+                            BinaryOp::Eq => {
+                                if let Some(n) = self.eval_expr(&other).to_u64() {
+                                    out.push(SizeCon::Eq(n));
+                                }
+                            }
+                            BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq => {
+                                let v = self.eval_expr(&other).to_u64().unwrap_or(0);
+                                out.push(SizeCon::Rel(eff, v));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ExprKind::Inside { expr: inner, ranges } => {
+                    if Self::is_size_call(inner, prop, row) {
+                        let cr: Vec<ConstraintRange> = ranges
+                            .iter()
+                            .map(|r| match &r.kind {
+                                ExprKind::Range(lo, hi) => ConstraintRange::Range {
+                                    lo: (**lo).clone(),
+                                    hi: (**hi).clone(),
+                                },
+                                _ => ConstraintRange::Value(r.clone()),
+                            })
+                            .collect();
+                        out.push(SizeCon::In(self.eval_range_list(&cr)));
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        out
+    }
+
+    /// Evaluate a constraint range list to concrete inclusive (lo, hi) pairs.
+    fn eval_range_list(&mut self, ranges: &[ConstraintRange]) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        for r in ranges {
+            match r {
+                ConstraintRange::Value(e) => {
+                    if let Some(u) = self.eval_expr(e).to_u64() {
+                        out.push((u, u));
+                    }
+                }
+                ConstraintRange::Range { lo, hi } => {
+                    let l = self.eval_expr(lo).to_u64().unwrap_or(0);
+                    let h = self.eval_expr(hi).to_u64().unwrap_or(l);
+                    out.push((l.min(h), l.max(h)));
+                }
+            }
+        }
+        out
+    }
+
+    /// `m.size()` (row=false) / `m[i].size()` (row=true) receiver test.
+    fn is_size_call(e: &Expression, prop: &str, row: bool) -> bool {
+        let ExprKind::Call { func, args } = &e.kind else { return false };
+        if !args.is_empty() {
+            return false;
+        }
+        let ExprKind::MemberAccess { expr: recv, member } = &func.kind else {
+            return false;
+        };
+        if member.name != "size" {
+            return false;
+        }
+        match (&recv.kind, row) {
+            (ExprKind::Ident(h), false) => {
+                h.path.last().map_or(false, |s| s.name.name == prop)
+            }
+            (ExprKind::Index { expr: b, .. }, true) => match &b.kind {
+                ExprKind::Ident(h) => h.path.last().map_or(false, |s| s.name.name == prop),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Bare array name of a `foreach (arr[i])` / `foreach (arr[i, j])` header.
+    fn foreach_base_name(array: &Expression) -> Option<String> {
+        match &array.kind {
+            ExprKind::Index { expr, .. } => Self::foreach_base_name(expr),
+            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
+            ExprKind::MemberAccess { member, .. } => Some(member.name.clone()),
+            _ => None,
+        }
+    }
+
+    /// Draw a fresh random value for an unconstrained collection element.
+    /// A drawn value that repeats the element's PREVIOUS content is re-rolled
+    /// a few times: `randomize()` must visibly re-draw every rand element
+    /// (§18.4), and a pre-seeded associative entry that came back identical is
+    /// indistinguishable from "the solver never touched it".
+    fn draw_elem(&mut self, width: u32, prev: Option<u64>) -> Value {
+        use rand::Rng;
+        let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+        let mut v = self.rng.gen::<u64>() & mask;
+        if mask > 0 {
+            for _ in 0..8 {
+                if Some(v) != prev {
+                    break;
+                }
+                v = self.rng.gen::<u64>() & mask;
+            }
+        }
+        Value::from_u64(v, width)
+    }
+
+    /// The value ranges an element of `prop` is restricted to by
+    /// `foreach (prop[i]) prop[i] inside {…}` bodies. Used by the `unique {}`
+    /// repair so a distinct re-pick stays inside the element's legal domain.
+    fn elem_allowed_ranges(
+        &mut self,
+        prop: &str,
+        constraints: &[ClassConstraint],
+    ) -> Vec<(u64, u64)> {
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        let mut ranges_expr: Vec<Vec<ConstraintRange>> = Vec::new();
+        fn walk(item: &ConstraintItem, prop: &str, out: &mut Vec<Vec<ConstraintRange>>) {
+            match item {
+                ConstraintItem::Expr(e) => {
+                    if let ExprKind::Inside { expr: inner, ranges } = &e.kind {
+                        let is_elem = matches!(&inner.kind, ExprKind::Index { expr: b, .. }
+                            if matches!(&b.kind, ExprKind::Ident(h)
+                                if h.path.last().map_or(false, |s| s.name.name == prop)));
+                        if is_elem {
+                            out.push(
+                                ranges
+                                    .iter()
+                                    .map(|r| match &r.kind {
+                                        ExprKind::Range(lo, hi) => ConstraintRange::Range {
+                                            lo: (**lo).clone(),
+                                            hi: (**hi).clone(),
+                                        },
+                                        _ => ConstraintRange::Value(r.clone()),
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    }
+                }
+                ConstraintItem::Inside { expr, range, is_dist, .. } => {
+                    let is_elem = matches!(&expr.kind, ExprKind::Index { expr: b, .. }
+                        if matches!(&b.kind, ExprKind::Ident(h)
+                            if h.path.last().map_or(false, |s| s.name.name == prop)));
+                    if is_elem && !*is_dist {
+                        out.push(range.clone());
+                    }
+                }
+                ConstraintItem::Block(items) => {
+                    for i in items {
+                        walk(i, prop, out);
+                    }
+                }
+                ConstraintItem::Soft(i) => walk(i, prop, out),
+                ConstraintItem::Foreach { array, item: body, .. } => {
+                    if Simulator::foreach_base_name(array).as_deref() == Some(prop) {
+                        walk(body, prop, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for con in constraints {
+            for it in &con.items {
+                walk(it, prop, &mut ranges_expr);
+            }
+        }
+        for rs in ranges_expr {
+            for r in &rs {
+                match r {
+                    ConstraintRange::Value(e) => {
+                        if let Some(u) = self.eval_expr(e).to_u64() {
+                            out.push((u, u));
+                        }
+                    }
+                    ConstraintRange::Range { lo, hi } => {
+                        let l = self.eval_expr(lo).to_u64().unwrap_or(0);
+                        let h = self.eval_expr(hi).to_u64().unwrap_or(l);
+                        out.push((l.min(h), l.max(h)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// §18.5.7 — solve every `foreach` constraint over a rand COLLECTION
+    /// (dynamic array / queue / associative array / 2-D dynamic array).
+    /// For each element: first try the structural repair (`elem == expr`,
+    /// `elem inside {…}`, `elem < K`), then fall back to a bounded
+    /// generate-and-test over the element's domain, which covers arbitrary
+    /// bodies such as `q[i] % 2 == 0`. Returns the keys pinned by an equality
+    /// (they must survive the later `unique {}` repair).
+    fn solve_coll_foreach(
+        &mut self,
+        handle: usize,
+        colls: &[RandColl],
+        constraints: &[ClassConstraint],
+        pinned: &mut HashSet<String>,
+    ) {
+        // (prop, vars, body) for every foreach over a collection we manage.
+        let mut jobs: Vec<(RandColl, Vec<Option<crate::ast::Identifier>>, ConstraintItem)> = Vec::new();
+        fn walk(
+            item: &ConstraintItem,
+            colls: &[RandColl],
+            jobs: &mut Vec<(RandColl, Vec<Option<crate::ast::Identifier>>, ConstraintItem)>,
+        ) {
+            match item {
+                ConstraintItem::Foreach { array, vars, item: body, .. } => {
+                    if let Some(name) = Simulator::foreach_base_name(array) {
+                        if let Some(c) = colls.iter().find(|c| c.prop == name) {
+                            if c.kind != CollKind::Fixed {
+                                jobs.push((c.clone(), vars.clone(), (**body).clone()));
+                            }
+                        }
+                    }
+                }
+                ConstraintItem::Block(items) => {
+                    for i in items {
+                        walk(i, colls, jobs);
+                    }
+                }
+                ConstraintItem::Soft(i) => walk(i, colls, jobs),
+                _ => {}
+            }
+        }
+        for con in constraints {
+            for it in &con.items {
+                walk(it, colls, &mut jobs);
+            }
+        }
+        for (c, vars, body) in jobs {
+            let idx_names: Vec<Option<String>> = vars
+                .iter()
+                .map(|v| v.as_ref().map(|i| i.name.clone()))
+                .collect();
+            match c.kind {
+                CollKind::Assoc => {
+                    for key in self.assoc_key_strs(&c.scoped) {
+                        let mut frame: HashMap<String, Value> = HashMap::default();
+                        if let Some(Some(n)) = idx_names.first() {
+                            let kv = if self.is_string_keyed_array(&c.scoped) {
+                                Value::from_string(&key)
+                            } else {
+                                Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, 32)
+                            };
+                            frame.insert(n.clone(), kv);
+                        }
+                        self.local_stack.push(frame);
+                        let ek = format!("{}[{}]", c.scoped, key);
+                        if self.solve_one_elem(handle, &body, &ek, c.width, &c.prop, constraints) {
+                            pinned.insert(ek);
+                        }
+                        self.local_stack.pop();
+                    }
+                }
+                CollKind::Dyn | CollKind::Fixed => {
+                    let outer = self.coll_outer_size(&c);
+                    for i in 0..outer as i64 {
+                        if c.nested && idx_names.len() >= 2 {
+                            let row = format!("{}[{}]", c.scoped, i);
+                            let inner = self.get_queue_size(&row) as i64;
+                            for j in 0..inner {
+                                let mut frame: HashMap<String, Value> = HashMap::default();
+                                if let Some(Some(n)) = idx_names.first() {
+                                    frame.insert(n.clone(), Value::from_u64(i as u64, 32));
+                                }
+                                if let Some(Some(n)) = idx_names.get(1) {
+                                    frame.insert(n.clone(), Value::from_u64(j as u64, 32));
+                                }
+                                self.local_stack.push(frame);
+                                let ek = format!("{}[{}]", row, j);
+                                if self.solve_one_elem(
+                                    handle, &body, &ek, c.width, &c.prop, constraints,
+                                ) {
+                                    pinned.insert(ek);
+                                }
+                                self.local_stack.pop();
+                            }
+                            continue;
+                        }
+                        let mut frame: HashMap<String, Value> = HashMap::default();
+                        if let Some(Some(n)) = idx_names.first() {
+                            frame.insert(n.clone(), Value::from_u64(i as u64, 32));
+                        }
+                        self.local_stack.push(frame);
+                        // A 1-var foreach over a 2-D array constrains the ROW
+                        // (its `.size()`), already handled by the sizing pass.
+                        if !c.nested {
+                            let ek = format!("{}[{}]", c.scoped, i);
+                            if self.solve_one_elem(
+                                handle, &body, &ek, c.width, &c.prop, constraints,
+                            ) {
+                                pinned.insert(ek);
+                            }
+                        }
+                        self.local_stack.pop();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Solve one element against a `foreach` body. Returns true when the body
+    /// PINS the element to an exact value (an equality) — such an element must
+    /// not be moved by the later `unique {}` repair.
+    fn solve_one_elem(
+        &mut self,
+        handle: usize,
+        body: &ConstraintItem,
+        elem_key: &str,
+        width: u32,
+        prop: &str,
+        constraints: &[ClassConstraint],
+    ) -> bool {
+        let pinned = self.force_elem_item(handle, body, elem_key, width);
+        // Structural repair may not cover the body (`q[i] % 2 == 0`,
+        // `q[i] > q[i-1]`, …). Fall back to generate-and-test over the
+        // element's domain — the bounded backstop that keeps randomize()
+        // honest for bodies the pattern matcher does not model.
+        if self.item_holds(handle, body) {
+            return pinned;
+        }
+        let allowed = self.elem_allowed_ranges(prop, constraints);
+        let saved = self.read_coll_elem(elem_key);
+        for _ in 0..256 {
+            let cand = if allowed.is_empty() {
+                self.draw_elem(width, None)
+            } else {
+                use rand::Rng;
+                let (l, h) = allowed[self.rng.gen_range(0..allowed.len())];
+                let v = if h > l { self.rng.gen_range(l..=h) } else { l };
+                Value::from_u64(v, width)
+            };
+            self.write_coll_elem(elem_key, cand);
+            if self.item_holds(handle, body) {
+                return pinned;
+            }
+        }
+        // Exhaustive sweep of a small domain — guarantees a solution exists
+        // (or proves there is none) rather than leaving a random value.
+        if width <= 16 {
+            for v in 0..(1u64 << width) {
+                self.write_coll_elem(elem_key, Value::from_u64(v, width));
+                if self.item_holds(handle, body) {
+                    return pinned;
+                }
+            }
+        }
+        if let Some(s) = saved {
+            self.write_coll_elem(elem_key, s);
+        }
+        pinned
+    }
+
+    /// Structural repair of a `foreach` body for one element: `elem == expr`
+    /// pins it, `elem inside {…}` / `elem < K` move it into range. Returns
+    /// true when an EQUALITY pinned the element.
+    fn force_elem_item(
+        &mut self,
+        handle: usize,
+        item: &ConstraintItem,
+        elem_key: &str,
+        width: u32,
+    ) -> bool {
+        match item {
+            ConstraintItem::Block(items) => {
+                let mut pinned = false;
+                for i in items {
+                    if self.force_elem_item(handle, i, elem_key, width) {
+                        pinned = true;
+                    }
+                }
+                pinned
+            }
+            ConstraintItem::Soft(i) => self.force_elem_item(handle, i, elem_key, width),
+            ConstraintItem::Implication { condition, constraint, .. } => {
+                if self.eval_expr(condition).is_true() {
+                    self.force_elem_item(handle, constraint, elem_key, width)
+                } else {
+                    false
+                }
+            }
+            ConstraintItem::IfElse { condition, then_item, else_item, .. } => {
+                if self.eval_expr(condition).is_true() {
+                    self.force_elem_item(handle, then_item, elem_key, width)
+                } else if let Some(e) = else_item {
+                    self.force_elem_item(handle, e, elem_key, width)
+                } else {
+                    false
+                }
+            }
+            ConstraintItem::Inside { expr, range, is_dist, .. } => {
+                if *is_dist || self.coll_elem_expr_key(expr).as_deref() != Some(elem_key) {
+                    return false;
+                }
+                let cur = self
+                    .read_coll_elem(elem_key)
+                    .unwrap_or_else(|| Value::zero(width));
+                if !self.value_in_ranges(&cur, range) {
+                    if let Some(p) = self.pick_from_ranges(range, width) {
+                        self.write_coll_elem(elem_key, p);
+                    }
+                }
+                false
+            }
+            ConstraintItem::Expr(e) => match &e.kind {
+                // The parser keeps a parenthesised constraint expression
+                // wrapped; unwrap so `(q[i] == i)` is solved like `q[i] == i`.
+                ExprKind::Paren(inner) => {
+                    let it = ConstraintItem::Expr((**inner).clone());
+                    self.force_elem_item(handle, &it, elem_key, width)
+                }
+                ExprKind::Inside { expr: inner, ranges } => {
+                    if self.coll_elem_expr_key(inner).as_deref() != Some(elem_key) {
+                        return false;
+                    }
+                    let cr: Vec<ConstraintRange> = ranges
+                        .iter()
+                        .map(|r| match &r.kind {
+                            ExprKind::Range(lo, hi) => ConstraintRange::Range {
+                                lo: (**lo).clone(),
+                                hi: (**hi).clone(),
+                            },
+                            _ => ConstraintRange::Value(r.clone()),
+                        })
+                        .collect();
+                    let cur = self
+                        .read_coll_elem(elem_key)
+                        .unwrap_or_else(|| Value::zero(width));
+                    if !self.value_in_ranges(&cur, &cr) {
+                        if let Some(p) = self.pick_from_ranges(&cr, width) {
+                            self.write_coll_elem(elem_key, p);
+                        }
+                    }
+                    false
+                }
+                ExprKind::Binary { op, left, right } => {
+                    let on_l = self.coll_elem_expr_key(left).as_deref() == Some(elem_key);
+                    let on_r = self.coll_elem_expr_key(right).as_deref() == Some(elem_key);
+                    if on_l == on_r {
+                        return false; // cross-element or unrelated
+                    }
+                    let (other, eff) = if on_l {
+                        (right, *op)
+                    } else {
+                        let m = match op {
+                            BinaryOp::Lt => BinaryOp::Gt,
+                            BinaryOp::Gt => BinaryOp::Lt,
+                            BinaryOp::Leq => BinaryOp::Geq,
+                            BinaryOp::Geq => BinaryOp::Leq,
+                            o => *o,
+                        };
+                        (left, m)
+                    };
+                    match eff {
+                        BinaryOp::Eq => {
+                            let v = self.eval_expr(other).resize(width);
+                            self.write_coll_elem(elem_key, v);
+                            true
+                        }
+                        BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq => {
+                            use rand::Rng;
+                            let b = self.eval_expr(other).to_i64().unwrap_or(0);
+                            let cur = self
+                                .read_coll_elem(elem_key)
+                                .and_then(|v| v.to_i64())
+                                .unwrap_or(0);
+                            let (mut lo, mut hi) = (
+                                0i64,
+                                if width >= 63 { i64::MAX } else { (1i64 << width) - 1 },
+                            );
+                            match eff {
+                                BinaryOp::Lt => hi = hi.min(b.saturating_sub(1)),
+                                BinaryOp::Leq => hi = hi.min(b),
+                                BinaryOp::Gt => lo = lo.max(b.saturating_add(1)),
+                                BinaryOp::Geq => lo = lo.max(b),
+                                _ => {}
+                            }
+                            if lo > hi || (cur >= lo && cur <= hi) {
+                                return false;
+                            }
+                            let p = if lo == hi { lo } else { self.rng.gen_range(lo..=hi) };
+                            self.write_coll_elem(elem_key, Value::from_u64(p as u64, width));
+                            false
+                        }
+                        _ => false,
+                    }
+                }
+                _ => {
+                    let _ = handle;
+                    false
+                }
+            },
+            _ => false,
+        }
+    }
+
+    /// Truth of one constraint item (a `foreach` BODY, or a plain item)
+    /// against the CURRENT solved state — the acceptance test of the
+    /// generate-and-test element search. Loop variables must already be bound
+    /// on `local_stack`.
+    fn item_holds(&mut self, handle: usize, item: &ConstraintItem) -> bool {
+        self.check_constraint_item(handle, item)
+    }
+
+    /// Constraints that name a collection ELEMENT outside any `foreach`
+    /// (`q[0] == 8'd99`, typically from an inline `randomize() with {…}`, and
+    /// `q[0] inside {…}`). Elements pinned by an equality are recorded so the
+    /// `unique {}` repair leaves them alone.
+    fn solve_top_level_elems(
+        &mut self,
+        handle: usize,
+        constraints: &[ClassConstraint],
+        pinned: &mut HashSet<String>,
+    ) {
+        let mut items: Vec<ConstraintItem> = Vec::new();
+        fn walk(item: &ConstraintItem, out: &mut Vec<ConstraintItem>) {
+            match item {
+                ConstraintItem::Block(is) => {
+                    for i in is {
+                        walk(i, out);
+                    }
+                }
+                ConstraintItem::Soft(i) => walk(i, out),
+                ConstraintItem::Foreach { .. } | ConstraintItem::Unique { .. } => {}
+                other => out.push(other.clone()),
+            }
+        }
+        for con in constraints {
+            for it in &con.items {
+                walk(it, &mut items);
+            }
+        }
+        for item in items {
+            // Resolve the element key of whichever side names an element.
+            let key = match &item {
+                ConstraintItem::Expr(e) => match &e.kind {
+                    ExprKind::Binary { left, right, .. } => self
+                        .coll_elem_expr_key(left)
+                        .or_else(|| self.coll_elem_expr_key(right)),
+                    ExprKind::Inside { expr, .. } => self.coll_elem_expr_key(expr),
+                    _ => None,
+                },
+                ConstraintItem::Inside { expr, .. } => self.coll_elem_expr_key(expr),
+                _ => None,
+            };
+            let Some(key) = key else { continue };
+            let width = self
+                .read_coll_elem(&key)
+                .map(|v| v.width)
+                .unwrap_or(32)
+                .max(1);
+            if self.force_elem_item(handle, &item, &key, width) {
+                pinned.insert(key);
+            }
+        }
+    }
+
+    /// §18.5.9 — an lvalue reaching THROUGH a rand class-handle member
+    /// (`sub_inst.sub_data`). Returns the sub-object's handle and the member
+    /// name, so a cross-object equality can be forced onto it.
+    fn cross_obj_lvalue(&mut self, e: &Expression) -> Option<(usize, String)> {
+        let (obj, field) = match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 2 => (
+                h.path[0].name.name.clone(),
+                h.path[1].name.name.clone(),
+            ),
+            ExprKind::MemberAccess { expr: base, member } => match &base.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 => {
+                    (h.path[0].name.name.clone(), member.name.clone())
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let this = self.this_stack.last().copied().flatten()?;
+        // `obj` must be a class-handle member of the enclosing object.
+        if self.prop_class_type(this, &obj).is_none() {
+            return None;
+        }
+        let sub = self
+            .heap
+            .get(this)
+            .and_then(|o| o.as_ref())
+            .and_then(|i| i.properties.get(&obj))
+            .and_then(|v| v.to_u64())
+            .unwrap_or(0) as usize;
+        if sub == 0 || self.heap.get(sub).and_then(|o| o.as_ref()).is_none() {
+            return None;
+        }
+        // Only a rand member of the sub-object may be forced.
+        if !self.object_rand_set(sub).contains(&field) {
+            return None;
+        }
+        Some((sub, field))
+    }
+
+    /// §18.5.5 / §18.5.9 — `unique {c}` over a rand collection: make every
+    /// element pairwise distinct. Elements pinned by an equality constraint
+    /// keep their value; the rest are re-picked from the element's legal
+    /// domain (the `foreach … inside {…}` ranges, when any).
+    fn enforce_unique_coll(
+        &mut self,
+        c: &RandColl,
+        constraints: &[ClassConstraint],
+        pinned: &HashSet<String>,
+    ) {
+        use rand::Rng;
+        let keys = self.coll_elem_keys(c);
+        if keys.len() < 2 {
+            return;
+        }
+        let allowed = self.elem_allowed_ranges(&c.prop, constraints);
+        let domain: Vec<(u64, u64)> = if allowed.is_empty() {
+            let hi = if c.width >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << c.width) - 1
+            };
+            vec![(0, hi)]
+        } else {
+            allowed
+        };
+        let total: u64 = domain.iter().map(|(l, h)| h - l + 1).sum();
+        if total < keys.len() as u64 {
+            return; // provably impossible — leave for the checker to reject
+        }
+        let mut used: HashSet<u64> = HashSet::default();
+        // Pinned elements claim their value first, so a free element never
+        // steals it and forces the pinned one to move.
+        for k in &keys {
+            if pinned.contains(k) {
+                if let Some(v) = self.read_coll_elem(k).and_then(|v| v.to_u64()) {
+                    used.insert(v);
+                }
+            }
+        }
+        for k in &keys {
+            if pinned.contains(k) {
+                continue;
+            }
+            let cur = self.read_coll_elem(k).and_then(|v| v.to_u64());
+            let in_domain = cur.map_or(false, |v| {
+                domain.iter().any(|(l, h)| v >= *l && v <= *h)
+            });
+            if let Some(v) = cur {
+                if in_domain && used.insert(v) {
+                    continue; // already distinct and legal
+                }
+            }
+            // Re-pick: random draws from the legal domain, then an exhaustive
+            // sweep so a tight domain still converges.
+            let mut pick: Option<u64> = None;
+            for _ in 0..256 {
+                let (l, h) = domain[self.rng.gen_range(0..domain.len())];
+                let v = if h > l { self.rng.gen_range(l..=h) } else { l };
+                if !used.contains(&v) {
+                    pick = Some(v);
+                    break;
+                }
+            }
+            if pick.is_none() {
+                'sweep: for (l, h) in &domain {
+                    let mut v = *l;
+                    loop {
+                        if !used.contains(&v) {
+                            pick = Some(v);
+                            break 'sweep;
+                        }
+                        if v == *h {
+                            break;
+                        }
+                        v += 1;
+                    }
+                }
+            }
+            if let Some(v) = pick {
+                used.insert(v);
+                self.write_coll_elem(k, Value::from_u64(v, c.width));
+            }
+        }
+    }
+
+    /// Strict acceptance test for a constraint item that targets a rand
+    /// COLLECTION. `None` means "not one of ours" — the caller falls back to
+    /// the legacy (unmodeled-skipping) check.
+    ///
+    /// Covers, per §18.4/§18.5.5/§18.5.7:
+    ///   * `a.size() == / inside / < …` on a sized dynamic array,
+    ///   * `foreach (a[i]) …` and `foreach (a[i, j]) …` bodies, element by
+    ///     element with the loop variables bound,
+    ///   * `unique {a}` distinctness.
+    fn coll_item_check(
+        &mut self,
+        handle: usize,
+        item: &ConstraintItem,
+        colls: &[RandColl],
+    ) -> Option<bool> {
+        match item {
+            ConstraintItem::Unique { exprs, .. } => {
+                let name = match exprs.first().map(|e| &e.kind) {
+                    Some(ExprKind::Ident(h)) => h.path.last().map(|s| s.name.name.clone())?,
+                    _ => return None,
+                };
+                let c = colls.iter().find(|c| c.prop == name)?.clone();
+                Some(self.coll_is_unique(&c))
+            }
+            ConstraintItem::Foreach { array, vars, item: body, .. } => {
+                let name = Self::foreach_base_name(array)?;
+                let c = colls.iter().find(|c| c.prop == name)?.clone();
+                if c.kind == CollKind::Fixed {
+                    return None; // legacy path owns fixed rand arrays
+                }
+                let idx: Vec<Option<String>> = vars
+                    .iter()
+                    .map(|v| v.as_ref().map(|i| i.name.clone()))
+                    .collect();
+                let body = (**body).clone();
+                Some(self.check_coll_foreach(handle, &c, &idx, &body))
+            }
+            ConstraintItem::Expr(_) | ConstraintItem::Inside { .. } => {
+                // A `.size()` constraint on a collection we sized is checkable.
+                let names: Vec<String> = colls
+                    .iter()
+                    .filter(|c| c.kind == CollKind::Dyn)
+                    .map(|c| c.prop.clone())
+                    .collect();
+                let touches = names
+                    .iter()
+                    .any(|n| Self::item_has_size_call(item, n));
+                if !touches {
+                    return None;
+                }
+                Some(self.check_constraint_item(handle, item))
+            }
+            _ => None,
+        }
+    }
+
+    /// Does the item contain a `<prop>.size()` / `<prop>[i].size()` call?
+    fn item_has_size_call(item: &ConstraintItem, prop: &str) -> bool {
+        fn in_expr(e: &Expression, prop: &str) -> bool {
+            if Simulator::is_size_call(e, prop, false) || Simulator::is_size_call(e, prop, true) {
+                return true;
+            }
+            match &e.kind {
+                ExprKind::Binary { left, right, .. } => {
+                    in_expr(left, prop) || in_expr(right, prop)
+                }
+                ExprKind::Unary { operand, .. } => in_expr(operand, prop),
+                ExprKind::Paren(i) => in_expr(i, prop),
+                ExprKind::Inside { expr, ranges } => {
+                    in_expr(expr, prop) || ranges.iter().any(|r| in_expr(r, prop))
+                }
+                _ => false,
+            }
+        }
+        match item {
+            ConstraintItem::Expr(e) => in_expr(e, prop),
+            ConstraintItem::Inside { expr, .. } => in_expr(expr, prop),
+            _ => false,
+        }
+    }
+
+    /// Evaluate a `foreach` body against every element of a collection.
+    fn check_coll_foreach(
+        &mut self,
+        handle: usize,
+        c: &RandColl,
+        idx_names: &[Option<String>],
+        body: &ConstraintItem,
+    ) -> bool {
+        let mut ok = true;
+        match c.kind {
+            CollKind::Assoc => {
+                for key in self.assoc_key_strs(&c.scoped) {
+                    let mut frame: HashMap<String, Value> = HashMap::default();
+                    if let Some(Some(n)) = idx_names.first() {
+                        let kv = if self.is_string_keyed_array(&c.scoped) {
+                            Value::from_string(&key)
+                        } else {
+                            Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, 32)
+                        };
+                        frame.insert(n.clone(), kv);
+                    }
+                    self.local_stack.push(frame);
+                    let good = self.item_holds(handle, body);
+                    self.local_stack.pop();
+                    if !good {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            _ => {
+                let outer = self.coll_outer_size(c) as i64;
+                'outer: for i in 0..outer {
+                    let inner_n = if c.nested && idx_names.len() >= 2 {
+                        self.get_queue_size(&format!("{}[{}]", c.scoped, i)) as i64
+                    } else {
+                        1
+                    };
+                    for j in 0..inner_n {
+                        let mut frame: HashMap<String, Value> = HashMap::default();
+                        if let Some(Some(n)) = idx_names.first() {
+                            frame.insert(n.clone(), Value::from_u64(i as u64, 32));
+                        }
+                        if c.nested && idx_names.len() >= 2 {
+                            if let Some(Some(n)) = idx_names.get(1) {
+                                frame.insert(n.clone(), Value::from_u64(j as u64, 32));
+                            }
+                        }
+                        self.local_stack.push(frame);
+                        let good = self.item_holds(handle, body);
+                        self.local_stack.pop();
+                        if !good {
+                            ok = false;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        ok
+    }
+
+    /// §18.5.10 — is uniform rejection sampling the right solver for this
+    /// class? It reproduces the LRM's solution-space distribution exactly, but
+    /// only where every constraint is (a) checkable and (b) free of the
+    /// mechanisms whose semantics are NOT "uniform over the solution space":
+    ///
+    ///   * `solve X before Y`      — the ordering hint deliberately REPLACES
+    ///                               solution-space weighting (§18.5.10); the
+    ///                               propagation solver already draws X first.
+    ///   * `dist`                  — weighted by construction (§18.5.4).
+    ///   * `soft`                  — may legally be violated (§18.5.14), so a
+    ///                               reject-on-violation loop would over-reject.
+    ///   * `randc`                 — cycles, not independent draws (§18.4.3).
+    ///   * collections / handles   — solved by the dedicated pipeline.
+    ///   * `real`                  — not a finite domain.
+    ///
+    /// Requiring at least one CONDITIONAL item keeps the pre-pass off the hot
+    /// path of classes whose constraints are independent per variable, where
+    /// propagation already yields the correct (uniform) distribution.
+    fn rejection_sample_ok(
+        &self,
+        constraints: &[ClassConstraint],
+        rand_props: &[(String, u32)],
+        randc_set: &HashSet<String>,
+        real_rand_props: &HashSet<String>,
+        colls: &[RandColl],
+        handles: &[String],
+    ) -> bool {
+        if rand_props.is_empty()
+            || !colls.is_empty()
+            || !handles.is_empty()
+            || !randc_set.is_empty()
+            || !real_rand_props.is_empty()
+        {
+            return false;
+        }
+        // A wide domain makes uniform rejection hopeless; the propagation
+        // solver handles those (and is what the tests expect there).
+        if rand_props.iter().any(|(_, w)| *w > 16) {
+            return false;
+        }
+        let mut has_cond = false;
+        fn scan(item: &ConstraintItem, has_cond: &mut bool) -> bool {
+            match item {
+                ConstraintItem::Solve { .. } | ConstraintItem::Soft(_) => false,
+                ConstraintItem::Inside { is_dist, .. } => !*is_dist,
+                ConstraintItem::Implication { constraint, .. } => {
+                    *has_cond = true;
+                    scan(constraint, has_cond)
+                }
+                ConstraintItem::IfElse { then_item, else_item, .. } => {
+                    *has_cond = true;
+                    scan(then_item, has_cond)
+                        && else_item.as_ref().map_or(true, |e| scan(e, has_cond))
+                }
+                ConstraintItem::Block(items) => items.iter().all(|i| scan(i, has_cond)),
+                ConstraintItem::Foreach { .. } | ConstraintItem::Unique { .. } => false,
+                ConstraintItem::Expr(e) => {
+                    if matches!(
+                        &e.kind,
+                        ExprKind::Binary { op: BinaryOp::LogImplies, .. }
+                    ) {
+                        *has_cond = true;
+                    }
+                    !Simulator::expr_unmodeled(e)
+                }
+            }
+        }
+        for con in constraints {
+            for it in &con.items {
+                if !scan(it, &mut has_cond) {
+                    return false;
+                }
+            }
+        }
+        has_cond
+    }
+
+    /// True when every element of the collection holds a distinct value.
+    fn coll_is_unique(&mut self, c: &RandColl) -> bool {
+        let keys = self.coll_elem_keys(c);
+        let mut seen: HashSet<u64> = HashSet::default();
+        for k in keys {
+            let v = self.read_coll_elem(&k).and_then(|v| v.to_u64()).unwrap_or(0);
+            if !seen.insert(v) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// §18.14.1: `obj.randomize()` draws from the OBJECT's random stream —
+    /// mark it the active stream owner for the whole solve (constraints, dist
+    /// picks, randc, pre/post_randomize) so every draw routes through
+    /// `cur_rng()`. Nested randomize calls stack, so an inner object still
+    /// uses its own stream.
     fn exec_randomize(&mut self, handle: usize) -> Value {
         self.obj_rng_stack.push(handle);
-        let r = self.exec_randomize_solve(handle);
+        let r = self.exec_randomize_inner(handle, &[]);
         self.obj_rng_stack.pop();
         r
     }
 
-    fn exec_randomize_solve(&mut self, handle: usize) -> Value {
+    fn exec_randomize_inner(
+        &mut self,
+        handle: usize,
+        inline: &[ConstraintItem],
+    ) -> Value {
         // Reset the dist-pick-once tracker so each randomize call gets a
         // fresh weighted draw per `(handle, prop)`.
         self.dist_picked_once.clear();
@@ -42937,6 +44465,11 @@ impl Simulator {
         // elem_width, enum_type). Randomized element-by-element after the scalar
         // fields they may exclude (sp/tp/scratch_reg) are solved.
         let mut rand_arrays: Vec<(String, String, i64, i64, u32, Option<String>)> = Vec::new();
+        // §18.5.9/§18.6 — rand class-handle members (`rand SubObject sub_inst`).
+        // A rand handle is NOT a random value: the object it points at is
+        // randomized recursively, and the enclosing object's constraints may
+        // refer to that object's members (`sub_inst.sub_data == q[0] + 5`).
+        let mut rand_handles: Vec<String> = Vec::new();
         let mut cur = Some(class_name.clone());
         while let Some(cname) = cur {
             if let Some(class_def) = self.module.classes.get(&cname) {
@@ -42960,13 +44493,35 @@ impl Simulator {
                             enum_t.clone(),
                         ));
                     }
-                    if let Some(sig) = class_def.properties.get(prop) {
-                        rand_props.push((prop.clone(), sig.width));
-                        if sig.is_real {
-                            real_rand_props.insert(prop.clone());
+                    // A dynamic array / queue / associative member has no
+                    // scalar value to draw — its elements are solved by the
+                    // collection pipeline below. Drawing a random scalar for
+                    // it would only pollute the property map.
+                    let is_coll = class_def.queue_properties.contains_key(prop)
+                        || class_def.assoc_properties.contains_key(prop);
+                    let is_handle = class_def
+                        .properties
+                        .get(prop)
+                        .and_then(|s| s.type_name.clone())
+                        .map_or(false, |tn| self.module.classes.contains_key(&tn));
+                    if is_handle {
+                        // §18.5.9: randomize the referenced object, never the
+                        // handle itself (a random handle would be a dangling
+                        // pointer and every cross-object constraint would fail).
+                        if !rand_handles.contains(prop) {
+                            rand_handles.push(prop.clone());
                         }
-                        if let Some(tn) = enum_t {
-                            enum_prop_types.insert(prop.clone(), tn);
+                        continue;
+                    }
+                    if let Some(sig) = class_def.properties.get(prop) {
+                        if !is_coll {
+                            rand_props.push((prop.clone(), sig.width));
+                            if sig.is_real {
+                                real_rand_props.insert(prop.clone());
+                            }
+                            if let Some(tn) = enum_t {
+                                enum_prop_types.insert(prop.clone(), tn);
+                            }
                         }
                     }
                     if class_def.randc_properties.contains(prop) {
@@ -42979,14 +44534,24 @@ impl Simulator {
                 // by constraint name so the parent's same-named constraint
                 // is skipped once the derived one is in. Also §18.13:
                 // skip constraint blocks that have constraint_mode(0).
-                for (cname, con) in class_def.constraints.iter() {
-                    if con_all_off || constraint_disabled.contains(cname) {
+                for (con_name, con) in class_def.constraints.iter() {
+                    // §18.5.11: a STATIC constraint block's enable state is
+                    // class-wide, so it is keyed by the DECLARING class rather
+                    // than by this instance.
+                    let disabled = if con.is_static {
+                        self.static_constraint_disabled
+                            .contains(&(cname.clone(), con_name.clone()))
+                            || con_all_off
+                    } else {
+                        con_all_off || constraint_disabled.contains(con_name)
+                    };
+                    if disabled {
                         // Mark name as seen so a parent same-named block is
                         // not picked up to substitute the disabled derived.
-                        seen_constraint_names.insert(cname.clone());
+                        seen_constraint_names.insert(con_name.clone());
                         continue;
                     }
-                    if seen_constraint_names.insert(cname.clone()) {
+                    if seen_constraint_names.insert(con_name.clone()) {
                         constraints.push(con.clone());
                         constraint_depth.push(class_depth);
                     }
@@ -42997,13 +44562,150 @@ impl Simulator {
                 break;
             }
         }
+        // §18.7 — inline `randomize() with { … }` constraints join the class's
+        // constraint set for THIS call (and are solved last, so they win the
+        // fixpoint's final word on any variable they pin).
+        if !inline.is_empty() {
+            constraints.push(ClassConstraint {
+                is_static: false,
+                is_extern: false,
+                has_body: true,
+                name: crate::ast::Identifier {
+                    name: "__inline__".to_string(),
+                    span: crate::ast::Span::new(0, 0),
+                },
+                items: inline.to_vec(),
+                span: crate::ast::Span::new(0, 0),
+            });
+        }
+
+        // Rand collection members (dynamic arrays, queues, associative arrays).
+        let rand_colls =
+            self.collect_rand_colls(handle, &rand_disabled, rand_all_off, &constraints);
+        // `unique {c}` items naming one of those collections (§18.5.5).
+        let unique_colls: Vec<RandColl> = {
+            let mut out: Vec<RandColl> = Vec::new();
+            fn walk(item: &ConstraintItem, out: &mut Vec<String>) {
+                match item {
+                    ConstraintItem::Unique { exprs, .. } => {
+                        for e in exprs {
+                            if let ExprKind::Ident(h) = &e.kind {
+                                if let Some(s) = h.path.last() {
+                                    out.push(s.name.name.clone());
+                                }
+                            }
+                        }
+                    }
+                    ConstraintItem::Block(items) => {
+                        for i in items {
+                            walk(i, out);
+                        }
+                    }
+                    ConstraintItem::Soft(i) => walk(i, out),
+                    _ => {}
+                }
+            }
+            let mut names: Vec<String> = Vec::new();
+            for con in &constraints {
+                for it in &con.items {
+                    walk(it, &mut names);
+                }
+            }
+            for n in names {
+                if let Some(c) = rand_colls.iter().find(|c| c.prop == n) {
+                    out.push(c.clone());
+                }
+            }
+            out
+        };
 
         self.this_stack.push(Some(handle));
+        // Constraint expressions reference collection members by their BARE
+        // name (`dyn_arr[i]`), which only resolves to the instance-scoped
+        // storage when a class context is active — push one for the whole
+        // solve, exactly as a method call would.
+        self.class_context_stack.push(Some(class_name.clone()));
         // SV semantics: randomize() calls pre_randomize() before solving.
         if self.class_has_method(&class_name, "pre_randomize") {
             self.exec_method_call(handle, "pre_randomize", &[]);
         }
         let has_post = self.class_has_method(&class_name, "post_randomize");
+
+        // ---------------------------------------------------------------
+        // IEEE 1800-2017 §18.5.10 — variable ordering.
+        //
+        // WITHOUT `solve … before …` the LRM requires all constraints to be
+        // solved SIMULTANEOUSLY: the random values are distributed over the
+        // joint SOLUTION SPACE, not per-variable. For
+        //     (c == 0) -> (d == 8'h00)
+        // the space has 1 solution with c==0 and 256 with c==1, so c==0 must
+        // come up ~1/257 of the time. xezim's propagation solver draws each
+        // variable uniformly and then REPAIRS the implication, which instead
+        // gives c==0 half the time — the very distortion §18.5.10 says
+        // `solve c before d` is needed to obtain.
+        //
+        // Rejection sampling over the joint domain reproduces the LRM
+        // distribution exactly: draw every rand variable uniformly, accept
+        // only a fully consistent assignment. It runs as a bounded pre-pass;
+        // if no sample lands, the propagation solver below still guarantees a
+        // result. When `solve … before …` IS present the pre-pass is skipped,
+        // so the ordered variables keep their uniform per-variable draw (which
+        // is exactly what the ordering hint asks for).
+        if self.rejection_sample_ok(
+            &constraints,
+            &rand_props,
+            &randc_set,
+            &real_rand_props,
+            &rand_colls,
+            &rand_handles,
+        ) {
+            let mut backup: HashMap<String, Value> = HashMap::default();
+            if let Some(Some(inst)) = self.heap.get(handle) {
+                for (n, v) in &inst.properties {
+                    backup.insert(n.clone(), v.clone());
+                }
+            }
+            for _ in 0..256 {
+                for (name, width) in &rand_props {
+                    let v = if let Some(et) = enum_prop_types.get(name) {
+                        let members = self.module.enum_members.get(et).cloned().unwrap_or_default();
+                        if members.is_empty() {
+                            Value::zero(*width)
+                        } else {
+                            let i = self.rng.gen_range(0..members.len());
+                            Value::from_u64(members[i].1, *width)
+                        }
+                    } else if *width <= 64 {
+                        Value::from_u64(self.rng.gen(), *width)
+                    } else {
+                        Value::zero(*width)
+                    };
+                    if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                        inst.properties.insert(name.clone(), v);
+                    }
+                }
+                let ok = constraints.iter().all(|con| {
+                    con.items
+                        .iter()
+                        .all(|it| self.check_constraint_item(handle, it))
+                });
+                if ok {
+                    if has_post {
+                        self.exec_method_call(handle, "post_randomize", &[]);
+                    }
+                    self.this_stack.pop();
+                    self.class_context_stack.pop();
+                    return Value::from_u64(1, 32);
+                }
+            }
+            // No sample landed — restore and fall through to propagation.
+            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                for (n, v) in backup {
+                    inst.properties.insert(n, v);
+                }
+            }
+        }
+
         for _trial in 0..1000 {
             // LRM §18.5.4 dist: clear the pick-once gate at each trial so a
             // failed trial doesn't permanently freeze the dist constraint.
@@ -43370,6 +45072,51 @@ impl Simulator {
                 }
             }
 
+            // §18.5.9/§18.6 — randomize every rand class-handle member BEFORE
+            // this object's own constraints are propagated, so a cross-object
+            // constraint (`sub_inst.sub_data == q[0] + 5`) gets the final word
+            // on the sub-object's variable.
+            for hp in &rand_handles {
+                let sub = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.properties.get(hp))
+                    .and_then(|v| v.to_u64())
+                    .unwrap_or(0) as usize;
+                if sub != 0 && sub != handle && self.randomize_depth < 8 {
+                    self.randomize_depth += 1;
+                    self.exec_randomize(sub);
+                    self.randomize_depth -= 1;
+                }
+            }
+
+            // ---- §18.4 collection pipeline: SIZE, then SEED, then SOLVE ----
+            // A rand dynamic array whose `.size()` is constrained has no
+            // element set until it is sized, so element solving must follow
+            // sizing. `unique {}` runs last over the settled elements.
+            let mut pinned_elems: HashSet<String> = HashSet::default();
+            if !rand_colls.is_empty() {
+                self.solve_array_sizes(&rand_colls, &constraints);
+                // Fresh random baseline for every element of a dynamic /
+                // associative member (fixed arrays keep the legacy pool pass).
+                for c in &rand_colls {
+                    if c.kind == CollKind::Fixed {
+                        continue;
+                    }
+                    for key in self.coll_elem_keys(c) {
+                        let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
+                        let v = self.draw_elem(c.width, prev);
+                        self.write_coll_elem(&key, v);
+                    }
+                }
+                self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
+                self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
+                for c in &unique_colls {
+                    self.enforce_unique_coll(c, &constraints, &pinned_elems);
+                }
+            }
+
             // Constraint propagation: with a random baseline now in place,
             // iteratively apply the *forced* assignments implied by equality,
             // dist/inside, and conditional (if/else, implication) constraints.
@@ -43681,6 +45428,17 @@ impl Simulator {
             let mut all_ok = true;
             for con in &constraints {
                 for item in &con.items {
+                    // Constraints over a rand COLLECTION (its `.size()`, its
+                    // `foreach` bodies, `unique {}` over it) ARE modeled — check
+                    // them strictly, so an unsatisfied one retries the trial
+                    // instead of being silently accepted.
+                    if let Some(ok) = self.coll_item_check(handle, item, &rand_colls) {
+                        if !ok {
+                            all_ok = false;
+                            break;
+                        }
+                        continue;
+                    }
                     // Skip constraints the solver structurally cannot satisfy
                     // (dynamic-array size/sum/element relations, foreach, solve
                     // ordering) so they don't block an otherwise-valid config.
@@ -43704,6 +45462,7 @@ impl Simulator {
                     self.exec_method_call(handle, "post_randomize", &[]);
                 }
                 self.this_stack.pop();
+                self.class_context_stack.pop();
                 return Value::from_u64(1, 32);
             }
 
@@ -43752,6 +45511,7 @@ impl Simulator {
                     self.exec_method_call(handle, "post_randomize", &[]);
                 }
                 self.this_stack.pop();
+                self.class_context_stack.pop();
                 return Value::from_u64(1, 32);
             }
 
@@ -43766,6 +45526,7 @@ impl Simulator {
         // every tentatively-drawn randc value back to its permutation cycle.
         self.randc_rollback_all();
         self.this_stack.pop();
+        self.class_context_stack.pop();
         Value::zero(32)
     }
 
@@ -44074,6 +45835,18 @@ impl Simulator {
     ) -> bool {
         match item {
             ConstraintItem::Expr(e) => match &e.kind {
+                // A parenthesised constraint expression — `(a -> (b == 0))`,
+                // and, crucially, the CONSEQUENT of an implication, which the
+                // parser keeps wrapped: `(control_bit == 0) -> (data_byte ==
+                // 0)`. Without unwrapping, the consequent was never forced and
+                // the trial loop simply re-drew until the antecedent was false,
+                // which silently turned every implication into a rejection
+                // sample (§18.5.10: that is the behavior `solve … before …` is
+                // supposed to REPLACE).
+                ExprKind::Paren(inner) => {
+                    let it = ConstraintItem::Expr((**inner).clone());
+                    return self.solve_forced(handle, &it, rand_set);
+                }
                 // `antecedent -> consequent`: when the antecedent holds, the
                 // consequent becomes a forced sub-constraint.
                 ExprKind::Binary { op: BinaryOp::LogImplies, left, right } => {
@@ -44093,6 +45866,41 @@ impl Simulator {
                     if let Some(v) = self.rand_lvalue_name(right, rand_set) {
                         let val = self.eval_expr(left);
                         return self.set_prop_if_changed(handle, &v, val);
+                    }
+                    // §18.5.9 global (cross-object) constraint: the lvalue is a
+                    // rand member of a class-handle member of `this`
+                    // (`sub_inst.sub_data == test_queue[0] + 8'd5`). Both sides
+                    // are solved simultaneously per the LRM; here the enclosing
+                    // object's variables are already drawn, so the sub-object's
+                    // variable takes the implied value.
+                    if let Some((sub, field)) = self.cross_obj_lvalue(left) {
+                        let val = self.eval_expr(right);
+                        return self.set_prop_if_changed(sub, &field, val);
+                    }
+                    if let Some((sub, field)) = self.cross_obj_lvalue(right) {
+                        let val = self.eval_expr(left);
+                        return self.set_prop_if_changed(sub, &field, val);
+                    }
+                    // A rand COLLECTION element (`q[0] == 8'd99`).
+                    let lk = self.coll_elem_expr_key(left);
+                    let rk = self.coll_elem_expr_key(right);
+                    if lk.is_some() != rk.is_some() {
+                        let (key, other) = if let Some(k) = lk {
+                            (k, right)
+                        } else {
+                            (rk.unwrap(), left)
+                        };
+                        let w = self
+                            .read_coll_elem(&key)
+                            .map(|v| v.width)
+                            .unwrap_or(32)
+                            .max(1);
+                        let val = self.eval_expr(other).resize(w);
+                        let changed = self
+                            .read_coll_elem(&key)
+                            .map_or(true, |c| c.to_u64() != val.to_u64());
+                        self.write_coll_elem(&key, val);
+                        return changed;
                     }
                     false
                 }
@@ -47933,4 +49741,47 @@ pub extern "C" fn svSetScope(scope: *mut libc::c_void) -> *mut libc::c_void {
     let prev = ACTIVE_SCOPE.with(|cell| cell.get());
     ACTIVE_SCOPE.with(|cell| cell.set(scope));
     prev
+}
+
+// =========================================================================
+// IEEE 1800-2017 §18.4 / §18.5.9 — rand COLLECTION members.
+// =========================================================================
+
+/// The three storage shapes a rand collection member can have.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CollKind {
+    /// `bit [7:0] a[4]` — fixed unpacked array, bounds known at elaboration.
+    Fixed,
+    /// `bit [7:0] a[]` / `a[$]` — dynamic array or queue (length is solved).
+    Dyn,
+    /// `bit [7:0] a[int]` — associative array (sparse; keys are pre-seeded).
+    Assoc,
+}
+
+/// One rand collection member of the object being randomized.
+#[derive(Clone, Debug)]
+struct RandColl {
+    /// Bare member name (`dyn_arr`).
+    prop: String,
+    /// Instance-scoped storage prefix (`<handle>#dyn_arr`).
+    scoped: String,
+    kind: CollKind,
+    /// Element width in bits.
+    width: u32,
+    /// Fixed-array bounds (unused for Dyn/Assoc).
+    lo: i64,
+    hi: i64,
+    /// Dynamic array of dynamic arrays (`bit [7:0] m[][]`).
+    nested: bool,
+}
+
+/// A `.size()` constraint on a rand dynamic array (§18.4): the array must be
+/// SIZED before its elements can be solved.
+enum SizeCon {
+    /// `a.size() == E` — E already evaluated.
+    Eq(u64),
+    /// `a.size() inside {…}` — the ranges already evaluated.
+    In(Vec<(u64, u64)>),
+    /// `a.size() < E`, `>= E`, … — E already evaluated.
+    Rel(crate::ast::expr::BinaryOp, u64),
 }
