@@ -53,6 +53,10 @@ thread_local! {
 /// fast recursive path.
 const RPS_TRAMPOLINE_DEPTH: usize = 300;
 
+/// Internal marker retrieving a §9.4.5 intra-assignment RHS value captured in
+/// `Simulator::intra_saved` (see `make_intra_saved_expr`). Never user-visible.
+const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
+
 pub fn set_sim_debug(enabled: bool) {
     SIM_DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
 }
@@ -1437,6 +1441,12 @@ pub struct Simulator {
     pub signals: HashMap<String, Value>,
     /// Signals currently under force/release control (LRM §9.3.1).
     forced_signals: HashMap<usize, Value>,
+    /// Flattened names currently under an active `force` (§10.6) or
+    /// procedural continuous `assign` (§10.6.1) whose storage lives only
+    /// in the runtime `signals` map (no compact signal-table id). Mirrors
+    /// `forced_signals` for those targets so the name-keyed write
+    /// fallbacks can drop ordinary writes while the override is active.
+    forced_names: HashSet<String>,
     /// Fast signal table: indexed by signal_id for O(1) access.
     signal_table: Vec<Value>,
     /// Parallel array: 1 byte per signal_id, non-zero iff that signal
@@ -1999,6 +2009,17 @@ pub struct Simulator {
     /// fixpoint after the same-time batch drains, suspending until the
     /// condition genuinely flips instead of falsely proceeding.
     condition_waiters: Vec<(usize, Vec<Statement>)>,
+    /// IEEE 1800-2017 §4.4.2.3 Inactive region: continuations of `#0`
+    /// delays park here instead of in the event_queue. The event_queue's
+    /// batch drain in `run_one_tick` re-fetches same-time entries into the
+    /// SAME active pass (before `apply_nba`), so scheduling a `#0`
+    /// continuation there made it resume BEFORE the NBA region committed —
+    /// an NBA posted before the `#0` was invisible after it. Commercial
+    /// simulators (VCS / Questa / Riviera) all make an NBA posted before a
+    /// `#0` visible after it, so entries parked here are promoted back into
+    /// the event queue only at the END of the current tick, after
+    /// `apply_nba` has run (see `promote_inactive_to_active`).
+    inactive_queue: Vec<(usize, Vec<Statement>)>,
     /// Bumped whenever a `wait(expr)` condition evaluates true (a parked waiter
     /// proceeds). The condition-waiter fixpoint uses it to detect "no progress
     /// this round" and stop (genuine stall).
@@ -2013,6 +2034,12 @@ pub struct Simulator {
     mailbox_get_waiters: HashMap<usize, std::collections::VecDeque<MailboxGetWaiter>>,
     /// Processes blocked in `semaphore.get()` on an under-full semaphore.
     semaphore_get_waiters: HashMap<usize, std::collections::VecDeque<SemGetWaiter>>,
+    /// IEEE 1800-2017 §9.4.5 intra-assignment delay (`lhs = #d rhs`): RHS
+    /// values captured at statement execution, keyed by the slot index baked
+    /// into the synthesized `$__xz_intra_saved(idx)` continuation. Taken
+    /// (removed) when the delayed assignment fires.
+    intra_saved: HashMap<u64, Value>,
+    intra_saved_next: u64,
     /// LRM §15.5.3: per-named-event last-trigger time. `e.triggered`
     /// returns 1 iff this map's `time` matches the current simulation time
     /// (i.e. the event has been triggered in the same time slot as the
@@ -3109,6 +3136,7 @@ impl Simulator {
             signed_signals,
             real_signals,
             forced_signals: HashMap::default(),
+            forced_names: HashSet::default(),
             signal_has_xz: signal_has_xz_init,
             signal_inline_bits: Vec::new(),
             jit_nba_side_queue: Vec::new(),
@@ -3260,10 +3288,13 @@ impl Simulator {
             ref_binding_stack: Vec::new(),
             task_cleanup: Vec::new(),
             condition_waiters: Vec::new(),
+            inactive_queue: Vec::new(),
             cond_progress: 0,
             real_time: 0.0,
             mailbox_get_waiters: HashMap::default(),
             semaphore_get_waiters: HashMap::default(),
+            intra_saved: HashMap::default(),
+            intra_saved_next: 0,
             event_triggered_time: HashMap::default(),
             event_waiters: Vec::new(),
             cg_event_waiters: Vec::new(),
@@ -7051,10 +7082,13 @@ impl Simulator {
                 let vs = view[s.sig_id as usize].get_bit_code(s.bit as usize);
                 let vt = view[t.sig_id as usize].get_bit_code(t.bit as usize);
                 let ve = view[e.sig_id as usize].get_bit_code(e.bit as usize);
+                // IEEE 1800 §11.4.11 Table 11-21: ambiguous select merges the
+                // branches per bit — 0/0→0, 1/1→1, every other pair (incl.
+                // z/z) → x.
                 let v = match vs {
                     0 => ve,
                     1 => vt,
-                    _ => if vt == ve { vt } else { 2 },
+                    _ => if vt == ve && vt < 2 { vt } else { 2 },
                 };
                 (dst, v)
             }
@@ -13267,6 +13301,23 @@ impl Simulator {
         }
     }
 
+    /// Promote `#0` continuations parked in the Inactive-region queue
+    /// (IEEE 1800-2017 §4.4.2.3) back into the event queue at the current
+    /// time. Called only AFTER `apply_nba` has committed this pass's NBA
+    /// region, so when the caller's loop re-drains same-time events the
+    /// promoted continuations observe post-NBA values — matching the
+    /// commercial consensus (VCS / Questa / Riviera): an NBA posted before
+    /// a `#0` is visible after it in the same time slot.
+    fn promote_inactive_to_active(&mut self) {
+        if self.inactive_queue.is_empty() {
+            return;
+        }
+        let moved = std::mem::take(&mut self.inactive_queue);
+        for (pid, cont) in moved {
+            self.event_queue.schedule(self.time, pid, cont);
+        }
+    }
+
     /// Drain pending NBAs and repeatedly snapshot → apply_nba → settle →
     /// check_edges until a round produces neither new edges nor new NBAs.
     ///
@@ -13513,6 +13564,16 @@ impl Simulator {
                 break;
             }
         }
+
+        // Inactive → Active promotion (IEEE 1800-2017 §4.4.2.3): `#0`
+        // continuations parked during this tick resume in the NEXT tick at
+        // the SAME time — the outer event_loop sees event_queue.next_time()
+        // == self.time and re-enters run_one_tick without advancing time.
+        // Because this runs after this tick's apply_nba / settle /
+        // check_edges, the promoted continuations observe post-NBA values,
+        // matching the commercial consensus (VCS/Questa/Riviera print `aa`
+        // for `nb <= 8'hAA; #0; $display(nb)`).
+        self.promote_inactive_to_active();
 
         self.loop_iters += 1;
     }
@@ -14491,6 +14552,12 @@ impl Simulator {
         let saved_pid = self.current_pid;
         let saved_break = self.break_flag;
         let saved_return = self.return_flag;
+        // §4.4.2.3: `#0` continuations parked by earlier same-batch
+        // processes must resume in THIS time slot, not drift to a later nt.
+        // Our caller (the synchronous Delay handler in exec_statement) has
+        // already run apply_nba for the current pass, so promoting here
+        // preserves the NBA-before-#0-continuation ordering.
+        self.promote_inactive_to_active();
         loop {
             // Advance to the EARLIEST of: event_queue, clock_generators,
             // and delayed-update queue (so a `#10` from inside an initial
@@ -14554,6 +14621,12 @@ impl Simulator {
                 let _ = self.drain_edge_cascade(self.cascade_limit);
                 self.snapshot_edge_signals();
             }
+            // §4.4.2.3: a process resumed above may have parked a `#0`
+            // continuation in the Inactive queue. apply_nba for this pass
+            // has already run, so promote now — the next loop iteration
+            // (next_eq == self.time <= target) resumes it with post-NBA
+            // values, same ordering as the run_one_tick path.
+            self.promote_inactive_to_active();
         }
         self.current_pid = saved_pid;
         self.break_flag = saved_break;
@@ -14579,6 +14652,15 @@ impl Simulator {
         // Save + clear it for the run, restore on EVERY exit path so the hint
         // never leaks across scheduled processes (or back to the caller).
         let saved_hint = self.name_resolve_hint.borrow_mut().take();
+        // Fork-capture names (`auto_loop_vars`) are scoped to one process
+        // activation. Structured statements pop their own pushes, but a
+        // blocking `begin/end` gets FLATTENED into the process's statement
+        // stream (see run_process_stmts), so an `automatic` local declared
+        // there is pushed with no enclosing SeqBlock arm to pop it. Truncate
+        // on both exits so nothing leaks into other processes — such a var
+        // stays capturable for the rest of its (flattened) block, which is
+        // exactly its scope.
+        let saved_auto_len = self.auto_loop_vars.len();
         // Install the process's instance scope (from its initial block) as the
         // resolution hint so AST-evaluated bare names — e.g. a
         // `std::randomize(sig)` target — resolve to THIS instance's signals in
@@ -14610,6 +14692,7 @@ impl Simulator {
                         .insert(pid, self.snapshot_process_context());
                 }
             }
+            self.auto_loop_vars.truncate(saved_auto_len);
             *self.name_resolve_hint.borrow_mut() = saved_hint;
             return;
         }
@@ -14638,6 +14721,7 @@ impl Simulator {
         // skipped), exactly mirroring shared-automatic semantics.
         self.propagate_fork_locals_to_parent(pid);
         self.restore_process_context(saved);
+        self.auto_loop_vars.truncate(saved_auto_len);
         *self.name_resolve_hint.borrow_mut() = saved_hint;
     }
 
@@ -14684,6 +14768,47 @@ impl Simulator {
         } else {
             v.to_u64().unwrap_or(0)
         }
+    }
+
+    /// IEEE 1800-2017 §9.4.5 intra-assignment delay: `lhs = #d rhs` /
+    /// `lhs <= #d rhs` is canonicalized at source level (see
+    /// `crate::intra_delay`) into `lhs = $__xz_intra_delay(d, rhs)`.
+    /// Returns `(delay_expr, rhs_expr)` when `rvalue` is that marker.
+    fn intra_delay_marker(rvalue: &Expression) -> Option<(&Expression, &Expression)> {
+        match &rvalue.kind {
+            ExprKind::SystemCall { name, args }
+                if name == crate::intra_delay::INTRA_DELAY_MARKER && args.len() == 2 =>
+            {
+                Some((&args[0], &args[1]))
+            }
+            _ => None,
+        }
+    }
+
+    /// Stash a §9.4.5 RHS value evaluated at statement-execution time and
+    /// synthesize the `$__xz_intra_saved(idx)` expression that retrieves it
+    /// when the delayed assignment finally runs — the pre-computed Value
+    /// survives process rescheduling this way.
+    fn make_intra_saved_expr(&mut self, val: Value, span: crate::ast::Span) -> Expression {
+        let idx = self.intra_saved_next;
+        self.intra_saved_next += 1;
+        self.intra_saved.insert(idx, val);
+        Expression::new(
+            ExprKind::SystemCall {
+                name: INTRA_SAVED_MARKER.to_string(),
+                args: vec![Expression::new(
+                    ExprKind::Number(NumberLiteral::Integer {
+                        size: None,
+                        signed: false,
+                        base: NumberBase::Decimal,
+                        value: idx.to_string(),
+                        cached_val: Cell::new(None),
+                    }),
+                    span,
+                )],
+            },
+            span,
+        )
     }
 
     /// Continue executing `cont` for `pid`. Normally recurses (fast path), but
@@ -15108,6 +15233,28 @@ impl Simulator {
                 }
             }
 
+            // IEEE 1800-2017 §9.4.5 intra-assignment delay `lhs = #d rhs`:
+            // the RHS is evaluated NOW, the process suspends d time units,
+            // then the pre-computed value is assigned — i.e. behave like
+            // `#d;` followed by `lhs = <saved value>;`.
+            if let StatementKind::BlockingAssign { lvalue, rvalue } = &stmt.kind {
+                if let Some((d_expr, rhs)) = Self::intra_delay_marker(rvalue) {
+                    let val = self.eval_expr(rhs);
+                    let delay = self.eval_delay_ticks(d_expr);
+                    let saved = self.make_intra_saved_expr(val, rvalue.span);
+                    let mut cont = vec![Statement::new(
+                        StatementKind::BlockingAssign {
+                            lvalue: lvalue.clone(),
+                            rvalue: saved,
+                        },
+                        stmt.span,
+                    )];
+                    cont.extend_from_slice(&stmts[i + 1..]);
+                    self.event_queue.schedule(self.time + delay, pid, cont);
+                    return;
+                }
+            }
+
             // Check for timing control — delay or event
             if let StatementKind::TimingControl {
                 control,
@@ -15119,7 +15266,20 @@ impl Simulator {
                         let delay = self.eval_delay_ticks(d);
                         let mut cont = vec![*body.clone()];
                         cont.extend_from_slice(&stmts[i + 1..]);
-                        self.event_queue.schedule(self.time + delay, pid, cont);
+                        if delay == 0 {
+                            // `#0` — IEEE 1800-2017 §4.4.2.3: suspend into the
+                            // Inactive region of the SAME time slot, not the
+                            // Active region. Scheduling into event_queue at
+                            // self.time would resume it in the same batch
+                            // drain, BEFORE apply_nba — so an NBA posted
+                            // before the `#0` would not be visible after it.
+                            // Commercial consensus (VCS/Questa/Riviera): it IS
+                            // visible. Park here; run_one_tick promotes after
+                            // the NBA region of this tick has been applied.
+                            self.inactive_queue.push((pid, cont));
+                        } else {
+                            self.event_queue.schedule(self.time + delay, pid, cont);
+                        }
                         return;
                     }
                     TimingControl::Event(event) => {
@@ -15423,6 +15583,31 @@ impl Simulator {
                     self.next_pid += 1;
                     self.process_parents.insert(pid_child, pid);
                     self.inherit_fork_child_context(pid_child);
+                    // §9.4.5: a child that IS an intra-assignment delay
+                    // (`fork lhs = #d rhs; join_none`) captures its RHS at the
+                    // fork point — a join_none parent keeps running and may
+                    // overwrite RHS operands before the child would start, so
+                    // deferring the capture to child start-up reads the
+                    // post-fork values. Evaluate now and schedule the
+                    // pre-computed assignment directly at t+d.
+                    if let StatementKind::BlockingAssign { lvalue, rvalue } = &s.kind {
+                        if let Some((d_expr, rhs)) = Self::intra_delay_marker(rvalue) {
+                            let val = self.eval_expr(rhs);
+                            let delay = self.eval_delay_ticks(d_expr);
+                            let saved = self.make_intra_saved_expr(val, rvalue.span);
+                            let assign = Statement::new(
+                                StatementKind::BlockingAssign {
+                                    lvalue: lvalue.clone(),
+                                    rvalue: saved,
+                                },
+                                s.span,
+                            );
+                            self.event_queue
+                                .schedule(self.time + delay, pid_child, vec![assign]);
+                            child_pids.insert(pid_child);
+                            continue;
+                        }
+                    }
                     // Schedule children to run at current time
                     self.event_queue
                         .schedule(self.time, pid_child, vec![s.clone()]);
@@ -15498,6 +15683,10 @@ impl Simulator {
                 control: TimingControl::Delay(_),
                 ..
             } => true,
+            // §9.4.5 intra-assignment delay suspends like a `#d` statement.
+            StatementKind::BlockingAssign { rvalue, .. } => {
+                Self::intra_delay_marker(rvalue).is_some()
+            }
             StatementKind::SeqBlock { stmts, .. } => {
                 stmts.iter().any(|s| self.stmt_has_event_wait(s))
             }
@@ -15513,6 +15702,10 @@ impl Simulator {
         match &stmt.kind {
             StatementKind::TimingControl { .. } => true,
             StatementKind::Wait { .. } => true,
+            // §9.4.5 intra-assignment delay suspends the process for `#d`.
+            StatementKind::BlockingAssign { rvalue, .. } => {
+                Self::intra_delay_marker(rvalue).is_some()
+            }
             StatementKind::SeqBlock { stmts, .. } => stmts.iter().any(|s| self.stmt_is_blocking(s)),
             StatementKind::If {
                 then_stmt,
@@ -15817,7 +16010,15 @@ impl Simulator {
                             body.span,
                         ));
                         cont.extend_from_slice(after);
-                        self.event_queue.schedule(self.time + delay, pid, cont);
+                        if delay == 0 {
+                            // `forever begin ... #0 ... end` — same §4.4.2.3
+                            // Inactive-region parking as the run_process_stmts
+                            // Delay handler above: resume only after this
+                            // tick's NBA region (commercial consensus).
+                            self.inactive_queue.push((pid, cont));
+                        } else {
+                            self.event_queue.schedule(self.time + delay, pid, cont);
+                        }
                         return;
                     }
                     TimingControl::Event(event) => {
@@ -18950,6 +19151,23 @@ impl Simulator {
         }
     }
 
+    /// Resolve a `force`/`release`/`assign`/`deassign` lvalue (LRM §10.6,
+    /// §10.6.1) to its override-tracking key: the flattened signal name plus
+    /// the compact-table id (`None` when the value lives only in the runtime
+    /// `signals` map). Only whole-signal identifiers are tracked; §10.6 also
+    /// allows bit/part-selects and concatenations on nets — those return
+    /// `None` and degrade to an untracked plain write.
+    fn force_target(&self, lv: &Expression) -> Option<(String, Option<usize>)> {
+        if let ExprKind::Ident(hier) = &lv.kind {
+            if hier.path.iter().all(|s| s.selects.is_empty()) {
+                let name = self.resolve_hier_name(hier);
+                let id = self.signal_name_to_id.get(name.as_str()).copied();
+                return Some((name, id));
+            }
+        }
+        None
+    }
+
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
@@ -19255,6 +19473,12 @@ impl Simulator {
                         return changed;
                     }
                 }
+                // LRM §10.6/§10.6.1: a target under an active force or
+                // procedural continuous assign ignores ordinary procedural
+                // writes until the matching release/deassign.
+                if self.forced_names.contains(&name) {
+                    return false;
+                }
                 let width = self
                     .widths
                     .get(&name)
@@ -19467,6 +19691,23 @@ impl Simulator {
                                         self.table_modified = true;
                                         self.after_signal_write(id);
                                         self.mark_dirty(&base);
+                                    }
+                                    return changed;
+                                }
+                            }
+                            // Block-local packed multi-D var: lives in the
+                            // runtime map, not the compact table.
+                            if let Some(cur) = self.get_signal_value_by_name(&base) {
+                                let total_w = cur.width as usize;
+                                let i = self.eval_expr(outer_idx).to_u64().unwrap_or(0) as usize;
+                                let j = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
+                                let lo = i * (elem_w as usize) + j;
+                                if lo < total_w {
+                                    let mut nv = cur.clone();
+                                    nv.set_bit(lo, val.get_bit(0));
+                                    let changed = nv != cur;
+                                    if changed {
+                                        self.set_signal_value_by_name(&base, nv);
                                     }
                                     return changed;
                                 }
@@ -22032,6 +22273,24 @@ impl Simulator {
                 v
             }
             ExprKind::SystemCall { name, args } => match name.as_str() {
+                // §9.4.5: retrieve a pre-evaluated intra-assignment RHS
+                // (stashed by the suspend path; see make_intra_saved_expr).
+                INTRA_SAVED_MARKER => {
+                    let idx = args
+                        .first()
+                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(0))
+                        .unwrap_or(0);
+                    self.intra_saved
+                        .remove(&idx)
+                        .unwrap_or_else(|| Value::zero(32))
+                }
+                // §9.4.5 marker reached from a context that cannot suspend
+                // (always-block settle, function body, bytecode fallback):
+                // degrade to the RHS value with the delay ignored.
+                crate::intra_delay::INTRA_DELAY_MARKER => args
+                    .get(1)
+                    .map(|a| self.eval_expr(a))
+                    .unwrap_or_else(|| Value::zero(32)),
                 // LRM §16.9.3 `$past(<sig>[, N])` — value of `<sig>` from
                 // N clock cycles ago (default N=1). Only meaningful
                 // inside an SVA clocked body; falls back to current
@@ -22127,14 +22386,26 @@ impl Simulator {
                         Value::zero(32)
                     }
                 }
+                "$__xz_size_cast" => {
+                    let n = args
+                        .first()
+                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(32))
+                        .unwrap_or(32) as u32;
+                    if let Some(a) = args.get(1) {
+                        let v = self.eval_expr(a).resize(n.max(1));
+                        return v;
+                    }
+                    return Value::zero(n.max(1));
+                }
                 "$clog2" => {
                     let v = args
                         .first()
                         .map(|a| self.eval_expr(a).to_u64().unwrap_or(0))
                         .unwrap_or(0);
+                    // §20.8.1: $clog2(0) and $clog2(1) are both 0.
                     Value::from_u64(
                         if v <= 1 {
-                            1
+                            0
                         } else {
                             64 - (v - 1).leading_zeros()
                         } as u64,
@@ -22177,6 +22448,23 @@ impl Simulator {
                             let leaf = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                             if let Some(w) = atom_type_keyword_width(leaf) {
                                 return Value::from_u64(w as u64, 32);
+                            }
+                            // §8.25: `$bits(T)` where `T` is a parameterized-
+                            // class TYPE parameter — resolve the active
+                            // specialization's binding (instance
+                            // `type_bindings` / `current_spec`) to the
+                            // concrete type and size that instead.
+                            if hier.path.len() == 1 {
+                                if let Some(concrete) =
+                                    self.resolve_type_param_binding(leaf)
+                                {
+                                    if let Some(w) = atom_type_keyword_width(&concrete) {
+                                        return Value::from_u64(w as u64, 32);
+                                    }
+                                    if let Some(w) = self.module.typedefs.get(&concrete) {
+                                        return Value::from_u64(*w as u64, 32);
+                                    }
+                                }
                             }
                         }
                         Value::from_u64(self.eval_expr(arg).width as u64, 32)
@@ -22532,6 +22820,16 @@ impl Simulator {
                         32,
                     )
                 }
+                // §6.24.1 literal size cast `N'(x)` — lowered by the parser.
+                "$__xz_size_cast" => {
+                    let n = args
+                        .first()
+                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(32))
+                        .unwrap_or(32) as u32;
+                    args.get(1)
+                        .map(|a| self.eval_expr(a).resize(n.max(1)))
+                        .unwrap_or_else(|| Value::zero(n.max(1)))
+                }
                 "$shortrealtobits" => {
                     let v = args
                         .first()
@@ -22606,7 +22904,9 @@ impl Simulator {
                             } else if let Some(&id) = self.signal_name_to_id.get(aname.as_str()) {
                                 self.signal_widths[id]
                             } else {
-                                0
+                                // Block-local vector: width lives in the
+                                // runtime maps, not the compact table.
+                                self.lookup_signal_width(&aname).unwrap_or(0)
                             };
                             let sel = dims.as_ref().and_then(|d| d.get(dim.saturating_sub(1)));
                             let (lo, hi, descending) = if let Some(&(l, h)) = sel {
@@ -25091,9 +25391,41 @@ impl Simulator {
                             return;
                         }
                         if let ExprKind::Concatenation(exprs) = &rvalue.kind {
+                            // IEEE 1800 §10.10.1: in an unpacked-array
+                            // concatenation each item is read in the context of
+                            // the ELEMENT type, so a nested plain-brace concat
+                            // is itself an array value whose elements SPLICE
+                            // into the outer one — `a = {1, {2, 3}}` assigns
+                            // `{1, 2, 3}` — i.e. nested braces flatten. Only
+                            // flatten when the element type is not itself an
+                            // array (for a multi-dimensional target an inner
+                            // brace denotes one whole sub-array element).
+                            // Assignment patterns `'{...}` never flatten; they
+                            // take the AssignmentPattern branch above.
+                            fn flatten_unpacked_concat<'a>(
+                                exprs: &'a [Expression],
+                                out: &mut Vec<&'a Expression>,
+                            ) {
+                                for e in exprs {
+                                    if let ExprKind::Concatenation(inner) = &e.kind {
+                                        flatten_unpacked_concat(inner, out);
+                                    } else {
+                                        out.push(e);
+                                    }
+                                }
+                            }
+                            let elem_is_scalar =
+                                self.foreach_dims(&lname).map_or(true, |d| d.len() == 1);
+                            let items: Vec<&Expression> = if elem_is_scalar {
+                                let mut v = Vec::new();
+                                flatten_unpacked_concat(exprs, &mut v);
+                                v
+                            } else {
+                                exprs.iter().collect()
+                            };
                             // Expand queue/array elements in concat (e.g. q = {q, 4})
                             let mut all_vals: Vec<Value> = Vec::new();
-                            for expr in exprs.iter() {
+                            for expr in items {
                                 // A queue/array operand — bare (`q`), an instance-
                                 // scoped member (`obj.q`, `arr[i].q`), or a nested
                                 // assoc-of-queue element (`assoc[key]`) —
@@ -25234,6 +25566,17 @@ impl Simulator {
                 delay,
                 rvalue,
             } => {
+                // §9.4.5 intra-assignment delay on an NBA (`lhs <= #d rhs`,
+                // canonicalized to `$__xz_intra_delay(d, rhs)`): the RHS is
+                // evaluated now; the update is scheduled d ticks out.
+                let mut intra_d: Option<u64> = None;
+                let rvalue: &Expression = match Self::intra_delay_marker(rvalue) {
+                    Some((d_expr, rhs)) => {
+                        intra_d = Some(self.eval_delay_ticks(d_expr));
+                        rhs
+                    }
+                    None => rvalue,
+                };
                 let val = self.eval_expr(rvalue);
                 // LRM §14.4: clocking-block output drive
                 // `cb.<out_sig> <= val`. Defer to the cb's next clock
@@ -25281,10 +25624,13 @@ impl Simulator {
                     lvalue
                 };
                 let w = self.infer_lhs_width(lvalue);
-                let d = delay
-                    .as_ref()
-                    .map(|de| self.eval_expr(de).to_u64().unwrap_or(0))
-                    .unwrap_or(0);
+                let d = match intra_d {
+                    Some(d) => d,
+                    None => delay
+                        .as_ref()
+                        .map(|de| self.eval_expr(de).to_u64().unwrap_or(0))
+                        .unwrap_or(0),
+                };
                 if d == 0 {
                     let id_opt = self.resolve_nba_target(lvalue);
                     if let Some(id) = id_opt {
@@ -25320,6 +25666,11 @@ impl Simulator {
                             resolved_id: None,
                         });
                     }
+                } else if let Some(id) = self.resolve_nba_target(lvalue) {
+                    // Delayed NBA is transport, not inertial: push directly
+                    // so pending same-signal updates are NOT cancelled.
+                    self.delayed_updates
+                        .push((self.time + d, id, val.resize_for_assign(w)));
                 } else {
                     self.nba_queue.push(NbaEntry {
                         lhs: Some(lvalue.clone()),
@@ -25603,6 +25954,16 @@ impl Simulator {
                     .filter_map(|v| v.as_ref().map(|id| id.name.clone()))
                     .collect();
                 let fe_saved = self.snapshot_loop_vars(&fe_names);
+                // foreach index vars are automatic (§12.7.3); like for-init
+                // vars, record them so a `fork … join_none/join_any` in the
+                // body captures the per-iteration value by value (§9.3.2).
+                // Truncated on every exit path of this arm.
+                let fe_auto_len = self.auto_loop_vars.len();
+                if self.local_stack.last().is_none() {
+                    for nm in &fe_names {
+                        self.auto_loop_vars.push(nm.clone());
+                    }
+                }
                 // `foreach (obj.assoc_member[k])` — iterate that object's
                 // instance-scoped associative array (base may be a 2-seg
                 // Ident `b.edges` or a MemberAccess).
@@ -25676,6 +26037,7 @@ impl Simulator {
                                 self.continue_flag = false;
                             }
                         }
+                        self.auto_loop_vars.truncate(fe_auto_len);
                         self.restore_loop_vars(&fe_saved);
                         return;
                     }
@@ -25733,6 +26095,7 @@ impl Simulator {
                                     body,
                                     var_scope.as_deref(),
                                 );
+                                self.auto_loop_vars.truncate(fe_auto_len);
                                 self.restore_loop_vars(&fe_saved);
                                 return;
                             }
@@ -25860,6 +26223,7 @@ impl Simulator {
                         }
                     }
                 }
+                self.auto_loop_vars.truncate(fe_auto_len);
                 self.restore_loop_vars(&fe_saved);
             }
             StatementKind::While { condition, body } => {
@@ -25945,12 +26309,18 @@ impl Simulator {
                 }
             }
             StatementKind::SeqBlock { stmts, name } => {
+                // `automatic` locals declared in this block (see the VarDecl
+                // arm) are fork-capturable only while the block is in scope
+                // (§6.21): each entry — e.g. each loop iteration — is a fresh
+                // variable, so pop them on exit.
+                let seq_auto_len = self.auto_loop_vars.len();
                 for s in stmts {
                     if self.finished || self.break_flag || self.continue_flag {
                         break;
                     }
                     self.exec_statement(s);
                 }
+                self.auto_loop_vars.truncate(seq_auto_len);
                 // A `disable` naming THIS block ends here; execution resumes
                 // after it (§9.6.2).
                 if let (Some(target), Some(n)) = (self.disable_target.as_deref(), name.as_ref()) {
@@ -26289,22 +26659,137 @@ impl Simulator {
             StatementKind::ProceduralContinuous(pc) => match pc {
                 ProceduralContinuous::Assign { lvalue, rvalue }
                 | ProceduralContinuous::Force { lvalue, rvalue } => {
-                    // LRM §9.3.1: force/assign inserts into forced_signals and
-                    // updates the signal regardless of comb drivers.
+                    // LRM §10.6.2 `force` / §10.6.1 procedural continuous
+                    // `assign`: the override supersedes ordinary procedural
+                    // assignments and continuous drivers until the matching
+                    // release/deassign. We register the target in
+                    // `forced_signals` (compact-table id) or `forced_names`
+                    // (runtime-map storage); every central write path
+                    // (`write_sig!`, the comb-settle direct-copy items, the
+                    // name-keyed fallbacks) drops writes to registered
+                    // targets.
                     let v = self.eval_expr(rvalue);
+                    let target = self.force_target(lvalue);
+                    // A second force/assign on an already-overridden target
+                    // REPLACES the previous override (§10.6.1/§10.6.2), so
+                    // lift the old one first — the guarded write paths would
+                    // otherwise drop this very write — then re-arm below.
+                    if let Some((ref name, id)) = target {
+                        if let Some(id) = id {
+                            self.forced_signals.remove(&id);
+                        }
+                        self.forced_names.remove(name);
+                    }
                     self.assign_value(lvalue, &v);
+                    match target {
+                        Some((_, Some(id))) => {
+                            // Record the value as stored (post-resize), so
+                            // the map mirrors the signal table.
+                            let stored = self
+                                .signal_table
+                                .get(id)
+                                .cloned()
+                                .unwrap_or(v);
+                            self.forced_signals.insert(id, stored);
+                        }
+                        Some((name, None)) => {
+                            self.forced_names.insert(name);
+                        }
+                        // Unsupported lvalue shape (part-select, concat, …):
+                        // degrade to a plain write, as before.
+                        None => {}
+                    }
                 }
-                ProceduralContinuous::Release(_lvalue)
-                | ProceduralContinuous::Deassign(_lvalue) => {
-                    // Native force/release from SystemVerilog code: 
-                    // mark all comb entries as dirty so they re-evaluate.
+                ProceduralContinuous::Release(lvalue)
+                | ProceduralContinuous::Deassign(lvalue) => {
+                    // LRM §10.6.2 `release`: a VARIABLE keeps the forced
+                    // value until the next procedural assignment — so we
+                    // only lift the override and leave the stored value
+                    // untouched. A NET returns to its continuous drivers —
+                    // mark the source signals of every comb entry driving it
+                    // dirty so the next settle re-evaluates the drivers.
+                    // §10.6.1 `deassign` likewise retains the last value.
+                    if let Some((name, id)) = self.force_target(lvalue) {
+                        self.forced_names.remove(&name);
+                        if let Some(id) = id {
+                            self.forced_signals.remove(&id);
+                            // Re-evaluate continuous drivers (nets). For a
+                            // variable no comb entry writes it, so this loop
+                            // finds nothing and the value is retained.
+                            let mut sources: Vec<usize> = Vec::new();
+                            for entry in self.comb_entries.iter() {
+                                if entry.write_signal_ids.contains(&id) {
+                                    sources
+                                        .extend(entry.read_signal_ids.iter().copied());
+                                }
+                            }
+                            for src_id in sources {
+                                if src_id < self.dirty_signals.len()
+                                    && !self.dirty_signals[src_id]
+                                {
+                                    self.dirty_signals[src_id] = true;
+                                    self.dirty_list.push(src_id);
+                                }
+                            }
+                        }
+                    }
                     self.dirty_any = true;
                 }
             },
+            StatementKind::Typedef(td) => {
+                // §6.18: a block-local typedef registers its width and
+                // underlying type so later declarations in this process
+                // resolve it — it was parsed and DISCARDED before, so a
+                // local `typedef struct packed {...} t; t v;` lost the
+                // member layout. Enum members become named constants.
+                let w = super::elaborate::resolve_type_width(
+                    &td.data_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                self.module.typedefs.insert(td.name.name.clone(), w);
+                self.module
+                    .typedef_types
+                    .insert(td.name.name.clone(), td.data_type.clone());
+                if !td.dimensions.is_empty() {
+                    self.module
+                        .typedef_unpacked_dims
+                        .insert(td.name.name.clone(), td.dimensions.clone());
+                }
+                if let crate::ast::types::DataType::Enum(et) = &td.data_type {
+                    let base_w = et
+                        .base_type
+                        .as_ref()
+                        .map(|bt| {
+                            super::elaborate::resolve_type_width(
+                                bt,
+                                Some(&self.module.parameters),
+                                Some(&self.module.typedefs),
+                            )
+                        })
+                        .unwrap_or(32);
+                    let mut next: u64 = 0;
+                    let mut members: Vec<(String, u64)> = Vec::new();
+                    for m in &et.members {
+                        let v = match &m.init {
+                            Some(e) => self.eval_expr(e).to_u64().unwrap_or(next),
+                            None => next,
+                        };
+                        next = v.wrapping_add(1);
+                        self.module
+                            .parameters
+                            .insert(m.name.name.clone(), Value::from_u64(v, base_w));
+                        members.push((m.name.name.clone(), v));
+                    }
+                    self.module
+                        .enum_members
+                        .insert(td.name.name.clone(), members);
+                }
+            }
             StatementKind::VarDecl {
                 data_type,
+                lifetime,
                 declarators,
-                ..
             } => {
                 let w0 = super::elaborate::resolve_type_width(
                     data_type,
@@ -26406,6 +26891,58 @@ impl Simulator {
                     // separate storage (a whole write doesn't reach members and
                     // vice-versa). Unpacked structs are intentionally excluded.
                     if d.dimensions.is_empty() {
+                        // §6.17: an `event` local becomes a real event —
+                        // `->e` / `@(e)` resolve through module.events.
+                        if matches!(
+                            data_type,
+                            crate::ast::types::DataType::Simple {
+                                kind: crate::ast::types::SimpleType::Event,
+                                ..
+                            }
+                        ) {
+                            self.module.events.insert(d.name.name.clone());
+                        }
+                        // Declared type of a scalar local: the member-wise
+                        // struct copy (`u2 = u1`) resolves the element type
+                        // through var_decl_types, which only module-scope
+                        // decls registered.
+                        self.module
+                            .var_decl_types
+                            .insert(d.name.name.clone(), data_type.clone());
+                        // Packed multi-D local (`logic [1:0][3:0] m;`): record
+                        // the per-element width so `m[i]` is an element slice,
+                        // not a bit-select — module-scope decls already do.
+                        if let Some(elem_w) = super::elaborate::packed_inner_elem_width(
+                            data_type,
+                            &self.module.parameters,
+                            &self.module.typedefs,
+                        ) {
+                            self.module
+                                .packed_signal_elem_widths
+                                .insert(d.name.name.clone(), elem_w);
+                        } else {
+                            self.module.packed_signal_elem_widths.remove(&d.name.name);
+                        }
+                        // Per-field element widths (`u.n[i]` where the member
+                        // is itself a packed array) — mirrors the module-scope
+                        // registration keyed "var.field".
+                        if let crate::ast::types::DataType::Struct(su) =
+                            self.resolve_dt(data_type)
+                        {
+                            for m in &su.members {
+                                if let Some(ew) = super::elaborate::packed_inner_elem_width(
+                                    &m.data_type,
+                                    &self.module.parameters,
+                                    &self.module.typedefs,
+                                ) {
+                                    for mdecl in &m.declarators {
+                                        let key =
+                                            format!("{}.{}", d.name.name, mdecl.name.name);
+                                        self.module.packed_signal_elem_widths.insert(key, ew);
+                                    }
+                                }
+                            }
+                        }
                         if let Some(fields) = super::elaborate::packed_struct_field_layout(
                             data_type,
                             &self.module.parameters,
@@ -26860,6 +27397,20 @@ impl Simulator {
                             frame.insert(d.name.name.clone(), v);
                         } else {
                             self.signals.insert(d.name.name.clone(), v);
+                            // §6.21/§9.3.2: an explicitly `automatic` block
+                            // local is a fresh variable per block entry, and a
+                            // fork child must capture ITS entry's value. With
+                            // no call frame it lives in the shared signal map,
+                            // so record it for `inherit_fork_child_context` to
+                            // copy by value at spawn time — exactly like a
+                            // for-init loop variable. The enclosing SeqBlock
+                            // pops it on scope exit.
+                            if matches!(
+                                lifetime,
+                                Some(crate::ast::types::Lifetime::Automatic)
+                            ) {
+                                self.auto_loop_vars.push(d.name.name.clone());
+                            }
                         }
                         // Track `signed` scalars so reads carry `is_signed`
                         // (needed for signed division/modulo, comparison, and
@@ -28939,11 +29490,14 @@ impl Simulator {
                 let vs = self.signal_table[s.sig_id as usize].get_bit_code(s.bit as usize);
                 let vt = self.signal_table[t.sig_id as usize].get_bit_code(t.bit as usize);
                 let ve = self.signal_table[e.sig_id as usize].get_bit_code(e.bit as usize);
+                // IEEE 1800 §11.4.11 Table 11-21: ambiguous select merges the
+                // branches per bit — 0/0→0, 1/1→1, every other pair (incl.
+                // z/z) → x.
                 let v = match vs {
                     0 => ve,
                     1 => vt,
                     _ => {
-                        if vt == ve {
+                        if vt == ve && vt < 2 {
                             vt
                         } else {
                             2
@@ -30281,6 +30835,12 @@ impl Simulator {
         if self.condition_waiters.iter().any(|(p, _)| *p == pid) {
             return true;
         }
+        // A process parked by `#0` in the Inactive-region queue (§4.4.2.3)
+        // is suspended, not finished — its continuation resumes after the
+        // NBA region of the current tick.
+        if self.inactive_queue.iter().any(|(p, _)| *p == pid) {
+            return true;
+        }
         // A process blocked on `fork...join`/`join_any` is the PARENT of a
         // join_waiter — also suspended. Without this it was treated as finished,
         // so its process context (this_stack, locals) was dropped and the
@@ -31112,6 +31672,10 @@ impl Simulator {
             // Genuine wide numeric keys were already truncation-broken here, so
             // this only improves correctness.
             idx_val.to_sv_string()
+        } else if idx_val.is_signed {
+            // §7.8: a signed key keeps its sign — folding -5 to 4294967291
+            // both mis-stores the element and breaks first()/next() order.
+            idx_val.to_i64().unwrap_or(0).to_string()
         } else {
             idx_val.to_u64().unwrap_or(0).to_string()
         }
@@ -31217,6 +31781,11 @@ impl Simulator {
                 }
                 return;
             }
+        }
+        // LRM §10.6/§10.6.1: drop ordinary writes to a runtime-map target
+        // that is under an active force / procedural continuous assign.
+        if self.forced_names.contains(name) {
+            return;
         }
         self.signals.insert(name.to_string(), val);
     }
@@ -36237,6 +36806,32 @@ impl Simulator {
         if let ExprKind::MemberAccess { expr, member } = &func.kind {
             let mname = member.name.as_str();
 
+            // IEEE 1800-2017 §8.15: `super.m(...)` binds STATICALLY to the
+            // method visible in the parent of the class LEXICALLY containing
+            // the call — never through virtual dispatch on the object's
+            // dynamic type. This must run BEFORE every method-name-keyed
+            // interceptor below (mailbox `get`/`put`, analysis-port `write`,
+            // collection builtins, ...), otherwise a user method whose name
+            // collides with a builtin (e.g. `super.get()`) is swallowed by
+            // the builtin path instead of running the base-class body.
+            // Guarded on the parent chain actually defining the method (or
+            // `new`, whose ctor-chaining path exec_super_method_call already
+            // owns) so `super.randomize()`-style builtin calls keep their
+            // legacy routing.
+            if let ExprKind::Ident(hier) = &expr.kind {
+                if hier.path.len() == 1 && hier.path[0].name.name == "super" {
+                    if let Some(handle) = self.this_stack.last().copied().flatten() {
+                        let routed = mname == "new"
+                            || self
+                                .super_call_parent()
+                                .map_or(false, |p| self.class_has_method(&p, mname));
+                        if routed {
+                            return self.exec_super_method_call(handle, mname, args);
+                        }
+                    }
+                }
+            }
+
             // PURE_SV_LRM: intercept the factory's by-name create EARLY (before
             // the real `uvm_default_factory::create_component_by_name` body,
             // whose `m_type_names` is empty, runs and returns null). Resolve the
@@ -37143,6 +37738,27 @@ impl Simulator {
         if let ExprKind::Ident(hier) = &func.kind {
             let path = &hier.path;
             let len = path.len();
+
+            // IEEE 1800-2017 §8.15: `super.m(args)` whose call flattened into
+            // a hierarchical Ident([super, m]) (the statement-level parse
+            // shape) — same STATIC binding as the MemberAccess form handled
+            // above. Without this the call fell through to the unqualified
+            // method fallback at the bottom of this arm, which dispatches
+            // VIRTUALLY through `this` — so `super.get()` ran the derived
+            // override (or a builtin name collision returned garbage) instead
+            // of the parent-of-the-lexically-containing-class method.
+            if len == 2 && path[0].name.name == "super" {
+                if let Some(handle) = self.this_stack.last().copied().flatten() {
+                    let m = path[1].name.name.clone();
+                    let routed = m == "new"
+                        || self
+                            .super_call_parent()
+                            .map_or(false, |p| self.class_has_method(&p, &m));
+                    if routed {
+                        return self.exec_super_method_call(handle, &m, args);
+                    }
+                }
+            }
 
             // IEEE 1800-2023 §9.7: `process::self()` (2-segment scoped-Ident
             // parse shape for the `::` call) — see the MemberAccess-form
@@ -39034,6 +39650,110 @@ impl Simulator {
         }
     }
 
+    /// True when a `#(...)` specialization argument is DEFINITELY a type
+    /// name (§8.25): a bare single-segment identifier naming a built-in
+    /// type keyword, a declared class, or a typedef. A literal / operator
+    /// expression / call is never a type; a bare identifier that names a
+    /// variable or constant is a value.
+    fn is_definite_type_arg(&self, e: &Expression) -> bool {
+        if let ExprKind::Ident(h) = &e.kind {
+            if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                let n = h.path[0].name.name.as_str();
+                return atom_type_keyword_width(n).is_some()
+                    || n == "string"
+                    || self.module.classes.contains_key(n)
+                    || self.module.typedefs.contains_key(n)
+                    || self.resolve_type_param_binding(n).is_some();
+            }
+        }
+        false
+    }
+
+    /// Map a specialization's `#(...)` argument list onto the class's
+    /// parameters by NAME (§8.25). Positional lists map by slot in
+    /// `param_order` (type and value parameters interleave in declaration
+    /// order). The parser flattens named connections (`.W(32)`) into the
+    /// same positional expression list with the names dropped, so the named
+    /// form is recovered structurally: §8.26 requires a list to be all-named
+    /// or all-positional, so if any slot is kind-inconsistent (a value
+    /// expression on a TYPE-parameter slot, or a definite type name on a
+    /// value-parameter slot) the list must have been named — pair type-name
+    /// args with TYPE params and value exprs with VALUE params, each in
+    /// declaration order. Known limitation: named args of the SAME kind
+    /// given out of declaration order (e.g. `#(.D(5), .W(32))`) mis-bind,
+    /// because the AST no longer carries the names.
+    fn class_param_arg_map(
+        &self,
+        class_def: &crate::compiler::elaborate::ElaboratedClass,
+        ta: &[Expression],
+    ) -> HashMap<String, Expression> {
+        // `param_order` is serde-defaulted: a compiled module cached by an
+        // older xezim has it empty. Reconstruct the legacy assumption
+        // (value params first, type params after) so those caches keep
+        // binding the way they used to.
+        let legacy_order: Vec<String>;
+        let order: &[String] = if class_def.param_order.is_empty()
+            && !(class_def.param_defaults.is_empty()
+                && class_def.type_param_names.is_empty())
+        {
+            legacy_order = class_def
+                .param_defaults
+                .iter()
+                .map(|(n, _)| n.clone())
+                .chain(class_def.type_param_names.iter().cloned())
+                .collect();
+            &legacy_order
+        } else {
+            &class_def.param_order
+        };
+        let is_type_param =
+            |n: &str| class_def.type_param_names.iter().any(|t| t == n);
+        // Kind-consistency scan: positional unless some slot mismatches.
+        let mut positional = true;
+        for (i, arg) in ta.iter().enumerate() {
+            let Some(pname) = order.get(i) else { break };
+            if is_type_param(pname) {
+                // A type arg is always a bare identifier (possibly a class
+                // not yet checked as definite); anything else is a value.
+                let ident_ok = matches!(&arg.kind, ExprKind::Ident(h)
+                    if h.path.len() == 1 && h.path[0].selects.is_empty());
+                if !ident_ok {
+                    positional = false;
+                    break;
+                }
+            } else if self.is_definite_type_arg(arg) {
+                positional = false;
+                break;
+            }
+        }
+        let mut map: HashMap<String, Expression> = HashMap::default();
+        if positional {
+            for (i, arg) in ta.iter().enumerate() {
+                if let Some(pname) = order.get(i) {
+                    map.insert(pname.clone(), arg.clone());
+                }
+            }
+        } else {
+            let type_params: Vec<&String> =
+                order.iter().filter(|n| is_type_param(n)).collect();
+            let value_params: Vec<&String> =
+                order.iter().filter(|n| !is_type_param(n)).collect();
+            let (mut ti, mut vi) = (0usize, 0usize);
+            for arg in ta {
+                if self.is_definite_type_arg(arg) {
+                    if let Some(p) = type_params.get(ti) {
+                        map.insert((*p).clone(), arg.clone());
+                        ti += 1;
+                    }
+                } else if let Some(p) = value_params.get(vi) {
+                    map.insert((*p).clone(), arg.clone());
+                    vi += 1;
+                }
+            }
+        }
+        map
+    }
+
     /// Resolve a class TYPE-parameter name through the current `this`
     /// instance's recorded bindings. Returns the concrete class name if `tn`
     /// is a type parameter bound on the active instance (e.g. `T -> Base`
@@ -39152,6 +39872,13 @@ impl Simulator {
             properties: HashMap::default(),
             type_bindings: HashMap::default(),
         };
+        // §8.25: map the specialization's `#(...)` args onto the leaf
+        // class's parameters BY NAME (type and value params interleave in
+        // `param_order`), so value-parameter overrides land on the right
+        // parameter and type args never clobber a value parameter.
+        let arg_map: HashMap<String, Expression> = type_args
+            .map(|ta| self.class_param_arg_map(class_def, ta))
+            .unwrap_or_default();
         let mut classes_to_init = vec![class_def.clone()];
         let mut cur = class_def.extends.clone();
         // Cycle guard — `sanitize_class_hierarchy` already severs `extends`
@@ -39185,13 +39912,18 @@ impl Simulator {
                     .properties
                     .insert(prop_name.clone(), prop_sig.value.clone());
             }
-            // Bind class parameters: each param gets its default value, then
-            // any positional type_args (on the leaf class only) override.
+            // Bind class VALUE parameters (§8.25): each parameter gets the
+            // specialization's argument (on the leaf class only, matched by
+            // NAME through `arg_map` — never by raw slot, since type and
+            // value params interleave), falling back to its declared
+            // default. `param_defaults` also carries class-body localparams,
+            // which are not overridable and always take their default.
             let is_leaf = cdef.name == class_def.name;
-            for (i, (pname, pdefault)) in cdef.param_defaults.iter().enumerate() {
+            for (pname, pdefault) in cdef.param_defaults.iter() {
                 let expr_opt: Option<Expression> = if is_leaf {
-                    type_args
-                        .and_then(|ta| ta.get(i).cloned())
+                    arg_map
+                        .get(pname)
+                        .cloned()
                         .or_else(|| pdefault.clone())
                 } else {
                     pdefault.clone()
@@ -39243,17 +39975,10 @@ impl Simulator {
         // these bindings to construct the right class (see the `new` dispatch
         // gated by `pure_sv_lrm`). Type and value params may be INTERLEAVED
         // (e.g. `uvm_component_registry#(type T, string Tname)` — type first),
-        // so map each type param by its TRUE position in `param_order`, not by
-        // assuming type params follow the data params.
+        // so look each type param up by NAME in `arg_map` (which maps args by
+        // `param_order` slot, or by kind for the recovered named form §8.26).
         for tp_name in class_def.type_param_names.iter() {
-            // Position of this type param among ALL params (declaration order)
-            // = its slot in the positional `#(...)` type-arg list.
-            let pos = class_def
-                .param_order
-                .iter()
-                .position(|n| n == tp_name)
-                .unwrap_or_else(|| class_def.param_defaults.len()); // legacy fallback
-            if let Some(ta) = type_args.and_then(|ta| ta.get(pos)) {
+            if let Some(ta) = arg_map.get(tp_name) {
                 if let Some(concrete) = Self::leaf_ident_name(ta) {
                     // The type arg may itself be a type PARAMETER of the enclosing
                     // parameterized context (`uvm_resource#(T)` where `T` is
@@ -41920,27 +42645,46 @@ impl Simulator {
         }
     }
 
+    /// IEEE 1800-2017 §8.15: the class a `super.m(...)` call resolves
+    /// against — the PARENT of the class LEXICALLY containing the call, not
+    /// the parent of the object's dynamic type. During method execution
+    /// `class_context_stack` holds the DEFINING class of the running method
+    /// (`exec_method_in_class_hierarchy` pushes the class where the body was
+    /// found while walking the extends chain, not the receiver's class), so
+    /// an inherited method's `super` chain correctly starts from its own
+    /// defining class's parent (e.g. Grand::sup2's `super.get()` binds to
+    /// Derived::get even on a Grand object).
+    fn super_call_parent(&self) -> Option<String> {
+        let ctx = self
+            .class_context_stack
+            .last()
+            .cloned()
+            .flatten()
+            .or_else(|| {
+                self.this_stack.last().copied().flatten().and_then(|h| {
+                    self.heap
+                        .get(h)
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.class_name.clone())
+                })
+            })?;
+        self.module.classes.get(&ctx).and_then(|cd| cd.extends.clone())
+    }
+
+    /// IEEE 1800-2017 §8.15: run `method_name` starting the resolution walk
+    /// at the parent of the calling context's class and execute it
+    /// NON-virtually (`exec_method_in_class_hierarchy` runs the first body
+    /// found walking UP the extends chain; it never re-dispatches through
+    /// the object's dynamic class).
     fn exec_super_method_call(
         &mut self,
         handle: usize,
         method_name: &str,
         args: &[Expression],
     ) -> Value {
-        let class_name = if let Some(Some(ctx)) = self.class_context_stack.last() {
-            ctx.clone()
-        } else {
-            if let Some(Some(inst)) = self.heap.get(handle) {
-                inst.class_name.clone()
-            } else {
-                return Value::zero(32);
-            }
-        };
-        let parent_name = if let Some(class_def) = self.module.classes.get(&class_name) {
-            class_def.extends.clone()
-        } else {
-            None
-        };
-        if let Some(pname) = parent_name {
+        // §8.15: bind from the parent of the class lexically containing the
+        // call (see super_call_parent), then execute non-virtually.
+        if let Some(pname) = self.super_call_parent() {
             return self.exec_method_in_class_hierarchy(handle, &pname, method_name, args);
         }
         Value::zero(32)

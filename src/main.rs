@@ -1159,6 +1159,12 @@ fn main() {
             std::process::exit(1);
         }
 
+        // §9.4.5 intra-assignment delay canonicalization — keep the compiled
+        // artifact consistent with the simulate path (see xezim::intra_delay).
+        let sources: Vec<String> = sources
+            .iter()
+            .map(|s| xezim::intra_delay::rewrite_intra_assignment_delays(s))
+            .collect();
         match xezim::parse_and_elaborate_multi(
             &sources,
             top_module.as_deref(),

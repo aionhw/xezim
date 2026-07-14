@@ -7,6 +7,7 @@
 //! For ahead-of-time native compilation, use the `xezim-b` crate.
 
 pub mod compiler;
+pub mod intra_delay;
 pub mod multikernel;
 pub mod should_fail_lint;
 
@@ -76,8 +77,15 @@ pub fn simulate_multi(
 ) -> Result<compiler::Simulator, String> {
     let total_start = std::time::Instant::now();
     let compilation_start = std::time::Instant::now();
+    // IEEE 1800-2017 §9.4.5: the parser discards intra-assignment delays
+    // (`lhs = #d rhs`); canonicalize them into a marker call the simulator
+    // implements (see `intra_delay`) before parsing.
+    let sources: Vec<String> = sources
+        .iter()
+        .map(|s| intra_delay::rewrite_intra_assignment_delays(s))
+        .collect();
     let (definitions, elab) = parse_and_elaborate_multi(
-        sources,
+        &sources,
         top_module_name,
         include_dirs,
         source_paths,
