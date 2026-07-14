@@ -33967,6 +33967,11 @@ impl Simulator {
                     b'"' => s.push_str("\\\""),
                     b'\n' => s.push_str("\\n"),
                     b'\t' => s.push_str("\\t"),
+                    // A raw comma inside a quoted value is spec-legal (a parser
+                    // that honours quotes handles it), but XTrace records are
+                    // comma-delimited and design goal #1 is "easy to parse", so
+                    // escape it via §8.5 `\xHH` to stay safe for naive splitters.
+                    b',' => s.push_str("\\x2c"),
                     0x20..=0x7e => s.push(b as char),
                     other => s.push_str(&format!("\\x{:02x}", other)),
                 }

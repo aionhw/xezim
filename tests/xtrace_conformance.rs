@@ -755,6 +755,32 @@ fn string_signals_use_str_type_and_quoted_values() {
     );
 }
 
+/// §8.5: a comma inside a string value would break the comma-delimited record
+/// for a naive parser, so it is escaped as `\x2c` — the record stays splittable
+/// and a §8.5 consumer decodes it back to a comma.
+#[test]
+fn comma_in_string_is_escaped_for_naive_parsers() {
+    let src = r#"
+module top;
+    string s;
+    initial begin s = "a,b,c"; #1 s = "x"; #1 $finish; end
+endmodule
+"#;
+    let xt = dump("comma", src);
+    let line = xt.lines().find(|l| l.starts_with("N,full")).unwrap();
+    assert!(
+        !line.trim_end_matches(|c| c != ',').is_empty() && line.matches("=").count() == 1,
+        "the N,full record must have exactly one assignment (no comma leaked \
+         out of the string): {}",
+        line
+    );
+    assert!(
+        line.contains(r#""a\x2cb\x2cc""#),
+        "§8.5: commas in a string must be `\\x2c`-escaped, got {}",
+        line
+    );
+}
+
 /// §19.7: the t=0 `N,full` checkpoint carries POST-SETTLE values, so a signal
 /// initialized in an initial block appears at its real value directly — not an
 /// all-X image that a redundant same-time record then corrects.
