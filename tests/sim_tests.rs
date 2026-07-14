@@ -256,7 +256,7 @@ fn test_sim_multibit_add() {
             assign sum = a + b;
             initial begin
                 a = 100; b = 55; #1;
-                $display(\"sum=%d\", sum);
+                $display(\"sum=%0d\", sum);
                 $finish;
             end
         endmodule
@@ -275,8 +275,8 @@ fn test_sim_ternary_mux() {
             assign y = sel ? a : b;
             initial begin
                 a = 42; b = 99;
-                sel = 0; #1; $display(\"%d\", y);
-                sel = 1; #1; $display(\"%d\", y);
+                sel = 0; #1; $display(\"%0d\", y);
+                sel = 1; #1; $display(\"%0d\", y);
                 $finish;
             end
         endmodule
@@ -322,10 +322,10 @@ fn test_sim_always_comb_case_mux() {
             end
             initial begin
                 a = 10; b = 20; c = 30; d = 40;
-                sel = 0; #1; $display(\"y=%d\", y);
-                sel = 1; #1; $display(\"y=%d\", y);
-                sel = 2; #1; $display(\"y=%d\", y);
-                sel = 3; #1; $display(\"y=%d\", y);
+                sel = 0; #1; $display(\"y=%0d\", y);
+                sel = 1; #1; $display(\"y=%0d\", y);
+                sel = 2; #1; $display(\"y=%0d\", y);
+                sel = 3; #1; $display(\"y=%0d\", y);
                 $finish;
             end
         endmodule
@@ -348,8 +348,8 @@ fn test_sim_always_comb_if_else() {
                 else max_val = b;
             end
             initial begin
-                a = 50; b = 30; #1; $display(\"max=%d\", max_val);
-                a = 10; b = 80; #1; $display(\"max=%d\", max_val);
+                a = 50; b = 30; #1; $display(\"max=%0d\", max_val);
+                a = 10; b = 80; #1; $display(\"max=%0d\", max_val);
                 $finish;
             end
         endmodule
@@ -369,7 +369,7 @@ fn test_sim_chained_assign() {
             assign c = b * 2;
             initial begin
                 a = 5; #1;
-                $display(\"a=%d b=%d c=%d\", a, b, c);
+                $display(\"a=%0d b=%0d c=%0d\", a, b, c);
                 $finish;
             end
         endmodule
@@ -413,10 +413,10 @@ fn test_sim_decoder_2to4() {
             logic [3:0] out_val;
             assign out_val = 4'b0001 << in_val;
             initial begin
-                in_val = 0; #1; $display(\"in=%d out=%b\", in_val, out_val);
-                in_val = 1; #1; $display(\"in=%d out=%b\", in_val, out_val);
-                in_val = 2; #1; $display(\"in=%d out=%b\", in_val, out_val);
-                in_val = 3; #1; $display(\"in=%d out=%b\", in_val, out_val);
+                in_val = 0; #1; $display(\"in=%0d out=%b\", in_val, out_val);
+                in_val = 1; #1; $display(\"in=%0d out=%b\", in_val, out_val);
+                in_val = 2; #1; $display(\"in=%0d out=%b\", in_val, out_val);
+                in_val = 3; #1; $display(\"in=%0d out=%b\", in_val, out_val);
                 $finish;
             end
         endmodule
@@ -464,7 +464,7 @@ fn test_sim_for_loop_display() {
         module test;
             initial begin
                 for (int i = 0; i < 4; i++) begin
-                    $display(\"i=%d\", i);
+                    $display(\"i=%0d\", i);
                 end
                 $finish;
             end
@@ -515,11 +515,11 @@ fn test_sim_alu() {
             end
             initial begin
                 a = 15; b = 10;
-                op = 0; #1; $display(\"ADD: %d\", result);
-                op = 1; #1; $display(\"SUB: %d\", result);
-                op = 2; #1; $display(\"AND: %d\", result);
-                op = 3; #1; $display(\"OR:  %d\", result);
-                op = 4; #1; $display(\"XOR: %d\", result);
+                op = 0; #1; $display(\"ADD: %0d\", result);
+                op = 1; #1; $display(\"SUB: %0d\", result);
+                op = 2; #1; $display(\"AND: %0d\", result);
+                op = 3; #1; $display(\"OR:  %0d\", result);
+                op = 4; #1; $display(\"XOR: %0d\", result);
                 $finish;
             end
         endmodule
@@ -537,7 +537,7 @@ fn test_sim_display_hex() {
             logic [15:0] val;
             initial begin
                 val = 16'hDEAD;
-                $display(\"hex=%h dec=%d bin=%b\", val, val, val);
+                $display(\"hex=%h dec=%0d bin=%b\", val, val, val);
                 $finish;
             end
         endmodule
@@ -625,7 +625,7 @@ fn test_sim_dff_with_reset() {
                 #5 clk = 1; #5 clk = 0;
                 #5 clk = 1;
                 #1;
-                $display(\"q=%d\", q);
+                $display(\"q=%0d\", q);
                 $finish;
             end
         endmodule
@@ -649,7 +649,7 @@ fn test_sim_counter_posedge() {
                 #5 clk = 1; #5 clk = 0;
                 #5 clk = 1;
                 #1;
-                $display(\"count=%d\", count);
+                $display(\"count=%0d\", count);
                 $finish;
             end
         endmodule
@@ -674,7 +674,7 @@ fn test_sim_nba_deferred() {
                 clk = 0; a = 8'd10; b = 8'd20;
                 #5 clk = 1;
                 #1;
-                $display(\"a=%d b=%d\", a, b);
+                $display(\"a=%0d b=%0d\", a, b);
                 $finish;
             end
         endmodule
@@ -702,7 +702,7 @@ fn test_sim_blocking_vs_nonblocking() {
                 #5 clk = 1; #5 clk = 0;
                 #5 clk = 1;
                 #1;
-                $display(\"x=%d y=%d\", x, y);
+                $display(\"x=%0d y=%0d\", x, y);
                 $finish;
             end
         endmodule
@@ -727,7 +727,7 @@ fn test_sim_clock_forever() {
             end
             initial begin
                 #52;
-                $display(\"count=%d\", count);
+                $display(\"count=%0d\", count);
                 $finish;
             end
         endmodule
@@ -777,7 +777,7 @@ fn test_sim_negedge() {
                 #5 clk = 1;
                 #5 clk = 0;  // negedge
                 #1;
-                $display(\"count=%d\", count);
+                $display(\"count=%0d\", count);
                 $finish;
             end
         endmodule

@@ -10,7 +10,7 @@ fn test_repro_import_wildcard() {
         module top;
             import p::*;
             initial begin
-                $display("A=%d B=%d", A, B);
+                $display("A=%0d B=%0d", A, B);
                 $finish;
             end
         endmodule
@@ -29,7 +29,7 @@ fn test_repro_import_too_much() {
         module top;
             import p::A;
             initial begin
-                $display("B=%d", B); // Should fail to elaborate because B is not imported
+                $display("B=%0d", B); // Should fail to elaborate because B is not imported
                 $finish;
             end
         endmodule
