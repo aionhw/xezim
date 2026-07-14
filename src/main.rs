@@ -83,13 +83,19 @@ fn print_usage() {
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
     eprintln!("                   n>=2 offloads stdout writes to a background thread.");
     eprintln!("  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>");
-    eprintln!("  --xtrace <file>  Emit XTrace v1.0 dump to <file>");
-    eprintln!("                   (minimal profile: dictionary + signal deltas).");
+    eprintln!("  --xtrace <file>  Emit an XTrace dump to <file> (compliance Level 0:");
+    eprintln!("                   dictionary + time + signal deltas + event records).");
     eprintln!("                   A '.zst'/'.zstd' suffix zstd-compresses the stream.");
     eprintln!("  --xtrace-scope <hier>  Restrict the XTrace dump to signals under <hier>");
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
     eprintln!("  --xtrace-from <ns>  Only dump XTrace changes at/after this time (ns).");
     eprintln!("  --xtrace-to <ns>    Stop the XTrace dump after this time (ns).");
+    eprintln!("  --xtrace-level <0>  XTrace compliance level (1-4 reserved: semantic,");
+    eprintln!("                   transactional, AI-native, retrieval layers).");
+    eprintln!("  --xtrace-format <text>  XTrace output format (binary reserved).");
+    eprintln!("  --xtrace-profile <name>  @profile header value (default: minimal).");
+    eprintln!("  --xtrace-compress <none|zstd>  Compress the XTrace stream (declared in");
+    eprintln!("                   the @compression header; forces a '.zst' file name).");
     eprintln!("  --fst <file>     Emit an FST (GTKWave binary) waveform dump to <file>.");
     eprintln!("  --fst-scope <hier>  Restrict the FST dump to signals under <hier>");
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
@@ -545,6 +551,14 @@ fn main() {
     let mut xtrace_scopes: Vec<String> = Vec::new();
     let mut xtrace_from_ns: u64 = 0;
     let mut xtrace_to_ns: u64 = u64::MAX;
+    // XTrace compliance level (§24). We emit Level 0 (dictionary + time +
+    // signal deltas, plus the §10.4 event record); levels 1-4 add the semantic,
+    // transactional and retrieval layers and are RESERVED — asking for one is a
+    // warning, not a silent lie in the header.
+    let mut xtrace_level: u8 = 0;
+    let mut xtrace_format = "text".to_string();
+    let mut xtrace_profile: Option<String> = None;
+    let mut xtrace_compress: Option<String> = None;
     let mut fst_file: Option<String> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
@@ -817,6 +831,42 @@ fn main() {
             _ if arg.starts_with("--xtrace-to=") => {
                 xtrace_to_ns = arg["--xtrace-to=".len()..].parse().unwrap_or(u64::MAX);
             }
+            "--xtrace-level" => {
+                i += 1;
+                if i < args.len() {
+                    xtrace_level = args[i].parse().unwrap_or(0);
+                }
+            }
+            _ if arg.starts_with("--xtrace-level=") => {
+                xtrace_level = arg["--xtrace-level=".len()..].parse().unwrap_or(0);
+            }
+            "--xtrace-format" => {
+                i += 1;
+                if i < args.len() {
+                    xtrace_format = args[i].clone();
+                }
+            }
+            _ if arg.starts_with("--xtrace-format=") => {
+                xtrace_format = arg["--xtrace-format=".len()..].to_string();
+            }
+            "--xtrace-profile" => {
+                i += 1;
+                if i < args.len() {
+                    xtrace_profile = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--xtrace-profile=") => {
+                xtrace_profile = Some(arg["--xtrace-profile=".len()..].to_string());
+            }
+            "--xtrace-compress" => {
+                i += 1;
+                if i < args.len() {
+                    xtrace_compress = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--xtrace-compress=") => {
+                xtrace_compress = Some(arg["--xtrace-compress=".len()..].to_string());
+            }
             "--fst" => {
                 i += 1;
                 if i < args.len() {
@@ -954,6 +1004,37 @@ fn main() {
         print_usage();
         std::process::exit(1);
     }
+
+    // XTrace option validation. Every one of these degrades to what we really
+    // emit and SAYS SO — the header must never claim a level, a format or a
+    // transport the file does not carry (XTrace §6, §24).
+    if xtrace_level != 0 {
+        eprintln!(
+            "Warning: --xtrace-level {} is reserved; emitting level 0 signal deltas",
+            xtrace_level
+        );
+        xtrace_level = 0;
+    }
+    let _ = xtrace_level;
+    if xtrace_format != "text" {
+        eprintln!(
+            "Warning: --xtrace-format '{}' is reserved; emitting text",
+            xtrace_format
+        );
+    }
+    if xtrace_compress.as_deref() == Some("none") {
+        xtrace_compress = None;
+    }
+    if let Some(ref c) = xtrace_compress {
+        if c != "zstd" {
+            eprintln!(
+                "Warning: --xtrace-compress '{}' is unknown; writing uncompressed text",
+                c
+            );
+            xtrace_compress = None;
+        }
+    }
+    xezim::compiler::simulator::set_xtrace_options(xtrace_profile.clone(), xtrace_compress.clone());
 
     // Install the --module-timescale configuration before any elaboration.
     if !module_timescale_args.is_empty() {

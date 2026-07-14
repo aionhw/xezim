@@ -161,6 +161,37 @@ fn sim_debug_enabled() -> bool {
     SIM_DEBUG_ENABLED.load(Ordering::Relaxed)
 }
 
+/// XTrace header knobs that only the CLI sets: `--xtrace-profile` (the §6.5
+/// `@profile` token) and `--xtrace-compress` (the §6.8 `@compression` token).
+///
+/// Process-global, like `set_dpi_libs`, because `simulate_multi` constructs and
+/// runs the `Simulator` internally — there is no other channel from `main` into
+/// the dump, and threading two more arguments through a 24-argument public
+/// signature would churn every caller in the tree.
+#[derive(Clone, Default)]
+pub struct XtraceOptions {
+    pub profile: Option<String>,
+    pub compress: Option<String>,
+}
+
+fn xtrace_options_cell() -> &'static Mutex<XtraceOptions> {
+    static XTRACE_OPTIONS: OnceLock<Mutex<XtraceOptions>> = OnceLock::new();
+    XTRACE_OPTIONS.get_or_init(|| Mutex::new(XtraceOptions::default()))
+}
+
+pub fn set_xtrace_options(profile: Option<String>, compress: Option<String>) {
+    if let Ok(mut guard) = xtrace_options_cell().lock() {
+        *guard = XtraceOptions { profile, compress };
+    }
+}
+
+fn xtrace_options() -> XtraceOptions {
+    xtrace_options_cell()
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
 fn dpi_lib_paths() -> &'static Mutex<Vec<String>> {
     DPI_LIB_PATHS.get_or_init(|| Mutex::new(Vec::new()))
 }
@@ -2353,10 +2384,23 @@ pub struct Simulator {
     /// signals matching one of these (exact, or `<scope>.` prefix) are dumped.
     pub xtrace_scopes: Vec<String>,
     xtrace_writer: Option<super::vcd_sink::VcdSink>,
-    /// Per-traced-signal table: (signal_table index, XTrace `sN` id).
+    /// Per-traced-NET table: (signal_table index, XTrace signal id). One entry
+    /// per backing net — an aliased name (§9.2 `alias=`) has its own id in the
+    /// dictionary but emits no deltas of its own.
     xtrace_trace: Vec<(usize, String)>,
     /// Previous emitted value per entry in `xtrace_trace` (parallel vector).
     xtrace_prev_signals: Vec<Value>,
+    /// Whether entry `i` of `xtrace_trace` is a `real` (parallel vector): its
+    /// value token is a decimal number, not a hex bit pattern (§15.1).
+    xtrace_real: Vec<bool>,
+    /// SV `event` objects (signal_table index, XTrace signal id). An event has
+    /// no level, so it is NOT in `xtrace_trace`: it emits an §10.4 `X` record
+    /// per trigger instead of a value delta.
+    xtrace_events: Vec<(usize, String)>,
+    /// Time of the last `X` record emitted for each `xtrace_events` entry, so a
+    /// 0→1→0 toggle inside one time slot still counts as exactly one trigger
+    /// (mirrors `vcd_event_last`).
+    xtrace_event_last: Vec<u64>,
     xtrace_last_time: u64,
     /// Change-emitting steps since the last durable flush of the XTrace
     /// writer. Bounds how much trailing trace a crash/SIGKILL can lose
@@ -3833,6 +3877,9 @@ impl Simulator {
             xtrace_writer: None,
             xtrace_trace: Vec::new(),
             xtrace_prev_signals: Vec::new(),
+            xtrace_real: Vec::new(),
+            xtrace_events: Vec::new(),
+            xtrace_event_last: Vec::new(),
             xtrace_last_time: 0,
             xtrace_dirty_steps: 0,
             xtrace_from_ns: 0,
@@ -33820,15 +33867,22 @@ impl Simulator {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // XTrace v1.0 dump support (XTrace_Specification_v1_0.txt)
+    // XTrace dump support (XTrace_Specification_v1_0.txt)
     // ═══════════════════════════════════════════════════════════════
     //
-    // Emits the "minimal" profile: dictionary + per-cycle signal deltas
-    // (a VCD-equivalent payload, under the @xtrace 1.0 header).
+    // CONFORMANCE LEVEL 0 (§24 "minimal"): dictionary (§9) + time (§10.1) +
+    // signal deltas (§10.2/§10.3), and nothing else — with ONE exception, the
+    // §10.4 `X` event record. An SV `event` has no level, so no D/P record can
+    // represent it (`->e` three times in a row is three events, not a toggling
+    // bit); §10.4/§19.5 define exactly the record for it, and `@capabilities`
+    // declares it.
+    //
+    // The semantic layer is deliberately ABSENT: no transactions (Q/TQ), no
+    // assertions (A), no enums (E), no source maps (F/SL), no memory records
+    // (MW/MR/MB), no context snapshots (N,ctx). The header says so honestly —
+    // `@profile minimal`, `@capabilities signal_delta|events` — rather than
+    // claiming the Appendix-A `xezim_ai_debug` profile we do not implement.
 
-    /// Format a Value per XTrace §13 / §A.6 4-state value semantics.
-    /// Fully-known values use 0xHEX; values with X/Z fall back to the
-    /// per-bit representation so unknowns aren't silently lost.
     /// Render the dump timescale string (e.g. "1ns", "100ps") from `tick_s`,
     /// the seconds-per-tick of the simulator's finest timescale precision.
     /// `T,+delta` records count these ticks, so the header MUST match — a
@@ -33851,12 +33905,76 @@ impl Simulator {
         "1fs".to_string()
     }
 
-    fn xtrace_format_value(val: &Value) -> String {
+    /// XTrace signal ids, in the compact spelling the 0.1.2 producer used (and
+    /// the reference traces carry): `a`..`z`, `A`..`Z`, `0`..`9`, then `ab`,
+    /// `bb`, ... A dictionary of a few thousand nets stays at 1-2 characters,
+    /// and every D/P record pays for it on every line.
+    fn xtrace_id_code(mut idx: usize) -> String {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let base = ALPHABET.len();
+        let mut code = String::new();
+        loop {
+            code.push(ALPHABET[idx % base] as char);
+            idx /= base;
+            if idx == 0 {
+                break;
+            }
+            idx -= 1;
+        }
+        code
+    }
+
+    /// Format a `Value` as an XTrace value token (§15).
+    ///
+    /// * `real` (`is_real`): a DECIMAL number — the same spelling the VCD path
+    ///   uses (`vcd_sink::vcd_real_string`). §9.3's type list is *recommended*,
+    ///   not exhaustive, so a `real` signal type carrying a decimal value is a
+    ///   legitimate producer choice; §15.1 explicitly allows decimal "where
+    ///   semantically better". The old code never checked `is_real` and emitted
+    ///   the raw IEEE-754 bit pattern as an integer, so `real r = 3.25` came out
+    ///   as `0x400a000000000000` — which a consumer decodes as the integer
+    ///   -4609434218613702656.
+    /// * fully-known: `0x<hex>`.
+    /// * all-x / all-z: the compact `X` / `Z` forms of §15.3. A 128-bit all-z
+    ///   net then costs 1 byte on the line instead of 130; 4-state designs sit
+    ///   at x/z for most of reset, and full-width binary made XTrace several
+    ///   times LARGER than the equivalent VCD.
+    /// * mixed x/z: FULL-WIDTH `0b<bits>`, every bit spelled out. VCD's
+    ///   leading-run suppression is deliberately NOT copied: it is legal there
+    ///   only because §21.7.2.1 defines a left-EXTENSION rule for a value
+    ///   shorter than its `$var` width. XTrace defines no such rule anywhere,
+    ///   so a partially collapsed vector would be unparseable (nothing tells a
+    ///   consumer how many bits were dropped, or what to refill them with).
+    fn xtrace_format_value(val: &Value, is_real: bool) -> String {
+        if is_real || val.is_real {
+            return super::vcd_sink::vcd_real_string(val.to_f64());
+        }
         if val.has_xz() {
+            let w = val.width as usize;
+            // §15.3 compact unknowns: `X` iff EVERY bit is x, `Z` iff every bit
+            // is z. A mixed vector (or one with known bits) keeps full width.
+            let (mut all_x, mut all_z) = (true, true);
+            for i in 0..w {
+                match val.get_bit(i) {
+                    LogicBit::X => all_z = false,
+                    LogicBit::Z => all_x = false,
+                    _ => {
+                        all_x = false;
+                        all_z = false;
+                        break;
+                    }
+                }
+            }
+            if w > 0 && all_x {
+                return "X".to_string();
+            }
+            if w > 0 && all_z {
+                return "Z".to_string();
+            }
             // Per-bit binary representation preserves X/Z exactly.
-            let mut s = String::with_capacity(val.width as usize + 2);
+            let mut s = String::with_capacity(w + 2);
             s.push_str("0b");
-            for i in (0..val.width as usize).rev() {
+            for i in (0..w).rev() {
                 s.push(match val.get_bit(i) {
                     LogicBit::Zero => '0',
                     LogicBit::One => '1',
@@ -33892,13 +34010,13 @@ impl Simulator {
         }
     }
 
-    /// Open the XTrace file and emit `@xtrace 1.0` header + `@section dict`
-    /// + initial state snapshot. Called once at the start of `run()` when
+    /// Open the XTrace file and emit the §6 header + `@section dict` + the
+    /// initial state snapshot. Called once at the start of `run()` when
     /// `xtrace_file` is set.
     fn xtrace_start_dump(&mut self) {
         // Signal count above which an unscoped (whole-design) dump is flagged.
         const XTRACE_UNSCOPED_WARN: usize = 100_000;
-        let filename = match self.xtrace_file.clone() {
+        let requested = match self.xtrace_file.clone() {
             Some(f) => f,
             None => return,
         };
@@ -33911,6 +34029,22 @@ impl Simulator {
         } else {
             (self.xtrace_to_ns as f64 * scale) as u64
         };
+
+        // §6.8 `@compression`: zstd is selected by a `.zst`/`.zstd` suffix or
+        // explicitly by `--xtrace-compress zstd` (which then names the file
+        // `.zst` so the transport is self-describing). The header MUST declare
+        // it — a file that is silently zstd-framed while its own header says
+        // `none` is a conformance bug a consumer cannot recover from.
+        let opts = xtrace_options();
+        let suffix_zstd = requested.ends_with(".zst") || requested.ends_with(".zstd");
+        let compress_zstd = suffix_zstd || opts.compress.as_deref() == Some("zstd");
+        let filename = if compress_zstd && !suffix_zstd {
+            format!("{}.zst", requested)
+        } else {
+            requested
+        };
+        let profile = opts.profile.as_deref().unwrap_or("minimal").to_string();
+
         let file = match std::fs::File::create(&filename) {
             Ok(f) => f,
             Err(e) => {
@@ -33918,12 +34052,7 @@ impl Simulator {
                 return;
             }
         };
-        // Compress the byte stream when the target is a `.zst`/`.zstd` file.
-        let zstd_level = if filename.ends_with(".zst") || filename.ends_with(".zstd") {
-            Some(3)
-        } else {
-            None
-        };
+        let zstd_level = if compress_zstd { Some(3) } else { None };
         let mut w = match super::vcd_sink::VcdSink::open_file(file, self.dump_writer_threaded(), zstd_level) {
             Ok(s) => s,
             Err(e) => {
@@ -33965,39 +34094,55 @@ impl Simulator {
         modules.push(("m0".to_string(), top_path.clone()));
         module_map.insert(top_path.clone(), "m0".to_string());
 
-        // Assign signal IDs and build S records. IDs are keyed by the backing
-        // `signal_table` index so that aliased nets (several hierarchical names
-        // resolving to the SAME signal) share ONE sid — VCD-style aliasing.
-        // Change records are then emitted once per net instead of once per
-        // name, shrinking the dump and the per-step change scan on alias-heavy
-        // designs. Every name still gets its own S record, so the full
-        // hierarchy stays navigable. `trace` (unique id → sid, in first-seen
-        // order) is the compact table reused at t=0 and every step.
-        let mut id_to_sid: HashMap<usize, String> = HashMap::default();
-        let mut id_map: HashMap<String, String> = HashMap::default();
-        let mut signal_records: Vec<String> = Vec::new();
-        let mut trace: Vec<(usize, String)> = Vec::new();
         // Port-connected nets resolve to ONE backing signal (see
-        // `dump_backing_ids`), so `.din(src_bus)` shares `src_bus`'s sid instead
-        // of tracing a second copy of the same net.
+        // `dump_backing_ids`): `.din(src_bus)` and `src_bus` are one net.
         let xt_backing = self.dump_backing_ids(&sig_names);
-        for name in sig_names.iter() {
-            let tbl_id = match xt_backing.get(name.as_str()) {
-                Some(&i) => i,
-                // Unresolved name: no backing signal to trace. Skip it (the
-                // old t=0 snapshot loop dropped these too).
-                _ => continue,
-            };
-            let sid = if let Some(existing) = id_to_sid.get(&tbl_id) {
-                existing.clone()
-            } else {
-                let sid = format!("s{}", trace.len());
-                id_to_sid.insert(tbl_id, sid.clone());
-                trace.push((tbl_id, sid.clone()));
-                sid
-            };
-            id_map.insert(name.clone(), sid.clone());
 
+        // §19.2: "once introduced, an ID retains its meaning" — so two names may
+        // NOT share one signal_id, as the old code had them do (a port-connected
+        // net emitted TWO `S` records carrying the SAME id; a parser keyed on the
+        // id clobbered one of them). Every NAME gets its own id here, and the
+        // names that resolve to the same backing net carry §9.2's
+        // `alias=<canonical_signal_id>` instead. Only the canonical id emits
+        // value deltas, so the record count is unchanged.
+        //
+        // The canonical name is the one that IS the backing net (`src_bus`, not
+        // `u_sub.din`); when the backing net itself is outside the dump (scope
+        // filter), the first name in sorted order stands in for it.
+        let mut canon_name: HashMap<usize, String> = HashMap::default();
+        for name in sig_names.iter() {
+            let Some(&tbl_id) = xt_backing.get(name.as_str()) else {
+                continue;
+            };
+            if self.signal_name_to_id.get(name.as_str()) == Some(&tbl_id) {
+                canon_name.entry(tbl_id).or_insert_with(|| name.clone());
+            }
+        }
+        // Ids are assigned over the WHOLE dictionary first: an alias that sorts
+        // before its canonical name still has to name it.
+        let mut entries: Vec<(&str, usize, String)> = Vec::with_capacity(sig_names.len());
+        for name in sig_names.iter() {
+            let Some(&tbl_id) = xt_backing.get(name.as_str()) else {
+                // Unresolved name: no backing signal to trace.
+                continue;
+            };
+            canon_name.entry(tbl_id).or_insert_with(|| name.clone());
+            let sid = Self::xtrace_id_code(entries.len());
+            entries.push((name.as_str(), tbl_id, sid));
+        }
+        let mut canon_sid: HashMap<usize, String> = HashMap::default();
+        for (name, tbl_id, sid) in &entries {
+            if canon_name.get(tbl_id).map(|c| c.as_str()) == Some(*name) {
+                canon_sid.insert(*tbl_id, sid.clone());
+            }
+        }
+
+        let mut signal_records: Vec<String> = Vec::with_capacity(entries.len());
+        // The compact per-NET tables reused at t=0 and every step.
+        let mut trace: Vec<(usize, String)> = Vec::new();
+        let mut reals: Vec<bool> = Vec::new();
+        let mut events: Vec<(usize, String)> = Vec::new();
+        for (name, tbl_id, sid) in &entries {
             // Walk the parent path once, creating M records on demand; the
             // deepest path component is this signal's module.
             let parts: Vec<&str> = name.split('.').collect();
@@ -34018,30 +34163,129 @@ impl Simulator {
                 }
                 (mid, parts[parts.len() - 1].to_string())
             } else {
-                ("m0".to_string(), name.clone())
+                ("m0".to_string(), (*name).to_string())
             };
 
-            let width = self.lookup_signal_width(name).unwrap_or(1);
-            let is_signed = self.lookup_signal_signed(name);
-            // Per spec §8.3 signal types.
-            let type_str = if width == 1 {
+            // Kind is read from the name's OWN table entry (a real/event is
+            // never folded into an alias group by `dump_backing_ids`).
+            let own_id = self
+                .signal_name_to_id
+                .get(*name)
+                .copied()
+                .unwrap_or(*tbl_id);
+            let kind = self.dump_var_kind(name, own_id);
+            let is_event = kind == VcdVarKind::Event;
+            let is_real = kind == VcdVarKind::Real;
+            let width = if is_real {
+                64
+            } else {
+                self.lookup_signal_width(name).unwrap_or(1)
+            };
+            // §9.3's type list is *recommended*, not exhaustive. `real` and
+            // `event` are producer types beyond it: a real carries a decimal
+            // value (§15.1), an event carries no value at all and shows up only
+            // as an §10.4 `X` record. Per §8.7/§19.10 a consumer that knows
+            // neither still parses the record and simply sees a signal that
+            // never changes.
+            let type_str = if is_event {
+                "event".to_string()
+            } else if is_real {
+                "real".to_string()
+            } else if width == 1 {
                 "bit".to_string()
-            } else if is_signed {
+            } else if self.lookup_signal_signed(name) {
                 format!("s{}", width)
             } else {
                 format!("u{}", width)
             };
 
-            signal_records.push(format!("S,{},{},{},{}", sid, mod_id, leaf, type_str));
+            // §9.2 attributes. `enc=` and `width=` were both missing: a consumer
+            // could not tell how the values were encoded, and had to infer the
+            // width from the type name (impossible for `bit`/`real`).
+            let mut attrs = vec![
+                if is_event {
+                    "enc=event".to_string()
+                } else {
+                    "enc=delta".to_string()
+                },
+                format!("width={}", width),
+            ];
+            // A bit-range whose LSB is not 0 (`logic [15:8] hi`) loses its
+            // offset in a bare `width=8` — the bits silently renumber to [7:0],
+            // and an ascending `[0:7]` loses its bit ORDER as well. §9.2 defines
+            // no range attribute, but §8.7 says consumers ignore (or preserve)
+            // unknown attributes, so `range=<msb>:<lsb>` is the safe way to
+            // carry it: a consumer that knows it renumbers correctly, one that
+            // does not is no worse off than before. Emitted only when it says
+            // something a plain `width=` does not (i.e. lsb != 0).
+            if !is_real && !is_event {
+                if let Some((l, r)) = self.dump_var_range(name, width) {
+                    if r != 0 {
+                        attrs.push(format!("range={}:{}", l, r));
+                    }
+                }
+            }
+            let canonical = canon_sid.get(tbl_id) == Some(sid);
+            if !canonical {
+                attrs.push(format!("alias={}", canon_sid[tbl_id]));
+            } else if is_event {
+                events.push((*tbl_id, sid.clone()));
+            } else {
+                trace.push((*tbl_id, sid.clone()));
+                reals.push(is_real);
+            }
+
+            signal_records.push(format!(
+                "S,{},{},{},{},{}",
+                sid,
+                mod_id,
+                leaf,
+                type_str,
+                attrs.join(",")
+            ));
         }
 
-        // Header per spec §6.
-        let _ = writeln!(w, "@xtrace 1.0");
+        // Header per §6. The §18 BNF orders `@producer` after `@profile`, but
+        // the spec's own Appendix-A example (and every xezim-produced trace in
+        // the wild, including the 0.1.2 reference dumps) puts it third; the
+        // directives are name-keyed, so this is the interoperable spelling.
+        let _ = writeln!(w, "@xtrace 1.1");
         let _ = writeln!(w, "@format text");
         let _ = writeln!(w, "@producer xezim {}", env!("CARGO_PKG_VERSION"));
         let _ = writeln!(w, "@timescale {}", Self::xtrace_timescale_str(self.module.tick_s));
         let _ = writeln!(w, "@design {}", top_name);
-        let _ = writeln!(w, "@profile minimal");
+        // §6.5: what we actually emit is Level 0, i.e. the `minimal` profile.
+        // `--xtrace-profile` can relabel it (the 0.1.2 traces say `raw_delta`),
+        // but the DEFAULT never over-claims.
+        let _ = writeln!(w, "@profile {}", profile);
+        // §6.7: declare only record families we really produce — signal deltas
+        // (§10.2/§10.3) and events (§10.4). Not transactions, not assertions.
+        let _ = writeln!(
+            w,
+            "@capabilities {}",
+            if compress_zstd {
+                "signal_delta|events|compression_zstd"
+            } else {
+                "signal_delta|events"
+            }
+        );
+        let _ = writeln!(
+            w,
+            "@compression {}",
+            if compress_zstd { "zstd" } else { "none" }
+        );
+        // §6.9: unknown records/attributes (our `range=`, `real`/`event` types)
+        // must not fail a consumer.
+        let _ = writeln!(w, "@extensions ignore_unknown");
+        // §8.3 comment recording which signals this dump carries. The 0.1.2
+        // producer wrote `# xtrace-signals debug` for a hardcoded leaf-name
+        // heuristic (pc/irq/instr/...) that silently dropped everything else;
+        // signal selection is `--xtrace-scope` now, so the comment reports THAT.
+        if self.xtrace_scopes.is_empty() {
+            let _ = writeln!(w, "# xtrace-signals all");
+        } else {
+            let _ = writeln!(w, "# xtrace-signals scope={}", self.xtrace_scopes.join("|"));
+        }
         let _ = writeln!(w);
 
         // Dictionary section.
@@ -34058,12 +34302,17 @@ impl Simulator {
         let _ = writeln!(w, "@section trace");
         let _ = writeln!(w, "T,+0");
         // Seed the t=0 snapshot from the deduped trace table (one entry per
-        // net) reading signal_table (the backing store of truth).
+        // net) reading signal_table (the backing store of truth). Events are
+        // absent by construction: they have no level to snapshot.
         let mut prev: Vec<Value> = Vec::with_capacity(trace.len());
         let mut snap_parts: Vec<String> = Vec::with_capacity(trace.len());
-        for (tbl_id, sid) in &trace {
+        for (idx, (tbl_id, sid)) in trace.iter().enumerate() {
             let val = self.signal_table[*tbl_id].clone();
-            snap_parts.push(format!("{}={}", sid, Self::xtrace_format_value(&val)));
+            snap_parts.push(format!(
+                "{}={}",
+                sid,
+                Self::xtrace_format_value(&val, reals[idx])
+            ));
             prev.push(val);
         }
         // Long N,full lines are split into 16-signal chunks per the
@@ -34082,14 +34331,18 @@ impl Simulator {
             }
         }
 
+        self.xtrace_event_last = vec![u64::MAX; events.len()];
+        self.xtrace_events = events;
         self.xtrace_trace = trace;
+        self.xtrace_real = reals;
         self.xtrace_prev_signals = prev;
         self.xtrace_writer = Some(w);
         self.xtrace_last_time = self.time;
     }
 
-    /// Per-cycle XTrace emit. Writes a T record (if time advanced) and the
-    /// signal deltas as packed (P) or single (D) records.
+    /// Per-cycle XTrace emit. Writes a T record (if time advanced), the signal
+    /// deltas as packed (P) or single (D) records, and one §10.4 `X` record per
+    /// event triggered in this time slot.
     fn xtrace_write_changes(&mut self) {
         if self.xtrace_writer.is_none() {
             return;
@@ -34116,12 +34369,34 @@ impl Simulator {
             let id = self.xtrace_trace[idx].0;
             let val = &self.signal_table[id];
             if self.xtrace_prev_signals[idx] != *val {
-                changes.push((idx, Self::xtrace_format_value(val)));
+                changes.push((idx, Self::xtrace_format_value(val, self.xtrace_real[idx])));
                 self.xtrace_prev_signals[idx] = val.clone();
             }
         }
 
-        if changes.is_empty() {
+        // §19.5 events. An SV `event` is a pulse, not a level: `->e1` three
+        // times in a row is THREE events. Tracing it as a 1-bit level (the old
+        // behaviour) emitted 0x1, 0x0, 0x1 — the second trigger read back as
+        // "no event", and a trigger whose 0→1→0 toggle cancelled inside one
+        // time slot emitted nothing at all. The trigger times are already
+        // tracked for VCD (`event_triggered_time`), so reuse them.
+        let now = self.time;
+        let mut fired: Vec<usize> = Vec::new();
+        for idx in 0..self.xtrace_events.len() {
+            let id = self.xtrace_events[idx].0;
+            let triggered = self
+                .id_to_name
+                .get(id)
+                .and_then(|n| self.event_triggered_time.get(n.as_ref()))
+                .copied()
+                == Some(now);
+            if triggered && self.xtrace_event_last[idx] != now {
+                self.xtrace_event_last[idx] = now;
+                fired.push(idx);
+            }
+        }
+
+        if changes.is_empty() && fired.is_empty() {
             return;
         }
 
@@ -34136,7 +34411,7 @@ impl Simulator {
         if changes.len() == 1 {
             let (idx, val) = &changes[0];
             let _ = writeln!(w, "D,{},{}", self.xtrace_trace[*idx].1, val);
-        } else {
+        } else if !changes.is_empty() {
             for chunk in changes.chunks(16) {
                 let _ = write!(w, "P");
                 for (idx, val) in chunk {
@@ -34144,6 +34419,14 @@ impl Simulator {
                 }
                 let _ = writeln!(w);
             }
+        }
+        // §10.4 `X,<event_type>[,k=v]*`. The event_type names the record family
+        // (`event` — an SV event object fired); the `sig=` attribute points at
+        // the object's own dictionary id, which is why an event keeps an `S`
+        // record even though it carries no value. `X` inherits the current time
+        // from the T record above (§19.3), so no timestamp is repeated.
+        for idx in fired {
+            let _ = writeln!(w, "X,event,sig={}", self.xtrace_events[idx].1);
         }
 
         // Periodic durable flush so a crash/SIGKILL leaves a readable partial
@@ -34162,6 +34445,30 @@ impl Simulator {
     /// Close the trace section and flush. Called once from `run()` after
     /// the event loop drains.
     fn xtrace_finish(&mut self) {
+        if self.xtrace_writer.is_none() {
+            return;
+        }
+        // Close the trace at the final simulation time. Without a trailing T the
+        // stream stops at the last CHANGE, so a run to t=40 whose last toggle was
+        // at t=30 produces a trace that simply ends at 30 — the consumer cannot
+        // tell a quiet tail from a truncated file. (The VCD path emits the same
+        // closing `#t` marker for the same reason.) A lone `T` is a well-formed
+        // trace_record per §18, and §19.3 gives it exactly this meaning: time
+        // advanced, nothing changed.
+        //
+        // `xtrace_write_changes` re-enters here when the run passes
+        // `--xtrace-to`; the window guard below keeps that path from appending a
+        // T record past the end of the window.
+        if self.time <= self.xtrace_to_t {
+            self.xtrace_write_changes();
+            if self.time > self.xtrace_last_time {
+                let delta = self.time - self.xtrace_last_time;
+                self.xtrace_last_time = self.time;
+                if let Some(ref mut w) = self.xtrace_writer {
+                    let _ = writeln!(w, "T,+{}", delta);
+                }
+            }
+        }
         if let Some(ref mut w) = self.xtrace_writer {
             let _ = writeln!(w);
             let _ = writeln!(w, "@section end");
