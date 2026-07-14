@@ -38,6 +38,94 @@ use std::thread::JoinHandle;
 static SIM_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 static DPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
+/// Opaque handle base for `process::self()` (IEEE 1800-2023 §9.7). The token is
+/// `PROCESS_HANDLE_BASE + pid`, chosen far above any real heap index so a
+/// process handle can never be mistaken for a class-object handle.
+const PROCESS_HANDLE_BASE: u64 = 0x7000_0000;
+
+/// A random stream (IEEE 1800-2023 §18.14 "Random stability").
+///
+/// §18.14 requires every *object* and every *process* to own an independent,
+/// seedable stream whose state can be captured (`get_randstate`) and restored
+/// (`set_randstate`) verbatim — a restored stream must replay the identical
+/// sequence. `StdRng` (ChaCha) has no stable, round-trippable textual state, so
+/// the streams use an explicit SplitMix64 generator: the entire state is one
+/// `u64`, which serialises to 16 hex digits and restores exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SvRng {
+    state: u64,
+}
+
+impl SvRng {
+    /// §18.14: seeding is deterministic — equal seeds yield equal sequences.
+    fn from_seed(seed: u64) -> Self {
+        SvRng {
+            state: seed ^ 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    /// Non-reproducible stream for an unseeded run (the default `$urandom`
+    /// source, which must vary from run to run).
+    fn from_entropy() -> Self {
+        use rand::Rng;
+        SvRng::from_seed(rand::rngs::StdRng::from_entropy().gen::<u64>())
+    }
+
+    /// §18.14.2 `get_randstate`: the full state as an implementation-defined
+    /// string (here: 16 hex digits).
+    fn to_state_string(&self) -> String {
+        format!("{:016x}", self.state)
+    }
+
+    /// §18.14.2 `set_randstate`: restore a state produced by `to_state_string`.
+    /// A foreign string is implementation-defined; hash it into a seed rather
+    /// than ignore it.
+    fn from_state_string(s: &str) -> Self {
+        let t = s.trim();
+        if let Ok(v) = u64::from_str_radix(t, 16) {
+            SvRng { state: v }
+        } else {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in t.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            SvRng { state: h }
+        }
+    }
+
+    /// SplitMix64 step.
+    fn next_state(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
+impl rand::RngCore for SvRng {
+    fn next_u32(&mut self) -> u32 {
+        (self.next_state() >> 32) as u32
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.next_state()
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        let mut i = 0;
+        while i < dest.len() {
+            let chunk = self.next_state().to_le_bytes();
+            let n = (dest.len() - i).min(8);
+            dest[i..i + n].copy_from_slice(&chunk[..n]);
+            i += n;
+        }
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
 thread_local! {
     /// Current `run_process_stmts` recursion depth. The suspend-aware loop
     /// handlers trampoline through the event queue (instead of recursing) once
@@ -1848,8 +1936,27 @@ pub struct Simulator {
     current_scope: String,
     /// Return value from last function call.
     return_value: Option<Value>,
-    /// Random number generator for randomization.
-    rng: rand::rngs::StdRng,
+    /// Default random number generator — the stream used by any object or
+    /// process that has not been given a private one (§18.14).
+    rng: SvRng,
+    /// §18.14.1 per-PROCESS random stream. Populated lazily: a process only
+    /// gets a private stream once `process::self().srandom()` /
+    /// `.set_randstate()` / `.get_randstate()` is called on it. Until then it
+    /// draws from `rng`, preserving the historical (entropy) behaviour.
+    /// Keyed by pid, so forked threads are independent of each other and of
+    /// their parent — their `$urandom` sequence no longer depends on the
+    /// scheduling order of the other threads.
+    proc_rng: HashMap<usize, SvRng>,
+    /// §18.14.1/§18.14.2 per-OBJECT random stream, keyed by class handle.
+    /// Populated lazily by `obj.srandom(seed)` / `obj.set_randstate(s)` /
+    /// `obj.get_randstate()`; `randomize()` on such an object draws from it, so
+    /// the object's sequence is unaffected by any thread reseeding and vice
+    /// versa.
+    obj_rng: HashMap<usize, SvRng>,
+    /// Handles of the objects whose `randomize()` is currently executing
+    /// (a stack — a constraint/post_randomize may randomize another object).
+    /// `cur_rng` consults the top of this stack first.
+    obj_rng_stack: Vec<usize>,
     settling: bool,
     in_edge_block: bool,
     /// Reusable bitmap for `check_edges`. Hoisted out of the per-iteration
@@ -3250,7 +3357,10 @@ impl Simulator {
             pending_ret_collection: None,
             current_scope: String::new(),
             return_value: None,
-            rng: rand::rngs::StdRng::from_entropy(),
+            rng: SvRng::from_entropy(),
+            proc_rng: HashMap::default(),
+            obj_rng: HashMap::default(),
+            obj_rng_stack: Vec::new(),
             settling: false,
             in_edge_block: false,
             edge_triggered_bitmap: Vec::new(),
@@ -3517,8 +3627,7 @@ impl Simulator {
         for a in &self.plusargs {
             if let Some(v) = a.strip_prefix("seed=").or_else(|| a.strip_prefix("+seed=")) {
                 if let Ok(seed) = v.trim().parse::<u64>() {
-                    use rand::SeedableRng;
-                    self.rng = rand::rngs::StdRng::seed_from_u64(seed);
+                    self.rng = SvRng::from_seed(seed);
                 }
             }
         }
@@ -32384,19 +32493,130 @@ impl Simulator {
             .insert(format!("{}.size", obj_name), Value::from_u64(size, 32));
     }
 
-    /// A fresh random 32-bit value from the entropy-seeded RNG. Backs
+    /// IEEE 1800-2023 §18.14 — the stream every random draw must come from.
+    ///
+    /// Priority:
+    ///   1. the OBJECT currently being `randomize()`d, if it owns a private
+    ///      stream (`srandom`/`set_randstate` was called on it). Its sequence is
+    ///      therefore independent of the calling thread's — reseeding a thread
+    ///      must not perturb an object's stream (§18.14.1);
+    ///   2. the CURRENT PROCESS, if it owns a private stream. This backs
+    ///      `$urandom`, `$urandom_range`, `shuffle()` and the randcase /
+    ///      randsequence draws, so a `process::self().srandom(s)` makes the
+    ///      thread's whole subsequent sequence a function of `s` alone,
+    ///      independent of the scheduling order of sibling threads;
+    ///   3. otherwise the simulator-wide default stream (historical behaviour:
+    ///      entropy-seeded, or `+seed=<n>`).
+    ///
+    /// A randomize() of an object with NO private stream deliberately falls back
+    /// to (3) rather than to the process stream, so it cannot consume draws from
+    /// (and thereby shift) a seeded thread's sequence.
+    fn cur_rng(&mut self) -> &mut SvRng {
+        if let Some(&h) = self.obj_rng_stack.last() {
+            if self.obj_rng.contains_key(&h) {
+                return self.obj_rng.get_mut(&h).unwrap();
+            }
+            return &mut self.rng;
+        }
+        let pid = self.current_pid;
+        if self.proc_rng.contains_key(&pid) {
+            return self.proc_rng.get_mut(&pid).unwrap();
+        }
+        &mut self.rng
+    }
+
+    /// §18.14 `srandom` / `get_randstate` / `set_randstate` on a *process*
+    /// handle (`process::self()`, §9.7) or on a *class object* handle.
+    /// Returns None when `method_name` is not one of them.
+    fn exec_rand_state_method(
+        &mut self,
+        handle: usize,
+        method_name: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
+        if !matches!(method_name, "srandom" | "get_randstate" | "set_randstate") {
+            return None;
+        }
+        // A `process::self()` token addresses the per-process stream; anything
+        // else is a class-object handle and addresses the per-object stream.
+        let is_process = handle as u64 >= PROCESS_HANDLE_BASE;
+        let key = if is_process {
+            (handle as u64 - PROCESS_HANDLE_BASE) as usize
+        } else {
+            handle
+        };
+        match method_name {
+            // §18.13.3 / §18.14.1: seed the stream. Deterministic — the same
+            // seed always produces the same subsequent sequence.
+            "srandom" => {
+                let seed = args
+                    .first()
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(0))
+                    .unwrap_or(0);
+                let s = SvRng::from_seed(seed);
+                if is_process {
+                    self.proc_rng.insert(key, s);
+                } else {
+                    self.obj_rng.insert(key, s);
+                }
+                Some(Value::zero(32))
+            }
+            // §18.14.2: serialise the stream state. The stream must exist from
+            // now on (otherwise there would be nothing for set_randstate to
+            // restore), so materialise it lazily off the default RNG.
+            "get_randstate" => {
+                let existing = if is_process {
+                    self.proc_rng.get(&key).copied()
+                } else {
+                    self.obj_rng.get(&key).copied()
+                };
+                let s = match existing {
+                    Some(s) => s,
+                    None => {
+                        let fresh =
+                            SvRng::from_seed(rand::RngCore::next_u64(&mut self.rng));
+                        if is_process {
+                            self.proc_rng.insert(key, fresh);
+                        } else {
+                            self.obj_rng.insert(key, fresh);
+                        }
+                        fresh
+                    }
+                };
+                Some(Value::from_string(&s.to_state_string()))
+            }
+            // §18.14.2: restore a previously captured state — the stream then
+            // replays exactly the sequence it produced after the capture.
+            "set_randstate" => {
+                let st = args
+                    .first()
+                    .map(|a| self.eval_expr(a).to_sv_string())
+                    .unwrap_or_default();
+                let s = SvRng::from_state_string(&st);
+                if is_process {
+                    self.proc_rng.insert(key, s);
+                } else {
+                    self.obj_rng.insert(key, s);
+                }
+                Some(Value::zero(32))
+            }
+            _ => None,
+        }
+    }
+
+    /// A fresh random 32-bit value from the current stream (§18.14). Backs
     /// `$urandom`/`$random` so riscv-dv's `$urandom_range`-driven choices
     /// (register dist, branch steps, illegal-instr injection, …) actually vary.
     fn rng_u32(&mut self) -> u32 {
         use rand::Rng;
-        self.rng.gen()
+        self.cur_rng().gen()
     }
 
     /// Inclusive random in [lo, hi] (lo>hi yields lo). Backs `$urandom_range`.
     fn rng_range_u64(&mut self, lo: u64, hi: u64) -> u64 {
         use rand::Rng;
         if hi >= lo {
-            self.rng.gen_range(lo..=hi)
+            self.cur_rng().gen_range(lo..=hi)
         } else {
             lo
         }
@@ -32870,7 +33090,7 @@ impl Simulator {
                                     if any && lo <= hi {
                                         use rand::Rng;
                                         let pick =
-                                            if lo == hi { lo } else { self.rng.gen_range(lo..=hi) };
+                                            if lo == hi { lo } else { self.cur_rng().gen_range(lo..=hi) };
                                         let masked = if width >= 64 {
                                             pick as u64
                                         } else {
@@ -33361,7 +33581,7 @@ impl Simulator {
             return; // already satisfied
         }
         for _ in 0..16 {
-            let p = if lo == hi { lo } else { self.rng.gen_range(lo..=hi) };
+            let p = if lo == hi { lo } else { self.cur_rng().gen_range(lo..=hi) };
             if !excl.contains(&p) {
                 self.set_signal_value_by_name(&elem_name, Value::from_u64(p as u64, w));
                 return;
@@ -33840,7 +34060,7 @@ impl Simulator {
         if buckets.is_empty() { return None; }
         let total: u64 = buckets.iter().map(|(_, w)| *w).sum();
         if total == 0 { return Some(buckets[0].0.clone()); }
-        let mut draw = self.rng.gen::<u64>() % total;
+        let mut draw = self.cur_rng().gen::<u64>() % total;
         for (v, w) in &buckets {
             if draw < *w { return Some(v.clone()); }
             draw -= *w;
@@ -33865,7 +34085,7 @@ impl Simulator {
                         // 32'he000_2000]` could never yield anything above
                         // 32'he000_0fff).
                         let span = (h as i128) - (l as i128) + 1;
-                        let pick = (l as i128) + (self.rng.gen::<u64>() as i128) % span;
+                        let pick = (l as i128) + (self.cur_rng().gen::<u64>() as i128) % span;
                         let w = lov.width.max(hiv.width).max(32);
                         candidates.push(Value::from_u64(pick as u64, w));
                     }
@@ -33896,7 +34116,7 @@ impl Simulator {
         if candidates.is_empty() {
             None
         } else {
-            Some(candidates[self.rng.gen::<usize>() % candidates.len()].clone())
+            Some(candidates[self.cur_rng().gen::<usize>() % candidates.len()].clone())
         }
     }
 
@@ -35531,7 +35751,7 @@ impl Simulator {
                     let w = self.infer_lhs_width(fexpr).max(1);
                     let rv = if w <= 64 {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                        Value::from_u64(self.rng.gen::<u64>() & mask, w)
+                        Value::from_u64(self.cur_rng().gen::<u64>() & mask, w)
                     } else {
                         Value::zero(w)
                     };
@@ -35547,7 +35767,7 @@ impl Simulator {
                 let w = self.module.arrays.get(&nm).map(|t| t.2).unwrap_or(32).max(1);
                 for i in 0..size {
                     let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                    let rv = Value::from_u64(self.rng.gen::<u64>() & mask, w);
+                    let rv = Value::from_u64(self.cur_rng().gen::<u64>() & mask, w);
                     self.set_signal_value_by_name(&format!("{}[{}]", nm, i), rv);
                 }
                 continue;
@@ -35555,7 +35775,7 @@ impl Simulator {
             let w = self.infer_lhs_width(a).max(1);
             let rv = if w <= 64 {
                 let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                Value::from_u64(self.rng.gen::<u64>() & mask, w)
+                Value::from_u64(self.cur_rng().gen::<u64>() & mask, w)
             } else {
                 Value::zero(w)
             };
@@ -36411,7 +36631,7 @@ impl Simulator {
                 let mut order: Vec<usize> = (0..cur_size).collect();
                 // Fisher-Yates over the index order, then move the elements.
                 for i in (1..cur_size).rev() {
-                    let j = self.rng.gen_range(0..=i);
+                    let j = self.cur_rng().gen_range(0..=i);
                     order.swap(i, j);
                 }
                 self.queue_permute(obj_name, &order);
@@ -38510,7 +38730,6 @@ impl Simulator {
                 // handler then yields RUNNING for it). 2017's sequencer has no
                 // `m_safe_select_item` wrapper, which is why 2017 completes.
                 if name == "process" && mname == "self" {
-                    const PROCESS_HANDLE_BASE: u64 = 0x7000_0000;
                     let h = PROCESS_HANDLE_BASE.wrapping_add(self.current_pid as u64);
                     return Value::from_u64(h, 64);
                 }
@@ -38930,7 +39149,6 @@ impl Simulator {
                 && path[0].name.name == "process"
                 && path[1].name.name == "self"
             {
-                const PROCESS_HANDLE_BASE: u64 = 0x7000_0000;
                 let h = PROCESS_HANDLE_BASE.wrapping_add(self.current_pid as u64);
                 return Value::from_u64(h, 64);
             }
@@ -39608,6 +39826,20 @@ impl Simulator {
                 if let Some(v) = obj_val {
                     let handle = v.to_u64().unwrap_or(0) as usize;
                     if handle != 0 {
+                        // IEEE 1800-2023 §9.7 + §18.14: `process::self()` yields an
+                        // opaque token, NOT a heap object, so the heap gate below
+                        // can never fire for it — `p.srandom(seed)` /
+                        // `p.get_randstate()` / `p.set_randstate(s)` on a
+                        // `process` variable (which parses as the flattened
+                        // Ident([p, method]) call shape) silently returned 0.
+                        // Route them to the per-process random stream.
+                        if handle as u64 >= PROCESS_HANDLE_BASE {
+                            if let Some(res) =
+                                self.exec_rand_state_method(handle, method_name, args)
+                            {
+                                return res;
+                            }
+                        }
                         if handle < self.cg_heap.len() && self.cg_heap[handle].is_some() {
                             return self.exec_cg_method_call(handle, method_name, args);
                         }
@@ -41412,6 +41644,25 @@ impl Simulator {
     }
 
     fn exec_method_call(&mut self, handle: usize, method_name: &str, args: &[Expression]) -> Value {
+        // IEEE 1800-2023 §18.13/§18.14 random stability. `srandom(seed)`,
+        // `get_randstate()` and `set_randstate(s)` are built-ins of BOTH the
+        // §9.7 `process` class (`process::self().srandom(...)` — the token
+        // handle is >= PROCESS_HANDLE_BASE) and of every class object
+        // (`obj.srandom(...)`, `this.srandom(...)`). They are intercepted here,
+        // ahead of user-method dispatch, unless the class actually defines an
+        // override of its own.
+        if matches!(method_name, "srandom" | "get_randstate" | "set_randstate")
+            && !self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .map(|i| self.class_has_method(&i.class_name, method_name))
+                .unwrap_or(false)
+        {
+            if let Some(v) = self.exec_rand_state_method(handle, method_name, args) {
+                return v;
+            }
+        }
         // PURE_SV_LRM: the real `uvm_factory::create_component_by_name` /
         // `create_object_by_name` calls (on a real factory handle) reach here.
         // The genuine factory's `m_type_names` is empty (per-spec registry
@@ -42233,12 +42484,25 @@ impl Simulator {
             used.clear();
             avail = domain.to_vec();
         }
-        let pick = avail[self.rng.gen_range(0..avail.len())];
+        let pick = avail[self.cur_rng().gen_range(0..avail.len())];
         self.randc_used.get_mut(&key).unwrap().insert(pick);
         pick
     }
 
+    /// IEEE 1800-2023 §18.14.1: `obj.randomize()` draws from the OBJECT's random
+    /// stream. Mark the object as the active stream owner for the whole solve
+    /// (constraints, dist picks, randc, pre/post_randomize) so every draw inside
+    /// `exec_randomize_solve` routes through `cur_rng()` → this object's stream
+    /// when it has been seeded (`srandom`/`set_randstate`). Nested randomize
+    /// calls stack, so an inner object still uses its own stream.
     fn exec_randomize(&mut self, handle: usize) -> Value {
+        self.obj_rng_stack.push(handle);
+        let r = self.exec_randomize_solve(handle);
+        self.obj_rng_stack.pop();
+        r
+    }
+
+    fn exec_randomize_solve(&mut self, handle: usize) -> Value {
         // Reset the dist-pick-once tracker so each randomize call gets a
         // fresh weighted draw per `(handle, prop)`.
         self.dist_picked_once.clear();
@@ -42592,7 +42856,7 @@ impl Simulator {
                                 (lo, hi)
                             };
                             let pick = if hi_e > lo_e {
-                                self.rng.gen_range(lo_e..hi_e)
+                                self.cur_rng().gen_range(lo_e..hi_e)
                             } else {
                                 lo_e
                             };
@@ -42627,10 +42891,10 @@ impl Simulator {
                             }
                         }
                         if let Some(ranges) = prop_allowed_ranges.get(name) {
-                            let r_idx = self.rng.gen_range(0..ranges.len());
+                            let r_idx = self.cur_rng().gen_range(0..ranges.len());
                             let (lo, hi) = ranges[r_idx];
                             let r_val = if hi >= lo {
-                                self.rng.gen_range(lo..=hi)
+                                self.cur_rng().gen_range(lo..=hi)
                             } else {
                                 lo
                             };
@@ -42639,13 +42903,13 @@ impl Simulator {
                             // Enum-typed rand field: pick a valid member.
                             let n = self.module.enum_members.get(et).map_or(0, |m| m.len());
                             if n > 0 {
-                                let idx = self.rng.gen_range(0..n);
+                                let idx = self.cur_rng().gen_range(0..n);
                                 let mv = self.module.enum_members.get(et).unwrap()[idx].1;
                                 val = Value::from_u64(mv, *width);
                             }
                         } else {
                             if *width <= 64 {
-                                let r: u64 = self.rng.gen();
+                                let r: u64 = self.cur_rng().gen();
                                 val = Value::from_u64(r, *width);
                             }
                         }
@@ -42683,12 +42947,12 @@ impl Simulator {
                 if let Some(et) = enum_prop_types.get(name) {
                     let n = self.module.enum_members.get(et).map_or(0, |m| m.len());
                     if n > 0 {
-                        let idx = self.rng.gen_range(0..n);
+                        let idx = self.cur_rng().gen_range(0..n);
                         let mv = self.module.enum_members.get(et).unwrap()[idx].1;
                         val = Value::from_u64(mv, *width);
                     }
                 } else if *width <= 64 {
-                    val = Value::from_u64(self.rng.gen(), *width);
+                    val = Value::from_u64(self.cur_rng().gen(), *width);
                 }
                 solved_props.insert(name.clone(), val);
             }
@@ -42780,7 +43044,7 @@ impl Simulator {
                                 })
                                 .unwrap_or_default();
                             if !members.is_empty() {
-                                let pick = members[self.rng.gen_range(0..members.len())];
+                                let pick = members[self.cur_rng().gen_range(0..members.len())];
                                 let w = self
                                     .heap
                                     .get(handle)
@@ -42916,12 +43180,12 @@ impl Simulator {
                         let avail: Vec<u64> =
                             pool.iter().copied().filter(|v| !used.contains(v)).collect();
                         let src = if avail.is_empty() { &pool } else { &avail };
-                        let pick = src[self.rng.gen_range(0..src.len())];
+                        let pick = src[self.cur_rng().gen_range(0..src.len())];
                         used.insert(pick);
                         pick
                     } else if *width <= 64 {
                         let mask = if *width >= 64 { u64::MAX } else { (1u64 << *width) - 1 };
-                        self.rng.gen::<u64>() & mask
+                        self.cur_rng().gen::<u64>() & mask
                     } else {
                         0
                     };
@@ -43153,8 +43417,8 @@ impl Simulator {
         if choices.is_empty() {
             return None;
         }
-        let (lo, hi) = choices[self.rng.gen_range(0..choices.len())];
-        let v = if hi > lo { self.rng.gen_range(lo..=hi) } else { lo };
+        let (lo, hi) = choices[self.cur_rng().gen_range(0..choices.len())];
+        let v = if hi > lo { self.cur_rng().gen_range(lo..=hi) } else { lo };
         Some(Value::from_u64(v, width))
     }
 
@@ -43414,7 +43678,7 @@ impl Simulator {
                         if members.is_empty() {
                             return false;
                         }
-                        let pick = members[self.rng.gen_range(0..members.len())];
+                        let pick = members[self.cur_rng().gen_range(0..members.len())];
                         return self.set_prop_if_changed(
                             handle,
                             &target,
@@ -43423,9 +43687,9 @@ impl Simulator {
                     }
                     for _try in 0..32 {
                         let cand = if width >= 64 {
-                            self.rng.gen::<u64>()
+                            self.cur_rng().gen::<u64>()
                         } else {
-                            self.rng.gen::<u64>() & ((1u64 << width) - 1)
+                            self.cur_rng().gen::<u64>() & ((1u64 << width) - 1)
                         };
                         if cand != avoid {
                             return self.set_prop_if_changed(
@@ -43667,11 +43931,11 @@ impl Simulator {
                         if avail.is_empty() {
                             continue; // domain exhausted — leave as-is
                         }
-                        Some(avail[self.rng.gen_range(0..avail.len())])
+                        Some(avail[self.cur_rng().gen_range(0..avail.len())])
                     } else {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
                         (0..64)
-                            .map(|_| self.rng.gen::<u64>() & mask)
+                            .map(|_| self.cur_rng().gen::<u64>() & mask)
                             .find(|c| !used.contains(c))
                     };
                     if let Some(p) = pick {
@@ -43828,7 +44092,7 @@ impl Simulator {
                             if lo > hi || (cur_i >= lo && cur_i <= hi) {
                                 return false; // unsatisfiable or already OK
                             }
-                            let p = if lo == hi { lo } else { self.rng.gen_range(lo..=hi) };
+                            let p = if lo == hi { lo } else { self.cur_rng().gen_range(lo..=hi) };
                             write_elem(self, Value::from_u64(p as u64, w));
                             true
                         }
