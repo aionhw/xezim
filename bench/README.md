@@ -7,7 +7,9 @@ diverge, you can attribute *why*.
 | # | Benchmark | What it measures | Hardware axis it discriminates |
 |---|-----------|------------------|--------------------------------|
 | B1 | `c910-hello` (real RTL) | end-to-end throughput on a full XuanTie C910 boot | the headline number; memory- and branch-bound |
-| B2 | `vm-dispatch` | bytecode interpreter rate, working set kept in L2 | indirect-branch prediction, IPC |
+| B2a | `dispatch_regular` | interpreter rate, predictable block order | cache-resident execution throughput, IPC |
+| B2b | `dispatch_branchy` | interpreter rate, data-dependent path (sequential) | **indirect-branch prediction** |
+| B2c | `dispatch_branchy_par` | same design under xezim's auto-parallel dispatch | **thread fork/join + sync cost** |
 | B3 | `mem-sweep` | ns/cycle as the working set walks L1 → LLC → DRAM | cache hierarchy, memory latency/bandwidth, TLB |
 | B4 | `parallel-scaling` | edge-dispatch parallelism (`XEZIM_DISPATCHER`) | atomics, false sharing, core count vs SMT |
 | B5 | `constraint-rand` | `randomize()` throughput (dist/foreach/unique) | branchy code, allocation, hashing, **i128 math** |
@@ -77,14 +79,29 @@ memory story. Without counters you can only observe the gap.
   NBA merge, not the hardware — which is precisely what B4 exists to find.
 * B3 already shows a clean knee on this box: ~537k cycles/s at a 4 KiB working
   set → ~279k at 16 MiB.
-* **B2 is not branch-bound — my original hypothesis was wrong.** On the i7-9800X
-  it runs at **IPC 3.09 with a 0.04% branch-miss rate**: the interpreter's
-  indirect dispatch is predicting almost perfectly, because the block-execution
-  order repeats every cycle. So B2 currently measures *cache-resident execution
-  throughput*, not branch prediction. That is still a useful axis, but if you
-  specifically want to stress the indirect predictor, the design needs an
-  irregular, data-dependent block order (e.g. randomized enables so a different
-  subset of blocks fires each cycle). Kept as-is and documented rather than
-  quietly relabelled — the counters are what caught it.
+* **The original B2 was not branch-bound.** With a block order that repeats
+  every cycle the predictor learns it perfectly — IPC 3.07, branch-miss 0.04%.
+  So it measures cache-resident throughput, not prediction. It is kept as
+  `dispatch_regular`, and `dispatch_branchy` was added: an LFSR selects a
+  different case arm *and* a different subset of firing blocks every cycle.
+  Same footprint, same work, only predictability differs — so the pair isolates
+  the predictor's cost. On the i7-9800X (median of reps):
+
+  | variant | items/s | IPC | br-miss | cache-miss |
+  |---|---:|---:|---:|---:|
+  | `dispatch_regular` | 83,542 | 3.07 | 0.04% | 35.6% |
+  | `dispatch_branchy` | 11,904 | 2.23 | 0.51% | 0.65% |
+  | `dispatch_branchy_par` | 1,695 | 0.93 | 1.60% | 0.86% |
+
+* **A real xezim performance bug fell out of this.** xezim automatically enables
+  parallel edge dispatch once a tick has >=10k bytecode insns across
+  parallel-eligible blocks (`parallel_blocks >= 2 && parallel_insn_count >=
+  10_000`). For many small blocks it then forks/joins **per clock edge**, and on
+  this box that is **~6x SLOWER than sequential** for the identical design
+  (total 10.3s vs 1.8s; `edge_exec` 9.8s vs 1.36s), while IPC collapses to 0.93.
+  It also silently reports `insns=0`/`ns_per_insn=0`, because the parallel path
+  does not increment those counters. `XEZIM_NO_PARALLEL=1` restores the fast
+  path. This is very likely why B4 shows no scaling, and it is worth fixing in
+  xezim (the heuristic should weigh per-block work, not the tick's total insns).
 * For contrast, B5 (the constraint solver) runs at IPC 2.25 with a 1.1%
   branch-miss rate: it *is* the branchy, unpredictable workload of the set.

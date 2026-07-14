@@ -48,6 +48,57 @@ def vm_dispatch(n_blocks=512, per_block=8, cycles=200_000):
     write("b2_vm_dispatch.sv", "\n".join(L) + "\n")
 
 
+def vm_dispatch_branchy(n_blocks=512, cycles=50_000):
+    """B2b: same footprint as B2a, but the executed path is DATA-DEPENDENT.
+
+    Each block dispatches on LFSR bits, so (a) a different arm of the case runs
+    each cycle, giving the interpreter's `match` on the Insn variant an
+    unpredictable target, and (b) each block's flops only move when its enable
+    bit is set, so edge-skip gating fires a different SUBSET of blocks every
+    cycle. B2a and B2b do the same amount of work and touch the same working
+    set; the only difference is predictability, so (B2a - B2b) isolates the
+    indirect-branch-predictor cost."""
+    L = []
+    L.append("// B2b vm-branchy: interpreter dispatch with an unpredictable path.")
+    L.append(f"// {n_blocks} blocks, data-dependent case arms + per-block enables")
+    L.append("module bench_vm_branchy;")
+    L.append("  bit clk = 0;")
+    L.append("  int cyc = 0;")
+    L.append("  logic [31:0] lfsr = 32'hACE1_2345;")
+    for b in range(n_blocks):
+        L.append(f"  logic [7:0] s{b}_0, s{b}_1, s{b}_2, s{b}_3, s{b}_4, s{b}_5, s{b}_6, s{b}_7;")
+    L.append("  always #1 clk = ~clk;")
+    L.append("  // xorshift: a new, unpredictable control word every cycle")
+    L.append("  always_ff @(posedge clk) begin")
+    L.append("    lfsr <= lfsr ^ (lfsr << 13) ^ (lfsr >> 17) ^ (lfsr << 5);")
+    L.append("    cyc  <= cyc + 1;")
+    L.append("  end")
+    for b in range(n_blocks):
+        sel_lo = (b * 3) % 29
+        en_bit = (b * 7) % 32
+        L.append(f"  always_ff @(posedge clk) begin")
+        L.append(f"    if (lfsr[{en_bit}]) begin")
+        L.append(f"      case (lfsr[{sel_lo+2}:{sel_lo}])")
+        L.append(f"        3'd0: s{b}_0 <= s{b}_7 + 8'd{(b + 1) & 0xFF};")
+        L.append(f"        3'd1: s{b}_1 <= s{b}_0 ^ 8'h5A;")
+        L.append(f"        3'd2: s{b}_2 <= s{b}_1 << 1;")
+        L.append(f"        3'd3: s{b}_3 <= s{b}_2 >> 2;")
+        L.append(f"        3'd4: s{b}_4 <= s{b}_3 & s{b}_6;")
+        L.append(f"        3'd5: s{b}_5 <= s{b}_4 | 8'h0F;")
+        L.append(f"        3'd6: s{b}_6 <= s{b}_5 - 8'd3;")
+        L.append(f"        default: s{b}_7 <= s{b}_6 + s{b}_0;")
+        L.append(f"      endcase")
+        L.append(f"    end")
+        L.append(f"  end")
+    L.append(f"  initial begin")
+    L.append(f"    #({2*cycles});")
+    L.append(f"    $display(\"BENCH_DONE cycles=%0d checksum=%0d\", cyc, s0_0 + s{n_blocks-1}_7);")
+    L.append("    $finish;")
+    L.append("  end")
+    L.append("endmodule")
+    write("b2b_vm_branchy.sv", "\n".join(L) + "\n")
+
+
 # ---------------------------------------------------------------- B3
 def mem_sweep(log2_depth, cycles=100_000):
     """One memory of 2^log2_depth x 32b, accessed at LFSR-scattered addresses
@@ -152,6 +203,7 @@ def constraint_rand(iters=20_000):
 if __name__ == "__main__":
     print("generating benchmark designs into bench/gen/ ...")
     vm_dispatch()
+    vm_dispatch_branchy()
     for n in (10, 12, 14, 16, 18, 20, 22):
         mem_sweep(n)
     parallel()

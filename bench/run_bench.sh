@@ -140,8 +140,27 @@ run() {
 
 # ---------------------------------------------------------------- B2
 if have B2; then
-  echo "== B2 vm-dispatch (interpreter dispatch rate, cache-resident)"
-  run B2 dispatch 1 4096 "$GEN/b2_vm_dispatch.sv" --max-time 500000
+  echo "== B2 vm-dispatch (interpreter rate, cache-resident)"
+  # Two variants with the same footprint and the same amount of work; only the
+  # PREDICTABILITY of the executed path differs. B2a's block order repeats every
+  # cycle (the predictor learns it perfectly: ~0.04% miss on x86); B2b dispatches
+  # on an LFSR so a different case arm and a different subset of blocks fires
+  # each cycle. The DELTA between them is the indirect-branch-predictor cost —
+  # which is the thing that actually differs between Zen, Golden Cove and Neoverse.
+  run B2 dispatch_regular 1 4096 "$GEN/b2_vm_dispatch.sv" --max-time 500000
+
+  # B2b under the SEQUENTIAL dispatcher: this is the real indirect-branch
+  # measurement (the bytecode VM actually runs; `insns` is non-zero).
+  XEZIM_NO_PARALLEL=1 run B2 dispatch_branchy 1 4096 "$GEN/b2b_vm_branchy.sv" --max-time 120000
+
+  # Same design with xezim's automatic parallel edge dispatch left ON. It kicks
+  # in at >=10k bytecode insns per tick, forks/joins per clock edge, and on this
+  # box is ~6x SLOWER than sequential for these fine-grained blocks. The ratio
+  # (branchy_par / branchy_seq) is therefore a direct measure of thread
+  # fork/join + sync cost — which is exactly what differs between x86 and
+  # Graviton, so it is worth carrying as its own number.
+  ( unset XEZIM_NO_PARALLEL
+    run B2 dispatch_branchy_par 1 4096 "$GEN/b2b_vm_branchy.sv" --max-time 120000 )
 fi
 
 # ---------------------------------------------------------------- B3
