@@ -111,3 +111,20 @@ fn issue_29_constraint_typecast() {
     let msgs = outputs(include_str!("issue_cases/constraint.typecast.sv"), 100_000);
     assert!(msgs.iter().any(|m| m.contains("TEST_PASS")), "{:?}", msgs);
 }
+
+#[test]
+fn issue_26_static_init_sysfuncs() {
+    // §6.21/§10.5 sim-time syscall inits + §20.6 type operands
+    // ($size(logic [7:0])). The test reads plusargs, so it needs the
+    // args-aware entry point.
+    let src = include_str!("issue_cases/static.init.sysfuncs.sv").to_string();
+    let plusargs = vec!["TEST_MODE".to_string(), "SEED_VAL=42".to_string()];
+    let sim = xezim::simulate_multi(
+        &[src], 100_000, None, &[], &[], None, false, None, None, &[],
+        &plusargs, 1, None, &[], 0, u64::MAX, None, &[], None, None, None,
+        None, false, None,
+    )
+    .expect("simulate failed");
+    let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(msgs.iter().any(|m| m.contains("TEST_PASS")), "{:?}", msgs);
+}
