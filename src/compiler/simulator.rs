@@ -2609,6 +2609,11 @@ pub struct Simulator {
     /// zero-delay event ping-pong, a `wait` on an already-true condition inside
     /// a `forever`) can never advance, and xezim used to spin silently forever
     /// — the user just saw the sim "stuck at time 0".
+    /// Re-entry depth of `exec_forever_sched`'s suspend-aware path. A `forever`
+    /// whose leading statement only SOMETIMES blocks (`wait (cond)` with cond
+    /// already true) would otherwise recurse once per iteration and overflow the
+    /// Rust stack; past this depth the continuation goes back to the scheduler.
+    forever_depth: u32,
     stall_iters: u64,
     stall_time: u64,
     /// Process activations at the current timestamp — the accurate signal for
@@ -3861,6 +3866,7 @@ impl Simulator {
             par_cal_use_parallel: false,
             prof_par_ticks: 0,
             prof_par_blocks: 0,
+            forever_depth: 0,
             stall_iters: 0,
             stall_time: 0,
             stall_pid_hits: HashMap::default(),
@@ -14012,6 +14018,12 @@ impl Simulator {
     /// disabled by the LLVM threshold drop).  See diff against the
     /// pre-Phase-3 inline body for context.
     #[inline(always)]
+    /// How deep `exec_forever_sched` may re-enter itself before it stops
+    /// recursing and trampolines through the event queue instead. Small: real
+    /// designs suspend on the first iteration, so any depth beyond a handful
+    /// means the loop is not actually blocking.
+    const FOREVER_RECURSION_LIMIT: u32 = 32;
+
     /// A zero-delay livelock: `self.stall_limit` delta cycles have run at one
     /// timestamp and time never moved. Rather than spin forever (the user just
     /// sees "stuck at time 0"), say so and name the processes responsible —
@@ -14022,9 +14034,17 @@ impl Simulator {
         top.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
         top.truncate(5);
 
+        // Report whichever count actually tripped: the outer loop's delta count,
+        // or (when a process re-armed inside one tick's drain loop) how many
+        // times that process ran. Quoting "1 delta cycle" for a process that ran
+        // 100_000 times would just be confusing.
+        let worst = top.first().map(|&(_, c)| c).unwrap_or(0);
         eprintln!(
-            "[xezim][error] simulation STALLED at time {} — {} delta cycles with no time advance.",
-            self.time, self.stall_iters
+            "[xezim][error] simulation STALLED at time {} — no progress after {} process activations \
+             at this timestamp ({} delta cycles).",
+            self.time,
+            worst.max(self.stall_iters),
+            self.stall_iters
         );
         eprintln!(
             "               This is a zero-delay (delta) livelock: one or more processes keep"
@@ -15543,7 +15563,21 @@ impl Simulator {
             DepthGuard
         };
         if self.stall_limit > 0 {
-            *self.stall_pid_hits.entry(pid).or_insert(0) += 1;
+            let hits = self.stall_pid_hits.entry(pid).or_insert(0);
+            *hits += 1;
+            // One process re-activated this many times at a SINGLE timestamp is
+            // not a busy design, it is a livelock: it keeps re-arming itself and
+            // time can never advance. (Counting per-process, rather than
+            // counting activations at the timestamp, is what makes this safe for
+            // a wide design that legitimately wakes thousands of DISTINCT
+            // processes at time 0.) run_one_tick's inner drain loop re-reads the
+            // queue at the current time, so a self-rescheduling process never
+            // reaches the outer event loop — the check has to live here.
+            if *hits > self.stall_limit {
+                self.report_zero_delay_stall();
+                self.finished = true;
+                return;
+            }
         }
         sim_dbg_eprintln!(
             "[DEBUG] running process {} ({} stmts) at time {}",
@@ -16767,7 +16801,23 @@ impl Simulator {
                     body.span,
                 ));
                 cont.extend_from_slice(after);
+
+                // The statement is only POTENTIALLY blocking: `wait (cond)` with
+                // cond already true runs straight through, reaches the Forever
+                // continuation, and lands back here — one recursion per loop
+                // iteration. Unbounded, that overflows the Rust stack (an abort,
+                // with no hint of which loop did it) instead of presenting as
+                // what it is: a zero-delay livelock. Past a small depth, hand the
+                // continuation to the scheduler as a delta at the current time.
+                // The loop then spins through the event loop, where it is bounded,
+                // and the stall detector can see it and name it.
+                if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
+                    self.event_queue.schedule(self.time, pid, cont);
+                    return;
+                }
+                self.forever_depth += 1;
                 self.run_process_stmts(pid, &cont);
+                self.forever_depth -= 1;
                 return;
             }
             self.exec_statement(s);
@@ -29409,12 +29459,14 @@ impl Simulator {
                 }
             }
             "$dumpvars" => {
-                // Collect optional scope/signal-name filter from args 1..N.
-                // arg[0] is depth (currently ignored — always treat as
-                // "all children"). args[1..] are scope or signal names.
-                // When non-empty, restrict the dump to signals whose
-                // resolved hierarchical name starts with one of these
-                // scopes (or matches a signal name exactly).
+                // §21.7.1.4 `$dumpvars(level, scope_or_var, ...)`.
+                // arg[0] is the DEPTH: 0 = every level below each named scope,
+                // N = N levels starting at it. args[1..] are scope or signal
+                // names; with none, the whole design is dumped.
+                let depth = args
+                    .first()
+                    .and_then(|a| self.eval_expr(a).to_u64())
+                    .unwrap_or(0) as u32;
                 let mut filter_scopes: Vec<String> = Vec::new();
                 for a in args.iter().skip(1) {
                     if let ExprKind::Ident(hier) = &a.kind {
@@ -29427,13 +29479,27 @@ impl Simulator {
                     }
                 }
                 self.vcd_filter_scopes = filter_scopes;
+                self.vcd_dump_depth = depth;
                 self.vcd_start_dump();
             }
             "$dumpoff" => {
-                self.vcd_enabled = false;
+                self.vcd_dump_off();
             }
             "$dumpon" => {
-                self.vcd_enabled = true;
+                self.vcd_dump_on();
+            }
+            "$dumpall" => {
+                self.vcd_dump_all();
+            }
+            "$dumpflush" => {
+                // §21.7.1.9: force everything buffered so far out to the file.
+                if let Some(w) = self.vcd_writer.as_mut() {
+                    let _ = w.flush();
+                }
+            }
+            "$dumplimit" => {
+                // §21.7.1.8: cap the dump at N bytes.
+                self.vcd_limit = args.first().and_then(|a| self.eval_expr(a).to_u64());
             }
             "$sscanf" => {
                 if args.len() >= 2 {
@@ -32075,27 +32141,24 @@ impl Simulator {
             }
         }
 
+        // Non-object table entries, computed over the WHOLE table (never over the
+        // selected subset — at `$dumpvars(1, top)` a scope's children are all
+        // filtered out, and an instance handle that is no longer the prefix of
+        // any selected name would leak straight back in as a 1-bit x wire):
+        //
+        //   * every dotted PREFIX of a name is a scope, so a same-named entry is
+        //     an instance handle or an UNPACKED STRUCT aggregate, not an object.
+        //     A PACKED struct is exempt — there the aggregate IS the storage and
+        //     its flattened members are slices of it.
+        //   * every module/interface INSTANCE path (authoritative, and it also
+        //     covers an instance whose module declares nothing at all).
+        //   * the base of an unpacked array whose elements are dumped
+        //     individually (`mem` beside `mem[0]`…`mem[3]`).
         let n = self.id_to_name.len().min(self.signal_table.len());
-        let mut names: Vec<&str> = Vec::with_capacity(n);
+        let mut scope_names: HashSet<&str> = HashSet::default();
+        let mut expanded_bases: HashSet<&str> = HashSet::default();
         for id in 0..n {
             let name = self.id_to_name[id].as_ref();
-            if name.is_empty() || enum_lits.contains(name) {
-                continue;
-            }
-            if !Self::dump_name_selected(name, filters.as_deref(), depth) {
-                continue;
-            }
-            names.push(name);
-        }
-
-        // Every dotted prefix of a selected name is a SCOPE. A same-named table
-        // entry is the instance handle / struct aggregate, not an object.
-        // A PACKED struct is exempt: there the aggregate IS the storage (its
-        // flattened members are slices of it), so it stays in the dump.
-        let mut scope_names: HashSet<&str> = HashSet::default();
-        // Bases of unpacked arrays that are dumped element-wise (`mem[0]`…).
-        let mut expanded_bases: HashSet<&str> = HashSet::default();
-        for name in &names {
             let mut cut = 0usize;
             while let Some(p) = name[cut..].find('.') {
                 let end = cut + p;
@@ -32108,12 +32171,25 @@ impl Simulator {
                 expanded_bases.insert(&name[..p]);
             }
         }
+        for inst in &self.module.instances {
+            scope_names.insert(inst.path.as_str());
+        }
 
-        let mut out: Vec<String> = names
-            .iter()
-            .filter(|n| !scope_names.contains(*n) && !expanded_bases.contains(*n))
-            .map(|n| n.to_string())
-            .collect();
+        let mut out: Vec<String> = Vec::new();
+        for id in 0..n {
+            let name = self.id_to_name[id].as_ref();
+            if name.is_empty()
+                || enum_lits.contains(name)
+                || scope_names.contains(name)
+                || expanded_bases.contains(name)
+            {
+                continue;
+            }
+            if !Self::dump_name_selected(name, filters.as_deref(), depth) {
+                continue;
+            }
+            out.push(name.to_string());
+        }
         out.sort();
         out.dedup();
         out
@@ -32483,12 +32559,11 @@ impl Simulator {
         self.vcd_account_bytes(nbytes);
     }
 
-    /// Write a single value to VCD. Delegates to the one shared formatter in
-    /// `vcd_sink` — this used to be a second, divergent copy that disagreed with
-    /// the sink about `real` and about leading-zero suppression.
-    fn vcd_write_value(w: &mut impl Write, val: &Value, id: &str) {
-        super::vcd_sink::write_vcd_value(w, val, id);
-    }
+    // NOTE: `Simulator::vcd_write_value` is GONE. It was a second, divergent
+    // copy of `vcd_sink::write_vcd_value` (the two disagreed about `real` and
+    // about leading-zero suppression, so a value's spelling depended on whether
+    // it went out through the header path or the sink's writer thread). There is
+    // now exactly one VCD value formatter, in `vcd_sink`, and every path uses it.
 
     /// Byte length of the value-change record the sink will format for `val`.
     /// The sink formats batched changes on its own thread, so `$dumplimit`
@@ -33035,31 +33110,12 @@ impl Simulator {
             }
         };
 
-        // Collect signal names to trace. When `xtrace_scopes` is non-empty,
-        // restrict to signals whose hierarchical name matches one of the
-        // scopes exactly or sits underneath it (prefix + '.'). Sorted for
-        // deterministic dictionary IDs.
-        let mut sig_names: Vec<String> = if self.xtrace_scopes.is_empty() {
-            self.signals.keys().cloned().collect()
-        } else {
-            // Precompute each scope's "<scope>." prefix ONCE rather than
-            // re-allocating it per (signal × filter) inside the hot filter loop.
-            let filters: Vec<(&str, String)> = self
-                .xtrace_scopes
-                .iter()
-                .map(|f| (f.as_str(), format!("{}.", f)))
-                .collect();
-            self.signals
-                .keys()
-                .filter(|name| {
-                    filters
-                        .iter()
-                        .any(|(f, fdot)| name.as_str() == *f || name.starts_with(fdot.as_str()))
-                })
-                .cloned()
-                .collect()
-        };
-        sig_names.sort();
+        // Collect signal names to trace. Shares `$dumpvars`'s enumeration: the
+        // REAL signal table (not the lazily-synced `self.signals` mirror, which
+        // is empty unless something dirtied the table first) and the same
+        // top-relative scope normalization, so `--xtrace-scope top.u_sub` and
+        // `--xtrace-scope u_sub` both match. Sorted for deterministic IDs.
+        let sig_names: Vec<String> = self.dump_signal_names(&self.xtrace_scopes, 0);
         if !self.xtrace_scopes.is_empty() {
             eprintln!(
                 "[XTrace] dumping {} signals (scopes={})",
@@ -33322,25 +33378,10 @@ impl Simulator {
         };
         self.sync_table_to_hashmap();
 
-        let mut sig_names: Vec<String> = if self.fst_scopes.is_empty() {
-            self.signals.keys().cloned().collect()
-        } else {
-            let filters: Vec<(&str, String)> = self
-                .fst_scopes
-                .iter()
-                .map(|f| (f.as_str(), format!("{}.", f)))
-                .collect();
-            self.signals
-                .keys()
-                .filter(|name| {
-                    filters
-                        .iter()
-                        .any(|(f, fdot)| name.as_str() == *f || name.starts_with(fdot.as_str()))
-                })
-                .cloned()
-                .collect()
-        };
-        sig_names.sort();
+        // Same enumeration + top-relative scope normalization as `$dumpvars`
+        // (see `dump_signal_names`): the old copy read the empty `self.signals`
+        // mirror and compared absolute filter paths against relative names.
+        let sig_names: Vec<String> = self.dump_signal_names(&self.fst_scopes, 0);
         eprintln!(
             "[FST] dumping {} signals (scopes={})",
             sig_names.len(),
