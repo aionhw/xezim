@@ -2316,6 +2316,19 @@ pub struct Simulator {
     /// fork time as a baseline; propagate merges only the keys whose value the
     /// child CHANGED relative to this baseline.
     fork_baselines: HashMap<usize, Vec<HashMap<String, Value>>>,
+    /// IEEE 1800-2023 §6.21/§9.3.2: automatic variables declared in a
+    /// procedural block (`initial`/`always`) with NO enclosing call frame live
+    /// in the global `self.signals` map (not a `local_stack` frame). At fork
+    /// time `inherit_fork_child_context` copies them (via `auto_loop_vars`)
+    /// INTO the child's `local_stack` frame so each child gets its own
+    /// snapshot. That creates a storage MISMATCH: the child's writes land in
+    /// its private frame, while the parent reads from `self.signals`. The
+    /// `local_stack` merge alone cannot bridge this — the parent has no frame
+    /// for these vars. This map records, per child, the bare names that were
+    /// captured FROM `self.signals`, so the propagate path can write the
+    /// child's changed values back INTO `self.signals` (true shared storage,
+    /// per §6.21's enclosing-scope rule).
+    fork_signal_captures: HashMap<usize, Vec<String>>,
     /// Processes blocked in `semaphore.get()` on an under-full semaphore.
     semaphore_get_waiters: HashMap<usize, std::collections::VecDeque<SemGetWaiter>>,
     /// IEEE 1800-2017 §9.4.5 intra-assignment delay (`lhs = #d rhs`): RHS
@@ -3769,6 +3782,7 @@ impl Simulator {
             real_time: 0.0,
             mailbox_get_waiters: HashMap::default(),
             fork_baselines: HashMap::default(),
+            fork_signal_captures: HashMap::default(),
             semaphore_get_waiters: HashMap::default(),
             intra_saved: HashMap::default(),
             intra_saved_next: 0,
@@ -15155,11 +15169,22 @@ impl Simulator {
     /// (LRM §9.3.2). Used when spawning fork children.
     fn inherit_fork_child_context(&mut self, pid: usize) {
         let mut ctx = self.snapshot_process_context();
+        // §6.21/§9.3.2: automatic block-locals (no call frame) live in
+        // `self.signals` and are listed in `auto_loop_vars`. Copy their
+        // current VALUES into the child's `local_stack` so each child gets
+        // its own snapshot (the child's reads consult its top frame first).
+        // Record WHICH names were captured from `signals` so the propagate
+        // path can write the child's changed values back into `self.signals`
+        // — the storage the parent actually reads from. Without this
+        // write-back, the child's writes are stranded in its private frame
+        // and the parent sees the stale pre-fork value (§6.21 violation).
+        let mut signal_caps: Vec<String> = Vec::new();
         if !self.auto_loop_vars.is_empty() {
             let mut caps: HashMap<String, Value> = HashMap::default();
             for nm in &self.auto_loop_vars {
                 if let Some(v) = self.signals.get(nm) {
                     caps.insert(nm.clone(), v.clone());
+                    signal_caps.push(nm.clone());
                 }
             }
             if !caps.is_empty() {
@@ -15192,6 +15217,7 @@ impl Simulator {
             // (which the parent may have modified in the meantime — e.g. a
             // mailbox-get delivery into `phase` while this child runs).
             self.fork_baselines.insert(pid, ctx.local_stack.clone());
+            self.fork_signal_captures.insert(pid, signal_caps);
             self.process_contexts.insert(pid, ctx);
         }
     }
@@ -15333,7 +15359,8 @@ impl Simulator {
         let has_pid_ctx = self.process_contexts.contains_key(&pid);
         if !saved_ctx_needed && !has_pid_ctx {
             self.run_process_stmts(pid, stmts);
-            if self.is_pid_suspended(pid) {
+            let susp = self.is_pid_suspended(pid);
+            if susp {
                 // Only snapshot if actually suspended and has state worth saving.
                 if !self.this_stack.is_empty()
                     || !self.local_stack.is_empty()
@@ -15347,7 +15374,7 @@ impl Simulator {
             *self.name_resolve_hint.borrow_mut() = saved_hint;
             return;
         }
-        let saved = self.snapshot_process_context();
+        let mut saved = self.snapshot_process_context();
         let ctx = self.process_contexts.remove(&pid).unwrap_or_default();
         self.restore_process_context(ctx);
         self.run_process_stmts(pid, stmts);
@@ -15357,82 +15384,103 @@ impl Simulator {
         } else {
             self.process_contexts.remove(&pid);
         }
-        // IEEE 1800-2023 §9.3.2: automatic variables declared in the parent
-        // scope are SHARED with fork children — a child's write must be
-        // visible to the parent (and to siblings after the parent resumes).
-        // xezim gives each fork child a COPY of the parent's locals (see
-        // inherit_fork_child_context), so propagate the child's local frames
-        // back into the parent's saved context. Without this, UVM 2020's
-        // m_safe_select_item idiom (`fork … select_process = process::self();
-        // … join_none; wait(select_process != null)`) deadlocks: the parent
-        // never sees the child's assignment and the `wait` parks forever.
-        // 2017's sequencer has no such fork-and-wait idiom, which is why it
-        // completes. We merge every frame the child shares with the parent
-        // (child may have pushed extra frames via nested calls — those are
-        // skipped), exactly mirroring shared-automatic semantics.
-        self.propagate_fork_locals_to_parent(pid);
+        // IEEE 1800-2023 §6.21/§9.3.2: automatic variables declared in the
+        // parent scope are SHARED with fork children — a child's write must be
+        // visible to the parent. xezim gives each fork child a COPY of the
+        // parent's locals (inherit_fork_child_context), so the child's writes
+        // live in its private copy and must be propagated back. Two storage
+        // models must be bridged:
+        //   (a) SUBROUTINE locals — live in a `local_stack` frame; merged into
+        //       the parent's frame (in `process_contexts` if suspended, or in
+        //       `saved` if the parent is the currently-active process whose
+        //       context is on THIS Rust stack — e.g. the child ran inside the
+        //       parent's own `#delay` via `run_events_until`).
+        //   (b) PROCEDURAL block-locals (`initial`/`always`, no call frame) —
+        //       live in the global `self.signals`; `inherit_fork_child_context`
+        //       copied them into the child's frame and recorded the names in
+        //       `fork_signal_captures`. Write the child's changed values back
+        //       into `self.signals`, which is what the parent reads from.
+        let child_frames: Vec<HashMap<String, Value>> = self.local_stack.clone();
+        let baseline = self.fork_baselines.get(&pid).cloned();
+        let signal_caps = self.fork_signal_captures.get(&pid).cloned();
+        if !child_frames.is_empty() {
+            if let Some(parent_pid) = self.process_parents.get(&pid).copied() {
+                // (a) subroutine-frame merge
+                if let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) {
+                    Self::merge_fork_writes(
+                        &mut parent_ctx.local_stack,
+                        &child_frames,
+                        baseline.as_ref(),
+                    );
+                } else {
+                    // Parent is the active process — its context is `saved`.
+                    Self::merge_fork_writes(
+                        &mut saved.local_stack,
+                        &child_frames,
+                        baseline.as_ref(),
+                    );
+                }
+            }
+        }
+        // (b) signal-capture write-back: procedural block-locals that live in
+        // `self.signals`. Write only keys the child CHANGED (relative to the
+        // fork-time baseline) so an inherited-unchanged value doesn't
+        // clobber a sibling's or the parent's concurrent write.
+        if let Some(caps) = &signal_caps {
+            let top = child_frames.last();
+            for nm in caps {
+                let Some(v) = top.and_then(|f| f.get(nm)) else {
+                    continue;
+                };
+                let inherited_unchanged = baseline
+                    .as_ref()
+                    .and_then(|b| b.last())
+                    .and_then(|f| f.get(nm))
+                    .is_some_and(|old| old == v);
+                if !inherited_unchanged {
+                    self.signals.insert(nm.clone(), v.clone());
+                }
+            }
+        }
+        if !self.is_pid_suspended(pid) {
+            self.fork_baselines.remove(&pid);
+            self.fork_signal_captures.remove(&pid);
+        }
         self.restore_process_context(saved);
         self.auto_loop_vars.truncate(saved_auto_len);
         *self.name_resolve_hint.borrow_mut() = saved_hint;
     }
 
-    /// Merge a (just-run) fork child's local frames into its parent process's
-    /// saved context so the parent observes the child's writes to shared
-    /// automatic variables (IEEE 1800-2023 §9.3.2). See the call site in
-    /// `run_scheduled_process` for the full rationale. Only frames that exist
-    /// in BOTH the child and parent stacks are merged (the child may hold
-    //  extra frames from nested subroutine calls; the parent may hold extra
-    //  frames pushed after the fork).
-    fn propagate_fork_locals_to_parent(&mut self, child_pid: usize) {
-        let parent_pid = match self.process_parents.get(&child_pid).copied() {
-            Some(p) => p,
-            None => return,
-        };
-        // §9.3.2 baseline: only the keys the child WROTE (its value now differs
-        // from the fork-time snapshot) are propagated — a key it merely
-        // inherited unchanged must NOT clobber a value the parent modified
-        // after the fork (e.g. a mailbox-get delivery into `phase` while this
-        // child ran, as in UVM `m_run_phases`). If no baseline survived (child
-        // that never had saved context, or an older run), fall back to the
-        // legacy whole-frame merge so the §9.3.2 write-visibility guarantee
-        // (e.g. m_safe_select_item's `select_process = process::self()`)
-        // still holds.
-        let baseline = self.fork_baselines.get(&child_pid).cloned();
-        // `self.local_stack` currently holds the CHILD's frames (captured
-        // before we restore the event-loop caller's context below).
-        let child_frames: Vec<HashMap<String, Value>> = self.local_stack.clone();
-        if child_frames.is_empty() {
-            return;
-        }
-        let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) else {
-            return;
-        };
-        let n = parent_ctx.local_stack.len().min(child_frames.len());
+    /// Merge a fork child's local-frame writes into a parent's `local_stack`.
+    ///
+    /// §9.3.2 baseline: only the keys the child WROTE (its value now differs
+    /// from the fork-time snapshot) are propagated — a key it merely
+    /// inherited unchanged must NOT clobber a value the parent modified
+    /// after the fork (e.g. a mailbox-get delivery into `phase` while this
+    /// child ran). If no baseline survived, fall back to the legacy
+    /// whole-frame merge so the §9.3.2 write-visibility guarantee still
+    /// holds. Only keys that exist in the parent's frame are propagated (a
+    /// key the child declared itself, like a loop-local, is child-private).
+    fn merge_fork_writes(
+        parent_frames: &mut [HashMap<String, Value>],
+        child_frames: &[HashMap<String, Value>],
+        baseline: Option<&Vec<HashMap<String, Value>>>,
+    ) {
+        let n = parent_frames.len().min(child_frames.len());
         for i in 0..n {
             for (k, v) in &child_frames[i] {
-                // Only propagate keys that exist in the parent's frame (a key
-                // the child declared itself, like a loop-local `succ`, is
-                // child-private and of no interest to the parent).
-                if !parent_ctx.local_stack[i].contains_key(k) {
+                if !parent_frames[i].contains_key(k) {
                     continue;
                 }
                 let inherited_unchanged = baseline
-                    .as_ref()
                     .and_then(|b| b.get(i))
                     .and_then(|f| f.get(k))
                     .is_some_and(|old| old == v);
                 if inherited_unchanged {
                     continue;
                 }
-                parent_ctx.local_stack[i].insert(k.clone(), v.clone());
+                parent_frames[i].insert(k.clone(), v.clone());
             }
-        }
-        // Drop the baseline once the child is done (no longer suspended) so the
-        // map doesn't grow unboundedly across a forever-fork loop (UVM
-        // `m_run_phases`). A child that merely parked (e.g. on a `#5`) keeps
-        // its baseline for the next propagate.
-        if !self.is_pid_suspended(child_pid) {
-            self.fork_baselines.remove(&child_pid);
         }
     }
 
@@ -16129,37 +16177,22 @@ impl Simulator {
                     i += 1;
                     continue;
                 } else {
-                    let sig_names = self.extract_signal_names(condition);
-                    // Only suspend on a signal EDGE for names that are real
-                    // edge-trackable signals (in the compact signal table).
-                    // A `wait(...)` over class members / procedural locals (the
-                    // UVM arbitration's wait(lock_arb_size != m_lock_arb_size),
-                    // wait(m_arb_size != m_lock_arb_size), ...) extracts names
-                    // that look like signals but never fire an edge, so it would
-                    // park in event_waiters forever — route it to the
-                    // condition-waiter fixpoint instead.
-                    let sens: Vec<Sensitivity> = sig_names
-                        .into_iter()
-                        .filter(|name| self.signal_name_to_id.contains_key(name.as_str()))
-                        .map(|name| Sensitivity {
-                            signal_name: name,
-                            edge: EdgeKind::AnyEdge,
-                            iff: None,
-                        })
-                        .collect();
-                    if !sens.is_empty() {
-                        let mut cont = vec![stmt.clone()];
-                        cont.extend_from_slice(&stmts[i + 1..]);
-                        self.event_waiters
-                            .push(self.make_event_waiter(pid, sens, cont));
-                        return;
-                    }
-                    // No signal sensitivities: the condition depends on class
-                    // members / locals another same-time process mutates (the
-                    // UVM sequencer arbitration). Park as a condition-waiter and
-                    // suspend; the fixpoint in run_one_tick re-checks it after
-                    // the batch drains. (Previously this fell through as if the
-                    // wait were satisfied, which spun m_select_sequence forever.)
+                    // IEEE 1800-2023 §9.7.4: `wait(cond)` is LEVEL-
+                    // sensitive — the process resumes the moment the
+                    // condition is true, including in the SAME timestep via a
+                    // delta-cycle (#0) write from another process. The
+                    // condition-waiter fixpoint in run_one_tick re-evaluates
+                    // the actual expression every tick, so it handles same-
+                    // timestep (delta), cross-timestep (#delay), and time-0
+                    // init uniformly. Routing a signal-naming wait through the
+                    // edge-triggered event_waiter path instead BREAKS delta-
+                    // cycle wakeup: its `registered_time == self.time` guard
+                    // (correct for edge-sensitive `@()`) skips any same-
+                    // timestep edge, so `wait(sig==v)` never resumes when a
+                    // peer process writes `sig` at the same simtime. The UVM
+                    // phase hopper (`fork ... join_none; wait(all_dropped)`)
+                    // and sequencer arbitration depend on exactly this delta-
+                    // cycle handoff. Always park in condition_waiters.
                     let mut cont = vec![stmt.clone()];
                     cont.extend_from_slice(&stmts[i + 1..]);
                     self.condition_waiters.push((pid, cont));
