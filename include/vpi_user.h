@@ -147,6 +147,9 @@ typedef PLI_UINT32 *vpiHandle;
 
 /* --- callback reasons (Table 38-49) ----------------------------------- */
 #define cbValueChange          1
+#define cbNextSimTime          8
+#define cbStartOfSimulation   11
+#define cbEndOfSimulation     12
 #define cbStartOfReset        19
 #define cbEndOfReset          20
 
@@ -329,16 +332,25 @@ void vpi_get_value(vpiHandle expr, p_vpi_value value_p);
 vpiHandle vpi_put_value(vpiHandle object, p_vpi_value value_p,
                         p_vpi_time time_p, PLI_INT32 flags);
 
+/* Reads the current simulation time. `object` is accepted for IEEE
+ * compatibility and currently ignored. `time_p->type` selects the format:
+ * vpiSimTime fills high/low, vpiScaledRealTime fills real. */
+void vpi_get_time(vpiHandle object, p_vpi_time time_p);
+
 PLI_INT32 vpi_free_object(vpiHandle object);
 PLI_INT32 vpi_release_handle(vpiHandle object);
 PLI_INT32 vpi_get_vlog_info(p_vpi_vlog_info vlog_info_p);
 
-/* Only cbValueChange and cbStartOfReset are dispatched. Any other reason
+/* Only cbValueChange, cbNextSimTime, cbStartOfSimulation,
+ * cbEndOfSimulation, and cbStartOfReset are dispatched. Any other reason
  * is rejected with a NULL return rather than silently accepted. When a
  * cbValueChange fires, cb_data_p->obj, ->time and ->value are populated;
  * ->value uses the format of the value struct supplied at registration
  * (vpiIntVal if none was given). */
 vpiHandle vpi_register_cb(p_cb_data cb_data_p);
+/* Fills `cb_data_p` from a callback object returned by vpi_register_cb.
+ * Returns 1 on success, 0 on failure. */
+PLI_INT32 vpi_get_cb_info(vpiHandle cb_obj, p_cb_data cb_data_p);
 PLI_INT32 vpi_remove_cb(vpiHandle cb_obj);
 
 /* DPI scope/runtime primitives live in svdpi.h with their proper

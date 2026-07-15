@@ -2741,8 +2741,15 @@ pub struct Simulator {
     /// `after_signal_write` whenever a signal value differs from its
     /// previous inline-bits snapshot.
     dpi_value_change_cbs: HashMap<usize, Vec<DpiCbHandle>>,
+    /// Registered cbNextSimTime callbacks with their registration time.
+    /// Each is one-shot and fires when simulation time advances.
+    dpi_next_time_cbs: Vec<(DpiCbHandle, u64)>,
     /// Registered start-of-reset callbacks. Fired at simulation start.
     dpi_reset_cbs: Vec<DpiCbHandle>,
+    /// Registered start-of-simulation callbacks. Fired once at sim start.
+    dpi_start_sim_cbs: Vec<DpiCbHandle>,
+    /// Registered end-of-simulation callbacks. Fired once when the event loop ends.
+    dpi_end_sim_cbs: Vec<DpiCbHandle>,
     /// Self-pointer, installed once at the top of `simulate()`. The
     /// `write_sig!` macro needs a `*mut Simulator` to hand the VPI
     /// callback dispatcher, but it expands in contexts that already hold
@@ -2755,6 +2762,8 @@ pub struct Simulator {
     /// (`vpi_register_cb` may also be called with `cbValueChange` to
     /// mark a scope's reset triggers; we keep a flag set for that).
     dpi_pending_reset_fired: bool,
+    dpi_pending_start_sim_fired: bool,
+    dpi_pending_end_sim_fired: bool,
     /// Open file handles for $fopen/$fwrite/$fclose.
     file_handles: HashMap<i32, std::fs::File>,
     /// Per-fd ungetc pushback buffer (LIFO).
@@ -4030,9 +4039,14 @@ impl Simulator {
             vpi_argv: Vec::new(),
             dpi_scopes: HashMap::default(),
             dpi_value_change_cbs: HashMap::default(),
+            dpi_next_time_cbs: Vec::new(),
             dpi_reset_cbs: Vec::new(),
+            dpi_start_sim_cbs: Vec::new(),
+            dpi_end_sim_cbs: Vec::new(),
             vpi_self_ptr: std::ptr::null_mut(),
             dpi_pending_reset_fired: false,
+            dpi_pending_start_sim_fired: false,
+            dpi_pending_end_sim_fired: false,
             file_handles: HashMap::default(),
             ungetc_buf: HashMap::default(),
             queues: HashMap::default(),
@@ -4066,10 +4080,15 @@ impl Simulator {
         if !vpi_paths.is_empty() {
             let self_ptr = &mut sim as *mut Simulator;
             ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
+            let prev_global = GLOBAL_ACTIVE_SIMULATOR.swap(
+                self_ptr,
+                std::sync::atomic::Ordering::AcqRel,
+            );
             let mut libs = std::mem::take(&mut sim.dpi_libraries);
             vpi_run_startup_routines(&mut libs, &vpi_paths);
             sim.dpi_libraries = libs;
             ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
+            GLOBAL_ACTIVE_SIMULATOR.store(prev_global, std::sync::atomic::Ordering::Release);
         }
         sim
     }
@@ -4197,7 +4216,10 @@ impl Drop for Simulator {
             cbs.clear();
         }
         // Reset callbacks
+        self.dpi_next_time_cbs.clear();
         self.dpi_reset_cbs.clear();
+        self.dpi_start_sim_cbs.clear();
+        self.dpi_end_sim_cbs.clear();
     }
 }
 
@@ -6225,12 +6247,13 @@ impl Simulator {
     }
 
     fn exec_dpi_import_call(&mut self, sv_name: &str, args: &[Expression]) -> Option<Value> {
+        let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
         let spec = self.module.dpi_imports.get(sv_name)?.clone();
         if !self.dpi_bindings.contains_key(sv_name) && !self.dpi_unsupported.contains(sv_name) {
             self.try_bind_dpi(sv_name, &spec);
         }
         if self.dpi_unsupported.contains(sv_name) {
-            ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
+            ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
             return Some(Value::zero(32));
         }
         let Some(binding) = self.dpi_bindings.get(sv_name) else {
@@ -6240,7 +6263,7 @@ impl Simulator {
                     sv_name, spec.c_name
                 );
             }
-            ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
+            ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
             return Some(Value::zero(32));
         };
         let ret_kind = binding.ret;
@@ -6682,8 +6705,8 @@ impl Simulator {
             // No side effects expected; kept for future optimization hooks.
             let _ = &mut result;
         }
-        // Clear active simulator after DPI call
-        ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
+        // Restore the caller's active simulator context after DPI call.
+        ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
         // Restore the previous DPI scope so nested DPI calls don't
         // leak scope state across invocations.
         ACTIVE_SCOPE.with(|cell| cell.set(prev_scope));
@@ -9639,7 +9662,23 @@ impl Simulator {
         if !self.compiled {
             self.compile();
         }
-        self.vpi_self_ptr = self as *mut Simulator;
+        let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
+        let self_ptr = self as *mut Simulator;
+        ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
+        let prev_global = GLOBAL_ACTIVE_SIMULATOR.swap(
+            self_ptr,
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        self.vpi_self_ptr = self_ptr;
+        // Fire cbStartOfSimulation callbacks exactly once at simulation start.
+        if !self.dpi_start_sim_cbs.is_empty() && !self.dpi_pending_start_sim_fired {
+            let self_ptr = self as *mut Simulator;
+            let now = self.time;
+            for cb in &self.dpi_start_sim_cbs.clone() {
+                dispatch_vpi_cb(self_ptr, now, None, cb, vpi::CB_START_OF_SIMULATION);
+            }
+            self.dpi_pending_start_sim_fired = true;
+        }
         // Fire cbStartOfReset callbacks exactly once at simulation
         // start. UVM's polling framework uses this hook to clear its
         // pending-change lists; we expose it because the upstream
@@ -9654,6 +9693,16 @@ impl Simulator {
             self.dpi_pending_reset_fired = true;
         }
         self.event_loop();
+        // Fire cbEndOfSimulation callbacks exactly once after the event loop
+        // terminates, before `final` blocks execute.
+        if !self.dpi_end_sim_cbs.is_empty() && !self.dpi_pending_end_sim_fired {
+            let self_ptr = self as *mut Simulator;
+            let now = self.time;
+            for cb in &self.dpi_end_sim_cbs.clone() {
+                dispatch_vpi_cb(self_ptr, now, None, cb, vpi::CB_END_OF_SIMULATION);
+            }
+            self.dpi_pending_end_sim_fired = true;
+        }
         // LRM §9.2.3 — `final` procedures run after the event loop terminates
         // but BEFORE any trace flush. May not contain time-consuming
         // statements (no `#`, `@`, `wait`). We honor that by running each
@@ -9692,6 +9741,8 @@ impl Simulator {
         if std::env::var("XEZIM_RS_STATS").is_ok() {
             xezim_core::value::Value::dump_range_select_stats();
         }
+        ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
+        GLOBAL_ACTIVE_SIMULATOR.store(prev_global, std::sync::atomic::Ordering::Release);
     }
 
     /// Detect `initial begin VAR = CONST; forever #d VAR = ~VAR; end`
@@ -14659,6 +14710,7 @@ impl Simulator {
             if next_time > self.max_time {
                 break;
             }
+            let old_time = self.time;
             if next_time > self.time {
                 self.time = next_time;
                 self.stall_iters = 0;
@@ -14677,6 +14729,18 @@ impl Simulator {
                     self.report_zero_delay_stall();
                     self.finished = true;
                     break;
+                }
+            }
+            if self.time > old_time && !self.dpi_next_time_cbs.is_empty() {
+                let self_ptr = self as *mut Simulator;
+                let now = self.time;
+                let mut pending = std::mem::take(&mut self.dpi_next_time_cbs);
+                for (cb, reg_time) in pending.drain(..) {
+                    if now > reg_time {
+                        dispatch_vpi_cb(self_ptr, now, None, &cb, vpi::CB_NEXT_SIM_TIME);
+                    } else {
+                        self.dpi_next_time_cbs.push((cb, reg_time));
+                    }
                 }
             }
 
@@ -51888,7 +51952,9 @@ mod vpi {
     pub const BIT_VAR: c_int = 620;
 
     // Time types.
+    pub const SCALED_REAL_TIME: c_int = 1;
     pub const SIM_TIME: c_int = 2;
+    pub const SUPPRESS_TIME: c_int = 3;
 
     // s_vpi_systf_data.type
     pub const SYS_TASK: c_int = 1;
@@ -51896,6 +51962,9 @@ mod vpi {
 
     // Callback reasons (Table 38-49).
     pub const CB_VALUE_CHANGE: c_int = 1;
+    pub const CB_NEXT_SIM_TIME: c_int = 8;
+    pub const CB_START_OF_SIMULATION: c_int = 11;
+    pub const CB_END_OF_SIMULATION: c_int = 12;
     pub const CB_START_OF_RESET: c_int = 19;
 }
 
@@ -51961,6 +52030,11 @@ thread_local! {
         std::cell::RefCell::new((0, vec![Vec::new(); 8]));
     static VPI_TIME_SCRATCH: std::cell::RefCell<s_vpi_time> =
         const { std::cell::RefCell::new(s_vpi_time { type_: 2, high: 0, low: 0, real: 0.0 }) };
+    // Storage returned from vpi_get_cb_info for cb_data_p->value/time.
+    static VPI_CB_INFO_VALUE_SCRATCH: std::cell::RefCell<s_vpi_value> =
+        const { std::cell::RefCell::new(s_vpi_value { format: 13, value: s_vpi_value_union { integer: 0 } }) };
+    static VPI_CB_INFO_TIME_SCRATCH: std::cell::RefCell<s_vpi_time> =
+        const { std::cell::RefCell::new(s_vpi_time { type_: 3, high: 0, low: 0, real: 0.0 }) };
 }
 
 /// `Value` bit code (0=0, 1=1, 2=X, 3=Z) -> one `(aval, bval)` bit pair.
@@ -52070,6 +52144,11 @@ thread_local! {
     /// Points to a `DpiScope` struct, or null if no scope is active.
     static ACTIVE_SCOPE: std::cell::Cell<*mut libc::c_void> = const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
+
+/// Process-wide fallback for VPI callers that execute on a different thread
+/// than the one that installed `ACTIVE_SIMULATOR` in TLS.
+static GLOBAL_ACTIVE_SIMULATOR: std::sync::atomic::AtomicPtr<Simulator> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 /// What a `vpiHandle` points at. `vpiHandle` is `void *` to C, so this is
 /// entirely private; every entry point checks `kind` before using the
@@ -52351,7 +52430,10 @@ fn try_active_sim<F, R>(who: &str, f: F) -> Option<R>
 where
     F: FnOnce(&mut Simulator) -> R,
 {
-    let sim_ptr = ACTIVE_SIMULATOR.with(|cell| cell.get());
+    let mut sim_ptr = ACTIVE_SIMULATOR.with(|cell| cell.get());
+    if sim_ptr.is_null() {
+        sim_ptr = GLOBAL_ACTIVE_SIMULATOR.load(std::sync::atomic::Ordering::Acquire);
+    }
     if sim_ptr.is_null() {
         eprintln!("[VPI] {}: no active simulator (call from outside a DPI context)", who);
         return None;
@@ -52365,7 +52447,10 @@ fn with_active_sim<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Simulator) -> R,
 {
-    let sim_ptr = ACTIVE_SIMULATOR.with(|cell| cell.get());
+    let mut sim_ptr = ACTIVE_SIMULATOR.with(|cell| cell.get());
+    if sim_ptr.is_null() {
+        sim_ptr = GLOBAL_ACTIVE_SIMULATOR.load(std::sync::atomic::Ordering::Acquire);
+    }
     if sim_ptr.is_null() {
         panic!("[VPI] No active simulator - VPI call outside DPI context?");
     }
@@ -53394,6 +53479,7 @@ fn dispatch_vpi_cb(
     cb: &DpiCbHandle,
     reason: libc::c_int,
 ) {
+    let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
     ACTIVE_SIMULATOR.with(|cell| cell.set(sim_ptr));
 
     let mut value = s_vpi_value {
@@ -53428,6 +53514,7 @@ fn dispatch_vpi_cb(
     type CbFn = extern "C" fn(*mut s_cb_data);
     let cb_fn: CbFn = unsafe { std::mem::transmute(cb.cb_routine as *const ()) };
     cb_fn(&cb_data as *const s_cb_data as *mut s_cb_data);
+    ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
 }
 
 /// Write a signal value via VPI (supports force/release).
@@ -53620,6 +53707,30 @@ pub extern "C" fn vpi_put_value(
     .unwrap_or(std::ptr::null_mut())
 }
 
+/// Read the current simulation time.
+///
+/// `object` is accepted for IEEE compatibility and currently ignored.
+/// `time_p->type` chooses the requested representation:
+/// - `vpiSimTime`: fill `high`/`low` and also mirror into `real`
+/// - `vpiScaledRealTime`: fill `real` and also mirror into `high`/`low`
+#[no_mangle]
+pub extern "C" fn vpi_get_time(_object: *mut libc::c_void, time_p: *mut s_vpi_time) {
+    if time_p.is_null() {
+        return;
+    }
+
+    let now = try_active_sim("vpi_get_time", |sim| sim.time).unwrap_or(0);
+    let tp = unsafe { &mut *time_p };
+    match tp.type_ {
+        vpi::SCALED_REAL_TIME | vpi::SIM_TIME | vpi::SUPPRESS_TIME => {}
+        _ => tp.type_ = vpi::SIM_TIME,
+    }
+
+    tp.high = (now >> 32) as u32;
+    tp.low = (now & 0xFFFF_FFFF) as u32;
+    tp.real = now as f64;
+}
+
 // ============================================================================
 // UVM VPI/DPI surface
 // ============================================================================
@@ -53676,8 +53787,9 @@ pub extern "C" fn vpi_release_handle(handle: *mut libc::c_void) -> libc::c_int {
 // --- vpi_register_cb ---------------------------------------------------------
 //
 // Registers a VPI callback. The minimum UVM-1.2/1800.2-2017 surface
-// accepts `cbValueChange` (6) and `cbStartOfReset` (15). Other reasons
-// are recorded but never fired.
+// accepts `cbValueChange` (1), `cbNextSimTime` (8),
+// `cbStartOfSimulation` (11), `cbEndOfSimulation` (12), and
+// `cbStartOfReset` (19). Other reasons are rejected.
 //
 // Returns a non-null opaque handle on success, null on failure. The
 // returned handle must be freed by `vpi_remove_cb` (which is itself
@@ -53714,7 +53826,12 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
 
     // Reject a reason we will never dispatch rather than handing back a
     // handle that quietly never fires.
-    if reason != vpi::CB_VALUE_CHANGE && reason != vpi::CB_START_OF_RESET {
+    if reason != vpi::CB_VALUE_CHANGE
+        && reason != vpi::CB_NEXT_SIM_TIME
+        && reason != vpi::CB_START_OF_RESET
+        && reason != vpi::CB_START_OF_SIMULATION
+        && reason != vpi::CB_END_OF_SIMULATION
+    {
         vpi_error(vpi::ERROR, format!("vpi_register_cb: unsupported reason {} (not registered)", reason));
         return std::ptr::null_mut();
     }
@@ -53740,7 +53857,11 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
                     .or_default()
                     .push(unsafe { *handle });
             }
-            _ => sim.dpi_reset_cbs.push(unsafe { *handle }),
+            vpi::CB_NEXT_SIM_TIME => sim.dpi_next_time_cbs.push((unsafe { *handle }, sim.time)),
+            vpi::CB_START_OF_RESET => sim.dpi_reset_cbs.push(unsafe { *handle }),
+            vpi::CB_START_OF_SIMULATION => sim.dpi_start_sim_cbs.push(unsafe { *handle }),
+            vpi::CB_END_OF_SIMULATION => sim.dpi_end_sim_cbs.push(unsafe { *handle }),
+            _ => {}
         }
         true
     })
@@ -53752,6 +53873,52 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
     }
 
     handle as *mut libc::c_void
+}
+
+// --- vpi_get_cb_info --------------------------------------------------------
+//
+// Returns callback registration information for a handle returned by
+// `vpi_register_cb`. Mirrors the fields xezim stores internally.
+#[no_mangle]
+pub extern "C" fn vpi_get_cb_info(cb_obj: *mut libc::c_void, cb_data_p: *mut s_cb_data) -> libc::c_int {
+    if cb_obj.is_null() || cb_data_p.is_null() {
+        return 0;
+    }
+
+    let cb = unsafe { &*(cb_obj as *const DpiCbHandle) };
+    let out = unsafe { &mut *cb_data_p };
+
+    out.reason = cb.cb_type;
+    out.cb_rtn = cb.cb_routine as *mut libc::c_void;
+    out.obj = cb.obj as *mut libc::c_void;
+    out.index = 0;
+    out.user_data = cb.user_data as *mut libc::c_void;
+
+    if cb.cb_type == vpi::CB_VALUE_CHANGE {
+        let vp = VPI_CB_INFO_VALUE_SCRATCH.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            slot.format = cb.value_format;
+            slot.value = s_vpi_value_union { integer: 0 };
+            cell.as_ptr()
+        });
+        let tp = VPI_CB_INFO_TIME_SCRATCH.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            *slot = s_vpi_time {
+                type_: vpi::SUPPRESS_TIME,
+                high: 0,
+                low: 0,
+                real: 0.0,
+            };
+            cell.as_ptr()
+        });
+        out.value = vp;
+        out.time = tp;
+    } else {
+        out.value = std::ptr::null_mut();
+        out.time = std::ptr::null_mut();
+    }
+
+    1
 }
 
 // --- vpi_remove_cb -----------------------------------------------------------
@@ -53782,6 +53949,16 @@ pub extern "C" fn vpi_remove_cb(cb: *mut libc::c_void) -> libc::c_int {
                     rc = 1;
                 }
             }
+            vpi::CB_NEXT_SIM_TIME => {
+                let before = sim.dpi_next_time_cbs.len();
+                sim.dpi_next_time_cbs.retain(|(cb, _)| {
+                    cb.cb_routine != removed.cb_routine
+                        || cb.user_data != removed.user_data
+                });
+                if sim.dpi_next_time_cbs.len() != before {
+                    rc = 1;
+                }
+            }
             vpi::CB_START_OF_RESET => {
                 let before = sim.dpi_reset_cbs.len();
                 sim.dpi_reset_cbs.retain(|cb| {
@@ -53789,6 +53966,26 @@ pub extern "C" fn vpi_remove_cb(cb: *mut libc::c_void) -> libc::c_int {
                         || cb.user_data != removed.user_data
                 });
                 if sim.dpi_reset_cbs.len() != before {
+                    rc = 1;
+                }
+            }
+            vpi::CB_START_OF_SIMULATION => {
+                let before = sim.dpi_start_sim_cbs.len();
+                sim.dpi_start_sim_cbs.retain(|cb| {
+                    cb.cb_routine != removed.cb_routine
+                        || cb.user_data != removed.user_data
+                });
+                if sim.dpi_start_sim_cbs.len() != before {
+                    rc = 1;
+                }
+            }
+            vpi::CB_END_OF_SIMULATION => {
+                let before = sim.dpi_end_sim_cbs.len();
+                sim.dpi_end_sim_cbs.retain(|cb| {
+                    cb.cb_routine != removed.cb_routine
+                        || cb.user_data != removed.user_data
+                });
+                if sim.dpi_end_sim_cbs.len() != before {
                     rc = 1;
                 }
             }

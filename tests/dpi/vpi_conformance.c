@@ -17,10 +17,13 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 #include "vpi_user.h"
 #include "svdpi.h"
 
 static int errors = 0;
+static vpiHandle g_start_sim_h = NULL;
+static vpiHandle g_end_sim_h = NULL;
 
 #define CHECK(cond, msg)                                                   \
     do {                                                                   \
@@ -242,6 +245,130 @@ int vc_vlog_info(void) {
     CHECK(rc == 1, "vpi_get_vlog_info returns 1");
     CHECK(info.product && strcmp(info.product, "xezim") == 0, "product is xezim");
     printf("VLOG_VERSION: %s\n", info.version ? info.version : "(null)");
+    return 0;
+}
+
+/* --- 6. vpi_get_time reports current simulation time ----------------- */
+int vc_get_time(int expect_tick) {
+    s_vpi_time t;
+    memset(&t, 0, sizeof t);
+
+    t.type = vpiSimTime;
+    vpi_get_time(NULL, &t);
+    {
+        uint64_t got = ((uint64_t)t.high << 32) | (uint64_t)t.low;
+        CHECK(got == (uint64_t)expect_tick, "vpi_get_time(vpiSimTime)");
+    }
+
+    t.type = vpiScaledRealTime;
+    t.high = 0;
+    t.low = 0;
+    t.real = -1.0;
+    vpi_get_time(NULL, &t);
+    CHECK(t.type == vpiScaledRealTime, "vpi_get_time preserves vpiScaledRealTime type");
+    CHECK(t.real == (double)expect_tick, "vpi_get_time(vpiScaledRealTime)");
+
+    return 0;
+}
+
+/* --- 7. vpi_get_cb_info reports callback registration data ----------- */
+static PLI_INT32 vc_info_cb(p_cb_data cb_data_p) {
+    (void)cb_data_p;
+    return 0;
+}
+
+static PLI_INT32 vc_start_sim_cb(p_cb_data cb_data_p) {
+    (void)cb_data_p;
+    return 0;
+}
+
+static PLI_INT32 vc_end_sim_cb(p_cb_data cb_data_p) {
+    (void)cb_data_p;
+    return 0;
+}
+
+int vc_get_cb_info(void) {
+    vpiHandle h = vpi_handle_by_name("tb.sig32", NULL);
+    CHECK(h != NULL, "vpi_get_cb_info setup handle");
+    if (h == NULL) {
+        return 0;
+    }
+
+    int cookie = 0x51A7;
+    s_vpi_value value;
+    memset(&value, 0, sizeof value);
+    value.format = vpiHexStrVal;
+
+    s_cb_data cb;
+    memset(&cb, 0, sizeof cb);
+    cb.reason = cbValueChange;
+    cb.cb_rtn = vc_info_cb;
+    cb.obj = h;
+    cb.value = &value;
+    cb.user_data = (PLI_BYTE8 *)&cookie;
+
+    vpiHandle cbh = vpi_register_cb(&cb);
+    CHECK(cbh != NULL, "vpi_register_cb for vpi_get_cb_info");
+    if (cbh == NULL) {
+        vpi_free_object(h);
+        return 0;
+    }
+
+    s_cb_data out;
+    memset(&out, 0, sizeof out);
+    CHECK(vpi_get_cb_info(cbh, &out) == 1, "vpi_get_cb_info returns 1");
+    CHECK(out.reason == cbValueChange, "vpi_get_cb_info reason");
+    CHECK(out.cb_rtn == vc_info_cb, "vpi_get_cb_info cb_rtn");
+    CHECK(out.obj == h, "vpi_get_cb_info obj");
+    CHECK(out.user_data == (PLI_BYTE8 *)&cookie, "vpi_get_cb_info user_data");
+    CHECK(out.value != NULL && out.value->format == vpiHexStrVal,
+          "vpi_get_cb_info value format");
+
+    CHECK(vpi_remove_cb(cbh) == 1, "vpi_remove_cb after vpi_get_cb_info");
+    vpi_free_object(h);
+    return 0;
+}
+
+int vc_register_sim_phase_cbs(void) {
+    s_cb_data cb;
+    memset(&cb, 0, sizeof cb);
+
+    cb.reason = cbStartOfSimulation;
+    cb.cb_rtn = vc_start_sim_cb;
+    g_start_sim_h = vpi_register_cb(&cb);
+    CHECK(g_start_sim_h != NULL, "register cbStartOfSimulation");
+
+    cb.reason = cbEndOfSimulation;
+    cb.cb_rtn = vc_end_sim_cb;
+    g_end_sim_h = vpi_register_cb(&cb);
+    CHECK(g_end_sim_h != NULL, "register cbEndOfSimulation");
+
+    return 0;
+}
+
+int vc_check_sim_phase_cb_info(void) {
+    s_cb_data out;
+    memset(&out, 0, sizeof out);
+
+    CHECK(g_start_sim_h != NULL, "cbStartOfSimulation handle available");
+    if (g_start_sim_h != NULL) {
+        CHECK(vpi_get_cb_info(g_start_sim_h, &out) == 1, "get_cb_info start-sim");
+        CHECK(out.reason == cbStartOfSimulation, "start-sim reason");
+        CHECK(out.cb_rtn == vc_start_sim_cb, "start-sim cb_rtn");
+        CHECK(vpi_remove_cb(g_start_sim_h) == 1, "remove start-sim callback");
+        g_start_sim_h = NULL;
+    }
+
+    memset(&out, 0, sizeof out);
+    CHECK(g_end_sim_h != NULL, "cbEndOfSimulation handle available");
+    if (g_end_sim_h != NULL) {
+        CHECK(vpi_get_cb_info(g_end_sim_h, &out) == 1, "get_cb_info end-sim");
+        CHECK(out.reason == cbEndOfSimulation, "end-sim reason");
+        CHECK(out.cb_rtn == vc_end_sim_cb, "end-sim cb_rtn");
+        CHECK(vpi_remove_cb(g_end_sim_h) == 1, "remove end-sim callback");
+        g_end_sim_h = NULL;
+    }
+
     return 0;
 }
 
