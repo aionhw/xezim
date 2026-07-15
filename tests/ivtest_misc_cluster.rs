@@ -122,3 +122,50 @@ endprogram
 "#
     ));
 }
+
+// ---------------------------------------------------------------------------
+// §12.7/§6.21: a for-loop-declared variable is automatic and shadows a
+// same-named outer signal (it must not clobber it or borrow its width).
+// Covers sv_for_variable.
+// ---------------------------------------------------------------------------
+#[test]
+fn for_loop_local_var_shadows_outer() {
+    assert!(passes(
+        r#"
+program main;
+  int sum;
+  logic idx;               // outer, 1-bit
+  initial begin
+    sum = 0;
+    idx = 1'bx;
+    for (int idx = 0; idx < 8; idx += 1) sum += idx;   // local int idx
+    if (sum != 28) begin $display("FAILED sum=%0d", sum); $finish; end
+    if (idx !== 1'bx) begin $display("FAILED outer idx=%b", idx); $finish; end
+    $display("PASSED");
+  end
+endprogram
+"#
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// §6.12.2: an integral actual bound to a `real` formal converts to floating
+// point so real arithmetic in the body is done in the real domain.
+// ---------------------------------------------------------------------------
+#[test]
+fn real_formal_converts_integral_actual() {
+    assert!(passes(
+        r#"
+module t;
+  function real div2(input real x);
+    x /= 2;
+    return x;
+  endfunction
+  initial begin
+    if (div2(5) == 2.5) $display("PASSED");
+    else $display("FAILED got %0f", div2(5));
+  end
+endmodule
+"#
+    ));
+}

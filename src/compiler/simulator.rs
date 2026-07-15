@@ -28083,6 +28083,24 @@ impl Simulator {
                 step,
                 body,
             } => {
+                // §12.7 / §6.21: a for-loop-declared variable is automatic and
+                // scoped to the loop — it must SHADOW any same-named outer
+                // signal, not clobber it. Without a local frame the loop var
+                // would land on the outer signal (wrong width + destroyed
+                // value: `logic idx` outer vs `for (int idx...)` spun forever on
+                // a 1-bit counter). Push a throwaway frame so the loop var gets
+                // its own declared-width storage; pop it at the arm's end.
+                let shadow_frame = self.local_stack.last().is_none()
+                    && init.iter().any(|fi| match fi {
+                        ForInit::VarDecl { name, .. } => {
+                            self.signal_name_to_id.contains_key(name.name.as_str())
+                                || self.signals.contains_key(&name.name)
+                        }
+                        _ => false,
+                    });
+                if shadow_frame {
+                    self.local_stack.push(HashMap::default());
+                }
                 // Init-declared loop vars are automatic. When the process has no
                 // local frame they land in the signal table; record them so a
                 // `fork` in the body captures the per-iteration value by value
@@ -28203,6 +28221,9 @@ impl Simulator {
                 }
                 for _ in 0..auto_pushed {
                     self.auto_loop_vars.pop();
+                }
+                if shadow_frame {
+                    self.local_stack.pop();
                 }
             }
             StatementKind::Foreach { array, vars, body } => {
@@ -44723,6 +44744,11 @@ impl Simulator {
                     &port.data_type,
                     &self.module.typedef_types,
                 );
+            } else if super::elaborate::is_type_real(&port.data_type) && !val.is_real {
+                // §6.12.2: an integral actual bound to a `real`/`shortreal`
+                // formal converts to floating point, so later real arithmetic
+                // in the body (e.g. `x /= 2`) is done in the real domain.
+                val = Value::from_f64(val.to_f64());
             }
             locals.insert(port.name.name.clone(), val);
         }
