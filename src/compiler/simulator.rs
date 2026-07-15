@@ -2506,6 +2506,18 @@ pub struct Simulator {
     /// Every subsequent settle call at time=0 can skip the re-seed; the
     /// worklist and dirty propagation already keep things moving.
     comb_time0_fired: bool,
+    /// §9.2.2.2: always_comb blocks with an EMPTY inferred sensitivity list
+    /// (no inputs, e.g. `always_comb y = 1'b0;`). The LRM says these trigger
+    /// exactly once at time zero, AFTER all initial/always procedures have
+    /// STARTED (run to their first delay). Firing them in the pre-initial
+    /// settle would let an initial block read the output as already-settled;
+    /// Icarus (and the standard) has that same-time pre-delay read return X.
+    /// So we hold these out of the normal time-0 settle and fire them once at
+    /// the END of the time-0 active region (see run_one_tick). Cloned entries,
+    /// evaluated directly.
+    comb_time0_deferred: Vec<CombEntry>,
+    /// Latches once the deferred empty-sensitivity always_comb blocks fired.
+    comb_time0_deferred_done: bool,
     /// Reverse index: signal_id → list of comb_entry indices that read
     /// this signal. CSR layout — `comb_dep_entries[comb_dep_offsets[id]
     /// .. comb_dep_offsets[id+1]]` gives the dependents of signal `id`.
@@ -3954,6 +3966,8 @@ impl Simulator {
             comb_unresolved_idx: Vec::new(),
             comb_time0_idx: Vec::new(),
             comb_time0_fired: false,
+            comb_time0_deferred: Vec::new(),
+            comb_time0_deferred_done: false,
             comb_dep_offsets: Vec::new(),
             comb_dep_entries: Vec::new(),
             dirty_signals: vec![false; num_signals],
@@ -13201,12 +13215,40 @@ impl Simulator {
                         ..
                     }
                 );
+                // §9.2.2.2: an always_comb with an EMPTY inferred sensitivity
+                // list (no inputs) is held out of the pre-initial settle and
+                // fired at the end of the time-0 active region instead (see
+                // `comb_time0_deferred`). always_comb blocks WITH inputs still
+                // settle at time 0 via normal dirty propagation, so excluding
+                // the empty ones here changes nothing for them.
+                if always_comb && e.read_signal_ids.is_empty() {
+                    return None;
+                }
                 if e.read_signal_ids.is_empty() || always_comb {
                     Some(i)
                 } else {
                     None
                 }
             })
+            .collect();
+        // Clone the empty-sensitivity always_comb entries into the deferred
+        // list; they fire once at the end of time-0's active region.
+        self.comb_time0_deferred = entries
+            .iter()
+            .filter(|e| {
+                let always_comb = matches!(
+                    &e.item,
+                    CombItem::AlwaysBlock {
+                        is_always_comb: true,
+                        ..
+                    } | CombItem::CompiledAlwaysBlock {
+                        is_always_comb: true,
+                        ..
+                    }
+                );
+                always_comb && e.read_signal_ids.is_empty()
+            })
+            .cloned()
             .collect();
         self.comb_entries = entries;
         // Drop AST storage for items we've consumed into comb_entries.
@@ -13487,6 +13529,37 @@ impl Simulator {
     }
 
     /// Collect all signal names read by an expression.
+    /// §9.2.2.2: pull the variable reads out of a called function's body so
+    /// they contribute to an always_comb/always_latch inferred sensitivity
+    /// list. Function locals/ports resolve to nothing at the signal table and
+    /// are harmlessly dropped later; only module-level references (the hidden
+    /// dependencies) survive. A thread-local active-set breaks (mutual)
+    /// recursion so recursive functions don't loop forever here.
+    fn collect_function_reads(
+        name: &str,
+        module: &ElaboratedModule,
+        reads: &mut HashSet<String>,
+    ) {
+        thread_local! {
+            static ACTIVE: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
+        }
+        let fdecl = match module.functions.get(name) {
+            Some(f) => f,
+            None => return,
+        };
+        let entered = ACTIVE.with(|a| a.borrow_mut().insert(name.to_string()));
+        if !entered {
+            return;
+        }
+        let mut scratch_writes: HashSet<String> = HashSet::default();
+        for item in &fdecl.items {
+            Self::collect_stmt_reads(item, module, reads, &mut scratch_writes);
+        }
+        ACTIVE.with(|a| {
+            a.borrow_mut().remove(name);
+        });
+    }
+
     fn collect_expr_reads(
         expr: &Expression,
         module: &ElaboratedModule,
@@ -13562,6 +13635,17 @@ impl Simulator {
                 Self::collect_expr_reads(func, module, reads);
                 for a in args {
                     Self::collect_expr_reads(a, module, reads);
+                }
+                // IEEE 1800-2017 §9.2.2.2: an always_comb (and always_latch)
+                // is sensitive to EVERY variable read in its evaluation,
+                // INCLUDING variables read inside a function it calls. Recurse
+                // into the callee body so module vars referenced only inside
+                // the function (e.g. `hidden`) join the inferred sensitivity
+                // list; without this the block never re-fires when they change.
+                if let ExprKind::Ident(hier) = &func.kind {
+                    if let Some(seg) = hier.path.last() {
+                        Self::collect_function_reads(&seg.name.name, module, reads);
+                    }
                 }
             }
             ExprKind::SystemCall { args, .. } => {
@@ -14426,6 +14510,25 @@ impl Simulator {
             }
         }
         accum.t_process += _t.elapsed().as_nanos() as u64;
+
+        // IEEE 1800-2017 §9.2.2.2: an always_comb with an empty inferred
+        // sensitivity list triggers exactly once at time zero, AFTER all
+        // initial/always procedures have started (run to their first delay).
+        // We deferred these out of the pre-initial settle; fire them now — at
+        // the end of the time-0 active region, once the initial blocks above
+        // have run and suspended — so a same-time pre-delay read of the output
+        // still observes X (matches Icarus).
+        if self.time == 0
+            && !self.comb_time0_deferred_done
+            && !self.comb_time0_deferred.is_empty()
+        {
+            self.comb_time0_deferred_done = true;
+            let deferred = std::mem::take(&mut self.comb_time0_deferred);
+            for entry in &deferred {
+                self.eval_comb_entry_full(entry);
+            }
+            self.comb_time0_deferred = deferred;
+        }
 
         let _t = std::time::Instant::now();
         if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() {
