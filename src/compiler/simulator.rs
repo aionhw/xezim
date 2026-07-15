@@ -8045,7 +8045,13 @@ impl Simulator {
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 // LRM §9.3.1: skip if the destination is forced
                 if !self.forced_signals.contains_key(dst_id) {
-                    let (sv, sx) = view[*src_id].raw_bits();
+                    let (mut sv, mut sx) = view[*src_id].raw_bits();
+                    // §6.11.1/§10.7: a 2-state destination drops X/Z on every
+                    // write (X/Z -> 0). The raw-bit copy would otherwise keep it.
+                    if sx != 0 && self.signal_two_state.get(*dst_id).copied().unwrap_or(false) {
+                        sv &= !sx;
+                        sx = 0;
+                    }
                     let (dv, dx) = view[*dst_id].raw_bits();
                     if (sv != dv || sx != dx) && view[*dst_id].set_inline_bits(sv, sx) {
                         dirtied.push(*dst_id as u32);
@@ -8061,7 +8067,9 @@ impl Simulator {
                     // Inline raw-bit copy only when src and dst widths match;
                     // set_inline_bits does not mask, so narrowing must go through
                     // the resize branch below (pr2224949).
-                    if *width <= 64 && dst_w == *width && self.signal_widths[*src_id] == *width {
+                    if *width <= 64 && dst_w == *width && self.signal_widths[*src_id] == *width
+                        && !self.signal_two_state.get(*dst_id).copied().unwrap_or(false)
+                    {
                         let (sv, sx) = view[*src_id].raw_bits();
                         let (dv, dx) = view[*dst_id].raw_bits();
                         if sv == dv && sx == dx {
@@ -8129,6 +8137,7 @@ impl Simulator {
         item: &CombItem,
         signal_widths: &[u32],
         signal_signed: &[bool],
+        signal_two_state: &[bool],
         signal_name_to_id: &HashMap<Arc<str>, usize>,
         array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
         view: &mut [Value],
@@ -8138,7 +8147,12 @@ impl Simulator {
         match item {
             CombItem::Noop => true,
             CombItem::FastDirectCopy { dst_id, src_id } => {
-                let (sv, sx) = view[*src_id].raw_bits();
+                let (mut sv, mut sx) = view[*src_id].raw_bits();
+                // §6.11.1/§10.7: a 2-state destination drops X/Z (X/Z -> 0).
+                if sx != 0 && signal_two_state.get(*dst_id).copied().unwrap_or(false) {
+                    sv &= !sx;
+                    sx = 0;
+                }
                 let (dv, dx) = view[*dst_id].raw_bits();
                 if (sv != dv || sx != dx) && view[*dst_id].set_inline_bits(sv, sx) {
                     dirtied.push(*dst_id as u32);
@@ -8147,11 +8161,14 @@ impl Simulator {
             }
             CombItem::DirectCopy { dst_id, src_id, width } => {
                 let dst_w = signal_widths[*dst_id];
+                let dst_two_state = signal_two_state.get(*dst_id).copied().unwrap_or(false);
                 let mut handled = false;
                 // Inline raw-bit copy only when src and dst widths match;
                 // set_inline_bits does not mask, so narrowing must go through
                 // the resize branch below (pr2224949).
-                if *width <= 64 && dst_w == *width && signal_widths[*src_id] == *width {
+                if *width <= 64 && dst_w == *width && signal_widths[*src_id] == *width
+                    && !dst_two_state
+                {
                     let (sv, sx) = view[*src_id].raw_bits();
                     let (dv, dx) = view[*dst_id].raw_bits();
                     if sv == dv && sx == dx {
@@ -8163,11 +8180,14 @@ impl Simulator {
                 }
                 if !handled {
                     let src_val = view[*src_id].clone();
-                    let resized = if src_val.width != *width {
+                    let mut resized = if src_val.width != *width {
                         src_val.resize(*width)
                     } else {
                         src_val
                     };
+                    if dst_two_state {
+                        resized = resized.to_two_state();
+                    }
                     if view[*dst_id] != resized {
                         view[*dst_id] = resized;
                         dirtied.push(*dst_id as u32);
@@ -9115,6 +9135,7 @@ impl Simulator {
             dep_entries: self.comb_dep_entries.clone(),
             signal_widths: self.signal_widths.clone(),
             signal_signed: self.signal_signed.clone(),
+            signal_two_state: self.signal_two_state.clone(),
             signal_name_to_id: self.signal_name_to_id.clone(),
             array_first_id: self.array_first_id.clone(),
         }
@@ -19588,6 +19609,7 @@ impl Simulator {
                         let view_len = view.len();
                         let widths: &[u32] = &self.signal_widths;
                         let signed: &[bool] = &self.signal_signed;
+                        let two_state: &[bool] = &self.signal_two_state;
                         let n2id = &self.signal_name_to_id;
                         let afi = &self.array_first_id;
                         // comb_entries' AST variants hold Cell/OnceCell (not
@@ -19630,6 +19652,7 @@ impl Simulator {
                                             &entries[eidx].item,
                                             widths,
                                             signed,
+                                            two_state,
                                             n2id,
                                             afi,
                                             v,
@@ -20286,7 +20309,16 @@ impl Simulator {
                     CombItem::FastDirectCopy { dst_id, src_id } => {
                         // LRM §9.3.1: skip if the destination is forced
                         if !self.forced_signals.contains_key(dst_id) {
-                            let (sv, sx) = self.signal_table[*src_id].raw_bits();
+                            let (mut sv, mut sx) = self.signal_table[*src_id].raw_bits();
+                            // §6.11.1/§10.7: a 2-state destination drops X/Z
+                            // (X/Z -> 0) on every write; the raw-bit copy would
+                            // otherwise keep it (e.g. an X-at-time-0 4-state driver).
+                            if sx != 0
+                                && self.signal_two_state.get(*dst_id).copied().unwrap_or(false)
+                            {
+                                sv &= !sx;
+                                sx = 0;
+                            }
                             let (dv, dx) = self.signal_table[*dst_id].raw_bits();
                             if (sv != dv || sx != dx)
                                 && self.signal_table[*dst_id].set_inline_bits(sv, sx)
@@ -22547,6 +22579,33 @@ impl Simulator {
                         .or_else(|| self.event_triggered_time.get(&resolved).copied())
                         .map_or(false, |t| t == self.time);
                     return if fired { Value::ones(1) } else { Value::zero(1) };
+                }
+                // §6.19.6: enum methods written WITHOUT parentheses parse as a
+                // hierarchical Ident, e.g. `color1.num` -> path=[color1, num].
+                // Route to the enum-method evaluator when the prefix is an
+                // enum-typed variable (guarded so a real hier signal whose leaf
+                // happens to be one of these names is unaffected).
+                if hier.path.len() >= 2
+                    && hier.path.last().map(|s| s.selects.is_empty()).unwrap_or(false)
+                {
+                    let mname = hier.path.last().unwrap().name.name.clone();
+                    if matches!(mname.as_str(), "num" | "first" | "last" | "next" | "prev") {
+                        let mut head = hier.clone();
+                        head.path.pop();
+                        if head.path.last().map(|s| s.selects.is_empty()).unwrap_or(false) {
+                            let bare = head.path.last().unwrap().name.name.clone();
+                            let is_enum_var = self
+                                .type_name_of_var(&bare)
+                                .map(|tn| self.module.enum_members.contains_key(&tn))
+                                .unwrap_or(false)
+                                || self.module.enum_members.contains_key(&bare);
+                            if is_enum_var {
+                                if let Some(v) = self.eval_builtin_method(&bare, &mname, &[]) {
+                                    return v;
+                                }
+                            }
+                        }
+                    }
                 }
                 if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
                     let name = &hier.path[0].name.name;
@@ -40487,8 +40546,15 @@ impl Simulator {
                 .signal_name_to_id
                 .get(obj_name)
                 .and_then(|id| self.signal_type_names.get(id).cloned());
-            if let Some(tn) = tn_opt {
-                if let Some(members) = self.module.enum_members.get(&tn).cloned() {
+            // Anonymous `enum {...} v;` variables have no typedef name, so the
+            // member list is keyed by the variable name itself (§6.19.6).
+            let members_opt = tn_opt
+                .as_ref()
+                .and_then(|tn| self.module.enum_members.get(tn))
+                .or_else(|| self.module.enum_members.get(obj_name))
+                .cloned();
+            {
+                if let Some(members) = members_opt {
                     if members.is_empty() { return Some(Value::zero(32)); }
                     // All enum members share the typedef's base width.
                     let mw = self.signal_name_to_id.get(members[0].0.as_str())
@@ -52417,6 +52483,7 @@ pub struct CombSettleCtx {
     pub dep_entries: Vec<u32>,
     pub signal_widths: Vec<u32>,
     pub signal_signed: Vec<bool>,
+    pub signal_two_state: Vec<bool>,
     pub signal_name_to_id: HashMap<Arc<str>, usize>,
     pub array_first_id: HashMap<Arc<str>, (usize, i64, i64)>,
 }
@@ -52443,7 +52510,12 @@ impl CombSettleCtx {
         match &self.items[eidx] {
             SendCombItem::Noop => true,
             SendCombItem::FastDirectCopy { dst_id, src_id } => {
-                let (sv, sx) = view[*src_id].raw_bits();
+                let (mut sv, mut sx) = view[*src_id].raw_bits();
+                // §6.11.1/§10.7: a 2-state destination drops X/Z (X/Z -> 0).
+                if sx != 0 && self.signal_two_state.get(*dst_id).copied().unwrap_or(false) {
+                    sv &= !sx;
+                    sx = 0;
+                }
                 let (dv, dx) = view[*dst_id].raw_bits();
                 if (sv != dv || sx != dx) && view[*dst_id].set_inline_bits(sv, sx) {
                     dirtied.push(*dst_id as u32);
@@ -52452,11 +52524,15 @@ impl CombSettleCtx {
             }
             SendCombItem::DirectCopy { dst_id, src_id, width } => {
                 let dst_w = self.signal_widths[*dst_id];
+                let dst_two_state =
+                    self.signal_two_state.get(*dst_id).copied().unwrap_or(false);
                 let mut handled = false;
                 // Inline raw-bit copy only when src and dst widths match;
                 // set_inline_bits does not mask, so narrowing must go through
                 // the resize branch below (pr2224949).
-                if *width <= 64 && dst_w == *width && self.signal_widths[*src_id] == *width {
+                if *width <= 64 && dst_w == *width && self.signal_widths[*src_id] == *width
+                    && !dst_two_state
+                {
                     let (sv, sx) = view[*src_id].raw_bits();
                     let (dv, dx) = view[*dst_id].raw_bits();
                     if sv == dv && sx == dx {
@@ -52468,11 +52544,14 @@ impl CombSettleCtx {
                 }
                 if !handled {
                     let src_val = view[*src_id].clone();
-                    let resized = if src_val.width != *width {
+                    let mut resized = if src_val.width != *width {
                         src_val.resize(*width)
                     } else {
                         src_val
                     };
+                    if dst_two_state {
+                        resized = resized.to_two_state();
+                    }
                     if view[*dst_id] != resized {
                         view[*dst_id] = resized;
                         dirtied.push(*dst_id as u32);
