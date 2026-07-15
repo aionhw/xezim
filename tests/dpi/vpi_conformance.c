@@ -133,6 +133,19 @@ int vc_get_value(void) {
     vpi_get_value(h, &v);
     CHECK(v.value.scalar == vpi1, "vpiScalarVal");
     vpi_free_object(h);
+
+    /* vpiTimeVal (clause 37): the s_vpi_time record must describe the VALUE
+     * being read, not the simulation clock. tb.t42 holds 42 and is read at
+     * sim time 1; high/low AND .real must all report 42. The old code set
+     * .real = current_time, so it read back 1 — a self-inconsistent record. */
+    h = vpi_handle_by_name("tb.t42", NULL);
+    v.format = vpiTimeVal;
+    vpi_get_value(h, &v);
+    CHECK(v.format == vpiTimeVal, "vpiTimeVal is supported");
+    CHECK(v.value.time->low == 42u, "vpiTimeVal low word is the value (42)");
+    CHECK(v.value.time->high == 0u, "vpiTimeVal high word is 0");
+    CHECK(v.value.time->real == 42.0, "vpiTimeVal .real describes the value, not the clock");
+    vpi_free_object(h);
     return 0;
 }
 

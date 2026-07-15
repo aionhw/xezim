@@ -7,6 +7,7 @@ module tb;
   bit   [127:0] wide;
   logic [7:0]   xz;
   logic         one_bit;
+  time          t42;      // read via vpiTimeVal; holds 42, read at t=1
 
   // vpi_get(vpiType) must answer from the DECLARATION, so one signal of
   // each declared type.
@@ -41,6 +42,7 @@ module tb;
     wide    = 128'h11223344_55667788_99AABBCC_DDEEFF00;
     xz      = 8'b1010_xzxz;
     one_bit = 1'b1;
+    t42     = 42;
     w64     = 64'h0;
     an_int  = 0;
     a_long  = 0;

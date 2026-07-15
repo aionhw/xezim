@@ -50,8 +50,10 @@ module test_format_specs;
 
     // ---- explicit field width on hex ----
     s = $sformatf("%4h", 16'h0F);         check(s, "000f", "%4h");
-    // width smaller than minimum-natural: keeps minimum (strip then zero-pad)
-    s = $sformatf("%2h", 32'hFF);         check(s, "ff", "%2h == minimum");
+    // Field width below the natural (full-vector) width keeps the natural
+    // form — Icarus `%2h` of 32'hFF is "000000ff", NOT "ff". Only bare
+    // `%0h` trims to the minimum; an explicit width never truncates.
+    s = $sformatf("%2h", 32'hFF);         check(s, "000000ff", "%2h < natural width keeps full form");
 
     // ---- decimal: %0d == %d (no full-width default) ----
     s = $sformatf("%d", 32'd255);         check(s, "       255", "%d default");

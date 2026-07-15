@@ -30625,8 +30625,7 @@ impl Simulator {
                                     'b' | 'B' => {
                                         let full = v.to_bin_string();
                                         if has_width {
-                                            let core = Self::trim_radix_zeros(&full);
-                                            Self::push_radix(&mut result, &core, pad_width, left_align);
+                                            Self::push_radix(&mut result, &full, pad_width, left_align, zero_pad);
                                         } else {
                                             result.push_str(&full);
                                         }
@@ -30634,8 +30633,7 @@ impl Simulator {
                                     'h' | 'H' | 'x' | 'X' => {
                                         let full = v.to_hex_string();
                                         if has_width {
-                                            let core = Self::trim_radix_zeros(&full);
-                                            Self::push_radix(&mut result, &core, pad_width, left_align);
+                                            Self::push_radix(&mut result, &full, pad_width, left_align, zero_pad);
                                         } else {
                                             result.push_str(&full);
                                         }
@@ -30645,39 +30643,47 @@ impl Simulator {
                                         // (§21.2.1.3).
                                         let full = Self::bin_to_oct_string(&v.to_bin_string());
                                         if has_width {
-                                            let core = Self::trim_radix_zeros(&full);
-                                            Self::push_radix(&mut result, &core, pad_width, left_align);
+                                            Self::push_radix(&mut result, &full, pad_width, left_align, zero_pad);
                                         } else {
                                             result.push_str(&full);
                                         }
                                     }
                                     'f' | 'F' => {
-                                        let mut core = format!(
-                                            "{:.*}",
-                                            precision.unwrap_or(6),
-                                            v.to_f64()
-                                        );
+                                        let x = v.to_f64();
+                                        let mut core = Self::nonfinite_float(x, spec == 'F')
+                                            .unwrap_or_else(|| {
+                                                format!("{:.*}", precision.unwrap_or(6), x)
+                                            });
                                         if plus_sign && !core.starts_with('-') {
                                             core.insert(0, '+');
                                         }
                                         result.push_str(&field(core, 0));
                                     }
                                     'g' | 'G' => {
-                                        let s = Self::format_g(
-                                            v.to_f64(),
-                                            precision.unwrap_or(6),
-                                            spec == 'G',
-                                        );
+                                        // §21.2.1.2: the `+` flag forces a sign
+                                        // on %g just as it does on %f/%d.
+                                        let x = v.to_f64();
+                                        let mut s = Self::nonfinite_float(x, spec == 'G')
+                                            .unwrap_or_else(|| {
+                                                Self::format_g(x, precision.unwrap_or(6), spec == 'G')
+                                            });
+                                        if plus_sign && !s.starts_with('-') {
+                                            s.insert(0, '+');
+                                        }
                                         result.push_str(&field(s, 0));
                                     }
                                     'e' | 'E' => {
                                         // C-style exponent: `1.0e+02`, two
                                         // exponent digits minimum (§21.2.1.2).
-                                        let core = Self::c_style_exp(
-                                            v.to_f64(),
-                                            precision.unwrap_or(6),
-                                            spec == 'E',
-                                        );
+                                        // The `+` flag forces a leading sign.
+                                        let x = v.to_f64();
+                                        let mut core = Self::nonfinite_float(x, spec == 'E')
+                                            .unwrap_or_else(|| {
+                                                Self::c_style_exp(x, precision.unwrap_or(6), spec == 'E')
+                                            });
+                                        if plus_sign && !core.starts_with('-') {
+                                            core.insert(0, '+');
+                                        }
                                         result.push_str(&field(core, 0));
                                     }
                                     's' | 'S' => {
@@ -37479,6 +37485,28 @@ impl Simulator {
         digits.into_iter().collect()
     }
 
+    /// C-printf spelling of a non-finite float, or `None` when `x` is finite.
+    /// `%f/%e/%g` render `inf`/`nan`; `%F/%E/%G` render `INF`/`NAN`. Only
+    /// negative infinity carries a sign — matching Icarus and the LRM's
+    /// C-printf mapping. (glibc emits `-nan` for `0.0/0.0` because that value
+    /// carries a sign bit; Icarus normalises it to `nan`, which is what we
+    /// reproduce here.) The caller layers on the `+` flag for the positive
+    /// forms, exactly as it does for a finite value.
+    fn nonfinite_float(x: f64, upper: bool) -> Option<String> {
+        if x.is_nan() {
+            Some(if upper { "NAN".to_string() } else { "nan".to_string() })
+        } else if x.is_infinite() {
+            let body = if upper { "INF" } else { "inf" };
+            Some(if x < 0.0 {
+                format!("-{}", body)
+            } else {
+                body.to_string()
+            })
+        } else {
+            None
+        }
+    }
+
     /// C-printf-style scientific notation: `1.0e+02` — sign always present,
     /// at least two exponent digits (Rust's `{:e}` writes `1.0e2`).
     fn c_style_exp(x: f64, prec: usize, upper: bool) -> String {
@@ -37499,19 +37527,38 @@ impl Simulator {
         )
     }
 
-    /// §21.2.1.2 hex/binary/octal: when an explicit width is given, the
-    /// value is stripped to its minimum representation and then padded to
-    /// the field width. Normally zero-padded on the left; a `-` flag
-    /// left-justifies with spaces on the right instead.
-    fn push_radix(result: &mut String, core: &str, width: usize, left_align: bool) {
-        if core.len() >= width {
-            result.push_str(core);
-        } else if left_align {
-            result.push_str(core);
-            result.push_str(&" ".repeat(width - core.len()));
+    /// §21.2.1.2 hex/binary/octal field padding. Icarus (and C) pad a bare
+    /// `%Nh` with SPACES around the natural full-width form (`8'h0f` -> `  0f`
+    /// for `%4h`); the leading-`0` flag both selects the minimal
+    /// (leading-zero-trimmed) form AND zero-pads it (`%04h` -> `000f`). A `-`
+    /// flag left-justifies with trailing spaces. Passing `full` (not a
+    /// pre-trimmed core) lets us honour the flag correctly.
+    fn push_radix(result: &mut String, full: &str, width: usize, left_align: bool, zero_pad: bool) {
+        // Icarus' radix-field model (matched byte-for-byte):
+        //   * No `0` flag: always the natural full-vector form, space-padded
+        //     (`%4h` of 8'h0f -> "  0f", `%-4h` -> "0f  ").
+        //   * `0` flag + right-justified + explicit width: natural form,
+        //     zero-padded — never trimmed below the natural width
+        //     (`%04b` of an 8-bit value stays "00001111", not "1111";
+        //     `%08o` of 16'o01234 -> "00001234").
+        //   * `0` flag + (bare `%0h` OR left-justified): the minimal
+        //     (leading-zero-trimmed) form (`%0h` -> "f", `%-08o` -> "1234    ").
+        let core = if zero_pad && (width == 0 || left_align) {
+            Self::trim_radix_zeros(full)
         } else {
+            full.to_string()
+        };
+        if core.len() >= width {
+            result.push_str(&core);
+        } else if left_align {
+            result.push_str(&core);
+            result.push_str(&" ".repeat(width - core.len()));
+        } else if zero_pad {
             result.push_str(&"0".repeat(width - core.len()));
-            result.push_str(core);
+            result.push_str(&core);
+        } else {
+            result.push_str(&" ".repeat(width - core.len()));
+            result.push_str(&core);
         }
     }
 
@@ -37523,7 +37570,18 @@ impl Simulator {
             return "0".to_string();
         }
         let p = prec.max(1);
-        let exp = x.abs().log10().floor() as i32;
+        // C `%g` decides %f-vs-%e on the exponent of the value ROUNDED to p
+        // significant digits, not the raw value. Deriving the exponent from
+        // `log10().floor()` picks wrongly at rounding boundaries (999999.5
+        // rounds to 1e6 -> exponent 6, so C uses %e) and suffers float error
+        // on exact powers of 10. Formatting via %e at precision p-1 performs
+        // the rounding for us; its printed exponent is the post-rounding
+        // decimal exponent, which is exactly what C's choice is based on.
+        let exp: i32 = format!("{:.*e}", p - 1, x)
+            .split(['e', 'E'])
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let mut raw = if exp < -4 || exp >= p as i32 {
             Self::c_style_exp(x, p.saturating_sub(1), upper)
         } else {
@@ -53249,7 +53307,7 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
 /// Shared by `vpi_get_value` and the value-change dispatcher, so a
 /// callback sees its trigger object's value in exactly the format a
 /// direct read would have produced.
-fn fill_vpi_value(val: &Value, current_time: u64, vp: &mut s_vpi_value) -> bool {
+fn fill_vpi_value(val: &Value, _current_time: u64, vp: &mut s_vpi_value) -> bool {
     {
         // vpiObjTypeVal: the simulator picks the object's natural format
         // and reports which one it chose in `format`.
@@ -53302,7 +53360,12 @@ fn fill_vpi_value(val: &Value, current_time: u64, vp: &mut s_vpi_value) -> bool 
                         type_: vpi::SIM_TIME,
                         high: (t >> 32) as u32,
                         low: (t & 0xFFFF_FFFF) as u32,
-                        real: current_time as f64,
+                        // §37 vpiTimeVal: `.real` must describe the SAME value
+                        // as high/low (the value being read, `t`), not the sim
+                        // clock. Using `current_time` made the record
+                        // self-inconsistent (a `time` var holding 42 read at
+                        // tick 5 reported real=5).
+                        real: t as f64,
                     };
                     cell.as_ptr()
                 });
