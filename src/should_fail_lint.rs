@@ -1658,34 +1658,54 @@ fn check_implicit_ports(
             continue;
         };
         for instance in &inst.instances {
-            for conn in &instance.connections {
-                match conn {
-                    xezim_core::ast::decl::PortConnection::Named { name, expr: None } => {
-                        if !scope.contains(&name.name) {
+        // Ports explicitly listed by name (`.p(...)` or the no-connect `.p()`)
+        // are NOT filled by `.*` and impose no implicit-net requirement.
+        let explicit: HashSet<String> = instance
+            .connections
+            .iter()
+            .filter_map(|c| match c {
+                xezim_core::ast::decl::PortConnection::Named { name, .. } => {
+                    Some(name.name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for conn in &instance.connections {
+            match conn {
+                // Only a parenthesis-free `.name` (implicit: true) requires a
+                // same-named net; `.name()` is an explicit no-connect.
+                xezim_core::ast::decl::PortConnection::Named {
+                    name,
+                    expr: None,
+                    implicit: true,
+                } => {
+                    if !scope.contains(&name.name) {
+                        errs.push(format!(
+                            "implicit port connection '.{}' has no matching signal in the \
+                             enclosing scope (LRM 1800-2017 §23.3.2.2)",
+                            name.name
+                        ));
+                    }
+                }
+                xezim_core::ast::decl::PortConnection::Wildcard => {
+                    if let Some(tports) = port_map.get(&inst.module_name.name) {
+                        let mut missing: Vec<&String> = tports
+                            .iter()
+                            .filter(|p| !scope.contains(*p) && !explicit.contains(*p))
+                            .collect();
+                        missing.sort();
+                        for p in missing {
                             errs.push(format!(
-                                "implicit port connection '.{}' has no matching signal in the \
-                                 enclosing scope (LRM 1800-2017 §23.3.2.2)",
-                                name.name
+                                "wildcard port connection (.*) found no matching signal for \
+                                 port '{}' (LRM 1800-2017 §23.3.2.4)",
+                                p
                             ));
                         }
                     }
-                    xezim_core::ast::decl::PortConnection::Wildcard => {
-                        if let Some(tports) = port_map.get(&inst.module_name.name) {
-                            let mut missing: Vec<&String> =
-                                tports.iter().filter(|p| !scope.contains(*p)).collect();
-                            missing.sort();
-                            for p in missing {
-                                errs.push(format!(
-                                    "wildcard port connection (.*) found no matching signal for \
-                                     port '{}' (LRM 1800-2017 §23.3.2.4)",
-                                    p
-                                ));
-                            }
-                        }
-                    }
-                    _ => {}
                 }
+                _ => {}
             }
+        }
         }
     }
 }

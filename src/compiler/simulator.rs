@@ -44271,7 +44271,13 @@ impl Simulator {
         ports: &[crate::ast::decl::FunctionPort],
         args: &[Expression],
     ) -> Option<Vec<Expression>> {
-        if !args.iter().any(|a| matches!(a.kind, ExprKind::NamedArg { .. })) {
+        // Normalize when there are named args (`.name(expr)`) or positional gaps
+        // (`f(a, , c)` — §13.5.3 default arguments). An omitted slot (`Empty`)
+        // must be filled from the formal's default, not evaluated as 0.
+        if !args
+            .iter()
+            .any(|a| matches!(a.kind, ExprKind::NamedArg { .. } | ExprKind::Empty))
+        {
             return None;
         }
         let mut bound: Vec<Option<Expression>> = vec![None; ports.len()];
@@ -44283,6 +44289,11 @@ impl Simulator {
                         bound[i] = Some((**e).clone());
                     }
                 }
+            } else if matches!(a.kind, ExprKind::Empty) {
+                // Omitted positional argument: leave the slot unbound so it is
+                // filled from the formal's default below; still consume a
+                // position so later actuals align with their formals.
+                pos += 1;
             } else if pos < ports.len() {
                 bound[pos] = Some(a.clone());
                 pos += 1;
@@ -51470,6 +51481,11 @@ impl Simulator {
                             continue;
                         }
                     };
+                    // §13.5.3: reorder named args into formal order and fill any
+                    // omitted (`.name()` / positional `,,`) slot from the formal's
+                    // default before positional binding below.
+                    let normalized = Self::normalize_call_args(ports, args);
+                    let args: &[Expression] = normalized.as_deref().unwrap_or(args);
                     // A function may set its result via the implicit
                     // return variable named after the function (`f = ...`)
                     // instead of an explicit `return`.
