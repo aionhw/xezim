@@ -80,6 +80,41 @@ endmodule
     );
 }
 
+/// Sibling found while auditing #35: `std::randomize(v) with {…}` returned 1
+/// UNCONDITIONALLY after its retry loop, so an unsatisfiable set — and a value
+/// its i64 interval solver could not reach — reported a false SUCCESS (§18.11
+/// requires 1 only when a consistent assignment was actually found). It must
+/// report 0 instead, matching the class-`randomize()` path.
+#[test]
+fn std_randomize_reports_unsat_honestly() {
+    let unsat = |decl: &str, body: &str| -> u64 {
+        let src = format!(
+            r#"
+module test;
+    {decl}
+    int flag = 99;
+    initial begin
+        flag = std::randomize(v) with {{ {body} }};
+    end
+endmodule
+"#
+        );
+        let sim = simulate(&src, 1000).expect("simulate failed");
+        u(&sim, "flag")
+    };
+    // Plain contradictions across widths / signedness: all must be 0.
+    assert_eq!(unsat("logic [31:0] v;", "v >= 100; v <= 5;"), 0, "32-bit UNSAT");
+    assert_eq!(unsat("int v;", "v >= 100; v <= 5;"), 0, "signed UNSAT");
+    assert_eq!(
+        unsat("logic [63:0] v;", "v >= 64'h8000_0000_0000_0000; v <= 5;"),
+        0,
+        "64-bit UNSAT must not report false success"
+    );
+    // A satisfiable set must still report 1.
+    assert_eq!(unsat("logic [31:0] v;", "v >= 100; v <= 200;"), 1, "SAT must be 1");
+    assert_eq!(unsat("logic [31:0] v;", "v >= 4294967290;"), 1, "SAT high-band must be 1");
+}
+
 /// The narrow-band case in isolation, across several seeds: every solve must
 /// succeed and land inside the six legal values — proving the bound narrowed
 /// the domain rather than relying on a lucky full-width draw.

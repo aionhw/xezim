@@ -35844,6 +35844,7 @@ impl Simulator {
                                     targets.push((self.resolve_hier_name(hh), a.clone()));
                                 }
                             }
+                            let mut satisfied = false;
                             for attempt in 0..10 {
                                 if attempt > 0 {
                                     // Previous attempt left a (modeled)
@@ -35914,10 +35915,16 @@ impl Simulator {
                                 // ascending cross-element chain that exhausts
                                 // its headroom); a fresh seed usually escapes.
                                 if self.inline_constraints_satisfied(constraints) {
+                                    satisfied = true;
                                     break;
                                 }
                             }
-                            return Value::from_u64(1, 32);
+                            // §18.11: `std::randomize` returns 1 only if a
+                            // consistent assignment was actually found. Returning
+                            // 1 unconditionally reported success for an
+                            // unsatisfiable set (`v >= 100; v <= 5;`) and for a
+                            // narrow band the i64 interval solver cannot reach.
+                            return Value::from_u64(if satisfied { 1 } else { 0 }, 32);
                         }
                     }
                     // §18.7 `obj.randomize() with {…}` — the inline constraints
