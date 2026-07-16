@@ -366,3 +366,43 @@ endmodule
         .expect("done not readable");
     assert_eq!(done, 3, "all zero-delay work must still run");
 }
+
+/// The report's "Parked" section must name the process the spinner is waiting
+/// for — the classic shape: a clock generator spinning on a zero period whose
+/// setter is scheduled at a future time the spin never reaches.
+#[test]
+fn stall_report_lists_parked_setter() {
+    let dir = std::env::temp_dir().join("xezim_stall_parked");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let sv = dir.join("parked.sv");
+    std::fs::write(
+        &sv,
+        "`timescale 1ps/1ps\nmodule t; real p; reg clk = 0;\n\
+         always #(p/2) clk = ~clk;\n\
+         initial begin #1 p = 100.0; end\nendmodule\n",
+    )
+    .expect("write sv");
+
+    let mut bin = std::env::current_exe().unwrap();
+    bin.pop();
+    if bin.ends_with("deps") {
+        bin.pop();
+    }
+    let out = std::process::Command::new(bin.join("xezim"))
+        .env("XEZIM_STALL_LIMIT", "1500")
+        .arg(&sv)
+        .output()
+        .expect("run xezim");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("re-arming via #(p/2)"), "spinner line missing:\n{}", err);
+    assert!(
+        err.contains("Parked (not spinning)"),
+        "parked section missing:\n{}",
+        err
+    );
+    assert!(
+        err.contains("next event at time 1"),
+        "the parked setter (scheduled at t=1) must be named:\n{}",
+        err
+    );
+}

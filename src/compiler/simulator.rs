@@ -1247,6 +1247,31 @@ impl TimingWheel {
     /// The pending continuation scheduled for `pid`, if any. Linear scan of
     /// every wheel slot + the overflow map — used ONLY by the terminal
     /// zero-delay stall report, never on the scheduling hot path.
+    /// Every pending (pid, absolute_time) in the wheel + overflow. Read-only,
+    /// used ONLY by the terminal stall report to show where non-spinning
+    /// processes are parked (e.g. the initializer the spinner is waiting for,
+    /// scheduled at a future time the livelock never reaches).
+    fn pending_pid_times(&self) -> Vec<(usize, u64)> {
+        let mut out: Vec<(usize, u64)> = Vec::new();
+        let cur_slot = Self::slot(self.current_time);
+        for s in 0..WHEEL_SIZE {
+            if self.wheel[s].is_empty() {
+                continue;
+            }
+            let delta = ((s + WHEEL_SIZE - cur_slot) % WHEEL_SIZE) as u64;
+            let abs_time = self.current_time + delta;
+            for (p, _) in &self.wheel[s] {
+                out.push((*p, abs_time));
+            }
+        }
+        for (t, list) in &self.overflow {
+            for (p, _) in list {
+                out.push((*p, *t));
+            }
+        }
+        out
+    }
+
     fn pending_stmts_for(&self, pid: usize) -> Option<&[Statement]> {
         if !self.has_pid(pid) {
             return None;
@@ -14834,10 +14859,49 @@ impl Simulator {
     /// inside `run_process_stmts` (its continuation lives on the Rust stack,
     /// not in any queue, so the caller must hand it over). `None` when the
     /// outer event loop tripped the delta-cycle limit instead.
+    /// "process N — <kind> at <file:line> (<instance path>, module <m>)" — the
+    /// attribution prefix shared by the spinner list and the parked-process
+    /// list of the stall report.
+    fn stall_pid_identity(&mut self, pid: usize) -> String {
+        let mut line = format!("                 process {}", pid);
+        let src_file = self.stall_pid_src_file(pid);
+        if let Some(&(span, kind)) = self.process_origin.get(&pid) {
+            line.push_str(" — ");
+            line.push_str(kind);
+            if let Some(loc) = self.span_file_line_in(span, src_file) {
+                line.push_str(" at ");
+                line.push_str(&loc);
+            }
+        }
+        match self.process_scope_hint.get(&pid) {
+            Some(s) if !s.is_empty() => {
+                let s = s.clone();
+                let def_mod = self
+                    .stall_pid_def_module(pid)
+                    .filter(|m| *m != self.module.name);
+                match def_mod {
+                    Some(m) => {
+                        line.push_str(&format!(" ({}.{}, module {})", self.module.name, s, m))
+                    }
+                    None => line.push_str(&format!(" ({}.{})", self.module.name, s)),
+                }
+            }
+            _ => line.push_str(&format!(" ({})", self.module.name)),
+        }
+        line
+    }
+
     fn report_zero_delay_stall(&mut self, running: Option<(usize, &[Statement])>) {
         let mut top: Vec<(usize, u64)> =
             self.stall_pid_hits.iter().map(|(p, c)| (*p, *c)).collect();
         top.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        // A process that ran once or twice at this timestamp is not a spinner —
+        // it belongs in the "parked" section below (it is usually the very
+        // process the spinner is waiting for). Keep low-count entries only if
+        // NOTHING spun (so the report always names someone).
+        if top.iter().any(|&(_, c)| c > 2) {
+            top.retain(|&(_, c)| c > 2);
+        }
         top.truncate(5);
 
         // Report whichever count actually tripped: the outer loop's delta count,
@@ -14861,39 +14925,8 @@ impl Simulator {
         if !top.is_empty() {
             eprintln!("               Most frequently scheduled processes:");
             for (pid, count) in &top {
-                let mut line = format!("                 process {}", pid);
-                // Which source file this pid's spans live in (multi-file
-                // designs), via its instance scope's defining module.
+                let mut line = self.stall_pid_identity(*pid);
                 let src_file = self.stall_pid_src_file(*pid);
-                // Origin: what construct spawned this pid, and where.
-                if let Some(&(span, kind)) = self.process_origin.get(pid) {
-                    line.push_str(" — ");
-                    line.push_str(kind);
-                    if let Some(loc) = self.span_file_line_in(span, src_file) {
-                        line.push_str(" at ");
-                        line.push_str(&loc);
-                    }
-                }
-                // Instance path: the scope hint under the top module's name;
-                // a process with no hint runs in the top scope itself. When
-                // the DEFINING module is known and isn't the top, name it too
-                // — the instance path alone doesn't say which module body to
-                // open: `(top.u_fifo.u_sync, module sync_cell)`.
-                match self.process_scope_hint.get(pid) {
-                    Some(s) if !s.is_empty() => {
-                        let def_mod = self
-                            .stall_pid_def_module(*pid)
-                            .filter(|m| *m != self.module.name);
-                        match def_mod {
-                            Some(m) => line.push_str(&format!(
-                                " ({}.{}, module {})",
-                                self.module.name, s, m
-                            )),
-                            None => line.push_str(&format!(" ({}.{})", self.module.name, s)),
-                        }
-                    }
-                    _ => line.push_str(&format!(" ({})", self.module.name)),
-                }
                 // Re-arm reason, from the pid's pending continuation.
                 if let Some(reason) = self.describe_stall_offender(*pid, running, src_file) {
                     line.push_str(" — ");
@@ -14901,6 +14934,53 @@ impl Simulator {
                 }
                 line.push_str(&format!(" — ran {} times at this timestamp", count));
                 eprintln!("{}", line);
+            }
+        }
+        // The OTHER half of the story: processes that are NOT spinning. The
+        // classic livelock has the spinner's fix parked right here — e.g. the
+        // initial block that would set the zero-valued clock period, scheduled
+        // for a future time the spin never reaches, or blocked on an event the
+        // spin never produces.
+        {
+            let spinner: HashSet<usize> = top.iter().map(|(p, _)| *p).collect();
+            let mut parked: Vec<String> = Vec::new();
+            let mut seen: HashSet<usize> = HashSet::default();
+            for (pid, t) in self.event_queue.pending_pid_times() {
+                if t > self.time && !spinner.contains(&pid) && seen.insert(pid) {
+                    let id = self.stall_pid_identity(pid);
+                    parked.push(format!("{} — next event at time {}", id, t));
+                }
+            }
+            let waiter_pids: Vec<usize> = self
+                .event_waiters
+                .iter()
+                .map(|w| w.pid)
+                .chain(self.condition_waiters.iter().map(|(p, _)| *p))
+                .collect();
+            for pid in waiter_pids {
+                if spinner.contains(&pid) || !seen.insert(pid) {
+                    continue;
+                }
+                let src_file = self.stall_pid_src_file(pid);
+                let id = self.stall_pid_identity(pid);
+                let why = self
+                    .describe_stall_offender(pid, None, src_file)
+                    .unwrap_or_else(|| "blocked".to_string());
+                // The ping-pong hint is for SPINNERS; a parked waiter is just
+                // waiting.
+                let why = why.replace(" — event ping-pong suspected", "");
+                parked.push(format!("{} — {}", id, why));
+            }
+            if !parked.is_empty() {
+                eprintln!(
+                    "               Parked (not spinning) — a spinner above may be waiting on one of these:"
+                );
+                for l in parked.iter().take(8) {
+                    eprintln!("{}", l);
+                }
+                if parked.len() > 8 {
+                    eprintln!("                 ... and {} more", parked.len() - 8);
+                }
             }
         }
         eprintln!("               Common causes:");
