@@ -35517,12 +35517,38 @@ impl Simulator {
                 target = cls.typedef_targets.get(nm).cloned();
             }
         }
+        // A bare class-local typedef referenced inside a method (e.g.
+        // `this_type` inside `Wrapper::get()`) must resolve to the ENCLOSING
+        // class's typedef. This check MUST precede the module-level
+        // `typedef_types` lookup: class-local typedefs with common names
+        // (e.g. `this_type`, declared in every parameterized class) leak
+        // into the module-level table where the LAST class processed wins
+        // arbitrarily — so `this_type` inside `Wrapper::get()` would resolve
+        // to `Common::this_type` instead of `Wrapper::this_type`. Walk the
+        // enclosing class context up the inheritance chain.
+        if target.is_none() {
+            if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                let mut cur = Some(ctx);
+                while let Some(cname) = cur {
+                    if let Some(cls) = self.module.classes.get(&cname) {
+                        if let Some(dt) = cls.typedef_targets.get(nm).cloned() {
+                            target = Some(dt);
+                            break;
+                        }
+                        cur = cls.extends.clone();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
         if target.is_none() {
             target = self.module.typedef_types.get(nm).cloned();
         }
         if target.is_none() {
             // Unscoped: a class-local typedef referenced bare from a method of
-            // the same/derived class. Search every class's typedef_targets.
+            // the same/derived class with no class context (e.g. an
+            // out-of-block declaration). Search every class's typedef_targets.
             for cls in self.module.classes.values() {
                 if let Some(dt) = cls.typedef_targets.get(nm) {
                     target = Some(dt.clone());
