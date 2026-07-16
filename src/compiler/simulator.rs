@@ -1221,6 +1221,30 @@ impl TimingWheel {
     fn has_pid(&self, pid: usize) -> bool {
         self.pid_counts.contains_key(&pid)
     }
+
+    /// The pending continuation scheduled for `pid`, if any. Linear scan of
+    /// every wheel slot + the overflow map — used ONLY by the terminal
+    /// zero-delay stall report, never on the scheduling hot path.
+    fn pending_stmts_for(&self, pid: usize) -> Option<&[Statement]> {
+        if !self.has_pid(pid) {
+            return None;
+        }
+        for slot in &self.wheel {
+            for (p, s) in slot {
+                if *p == pid {
+                    return Some(s);
+                }
+            }
+        }
+        for list in self.overflow.values() {
+            for (p, s) in list {
+                if *p == pid {
+                    return Some(s);
+                }
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2058,6 +2082,12 @@ pub struct Simulator {
     /// name-resolution hint so AST-evaluated bare names in a multiply-
     /// instantiated module resolve to THIS instance's signals.
     process_scope_hint: HashMap<usize, String>,
+    /// Where each process came from: the creating construct's source span
+    /// and its kind ("initial block", "always block", "fork child", …).
+    /// One insert per process CREATION (never on the activation hot path);
+    /// read only by `report_zero_delay_stall` so a spinning pid can be
+    /// traced back to the RTL construct that spawned it.
+    process_origin: HashMap<usize, (crate::ast::Span, &'static str)>,
     /// Instance scope of the edge block currently executing (set around
     /// dispatch, cleared after). `current_module_def` prefers it over the
     /// per-pid hint so $time/%t scale to the BLOCK's module timescale, not
@@ -3894,6 +3924,7 @@ impl Simulator {
             process_parents: HashMap::default(),
             process_contexts: HashMap::default(),
             process_scope_hint: HashMap::default(),
+            process_origin: HashMap::default(),
             timescale_scope_override: None,
             pending_ret_collection: None,
             current_scope: String::new(),
@@ -7262,6 +7293,7 @@ impl Simulator {
             if !ib.scope.is_empty() {
                 self.process_scope_hint.insert(pid, ib.scope);
             }
+            self.process_origin.insert(pid, (span, "static initializer"));
             self.event_queue.schedule(0, pid, stmts);
         }
         if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
@@ -7279,6 +7311,7 @@ impl Simulator {
             .chain(initial_blocks.into_iter())
         {
             let scope = ib.scope;
+            let span = ib.stmt.span;
             let block_label = match &ib.stmt.kind {
                 StatementKind::SeqBlock { name, .. } => name.as_ref().map(|n| n.name.clone()),
                 _ => None,
@@ -7302,6 +7335,7 @@ impl Simulator {
             if !scope.is_empty() {
                 self.process_scope_hint.insert(pid, scope);
             }
+            self.process_origin.insert(pid, (span, "initial block"));
             if let Some(l) = block_label {
                 self.disable_labels.insert(l, pid);
             }
@@ -9849,6 +9883,7 @@ impl Simulator {
             let was_finished = self.finished;
             self.finished = false;
             for fb in finals {
+                let span = fb.stmt.span;
                 let stmts = match fb.stmt.kind {
                     StatementKind::SeqBlock { stmts, .. } => stmts,
                     other => vec![Statement::new(other, fb.stmt.span)],
@@ -9863,6 +9898,7 @@ impl Simulator {
                 } else {
                     self.current_scope.clear();
                 }
+                self.process_origin.insert(pid, (span, "final block"));
                 self.run_process_stmts(pid, &stmts);
                 // A final block's $finish should NOT stop subsequent finals;
                 // re-clear after each.
@@ -10290,6 +10326,10 @@ impl Simulator {
                 );
                 let pid = self.next_pid;
                 self.next_pid += 1;
+                if !ab.scope.is_empty() {
+                    self.process_scope_hint.insert(pid, ab.scope.clone());
+                }
+                self.process_origin.insert(pid, (ab.stmt.span, "always block"));
                 self.event_queue.schedule(0, pid, vec![forever_stmt]);
                 return None;
             }
@@ -10302,6 +10342,10 @@ impl Simulator {
                 );
                 let pid = self.next_pid;
                 self.next_pid += 1;
+                if !ab.scope.is_empty() {
+                    self.process_scope_hint.insert(pid, ab.scope.clone());
+                }
+                self.process_origin.insert(pid, (ab.stmt.span, "always block"));
                 self.event_queue.schedule(0, pid, vec![forever_stmt]);
                 return None;
             }
@@ -14529,8 +14573,15 @@ impl Simulator {
     /// A zero-delay livelock: `self.stall_limit` delta cycles have run at one
     /// timestamp and time never moved. Rather than spin forever (the user just
     /// sees "stuck at time 0"), say so and name the processes responsible —
-    /// the ones the scheduler keeps re-arming.
-    fn report_zero_delay_stall(&mut self) {
+    /// the ones the scheduler keeps re-arming — including, per offender, the
+    /// RTL construct it came from (kind + file:line + instance path) and WHY
+    /// it keeps re-arming (its pending continuation's head).
+    ///
+    /// `running` is the currently-executing process when the limit tripped
+    /// inside `run_process_stmts` (its continuation lives on the Rust stack,
+    /// not in any queue, so the caller must hand it over). `None` when the
+    /// outer event loop tripped the delta-cycle limit instead.
+    fn report_zero_delay_stall(&mut self, running: Option<(usize, &[Statement])>) {
         let mut top: Vec<(usize, u64)> =
             self.stall_pid_hits.iter().map(|(p, c)| (*p, *c)).collect();
         top.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
@@ -14557,13 +14608,31 @@ impl Simulator {
         if !top.is_empty() {
             eprintln!("               Most frequently scheduled processes:");
             for (pid, count) in &top {
-                let scope = self
-                    .process_scope_hint
-                    .get(pid)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| format!(" in {}", s))
-                    .unwrap_or_default();
-                eprintln!("                 process {}{} — ran {} times at this timestamp", pid, scope, count);
+                let mut line = format!("                 process {}", pid);
+                // Origin: what construct spawned this pid, and where.
+                if let Some(&(span, kind)) = self.process_origin.get(pid) {
+                    line.push_str(" — ");
+                    line.push_str(kind);
+                    if let Some(loc) = self.span_file_line(span) {
+                        line.push_str(" at ");
+                        line.push_str(&loc);
+                    }
+                }
+                // Instance path: the scope hint under the top module's name;
+                // a process with no hint runs in the top scope itself.
+                match self.process_scope_hint.get(pid) {
+                    Some(s) if !s.is_empty() => {
+                        line.push_str(&format!(" ({}.{})", self.module.name, s))
+                    }
+                    _ => line.push_str(&format!(" ({})", self.module.name)),
+                }
+                // Re-arm reason, from the pid's pending continuation.
+                if let Some(reason) = self.describe_stall_offender(*pid, running) {
+                    line.push_str(" — ");
+                    line.push_str(&reason);
+                }
+                line.push_str(&format!(" — ran {} times at this timestamp", count));
+                eprintln!("{}", line);
             }
         }
         eprintln!("               Common causes:");
@@ -14573,6 +14642,215 @@ impl Simulator {
         eprintln!(
             "               Raise or disable the check with XEZIM_STALL_LIMIT=<n> (0 = never stall-check)."
         );
+    }
+
+    /// Best-effort `file:line` for a statement span. A span is a byte offset
+    /// into its OWN file's preprocessed text, and the elaborated module does
+    /// not record which file each statement came from — so resolve only when
+    /// it is unambiguous: exactly ONE retained source is long enough to
+    /// contain the offset (trivially true for the single-source case). When
+    /// several files could contain it, print nothing rather than risk a
+    /// wrong location.
+    fn span_file_line(&self, span: crate::ast::Span) -> Option<String> {
+        if span.start == 0 && span.end == 0 {
+            return None; // Span::dummy() — synthesized statement, no source
+        }
+        let texts = &self.module.source_texts;
+        let mut hit: Option<usize> = None;
+        for (i, t) in texts.iter().enumerate() {
+            if span.start < t.len() {
+                if hit.is_some() {
+                    return None; // ambiguous across files
+                }
+                hit = Some(i);
+            }
+        }
+        let i = hit?;
+        let line = 1 + texts[i].as_bytes()[..span.start]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        let file = self
+            .module
+            .source_files
+            .get(i)
+            .filter(|f| !f.is_empty())
+            .cloned()
+            .unwrap_or_else(|| format!("<source {}>", i + 1));
+        Some(format!("{}:{}", file, line))
+    }
+
+    /// The source text a span covers, when it resolves to exactly one file
+    /// (same rule as `span_file_line`). Whitespace-collapsed and capped, for
+    /// inline display of e.g. a `wait (...)` condition.
+    fn span_source_snippet(&self, span: crate::ast::Span) -> Option<String> {
+        if span.start == 0 && span.end == 0 {
+            return None;
+        }
+        let texts = &self.module.source_texts;
+        let mut hit: Option<usize> = None;
+        for (i, t) in texts.iter().enumerate() {
+            if span.end <= t.len() && span.start < span.end {
+                if hit.is_some() {
+                    return None;
+                }
+                hit = Some(i);
+            }
+        }
+        let i = hit?;
+        let raw = texts[i].get(span.start..span.end)?;
+        let mut s = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if s.len() > 60 {
+            s.truncate(57);
+            s.push('…');
+        }
+        Some(s)
+    }
+
+    fn expr_snippet(&self, e: &Expression) -> String {
+        self.span_source_snippet(e.span)
+            .unwrap_or_else(|| "…".to_string())
+    }
+
+    /// Why is `pid` re-arming at this timestamp? Finds its pending
+    /// continuation — the running process's own statements, the `#0`
+    /// inactive queue, the event/condition waiter lists, or the event
+    /// queue — and classifies its head. Terminal-path only.
+    fn describe_stall_offender(
+        &mut self,
+        pid: usize,
+        running: Option<(usize, &[Statement])>,
+    ) -> Option<String> {
+        // The process that tripped the limit is mid-execution: its
+        // continuation is on the Rust stack, not in any queue.
+        if let Some((rpid, rstmts)) = running {
+            if rpid == pid {
+                return Some(
+                    self.classify_stall_stmts(rstmts, 0)
+                        .unwrap_or_else(|| "currently executing".to_string()),
+                );
+            }
+        }
+        // Parked in the Inactive region — only a `#0` puts a process here.
+        if self.inactive_queue.iter().any(|(p, _)| *p == pid) {
+            return Some("re-arming via #0 delay".to_string());
+        }
+        // Blocked on @(...) — if it is also a top spinner, something keeps
+        // re-triggering it at this timestamp.
+        if let Some(w) = self.event_waiters.iter().find(|w| w.pid == pid) {
+            let sens = w
+                .resolved_sensitivities
+                .iter()
+                .map(|s| {
+                    let edge = match s.edge {
+                        EdgeKind::Posedge => "posedge ",
+                        EdgeKind::Negedge => "negedge ",
+                        EdgeKind::AnyEdge => "",
+                    };
+                    format!("{}{}", edge, self.name_for_id(s.signal_id))
+                })
+                .collect::<Vec<_>>()
+                .join(" or ");
+            return Some(format!(
+                "waiting on @({}) — event ping-pong suspected",
+                sens
+            ));
+        }
+        // Blocked on a signal-less `wait (cond)` (condition-waiter fixpoint).
+        if let Some((_, cont)) = self
+            .condition_waiters
+            .iter()
+            .find(|(p, _)| *p == pid)
+        {
+            let cont = cont.clone();
+            return self.classify_stall_stmts(&cont, 0);
+        }
+        // A delta continuation sitting in the event queue.
+        if let Some(stmts) = self.event_queue.pending_stmts_for(pid) {
+            let stmts = stmts.to_vec();
+            return self.classify_stall_stmts(&stmts, 0);
+        }
+        None
+    }
+
+    /// Classify the first suspension point in a pending continuation: a `#0`
+    /// re-arm, an `@(...)` event wait, a `wait (cond)` (noting whether the
+    /// condition is ALREADY true — the classic spin), or a `forever` whose
+    /// body never yields. Descends into `forever` / `begin..end` bodies a
+    /// few levels; evaluates only call-free expressions so a terminal
+    /// diagnostic can't run user side effects.
+    fn classify_stall_stmts(&mut self, stmts: &[Statement], depth: u32) -> Option<String> {
+        if depth > 4 {
+            return None;
+        }
+        for s in stmts.iter().take(64) {
+            match &s.kind {
+                StatementKind::TimingControl { control, .. } => match control {
+                    TimingControl::Delay(d) => {
+                        if !Self::expr_contains_call(d) && self.eval_delay_ticks(d) == 0 {
+                            return Some("re-arming via #0 delay".to_string());
+                        }
+                        // A real (nonzero/unknown) delay ahead would advance
+                        // time — the spin is something else; stop guessing.
+                        return None;
+                    }
+                    TimingControl::Event(ev) => {
+                        return Some(format!(
+                            "waiting on @({}) — event ping-pong suspected",
+                            self.render_event_control(ev)
+                        ));
+                    }
+                },
+                StatementKind::Wait { condition, .. } => {
+                    let cond_src = self.expr_snippet(condition);
+                    let already_true = !Self::expr_contains_call(condition)
+                        && self.eval_expr(condition).is_true();
+                    return Some(if already_true {
+                        format!("`wait ({})` with the condition already true", cond_src)
+                    } else {
+                        format!("blocked on `wait ({})`", cond_src)
+                    });
+                }
+                StatementKind::Forever { body } => {
+                    let inner: &[Statement] = match &body.kind {
+                        StatementKind::SeqBlock { stmts, .. } => stmts,
+                        _ => std::slice::from_ref(&**body),
+                    };
+                    return Some(self.classify_stall_stmts(inner, depth + 1).unwrap_or_else(
+                        || "loop body has no timing control — never yields".to_string(),
+                    ));
+                }
+                StatementKind::SeqBlock { stmts: inner, .. } => {
+                    if let Some(r) = self.classify_stall_stmts(inner, depth + 1) {
+                        return Some(r);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Render an `@(...)` event control for the stall report.
+    fn render_event_control(&self, ev: &EventControl) -> String {
+        match ev {
+            EventControl::Star | EventControl::ParenStar => "*".to_string(),
+            EventControl::Identifier(id) => id.name.clone(),
+            EventControl::HierIdentifier(e) => self.expr_snippet(e),
+            EventControl::EventExpr(terms) => terms
+                .iter()
+                .map(|t| {
+                    let edge = match t.edge {
+                        Some(Edge::Posedge) => "posedge ",
+                        Some(Edge::Negedge) => "negedge ",
+                        Some(Edge::Edge) => "edge ",
+                        None => "",
+                    };
+                    format!("{}{}", edge, self.expr_snippet(&t.expr))
+                })
+                .collect::<Vec<_>>()
+                .join(" or "),
+        }
     }
 
     fn run_one_tick(
@@ -14992,7 +15270,7 @@ impl Simulator {
                     self.stall_iters = 1;
                 }
                 if self.stall_limit > 0 && self.stall_iters > self.stall_limit {
-                    self.report_zero_delay_stall();
+                    self.report_zero_delay_stall(None);
                     self.finished = true;
                     break;
                 }
@@ -16145,7 +16423,7 @@ impl Simulator {
             // queue at the current time, so a self-rescheduling process never
             // reaches the outer event loop — the check has to live here.
             if *hits > self.stall_limit {
-                self.report_zero_delay_stall();
+                self.report_zero_delay_stall(Some((pid, stmts)));
                 self.finished = true;
                 return;
             }
@@ -16886,6 +17164,13 @@ impl Simulator {
                     let pid_child = self.next_pid;
                     self.next_pid += 1;
                     self.process_parents.insert(pid_child, pid);
+                    // §9.3.2: a fork child executes in the forking process's
+                    // scope, so it inherits the parent's instance-scope hint
+                    // (additive — a child previously had none at all).
+                    if let Some(h) = self.process_scope_hint.get(&pid).cloned() {
+                        self.process_scope_hint.insert(pid_child, h);
+                    }
+                    self.process_origin.insert(pid_child, (s.span, "fork child"));
                     self.inherit_fork_child_context(pid_child);
                     // §9.4.5: a child that IS an intra-assignment delay
                     // (`fork lhs = #d rhs; join_none`) captures its RHS at the
@@ -28782,6 +29067,12 @@ impl Simulator {
                     let pid = self.next_pid;
                     self.next_pid += 1;
                     self.process_parents.insert(pid, self.current_pid);
+                    // Same scope-hint inheritance as the run_process_stmts
+                    // ParBlock arm — §9.3.2, additive.
+                    if let Some(h) = self.process_scope_hint.get(&self.current_pid).cloned() {
+                        self.process_scope_hint.insert(pid, h);
+                    }
+                    self.process_origin.insert(pid, (s.span, "fork child"));
                     self.inherit_fork_child_context(pid);
                     self.event_queue.schedule(self.time, pid, vec![s.clone()]);
                     child_set.insert(pid);
@@ -31653,6 +31944,10 @@ impl Simulator {
         // (disable labels, scope hints) has somewhere to attach.
         let pid = self.next_pid;
         self.next_pid += 1;
+        if let Some(first) = stmts.first() {
+            self.process_origin
+                .insert(pid, (first.span, "program initial block"));
+        }
         self.run_process_stmts(pid, &stmts);
     }
 
@@ -47369,6 +47664,9 @@ impl Simulator {
                         }
                         let pid = self.next_pid;
                         self.next_pid += 1;
+                        if let Some(first) = t.items.first() {
+                            self.process_origin.insert(pid, (first.span, "class task"));
+                        }
                         self.process_contexts.insert(
                             pid,
                             ProcessContext {
