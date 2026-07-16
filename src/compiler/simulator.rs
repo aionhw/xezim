@@ -26209,6 +26209,41 @@ impl Simulator {
             }
             StatementKind::Expr(expr) => self.exec_expr_stmt(expr),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
+                // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)
+                // is evaluated exactly ONCE. The assign_value machinery
+                // re-evaluates the index in several candidate branches, so
+                // fold side-effecting indices to literals up front. A
+                // compound assign (`x[i++] += 2`) was desugared by the parser
+                // into `x[i++] = x[i++] + 2` with a CLONED lvalue (same span)
+                // on the RHS — point that clone at the same folded index so
+                // the increment still happens once.
+                if Self::lvalue_has_incdec_index(lvalue) {
+                    if let Some(new_lhs) = self.rewrite_lvalue_index_side_effects(lvalue) {
+                        let new_rhs: Expression = match &rvalue.kind {
+                            ExprKind::Binary { op, left, right }
+                                if left.span == lvalue.span
+                                    && std::mem::discriminant(&left.kind)
+                                        == std::mem::discriminant(&lvalue.kind) =>
+                            {
+                                Expression::new(
+                                    ExprKind::Binary {
+                                        op: *op,
+                                        left: Box::new(new_lhs.clone()),
+                                        right: right.clone(),
+                                    },
+                                    rvalue.span,
+                                )
+                            }
+                            _ => (*rvalue).clone(),
+                        };
+                        let val = self.eval_expr(&new_rhs);
+                        self.assign_value(&new_lhs, &val);
+                        if !self.in_edge_block {
+                            self.settle_combinatorial();
+                        }
+                        return;
+                    }
+                }
                 // LRM §25.8 virtual-interface binding. When the LHS is a
                 // class-property write whose property is declared
                 // `virtual <iface_t>`, the assignment isn't a value copy:
@@ -35751,6 +35786,140 @@ impl Simulator {
     /// `(container, offset, width)`. Such a dotted name parses as ONE
     /// hierarchical identifier, so the field lookups that key off the ROOT
     /// (`a`) never see it.
+    /// Does this expression contain an inc/dec side effect (`i++`, `--j`)
+    /// or an embedded assignment? Used to guarantee §11.4.1 single
+    /// evaluation of lvalue index expressions.
+    fn expr_has_incdec(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Unary { op, operand } => {
+                matches!(
+                    op,
+                    UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr
+                ) || Self::expr_has_incdec(operand)
+            }
+            ExprKind::AssignExpr { .. } => true,
+            ExprKind::Binary { left, right, .. } => {
+                Self::expr_has_incdec(left) || Self::expr_has_incdec(right)
+            }
+            ExprKind::Paren(inner) => Self::expr_has_incdec(inner),
+            ExprKind::Index { expr, index } => {
+                Self::expr_has_incdec(expr) || Self::expr_has_incdec(index)
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                Self::expr_has_incdec(condition)
+                    || Self::expr_has_incdec(then_expr)
+                    || Self::expr_has_incdec(else_expr)
+            }
+            ExprKind::Concatenation(parts) => parts.iter().any(Self::expr_has_incdec),
+            _ => false,
+        }
+    }
+
+    /// Does an lvalue's INDEX position contain an inc/dec side effect
+    /// (`x[i++] = v`)?
+    fn lvalue_has_incdec_index(lhs: &Expression) -> bool {
+        match &lhs.kind {
+            ExprKind::Index { expr, index } => {
+                Self::expr_has_incdec(index) || Self::lvalue_has_incdec_index(expr)
+            }
+            ExprKind::RangeSelect { expr, left, right, .. } => {
+                Self::expr_has_incdec(left)
+                    || Self::expr_has_incdec(right)
+                    || Self::lvalue_has_incdec_index(expr)
+            }
+            _ => false,
+        }
+    }
+
+    /// Wrap an already-evaluated index value as a literal expression so the
+    /// original (side-effecting) index is not re-evaluated.
+    fn literal_index_expr(iv: i64, span: crate::ast::Span) -> Expression {
+        let mag = Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: false,
+                base: NumberBase::Decimal,
+                value: iv.unsigned_abs().to_string(),
+                cached_val: Cell::new(None),
+            }),
+            span,
+        );
+        if iv < 0 {
+            Expression::new(
+                ExprKind::Unary { op: UnaryOp::Minus, operand: Box::new(mag) },
+                span,
+            )
+        } else {
+            mag
+        }
+    }
+
+    /// §11.4.1: an lvalue's index expressions are evaluated exactly ONCE per
+    /// assignment. Rewrite every side-effecting index (`x[i++]`) to the
+    /// literal value it evaluates to, applying the side effect here. Returns
+    /// None when no index carries a side effect.
+    fn rewrite_lvalue_index_side_effects(&mut self, lhs: &Expression) -> Option<Expression> {
+        match &lhs.kind {
+            ExprKind::Index { expr, index } => {
+                let inner = self.rewrite_lvalue_index_side_effects(expr);
+                let idx_needs = Self::expr_has_incdec(index);
+                if inner.is_none() && !idx_needs {
+                    return None;
+                }
+                let new_base = inner.unwrap_or_else(|| (**expr).clone());
+                let new_index = if idx_needs {
+                    let v = self.eval_expr(index);
+                    let iv = if v.is_signed {
+                        v.to_i64().unwrap_or(0)
+                    } else {
+                        v.to_u64().unwrap_or(0) as i64
+                    };
+                    Self::literal_index_expr(iv, index.span)
+                } else {
+                    (**index).clone()
+                };
+                Some(Expression::new(
+                    ExprKind::Index { expr: Box::new(new_base), index: Box::new(new_index) },
+                    lhs.span,
+                ))
+            }
+            ExprKind::RangeSelect { expr, left, right, kind } => {
+                let inner = self.rewrite_lvalue_index_side_effects(expr);
+                let l_needs = Self::expr_has_incdec(left);
+                let r_needs = Self::expr_has_incdec(right);
+                if inner.is_none() && !l_needs && !r_needs {
+                    return None;
+                }
+                let new_base = inner.unwrap_or_else(|| (**expr).clone());
+                let mut fold = |e: &Expression, needs: bool| -> Expression {
+                    if needs {
+                        let v = self.eval_expr(e);
+                        let iv = if v.is_signed {
+                            v.to_i64().unwrap_or(0)
+                        } else {
+                            v.to_u64().unwrap_or(0) as i64
+                        };
+                        Self::literal_index_expr(iv, e.span)
+                    } else {
+                        e.clone()
+                    }
+                };
+                let new_left = fold(left, l_needs);
+                let new_right = fold(right, r_needs);
+                Some(Expression::new(
+                    ExprKind::RangeSelect {
+                        expr: Box::new(new_base),
+                        left: Box::new(new_left),
+                        right: Box::new(new_right),
+                        kind: *kind,
+                    },
+                    lhs.span,
+                ))
+            }
+            _ => None,
+        }
+    }
+
     /// Resolve a nested packed-vector index chain `base[i0][i1]...` (LRM
     /// §7.4.1) to the flat bit slice it selects, using the signal's full
     /// packed dimension list (`packed_full_dims`, outermost first) with

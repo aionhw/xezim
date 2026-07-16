@@ -14,6 +14,35 @@ fn passes(src: &str) -> bool {
     }
 }
 
+/// §11.4.1: an lvalue index with a side effect (`x[i++] = v`,
+/// `x[i++] += 2`) evaluates the index exactly once (ivtest pr3390385).
+#[test]
+fn lvalue_index_side_effect_single_eval() {
+    assert!(passes(r#"
+module tb;
+reg [1:0] i, j;
+reg [3:0] x[0:2];
+reg error;
+initial begin
+   error = 0;
+   i = 0;
+   j = i++;
+   if (i !== 2'b01 || j !== 2'b00) error = 1;
+   i = 0;
+   x[0] = 4'dx; x[1] = 4'dx;
+   x[i++] = 0;
+   if (x[0] !== 4'd0 || x[1] !== 4'dx || i !== 2'd1) error = 1;
+   i = 0;
+   x[0] = 1;
+   x[i++] += 2;
+   if (x[0] !== 4'd3) error = 1;
+   if (i !== 2'd1) error = 1;
+   if (error == 0) $display("PASSED"); else $display("FAILED");
+end
+endmodule
+"#));
+}
+
 /// §7.4.1: nested index on a 3-D packed vector selects the element slice,
 /// with $bits agreeing at each level (ivtest br_gh112a).
 #[test]
