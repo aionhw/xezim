@@ -43424,11 +43424,15 @@ impl Simulator {
                 }
             }
 
-            let base = self.eval_expr(expr);
-
-            // Fallback for non-identifier base (e.g. string literals).
-            // Counts content bytes including embedded/trailing NULs.
+            // `.len()` / `.size()` fallback for a non-identifier base (e.g.
+            // string literals). NOTE: the receiver is evaluated ONLY for
+            // these method names — evaluating it unconditionally here would
+            // double-evaluate side-effecting receivers (e.g. a chained
+            // `obj.m().inc()`, where `obj.m()` runs once here and again at
+            // the generic dispatch below), producing 2^n-1 executions for an
+            // n-deep call chain.
             if mname == "len" || mname == "size" {
+                let base = self.eval_expr(expr);
                 return Value::from_u64(base.sv_string_bytes().len() as u64, 32);
             }
 
