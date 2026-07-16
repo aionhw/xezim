@@ -36421,6 +36421,51 @@ impl Simulator {
                                     // constraint violated — reseed and retry.
                                     self.exec_std_randomize(args);
                                 }
+                                // §18.5.12 (issue #4): COUPLED affine constraints
+                                // (`A + B < 1000`, `A < B`, `A + B == 50`) tie two
+                                // targets together, so per-target narrowing below
+                                // narrows nothing. Solve them sequentially first
+                                // and skip those targets in the independent loop.
+                                let mut cvar_names: Vec<String> = Vec::with_capacity(targets.len());
+                                let mut cvar_dom: Vec<(i128, i128)> = Vec::with_capacity(targets.len());
+                                let mut cvar_ws: Vec<(u32, bool)> = Vec::with_capacity(targets.len());
+                                for (name, lv) in &targets {
+                                    let cur = self.eval_expr(lv);
+                                    let w = cur.width.max(1);
+                                    let s = cur.is_signed;
+                                    let ww = w.min(127);
+                                    let (lo, hi): (i128, i128) = if s {
+                                        (-(1i128 << ww.saturating_sub(1)), (1i128 << ww.saturating_sub(1)) - 1)
+                                    } else {
+                                        (0, (1i128 << ww) - 1)
+                                    };
+                                    cvar_names.push(name.clone());
+                                    cvar_dom.push((lo, hi));
+                                    cvar_ws.push((w, s));
+                                }
+                                let all_unsigned = cvar_ws.iter().all(|(_, s)| !*s);
+                                self.constraint_cmp_unsigned = all_unsigned;
+                                let coupled = self.solve_coupled_affine(
+                                    constraints, &cvar_names, &cvar_dom, attempt,
+                                );
+                                self.constraint_cmp_unsigned = false;
+                                let mut owned_names: HashSet<String> = HashSet::default();
+                                if let Some(pairs) = coupled {
+                                    for (col, val) in pairs {
+                                        let (name, lv) = &targets[col];
+                                        let (w, s) = cvar_ws[col];
+                                        let masked = if w >= 64 {
+                                            val as u64
+                                        } else {
+                                            (val as u64) & ((1u64 << w) - 1)
+                                        };
+                                        let mut v = Value::from_u64(masked, w);
+                                        v.is_signed = s;
+                                        owned_names.insert(name.clone());
+                                        let lv = lv.clone();
+                                        self.assign_value(&lv, &v);
+                                    }
+                                }
                                 // Relational items (`t > e`, `t <= e`, …): narrow a
                                 // [lo, hi] interval per target across the WHOLE
                                 // constraint set, then pick uniformly inside it.
@@ -36429,6 +36474,10 @@ impl Simulator {
                                 // converges in one shot (same approach as the
                                 // real-rand bounds scan in exec_randomize).
                                 for (name, lv) in &targets {
+                                    // A coupled target already has its value.
+                                    if owned_names.contains(name) {
+                                        continue;
+                                    }
                                     let cur = self.eval_expr(lv);
                                     let width = cur.width.max(1);
                                     let signed = cur.is_signed;
@@ -37767,6 +37816,452 @@ impl Simulator {
             }
         }
         Some((0, v.to_i64()?))
+    }
+
+    // -----------------------------------------------------------------------
+    // §18.5.12 COUPLED multi-variable affine constraint solve (issue #4).
+    //
+    // `narrow_relational_bounds` narrows each rand variable's [lo,hi] interval
+    // INDEPENDENTLY: a constraint that references two targets (`A + B < 1000`)
+    // narrows NOTHING, so both are drawn full-range and the coupled constraint
+    // is essentially never satisfied. The routines below add a SEQUENTIAL /
+    // propagation solve: order the coupled variables, assign them one at a
+    // time treating already-assigned ones as constants and still-unassigned
+    // ones at the domain extreme that keeps a feasible completion, and draw
+    // each uniformly from its narrowed range. This handles `A+B<K`, `A<B`,
+    // `A+B==C`, `A-B==0` and any `sum(ci*Vi) REL K`. Nonlinear (`A*B`) and
+    // non-affine terms are left to the existing best-effort path.
+    // -----------------------------------------------------------------------
+
+    /// §18.3 flip a relational operator (used when dividing an inequality by a
+    /// negative coefficient).
+    fn flip_op(op: BinaryOp) -> BinaryOp {
+        match op {
+            BinaryOp::Lt => BinaryOp::Gt,
+            BinaryOp::Gt => BinaryOp::Lt,
+            BinaryOp::Leq => BinaryOp::Geq,
+            BinaryOp::Geq => BinaryOp::Leq,
+            o => o,
+        }
+    }
+
+    /// Integer bounds on `vi` for `a*vi OP R` with `a > 0`, where `R` ranges
+    /// over `[rmin, rmax]`. We keep `vi` feasible for the BEST completion (the
+    /// most permissive endpoint of R), so a later variable can always realise
+    /// the required R. Returns `(lo, hi)` narrowings (either may be `None`).
+    fn coupled_narrow(
+        a: i128,
+        op: BinaryOp,
+        rmin: i128,
+        rmax: i128,
+    ) -> (Option<i128>, Option<i128>) {
+        let floor_div = |x: i128, d: i128| x.div_euclid(d);
+        let ceil_div = |x: i128, d: i128| -((-x).div_euclid(d));
+        match op {
+            // a*vi < R  → feasible if vi < rmax  → vi <= floor((rmax-1)/a)
+            BinaryOp::Lt => (None, Some(floor_div(rmax - 1, a))),
+            // a*vi <= R → vi <= floor(rmax/a)
+            BinaryOp::Leq => (None, Some(floor_div(rmax, a))),
+            // a*vi > R  → vi > rmin  → vi >= floor(rmin/a)+1
+            BinaryOp::Gt => (Some(floor_div(rmin, a) + 1), None),
+            // a*vi >= R → vi >= ceil(rmin/a)
+            BinaryOp::Geq => (Some(ceil_div(rmin, a)), None),
+            // a*vi == R → vi ∈ [ceil(rmin/a), floor(rmax/a)]
+            BinaryOp::Eq => (Some(ceil_div(rmin, a)), Some(floor_div(rmax, a))),
+            // != cannot narrow an interval — the acceptance check enforces it.
+            _ => (None, None),
+        }
+    }
+
+    /// Decompose `e` into `(coeffs, const)` where `coeffs[i]` is the integer
+    /// coefficient of target column `i` (`names[last_segment] = i`) and `const`
+    /// is the target-free remainder. `None` when `e` is not affine in the
+    /// targets (a product of two targets, an unmodeled call, …). Mirrors
+    /// `affine_in_target` but tracks ALL target columns at once.
+    fn affine_cols(
+        &mut self,
+        e: &Expression,
+        names: &HashMap<String, usize>,
+        ncols: usize,
+    ) -> Option<(Vec<i128>, i128)> {
+        // A bare target leaf (matched by last path segment, as the constraint
+        // solver matches rand props / scope-randomize targets everywhere).
+        if let ExprKind::Ident(h) = &e.kind {
+            if let Some(seg) = h.path.last() {
+                if let Some(&idx) = names.get(&seg.name.name) {
+                    let mut c = vec![0i128; ncols];
+                    c[idx] = 1;
+                    return Some((c, 0));
+                }
+            }
+        }
+        // A subexpression naming no target is a plain constant.
+        let mut ids = HashSet::default();
+        self.collect_expr_idents(e, &mut ids);
+        if !names.keys().any(|n| ids.contains(n)) {
+            let v = self.eval_expr(e);
+            let k: i128 = if self.constraint_cmp_unsigned {
+                v.to_u128() as i128
+            } else {
+                v.to_i64()? as i128
+            };
+            return Some((vec![0i128; ncols], k));
+        }
+        match &e.kind {
+            ExprKind::Paren(inner) => self.affine_cols(inner, names, ncols),
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$__xz_size_cast" if args.len() == 2 => self.affine_cols(&args[1], names, ncols),
+                "$signed" | "$unsigned" if args.len() == 1 => {
+                    self.affine_cols(&args[0], names, ncols)
+                }
+                _ => None,
+            },
+            ExprKind::Binary { op, left, right }
+                if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) =>
+            {
+                let (lc, lk) = self.affine_cols(left, names, ncols)?;
+                let (rc, rk) = self.affine_cols(right, names, ncols)?;
+                let mut c = vec![0i128; ncols];
+                match op {
+                    BinaryOp::Add => {
+                        for i in 0..ncols {
+                            c[i] = lc[i].checked_add(rc[i])?;
+                        }
+                        Some((c, lk.checked_add(rk)?))
+                    }
+                    BinaryOp::Sub => {
+                        for i in 0..ncols {
+                            c[i] = lc[i].checked_sub(rc[i])?;
+                        }
+                        Some((c, lk.checked_sub(rk)?))
+                    }
+                    BinaryOp::Mul => {
+                        let l_const = lc.iter().all(|&x| x == 0);
+                        let r_const = rc.iter().all(|&x| x == 0);
+                        if r_const {
+                            for i in 0..ncols {
+                                c[i] = lc[i].checked_mul(rk)?;
+                            }
+                            Some((c, lk.checked_mul(rk)?))
+                        } else if l_const {
+                            for i in 0..ncols {
+                                c[i] = rc[i].checked_mul(lk)?;
+                            }
+                            Some((c, lk.checked_mul(rk)?))
+                        } else {
+                            None // quadratic in the targets — not affine
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// A top-level relational/equality expression as a normalized affine
+    /// constraint `sum(coeffs·V) OP c`. `None` when either side is non-affine
+    /// or the targets cancel out entirely.
+    fn affine_binary_con(
+        &mut self,
+        e: &Expression,
+        names: &HashMap<String, usize>,
+        ncols: usize,
+    ) -> Option<(Vec<i128>, i128, BinaryOp)> {
+        let ExprKind::Binary { op, left, right } = &e.kind else {
+            return None;
+        };
+        if !matches!(
+            op,
+            BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq | BinaryOp::Eq | BinaryOp::Neq
+        ) {
+            return None;
+        }
+        let (lc, lk) = self.affine_cols(left, names, ncols)?;
+        let (rc, rk) = self.affine_cols(right, names, ncols)?;
+        let mut coeffs = vec![0i128; ncols];
+        let mut any = false;
+        for i in 0..ncols {
+            coeffs[i] = lc[i].checked_sub(rc[i])?;
+            if coeffs[i] != 0 {
+                any = true;
+            }
+        }
+        if !any {
+            return None; // no target term after cancellation
+        }
+        let c = rk.checked_sub(lk)?;
+        Some((coeffs, c, *op))
+    }
+
+    /// Collect every affine relational/equality constraint reachable in `item`
+    /// (through `Block`). `soft` items are skipped — they are best-effort and
+    /// must never over-constrain the coupled solve.
+    fn collect_affine_cons(
+        &mut self,
+        item: &crate::ast::decl::ConstraintItem,
+        names: &HashMap<String, usize>,
+        ncols: usize,
+        out: &mut Vec<(Vec<i128>, i128, BinaryOp)>,
+    ) {
+        use crate::ast::decl::ConstraintItem as CI;
+        match item {
+            CI::Expr(e) => {
+                if let Some(con) = self.affine_binary_con(e, names, ncols) {
+                    out.push(con);
+                }
+            }
+            CI::Block(items) => {
+                for it in items {
+                    self.collect_affine_cons(it, names, ncols, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every identifier (by last path segment) referenced anywhere in a
+    /// constraint item, including conditions, ranges and nested items.
+    fn collect_item_idents(
+        &self,
+        item: &crate::ast::decl::ConstraintItem,
+        out: &mut HashSet<String>,
+    ) {
+        use crate::ast::decl::ConstraintItem as CI;
+        use crate::ast::decl::ConstraintRange as CR;
+        match item {
+            CI::Expr(e) => self.collect_expr_idents(e, out),
+            CI::Inside { expr, range, .. } => {
+                self.collect_expr_idents(expr, out);
+                for r in range {
+                    match r {
+                        CR::Value(e) => self.collect_expr_idents(e, out),
+                        CR::Range { lo, hi } => {
+                            self.collect_expr_idents(lo, out);
+                            self.collect_expr_idents(hi, out);
+                        }
+                    }
+                }
+            }
+            CI::Implication { condition, constraint, .. } => {
+                self.collect_expr_idents(condition, out);
+                self.collect_item_idents(constraint, out);
+            }
+            CI::IfElse { condition, then_item, else_item, .. } => {
+                self.collect_expr_idents(condition, out);
+                self.collect_item_idents(then_item, out);
+                if let Some(ei) = else_item {
+                    self.collect_item_idents(ei, out);
+                }
+            }
+            CI::Foreach { array, item, .. } => {
+                self.collect_expr_idents(array, out);
+                self.collect_item_idents(item, out);
+            }
+            CI::Soft(inner) => self.collect_item_idents(inner, out),
+            CI::Block(items) => {
+                for it in items {
+                    self.collect_item_idents(it, out);
+                }
+            }
+            CI::Unique { exprs, .. } => {
+                for e in exprs {
+                    self.collect_expr_idents(e, out);
+                }
+            }
+            CI::Solve { .. } => {}
+        }
+    }
+
+    /// True when `item` is safe for the coupled solve to own the referenced
+    /// targets — i.e. it does NOT constrain an owned variable through a
+    /// construct the affine solve cannot see (`inside`, `dist`, implication,
+    /// `foreach`, a non-affine `==`, …). If it does, we abort the coupled
+    /// solve and let the existing best-effort pipeline handle the whole set,
+    /// so we never regress a case that already worked.
+    fn item_ok_for_coupled(
+        &mut self,
+        item: &crate::ast::decl::ConstraintItem,
+        names: &HashMap<String, usize>,
+        ncols: usize,
+        owned: &HashSet<usize>,
+    ) -> bool {
+        use crate::ast::decl::ConstraintItem as CI;
+        let touches_owned = |me: &Self, it: &CI| -> bool {
+            let mut ids = HashSet::default();
+            me.collect_item_idents(it, &mut ids);
+            ids.iter()
+                .any(|n| names.get(n).map_or(false, |i| owned.contains(i)))
+        };
+        match item {
+            CI::Expr(e) => {
+                if self.affine_binary_con(e, names, ncols).is_some() {
+                    return true; // fully modeled affine constraint
+                }
+                !touches_owned(self, item)
+            }
+            CI::Block(items) => items
+                .iter()
+                .all(|it| self.item_ok_for_coupled(it, names, ncols, owned)),
+            // A soft constraint can always be dropped, and `solve` is only an
+            // ordering hint — neither blocks the coupled solve.
+            CI::Soft(_) | CI::Solve { .. } => true,
+            other => !touches_owned(self, other),
+        }
+    }
+
+    /// §18.5.12 — sequential coupled affine solve. `var_names[i]` /
+    /// `var_dom[i]` describe target column `i` (name matched by last path
+    /// segment; `[lo,hi]` its declared integer domain). Returns `(col, value)`
+    /// pairs for the COUPLED columns it assigned, or `None` when there is no
+    /// coupling (backward-compatible: caller uses its existing path), when an
+    /// owned variable is also constrained by an unmodeled construct, or when
+    /// the chosen order dead-ends (caller retries with a fresh seed/order).
+    fn solve_coupled_affine(
+        &mut self,
+        items: &[crate::ast::decl::ConstraintItem],
+        var_names: &[String],
+        var_dom: &[(i128, i128)],
+        attempt: usize,
+    ) -> Option<Vec<(usize, i128)>> {
+        use rand::Rng;
+        let ncols = var_names.len();
+        if ncols < 2 {
+            return None;
+        }
+        let mut names: HashMap<String, usize> = HashMap::default();
+        for (i, n) in var_names.iter().enumerate() {
+            names.insert(n.clone(), i);
+        }
+        // Extract the affine relational/equality constraints.
+        let mut cons: Vec<(Vec<i128>, i128, BinaryOp)> = Vec::new();
+        for it in items {
+            self.collect_affine_cons(it, &names, ncols, &mut cons);
+        }
+        // A variable is COUPLED if it shares a constraint with another target.
+        let mut owned: HashSet<usize> = HashSet::default();
+        for (coeffs, _, _) in &cons {
+            let nz: Vec<usize> = (0..ncols).filter(|&i| coeffs[i] != 0).collect();
+            if nz.len() >= 2 {
+                for i in nz {
+                    owned.insert(i);
+                }
+            }
+        }
+        if owned.is_empty() {
+            return None; // no coupling — nothing to do here
+        }
+        // Never take ownership of a variable that an unmodeled construct also
+        // constrains (preserve existing behavior for such mixed sets).
+        for it in items {
+            if !self.item_ok_for_coupled(it, &names, ncols, &owned) {
+                return None;
+            }
+        }
+        // Keep only constraints wholly over owned columns (single-variable
+        // bounds on an owned var are included and tighten its domain).
+        cons.retain(|(coeffs, _, _)| (0..ncols).all(|i| coeffs[i] == 0 || owned.contains(&i)));
+
+        // Pre-narrow each owned var by its SINGLE-variable bounds first, so the
+        // extreme used for a still-unassigned var already respects that var's
+        // own constraints (makes the solve order far less brittle).
+        let mut dom0 = var_dom.to_vec();
+        for &col in owned.iter() {
+            let (mut lo, mut hi) = dom0[col];
+            for (coeffs, c, op) in &cons {
+                if coeffs[col] == 0 {
+                    continue;
+                }
+                if (0..ncols).any(|i| i != col && coeffs[i] != 0) {
+                    continue; // not a single-variable bound
+                }
+                let ci = coeffs[col];
+                let (a, eop, rmn, rmx) = if ci < 0 {
+                    (-ci, Self::flip_op(*op), -*c, -*c)
+                } else {
+                    (ci, *op, *c, *c)
+                };
+                let (ol, oh) = Self::coupled_narrow(a, eop, rmn, rmx);
+                if let Some(l) = ol {
+                    lo = lo.max(l);
+                }
+                if let Some(h) = oh {
+                    hi = hi.min(h);
+                }
+            }
+            dom0[col] = (lo, hi);
+        }
+
+        // Solve order: declaration order first; reshuffle on retries so a
+        // dead-ending order is escaped with a fresh seed.
+        let mut order: Vec<usize> = {
+            let mut v: Vec<usize> = owned.iter().copied().collect();
+            v.sort_unstable();
+            v
+        };
+        if attempt > 0 && order.len() > 1 {
+            for i in (1..order.len()).rev() {
+                let j = self.cur_rng().gen_range(0..=i);
+                order.swap(i, j);
+            }
+        }
+
+        // Sequential assignment.
+        let mut assigned: HashMap<usize, i128> = HashMap::default();
+        for &col in &order {
+            let (mut lo, mut hi) = dom0[col];
+            for (coeffs, c, op) in &cons {
+                let ci = coeffs[col];
+                if ci == 0 {
+                    continue;
+                }
+                let mut fixed = 0i128;
+                let mut sum_min = 0i128; // min of sum(cj*vj) over unassigned j!=col
+                let mut sum_max = 0i128;
+                for j in 0..ncols {
+                    let cj = coeffs[j];
+                    if j == col || cj == 0 {
+                        continue;
+                    }
+                    if let Some(&vj) = assigned.get(&j) {
+                        fixed += cj * vj;
+                    } else {
+                        let (lj, hj) = dom0[j];
+                        if cj > 0 {
+                            sum_min += cj * lj;
+                            sum_max += cj * hj;
+                        } else {
+                            sum_min += cj * hj;
+                            sum_max += cj * lj;
+                        }
+                    }
+                }
+                let rmax = *c - fixed - sum_min;
+                let rmin = *c - fixed - sum_max;
+                let (a, eop, rmn, rmx) = if ci < 0 {
+                    (-ci, Self::flip_op(*op), -rmax, -rmin)
+                } else {
+                    (ci, *op, rmin, rmax)
+                };
+                let (ol, oh) = Self::coupled_narrow(a, eop, rmn, rmx);
+                if let Some(l) = ol {
+                    lo = lo.max(l);
+                }
+                if let Some(h) = oh {
+                    hi = hi.min(h);
+                }
+            }
+            if lo > hi {
+                return None; // this order dead-ended — caller retries
+            }
+            let pick = if lo == hi {
+                lo
+            } else {
+                self.cur_rng().gen_range(lo..=hi)
+            };
+            assigned.insert(col, pick);
+        }
+        Some(assigned.into_iter().collect())
     }
 
     /// Match `expr` (a constraint operand) to one of the randomize targets,
@@ -49409,6 +49904,62 @@ impl Simulator {
             if let Some(Some(inst)) = self.heap.get_mut(handle) {
                 for (name, val) in &solved_props {
                     inst.properties.insert(name.clone(), val.clone());
+                }
+            }
+
+            // §18.5.12 (issue #4): COUPLED affine constraints (`A + B < 1000`,
+            // `A < B`, `A + B == 50`) tie two rand props together, so the
+            // per-variable draw above cannot satisfy them. Solve those props
+            // sequentially and overwrite their independently-drawn values; the
+            // acceptance check + trial retry below still guards the result
+            // (an UNSAT set keeps failing and honestly returns 0).
+            {
+                let mut cvar_names: Vec<String> = Vec::new();
+                let mut cvar_dom: Vec<(i128, i128)> = Vec::new();
+                let mut cvar_w: Vec<(u32, bool)> = Vec::new();
+                for (name, width) in &rand_props {
+                    if enum_prop_types.contains_key(name)
+                        || real_rand_props.contains(name)
+                        || randc_set.contains(name)
+                    {
+                        continue;
+                    }
+                    let s = signed_rand_props.contains(name);
+                    let ww = (*width).min(127);
+                    let (lo, hi): (i128, i128) = if s {
+                        (-(1i128 << ww.saturating_sub(1)), (1i128 << ww.saturating_sub(1)) - 1)
+                    } else {
+                        (0, (1i128 << ww) - 1)
+                    };
+                    cvar_names.push(name.clone());
+                    cvar_dom.push((lo, hi));
+                    cvar_w.push((*width, s));
+                }
+                if cvar_names.len() >= 2 {
+                    let citems: Vec<ConstraintItem> =
+                        constraints.iter().flat_map(|c| c.items.iter().cloned()).collect();
+                    let all_unsigned = cvar_w.iter().all(|(_, s)| !*s);
+                    self.constraint_cmp_unsigned = all_unsigned;
+                    let coupled =
+                        self.solve_coupled_affine(&citems, &cvar_names, &cvar_dom, _trial);
+                    self.constraint_cmp_unsigned = false;
+                    if let Some(pairs) = coupled {
+                        for (col, val) in pairs {
+                            let name = cvar_names[col].clone();
+                            let (w, s) = cvar_w[col];
+                            let masked = if w >= 64 {
+                                val as u64
+                            } else {
+                                (val as u64) & ((1u64 << w) - 1)
+                            };
+                            let mut v = Value::from_u64(masked, w);
+                            v.is_signed = s;
+                            solved_props.insert(name.clone(), v.clone());
+                            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                                inst.properties.insert(name, v);
+                            }
+                        }
+                    }
                 }
             }
 
