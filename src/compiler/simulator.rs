@@ -52503,6 +52503,25 @@ impl Simulator {
                         {
                             return Some(t.clone());
                         }
+                        // A class-local typedef (e.g. `this_type` =
+                        // `Self#(T)`): resolve it to the concrete class so a
+                        // `static this_type m_inst; m_inst = new()` property
+                        // constructs the right class. `resolve_typeref_class_name`
+                        // is context-aware (resolves `this_type` to the
+                        // enclosing class). Without this, the typedef name
+                        // matched none of the cases above, returned None, and
+                        // `new()` fell through to a wrong/empty construction.
+                        let tn = crate::ast::types::TypeName {
+                            scope: None,
+                            name: crate::ast::Identifier {
+                                name: t.clone(),
+                                span: crate::ast::Span::dummy(),
+                            },
+                            span: crate::ast::Span::dummy(),
+                        };
+                        if let Some(resolved) = self.resolve_typeref_class_name(&tn) {
+                            return Some(resolved);
+                        }
                     }
                     return None;
                 }
