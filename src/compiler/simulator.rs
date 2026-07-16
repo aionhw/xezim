@@ -42873,11 +42873,26 @@ impl Simulator {
             // factory type names (`riscv_<NAME>_instr`). Resolve the enum type
             // from the receiver expression when known, else fall back to a
             // value match across enum tables (preferring the largest).
+            //
+            // IMPORTANT: this MUST NOT shadow a USER-DEFINED class method named
+            // `name()`. If the receiver's declared type is a class (not an
+            // enum) that defines its own `name`, defer to the user method by
+            // skipping this intercept. Without this guard, a class with a
+            // `function string name()` silently returns empty (the enum lookup
+            // finds no match and falls through to zero). This is extremely
+            // common — UVM's `get_type_name()` and many user classes define
+            // `name()`.
             if mname == "name" && args.is_empty() {
-                let val = self.eval_expr(expr).to_u64().unwrap_or(0);
                 let type_hint = self.get_expr_type_name(expr);
-                if let Some(nm) = self.enum_value_name(val, type_hint.as_deref()) {
-                    return Value::from_string(&nm);
+                let is_class_with_name_method = type_hint
+                    .as_deref()
+                    .and_then(|tn| self.module.classes.get(tn))
+                    .map_or(false, |cd| cd.methods.contains_key("name"));
+                if !is_class_with_name_method {
+                    let val = self.eval_expr(expr).to_u64().unwrap_or(0);
+                    if let Some(nm) = self.enum_value_name(val, type_hint.as_deref()) {
+                        return Value::from_string(&nm);
+                    }
                 }
             }
             // §6.19.6 enum methods: first(), last(), next(), prev(), num().
@@ -43663,14 +43678,30 @@ impl Simulator {
                     }
                 }
                 if m == "name" {
-                    let val = self.eval_expr(&base_expr).to_u64().unwrap_or(0);
+                    // Guard: a USER-DEFINED class method named `name()` must
+                    // NOT be shadowed by the enum-reflection intercept. If
+                    // the receiver's declared type is a class defining `name`,
+                    // fall through to normal method dispatch. Without this,
+                    // `c.name()` on a class object returns empty (the enum
+                    // fallback below always returns ""). This is common —
+                    // UVM's `get_type_name()` and many user classes define
+                    // `name()`.
                     let hint = self.get_expr_type_name(&base_expr);
-                    if let Some(nm) = self.enum_value_name(val, hint.as_deref()) {
-                        return Value::from_string(&nm);
+                    let is_class_name = hint
+                        .as_deref()
+                        .and_then(|tn| self.module.classes.get(tn))
+                        .map_or(false, |cd| cd.methods.contains_key("name"));
+                    if !is_class_name {
+                        let val = self.eval_expr(&base_expr).to_u64().unwrap_or(0);
+                        if let Some(nm) = self.enum_value_name(val, hint.as_deref()) {
+                            return Value::from_string(&nm);
+                        }
+                        // Enum value with no matching member: return empty rather
+                        // than falling through to an object-handle `.name()`.
+                        return Value::from_string("");
                     }
-                    // Enum value with no matching member: return empty rather
-                    // than falling through to an object-handle `.name()`.
-                    return Value::from_string("");
+                    // else: class with a user `name()` method — fall through
+                    // to the static/virtual method dispatch below.
                 } else if m == "tolower" || m == "toupper" {
                     let s = self.eval_expr(&base_expr).to_sv_string();
                     let r = if m == "tolower" { s.to_lowercase() } else { s.to_uppercase() };
