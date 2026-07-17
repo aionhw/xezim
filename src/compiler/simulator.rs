@@ -506,6 +506,11 @@ struct CombEntry {
     /// stimulus. So: don't seed these from the time-0 dirty set; let the
     /// first real sensitivity transition trigger them.
     defer_at_time0: bool,
+    /// Source span of the originating construct (cont-assign LHS or always
+    /// block statement) so diagnostics — notably the settle-limit warning —
+    /// can name file:line for a non-converging driver. `Span::dummy()` when
+    /// the origin has no source (synthesized entries).
+    span: crate::ast::Span,
 }
 
 /// Does `stmt` (transitively, through nested blocks/branches/loops/timing
@@ -12894,6 +12899,8 @@ impl Simulator {
             .chain(pending_ca.into_iter().map(|p| p.materialize()))
         {
             let explicit_delay = ca.delay;
+            // Captured before `ca.lhs` may be moved into the CombItem below.
+            let ca_span = ca.lhs.span;
             // §21.7.2.1 `var_type`: an object whose only driver is continuous is
             // a `wire` in a dump (see `cont_driven`). Recorded here — this is the
             // last point at which the continuous assigns still exist as ASTs.
@@ -13223,6 +13230,7 @@ impl Simulator {
                 write_signal_ids: wids,
                 has_unresolved_reads,
                 defer_at_time0: false,
+                span: ca_span,
             });
         }
 
@@ -13345,6 +13353,7 @@ impl Simulator {
                     write_signal_ids: wids,
                     has_unresolved_reads,
                     defer_at_time0: !is_always_comb && stmt_has_finish_or_stop(&ab.stmt),
+                    span: ab.stmt.span,
                 });
             }
         }
@@ -15027,7 +15036,14 @@ impl Simulator {
     /// The module whose definition `pid`'s originating block was written in,
     /// via the same scope→instance lookup as `stall_pid_src_file`.
     fn stall_pid_def_module(&self, pid: usize) -> Option<String> {
-        match self.process_scope_hint.get(&pid).map(String::as_str) {
+        self.scope_def_module(self.process_scope_hint.get(&pid).map(String::as_str))
+    }
+
+    /// The module DEFINING the instance at `scope` (empty/None = the top
+    /// module itself). Shared by pid-based attribution (stall report) and
+    /// scope-hint-based attribution (settle-limit warning, edge blocks).
+    fn scope_def_module(&self, scope: Option<&str>) -> Option<String> {
+        match scope {
             None | Some("") => Some(self.module.name.clone()),
             Some(scope) => self
                 .module
@@ -15036,6 +15052,14 @@ impl Simulator {
                 .find(|inst| inst.path == scope)
                 .map(|inst| inst.def_name.clone()),
         }
+    }
+
+    /// The retained-source index for a construct inlined under `scope` —
+    /// scope → defining module → file. `None` when any link is missing;
+    /// `span_file_line_in` then falls back to the exact-fit rule.
+    fn scope_src_file(&self, scope: Option<&str>) -> Option<u32> {
+        self.scope_def_module(scope)
+            .and_then(|m| self.module.src_file_of_module.get(&m).copied())
     }
 
     /// Best-effort `file:line` for a statement span. A span is a byte offset
@@ -21176,9 +21200,18 @@ impl Simulator {
         // (e.g. ~467K on c910) but the triggered set is small.
         let mut cur_list = std::mem::take(&mut self.settle_dirty_ids);
         cur_list.clear();
+        // Settle-limit attribution: when the loop is about to exhaust its
+        // budget, record which signals are still being written — and by
+        // which entry — so the warning below can NAME the non-converging
+        // ring instead of just saying "signals may not have converged".
+        // Costs one compare per pass until the final CHURN_TAIL passes.
+        const CHURN_TAIL: u64 = 3;
+        let mut churn: Vec<(usize, usize)> = Vec::new(); // (signal_id, entry_idx)
+        let mut converged = false;
         for _iteration in 0..limit {
             total_iters += 1;
             let mut evaluated_any = false;
+            let capture_churn = _iteration + CHURN_TAIL >= limit;
 
             // Take the current worklist and sort by eidx (topo order).
             std::mem::swap(&mut cur_list, &mut self.settle_triggered_list);
@@ -21238,6 +21271,9 @@ impl Simulator {
                             {
                                 self.table_modified = true;
                                 self.after_signal_write(*dst_id);
+                                if capture_churn {
+                                    churn.push((*dst_id, eidx));
+                                }
                                 if self.activity_mon {
                                     if self.signal_toggle_counts.len() != self.signal_table.len() {
                                         self.signal_toggle_counts.resize(self.signal_table.len(), 0);
@@ -21300,6 +21336,9 @@ impl Simulator {
                             } else if self.signal_table[*dst_id].set_inline_bits(sv, sx) {
                                 self.table_modified = true;
                                 self.after_signal_write(*dst_id);
+                                if capture_churn {
+                                    churn.push((*dst_id, eidx));
+                                }
                                 if self.activity_mon {
                                     if self.signal_toggle_counts.len() != self.signal_table.len() {
                                         self.signal_toggle_counts
@@ -21339,6 +21378,9 @@ impl Simulator {
                                 } else {
                                     write_sig!(self, *dst_id, resized);
                                     self.table_modified = true;
+                                    if capture_churn {
+                                        churn.push((*dst_id, eidx));
+                                    }
                                     if self.activity_mon {
                                         if self.signal_toggle_counts.len()
                                             != self.signal_table.len()
@@ -21421,6 +21463,11 @@ impl Simulator {
                 // and will be reached before the outer iter boundary.
                 let dirty_after = self.dirty_list.len();
                 if dirty_after > dirty_before {
+                    if capture_churn {
+                        for di in dirty_before..dirty_after {
+                            churn.push((self.dirty_list[di], eidx));
+                        }
+                    }
                     for di in dirty_before..dirty_after {
                         let sig_id = self.dirty_list[di];
                         // Consume the dirty flag — we're propagating it now.
@@ -21448,6 +21495,7 @@ impl Simulator {
 
             // After one full topo scan: if no entry was evaluated, fixpoint.
             if !evaluated_any {
+                converged = true;
                 break;
             }
             // Reset dirty bookkeeping for the next scan. (We already consumed
@@ -21464,13 +21512,86 @@ impl Simulator {
         self.settle_dirty_ids = cur_list;
         self.settle_iters += total_iters;
         if total_iters > self.max_settle_iters {
-            if total_iters >= limit && self.dirty_any {
+            // Unconverged = the loop exhausted its budget with entries still
+            // queued for the next pass. (The old `self.dirty_any` test here
+            // was dead: every pass ends with `dirty_any = false`, so the
+            // warning never actually fired even on a hard oscillator.)
+            if total_iters >= limit && !converged && !self.settle_triggered_list.is_empty() {
                 eprintln!("[WARN] settle limit hit ({} iters) at time {} — signals may not have converged. Use --settle-limit to increase.",
                     limit, self.time);
+                self.report_settle_churn(&churn, CHURN_TAIL);
             }
             self.max_settle_iters = total_iters;
         }
         self.settling = false;
+    }
+
+    /// Attribution for the settle-limit warning: name the signals that were
+    /// still CHANGING in the final settle iterations — current value, change
+    /// count, and (when resolvable) the driving cont-assign / comb block's
+    /// file:line and instance scope. Degrades gracefully: entries without a
+    /// span print name + value only.
+    fn report_settle_churn(&self, churn: &[(usize, usize)], tail: u64) {
+        if churn.is_empty() {
+            return;
+        }
+        // (signal -> (change count, last writing entry)).
+        let mut counts: HashMap<usize, (u64, usize)> = HashMap::default();
+        for &(sig, eidx) in churn {
+            let e = counts.entry(sig).or_insert((0, eidx));
+            e.0 += 1;
+            e.1 = eidx;
+        }
+        let total = counts.len();
+        let mut top: Vec<(usize, u64, usize)> =
+            counts.into_iter().map(|(s, (c, e))| (s, c, e)).collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        top.truncate(5);
+        eprintln!(
+            "       Still changing in the last {} iterations ({} of {} signals shown) — likely a zero-delay combinational loop through:",
+            tail,
+            top.len(),
+            total
+        );
+        for (sig, cnt, eidx) in top {
+            let name = self.name_for_id(sig);
+            let width = self.signal_widths.get(sig).copied().unwrap_or(1);
+            let val = match self.signal_table.get(sig) {
+                Some(v) if width > 16 => format!("'h{}", v.to_hex_string()),
+                Some(v) => format!("'b{}", v.to_bin()),
+                None => "?".to_string(),
+            };
+            let mut line = format!("         {} = {} — changed {}x", name, val, cnt);
+            if let Some(entry) = self.comb_entries.get(eidx) {
+                let kind = match &entry.item {
+                    CombItem::AlwaysBlock { is_always_comb, .. }
+                    | CombItem::CompiledAlwaysBlock { is_always_comb, .. } => {
+                        if *is_always_comb {
+                            "always_comb block"
+                        } else {
+                            "always block"
+                        }
+                    }
+                    _ => "cont-assign",
+                };
+                line.push_str(" — driven by ");
+                line.push_str(kind);
+                let src_file = self.scope_src_file(entry.scope_hint.as_deref());
+                if let Some(loc) = self.span_file_line_in(entry.span, src_file) {
+                    line.push_str(" at ");
+                    line.push_str(&loc);
+                }
+                if let Some(scope) = entry.scope_hint.as_deref().filter(|s| !s.is_empty()) {
+                    match self.scope_def_module(Some(scope)) {
+                        Some(m) if m != self.module.name => {
+                            line.push_str(&format!(" ({}, module {})", scope, m));
+                        }
+                        _ => line.push_str(&format!(" ({})", scope)),
+                    }
+                }
+            }
+            eprintln!("{}", line);
+        }
     }
 
     /// Resolve a fully-qualified signal name (possibly an array element

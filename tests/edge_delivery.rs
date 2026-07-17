@@ -140,6 +140,62 @@ endmodule
     assert!(find_line(&sim, "CLEAN").is_some());
 }
 
+/// S3d: the settle-limit warning must NAME the non-converging signals —
+/// value, and the driving block's file:line — not just say "signals may not
+/// have converged". Asserted through the CLI binary (the warning goes to
+/// stderr) — same subprocess pattern as tests/determinism_and_stall.rs.
+#[test]
+fn settle_limit_warning_names_the_oscillating_signals() {
+    use std::process::Command;
+
+    fn xezim_bin() -> std::path::PathBuf {
+        let mut p = std::env::current_exe().expect("current_exe");
+        p.pop();
+        if p.ends_with("deps") {
+            p.pop();
+        }
+        p.join("xezim")
+    }
+
+    let dir = std::env::temp_dir().join("xezim_settle_warn_test");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let sv = dir.join("settle_ring.sv");
+    // A zero-delay combinational oscillator: a -> b -> a with an inverter.
+    // The always_comb blocks sit on lines 3 and 4 of the file.
+    std::fs::write(
+        &sv,
+        "module t;\n  logic a, b;\n  always_comb a = ~b;\n  always_comb b = a;\n  initial begin a = 0; #10 $finish; end\nendmodule\n",
+    )
+    .expect("write sv");
+    let out = Command::new(xezim_bin()).arg(&sv).output().expect("run xezim");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The established first line must survive verbatim (scripts grep it).
+    assert!(
+        stderr.contains("settle limit hit (100 iters) at time 0 — signals may not have converged"),
+        "settle-limit warning missing or first line changed:\n{}",
+        stderr
+    );
+    // ... and it must now carry attribution: both ring signals with values
+    // and the driving block's file:line.
+    assert!(
+        stderr.contains("Still changing in the last"),
+        "attribution section missing:\n{}",
+        stderr
+    );
+    for (sig, line) in [("a = 'b", 3), ("b = 'b", 4)] {
+        assert!(
+            stderr.contains(sig),
+            "signal + value missing from settle warning:\n{}",
+            stderr
+        );
+        assert!(
+            stderr.contains(&format!("always_comb block at {}:{}", sv.display(), line)),
+            "driver file:line missing from settle warning:\n{}",
+            stderr
+        );
+    }
+}
+
 /// A `forever @(posedge clk)` loop must fire exactly once per edge — the
 /// re-registration after each wake must not re-consume the same edge in a
 /// later delta cycle of the same timestamp.
