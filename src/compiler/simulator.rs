@@ -365,6 +365,17 @@ macro_rules! write_sig {
                     $self.changed_edge_pos.push(__ep as usize);
                 }
             }
+            // §9.2 re-trigger: a blocking write to an edge-sensitive signal
+            // made WHILE an edge block executes must re-run edge detection
+            // for that signal (drain_edge_exec_rescan) — record its position.
+            // One bool load when not inside an edge block.
+            if $self.in_edge_block && (__wsig_id as usize) < $self.sig_to_edge_pos.len() {
+                let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
+                if __ep >= 0 && !$self.edge_exec_seen[__ep as usize] {
+                    $self.edge_exec_seen[__ep as usize] = true;
+                    $self.edge_exec_wrote.push(__ep as usize);
+                }
+            }
             // Fire any registered cbValueChange callbacks. The dispatch lives
             // inside the macro so every write path (blocking assigns,
             // NBA writes, force updates, settle loops, initial block
@@ -2769,6 +2780,20 @@ pub struct Simulator {
     edge_pos_seen: Vec<bool>,
     dirty_edge: bool,
     dirty_edge_shadow: bool,
+    /// Edge positions written by a BLOCKING assign while an edge-triggered
+    /// block was executing (`in_edge_block`), deduped via `edge_exec_seen`.
+    /// §9.2: such a change must (re-)trigger blocks sensitive to it —
+    /// `drain_edge_exec_rescan` re-detects exactly these positions in a
+    /// follow-up delta pass instead of silently coalescing them away.
+    edge_exec_wrote: Vec<usize>,
+    edge_exec_seen: Vec<bool>,
+    /// True while `drain_edge_exec_rescan` is re-running check_edges for
+    /// exec-written positions; makes check_edges_inner count block
+    /// executions into `edge_rescan_block_hits` for stall attribution.
+    in_edge_rescan: bool,
+    /// block index -> executions during the current rescan drain. Read by
+    /// `report_edge_rescan_stall` to name the ping-ponging always blocks.
+    edge_rescan_block_hits: HashMap<usize, u64>,
     /// Counter — number of iters whose check_edges ran over just the
     /// toggled clock subset instead of the full edge_signal_ids scan.
     prof_clocks_only_detect: u64,
@@ -4386,6 +4411,10 @@ impl Simulator {
             sig_to_edge_pos: Vec::new(),
             changed_edge_pos: Vec::new(),
             edge_pos_seen: Vec::new(),
+            edge_exec_wrote: Vec::new(),
+            edge_exec_seen: Vec::new(),
+            in_edge_rescan: false,
+            edge_rescan_block_hits: HashMap::default(),
             dirty_edge: std::env::var_os("XEZIM_DIRTY_EDGE").is_some(),
             dirty_edge_shadow: std::env::var_os("XEZIM_DIRTY_EDGE_SHADOW").is_some(),
             prof_clocks_only_detect: 0,
@@ -7378,16 +7407,20 @@ impl Simulator {
         // Also collect from event waiters that are registered at time 0
         self.edge_signal_ids.sort_unstable();
         self.edge_signal_ids.dedup();
-        // Reverse map for dirty-driven edge detect: signal id -> its position
-        // in the (now sorted, stable) edge_signal_ids, or -1. Sized to the
-        // signal table so the per-write check is one bounds-checked load.
-        if self.dirty_edge || self.dirty_edge_shadow {
-            self.sig_to_edge_pos = vec![-1i32; self.signal_table.len()];
-            for (pos, &sid) in self.edge_signal_ids.iter().enumerate() {
-                if sid < self.sig_to_edge_pos.len() {
-                    self.sig_to_edge_pos[sid] = pos as i32;
-                }
+        // Reverse map: signal id -> its position in the (now sorted, stable)
+        // edge_signal_ids, or -1. Sized to the signal table so the per-write
+        // check is one bounds-checked load. Used by the dirty-driven edge
+        // detect (opt-in) AND by the always-on edge-exec write recording
+        // (blocking writes made DURING edge-block execution must trigger a
+        // re-detect pass — see drain_edge_exec_rescan).
+        self.sig_to_edge_pos = vec![-1i32; self.signal_table.len()];
+        for (pos, &sid) in self.edge_signal_ids.iter().enumerate() {
+            if sid < self.sig_to_edge_pos.len() {
+                self.sig_to_edge_pos[sid] = pos as i32;
             }
+        }
+        self.edge_exec_seen = vec![false; self.edge_signal_ids.len()];
+        if self.dirty_edge || self.dirty_edge_shadow {
             self.edge_pos_seen = vec![false; self.edge_signal_ids.len()];
         }
         // Cache each clock generator's position inside edge_signal_ids so
@@ -18794,6 +18827,138 @@ impl Simulator {
     }
 
     fn check_edges(&mut self) {
+        self.check_edges_pass();
+        self.drain_edge_exec_rescan();
+    }
+
+    /// §9.2 re-trigger drain. A blocking write to an edge-sensitive signal
+    /// made WHILE an edge block executed (recorded into `edge_exec_wrote`
+    /// via write_sig!/note_edge_write) is a change that must re-trigger
+    /// blocks sensitive to it — check_edges used to coalesce it away
+    /// (prev was only refreshed by the NEXT snapshot, which erased the
+    /// pending edge before any detect saw it: silent event loss). Re-detect
+    /// exactly the written positions, repeating while the re-triggered
+    /// blocks keep producing new writes. A mutual ping-pong
+    /// (`always @(a) b=~b;` / `always @(b) a=~a;`) is then a genuine
+    /// zero-delay livelock: bounded by the stall detector
+    /// (XEZIM_STALL_LIMIT), which terminates with an attributed report
+    /// naming the blocks instead of hanging.
+    fn drain_edge_exec_rescan(&mut self) {
+        if self.edge_exec_wrote.is_empty() {
+            return;
+        }
+        let mut passes: u64 = 0;
+        self.edge_rescan_block_hits.clear();
+        self.in_edge_rescan = true;
+        let mut subset: Vec<usize> = Vec::new();
+        while !self.edge_exec_wrote.is_empty() && !self.finished {
+            subset.clear();
+            std::mem::swap(&mut subset, &mut self.edge_exec_wrote);
+            for &p in &subset {
+                if p < self.edge_exec_seen.len() {
+                    self.edge_exec_seen[p] = false;
+                }
+            }
+            passes += 1;
+            if self.stall_limit > 0 && passes > self.stall_limit {
+                self.report_edge_rescan_stall(passes);
+                self.finished = true;
+                break;
+            }
+            self.check_edges_inner(Some(&subset), false);
+        }
+        self.in_edge_rescan = false;
+    }
+
+    /// A zero-delay livelock sustained entirely by edge-triggered always
+    /// blocks re-triggering each other through blocking writes (no process
+    /// ever re-enters the scheduler, so the pid-based stall report cannot
+    /// see it). Names the most frequently re-triggered blocks — kind,
+    /// file:line, instance scope, sensitivity list — mirroring
+    /// `report_zero_delay_stall`'s shape.
+    fn report_edge_rescan_stall(&mut self, passes: u64) {
+        eprintln!(
+            "[xezim][error] simulation STALLED at time {} — no progress after {} edge-cascade delta cycles at this timestamp.",
+            self.time, passes
+        );
+        eprintln!(
+            "               This is a zero-delay (delta) livelock: edge-sensitive always blocks keep"
+        );
+        eprintln!(
+            "               re-triggering each other at the same timestamp, so simulated time can never move."
+        );
+        let mut top: Vec<(usize, u64)> = self
+            .edge_rescan_block_hits
+            .iter()
+            .map(|(b, c)| (*b, *c))
+            .collect();
+        top.sort_by_key(|&(bi, c)| (std::cmp::Reverse(c), bi));
+        top.truncate(5);
+        if !top.is_empty() {
+            eprintln!("               Most frequently re-triggered blocks:");
+            for (bi, count) in top {
+                let Some(block) = self.edge_blocks.get(bi) else { continue };
+                let kind = match block.kind {
+                    AlwaysKind::AlwaysFf => "always_ff block",
+                    AlwaysKind::AlwaysComb => "always_comb block",
+                    AlwaysKind::AlwaysLatch => "always_latch block",
+                    AlwaysKind::Always => "always block",
+                };
+                let mut line = format!("                 {}", kind);
+                let scope = if block.scope.is_empty() {
+                    None
+                } else {
+                    Some(block.scope.as_str())
+                };
+                let src_file = self.scope_src_file(scope);
+                if let Some(loc) = self.span_file_line_in(block.stmt.span, src_file) {
+                    line.push_str(" at ");
+                    line.push_str(&loc);
+                }
+                if let Some(s) = scope {
+                    match self.scope_def_module(Some(s)) {
+                        Some(m) if m != self.module.name => {
+                            line.push_str(&format!(" ({}, module {})", s, m));
+                        }
+                        _ => line.push_str(&format!(" ({})", s)),
+                    }
+                }
+                let sens = block
+                    .resolved_sensitivities
+                    .iter()
+                    .map(|si| {
+                        let edge = match si.edge {
+                            EdgeKind::Posedge => "posedge ",
+                            EdgeKind::Negedge => "negedge ",
+                            EdgeKind::AnyEdge => "",
+                        };
+                        format!("{}{}", edge, self.name_for_id(si.signal_id))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" or ");
+                if !sens.is_empty() {
+                    line.push_str(&format!(" — sensitive to @({})", sens));
+                }
+                line.push_str(&format!(" — ran {} times at this timestamp", count));
+                eprintln!("{}", line);
+            }
+        }
+        eprintln!("               Common causes:");
+        eprintln!(
+            "                 * two always blocks each writing a signal in the other's sensitivity list with no delay"
+        );
+        eprintln!(
+            "                 * a combinational feedback loop expressed through @(...) blocks"
+        );
+        eprintln!(
+            "               Raise or disable the check with XEZIM_STALL_LIMIT=<n> (0 = never stall-check)."
+        );
+    }
+
+    /// One edge detect+dispatch pass (mode dispatcher). Callers should use
+    /// `check_edges`, which additionally drains the §9.2 re-triggers
+    /// produced by blocking writes during edge-block execution.
+    fn check_edges_pass(&mut self) {
         // Time-0 init detect is special (initial values set via non-hot paths
         // vs uninitialized prev → everything "fires"). Run it as a full scan
         // and reset the dirty accumulator so steady-state (time>0) starts clean.
@@ -18870,6 +19035,7 @@ impl Simulator {
         let positions = self.toggled_clock_positions.clone();
         self.check_edges_inner(Some(&positions), false);
         self.prof_clocks_only_detect += 1;
+        self.drain_edge_exec_rescan();
     }
 
     /// Edge-detect + dispatch core.  When `detect_subset` is `Some`, scans
@@ -18968,6 +19134,14 @@ impl Simulator {
             Some(subset) => PosIter::Subset(subset.iter()),
             None => PosIter::Full(0..self.edge_signal_ids.len()),
         };
+        // Every position that fires an edge this pass, with its value AT
+        // DETECT TIME (pre-exec). After dispatch + waiter wakeup, prev is
+        // refreshed to these values so (a) the consumed edge cannot re-fire
+        // in a later same-time detect, and (b) a blocking write made DURING
+        // exec reads as a NEW edge relative to the refreshed prev — which
+        // drain_edge_exec_rescan then delivers (§9.2).
+        let mut fired_snap: Vec<(usize, u64, u64)> = Vec::new();
+        let mut fired_wide: Vec<(usize, Value)> = Vec::new();
         for pos in positions {
             let sid = match self.edge_signal_ids.get(pos) {
                 Some(&s) => s,
@@ -19006,6 +19180,10 @@ impl Simulator {
             }
             if !fires_pos && !fires_neg && !fires_any {
                 continue;
+            }
+            fired_snap.push((sid, cur_v, cur_x));
+            if self.signal_widths[sid] > 64 {
+                fired_wide.push((sid, self.signal_table[sid].clone()));
             }
             if self.edge_scan_stats {
                 self.edge_scan_changed += 1;
@@ -19183,6 +19361,15 @@ impl Simulator {
                     }
                     self.flop_last_fire[bi] = now;
                 }
+            }
+        }
+
+        // Stall attribution: while the exec-write rescan drain is looping,
+        // count executions per block so a livelock report can name the
+        // ping-ponging always blocks.
+        if self.in_edge_rescan && !triggered.is_empty() {
+            for &bi in &triggered {
+                *self.edge_rescan_block_hits.entry(bi).or_insert(0) += 1;
             }
         }
 
@@ -19921,6 +20108,22 @@ impl Simulator {
         }
         std::mem::swap(&mut self.event_waiters, &mut self.event_waiters_swap);
         self.prof_edge_waiters += _t_w.elapsed().as_nanos() as u64;
+        // Consume the edges dispatched this pass: refresh prev for every
+        // FIRED position to its pre-exec value (captured at detect time,
+        // AFTER the cg/waiter checks above so those still saw the original
+        // prev). A blocking write made by a triggered block during exec now
+        // reads as a fresh edge against this prev, so the rescan drain can
+        // re-trigger sensitive blocks without re-firing the edge already
+        // consumed here.
+        for &(sid, v, x) in &fired_snap {
+            self.prev_val[sid] = v;
+            self.prev_xz[sid] = x;
+        }
+        for (sid, val) in fired_wide {
+            if let Some(p) = self.prev_wide.get_mut(&sid) {
+                *p = val;
+            }
+        }
         self.edge_blocks = blocks;
         self.in_edge_block = false;
 
@@ -33818,6 +34021,18 @@ impl Simulator {
     /// load) unless XEZIM_DIRTY_EDGE / _SHADOW is active.
     #[inline(always)]
     fn note_edge_write(&mut self, id: usize) {
+        // §9.2 re-trigger recording (always on) — see the write_sig! twin.
+        if self.in_edge_block {
+            if let Some(&p) = self.sig_to_edge_pos.get(id) {
+                if p >= 0 {
+                    let p = p as usize;
+                    if !self.edge_exec_seen[p] {
+                        self.edge_exec_seen[p] = true;
+                        self.edge_exec_wrote.push(p);
+                    }
+                }
+            }
+        }
         if !self.dirty_edge && !self.dirty_edge_shadow {
             return;
         }

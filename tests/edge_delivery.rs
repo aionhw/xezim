@@ -140,6 +140,104 @@ endmodule
     assert!(find_line(&sim, "CLEAN").is_some());
 }
 
+/// S2 safety net: with §9.2 re-triggering delivered correctly, a two-block
+/// signal ping-pong (`always @(a) b=~b;` / `always @(b) a=~a;`) is a genuine
+/// zero-delay livelock (Icarus spins forever on it). It must terminate via
+/// the stall detector with a report NAMING both always blocks — not hang,
+/// and not silently "survive" to a later time with the events dropped.
+#[test]
+fn signal_ping_pong_livelocks_into_attributed_stall() {
+    use std::process::Command;
+
+    fn xezim_bin() -> std::path::PathBuf {
+        let mut p = std::env::current_exe().expect("current_exe");
+        p.pop();
+        if p.ends_with("deps") {
+            p.pop();
+        }
+        p.join("xezim")
+    }
+
+    let dir = std::env::temp_dir().join("xezim_edge_pingpong_test");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let sv = dir.join("pingpong.sv");
+    // The two always blocks sit on lines 2 and 3 of the file.
+    std::fs::write(
+        &sv,
+        "module t; reg a = 0, b = 0; int n = 0;\n  always @(a) begin n++; b = ~b; end\n  always @(b) begin n++; a = ~a; end\n  initial begin #0 a = 1; end\n  initial #10 begin $display(\"SURVIVED n=%0d\", n); $finish; end\nendmodule\n",
+    )
+    .expect("write sv");
+    let out = Command::new(xezim_bin())
+        .env("XEZIM_STALL_LIMIT", "2000")
+        .args(["--simulate", "-s", "t"])
+        .arg(&sv)
+        .output()
+        .expect("run xezim");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stderr.contains("simulation STALLED"),
+        "the ping-pong must trip the stall detector:\nstderr:{}\nstdout:{}",
+        stderr,
+        stdout
+    );
+    assert!(
+        !stdout.contains("SURVIVED"),
+        "the sim must NOT coast to t=10 with the re-triggers dropped:\n{}",
+        stdout
+    );
+    // Both blocks must be named, with file:line and their sensitivity.
+    for (line, sens) in [(2, "@(a)"), (3, "@(b)")] {
+        assert!(
+            stderr.contains(&format!("always block at {}:{}", sv.display(), line)),
+            "stall report must name the always block on line {}:\n{}",
+            line,
+            stderr
+        );
+        assert!(
+            stderr.contains(&format!("sensitive to {}", sens)),
+            "stall report must show the block's sensitivity {}:\n{}",
+            sens,
+            stderr
+        );
+    }
+    assert!(
+        stderr.contains("ran 2000 times at this timestamp"),
+        "the count phrasing must carry the per-block execution count:\n{}",
+        stderr
+    );
+}
+
+/// S2 correctness: a LEGITIMATE blocking-write cascade a -> b -> c through
+/// `always @` blocks must deliver every re-trigger AND terminate. Before the
+/// fix, a change made by an edge block during the same delta batch was
+/// coalesced away: block 2 never saw b change, c stayed 0 (silent event
+/// loss in handshake-style logic).
+#[test]
+fn blocking_write_cascade_retriggers_each_stage_and_terminates() {
+    const SRC: &str = r#"
+module t; reg a = 0, b = 0, c = 0; int na = 0, nb = 0, nc = 0;
+  always @(a) begin na++; b = a; end
+  always @(b) begin nb++; c = b; end
+  always @(c) begin nc++; end
+  initial begin #0 a = 1; end
+  initial #10 begin $display("CHAIN na=%0d nb=%0d nc=%0d c=%b", na, nb, nc, c); $finish; end
+endmodule
+"#;
+    let sim = run(SRC, &[]);
+    assert_eq!(sim.time, 10, "the cascade must settle and let time advance");
+    let line = find_line(&sim, "CHAIN ").expect("no CHAIN line").to_string();
+    // Each stage runs once at t=0 (xezim's init-detect fires every block
+    // once against the X->init pseudo-edge) and exactly once more for the
+    // #0-driven wave — the b and c re-triggers are the part the old
+    // coalescing dropped. Exact counts also prove no double-delivery.
+    assert_eq!(
+        line.trim(),
+        "CHAIN na=2 nb=2 nc=2 c=1",
+        "every stage of the cascade must re-trigger exactly once per change"
+    );
+}
+
 /// S3d: the settle-limit warning must NAME the non-converging signals —
 /// value, and the driving block's file:line — not just say "signals may not
 /// have converged". Asserted through the CLI binary (the warning goes to
