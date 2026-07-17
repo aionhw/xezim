@@ -365,6 +365,17 @@ macro_rules! write_sig {
                     $self.changed_edge_pos.push(__ep as usize);
                 }
             }
+            // §9.2 re-trigger: a blocking write to an edge-sensitive signal
+            // made WHILE an edge block executes must re-run edge detection
+            // for that signal (drain_edge_exec_rescan) — record its position.
+            // One bool load when not inside an edge block.
+            if $self.in_edge_block && (__wsig_id as usize) < $self.sig_to_edge_pos.len() {
+                let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
+                if __ep >= 0 && !$self.edge_exec_seen[__ep as usize] {
+                    $self.edge_exec_seen[__ep as usize] = true;
+                    $self.edge_exec_wrote.push(__ep as usize);
+                }
+            }
             // Fire any registered cbValueChange callbacks. The dispatch lives
             // inside the macro so every write path (blocking assigns,
             // NBA writes, force updates, settle loops, initial block
@@ -506,6 +517,11 @@ struct CombEntry {
     /// stimulus. So: don't seed these from the time-0 dirty set; let the
     /// first real sensitivity transition trigger them.
     defer_at_time0: bool,
+    /// Source span of the originating construct (cont-assign LHS or always
+    /// block statement) so diagnostics — notably the settle-limit warning —
+    /// can name file:line for a non-converging driver. `Span::dummy()` when
+    /// the origin has no source (synthesized entries).
+    span: crate::ast::Span,
 }
 
 /// Does `stmt` (transitively, through nested blocks/branches/loops/timing
@@ -949,7 +965,19 @@ struct EventWaiter {
     /// consulted afterwards — dropped.
     resolved_sensitivities: Vec<SensitivityId>,
     continuation: Vec<Statement>,
-    registered_time: u64,
+    /// Value of `Simulator::snap_gen` when this waiter registered. A waiter
+    /// only fires on edges detected against a snapshot taken AFTER it
+    /// registered (`registered_snap_gen != snap_gen`). This protects a
+    /// waiter registered mid-tick from the tick's pre-registration edges —
+    /// notably the time-0 init pseudo-edges (prev seeded to X so every
+    /// initialized signal "fires" at the first check_edges) and the
+    /// re-registration of a `forever @(posedge clk)` loop against the edge
+    /// it just consumed. Unlike the old `registered_time == self.time`
+    /// guard, it does NOT suppress edges produced in LATER delta cycles of
+    /// the same timestamp (an inactive-region `#0 clk = 1;` toggle must
+    /// wake an `@(posedge clk)` waiter registered earlier at that time —
+    /// IEEE 1800-2023 §4.4.2.3, matching Icarus/commercial simulators).
+    registered_snap_gen: u64,
 }
 
 /// Pad a string to a given width with spaces (or zeros if zero_pad).
@@ -1247,6 +1275,31 @@ impl TimingWheel {
     /// The pending continuation scheduled for `pid`, if any. Linear scan of
     /// every wheel slot + the overflow map — used ONLY by the terminal
     /// zero-delay stall report, never on the scheduling hot path.
+    /// Every pending (pid, absolute_time) in the wheel + overflow. Read-only,
+    /// used ONLY by the terminal stall report to show where non-spinning
+    /// processes are parked (e.g. the initializer the spinner is waiting for,
+    /// scheduled at a future time the livelock never reaches).
+    fn pending_pid_times(&self) -> Vec<(usize, u64)> {
+        let mut out: Vec<(usize, u64)> = Vec::new();
+        let cur_slot = Self::slot(self.current_time);
+        for s in 0..WHEEL_SIZE {
+            if self.wheel[s].is_empty() {
+                continue;
+            }
+            let delta = ((s + WHEEL_SIZE - cur_slot) % WHEEL_SIZE) as u64;
+            let abs_time = self.current_time + delta;
+            for (p, _) in &self.wheel[s] {
+                out.push((*p, abs_time));
+            }
+        }
+        for (t, list) in &self.overflow {
+            for (p, _) in list {
+                out.push((*p, *t));
+            }
+        }
+        out
+    }
+
     fn pending_stmts_for(&self, pid: usize) -> Option<&[Statement]> {
         if !self.has_pid(pid) {
             return None;
@@ -1848,6 +1901,12 @@ pub struct Simulator {
     /// Fallback for signals wider than 64 bits where the inline u64 pair
     /// above can't represent the full state.
     prev_wide: HashMap<usize, Value>,
+    /// Snapshot generation counter: bumped every `snapshot_edge_signals`.
+    /// `EventWaiter::registered_snap_gen` records it at registration so the
+    /// wake path can tell "edge detected against a snapshot the waiter had
+    /// already registered under" (fire) from "edge predates registration /
+    /// is a time-0 init pseudo-edge" (skip). See EventWaiter docs.
+    snap_gen: u64,
     edge_signal_names: HashSet<String>,
     /// Edge sensitivity resolved to signal IDs.
     edge_signal_ids: Vec<usize>,
@@ -2749,6 +2808,20 @@ pub struct Simulator {
     edge_pos_seen: Vec<bool>,
     dirty_edge: bool,
     dirty_edge_shadow: bool,
+    /// Edge positions written by a BLOCKING assign while an edge-triggered
+    /// block was executing (`in_edge_block`), deduped via `edge_exec_seen`.
+    /// §9.2: such a change must (re-)trigger blocks sensitive to it —
+    /// `drain_edge_exec_rescan` re-detects exactly these positions in a
+    /// follow-up delta pass instead of silently coalescing them away.
+    edge_exec_wrote: Vec<usize>,
+    edge_exec_seen: Vec<bool>,
+    /// True while `drain_edge_exec_rescan` is re-running check_edges for
+    /// exec-written positions; makes check_edges_inner count block
+    /// executions into `edge_rescan_block_hits` for stall attribution.
+    in_edge_rescan: bool,
+    /// block index -> executions during the current rescan drain. Read by
+    /// `report_edge_rescan_stall` to name the ping-ponging always blocks.
+    edge_rescan_block_hits: HashMap<usize, u64>,
     /// Counter — number of iters whose check_edges ran over just the
     /// toggled clock subset instead of the full edge_signal_ids scan.
     prof_clocks_only_detect: u64,
@@ -3210,6 +3283,7 @@ impl Simulator {
                 if cd.queue_properties.contains_key(pname)
                     || cd.assoc_properties.contains_key(pname)
                     || cd.array_properties.contains_key(pname)
+                    || cd.array_nd_properties.contains_key(pname)
                     || cd.static_collections.iter().any(|(n, ..)| n == pname)
                 {
                     continue;
@@ -3244,6 +3318,36 @@ impl Simulator {
                         _ => {}
                     }
                     continue;
+                }
+                // Multi-dim fixed member via typedef dims: record the FULL
+                // shape (the `first()`-only match below drops inner dims).
+                if dims.len() >= 2 {
+                    let shape: Option<Vec<(i64, i64)>> = dims
+                        .iter()
+                        .map(|dm| match dm {
+                            UD::Range { left, right, .. } => match (
+                                super::elaborate::const_eval_i64_with_params(left, Some(&params)),
+                                super::elaborate::const_eval_i64_with_params(right, Some(&params)),
+                            ) {
+                                (Some(l), Some(r)) => Some((l.min(r), l.max(r))),
+                                _ => None,
+                            },
+                            UD::Expression { expr, .. } => {
+                                match super::elaborate::const_eval_i64_with_params(
+                                    expr,
+                                    Some(&params),
+                                ) {
+                                    Some(n) if n > 0 => Some((0, n - 1)),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(shape) = shape {
+                        cd.array_nd_properties.insert(pname, (shape, w));
+                        continue;
+                    }
                 }
                 match dims.first() {
                     Some(UD::Associative { data_type: key_dt, .. }) => {
@@ -4087,6 +4191,7 @@ impl Simulator {
             prev_val,
             prev_xz,
             prev_wide,
+            snap_gen: 0,
             edge_signal_names: HashSet::default(),
             edge_signal_ids: Vec::new(),
             edge_blocks_by_sig: Vec::new(),
@@ -4370,6 +4475,10 @@ impl Simulator {
             sig_to_edge_pos: Vec::new(),
             changed_edge_pos: Vec::new(),
             edge_pos_seen: Vec::new(),
+            edge_exec_wrote: Vec::new(),
+            edge_exec_seen: Vec::new(),
+            in_edge_rescan: false,
+            edge_rescan_block_hits: HashMap::default(),
             dirty_edge: std::env::var_os("XEZIM_DIRTY_EDGE").is_some(),
             dirty_edge_shadow: std::env::var_os("XEZIM_DIRTY_EDGE_SHADOW").is_some(),
             prof_clocks_only_detect: 0,
@@ -7363,16 +7472,20 @@ impl Simulator {
         // Also collect from event waiters that are registered at time 0
         self.edge_signal_ids.sort_unstable();
         self.edge_signal_ids.dedup();
-        // Reverse map for dirty-driven edge detect: signal id -> its position
-        // in the (now sorted, stable) edge_signal_ids, or -1. Sized to the
-        // signal table so the per-write check is one bounds-checked load.
-        if self.dirty_edge || self.dirty_edge_shadow {
-            self.sig_to_edge_pos = vec![-1i32; self.signal_table.len()];
-            for (pos, &sid) in self.edge_signal_ids.iter().enumerate() {
-                if sid < self.sig_to_edge_pos.len() {
-                    self.sig_to_edge_pos[sid] = pos as i32;
-                }
+        // Reverse map: signal id -> its position in the (now sorted, stable)
+        // edge_signal_ids, or -1. Sized to the signal table so the per-write
+        // check is one bounds-checked load. Used by the dirty-driven edge
+        // detect (opt-in) AND by the always-on edge-exec write recording
+        // (blocking writes made DURING edge-block execution must trigger a
+        // re-detect pass — see drain_edge_exec_rescan).
+        self.sig_to_edge_pos = vec![-1i32; self.signal_table.len()];
+        for (pos, &sid) in self.edge_signal_ids.iter().enumerate() {
+            if sid < self.sig_to_edge_pos.len() {
+                self.sig_to_edge_pos[sid] = pos as i32;
             }
+        }
+        self.edge_exec_seen = vec![false; self.edge_signal_ids.len()];
+        if self.dirty_edge || self.dirty_edge_shadow {
             self.edge_pos_seen = vec![false; self.edge_signal_ids.len()];
         }
         // Cache each clock generator's position inside edge_signal_ids so
@@ -12884,6 +12997,8 @@ impl Simulator {
             .chain(pending_ca.into_iter().map(|p| p.materialize()))
         {
             let explicit_delay = ca.delay;
+            // Captured before `ca.lhs` may be moved into the CombItem below.
+            let ca_span = ca.lhs.span;
             // §21.7.2.1 `var_type`: an object whose only driver is continuous is
             // a `wire` in a dump (see `cont_driven`). Recorded here — this is the
             // last point at which the continuous assigns still exist as ASTs.
@@ -13213,6 +13328,7 @@ impl Simulator {
                 write_signal_ids: wids,
                 has_unresolved_reads,
                 defer_at_time0: false,
+                span: ca_span,
             });
         }
 
@@ -13335,6 +13451,7 @@ impl Simulator {
                     write_signal_ids: wids,
                     has_unresolved_reads,
                     defer_at_time0: !is_always_comb && stmt_has_finish_or_stop(&ab.stmt),
+                    span: ab.stmt.span,
                 });
             }
         }
@@ -13721,6 +13838,7 @@ impl Simulator {
                 !self.module.arrays.contains_key(&name)
                     && !self.module.arrays_2d.contains_key(&name)
                     && !self.module.arrays_nd.contains_key(&name)
+                    && !self.signal_name_to_id.contains_key(name.as_str())
             }
             ExprKind::Index { expr, .. } => {
                 let ExprKind::Index {
@@ -13733,8 +13851,12 @@ impl Simulator {
                     return false;
                 };
                 let name = self.resolve_hier_name(hier);
+                // A multi-D PACKED vector root (`logic [1:0][3:0][7:0] foo`)
+                // is a real write target for `foo[i][j]` — only drop the
+                // assign when the root resolves to nothing at all.
                 !self.module.arrays_2d.contains_key(&name)
                     && !self.module.arrays_nd.contains_key(&name)
+                    && !self.signal_name_to_id.contains_key(name.as_str())
             }
             _ => false,
         }
@@ -14716,7 +14838,7 @@ impl Simulator {
             pid,
             resolved_sensitivities: resolved,
             continuation,
-            registered_time: self.time,
+            registered_snap_gen: self.snap_gen,
         }
     }
 
@@ -14821,6 +14943,52 @@ impl Simulator {
             }
             cascade_iter += 1;
         }
+        // Exiting at the limit with NBAs STILL pending is a zero-delay
+        // livelock through the NBA region (`always @(fb) fb <= ~fb;` — the
+        // classic PLL-feedback model). The old behavior silently DISCARDED the
+        // pending writes and carried on with stale state — worse than a hang,
+        // because nothing ever said so. Report it like the other delta-loop
+        // detectors and stop. The pending targets ARE the feedback signals.
+        if cascade_iter >= cascade_limit
+            && !(self.nba_fast.is_empty() && self.nba_queue.is_empty())
+            && !self.finished
+        {
+            eprintln!(
+                "[xezim][error] simulation STALLED at time {} — the edge/NBA cascade did not converge after {} delta cycles (XEZIM_CASCADE_LIMIT).",
+                self.time, cascade_iter
+            );
+            eprintln!(
+                "               This is a zero-delay (delta) livelock: non-blocking writes keep"
+            );
+            eprintln!(
+                "               re-triggering edge-sensitive blocks at the same timestamp."
+            );
+            let mut names: Vec<String> = Vec::new();
+            for e in &self.nba_fast {
+                if let Some(n) = self.id_to_name.get(e.signal_id) {
+                    names.push(n.to_string());
+                }
+            }
+            for e in &self.nba_queue {
+                if let Some(n) = e.resolved_id.and_then(|i| self.id_to_name.get(i)) {
+                    names.push(n.to_string());
+                }
+            }
+            names.sort();
+            names.dedup();
+            if !names.is_empty() {
+                eprintln!(
+                    "               Pending non-blocking writes that keep the loop alive:"
+                );
+                for n in names.iter().take(5) {
+                    eprintln!("                 {} <= ... (re-armed every cycle)", n);
+                }
+            }
+            eprintln!(
+                "               Raise XEZIM_CASCADE_LIMIT=<n> if the design legitimately needs deeper same-time NBA cascades."
+            );
+            self.finished = true;
+        }
         // Final propagation pass: level-sensitive always blocks fired by the
         // last check_edges may have done blocking-writes to regs that feed
         // downstream cont-assigns (e.g. cr_iu_decd's ill_expt16 always block
@@ -14868,10 +15036,49 @@ impl Simulator {
     /// inside `run_process_stmts` (its continuation lives on the Rust stack,
     /// not in any queue, so the caller must hand it over). `None` when the
     /// outer event loop tripped the delta-cycle limit instead.
+    /// "process N — <kind> at <file:line> (<instance path>, module <m>)" — the
+    /// attribution prefix shared by the spinner list and the parked-process
+    /// list of the stall report.
+    fn stall_pid_identity(&mut self, pid: usize) -> String {
+        let mut line = format!("                 process {}", pid);
+        let src_file = self.stall_pid_src_file(pid);
+        if let Some(&(span, kind)) = self.process_origin.get(&pid) {
+            line.push_str(" — ");
+            line.push_str(kind);
+            if let Some(loc) = self.span_file_line_in(span, src_file) {
+                line.push_str(" at ");
+                line.push_str(&loc);
+            }
+        }
+        match self.process_scope_hint.get(&pid) {
+            Some(s) if !s.is_empty() => {
+                let s = s.clone();
+                let def_mod = self
+                    .stall_pid_def_module(pid)
+                    .filter(|m| *m != self.module.name);
+                match def_mod {
+                    Some(m) => {
+                        line.push_str(&format!(" ({}.{}, module {})", self.module.name, s, m))
+                    }
+                    None => line.push_str(&format!(" ({}.{})", self.module.name, s)),
+                }
+            }
+            _ => line.push_str(&format!(" ({})", self.module.name)),
+        }
+        line
+    }
+
     fn report_zero_delay_stall(&mut self, running: Option<(usize, &[Statement])>) {
         let mut top: Vec<(usize, u64)> =
             self.stall_pid_hits.iter().map(|(p, c)| (*p, *c)).collect();
         top.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        // A process that ran once or twice at this timestamp is not a spinner —
+        // it belongs in the "parked" section below (it is usually the very
+        // process the spinner is waiting for). Keep low-count entries only if
+        // NOTHING spun (so the report always names someone).
+        if top.iter().any(|&(_, c)| c > 2) {
+            top.retain(|&(_, c)| c > 2);
+        }
         top.truncate(5);
 
         // Report whichever count actually tripped: the outer loop's delta count,
@@ -14895,39 +15102,8 @@ impl Simulator {
         if !top.is_empty() {
             eprintln!("               Most frequently scheduled processes:");
             for (pid, count) in &top {
-                let mut line = format!("                 process {}", pid);
-                // Which source file this pid's spans live in (multi-file
-                // designs), via its instance scope's defining module.
+                let mut line = self.stall_pid_identity(*pid);
                 let src_file = self.stall_pid_src_file(*pid);
-                // Origin: what construct spawned this pid, and where.
-                if let Some(&(span, kind)) = self.process_origin.get(pid) {
-                    line.push_str(" — ");
-                    line.push_str(kind);
-                    if let Some(loc) = self.span_file_line_in(span, src_file) {
-                        line.push_str(" at ");
-                        line.push_str(&loc);
-                    }
-                }
-                // Instance path: the scope hint under the top module's name;
-                // a process with no hint runs in the top scope itself. When
-                // the DEFINING module is known and isn't the top, name it too
-                // — the instance path alone doesn't say which module body to
-                // open: `(top.u_fifo.u_sync, module sync_cell)`.
-                match self.process_scope_hint.get(pid) {
-                    Some(s) if !s.is_empty() => {
-                        let def_mod = self
-                            .stall_pid_def_module(*pid)
-                            .filter(|m| *m != self.module.name);
-                        match def_mod {
-                            Some(m) => line.push_str(&format!(
-                                " ({}.{}, module {})",
-                                self.module.name, s, m
-                            )),
-                            None => line.push_str(&format!(" ({}.{})", self.module.name, s)),
-                        }
-                    }
-                    _ => line.push_str(&format!(" ({})", self.module.name)),
-                }
                 // Re-arm reason, from the pid's pending continuation.
                 if let Some(reason) = self.describe_stall_offender(*pid, running, src_file) {
                     line.push_str(" — ");
@@ -14935,6 +15111,53 @@ impl Simulator {
                 }
                 line.push_str(&format!(" — ran {} times at this timestamp", count));
                 eprintln!("{}", line);
+            }
+        }
+        // The OTHER half of the story: processes that are NOT spinning. The
+        // classic livelock has the spinner's fix parked right here — e.g. the
+        // initial block that would set the zero-valued clock period, scheduled
+        // for a future time the spin never reaches, or blocked on an event the
+        // spin never produces.
+        {
+            let spinner: HashSet<usize> = top.iter().map(|(p, _)| *p).collect();
+            let mut parked: Vec<String> = Vec::new();
+            let mut seen: HashSet<usize> = HashSet::default();
+            for (pid, t) in self.event_queue.pending_pid_times() {
+                if t > self.time && !spinner.contains(&pid) && seen.insert(pid) {
+                    let id = self.stall_pid_identity(pid);
+                    parked.push(format!("{} — next event at time {}", id, t));
+                }
+            }
+            let waiter_pids: Vec<usize> = self
+                .event_waiters
+                .iter()
+                .map(|w| w.pid)
+                .chain(self.condition_waiters.iter().map(|(p, _)| *p))
+                .collect();
+            for pid in waiter_pids {
+                if spinner.contains(&pid) || !seen.insert(pid) {
+                    continue;
+                }
+                let src_file = self.stall_pid_src_file(pid);
+                let id = self.stall_pid_identity(pid);
+                let why = self
+                    .describe_stall_offender(pid, None, src_file)
+                    .unwrap_or_else(|| "blocked".to_string());
+                // The ping-pong hint is for SPINNERS; a parked waiter is just
+                // waiting.
+                let why = why.replace(" — event ping-pong suspected", "");
+                parked.push(format!("{} — {}", id, why));
+            }
+            if !parked.is_empty() {
+                eprintln!(
+                    "               Parked (not spinning) — a spinner above may be waiting on one of these:"
+                );
+                for l in parked.iter().take(8) {
+                    eprintln!("{}", l);
+                }
+                if parked.len() > 8 {
+                    eprintln!("                 ... and {} more", parked.len() - 8);
+                }
             }
         }
         eprintln!("               Common causes:");
@@ -14962,7 +15185,14 @@ impl Simulator {
     /// The module whose definition `pid`'s originating block was written in,
     /// via the same scope→instance lookup as `stall_pid_src_file`.
     fn stall_pid_def_module(&self, pid: usize) -> Option<String> {
-        match self.process_scope_hint.get(&pid).map(String::as_str) {
+        self.scope_def_module(self.process_scope_hint.get(&pid).map(String::as_str))
+    }
+
+    /// The module DEFINING the instance at `scope` (empty/None = the top
+    /// module itself). Shared by pid-based attribution (stall report) and
+    /// scope-hint-based attribution (settle-limit warning, edge blocks).
+    fn scope_def_module(&self, scope: Option<&str>) -> Option<String> {
+        match scope {
             None | Some("") => Some(self.module.name.clone()),
             Some(scope) => self
                 .module
@@ -14971,6 +15201,14 @@ impl Simulator {
                 .find(|inst| inst.path == scope)
                 .map(|inst| inst.def_name.clone()),
         }
+    }
+
+    /// The retained-source index for a construct inlined under `scope` —
+    /// scope → defining module → file. `None` when any link is missing;
+    /// `span_file_line_in` then falls back to the exact-fit rule.
+    fn scope_src_file(&self, scope: Option<&str>) -> Option<u32> {
+        self.scope_def_module(scope)
+            .and_then(|m| self.module.src_file_of_module.get(&m).copied())
     }
 
     /// Best-effort `file:line` for a statement span. A span is a byte offset
@@ -17449,10 +17687,10 @@ impl Simulator {
                     // timestep (delta), cross-timestep (#delay), and time-0
                     // init uniformly. Routing a signal-naming wait through the
                     // edge-triggered event_waiter path instead BREAKS delta-
-                    // cycle wakeup: its `registered_time == self.time` guard
-                    // (correct for edge-sensitive `@()`) skips any same-
-                    // timestep edge, so `wait(sig==v)` never resumes when a
-                    // peer process writes `sig` at the same simtime. The UVM
+                    // cycle wakeup: its registration-generation guard
+                    // (correct for edge-sensitive `@()`) skips edges from the
+                    // current snapshot window, so `wait(sig==v)` may miss a
+                    // peer process writing `sig` at the same simtime. The UVM
                     // phase hopper (`fork ... join_none; wait(all_dropped)`)
                     // and sequencer arbitration depend on exactly this delta-
                     // cycle handoff. Always park in condition_waiters.
@@ -18279,13 +18517,33 @@ impl Simulator {
             }
             self.exec_statement(s);
         }
-        // No delay/event in forever body — safety limit
-        let mut safety = 0;
-        while !self.finished && safety < 10000 {
+        // No delay/event in the forever body: the loop can never yield, so
+        // running it is a zero-delay livelock (`always fb = ~fb;`). The old
+        // code silently STOPPED after 10k iterations and let the sim continue
+        // with whatever state the truncated loop left — silent wrongness.
+        // Run up to the stall limit, then report with full attribution.
+        let cap = if self.stall_limit > 0 { self.stall_limit } else { 10_000 };
+        let mut safety: u64 = 0;
+        while !self.finished && safety < cap {
             safety += 1;
             for s in &body_stmts {
                 self.exec_statement(s);
             }
+        }
+        if !self.finished && safety >= cap {
+            eprintln!(
+                "[xezim][error] simulation STALLED at time {} — a `forever`/`always` body with no timing control ran {} times.",
+                self.time, safety
+            );
+            let id = self.stall_pid_identity(pid);
+            eprintln!("{} — no `#delay`/`@event`/`wait` anywhere in its body", id);
+            eprintln!(
+                "               Simulated time can never advance past this loop. Add a timing control,"
+            );
+            eprintln!(
+                "               or raise/disable the check with XEZIM_STALL_LIMIT=<n>."
+            );
+            self.finished = true;
         }
     }
 
@@ -18641,6 +18899,9 @@ impl Simulator {
     /// the prev_val/prev_xz parallel arrays (A3 from the compression
     /// analysis). Wide signals (> 64 bits) also update `prev_wide`.
     fn snapshot_edge_signals(&mut self) {
+        // New snapshot generation: waiters registered before this point
+        // become eligible for edges detected against it (see EventWaiter).
+        self.snap_gen = self.snap_gen.wrapping_add(1);
         #[inline]
         fn snap_one(
             id: usize,
@@ -18723,6 +18984,138 @@ impl Simulator {
     }
 
     fn check_edges(&mut self) {
+        self.check_edges_pass();
+        self.drain_edge_exec_rescan();
+    }
+
+    /// §9.2 re-trigger drain. A blocking write to an edge-sensitive signal
+    /// made WHILE an edge block executed (recorded into `edge_exec_wrote`
+    /// via write_sig!/note_edge_write) is a change that must re-trigger
+    /// blocks sensitive to it — check_edges used to coalesce it away
+    /// (prev was only refreshed by the NEXT snapshot, which erased the
+    /// pending edge before any detect saw it: silent event loss). Re-detect
+    /// exactly the written positions, repeating while the re-triggered
+    /// blocks keep producing new writes. A mutual ping-pong
+    /// (`always @(a) b=~b;` / `always @(b) a=~a;`) is then a genuine
+    /// zero-delay livelock: bounded by the stall detector
+    /// (XEZIM_STALL_LIMIT), which terminates with an attributed report
+    /// naming the blocks instead of hanging.
+    fn drain_edge_exec_rescan(&mut self) {
+        if self.edge_exec_wrote.is_empty() {
+            return;
+        }
+        let mut passes: u64 = 0;
+        self.edge_rescan_block_hits.clear();
+        self.in_edge_rescan = true;
+        let mut subset: Vec<usize> = Vec::new();
+        while !self.edge_exec_wrote.is_empty() && !self.finished {
+            subset.clear();
+            std::mem::swap(&mut subset, &mut self.edge_exec_wrote);
+            for &p in &subset {
+                if p < self.edge_exec_seen.len() {
+                    self.edge_exec_seen[p] = false;
+                }
+            }
+            passes += 1;
+            if self.stall_limit > 0 && passes > self.stall_limit {
+                self.report_edge_rescan_stall(passes);
+                self.finished = true;
+                break;
+            }
+            self.check_edges_inner(Some(&subset), false);
+        }
+        self.in_edge_rescan = false;
+    }
+
+    /// A zero-delay livelock sustained entirely by edge-triggered always
+    /// blocks re-triggering each other through blocking writes (no process
+    /// ever re-enters the scheduler, so the pid-based stall report cannot
+    /// see it). Names the most frequently re-triggered blocks — kind,
+    /// file:line, instance scope, sensitivity list — mirroring
+    /// `report_zero_delay_stall`'s shape.
+    fn report_edge_rescan_stall(&mut self, passes: u64) {
+        eprintln!(
+            "[xezim][error] simulation STALLED at time {} — no progress after {} edge-cascade delta cycles at this timestamp.",
+            self.time, passes
+        );
+        eprintln!(
+            "               This is a zero-delay (delta) livelock: edge-sensitive always blocks keep"
+        );
+        eprintln!(
+            "               re-triggering each other at the same timestamp, so simulated time can never move."
+        );
+        let mut top: Vec<(usize, u64)> = self
+            .edge_rescan_block_hits
+            .iter()
+            .map(|(b, c)| (*b, *c))
+            .collect();
+        top.sort_by_key(|&(bi, c)| (std::cmp::Reverse(c), bi));
+        top.truncate(5);
+        if !top.is_empty() {
+            eprintln!("               Most frequently re-triggered blocks:");
+            for (bi, count) in top {
+                let Some(block) = self.edge_blocks.get(bi) else { continue };
+                let kind = match block.kind {
+                    AlwaysKind::AlwaysFf => "always_ff block",
+                    AlwaysKind::AlwaysComb => "always_comb block",
+                    AlwaysKind::AlwaysLatch => "always_latch block",
+                    AlwaysKind::Always => "always block",
+                };
+                let mut line = format!("                 {}", kind);
+                let scope = if block.scope.is_empty() {
+                    None
+                } else {
+                    Some(block.scope.as_str())
+                };
+                let src_file = self.scope_src_file(scope);
+                if let Some(loc) = self.span_file_line_in(block.stmt.span, src_file) {
+                    line.push_str(" at ");
+                    line.push_str(&loc);
+                }
+                if let Some(s) = scope {
+                    match self.scope_def_module(Some(s)) {
+                        Some(m) if m != self.module.name => {
+                            line.push_str(&format!(" ({}, module {})", s, m));
+                        }
+                        _ => line.push_str(&format!(" ({})", s)),
+                    }
+                }
+                let sens = block
+                    .resolved_sensitivities
+                    .iter()
+                    .map(|si| {
+                        let edge = match si.edge {
+                            EdgeKind::Posedge => "posedge ",
+                            EdgeKind::Negedge => "negedge ",
+                            EdgeKind::AnyEdge => "",
+                        };
+                        format!("{}{}", edge, self.name_for_id(si.signal_id))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" or ");
+                if !sens.is_empty() {
+                    line.push_str(&format!(" — sensitive to @({})", sens));
+                }
+                line.push_str(&format!(" — ran {} times at this timestamp", count));
+                eprintln!("{}", line);
+            }
+        }
+        eprintln!("               Common causes:");
+        eprintln!(
+            "                 * two always blocks each writing a signal in the other's sensitivity list with no delay"
+        );
+        eprintln!(
+            "                 * a combinational feedback loop expressed through @(...) blocks"
+        );
+        eprintln!(
+            "               Raise or disable the check with XEZIM_STALL_LIMIT=<n> (0 = never stall-check)."
+        );
+    }
+
+    /// One edge detect+dispatch pass (mode dispatcher). Callers should use
+    /// `check_edges`, which additionally drains the §9.2 re-triggers
+    /// produced by blocking writes during edge-block execution.
+    fn check_edges_pass(&mut self) {
         // Time-0 init detect is special (initial values set via non-hot paths
         // vs uninitialized prev → everything "fires"). Run it as a full scan
         // and reset the dirty accumulator so steady-state (time>0) starts clean.
@@ -18799,6 +19192,7 @@ impl Simulator {
         let positions = self.toggled_clock_positions.clone();
         self.check_edges_inner(Some(&positions), false);
         self.prof_clocks_only_detect += 1;
+        self.drain_edge_exec_rescan();
     }
 
     /// Edge-detect + dispatch core.  When `detect_subset` is `Some`, scans
@@ -18897,6 +19291,14 @@ impl Simulator {
             Some(subset) => PosIter::Subset(subset.iter()),
             None => PosIter::Full(0..self.edge_signal_ids.len()),
         };
+        // Every position that fires an edge this pass, with its value AT
+        // DETECT TIME (pre-exec). After dispatch + waiter wakeup, prev is
+        // refreshed to these values so (a) the consumed edge cannot re-fire
+        // in a later same-time detect, and (b) a blocking write made DURING
+        // exec reads as a NEW edge relative to the refreshed prev — which
+        // drain_edge_exec_rescan then delivers (§9.2).
+        let mut fired_snap: Vec<(usize, u64, u64)> = Vec::new();
+        let mut fired_wide: Vec<(usize, Value)> = Vec::new();
         for pos in positions {
             let sid = match self.edge_signal_ids.get(pos) {
                 Some(&s) => s,
@@ -18935,6 +19337,10 @@ impl Simulator {
             }
             if !fires_pos && !fires_neg && !fires_any {
                 continue;
+            }
+            fired_snap.push((sid, cur_v, cur_x));
+            if self.signal_widths[sid] > 64 {
+                fired_wide.push((sid, self.signal_table[sid].clone()));
             }
             if self.edge_scan_stats {
                 self.edge_scan_changed += 1;
@@ -19112,6 +19518,15 @@ impl Simulator {
                     }
                     self.flop_last_fire[bi] = now;
                 }
+            }
+        }
+
+        // Stall attribution: while the exec-write rescan drain is looping,
+        // count executions per block so a livelock report can name the
+        // ping-ponging always blocks.
+        if self.in_edge_rescan && !triggered.is_empty() {
+            for &bi in &triggered {
+                *self.edge_rescan_block_hits.entry(bi).or_insert(0) += 1;
             }
         }
 
@@ -19805,7 +20220,15 @@ impl Simulator {
         self.event_waiters_swap.clear();
         let mut triggered_conts: Vec<(usize, Vec<Statement>)> = Vec::new();
         for waiter in waiters {
-            if waiter.registered_time == self.time {
+            // Skip waiters registered since the last snapshot: the prev
+            // values their edges would be checked against were captured
+            // BEFORE they registered, so a detected "edge" may predate the
+            // registration (time-0 init pseudo-edges, a forever-@ loop
+            // re-registering against the edge it just consumed). Waiters
+            // registered in an EARLIER delta cycle of this same timestamp
+            // stay eligible — an inactive-region (`#0`) toggle or an NBA
+            // commit at the current time must wake them (§4.4.2.3/§4.4.5).
+            if waiter.registered_snap_gen == self.snap_gen {
                 self.event_waiters_swap.push(waiter);
                 continue;
             }
@@ -19842,6 +20265,22 @@ impl Simulator {
         }
         std::mem::swap(&mut self.event_waiters, &mut self.event_waiters_swap);
         self.prof_edge_waiters += _t_w.elapsed().as_nanos() as u64;
+        // Consume the edges dispatched this pass: refresh prev for every
+        // FIRED position to its pre-exec value (captured at detect time,
+        // AFTER the cg/waiter checks above so those still saw the original
+        // prev). A blocking write made by a triggered block during exec now
+        // reads as a fresh edge against this prev, so the rescan drain can
+        // re-trigger sensitive blocks without re-firing the edge already
+        // consumed here.
+        for &(sid, v, x) in &fired_snap {
+            self.prev_val[sid] = v;
+            self.prev_xz[sid] = x;
+        }
+        for (sid, val) in fired_wide {
+            if let Some(p) = self.prev_wide.get_mut(&sid) {
+                *p = val;
+            }
+        }
         self.edge_blocks = blocks;
         self.in_edge_block = false;
 
@@ -21121,9 +21560,18 @@ impl Simulator {
         // (e.g. ~467K on c910) but the triggered set is small.
         let mut cur_list = std::mem::take(&mut self.settle_dirty_ids);
         cur_list.clear();
+        // Settle-limit attribution: when the loop is about to exhaust its
+        // budget, record which signals are still being written — and by
+        // which entry — so the warning below can NAME the non-converging
+        // ring instead of just saying "signals may not have converged".
+        // Costs one compare per pass until the final CHURN_TAIL passes.
+        const CHURN_TAIL: u64 = 3;
+        let mut churn: Vec<(usize, usize)> = Vec::new(); // (signal_id, entry_idx)
+        let mut converged = false;
         for _iteration in 0..limit {
             total_iters += 1;
             let mut evaluated_any = false;
+            let capture_churn = _iteration + CHURN_TAIL >= limit;
 
             // Take the current worklist and sort by eidx (topo order).
             std::mem::swap(&mut cur_list, &mut self.settle_triggered_list);
@@ -21183,6 +21631,9 @@ impl Simulator {
                             {
                                 self.table_modified = true;
                                 self.after_signal_write(*dst_id);
+                                if capture_churn {
+                                    churn.push((*dst_id, eidx));
+                                }
                                 if self.activity_mon {
                                     if self.signal_toggle_counts.len() != self.signal_table.len() {
                                         self.signal_toggle_counts.resize(self.signal_table.len(), 0);
@@ -21245,6 +21696,9 @@ impl Simulator {
                             } else if self.signal_table[*dst_id].set_inline_bits(sv, sx) {
                                 self.table_modified = true;
                                 self.after_signal_write(*dst_id);
+                                if capture_churn {
+                                    churn.push((*dst_id, eidx));
+                                }
                                 if self.activity_mon {
                                     if self.signal_toggle_counts.len() != self.signal_table.len() {
                                         self.signal_toggle_counts
@@ -21284,6 +21738,9 @@ impl Simulator {
                                 } else {
                                     write_sig!(self, *dst_id, resized);
                                     self.table_modified = true;
+                                    if capture_churn {
+                                        churn.push((*dst_id, eidx));
+                                    }
                                     if self.activity_mon {
                                         if self.signal_toggle_counts.len()
                                             != self.signal_table.len()
@@ -21366,6 +21823,11 @@ impl Simulator {
                 // and will be reached before the outer iter boundary.
                 let dirty_after = self.dirty_list.len();
                 if dirty_after > dirty_before {
+                    if capture_churn {
+                        for di in dirty_before..dirty_after {
+                            churn.push((self.dirty_list[di], eidx));
+                        }
+                    }
                     for di in dirty_before..dirty_after {
                         let sig_id = self.dirty_list[di];
                         // Consume the dirty flag — we're propagating it now.
@@ -21393,6 +21855,7 @@ impl Simulator {
 
             // After one full topo scan: if no entry was evaluated, fixpoint.
             if !evaluated_any {
+                converged = true;
                 break;
             }
             // Reset dirty bookkeeping for the next scan. (We already consumed
@@ -21409,13 +21872,86 @@ impl Simulator {
         self.settle_dirty_ids = cur_list;
         self.settle_iters += total_iters;
         if total_iters > self.max_settle_iters {
-            if total_iters >= limit && self.dirty_any {
+            // Unconverged = the loop exhausted its budget with entries still
+            // queued for the next pass. (The old `self.dirty_any` test here
+            // was dead: every pass ends with `dirty_any = false`, so the
+            // warning never actually fired even on a hard oscillator.)
+            if total_iters >= limit && !converged && !self.settle_triggered_list.is_empty() {
                 eprintln!("[WARN] settle limit hit ({} iters) at time {} — signals may not have converged. Use --settle-limit to increase.",
                     limit, self.time);
+                self.report_settle_churn(&churn, CHURN_TAIL);
             }
             self.max_settle_iters = total_iters;
         }
         self.settling = false;
+    }
+
+    /// Attribution for the settle-limit warning: name the signals that were
+    /// still CHANGING in the final settle iterations — current value, change
+    /// count, and (when resolvable) the driving cont-assign / comb block's
+    /// file:line and instance scope. Degrades gracefully: entries without a
+    /// span print name + value only.
+    fn report_settle_churn(&self, churn: &[(usize, usize)], tail: u64) {
+        if churn.is_empty() {
+            return;
+        }
+        // (signal -> (change count, last writing entry)).
+        let mut counts: HashMap<usize, (u64, usize)> = HashMap::default();
+        for &(sig, eidx) in churn {
+            let e = counts.entry(sig).or_insert((0, eidx));
+            e.0 += 1;
+            e.1 = eidx;
+        }
+        let total = counts.len();
+        let mut top: Vec<(usize, u64, usize)> =
+            counts.into_iter().map(|(s, (c, e))| (s, c, e)).collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        top.truncate(5);
+        eprintln!(
+            "       Still changing in the last {} iterations ({} of {} signals shown) — likely a zero-delay combinational loop through:",
+            tail,
+            top.len(),
+            total
+        );
+        for (sig, cnt, eidx) in top {
+            let name = self.name_for_id(sig);
+            let width = self.signal_widths.get(sig).copied().unwrap_or(1);
+            let val = match self.signal_table.get(sig) {
+                Some(v) if width > 16 => format!("'h{}", v.to_hex_string()),
+                Some(v) => format!("'b{}", v.to_bin()),
+                None => "?".to_string(),
+            };
+            let mut line = format!("         {} = {} — changed {}x", name, val, cnt);
+            if let Some(entry) = self.comb_entries.get(eidx) {
+                let kind = match &entry.item {
+                    CombItem::AlwaysBlock { is_always_comb, .. }
+                    | CombItem::CompiledAlwaysBlock { is_always_comb, .. } => {
+                        if *is_always_comb {
+                            "always_comb block"
+                        } else {
+                            "always block"
+                        }
+                    }
+                    _ => "cont-assign",
+                };
+                line.push_str(" — driven by ");
+                line.push_str(kind);
+                let src_file = self.scope_src_file(entry.scope_hint.as_deref());
+                if let Some(loc) = self.span_file_line_in(entry.span, src_file) {
+                    line.push_str(" at ");
+                    line.push_str(&loc);
+                }
+                if let Some(scope) = entry.scope_hint.as_deref().filter(|s| !s.is_empty()) {
+                    match self.scope_def_module(Some(scope)) {
+                        Some(m) if m != self.module.name => {
+                            line.push_str(&format!(" ({}, module {})", scope, m));
+                        }
+                        _ => line.push_str(&format!(" ({})", scope)),
+                    }
+                }
+            }
+            eprintln!("{}", line);
+        }
     }
 
     /// Resolve a fully-qualified signal name (possibly an array element
@@ -21972,7 +22508,14 @@ impl Simulator {
                         cur = inner_e.as_ref();
                     }
                     if let ExprKind::Ident(hier) = &cur.kind {
-                        let base_name = self.resolve_hier_name(hier);
+                        let mut base_name = self.resolve_hier_name(hier);
+                        // Bare class-member N-D array inside a method:
+                        // resolve to its per-instance `<handle>#<member>`.
+                        if !self.module.arrays_nd.contains_key(&base_name) {
+                            if let Some(s) = self.instance_assoc_member(&base_name) {
+                                base_name = s;
+                            }
+                        }
                         if let Some((shape, _w)) = self.module.arrays_nd.get(&base_name).cloned() {
                             if rev_idxs.len() == shape.len() {
                                 let mut name = base_name.clone();
@@ -22013,7 +22556,14 @@ impl Simulator {
                 } = &expr.kind
                 {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
-                        let name = self.resolve_hier_name(hier);
+                        let mut name = self.resolve_hier_name(hier);
+                        // Bare class-member 2D array inside a method:
+                        // resolve to its per-instance `<handle>#<member>`.
+                        if !self.module.arrays_2d.contains_key(&name) {
+                            if let Some(s) = self.instance_assoc_member(&name) {
+                                name = s;
+                            }
+                        }
                         if self.module.arrays_2d.contains_key(&name) {
                             let i = self.eval_expr(inner_idx).to_u64().unwrap_or(0) as i64;
                             let j = self.eval_expr(index).to_u64().unwrap_or(0) as i64;
@@ -24458,7 +25008,14 @@ impl Simulator {
                         cur = inner_e.as_ref();
                     }
                     if let ExprKind::Ident(hier) = &cur.kind {
-                        let base_name = self.resolve_hier_name(hier);
+                        let mut base_name = self.resolve_hier_name(hier);
+                        // Bare class-member N-D array inside a method:
+                        // resolve to its per-instance `<handle>#<member>`.
+                        if !self.module.arrays_nd.contains_key(&base_name) {
+                            if let Some(s) = self.instance_assoc_member(&base_name) {
+                                base_name = s;
+                            }
+                        }
                         if let Some((shape, w)) = self.module.arrays_nd.get(&base_name).cloned() {
                             if rev_idxs.len() == shape.len() {
                                 let mut name = base_name.clone();
@@ -24489,7 +25046,14 @@ impl Simulator {
                 } = &expr.kind
                 {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
-                        let name = self.resolve_hier_name(hier);
+                        let mut name = self.resolve_hier_name(hier);
+                        // Bare class-member 2D array inside a method:
+                        // resolve to its per-instance `<handle>#<member>`.
+                        if !self.module.arrays_2d.contains_key(&name) {
+                            if let Some(s) = self.instance_assoc_member(&name) {
+                                name = s;
+                            }
+                        }
                         if self.module.arrays_2d.contains_key(&name) {
                             let i = self.eval_expr(inner_idx).to_u64().unwrap_or(0) as i64;
                             let j = self.eval_expr(index).to_u64().unwrap_or(0) as i64;
@@ -27365,7 +27929,14 @@ impl Simulator {
                         _ => false,
                     };
                     if is_new {
-                        if let ExprKind::Ident(bh) = &base.kind {
+                        // Walk a chained-Index base (`foo[i][j] = new(...)` on a
+                        // multi-dim member) to the root Ident — the element
+                        // class is keyed by the base collection's name.
+                        let mut root = base.as_ref();
+                        while let ExprKind::Index { expr: inner, .. } = &root.kind {
+                            root = inner.as_ref();
+                        }
+                        if let ExprKind::Ident(bh) = &root.kind {
                             let bname =
                                 bh.path.last().map(|s| s.name.name.clone()).unwrap_or_default();
                             let elem_cls = self
@@ -27417,8 +27988,11 @@ impl Simulator {
                                 // allocated nested handles instead of the
                                 // source's. The same guards as the plain-handle
                                 // path (`h = new src`): exactly one argument,
-                                // and it must be a handle expression naming a
-                                // live object — never `new(size)`.
+                                // and it must be a STATICALLY class-typed
+                                // handle expression naming a live object —
+                                // never `new(size)` / `new(int_var)` (an int
+                                // whose value collides with a live heap index
+                                // is construction, not a copy).
                                 let arg_could_be_handle = ctor_args
                                     .first()
                                     .map(|a| matches!(
@@ -27426,7 +28000,7 @@ impl Simulator {
                                         ExprKind::Ident(_)
                                             | ExprKind::MemberAccess { .. }
                                             | ExprKind::Index { .. }
-                                    ))
+                                    ) && self.expr_is_class_handle(a))
                                     .unwrap_or(false);
                                 if ctor_args.len() == 1 && arg_could_be_handle {
                                     let src_h =
@@ -28242,11 +28816,13 @@ impl Simulator {
                             // argument that resolves to a live object handle is
                             // shallow-copied into a fresh instance. riscv-dv's
                             // get_rand_instr does `new instr_template[name]`.
-                            // Guard against confusing a small integer literal
-                            // with a handle: only treat the arg as a copy
-                            // source when it's clearly a handle expression
-                            // (Ident/MemberAccess/Index path) — never a
-                            // bare Number, Binary, or SystemCall.
+                            // Guard against confusing an integer with a
+                            // handle: only treat the arg as a copy source
+                            // when it's a STATICALLY class-typed handle
+                            // expression (Ident/MemberAccess/Index path) —
+                            // never a Number, Binary, SystemCall, or an
+                            // int var whose value collides with a live
+                            // heap index (`new(i)` in a loop).
                             let arg_could_be_handle = args
                                 .first()
                                 .map(|a| matches!(
@@ -28254,7 +28830,7 @@ impl Simulator {
                                     ExprKind::Ident(_)
                                         | ExprKind::MemberAccess { .. }
                                         | ExprKind::Index { .. }
-                                ))
+                                ) && self.expr_is_class_handle(a))
                                 .unwrap_or(false);
                             if args.len() == 1 && arg_could_be_handle {
                                 let src_h = self.eval_expr(&args[0]).to_u64().unwrap_or(0) as usize;
@@ -29289,6 +29865,27 @@ impl Simulator {
                             self.restore_loop_vars(&fe_saved);
                             return;
                         }
+                        // Multi-var foreach over a FIXED multi-dim class member
+                        // (`foreach (foo[ia,ib])` on `test_t foo[0:3][0:7]`):
+                        // its per-instance shape is registered in
+                        // arrays_2d/arrays_nd — iterate the rectangle. The
+                        // single-var key-scan below would leave the inner
+                        // index X and mis-parse `i][j` composite keys.
+                        if vars.len() >= 2 {
+                            if let Some(dims) = self.foreach_dims(&an) {
+                                if dims.len() >= vars.len() {
+                                    self.exec_foreach_nested(
+                                        &dims[..vars.len()],
+                                        vars,
+                                        body,
+                                        None,
+                                    );
+                                    self.auto_loop_vars.truncate(fe_auto_len);
+                                    self.restore_loop_vars(&fe_saved);
+                                    return;
+                                }
+                            }
+                        }
                         if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
                             // A queue / dynamic array carries an authoritative
                             // `<name>.size` shadow and is DENSE: iterate the
@@ -29407,6 +30004,26 @@ impl Simulator {
                             if self.module.dynamic_arrays.contains(&name) {
                                 let sz = self.get_queue_size(&name) as i64;
                                 dims[0] = (0, sz - 1);
+                            }
+                            // §12.7.3: a loop var BEYOND the unpacked dims maps
+                            // to the element's packed dimension — `foreach
+                            // (array[i,j,k])` on `reg [3:0] array[0:1][0:2]`
+                            // iterates k over the 4 bits.
+                            if dims.len() + 1 == vars.len() {
+                                let ew = self
+                                    .module
+                                    .arrays
+                                    .get(&name)
+                                    .map(|&(_, _, w)| w)
+                                    .or_else(|| {
+                                        self.module.arrays_2d.get(&name).map(|&(_, _, w)| w)
+                                    })
+                                    .or_else(|| {
+                                        self.module.arrays_nd.get(&name).map(|(_, w)| *w)
+                                    });
+                                if let Some(w) = ew.filter(|&w| w > 1) {
+                                    dims.push((0, w as i64 - 1));
+                                }
                             }
                             if dims.len() >= vars.len() {
                                 self.exec_foreach_nested(
@@ -33777,6 +34394,18 @@ impl Simulator {
     /// load) unless XEZIM_DIRTY_EDGE / _SHADOW is active.
     #[inline(always)]
     fn note_edge_write(&mut self, id: usize) {
+        // §9.2 re-trigger recording (always on) — see the write_sig! twin.
+        if self.in_edge_block {
+            if let Some(&p) = self.sig_to_edge_pos.get(id) {
+                if p >= 0 {
+                    let p = p as usize;
+                    if !self.edge_exec_seen[p] {
+                        self.edge_exec_seen[p] = true;
+                        self.edge_exec_wrote.push(p);
+                    }
+                }
+            }
+        }
         if !self.dirty_edge && !self.dirty_edge_shadow {
             return;
         }
@@ -34605,6 +35234,26 @@ impl Simulator {
                     if let Some((shape, w)) = self.module.arrays_nd.get(&n) {
                         if depth == shape.len() {
                             return *w;
+                        }
+                    }
+                    // Multi-D PACKED vector (`logic [1:0][3:0][7:0] foo`):
+                    // `foo[i]`/`foo[i][j]` select a SLICE — its width is the
+                    // product of the remaining dims, not 1 bit.
+                    if let Some(dims) = self.module.packed_full_dims.get(&n) {
+                        if depth < dims.len() {
+                            let w: u64 = dims[depth..]
+                                .iter()
+                                .map(|(l, r)| (l - r).unsigned_abs() + 1)
+                                .product();
+                            if w > 1 {
+                                return w as u32;
+                            }
+                        }
+                    } else if depth == 1 {
+                        if let Some(&ew) = self.module.packed_signal_elem_widths.get(&n) {
+                            if ew > 1 {
+                                return ew;
+                            }
                         }
                     }
                 }
@@ -44464,6 +45113,7 @@ impl Simulator {
             if cd.assoc_properties.contains_key(name)
                 || cd.queue_properties.contains_key(name)
                 || cd.array_properties.contains_key(name)
+                || cd.array_nd_properties.contains_key(name)
             {
                 return Some(format!("{}#{}", handle, name));
             }
@@ -49210,6 +49860,49 @@ impl Simulator {
                     self.signals
                         .insert(format!("{}[{}]", scoped, i), Value::zero(width));
                     self.widths.insert(format!("{}[{}]", scoped, i), width);
+                }
+            }
+            // Per-instance MULTI-dim fixed array members (`test_t foo[0:3][0:7]`):
+            // register the full shape so nested index access and multi-var
+            // foreach resolve, and default every element to 0 (a class-handle
+            // element's default is null). Oversized shapes stay lazy.
+            for (prop, (shape, width)) in &cdef.array_nd_properties {
+                let scoped = format!("{}#{}", handle, prop);
+                if shape.len() == 2 {
+                    self.module
+                        .arrays_2d
+                        .insert(scoped.clone(), (shape[0], shape[1], *width));
+                } else {
+                    self.module
+                        .arrays_nd
+                        .insert(scoped.clone(), (shape.clone(), *width));
+                }
+                let total: i64 = shape
+                    .iter()
+                    .map(|&(lo, hi)| (hi - lo + 1).max(0))
+                    .product();
+                if total > 0 && total <= 65536 {
+                    let mut idx: Vec<i64> = shape.iter().map(|d| d.0).collect();
+                    'fill: loop {
+                        let mut name = scoped.clone();
+                        for v in &idx {
+                            name = format!("{}[{}]", name, v);
+                        }
+                        self.widths.insert(name.clone(), *width);
+                        self.signals.insert(name, Value::zero(*width));
+                        let mut k = shape.len();
+                        loop {
+                            if k == 0 {
+                                break 'fill;
+                            }
+                            k -= 1;
+                            idx[k] += 1;
+                            if idx[k] <= shape[k].1 {
+                                break;
+                            }
+                            idx[k] = shape[k].0;
+                        }
+                    }
                 }
             }
         }
@@ -55736,6 +56429,21 @@ impl Simulator {
             }
         }
         best.map(|(_, n)| n)
+    }
+
+    /// Is `e` STATICALLY a class-handle expression? Guards the §8.12
+    /// copy-constructor reading of `new <src>`: construction vs copy is
+    /// decided by the operand's DECLARED type, never its runtime value —
+    /// an int arg (`new(i)`) whose value collides with a live heap index
+    /// must construct, not shallow-copy heap object #i.
+    fn expr_is_class_handle(&self, e: &Expression) -> bool {
+        if matches!(e.kind, ExprKind::This) {
+            return true;
+        }
+        self.get_expr_type_name(e).is_some_and(|t| {
+            let t = self.resolve_type_param_binding(&t).unwrap_or(t);
+            self.module.classes.contains_key(&t)
+        })
     }
 
     fn get_expr_type_name(&self, expr: &Expression) -> Option<String> {

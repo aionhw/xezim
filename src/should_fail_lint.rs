@@ -111,6 +111,7 @@ fn check_module_item(item: &ModuleItem, elab: &ElaboratedModule, errs: &mut Vec<
         }
         ModuleItem::AlwaysConstruct(a) => {
             for_each_stmt_expr(&a.stmt, &mut |e| check_zero_slice(e, elab, errs));
+            check_always_has_timing_control(a, errs);
         }
         ModuleItem::InitialConstruct(i) => {
             for_each_stmt_expr(&i.stmt, &mut |e| check_zero_slice(e, elab, errs));
@@ -1707,5 +1708,75 @@ fn check_implicit_ports(
             }
         }
         }
+    }
+}
+
+
+/// §9.2.1: a plain `always` whose body contains NO timing control anywhere
+/// (`#delay`, `@event`, `wait`, or an intra-assignment delay) can never yield —
+/// executing it is an infinite zero-time loop. xezim used to classify such a
+/// block as combinational with self-written vars dropped from the sensitivity
+/// list, so it silently ran ONCE and never again (silent wrongness, not even a
+/// hang). Commercial tools and ivtest's br991b expect a compile error.
+///
+/// Over-reject guards: any user TASK call is assumed potentially timed (the
+/// delay may live in the task body), and `always_comb`/`always_latch`/
+/// `always_ff` are governed by their own §9.2.2 rules, not this one.
+fn check_always_has_timing_control(
+    a: &crate::ast::decl::AlwaysConstruct,
+    errs: &mut Vec<String>,
+) {
+    use crate::ast::decl::AlwaysKind;
+    if a.kind != AlwaysKind::Always {
+        return;
+    }
+    fn stmt_may_yield(st: &crate::ast::stmt::Statement) -> bool {
+        use crate::ast::expr::ExprKind;
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::TimingControl { .. } | SK::Wait { .. } | SK::WaitFork => true,
+            // NBAs/assignments with an intra-assignment delay were
+            // canonicalized to a marker call by the pre-parse rewrite.
+            SK::BlockingAssign { rvalue, .. } => {
+                matches!(&rvalue.kind, ExprKind::SystemCall { name, .. }
+                    if name.contains("__xz_intra_delay"))
+            }
+            // An NBA with an explicit delay (`x <= #5 y`) yields time.
+            SK::NonblockingAssign { delay, rvalue, .. } => {
+                delay.is_some()
+                    || matches!(&rvalue.kind, ExprKind::SystemCall { name, .. }
+                        if name.contains("__xz_intra_delay"))
+            }
+            // A user task may contain the timing control — cannot prove
+            // otherwise here, so treat the block as legal.
+            SK::Expr(e) => matches!(&e.kind, ExprKind::Call { .. }),
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                stmts.iter().any(stmt_may_yield)
+            }
+            SK::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                stmt_may_yield(then_stmt)
+                    || else_stmt.as_deref().map(stmt_may_yield).unwrap_or(false)
+            }
+            SK::Case { items, .. } => items.iter().any(|it| stmt_may_yield(&it.stmt)),
+            SK::Forever { body }
+            | SK::Repeat { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::For { body, .. }
+            | SK::Foreach { body, .. } => stmt_may_yield(body),
+            _ => false,
+        }
+    }
+    if !stmt_may_yield(&a.stmt) {
+        errs.push(format!(
+            "`always` block with no timing control anywhere in its body — it can never \
+yield, so simulated time cannot advance (IEEE 1800-2017 §9.2.1). Add a `#delay`, \
+`@(...)`, or `wait`, or use `always_comb` (at byte {}..{})",
+            a.span.start, a.span.end
+        ));
     }
 }

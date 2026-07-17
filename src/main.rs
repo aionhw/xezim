@@ -82,7 +82,10 @@ fn print_usage() {
     eprintln!("                     overrides a `timeunit`/`timeprecision` decl or an active `timescale.");
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
     eprintln!("                   n>=2 offloads stdout writes to a background thread.");
-    eprintln!("  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>");
+    eprintln!("  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>
+  -v <file>        Library file: modules compiled only to resolve instantiations
+  -y <dir>         Library directory: <module>.<ext> loaded on demand
+  +libext+<ext>+.. Extension list for -y search (replaces default .v/.sv/.V)");
     eprintln!("  --xtrace <file>  Emit an XTrace dump to <file> (compliance Level 0:");
     eprintln!("                   dictionary + time + signal deltas + event records).");
     eprintln!("                   A '.zst'/'.zstd' suffix zstd-compresses the stream.");
@@ -212,6 +215,19 @@ fn push_plus_incdir(arg: &str, include_dirs: &mut Vec<String>, lib_dirs: &mut Ve
     for dir in payload.split('+').filter(|s| !s.is_empty()) {
         include_dirs.push(dir.to_string());
         lib_dirs.push(dir.to_string());
+    }
+}
+
+/// `+libext+.sv+.vlib` — extension list for `-y` library-directory search.
+/// Entries may be given with or without the leading dot; the list REPLACES
+/// the default (.v/.sv/.V), matching commercial tools.
+fn push_plus_libext(arg: &str, lib_exts: &mut Option<Vec<String>>) {
+    let list = lib_exts.get_or_insert_with(Vec::new);
+    for e in arg["+libext+".len()..].split('+') {
+        let e = e.trim().trim_start_matches('.');
+        if !e.is_empty() {
+            list.push(e.to_string());
+        }
     }
 }
 
@@ -352,6 +368,8 @@ fn process_command_file(
     defines: &mut Vec<(String, Option<String>)>,
     lib_dirs: &mut Vec<String>,
     plusargs: &mut Vec<String>,
+    lib_files: &mut Vec<String>,
+    lib_exts: &mut Option<Vec<String>>,
 ) -> Result<(), String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Cannot read command file '{}': {}", path, e))?;
@@ -413,6 +431,15 @@ fn process_command_file(
                         include_dirs.push(d);
                     }
                 }
+                "-v" => {
+                    i += 1;
+                    if i < toks.len() {
+                        lib_files.push(resolve_rel(base, &toks[i]));
+                    }
+                }
+                _ if t.starts_with("+libext+") => {
+                    push_plus_libext(t, lib_exts);
+                }
                 "-f" | "-c" => {
                     i += 1;
                     if i < toks.len() {
@@ -424,6 +451,8 @@ fn process_command_file(
                             defines,
                             lib_dirs,
                             plusargs,
+                            lib_files,
+                            lib_exts,
                         )?;
                     }
                 }
@@ -447,6 +476,8 @@ fn process_command_file(
                         defines,
                         lib_dirs,
                         plusargs,
+                        lib_files,
+                        lib_exts,
                     )?;
                 }
                 _ if t.starts_with("+incdir+") => {
@@ -542,6 +573,8 @@ fn main() {
     let mut verbose = false;
     let mut _output_file: Option<String> = None;
     let mut lib_dirs: Vec<String> = Vec::new();
+    let mut lib_files: Vec<String> = Vec::new();
+    let mut lib_exts: Option<Vec<String>> = None;
     let mut log_file: Option<String> = None;
     let mut settle_limit: Option<u32> = None;
     let mut activity_mon = false;
@@ -647,6 +680,8 @@ fn main() {
                         &mut defines,
                         &mut lib_dirs,
                         &mut plusargs,
+                        &mut lib_files,
+                        &mut lib_exts,
                     ) {
                         Ok(()) => {}
                         Err(e) => {
@@ -664,6 +699,8 @@ fn main() {
                     &mut defines,
                     &mut lib_dirs,
                     &mut plusargs,
+                    &mut lib_files,
+                    &mut lib_exts,
                 ) {
                     Ok(()) => {}
                     Err(e) => {
@@ -696,10 +733,27 @@ fn main() {
             _ if arg.starts_with("+define+") => {
                 push_plus_define(arg, &mut defines);
             }
+            _ if arg.starts_with("+libext+") => {
+                push_plus_libext(arg, &mut lib_exts);
+            }
             _ if arg.starts_with('+') => {
                 plusargs.push(arg.clone());
             }
+            // `-v <file>` — a library FILE (Verilog-XL/VCS semantics): its
+            // modules are compiled on demand to satisfy unresolved
+            // instantiations and are never top-module candidates. The old
+            // "verbose" meaning of -v (which controlled nothing) moved to
+            // --verbose.
             "-v" => {
+                i += 1;
+                if i < args.len() {
+                    lib_files.push(args[i].clone());
+                } else {
+                    eprintln!("Error: -v requires a library file name");
+                    std::process::exit(1);
+                }
+            }
+            "--verbose" => {
                 verbose = true;
             }
             "-V" => {
@@ -1045,6 +1099,16 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+
+    // Library search config (`-v` files, `+libext+` extensions) — consumed by
+    // the core resolver that satisfies unresolved instantiations from `-y`
+    // directories and `-v` files.
+    if !lib_files.is_empty() || lib_exts.is_some() {
+        xezim::set_library_cli(xezim::LibraryCli {
+            lib_files: lib_files.clone(),
+            lib_exts: lib_exts.clone(),
+        });
     }
 
     if let Some(ref path) = log_file {

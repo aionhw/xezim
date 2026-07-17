@@ -1,6 +1,7 @@
 [package]
 name = "xezim"
 version = "0.9.5"
+build = "src/build.rs"
 edition = "2021"
 rust-version = "1.75"
 description = "SystemVerilog bytecode interpreter (IEEE 1800-2023, with --sv2017 opt-out). For native compilation, see xezim-b."

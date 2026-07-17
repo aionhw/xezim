@@ -176,3 +176,186 @@ module test();
 endmodule
 "#));
 }
+
+/// §8.12 vs constructor call: `foo[i] = new(i)` with an INT arg constructs —
+/// it must never be read as the shallow-copy form `new <src>` just because
+/// the int's value collides with a live heap index (ivtest sv_foreach3/4).
+#[test]
+fn class_new_int_arg_is_construction_not_copy() {
+    assert!(passes(r#"
+module main;
+   class test_t;
+      reg [7:0] a;
+      function new (int ax); a = ax; endfunction
+   endclass
+   class container_t;
+      test_t foo [0:3];
+      task run();
+	 test_t tmp;
+	 for (int i = 0 ; i < 4 ; i++) foo[i] = new(i);
+	 for (int i = 0 ; i < 4 ; i++) begin
+	    tmp = foo[i];
+	    if (tmp == null) begin $display("FAILED -- null %0d", i); $finish; end
+	    if (tmp.a !== 8'(i)) begin $display("FAILED -- a %0d %0d", i, tmp.a); $finish; end
+	 end
+	 $display("PASSED");
+      endtask
+   endclass
+   container_t dut;
+   initial begin dut = new; dut.run; end
+endmodule
+"#));
+}
+
+/// Multi-dim fixed class-array member: element writes/reads (`foo[i][j]`)
+/// and multi-var `foreach (foo[ia,ib])` resolve per-instance storage —
+/// previously only the first dimension was recorded (ivtest sv_foreach3/4).
+#[test]
+fn class_member_2d_array_rw_and_foreach() {
+    assert!(passes(r#"
+module main;
+   class test_t;
+      reg [1:0] a;
+      reg [2:0] b;
+      function new (int ax, int bx); a = ax; b = bx; endfunction
+   endclass
+   class container_t;
+      test_t foo [0:3][0:7];
+      function new();
+	 for (int i = 0 ; i < 4 ; i++)
+	    for (int j = 0 ; j < 8 ; j++)
+	       foo[i][j] = new(i,j);
+      endfunction
+      task run();
+	 test_t tmp;
+	 foreach (foo[ia,ib]) begin
+	    if (ia > 3 || ib > 7) begin
+	       $display("FAILED -- range ia=%0d ib=%0d", ia, ib); $finish;
+	    end
+	    tmp = foo[ia][ib];
+	    if (tmp.a !== ia[1:0] || tmp.b !== ib[2:0]) begin
+	       $display("FAILED -- foo[%0d][%0d] = %b", ia, ib, {tmp.a, tmp.b}); $finish;
+	    end
+	    foo[ia][ib] = null;
+	 end
+	 for (int i = 0 ; i < 4 ; i++)
+	    for (int j = 0 ; j < 8 ; j++)
+	       if (foo[i][j] != null) begin
+		  $display("FAILED -- not visited %0d %0d", i, j); $finish;
+	       end
+	 $display("PASSED");
+      endtask
+   endclass
+   container_t dut;
+   initial begin dut = new; dut.run; end
+endmodule
+"#));
+}
+
+/// §12.7.3: a foreach loop var BEYOND the unpacked dims iterates the
+/// element's packed dimension (ivtest sv_foreach5).
+#[test]
+fn foreach_packed_dim_loop_var() {
+    assert!(passes(r#"
+module test();
+reg [3:0] array[0:1][0:2];
+reg [3:0] expected;
+reg failed = 0;
+initial begin
+  for (int i = 0; i < 2; i++)
+    for (int j = 0; j < 3; j++)
+      array[i][j] = i * 4 + j;
+  foreach (array[i,j,k]) begin
+    expected = i * 4 + j;
+    if (array[i][j][k] !== expected[k]) failed = 1;
+  end
+  foreach (array[i,j]) begin
+    expected = i * 4 + j;
+    if (array[i][j] !== expected) failed = 1;
+  end
+  if (failed) $display("FAILED"); else $display("PASSED");
+end
+endmodule
+"#));
+}
+
+/// §7.4.1: genloop port connections onto elements of a multi-D PACKED net
+/// (`wire logic [3:0][7:0] foo; test dut(.sum(foo[idx]))`) drive the full
+/// element slice, and `foo[i]` reads a slice, not a bit (ivtest packeda2).
+#[test]
+fn packed_net_elem_port_connection() {
+    assert!(passes(r#"
+module main;
+   wire logic [3:0][7:0] foo;
+   genvar idx;
+   for (idx = 0 ; idx <= 3 ; idx = idx+1) begin: test
+      test dut (.sum(foo[idx]), .a(idx));
+   end
+   logic [7:0] tmp;
+   initial begin
+      #1;
+      for (tmp = 0 ; tmp <= 3 ; tmp = tmp+1) begin
+	 if (foo[tmp] !== (tmp+8'd5)) begin
+	    $display("FAILED -- foo[%d] = %b", tmp, foo[tmp]);
+	    $finish;
+	 end
+      end
+      $display("PASSED");
+   end
+endmodule
+module test (output logic[7:0] sum, input logic [7:0]a);
+   assign sum = a + 8'd5;
+endmodule
+"#));
+}
+
+/// §6.6.1: an undriven net reads Z, not X — and bits of a net nothing
+/// drives stay z after partial continuous assigns (ivtest
+/// struct_packed_write_read2's word_se0/sw0/ep0 checks).
+#[test]
+fn undriven_net_defaults_to_z() {
+    assert!(passes(r#"
+module main;
+   typedef struct packed {
+      logic [7:0] high;
+      logic [7:0] low;
+   } word_t;
+   wire word_t word_se0;
+   wire word_t word_ep1;
+   assign word_ep1.high [3:0] = 4'b1111;
+   assign word_ep1.low  [3:0] = 4'b0000;
+   initial begin
+      #1;
+      if (word_se0 !== 16'bzzzzzzzz_zzzzzzzz) begin
+	 $display("FAILED -- word_se0 = 'b%b", word_se0); $finish;
+      end
+      if (word_ep1 !== 16'bzzzz1111_zzzz0000) begin
+	 $display("FAILED -- word_ep1 = 'b%b", word_ep1); $finish;
+      end
+      $display("PASSED");
+   end
+endmodule
+"#));
+}
+
+/// Nested cont-assign selects on a multi-D packed NET write the addressed
+/// slice with full element width (regression probe for the interpreted
+/// ContAssign path: infer_lhs_width must not truncate to 1 bit).
+#[test]
+fn packed_net_nested_index_cont_assign() {
+    assert!(passes(r#"
+module main;
+   wire logic [1:0][3:0][7:0] foo;
+   assign foo[0][0] = 8'hA5;
+   assign foo[0][3] = 8'hC3;
+   assign foo[1][2] = 8'h7E;
+   initial begin
+      #1;
+      if (foo !== 64'hzz7ezzzzc3zzzza5) begin
+	 $display("FAILED -- foo=%h", foo); $finish;
+      end
+      $display("PASSED");
+   end
+endmodule
+"#));
+}

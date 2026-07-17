@@ -529,7 +529,28 @@ impl<'a> BytecodeCompiler<'a> {
         if self.lookup_array_name(hier).is_some() {
             return None;
         }
+        // A multi-D PACKED base (`logic [1:0][3:0][7:0] foo`) is NOT a
+        // flattening no-op: `foo[0]` selects a slice, so `foo[0][j]` must
+        // not degrade to a bit-select of the whole vector (§7.4.1).
+        if self.packed_elem_width_of(hier).is_some() {
+            return None;
+        }
         self.lookup_signal_id(hier)
+    }
+
+    /// The base's registered packed ELEMENT width (>1), if it is a
+    /// multi-dimensional packed vector (`logic [3:0][7:0] x`).
+    fn packed_elem_width_of(&self, hier: &HierarchicalIdentifier) -> Option<u32> {
+        let raw = Self::hier_raw_name(hier);
+        self.packed_elem_widths
+            .and_then(|m| {
+                m.get(raw.as_str()).copied().or_else(|| {
+                    hier.path
+                        .last()
+                        .and_then(|s| m.get(s.name.name.as_str()).copied())
+                })
+            })
+            .filter(|&w| w > 1)
     }
 
     fn flattened_const_range_target(
@@ -1770,6 +1791,13 @@ impl<'a> BytecodeCompiler<'a> {
                 kind,
             } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
+                    // §7.4.1: a range select on a multi-D PACKED vector
+                    // (`logic [1:16][7:0] s; s[1:8] = …`) selects ELEMENTS,
+                    // not bits — bail to the interpreter's element-aware path.
+                    if self.packed_elem_width_of(hier).is_some() {
+                        self.bail("blocking_range_packed_multid");
+                        return false;
+                    }
                     if let Some(id) = self.lookup_signal_id(hier) {
                         match kind {
                             RangeKind::Constant => {
