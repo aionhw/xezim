@@ -949,7 +949,19 @@ struct EventWaiter {
     /// consulted afterwards — dropped.
     resolved_sensitivities: Vec<SensitivityId>,
     continuation: Vec<Statement>,
-    registered_time: u64,
+    /// Value of `Simulator::snap_gen` when this waiter registered. A waiter
+    /// only fires on edges detected against a snapshot taken AFTER it
+    /// registered (`registered_snap_gen != snap_gen`). This protects a
+    /// waiter registered mid-tick from the tick's pre-registration edges —
+    /// notably the time-0 init pseudo-edges (prev seeded to X so every
+    /// initialized signal "fires" at the first check_edges) and the
+    /// re-registration of a `forever @(posedge clk)` loop against the edge
+    /// it just consumed. Unlike the old `registered_time == self.time`
+    /// guard, it does NOT suppress edges produced in LATER delta cycles of
+    /// the same timestamp (an inactive-region `#0 clk = 1;` toggle must
+    /// wake an `@(posedge clk)` waiter registered earlier at that time —
+    /// IEEE 1800-2023 §4.4.2.3, matching Icarus/commercial simulators).
+    registered_snap_gen: u64,
 }
 
 /// Pad a string to a given width with spaces (or zeros if zero_pad).
@@ -1866,6 +1878,12 @@ pub struct Simulator {
     /// Fallback for signals wider than 64 bits where the inline u64 pair
     /// above can't represent the full state.
     prev_wide: HashMap<usize, Value>,
+    /// Snapshot generation counter: bumped every `snapshot_edge_signals`.
+    /// `EventWaiter::registered_snap_gen` records it at registration so the
+    /// wake path can tell "edge detected against a snapshot the waiter had
+    /// already registered under" (fire) from "edge predates registration /
+    /// is a time-0 init pseudo-edge" (skip). See EventWaiter docs.
+    snap_gen: u64,
     edge_signal_names: HashSet<String>,
     /// Edge sensitivity resolved to signal IDs.
     edge_signal_ids: Vec<usize>,
@@ -4084,6 +4102,7 @@ impl Simulator {
             prev_val,
             prev_xz,
             prev_wide,
+            snap_gen: 0,
             edge_signal_names: HashSet::default(),
             edge_signal_ids: Vec::new(),
             edge_blocks_by_sig: Vec::new(),
@@ -14707,7 +14726,7 @@ impl Simulator {
             pid,
             resolved_sensitivities: resolved,
             continuation,
-            registered_time: self.time,
+            registered_snap_gen: self.snap_gen,
         }
     }
 
@@ -17490,10 +17509,10 @@ impl Simulator {
                     // timestep (delta), cross-timestep (#delay), and time-0
                     // init uniformly. Routing a signal-naming wait through the
                     // edge-triggered event_waiter path instead BREAKS delta-
-                    // cycle wakeup: its `registered_time == self.time` guard
-                    // (correct for edge-sensitive `@()`) skips any same-
-                    // timestep edge, so `wait(sig==v)` never resumes when a
-                    // peer process writes `sig` at the same simtime. The UVM
+                    // cycle wakeup: its registration-generation guard
+                    // (correct for edge-sensitive `@()`) skips edges from the
+                    // current snapshot window, so `wait(sig==v)` may miss a
+                    // peer process writing `sig` at the same simtime. The UVM
                     // phase hopper (`fork ... join_none; wait(all_dropped)`)
                     // and sequencer arbitration depend on exactly this delta-
                     // cycle handoff. Always park in condition_waiters.
@@ -18666,6 +18685,9 @@ impl Simulator {
     /// the prev_val/prev_xz parallel arrays (A3 from the compression
     /// analysis). Wide signals (> 64 bits) also update `prev_wide`.
     fn snapshot_edge_signals(&mut self) {
+        // New snapshot generation: waiters registered before this point
+        // become eligible for edges detected against it (see EventWaiter).
+        self.snap_gen = self.snap_gen.wrapping_add(1);
         #[inline]
         fn snap_one(
             id: usize,
@@ -19830,7 +19852,15 @@ impl Simulator {
         self.event_waiters_swap.clear();
         let mut triggered_conts: Vec<(usize, Vec<Statement>)> = Vec::new();
         for waiter in waiters {
-            if waiter.registered_time == self.time {
+            // Skip waiters registered since the last snapshot: the prev
+            // values their edges would be checked against were captured
+            // BEFORE they registered, so a detected "edge" may predate the
+            // registration (time-0 init pseudo-edges, a forever-@ loop
+            // re-registering against the edge it just consumed). Waiters
+            // registered in an EARLIER delta cycle of this same timestamp
+            // stay eligible — an inactive-region (`#0`) toggle or an NBA
+            // commit at the current time must wake them (§4.4.2.3/§4.4.5).
+            if waiter.registered_snap_gen == self.snap_gen {
                 self.event_waiters_swap.push(waiter);
                 continue;
             }
