@@ -32168,6 +32168,12 @@ impl Simulator {
             "$strobe" | "$strobeb" | "$strobeh" | "$strobeo" => {
                 self.pending_strobes.push((name.to_string(), args.to_vec()));
             }
+            // §21.2.2 file variants: queue exactly like $strobe (postponed
+            // region, so post-NBA values are printed); drain_pending_strobes
+            // routes "$fstrobe*" entries to the file descriptor in args[0].
+            "$fstrobe" | "$fstrobeb" | "$fstrobeh" | "$fstrobeo" => {
+                self.pending_strobes.push((name.to_string(), args.to_vec()));
+            }
             // $value$plusargs and $test$plusargs return a bit but the
             // common pattern `$value$plusargs("...", var);` calls them as
             // statements (return value discarded). Without this arm the
@@ -32184,6 +32190,16 @@ impl Simulator {
                 }
             }
             "$monitor" | "$monitorb" | "$monitorh" | "$monitoro" => {
+                self.monitor = Some((name.to_string(), args.to_vec()));
+                self.monitor_arg_prev = None; // fresh arm ⇒ print immediately
+                self.check_monitor();
+            }
+            // §21.2.3 file variant: SHARES the single $monitor slot (xezim
+            // models one active monitor; the LRM allows any number of
+            // $fmonitor tasks — approximation: the last armed $monitor or
+            // $fmonitor wins). check_monitor routes "$fmonitor*" output to
+            // the file descriptor in args[0] and watches args[1..].
+            "$fmonitor" | "$fmonitorb" | "$fmonitorh" | "$fmonitoro" => {
                 self.monitor = Some((name.to_string(), args.to_vec()));
                 self.monitor_arg_prev = None; // fresh arm ⇒ print immediately
                 self.check_monitor();
@@ -33241,9 +33257,16 @@ impl Simulator {
         }
         let queued = std::mem::take(&mut self.pending_strobes);
         for (name, args) in queued {
-            let m = self.format_args(&args, &name);
-            self.record_output(m.clone());
-            self.stdout_writeln(&m);
+            if let Some(radix_suffix) = name.strip_prefix("$fstrobe") {
+                // §21.2.2 $fstrobeX(fd, fmt, …): format with $strobeX radix
+                // rules, write to the file descriptor in args[0].
+                let tn = format!("$strobe{}", radix_suffix);
+                let _ = self.write_file_handle_named(&args, true, &tn);
+            } else {
+                let m = self.format_args(&args, &name);
+                self.record_output(m.clone());
+                self.stdout_writeln(&m);
+            }
         }
     }
 
@@ -33741,16 +33764,29 @@ impl Simulator {
             // when one of its monitored arguments changes — EXCLUDING the time
             // functions (otherwise it would print every time step). Snapshot
             // the non-time argument values and compare against the last print.
-            let cur: Vec<Value> = args
+            // The $fmonitor* variants watch args[1..] (args[0] is the file
+            // descriptor) and write to that descriptor instead of stdout.
+            let is_file = tn.starts_with("$fmonitor");
+            let watch: &[Expression] = if is_file {
+                args.get(1..).unwrap_or(&[])
+            } else {
+                &args[..]
+            };
+            let cur: Vec<Value> = watch
                 .iter()
                 .filter(|a| !Self::is_monitor_time_arg(a))
                 .map(|a| self.eval_expr(a))
                 .collect();
             let changed = self.monitor_arg_prev.as_deref() != Some(cur.as_slice());
             if changed {
-                let m = self.format_args(&args, &tn);
-                self.record_output(m.clone());
-                self.stdout_writeln(&m);
+                if is_file {
+                    let tn2 = format!("$monitor{}", &tn["$fmonitor".len()..]);
+                    let _ = self.write_file_handle_named(&args, true, &tn2);
+                } else {
+                    let m = self.format_args(&args, &tn);
+                    self.record_output(m.clone());
+                    self.stdout_writeln(&m);
+                }
                 self.monitor_arg_prev = Some(cur);
             }
         }

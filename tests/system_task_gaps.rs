@@ -66,6 +66,46 @@ endmodule
     assert!(sim.warned_system_task_names().is_empty());
 }
 
+// ---------------------------------------------------------------- group 3
+
+#[test]
+fn fstrobe_and_fmonitor_write_to_file() {
+    let dir = std::env::temp_dir().join(format!("xezim_fstrobe_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("out.txt");
+    let src = format!(
+        r#"
+module tb;
+  integer fd;
+  reg [7:0] a;
+  initial begin
+    fd = $fopen("{out}", "w");
+    a = 8'h11;
+    $fstrobe(fd, "strobe a=%h t=%0t", a, $time);
+    a = 8'h22;
+    #1;
+    $fmonitor(fd, "mon a=%h t=%0t", a, $time);
+    #1 a = 8'h33;
+    #1 a = 8'h44;
+    #1 $fclose(fd);
+    $finish;
+  end
+endmodule
+"#,
+        out = out.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    let text = std::fs::read_to_string(&out).expect("fstrobe output file missing");
+    // Matches Icarus (iverilog -g2012) verbatim: strobe sees the post-update
+    // value 22; fmonitor prints once when armed and on each change.
+    assert_eq!(
+        text,
+        "strobe a=22 t=0\nmon a=22 t=1\nmon a=33 t=2\nmon a=44 t=3\n"
+    );
+    assert!(sim.warned_system_task_names().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn handled_names_do_not_trip_unknown_warning() {
     // Function-only names in statement position (result discarded) and
