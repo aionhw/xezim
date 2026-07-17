@@ -463,7 +463,7 @@ pub fn simulate_multi(
         let sdf_content = std::fs::read_to_string(sdf_path)
             .map_err(|e| format!("Cannot read SDF file '{}': {}", sdf_path, e))?;
         let sdf = xezim_core::sdf::parse_sdf(&sdf_content)
-            .map_err(|e| format!("SDF parse error: {}", e))?;
+            .map_err(|e| format!("SDF parse error in '{}': {}", sdf_path, e))?;
         let select = sdf_select.unwrap_or(xezim_core::sdf::DelaySelect::Typ);
         let sim_timescale = 1e-9;
         let annotation = xezim_core::sdf::annotate_sdf(&sdf, sim_timescale, select);

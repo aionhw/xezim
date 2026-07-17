@@ -87,6 +87,7 @@ fn print_usage() {
   -y <dir>         Library directory: <module>.<ext> loaded on demand
   +libext+<ext>+.. Extension list for -y search (replaces default .v/.sv/.V)
   +nospecify       Suppress specify-block path delays (zero-delay gate sim)
+  +mindelays/+typdelays/+maxdelays  min:typ:max selection (specify + SDF; default typ)
   +notimingcheck   Accepted no-op (specify timing checks are not modeled)");
     eprintln!("  --xtrace <file>  Emit an XTrace dump to <file> (compliance Level 0:");
     eprintln!("                   dictionary + time + signal deltas + event records).");
@@ -755,6 +756,26 @@ fn main() {
             // are accepted too.
             "+nospecify" | "-nospecify" => {
                 nospecify = true;
+            }
+            // min:typ:max selection — governs specify-path triplets and, when
+            // no --sdf-min/typ/max was given, the SDF annotation too.
+            "+mindelays" | "-mindelays" => {
+                xezim::sv_parser::set_delay_select(0);
+                if sdf_select.is_none() {
+                    sdf_select = Some(xezim::compiler::sdf::DelaySelect::Min);
+                }
+            }
+            "+typdelays" | "-typdelays" => {
+                xezim::sv_parser::set_delay_select(1);
+                if sdf_select.is_none() {
+                    sdf_select = Some(xezim::compiler::sdf::DelaySelect::Typ);
+                }
+            }
+            "+maxdelays" | "-maxdelays" => {
+                xezim::sv_parser::set_delay_select(2);
+                if sdf_select.is_none() {
+                    sdf_select = Some(xezim::compiler::sdf::DelaySelect::Max);
+                }
             }
             "+notimingcheck" | "+notimingchecks" | "-notimingchecks" => {
                 // no-op by design; recognized so flows don't carry a mystery plusarg

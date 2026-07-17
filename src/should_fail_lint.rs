@@ -124,6 +124,34 @@ fn check_module_item(item: &ModuleItem, elab: &ElaboratedModule, errs: &mut Vec<
         }
         ModuleItem::FunctionDeclaration(f) => check_output_port_defaults(&f.ports, errs),
         ModuleItem::TaskDeclaration(t) => check_output_port_defaults(&t.ports, errs),
+        // The per-item checks must SEE inside generate constructs — without
+        // this recursion every rule above was bypassed by wrapping the illegal
+        // code in `generate begin ... end` (same walker-coverage bug class as
+        // the library resolver's).
+        ModuleItem::GenerateRegion(gr) => {
+            for it in &gr.items {
+                check_module_item(it, elab, errs);
+            }
+        }
+        ModuleItem::GenerateIf(gi) => {
+            for (_c, items) in &gi.branches {
+                for it in items {
+                    check_module_item(it, elab, errs);
+                }
+            }
+        }
+        ModuleItem::GenerateFor(gf) => {
+            for it in &gf.items {
+                check_module_item(it, elab, errs);
+            }
+        }
+        ModuleItem::GenerateCase(gc) => {
+            for arm in &gc.arms {
+                for it in &arm.items {
+                    check_module_item(it, elab, errs);
+                }
+            }
+        }
         _ => {}
     }
 }
