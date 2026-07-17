@@ -32077,6 +32077,24 @@ impl Simulator {
             "$monitoroff" => {
                 self.monitor_paused = true;
             }
+            // Verilog-XL/VCS `$deposit(target, value)`: set the target's value
+            // immediately, WITHOUT a persistent driver — it holds until the
+            // next driver transaction overwrites it (an undriven net keeps it).
+            // A plain simulator write has exactly those semantics here: the
+            // settle/edge machinery propagates it, and any cont-assign driver
+            // re-evaluation replaces it.
+            "$deposit" => {
+                if args.len() == 2 {
+                    let mut v = self.eval_expr(&args[1]);
+                    let w = self.infer_lhs_width(&args[0]).max(1);
+                    if v.width != w {
+                        v = v.resize(w);
+                    }
+                    self.assign_value(&args[0], &v);
+                } else {
+                    eprintln!("Warning: $deposit expects (target, value) — got {} args", args.len());
+                }
+            }
             "$monitoron" => {
                 // Re-enable a previously paused monitor. Per LRM §21.2.3,
                 // $monitoron always prints once immediately (even if values
