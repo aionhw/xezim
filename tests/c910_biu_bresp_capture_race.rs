@@ -2,11 +2,11 @@
 //! race localized in round 34 of the c910 memcpy investigation. See
 //! docs/c910_memcpy_investigation.md.
 //!
-//! VCD diff vs iverilog shows:
+//! VCD diff vs a reference simulator shows:
 //!  - `pad_biu_bvalid` (raw AXI slave bvalid): 4 pulses fire identically
-//!    in xezim and iverilog through sim 47695.
+//!    in xezim and a reference simulator through sim 47695.
 //!  - `cur_bresp_buf_bvalid` (registered in BIU at ct_biu_write_channel.v:975
-//!    on `posedge bcpuclk`): iverilog captures all 4; xezim only captures
+//!    on `posedge bcpuclk`): a reference simulator captures all 4; xezim only captures
 //!    the first 3. The 4th pad_biu_bvalid at sim 47695 is missed.
 //!
 //! `bcpuclk` is gated from `coreclk` via a passthrough `gated_clk_cell`

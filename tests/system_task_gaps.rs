@@ -96,7 +96,7 @@ endmodule
     );
     let sim = simulate(&src, 1000).expect("simulate failed");
     let text = std::fs::read_to_string(&out).expect("fstrobe output file missing");
-    // Matches Icarus (iverilog -g2012) verbatim: strobe sees the post-update
+    // Matches a reference simulator (a reference simulator) verbatim: strobe sees the post-update
     // value 22; fmonitor prints once when armed and on each change.
     assert_eq!(
         text,
@@ -143,7 +143,7 @@ endmodule
         bin = bin.display()
     );
     let sim = simulate(&src, 1000).expect("simulate failed");
-    // All values verified against Icarus (iverilog -g2012).
+    // All values verified against a reference simulator (a reference simulator).
     assert_eq!(u(&sim, "n1"), 2);
     assert_eq!(u(&sim, "r16"), 0x0102);
     assert_eq!(u(&sim, "n2"), 4);

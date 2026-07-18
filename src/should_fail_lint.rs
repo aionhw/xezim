@@ -158,7 +158,7 @@ fn check_module_item(item: &ModuleItem, elab: &ElaboratedModule, errs: &mut Vec<
     }
 }
 
-/// §13.5.3 (iverilog restriction): a default value on an `output`/`inout`
+/// §13.5.3 (a reference simulator restriction): a default value on an `output`/`inout`
 /// subroutine port is not permitted. Flags `task t(output int j = b);`.
 fn check_output_port_defaults(
     ports: &[xezim_core::ast::decl::FunctionPort],

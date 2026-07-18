@@ -1034,6 +1034,10 @@ struct EventWaiter {
     /// `Vec<Sensitivity>` mirror was set at construction but never
     /// consulted afterwards — dropped.
     resolved_sensitivities: Vec<SensitivityId>,
+    /// Value (raw v,x low-64) of each `resolved_sensitivities` signal at the
+    /// moment this waiter armed. Parallel to `resolved_sensitivities`. Used to
+    /// detect a change made AFTER arming within the same snapshot generation.
+    arm_bits: Vec<(u64, u64)>,
     continuation: Vec<Statement>,
     /// Each sensitivity signal's value captured AT registration time
     /// (`raw_bits()` for the ≤64-bit fast path). The waiter fires when the
@@ -1945,7 +1949,7 @@ pub struct Simulator {
     /// `assign` (including the continuous-assigns that inlining synthesizes for
     /// instance port connections). §6.5 forbids mixing continuous and procedural
     /// drivers on a variable, so this is exactly "has no procedural driver", and
-    /// §21.7.2.1's `var_type` for such an object is `wire` — what Icarus emits
+    /// §21.7.2.1's `var_type` for such an object is `wire` — what a reference simulator emits
     /// and what makes a viewer colour it as a net. `module.continuous_assigns` is
     /// drained into bytecode at compile time, so the fact is recorded here while
     /// it is still known.
@@ -1973,10 +1977,11 @@ pub struct Simulator {
     /// above can't represent the full state.
     prev_wide: HashMap<usize, Value>,
     /// Snapshot generation counter: bumped every `snapshot_edge_signals`.
-    /// `EventWaiter::registered_snap_gen` records it at registration so the
-    /// wake path can tell "edge detected against a snapshot the waiter had
-    /// already registered under" (fire) from "edge predates registration /
-    /// is a time-0 init pseudo-edge" (skip). See EventWaiter docs.
+    /// (Previously read by `EventWaiter::registered_snap_gen` to guard
+    /// pre-registration edges; that mechanism was replaced by per-signal
+    /// `captured_prev` baselines captured at arm time — see `EventWaiter` —
+    /// which handles the NBA-region / same-tick cases directly. The counter
+    /// is retained for diagnostics/future use but is currently write-only.)
     snap_gen: u64,
     edge_signal_names: HashSet<String>,
     /// Edge sensitivity resolved to signal IDs.
@@ -2854,7 +2859,7 @@ pub struct Simulator {
     /// exactly once at time zero, AFTER all initial/always procedures have
     /// STARTED (run to their first delay). Firing them in the pre-initial
     /// settle would let an initial block read the output as already-settled;
-    /// Icarus (and the standard) has that same-time pre-delay read return X.
+    /// a reference simulator (and the standard) has that same-time pre-delay read return X.
     /// So we hold these out of the normal time-0 settle and fire them once at
     /// the END of the time-0 active region (see run_one_tick). Cloned entries,
     /// evaluated directly.
@@ -6185,7 +6190,7 @@ impl Simulator {
     /// most significant (IEEE 1800-2017 §21.3.4.4); on a short (EOF) read the
     /// data is left-justified — the missing low-order bytes read as zero.
     /// Truncation to `width` keeps the low-order bits (16-bit data into a
-    /// 12-bit reg keeps bits [11:0], matching Icarus).
+    /// 12-bit reg keeps bits [11:0], matching a reference simulator).
     fn fread_value_from_bytes(bytes: &[u8], nbytes_full: usize, width: u32) -> Value {
         let mut hex = String::with_capacity(nbytes_full * 2);
         for b in bytes {
@@ -14139,7 +14144,7 @@ impl Simulator {
             });
             self.has_udp = true;
         }
-        // A UDP output initializes to x (Icarus), not the undriven-wire z — a
+        // A UDP output initializes to x (a reference simulator), not the undriven-wire z — a
         // sequential UDP to its `initial` start state (default x), a
         // combinational UDP to x until its first evaluation drives it. This is
         // visible when an instance `#delay` postpones the first real drive.
@@ -14182,7 +14187,7 @@ impl Simulator {
 
         // Previous input levels. Before the first evaluation each input's prior
         // value is x (its pre-time-0 state), so a t=0 x→value transition is a
-        // real edge — matching Icarus.
+        // real edge — matching a reference simulator.
         let mut prev = [2u8; 32];
         for i in 0..n {
             prev[i] = if first { 2 } else { rt.prev_inputs[i] };
@@ -14190,7 +14195,7 @@ impl Simulator {
 
         // A UDP is event-driven: it evaluates only when an input actually
         // changes. A spurious re-trigger with no input change must NOT alter the
-        // output (Icarus never re-evaluates without an event). The very first
+        // output (a reference simulator never re-evaluates without an event). The very first
         // evaluation always runs so combinational level rows establish t=0.
         let any_change = first || (0..n).any(|i| cur[i] != prev[i]);
         if !any_change {
@@ -14208,7 +14213,7 @@ impl Simulator {
             }
         }
 
-        // Resolve the driven value. Per Icarus (empirically): on ANY input
+        // Resolve the driven value. Per a reference simulator (empirically): on ANY input
         // change with no matching row the output becomes x — for both
         // combinational (§29.3) and sequential UDPs. Holding happens only via an
         // explicit `-` output row (or when no input changed, handled above).
@@ -14236,7 +14241,7 @@ impl Simulator {
         let id = out_ref.sig_id as usize;
         let bit = out_ref.bit as usize;
         // §29.7 instance delay: applied to every transition, including the
-        // initial one at t=0 (Icarus leaves the output at x until the delay
+        // initial one at t=0 (a reference simulator leaves the output at x until the delay
         // elapses — unlike SDF back-annotation, which does not act at t=0).
         if delay > 0 {
             if self.signal_table[id].get_bit_code(bit) != new_code {
@@ -14250,7 +14255,7 @@ impl Simulator {
             // SAME clock edge see this output's OLD value, not the new one.
             // Committing immediately (like a comb UDP) shifts a whole DFF chain
             // through in one edge — a shift register would collapse. Verified
-            // against a commercial simulator and Icarus: a `q0->q1` chain must
+            // against a commercial simulator and a reference simulator: a `q0->q1` chain must
             // shift one stage per clock. Route through the NBA queue like a flop.
             if self.signal_table[id].get_bit_code(bit) != new_code {
                 let mut v = self.signal_table[id].clone();
@@ -15368,6 +15373,15 @@ impl Simulator {
                     })
             })
             .collect();
+        // Capture each sensitivity signal's value AT ARM TIME, parallel to
+        // `resolved`. A waiter registered within the current snapshot
+        // generation is checked against these (not the tick-start snapshot),
+        // so only a change made AFTER it armed counts as an edge — see the
+        // firing loop in `check_edges_inner`.
+        let arm_bits: Vec<(u64, u64)> = resolved
+            .iter()
+            .map(|sid| self.signal_table[sid.signal_id].raw_bits())
+            .collect();
         // `sens` (Vec<Sensitivity>) is consumed for resolution and dropped;
         // EventWaiter only carries the resolved IDs from here on.
         //
@@ -15391,9 +15405,30 @@ impl Simulator {
         EventWaiter {
             pid,
             resolved_sensitivities: resolved,
+            arm_bits,
             continuation,
             captured_prev,
             captured_prev_wide,
+        }
+    }
+
+    /// Edge check against an EXPLICIT prior value (the waiter's arm-time
+    /// snapshot) rather than `prev_val`. Used for a waiter registered in the
+    /// current snapshot generation: comparing against the value the signal had
+    /// when the waiter armed distinguishes a genuine post-arm change (fire)
+    /// from a pre-arm edge the tick-start snapshot would otherwise report
+    /// (a `forever @(posedge clk)` loop re-arming against the edge it just
+    /// consumed, or time-0 init pseudo-edges — both read as no change).
+    fn check_edge_vs(&self, id: usize, edge: EdgeKind, prev_v: u64, prev_x: u64) -> bool {
+        let (cur_v, cur_x) = self.signal_table[id].raw_bits();
+        let cb_one = (cur_v & 1) == 1 && (cur_x & 1) == 0;
+        let cb_zero = (cur_v & 1) == 0 && (cur_x & 1) == 0;
+        let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
+        let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
+        match edge {
+            EdgeKind::Posedge => !pb_one && cb_one,
+            EdgeKind::Negedge => !pb_zero && cb_zero,
+            EdgeKind::AnyEdge => cur_v != prev_v || cur_x != prev_x,
         }
     }
 
@@ -15549,7 +15584,7 @@ impl Simulator {
         // downstream cont-assigns (e.g. cr_iu_decd's ill_expt16 always block
         // → decd_ill_expt → decd_special_sel chain). Without this final
         // settle, those cont-assign dependents stay stale until the next
-        // clock tick — symptom: e902 part6 decoder outputs lag iverilog by
+        // clock tick — symptom: e902 part6 decoder outputs lag a reference simulator by
         // one cycle on inst-class transitions. settle alone is sufficient
         // (no further check_edges); the always-block sens lists read from
         // signals already captured in the loop's last snapshot, so they
@@ -16112,7 +16147,7 @@ impl Simulator {
         // We deferred these out of the pre-initial settle; fire them now — at
         // the end of the time-0 active region, once the initial blocks above
         // have run and suspended — so a same-time pre-delay read of the output
-        // still observes X (matches Icarus).
+        // still observes X (matches a reference simulator).
         if self.time == 0
             && !self.comb_time0_deferred_done
             && !self.comb_time0_deferred.is_empty()
@@ -25795,7 +25830,7 @@ impl Simulator {
                 // 1) **O(n × inner.width) instead of O(n²)**: pre-allocate
                 //    the result `Value::zero(n × inner.width)` and copy
                 //    `inner` into each slot at offset `k × inner.width`.
-                //    Mirrors iverilog's `of_REPLICATE` (`vvp_vector4_t res
+                //    Mirrors a reference simulator's `of_REPLICATE` (`vvp_vector4_t res
                 //    (val.size() * rept, BIT4_X); for (idx) res.set_vec
                 //    (idx * val.size(), val);`). The old loop allocated a
                 //    growing `Value` each iteration and copied the
@@ -26536,6 +26571,33 @@ impl Simulator {
                     let mut out = Value::zero(w);
                     for i in 0..w as usize {
                         out.set_bit(i, Self::wire_resolve_bit(a.get_bit(i), b.get_bit(i)));
+                    }
+                    return out;
+                }
+                // §28.4 pull-strength marker. A lone pull driver just carries
+                // its value; multi-driver resolution unwraps it (see
+                // `resolve_multi_driver_nets`), so this identity path only runs
+                // when a pullup/pulldown is the net's sole driver.
+                "$__pull" => {
+                    return args.first().map(|a| self.eval_expr(a)).unwrap_or_else(|| Value::new(1));
+                }
+                // Strong-over-weak resolution: `$__wres_pull(strong, weak)`.
+                // The STRONG chain (all non-pull drivers, already $__wres-folded)
+                // wins on every bit it drives; the WEAK pull value fills only the
+                // bits where strong is z. This is the pull-up/pull-down behavior
+                // — a strong driver overrides the resistor, which otherwise holds
+                // the net at its pull value.
+                "$__wres_pull" => {
+                    if args.len() < 2 {
+                        return Value::new(1);
+                    }
+                    let st = self.eval_expr(&args[0]);
+                    let wk = self.eval_expr(&args[1]);
+                    let w = st.width.max(wk.width).max(1);
+                    let mut out = Value::zero(w);
+                    for i in 0..w as usize {
+                        let sb = st.get_bit(i);
+                        out.set_bit(i, if sb == LogicBit::Z { wk.get_bit(i) } else { sb });
                     }
                     return out;
                 }
@@ -28791,7 +28853,7 @@ impl Simulator {
                                     }
                                     // A non-array scalar argument (`new[n](3.0)`,
                                     // `new[n]("A")`) broadcasts to every element
-                                    // (matches Icarus). Ident sources were already
+                                    // (matches a reference simulator). Ident sources were already
                                     // element-copied above.
                                     ExprKind::Ident(_) => {}
                                     _ => {
@@ -29394,10 +29456,10 @@ impl Simulator {
                 // `q.min()` parses as a Call, which the old match missed, so the
                 // result was a packed scalar written to a queue container signal
                 // that nothing reads — the destination came back as X.
-                if let Some((arr_name, mname, filter)) = self.locator_call(rvalue) {
+                if let Some((arr_name, mname, filter, iter_name)) = self.locator_call(rvalue) {
                     if let ExprKind::Ident(lhier) = &lvalue.kind {
                         let lname = self.resolve_hier_name(lhier);
-                        let idxs = self.locator_indices(&arr_name, &mname, filter.as_ref());
+                        let idxs = self.locator_indices_named(&arr_name, &mname, filter.as_ref(), iter_name.as_deref());
                         self.materialize_locator(&lname, &arr_name, &mname, &idxs);
                         if !self.in_edge_block {
                             self.settle_combinatorial();
@@ -34489,7 +34551,7 @@ impl Simulator {
                                 // no instance scope: `%m` must be the
                                 // subroutine's declaring hierarchy. For a
                                 // package function this is `<pkg>.<name>`
-                                // (matches real simulators, e.g. iverilog), so
+                                // (matches real simulators, e.g. a reference simulator), so
                                 // UVM's `uvm_instance_scope()` recovers `uvm_pkg`
                                 // rather than the top-module name. A module-level
                                 // function (absent from `func_decl_scope`) uses
@@ -36949,7 +37011,7 @@ impl Simulator {
     /// second object: inlining gives the formal its own table entry kept in step
     /// by a port continuous-assign, but `src_bus` and `u_sub.din` are ONE net.
     /// Verilator collapses them (same `$var` identifier code, one value-change
-    /// record per change); so does Icarus. Dumping them independently doubled the
+    /// record per change); so does a reference simulator. Dumping them independently doubled the
     /// records of every hierarchical design and showed one net as two signals.
     ///
     /// Resolves alias CHAINS (a port bound to a port bound to a port) up to the
@@ -37045,7 +37107,7 @@ impl Simulator {
         }
         // §21.7.2.1: a variable with no PROCEDURAL driver — driven only by a
         // continuous assign, or by an instance output port (which inlining
-        // lowers to one) — is a net to a viewer, and Icarus types it `wire`.
+        // lowers to one) — is a net to a viewer, and a reference simulator types it `wire`.
         // §6.5 makes continuous and procedural drivers mutually exclusive on a
         // variable, so a continuous driver is proof there is no procedural one.
         // Typing these `reg` made GTKWave colour a driven net as a register.
@@ -42945,9 +43007,9 @@ impl Simulator {
 
     /// C-printf spelling of a non-finite float, or `None` when `x` is finite.
     /// `%f/%e/%g` render `inf`/`nan`; `%F/%E/%G` render `INF`/`NAN`. Only
-    /// negative infinity carries a sign — matching Icarus and the LRM's
+    /// negative infinity carries a sign — matching a reference simulator and the LRM's
     /// C-printf mapping. (glibc emits `-nan` for `0.0/0.0` because that value
-    /// carries a sign bit; Icarus normalises it to `nan`, which is what we
+    /// carries a sign bit; a reference simulator normalises it to `nan`, which is what we
     /// reproduce here.) The caller layers on the `+` flag for the positive
     /// forms, exactly as it does for a finite value.
     fn nonfinite_float(x: f64, upper: bool) -> Option<String> {
@@ -42985,14 +43047,14 @@ impl Simulator {
         )
     }
 
-    /// §21.2.1.2 hex/binary/octal field padding. Icarus (and C) pad a bare
+    /// §21.2.1.2 hex/binary/octal field padding. a reference simulator (and C) pad a bare
     /// `%Nh` with SPACES around the natural full-width form (`8'h0f` -> `  0f`
     /// for `%4h`); the leading-`0` flag both selects the minimal
     /// (leading-zero-trimmed) form AND zero-pads it (`%04h` -> `000f`). A `-`
     /// flag left-justifies with trailing spaces. Passing `full` (not a
     /// pre-trimmed core) lets us honour the flag correctly.
     fn push_radix(result: &mut String, full: &str, width: usize, left_align: bool, zero_pad: bool) {
-        // Icarus' radix-field model (matched byte-for-byte):
+        // a reference simulator' radix-field model (matched byte-for-byte):
         //   * No `0` flag: always the natural full-vector form, space-padded
         //     (`%4h` of 8'h0f -> "  0f", `%-4h` -> "0f  ").
         //   * `0` flag + right-justified + explicit width: natural form,
@@ -44930,13 +44992,26 @@ impl Simulator {
     /// `(array, method, filter)` when `e` is a locator call on an array/queue,
     /// with or without a `with (...)` clause. `q.min()` parses as a Call, while
     /// `q.min` (no parens) parses as a 2-segment identifier.
-    fn locator_call(&mut self, e: &Expression) -> Option<(String, String, Option<Expression>)> {
+    fn locator_call(&mut self, e: &Expression) -> Option<(String, String, Option<Expression>, Option<String>)> {
         let (inner, filter) = match &e.kind {
             ExprKind::WithClause { expr, filter } => (expr.as_ref(), Some((**filter).clone())),
             _ => (e, None),
         };
+        // A custom iterator name from `find(x) with (x > 3)` — the first Call
+        // argument. Without capturing it the filter's `x` is unbound and the
+        // method wrongly returns an empty result.
+        let mut iter_name: Option<String> = None;
         let target = match &inner.kind {
-            ExprKind::Call { func, .. } => func.as_ref(),
+            ExprKind::Call { func, args } => {
+                if let Some(a0) = args.first() {
+                    if let ExprKind::Ident(h) = &a0.kind {
+                        if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                            iter_name = Some(h.path[0].name.name.clone());
+                        }
+                    }
+                }
+                func.as_ref()
+            }
             _ => inner,
         };
         let (arr, mname) = match &target.kind {
@@ -44954,7 +45029,7 @@ impl Simulator {
             return None;
         }
         if self.module.arrays.contains_key(&arr) || self.module.dynamic_arrays.contains(&arr) {
-            Some((arr, mname, filter))
+            Some((arr, mname, filter, iter_name))
         } else {
             None
         }
@@ -44969,6 +45044,16 @@ impl Simulator {
         arr: &str,
         method: &str,
         filter: Option<&Expression>,
+    ) -> Vec<usize> {
+        self.locator_indices_named(arr, method, filter, None)
+    }
+
+    fn locator_indices_named(
+        &mut self,
+        arr: &str,
+        method: &str,
+        filter: Option<&Expression>,
+        iter_name: Option<&str>,
     ) -> Vec<usize> {
         let size = self.get_queue_size(arr) as usize;
         if size == 0 {
@@ -44996,6 +45081,11 @@ impl Simulator {
                 .unwrap_or_else(|| Value::zero(32));
             if let Some(f) = self.local_stack.last_mut() {
                 f.insert("item".to_string(), v.clone());
+                if let Some(nm) = iter_name {
+                    if nm != "item" {
+                        f.insert(nm.to_string(), v.clone());
+                    }
+                }
             }
             match filter {
                 Some(f) => {

@@ -1,5 +1,5 @@
 //! Ratchet for the `always_comb` / `always_latch` / `always_ff` cluster of the
-//! Icarus `ivtest` regression suite (IEEE 1800-2017 §9.2.2).
+//! a reference simulator `ivtest` regression suite (IEEE 1800-2017 §9.2.2).
 //!
 //! Two properties are pinned here:
 //!

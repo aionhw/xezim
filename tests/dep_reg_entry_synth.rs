@@ -2,7 +2,7 @@
 //! dependency tracker whose `x_read_rdy_for_issue` output (bit 9 of
 //! x_read_data) feeds the AIQ0 entry-ready logic. The c910 memcpy bug
 //! manifests as: after a producer instruction has retired, a new
-//! consumer is allocated into AIQ0 entry 2; in iverilog the entry's
+//! consumer is allocated into AIQ0 entry 2; in a reference simulator the entry's
 //! src0_dep_reg signals rdy_for_issue=1 immediately (or one cycle
 //! later via wb→wake_up→rdy_update). In xezim it stays 0.
 //!

@@ -127,3 +127,29 @@ fn missing_v_file_errors() {
         out
     );
 }
+
+/// `--module-timescale` must apply to modules loaded from a `-v` library file,
+/// same as a primary-source module. Before this, a `-v` module kept raw
+/// tick-unit delays (adopted after the primary delay-rewrite), so the same
+/// module scaled differently depending on how it was loaded.
+#[test]
+fn module_timescale_applies_to_v_library_modules() {
+    let dir = std::env::temp_dir().join("xezim_libflags_ts");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("libc.v"),
+        "module libcell;\n  initial #100 $display(\"CT=%0t\", $time);\nendmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("t.sv"),
+        "module top; libcell u(); initial #100000 $finish; endmodule\n",
+    )
+    .unwrap();
+    // #100 in a 1ns/1ps module = 100000 ps.
+    let via_v = run(&dir, &["-v", "libc.v", "--module-timescale", "1ns/1ps", "t.sv"]);
+    assert!(via_v.contains("CT=100000"), "-v module must get --module-timescale:\n{}", via_v);
+    // Same module as a primary source — must agree.
+    let reg = run(&dir, &["--module-timescale", "1ns/1ps", "t.sv", "libc.v"]);
+    assert!(reg.contains("CT=100000"), "regular source baseline:\n{}", reg);
+}
