@@ -362,3 +362,31 @@ endmodule
         sim.warned_system_task_names()
     );
 }
+
+/// §18.13.3/.4: $srandom seeds the default RNG (repeatable streams from
+/// source), and $get_randstate/$set_randstate round-trip the RNG state. All
+/// three were silently unknown before — the meta-warn surfaced them.
+#[test]
+fn srandom_and_randstate() {
+    let sim = xezim::simulate(
+        r#"
+module t; int a,b,c,d; string st;
+initial begin
+  $srandom(42); a = $urandom();
+  $srandom(42); b = $urandom();
+  $srandom(1);  void'($urandom());
+  st = $get_randstate();
+  c = $urandom();
+  $set_randstate(st);
+  d = $urandom();
+  if (a == b)  $display("SEED_OK");
+  if (c == d)  $display("STATE_OK");
+end endmodule
+"#,
+        1000,
+    )
+    .expect("simulate");
+    let joined: String = sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n");
+    assert!(joined.contains("SEED_OK"), "$srandom(42) must reproduce the stream:\n{}", joined);
+    assert!(joined.contains("STATE_OK"), "get/set_randstate must round-trip:\n{}", joined);
+}

@@ -26621,6 +26621,12 @@ impl Simulator {
                     }
                     Value::zero(32)
                 }
+                "$get_randstate" => {
+                    // §18.13.4: the RNG state as an implementation-defined
+                    // string (16 hex digits here), round-trippable via
+                    // $set_randstate.
+                    return Value::from_string(&self.rng.to_state_string());
+                }
                 "$typename" => {
                     if let Some(arg) = args.first() {
                         if let ExprKind::Ident(hier) = &arg.kind {
@@ -32051,7 +32057,7 @@ impl Simulator {
     fn known_system_name(name: &str) -> bool {
         matches!(
             name,
-            // -- statement-position tasks (exec_system_task arms) --
+            "$srandom" | "$get_randstate" | "$set_randstate" | // -- statement-position tasks (exec_system_task arms) --
             "$timeformat" | "$printtimescale" | "$cast" | "$info" | "$warning"
                 | "$error" | "$fatal"
                 | "$display" | "$displayb" | "$displayh" | "$displayo"
@@ -32355,6 +32361,24 @@ impl Simulator {
             }
             "$monitoroff" => {
                 self.monitor_paused = true;
+            }
+            // §18.13.3 $srandom(seed): reseed the thread RNG. As a system task
+            // (not the object method form) it seeds the default stream — the
+            // same stream +seed=<n> selects — so a run can be made repeatable
+            // from inside the source.
+            "$srandom" => {
+                if let Some(a) = args.first() {
+                    let seed = self.eval_expr(a).to_u64().unwrap_or(0);
+                    self.rng = SvRng::from_seed(seed);
+                }
+            }
+            // §18.13.4 $set_randstate(str): restore a state string produced by
+            // $get_randstate.
+            "$set_randstate" => {
+                if let Some(a) = args.first() {
+                    let v = self.eval_expr(a);
+                    self.rng = SvRng::from_state_string(&v.to_string());
+                }
             }
             // Verilog-XL/VCS `$deposit(target, value)`: set the target's value
             // immediately, WITHOUT a persistent driver — it holds until the
