@@ -106,6 +106,59 @@ endmodule
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------- group 4
+
+#[test]
+fn fread_reg_memory_and_eof() {
+    let dir = std::env::temp_dir().join(format!("xezim_fread_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("data.bin");
+    std::fs::write(&bin, [1u8, 2, 3, 4, 5, 6, 7, 8, 0xAA, 0xBB]).unwrap();
+    let src = format!(
+        r#"
+module tb;
+  integer fd;
+  integer n1, n2, n3, n4, n5, n6;
+  reg [15:0] r16;
+  reg [15:0] r16b;
+  reg [7:0] mem [0:3];
+  reg [11:0] w12;
+  reg [7:0] m0, m1, m2, m3, p1, p2;
+  initial begin
+    fd = $fopen("{bin}", "rb");
+    n1 = $fread(r16, fd);
+    n2 = $fread(mem, fd);
+    m0 = mem[0]; m1 = mem[1]; m2 = mem[2]; m3 = mem[3];
+    n3 = $fread(w12, fd);
+    n4 = $fread(r16b, fd);
+    n5 = $fread(r16b, fd);
+    $fclose(fd);
+    fd = $fopen("{bin}", "rb");
+    n6 = $fread(mem, fd, 1, 2);
+    p1 = mem[1]; p2 = mem[2];
+    $fclose(fd);
+  end
+endmodule
+"#,
+        bin = bin.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    // All values verified against Icarus (iverilog -g2012).
+    assert_eq!(u(&sim, "n1"), 2);
+    assert_eq!(u(&sim, "r16"), 0x0102);
+    assert_eq!(u(&sim, "n2"), 4);
+    assert_eq!((u(&sim, "m0"), u(&sim, "m1"), u(&sim, "m2"), u(&sim, "m3")), (3, 4, 5, 6));
+    assert_eq!(u(&sim, "n3"), 2);
+    assert_eq!(u(&sim, "w12"), 0x708, "12-bit dest keeps low 12 bits of 0x0708");
+    assert_eq!(u(&sim, "n4"), 2);
+    assert_eq!(u(&sim, "r16b"), 0xAABB);
+    assert_eq!(u(&sim, "n5"), 0, "EOF returns 0");
+    assert_eq!(u(&sim, "n6"), 2, "start/count form reads 2 elements");
+    assert_eq!((u(&sim, "p1"), u(&sim, "p2")), (1, 2));
+    assert!(sim.warned_system_task_names().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn handled_names_do_not_trip_unknown_warning() {
     // Function-only names in statement position (result discarded) and

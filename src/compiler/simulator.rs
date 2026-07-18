@@ -6042,6 +6042,98 @@ impl Simulator {
         Value::from_u64(nbytes, 32)
     }
 
+    /// Read up to `buf.len()` bytes from file descriptor `fd`, looping until
+    /// the buffer is full or EOF. Returns the byte count actually read.
+    /// Pending `$ungetc` bytes are not consulted (mixing `$ungetc` with
+    /// `$fread` is not modeled).
+    fn fread_bytes(&mut self, fd: i32, buf: &mut [u8]) -> usize {
+        use std::io::Read;
+        let Some(f) = self.file_handles.get_mut(&fd) else { return 0 };
+        let mut got = 0usize;
+        while got < buf.len() {
+            match f.read(&mut buf[got..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+        }
+        got
+    }
+
+    /// Big-endian bytes → `Value` of `width` bits. The FIRST byte read is the
+    /// most significant (IEEE 1800-2017 §21.3.4.4); on a short (EOF) read the
+    /// data is left-justified — the missing low-order bytes read as zero.
+    /// Truncation to `width` keeps the low-order bits (16-bit data into a
+    /// 12-bit reg keeps bits [11:0], matching Icarus).
+    fn fread_value_from_bytes(bytes: &[u8], nbytes_full: usize, width: u32) -> Value {
+        let mut hex = String::with_capacity(nbytes_full * 2);
+        for b in bytes {
+            hex.push_str(&format!("{:02x}", b));
+        }
+        for _ in bytes.len()..nbytes_full {
+            hex.push_str("00");
+        }
+        Value::from_str_radix(&hex, 16, width)
+    }
+
+    /// §21.3.4.4 `$fread(dest, fd [, start [, count]])` — BINARY load into an
+    /// integral variable or an unpacked memory. Returns the number of bytes
+    /// read (0 on EOF or a bad descriptor). For a memory, `start` is an
+    /// ADDRESS (defaults to the lowest) and `count` a number of elements;
+    /// each element consumes ceil(width/8) bytes, big-endian.
+    fn fread_impl(&mut self, args: &[Expression]) -> Value {
+        if args.len() < 2 {
+            return Value::zero(32);
+        }
+        let fd = self.eval_file_handle_arg(&args[1]);
+        // Memory destination?
+        if let Some(mem_name) = self.resolve_array_name_from_expr(&args[0]) {
+            if let Some((lo, hi, width)) = self.module.arrays.get(&mem_name).copied() {
+                let min_idx = lo.min(hi);
+                let max_idx = lo.max(hi);
+                let start = if args.len() >= 3 {
+                    self.eval_expr(&args[2]).to_i64().unwrap_or(min_idx)
+                } else {
+                    min_idx
+                };
+                let count = if args.len() >= 4 {
+                    self.eval_expr(&args[3]).to_i64().unwrap_or(0).max(0)
+                } else {
+                    (max_idx - start + 1).max(0)
+                };
+                let nbytes_elem = ((width as usize) + 7) / 8;
+                let mut total = 0u64;
+                let mut buf = vec![0u8; nbytes_elem];
+                for k in 0..count {
+                    let addr = start + k;
+                    if addr < min_idx || addr > max_idx {
+                        break;
+                    }
+                    let got = self.fread_bytes(fd, &mut buf);
+                    if got == 0 {
+                        break; // EOF: remaining elements left unchanged
+                    }
+                    let val = Self::fread_value_from_bytes(&buf[..got], nbytes_elem, width);
+                    self.fast_signal_write(&format!("{}[{}]", mem_name, addr), val);
+                    total += got as u64;
+                    if got < nbytes_elem {
+                        break; // short element read: EOF reached
+                    }
+                }
+                return Value::from_u64(total, 32);
+            }
+        }
+        // Integral variable destination.
+        let w = self.infer_lhs_width(&args[0]).max(1);
+        let nbytes = ((w as usize) + 7) / 8;
+        let mut buf = vec![0u8; nbytes];
+        let got = self.fread_bytes(fd, &mut buf);
+        if got > 0 {
+            let val = Self::fread_value_from_bytes(&buf[..got], nbytes, w);
+            self.assign_value(&args[0], &val);
+        }
+        Value::from_u64(got as u64, 32)
+    }
+
     fn resolve_array_name_from_expr(&self, expr: &Expression) -> Option<String> {
         let (resolved, raw) = match &expr.kind {
             ExprKind::Ident(hier) => {
@@ -25756,6 +25848,8 @@ impl Simulator {
                         None => Value::zero(32),
                     }
                 }
+                // §21.3.4.4 binary read; returns bytes read (0 on EOF).
+                "$fread" => self.fread_impl(args),
                 "$fscanf" => {
                     let fd = args
                         .first()
@@ -32358,6 +32452,11 @@ impl Simulator {
                 if let Some(d) = dest {
                     self.assign_value(d, &Value::from_string(&s));
                 }
+            }
+            // §21.3.4.4 task-position `$fread(dest, fd, …)`: perform the read,
+            // discard the byte count.
+            "$fread" => {
+                let _ = self.fread_impl(args);
             }
             "$feof" => { /* function-only; task form is a no-op */ }
             "$ferror" => {
