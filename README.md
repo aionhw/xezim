@@ -72,6 +72,22 @@ Current capabilities include:
   `vlog_startup_routines`: system-task/function registration (`vpi_register_systf`)
   and design iteration (`vpi_iterate`/`vpi_scan`, handle/property access).
 
+### Non-standard extensions
+
+These are **not** part of IEEE 1800 — they are de-facto vendor (Verilog-XL / VCS /
+Questa / Xcelium) extensions supported for compatibility with existing gate-level
+and testbench flows. Portable code should not rely on them.
+
+* **`$deposit(target, value)`** — sets `target` to `value` immediately *without*
+  installing a persistent driver: the value holds until the next driver
+  transaction overwrites it (on an undriven net it simply sticks). This is a
+  Verilog-XL/VCS system task, **not** in the LRM. xezim matches the vendor
+  semantics — a variable keeps the deposited value, and a real driver on a net
+  overrides a deposit on its next update.
+* Gate-level-simulation CLI flags — `+nospecify`, `+notimingcheck`,
+  `+delay_mode_zero`/`+delay_mode_unit`, `+mindelays`/`+typdelays`/`+maxdelays`,
+  and the `-v`/`-y`/`+libext+` library flags — mirror the commercial spellings.
+
 ---
 
 # What's new in 0.9
@@ -263,6 +279,8 @@ Common options:
 | `-v <file>` | Library file: modules compiled only to resolve unresolved instantiations |
 | `-y <dir>` | Library directory: `<module>.<ext>` loaded on demand |
 | `+libext+<ext>+…` | Extension list for `-y` search (replaces the default `.v`/`.sv`/`.V`) |
+| `+nospecify` | Suppress specify-block path delays — zero-delay gate simulation (`-nospecify` also accepted) |
+| `+notimingcheck` | Accepted no-op: specify timing checks are not modeled (also `+notimingchecks`/`-notimingchecks`) |
 | `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
 

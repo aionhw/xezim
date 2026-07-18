@@ -85,7 +85,12 @@ fn print_usage() {
     eprintln!("  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>
   -v <file>        Library file: modules compiled only to resolve instantiations
   -y <dir>         Library directory: <module>.<ext> loaded on demand
-  +libext+<ext>+.. Extension list for -y search (replaces default .v/.sv/.V)");
+  +libext+<ext>+.. Extension list for -y search (replaces default .v/.sv/.V)
+  +nospecify       Suppress specify-block path delays (zero-delay gate sim)
+  +delay_mode_zero Force all structural (specify/SDF) delays to 0 (fast functional GLS)
+  +delay_mode_unit Collapse every nonzero structural delay to 1 time unit
+  +mindelays/+typdelays/+maxdelays  min:typ:max selection (specify + SDF; default typ)
+  +notimingcheck   Accepted no-op (specify timing checks are not modeled)");
     eprintln!("  --xtrace <file>  Emit an XTrace dump to <file> (compliance Level 0:");
     eprintln!("                   dictionary + time + signal deltas + event records).");
     eprintln!("                   A '.zst'/'.zstd' suffix zstd-compresses the stream.");
@@ -231,6 +236,60 @@ fn push_plus_libext(arg: &str, lib_exts: &mut Option<Vec<String>>) {
     }
 }
 
+/// Recognize the commercial gate-level-simulation (GLS) delay/timing flag
+/// family (VCS / Questa / Xcelium) so it never falls silently into the generic
+/// plusarg bucket. Returns true if `flag` was consumed here.
+///
+/// - `+delay_mode_zero` / `+delay_mode_unit` are MODELED (force structural
+///   delays to 0, or every nonzero one to 1 tick).
+/// - `+delay_mode_path` maps to xezim's default (specify path delays apply) —
+///   recognized, no effect.
+/// - Flags whose effect xezim cannot model (`+delay_mode_distributed`, pulse
+///   control, transport/multisource interconnect delays) warn ONCE so the user
+///   knows the timing is approximated — never silent.
+/// - Timing-check controls (`+no_notifier`, `+neg_tchk`, …) are recognized
+///   no-ops: xezim does not model specify timing checks, so there is nothing to
+///   toggle (same rationale as `+notimingcheck`).
+fn handle_gls_flag(flag: &str) -> bool {
+    // `+pulse_e/0`, `+pulse_r/95` etc. carry a trailing value.
+    let head = flag.split('/').next().unwrap_or(flag);
+    match head {
+        "+delay_mode_zero" | "-delay_mode_zero" => {
+            xezim::compiler::simulator::set_delay_mode(1);
+        }
+        "+delay_mode_unit" | "-delay_mode_unit" => {
+            xezim::compiler::simulator::set_delay_mode(2);
+        }
+        // Path delays are what xezim already uses when a specify block is
+        // present — recognized, no behavior change.
+        "+delay_mode_path" | "-delay_mode_path" => {}
+        // Timing-check control: nothing to disable (checks aren't modeled).
+        "+no_notifier" | "+no_tchk_msg" | "+neg_tchk" | "+nonegdelay"
+        | "+old_ntc" | "+ntc_warn" | "+nosdferror" | "+nocelldefinepragma"
+        | "+sdf_verbose" | "+sdfverbose" => {}
+        // Behavior xezim cannot model — warn once, don't pretend.
+        "+delay_mode_distributed" | "-delay_mode_distributed" => {
+            eprintln!(
+                "Warning: {} requests distributed (gate/net) delays, which xezim does not model \
+                 — structural timing is approximated (functional results are unaffected in the \
+                 typical case).",
+                flag
+            );
+        }
+        "+pulse_e" | "+pulse_r" | "+pulse_int_e" | "+pulse_int_r"
+        | "+transport_int_delays" | "+transport_path_delays"
+        | "+multisource_int_delays" => {
+            eprintln!(
+                "Warning: {} (pulse/transport/multisource delay control) is not modeled by xezim; \
+                 delays are treated as simple inertial.",
+                flag
+            );
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn push_plus_define(arg: &str, defines: &mut Vec<(String, Option<String>)>) {
     if !arg.starts_with("+define+") {
         return;
@@ -370,6 +429,7 @@ fn process_command_file(
     plusargs: &mut Vec<String>,
     lib_files: &mut Vec<String>,
     lib_exts: &mut Option<Vec<String>>,
+    nospecify: &mut bool,
 ) -> Result<(), String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Cannot read command file '{}': {}", path, e))?;
@@ -440,6 +500,10 @@ fn process_command_file(
                 _ if t.starts_with("+libext+") => {
                     push_plus_libext(t, lib_exts);
                 }
+                "+nospecify" | "-nospecify" => {
+                    *nospecify = true;
+                }
+                "+notimingcheck" | "+notimingchecks" | "-notimingchecks" => {}
                 "-f" | "-c" => {
                     i += 1;
                     if i < toks.len() {
@@ -453,6 +517,7 @@ fn process_command_file(
                             plusargs,
                             lib_files,
                             lib_exts,
+                            nospecify,
                         )?;
                     }
                 }
@@ -478,6 +543,7 @@ fn process_command_file(
                         plusargs,
                         lib_files,
                         lib_exts,
+                        nospecify,
                     )?;
                 }
                 _ if t.starts_with("+incdir+") => {
@@ -486,6 +552,7 @@ fn process_command_file(
                 _ if t.starts_with("+define+") => {
                     push_plus_define(t, defines);
                 }
+                _ if handle_gls_flag(t) => {}
                 _ if t.starts_with('+') => {
                     plusargs.push(t.to_string());
                 }
@@ -575,6 +642,7 @@ fn main() {
     let mut lib_dirs: Vec<String> = Vec::new();
     let mut lib_files: Vec<String> = Vec::new();
     let mut lib_exts: Option<Vec<String>> = None;
+    let mut nospecify = false;
     let mut log_file: Option<String> = None;
     let mut settle_limit: Option<u32> = None;
     let mut activity_mon = false;
@@ -682,6 +750,7 @@ fn main() {
                         &mut plusargs,
                         &mut lib_files,
                         &mut lib_exts,
+                        &mut nospecify,
                     ) {
                         Ok(()) => {}
                         Err(e) => {
@@ -701,6 +770,7 @@ fn main() {
                     &mut plusargs,
                     &mut lib_files,
                     &mut lib_exts,
+                    &mut nospecify,
                 ) {
                     Ok(()) => {}
                     Err(e) => {
@@ -736,6 +806,38 @@ fn main() {
             _ if arg.starts_with("+libext+") => {
                 push_plus_libext(arg, &mut lib_exts);
             }
+            // Commercial GLS flags. `+nospecify` suppresses specify-block path
+            // delays (zero-delay gate sim). `+notimingcheck(s)` is accepted as a
+            // documented no-op: xezim does not model specify timing checks, so
+            // they are permanently "disabled" already. Xcelium's `-` spellings
+            // are accepted too.
+            "+nospecify" | "-nospecify" => {
+                nospecify = true;
+            }
+            // min:typ:max selection — governs specify-path triplets and, when
+            // no --sdf-min/typ/max was given, the SDF annotation too.
+            "+mindelays" | "-mindelays" => {
+                xezim::sv_parser::set_delay_select(0);
+                if sdf_select.is_none() {
+                    sdf_select = Some(xezim::compiler::sdf::DelaySelect::Min);
+                }
+            }
+            "+typdelays" | "-typdelays" => {
+                xezim::sv_parser::set_delay_select(1);
+                if sdf_select.is_none() {
+                    sdf_select = Some(xezim::compiler::sdf::DelaySelect::Typ);
+                }
+            }
+            "+maxdelays" | "-maxdelays" => {
+                xezim::sv_parser::set_delay_select(2);
+                if sdf_select.is_none() {
+                    sdf_select = Some(xezim::compiler::sdf::DelaySelect::Max);
+                }
+            }
+            "+notimingcheck" | "+notimingchecks" | "-notimingchecks" => {
+                // no-op by design; recognized so flows don't carry a mystery plusarg
+            }
+            _ if handle_gls_flag(arg) => {}
             _ if arg.starts_with('+') => {
                 plusargs.push(arg.clone());
             }
@@ -1104,6 +1206,15 @@ fn main() {
     // Library search config (`-v` files, `+libext+` extensions) — consumed by
     // the core resolver that satisfies unresolved instantiations from `-y`
     // directories and `-v` files.
+    if nospecify {
+        xezim::compiler::simulator::set_nospecify(true);
+        if sdf_file.is_some() {
+            eprintln!(
+                "Warning: +nospecify combined with --sdf — specify path delays are \
+suppressed but the explicit SDF annotation still applies."
+            );
+        }
+    }
     if !lib_files.is_empty() || lib_exts.is_some() {
         xezim::set_library_cli(xezim::LibraryCli {
             lib_files: lib_files.clone(),

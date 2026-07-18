@@ -2,7 +2,7 @@
 //!
 //! A `#0` suspends the process and reschedules its continuation into the
 //! Inactive region of the SAME time slot. The commercial consensus
-//! (VCS / Questa / Riviera all agree) is that a nonblocking assignment
+//! (VCS / Riviera all agree) is that a nonblocking assignment
 //! posted before the `#0` IS visible after it: the NBA region for the
 //! active pass that posted the update commits before the suspended
 //! process's continuation resumes.

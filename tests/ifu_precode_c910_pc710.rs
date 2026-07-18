@@ -42,7 +42,7 @@
 //! exact inst_data the testbench presents — and that the output matches
 //! a hand-computed reference.
 //!
-//! The reference values can be cross-checked against Questa/iverilog by
+//! The reference values can be cross-checked against a commercial simulator/iverilog by
 //! probing `x_ct_core.x_ct_top_0.x_ct_ifu_top.x_ct_ifu_precode.pre_code`
 //! at the cycle when ipctl_iu_inst_data == this cacheline.
 
@@ -182,7 +182,7 @@ fn precode_at_pc710_cacheline_is_deterministic() {
 /// little-endian within each 32-bit subword (so byte 0 of cacheline =
 /// word[7:0]). This is what would happen if the testbench mapping is
 /// inverted from what we computed above. Run BOTH and compare against
-/// the Questa pre_code probe to determine which ordering matches.
+/// the commercial-simulator pre_code probe to determine which ordering matches.
 #[test]
 fn precode_at_pc710_cacheline_alt_ordering() {
     // Alternative: word[1c4]=0x0bd74758 stored little-endian

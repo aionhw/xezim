@@ -5,7 +5,7 @@
 // wand/triand, with default pull-down for tri0, default pull-up for tri1,
 // and ground/power for supply0/supply1).
 //
-// Reference behavior: QuestaSim-64 2021.2_1 AND Icarus 12.0 agree on:
+// Reference behavior: a commercial SV simulator AND Icarus 12.0 agree on:
 //
 //   tri  [0, 1] -> x     (active conflict -> x; wand/wor resolve cleanly, tri does not)
 //   tri  [1, 1] -> 1

@@ -5,7 +5,7 @@
 // least one active driver. With multiple *active* drivers, the result is `x`
 // (because the LRM requires `x` for conflicting active drivers).
 //
-// Reference behavior: QuestaSim-64 2021.2_1 AND Icarus 12.0 agree
+// Reference behavior: a commercial SV simulator AND Icarus 12.0 agree
 // byte-for-byte on every case below:
 //
 //   tri [1, z]              -> 1   (active 1 wins)

@@ -4,10 +4,10 @@
 // function registered in `nettype ... with <fn>` actually gets called by
 // the simulator with the simultaneous-driver queue.
 //
-// Reference behavior: QuestaSim-64 2021.2_1 (ModelSim/Questa is one of the
+// Reference behavior: a commercial SV simulator (a commercial simulator is one of the
 // few open commercial simulators that implements §6.6.7 user-defined
 // resolvers; Icarus 12 does NOT support `nettype` at all, so this file
-// cannot be cross-checked against Icarus and is Questa-only).
+// cannot be cross-checked against Icarus and is a commercial simulator-only).
 //
 // Test goal: prove that xezim's elaborator actually invokes the resolver
 // function instead of falling back to a hardcoded OR fold (which is its

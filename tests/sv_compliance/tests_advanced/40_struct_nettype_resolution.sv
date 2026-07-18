@@ -12,8 +12,8 @@
 //   - struct field-by-field resolver              — return type is a struct,
 //                                                    not a primitive scalar
 //
-// Reference: QuestaSim-64 2021.2_1. (Icarus 12 does not implement `nettype`;
-// this test is Questa-only, just like file 38.)
+// Reference: a commercial SV simulator. (Icarus 12 does not implement `nettype`;
+// this test is a commercial simulator-only, just like file 38.)
 //
 // xezim's current behavior: file 38's resolver never gets called (hardcoded
 // BitOr fold in xezim-core/src/elaborate.rs:2802-2844). This file exercises

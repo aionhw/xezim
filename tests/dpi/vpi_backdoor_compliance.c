@@ -127,7 +127,7 @@ int backdoor_release(const char* path) {
     if (!h) return 0;
     
     // Pass a dummy value structure with vpiObjTypeVal format (uses target's native type format)
-    // to satisfy strict simulator implementations (like Questa)
+    // to satisfy strict simulator implementations (strict commercial simulators)
     s_vpi_value value_s;
     value_s.format = vpiObjTypeVal;
     vpi_put_value(h, &value_s, NULL, vpiReleaseFlag);
