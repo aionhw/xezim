@@ -32071,26 +32071,57 @@ impl Simulator {
                                 };
                                 if let Some(class_def) = self.module.classes.get(cn).cloned() {
                                     if let Some(call_args) = is_new {
-                                        // Pass the declared type's `#(...)` args
-                                        // (e.g. `uvm_resource#(int) r = new()`) so
-                                        // the instance records its type bindings
-                                        // (`T -> int`) — needed for per-spec static
-                                        // member resolution (get_type vs
-                                        // get_type_handle → config_db GET).
-                                        let ta: Option<&[Expression]> = match data_type {
-                                            crate::ast::types::DataType::TypeReference {
-                                                type_args,
-                                                ..
-                                            } if !type_args.is_empty() => {
-                                                Some(type_args.as_slice())
+                                        // §8.12 copy constructor: `T x = new src;`
+                                        // with a single CLASS-HANDLE argument
+                                        // shallow-copies `src`, it does NOT run
+                                        // the constructor. The assignment path
+                                        // handles this; the decl-init path used
+                                        // to fall straight through to construction
+                                        // (passing the handle as an ignored ctor
+                                        // arg), so `T x = new src;` silently ran
+                                        // `new()` and produced a fresh object.
+                                        if call_args.len() == 1
+                                            && matches!(
+                                                &call_args[0].kind,
+                                                ExprKind::Ident(_)
+                                                    | ExprKind::MemberAccess { .. }
+                                                    | ExprKind::Index { .. }
+                                            )
+                                            && self.expr_is_class_handle(&call_args[0])
+                                        {
+                                            let src_h = self
+                                                .eval_expr(&call_args[0])
+                                                .to_u64()
+                                                .unwrap_or(0)
+                                                as usize;
+                                            if src_h != 0
+                                                && matches!(self.heap.get(src_h), Some(Some(_)))
+                                            {
+                                                produced = Some(self.copy_construct(src_h));
                                             }
-                                            _ => None,
-                                        };
-                                        produced = Some(self.instantiate_class_with_type_args(
-                                            &class_def,
-                                            &call_args,
-                                            ta,
-                                        ));
+                                        }
+                                        if produced.is_none() {
+                                            // Pass the declared type's `#(...)` args
+                                            // (e.g. `uvm_resource#(int) r = new()`) so
+                                            // the instance records its type bindings
+                                            // (`T -> int`) — needed for per-spec static
+                                            // member resolution (get_type vs
+                                            // get_type_handle → config_db GET).
+                                            let ta: Option<&[Expression]> = match data_type {
+                                                crate::ast::types::DataType::TypeReference {
+                                                    type_args,
+                                                    ..
+                                                } if !type_args.is_empty() => {
+                                                    Some(type_args.as_slice())
+                                                }
+                                                _ => None,
+                                            };
+                                            produced = Some(self.instantiate_class_with_type_args(
+                                                &class_def,
+                                                &call_args,
+                                                ta,
+                                            ));
+                                        }
                                     }
                                 } else if let Some(cg_def) =
                                     self.module.covergroups.get(cn).cloned()
