@@ -159,6 +159,75 @@ endmodule
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------- group 5
+
+#[test]
+fn sdf_annotate_applies_iopath_delay_at_runtime() {
+    let dir = std::env::temp_dir().join(format!("xezim_sdf_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sdf = dir.join("t.sdf");
+    std::fs::write(
+        &sdf,
+        r#"(DELAYFILE
+  (SDFVERSION "3.0")
+  (TIMESCALE 1ns)
+  (CELL (CELLTYPE "andcell") (INSTANCE u1)
+    (DELAY (ABSOLUTE (IOPATH a y (5.0:5.0:5.0) (5.0:5.0:5.0))
+                     (IOPATH b y (5.0:5.0:5.0) (5.0:5.0:5.0)))))
+)
+"#,
+    )
+    .unwrap();
+    let tpl = r#"
+`timescale 1ns/1ns
+module andcell(input a, input b, output y);
+  assign y = a & b;
+endmodule
+module tb;
+  reg a, b; wire y;
+  reg mid, fin;
+  andcell u1(.a(a), .b(b), .y(y));
+  initial begin
+    ANNOTATE
+    a = 1; b = 0;
+    #10 b = 1;
+    #3  mid = y;  // 5ns IOPATH: still 0 here; without SDF: 1
+    #10 fin = y;  // settled: 1 either way
+  end
+endmodule
+"#;
+    let with = tpl.replace("ANNOTATE", &format!("$sdf_annotate(\"{}\");", sdf.display()));
+    let sim = simulate(&with, 1000).expect("simulate failed");
+    assert_eq!(u(&sim, "mid") & 1, 0, "IOPATH delay must postpone y past t=13");
+    assert_eq!(u(&sim, "fin") & 1, 1);
+    let without = tpl.replace("ANNOTATE", "");
+    let sim2 = simulate(&without, 1000).expect("simulate failed");
+    assert_eq!(u(&sim2, "mid") & 1, 1, "without annotation y updates immediately");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sdf_annotate_missing_file_is_fatal() {
+    let src = r#"
+`timescale 1ns/1ns
+module tb;
+  reg done;
+  initial begin
+    $sdf_annotate("/nonexistent/xezim_no_such.sdf");
+    #1 done = 1;  // must never run
+  end
+endmodule
+"#;
+    let sim = simulate(src, 1000).expect("simulate failed");
+    // hard failure: simulation ends at time 0, so `#1 done = 1` never runs
+    let done = sim
+        .get_signal("tb.done")
+        .or_else(|| sim.get_signal("done"))
+        .and_then(|v| v.to_u64())
+        .unwrap_or(0);
+    assert_ne!(done, 1, "simulation must stop before #1 after a missing SDF file");
+}
+
 #[test]
 fn handled_names_do_not_trip_unknown_warning() {
     // Function-only names in statement position (result discarded) and

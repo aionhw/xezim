@@ -459,6 +459,10 @@ pub fn simulate_multi(
     argv.extend(plusargs.iter().cloned());
     sim.set_args(&argv);
 
+    // Stored regardless of --sdf: a runtime `$sdf_annotate` honors the
+    // CLI-selected min/typ/max (or the +mindelays/+typdelays/+maxdelays
+    // plusargs, which main.rs folds into sdf_select).
+    sim.sdf_select = sdf_select;
     if let Some(sdf_path) = sdf_file {
         let sdf_content = std::fs::read_to_string(sdf_path)
             .map_err(|e| format!("Cannot read SDF file '{}': {}", sdf_path, e))?;

@@ -2022,6 +2022,10 @@ pub struct Simulator {
     cascade_limit: u32,
     /// SDF delay annotation (None if no SDF loaded).
     pub sdf_annotation: Option<super::sdf::SdfAnnotation>,
+    /// min/typ/max selection from the CLI (--sdf-min/typ/max or the
+    /// +mindelays/+typdelays/+maxdelays plusargs). A runtime `$sdf_annotate`
+    /// honors this; `None` means Typ (the CLI default).
+    pub sdf_select: Option<super::sdf::DelaySelect>,
     /// Per-signal delay in sim ticks (0 = no delay). Indexed by signal_id.
     sdf_delays: Vec<u64>,
     /// Pending delayed signal updates: (time, signal_id, value)
@@ -4241,6 +4245,7 @@ impl Simulator {
             // First annotated signal triggers a resize-to-num_signals via
             // the helper used by sdf and specify_delays paths.
             sdf_annotation: None,
+            sdf_select: None,
             sdf_delays: Vec::new(),
             delayed_updates: Vec::new(),
             module,
@@ -31984,6 +31989,45 @@ impl Simulator {
         }
     }
 
+    /// Apply `self.sdf_annotation` to a design whose comb-entry tables are
+    /// ALREADY BUILT (runtime `$sdf_annotate`, executing long after
+    /// `compile()`). Mirrors the application step in `compile()` (fill
+    /// `sdf_delays` from the annotation's signal_delays), then fixes up the
+    /// two baked fast paths that never consult `sdf_delays` at eval time:
+    ///
+    ///  * `FastDirectCopy` → demoted to `DirectCopy`, whose slow path routes
+    ///    a delayed destination through `schedule_delayed`;
+    ///  * `FusedGate` → `exec_fused_gate` now checks `sdf_delays` whenever
+    ///    the vec is nonempty (build-time CLI annotation never fuses a
+    ///    delayed destination, so the check is one `is_empty()` there).
+    ///
+    /// `CompiledContAssign` (bytecode VM) entries keep their build-time
+    /// behavior — the VM's BlockingAssign does not model SDF delay, which is
+    /// the same limitation the CLI --sdf path has.
+    fn apply_sdf_annotation_late(&mut self) {
+        if self.sdf_delays.len() != self.signal_table.len() {
+            self.sdf_delays.resize(self.signal_table.len(), 0);
+        }
+        let Some(ann) = self.sdf_annotation.take() else { return };
+        let mut count = 0usize;
+        for (sig_name, &delay) in &ann.signal_delays {
+            if let Some(&id) = self.signal_name_to_id.get(sig_name.as_str()) {
+                self.sdf_delays[id] = delay;
+                count += 1;
+            }
+        }
+        self.sdf_annotation = Some(ann);
+        eprintln!("[SDF] annotated {} signals with delays", count);
+        for e in self.comb_entries.iter_mut() {
+            if let CombItem::FastDirectCopy { dst_id, src_id } = e.item {
+                if self.sdf_delays.get(dst_id).copied().unwrap_or(0) > 0 {
+                    let width = self.signal_widths[dst_id];
+                    e.item = CombItem::DirectCopy { dst_id, src_id, width };
+                }
+            }
+        }
+    }
+
     /// Every `$name` serviced somewhere by the two runtime dispatchers — the
     /// statement-position `exec_system_task` match and the expression-position
     /// `SystemCall` eval match. The unknown-system-task diagnostic consults
@@ -32476,6 +32520,50 @@ impl Simulator {
             }
             "$writememb" | "$writememh" | "$writememd" => {
                 let _ = self.write_memory_file(args, name);
+            }
+            // §20.16 `$sdf_annotate("file" [, instance])` — runtime SDF
+            // annotation routed through the SAME xezim_core::sdf machinery as
+            // the --sdf CLI flag, honoring the CLI-selected min/typ/max
+            // (--sdf-min/typ/max or +mindelays/+typdelays/+maxdelays; default
+            // Typ). The instance argument is approximated: annotation is
+            // applied globally (SDF cell INSTANCE paths are design-absolute
+            // in xezim's model). A missing/unparsable file is fatal, matching
+            // the CLI path's hard failure.
+            "$sdf_annotate" => {
+                let path = args
+                    .first()
+                    .map(|a| self.system_string_arg(a))
+                    .unwrap_or_default();
+                if args.len() >= 2 {
+                    self.warn_system_task_once(
+                        "$sdf_annotate(instance)",
+                        "Note: $sdf_annotate instance argument is approximated — annotation applies globally",
+                    );
+                }
+                match std::fs::read_to_string(&path) {
+                    Err(e) => {
+                        eprintln!("Fatal: $sdf_annotate cannot read SDF file '{}': {}", path, e);
+                        self.finished = true;
+                    }
+                    Ok(content) => match super::sdf::parse_sdf(&content) {
+                        Err(e) => {
+                            eprintln!(
+                                "Fatal: $sdf_annotate cannot parse SDF file '{}': {}",
+                                path, e
+                            );
+                            self.finished = true;
+                        }
+                        Ok(sdf) => {
+                            let select =
+                                self.sdf_select.unwrap_or(super::sdf::DelaySelect::Typ);
+                            // Same fixed 1ns simulation-timescale assumption as
+                            // the CLI application in lib.rs.
+                            let ann = super::sdf::annotate_sdf(&sdf, 1e-9, select);
+                            self.sdf_annotation = Some(ann);
+                            self.apply_sdf_annotation_late();
+                        }
+                    },
+                }
             }
             "$dumpfile" => {
                 if let Some(arg) = args.first() {
@@ -34439,6 +34527,23 @@ impl Simulator {
             }
         };
         let id = dst.sig_id as usize;
+        // Late (runtime $sdf_annotate) SDF delay on a fused-gate destination:
+        // route the whole-signal updated value through schedule_delayed
+        // instead of writing the bit immediately. Build-time (CLI --sdf)
+        // annotation never fuses a delayed destination, so on that path
+        // sdf_delays is either empty (no SDF at all — one is_empty() check)
+        // or zero for every fused dst (one Vec index).
+        if !self.sdf_delays.is_empty()
+            && self.sdf_delays.get(id).copied().unwrap_or(0) > 0
+            && self.time > 0
+        {
+            if self.signal_table[id].get_bit_code(dst.bit as usize) != new_bit {
+                let mut v = self.signal_table[id].clone();
+                v.set_bit_code(dst.bit as usize, new_bit);
+                self.schedule_delayed(id, v);
+            }
+            return;
+        }
         if self.signal_table[id].set_bit_code(dst.bit as usize, new_bit) {
             self.table_modified = true;
             self.after_signal_write(id);
