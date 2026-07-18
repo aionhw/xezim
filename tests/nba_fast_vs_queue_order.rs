@@ -11,7 +11,7 @@
 //! 2. A statement that bails to AST fallback NbaAssigns A to value V_ast.
 //! 3. We observe the final value of A.
 //!
-//! In iverilog (and per IEEE 1364), the order resolution for two NBAs
+//! In a reference simulator (and per IEEE 1364), the order resolution for two NBAs
 //! in the same time-tick is implementation-defined but typically the
 //! later-scheduled wins. Both sims should agree. If xezim has a
 //! consistent ordering bug, this should expose it.

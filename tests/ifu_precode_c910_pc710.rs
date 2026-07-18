@@ -42,7 +42,7 @@
 //! exact inst_data the testbench presents — and that the output matches
 //! a hand-computed reference.
 //!
-//! The reference values can be cross-checked against a commercial simulator/iverilog by
+//! The reference values can be cross-checked against a commercial simulator/a reference simulator by
 //! probing `x_ct_core.x_ct_top_0.x_ct_ifu_top.x_ct_ifu_precode.pre_code`
 //! at the cycle when ipctl_iu_inst_data == this cacheline.
 

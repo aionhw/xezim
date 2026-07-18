@@ -6,7 +6,7 @@
 //! in an earlier delta cycle of that timestamp must see the resulting edge.
 //! xezim used to skip every waiter registered at the current timestamp
 //! wholesale, so an edge produced by an inactive-region write was never
-//! delivered and the waiter hung forever (Icarus fires it at the same time).
+//! delivered and the waiter hung forever (a reference simulator fires it at the same time).
 //!
 //! §9.2: every change on a signal in an `always @(...)` sensitivity list must
 //! (re-)trigger the block — including a change made by another edge-triggered
@@ -56,7 +56,7 @@ fn find_line<'a>(sim: &'a xezim::compiler::Simulator, prefix: &str) -> Option<&'
 
 /// S1 shape (a): the edge is produced at time 0 by a `#0` (Inactive-region)
 /// blocking assign. The waiter registered in the first delta cycle of time 0
-/// and must still be woken — Icarus prints `hits=1 t=0`.
+/// and must still be woken — a reference simulator prints `hits=1 t=0`.
 #[test]
 fn posedge_from_inactive_region_write_at_time_zero_wakes_waiter() {
     const SRC: &str = r#"
@@ -142,7 +142,7 @@ endmodule
 
 /// S2 safety net: with §9.2 re-triggering delivered correctly, a two-block
 /// signal ping-pong (`always @(a) b=~b;` / `always @(b) a=~a;`) is a genuine
-/// zero-delay livelock (Icarus spins forever on it). It must terminate via
+/// zero-delay livelock (a reference simulator spins forever on it). It must terminate via
 /// the stall detector with a report NAMING both always blocks — not hang,
 /// and not silently "survive" to a later time with the events dropped.
 #[test]

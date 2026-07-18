@@ -1050,7 +1050,7 @@ struct EventWaiter {
     /// guard, it does NOT suppress edges produced in LATER delta cycles of
     /// the same timestamp (an inactive-region `#0 clk = 1;` toggle must
     /// wake an `@(posedge clk)` waiter registered earlier at that time —
-    /// IEEE 1800-2023 §4.4.2.3, matching Icarus/commercial simulators).
+    /// IEEE 1800-2023 §4.4.2.3, matching reference/commercial simulators).
     registered_snap_gen: u64,
 }
 
@@ -1948,7 +1948,7 @@ pub struct Simulator {
     /// `assign` (including the continuous-assigns that inlining synthesizes for
     /// instance port connections). §6.5 forbids mixing continuous and procedural
     /// drivers on a variable, so this is exactly "has no procedural driver", and
-    /// §21.7.2.1's `var_type` for such an object is `wire` — what Icarus emits
+    /// §21.7.2.1's `var_type` for such an object is `wire` — what a reference simulator emits
     /// and what makes a viewer colour it as a net. `module.continuous_assigns` is
     /// drained into bytecode at compile time, so the fact is recorded here while
     /// it is still known.
@@ -2842,7 +2842,7 @@ pub struct Simulator {
     /// exactly once at time zero, AFTER all initial/always procedures have
     /// STARTED (run to their first delay). Firing them in the pre-initial
     /// settle would let an initial block read the output as already-settled;
-    /// Icarus (and the standard) has that same-time pre-delay read return X.
+    /// a reference simulator (and the standard) has that same-time pre-delay read return X.
     /// So we hold these out of the normal time-0 settle and fire them once at
     /// the END of the time-0 active region (see run_one_tick). Cloned entries,
     /// evaluated directly.
@@ -6170,7 +6170,7 @@ impl Simulator {
     /// most significant (IEEE 1800-2017 §21.3.4.4); on a short (EOF) read the
     /// data is left-justified — the missing low-order bytes read as zero.
     /// Truncation to `width` keeps the low-order bits (16-bit data into a
-    /// 12-bit reg keeps bits [11:0], matching Icarus).
+    /// 12-bit reg keeps bits [11:0], matching a reference simulator).
     fn fread_value_from_bytes(bytes: &[u8], nbytes_full: usize, width: u32) -> Value {
         let mut hex = String::with_capacity(nbytes_full * 2);
         for b in bytes {
@@ -14124,7 +14124,7 @@ impl Simulator {
             });
             self.has_udp = true;
         }
-        // A UDP output initializes to x (Icarus), not the undriven-wire z — a
+        // A UDP output initializes to x (a reference simulator), not the undriven-wire z — a
         // sequential UDP to its `initial` start state (default x), a
         // combinational UDP to x until its first evaluation drives it. This is
         // visible when an instance `#delay` postpones the first real drive.
@@ -14167,7 +14167,7 @@ impl Simulator {
 
         // Previous input levels. Before the first evaluation each input's prior
         // value is x (its pre-time-0 state), so a t=0 x→value transition is a
-        // real edge — matching Icarus.
+        // real edge — matching a reference simulator.
         let mut prev = [2u8; 32];
         for i in 0..n {
             prev[i] = if first { 2 } else { rt.prev_inputs[i] };
@@ -14175,7 +14175,7 @@ impl Simulator {
 
         // A UDP is event-driven: it evaluates only when an input actually
         // changes. A spurious re-trigger with no input change must NOT alter the
-        // output (Icarus never re-evaluates without an event). The very first
+        // output (a reference simulator never re-evaluates without an event). The very first
         // evaluation always runs so combinational level rows establish t=0.
         let any_change = first || (0..n).any(|i| cur[i] != prev[i]);
         if !any_change {
@@ -14193,7 +14193,7 @@ impl Simulator {
             }
         }
 
-        // Resolve the driven value. Per Icarus (empirically): on ANY input
+        // Resolve the driven value. Per a reference simulator (empirically): on ANY input
         // change with no matching row the output becomes x — for both
         // combinational (§29.3) and sequential UDPs. Holding happens only via an
         // explicit `-` output row (or when no input changed, handled above).
@@ -14221,7 +14221,7 @@ impl Simulator {
         let id = out_ref.sig_id as usize;
         let bit = out_ref.bit as usize;
         // §29.7 instance delay: applied to every transition, including the
-        // initial one at t=0 (Icarus leaves the output at x until the delay
+        // initial one at t=0 (a reference simulator leaves the output at x until the delay
         // elapses — unlike SDF back-annotation, which does not act at t=0).
         if delay > 0 {
             if self.signal_table[id].get_bit_code(bit) != new_code {
@@ -14235,7 +14235,7 @@ impl Simulator {
             // SAME clock edge see this output's OLD value, not the new one.
             // Committing immediately (like a comb UDP) shifts a whole DFF chain
             // through in one edge — a shift register would collapse. Verified
-            // against a commercial simulator and Icarus: a `q0->q1` chain must
+            // against a commercial simulator and a reference simulator: a `q0->q1` chain must
             // shift one stage per clock. Route through the NBA queue like a flop.
             if self.signal_table[id].get_bit_code(bit) != new_code {
                 let mut v = self.signal_table[id].clone();
@@ -15545,7 +15545,7 @@ impl Simulator {
         // downstream cont-assigns (e.g. cr_iu_decd's ill_expt16 always block
         // → decd_ill_expt → decd_special_sel chain). Without this final
         // settle, those cont-assign dependents stay stale until the next
-        // clock tick — symptom: e902 part6 decoder outputs lag iverilog by
+        // clock tick — symptom: e902 part6 decoder outputs lag a reference simulator by
         // one cycle on inst-class transitions. settle alone is sufficient
         // (no further check_edges); the always-block sens lists read from
         // signals already captured in the loop's last snapshot, so they
@@ -16108,7 +16108,7 @@ impl Simulator {
         // We deferred these out of the pre-initial settle; fire them now — at
         // the end of the time-0 active region, once the initial blocks above
         // have run and suspended — so a same-time pre-delay read of the output
-        // still observes X (matches Icarus).
+        // still observes X (matches a reference simulator).
         if self.time == 0
             && !self.comb_time0_deferred_done
             && !self.comb_time0_deferred.is_empty()
@@ -25466,7 +25466,7 @@ impl Simulator {
                 // 1) **O(n × inner.width) instead of O(n²)**: pre-allocate
                 //    the result `Value::zero(n × inner.width)` and copy
                 //    `inner` into each slot at offset `k × inner.width`.
-                //    Mirrors iverilog's `of_REPLICATE` (`vvp_vector4_t res
+                //    Mirrors a reference simulator's `of_REPLICATE` (`vvp_vector4_t res
                 //    (val.size() * rept, BIT4_X); for (idx) res.set_vec
                 //    (idx * val.size(), val);`). The old loop allocated a
                 //    growing `Value` each iteration and copied the
@@ -28458,7 +28458,7 @@ impl Simulator {
                                     }
                                     // A non-array scalar argument (`new[n](3.0)`,
                                     // `new[n]("A")`) broadcasts to every element
-                                    // (matches Icarus). Ident sources were already
+                                    // (matches a reference simulator). Ident sources were already
                                     // element-copied above.
                                     ExprKind::Ident(_) => {}
                                     _ => {
@@ -34071,7 +34071,7 @@ impl Simulator {
                                 // no instance scope: `%m` must be the
                                 // subroutine's declaring hierarchy. For a
                                 // package function this is `<pkg>.<name>`
-                                // (matches real simulators, e.g. iverilog), so
+                                // (matches real simulators, e.g. a reference simulator), so
                                 // UVM's `uvm_instance_scope()` recovers `uvm_pkg`
                                 // rather than the top-module name. A module-level
                                 // function (absent from `func_decl_scope`) uses
@@ -36531,7 +36531,7 @@ impl Simulator {
     /// second object: inlining gives the formal its own table entry kept in step
     /// by a port continuous-assign, but `src_bus` and `u_sub.din` are ONE net.
     /// Verilator collapses them (same `$var` identifier code, one value-change
-    /// record per change); so does Icarus. Dumping them independently doubled the
+    /// record per change); so does a reference simulator. Dumping them independently doubled the
     /// records of every hierarchical design and showed one net as two signals.
     ///
     /// Resolves alias CHAINS (a port bound to a port bound to a port) up to the
@@ -36627,7 +36627,7 @@ impl Simulator {
         }
         // §21.7.2.1: a variable with no PROCEDURAL driver — driven only by a
         // continuous assign, or by an instance output port (which inlining
-        // lowers to one) — is a net to a viewer, and Icarus types it `wire`.
+        // lowers to one) — is a net to a viewer, and a reference simulator types it `wire`.
         // §6.5 makes continuous and procedural drivers mutually exclusive on a
         // variable, so a continuous driver is proof there is no procedural one.
         // Typing these `reg` made GTKWave colour a driven net as a register.
@@ -42331,9 +42331,9 @@ impl Simulator {
 
     /// C-printf spelling of a non-finite float, or `None` when `x` is finite.
     /// `%f/%e/%g` render `inf`/`nan`; `%F/%E/%G` render `INF`/`NAN`. Only
-    /// negative infinity carries a sign — matching Icarus and the LRM's
+    /// negative infinity carries a sign — matching a reference simulator and the LRM's
     /// C-printf mapping. (glibc emits `-nan` for `0.0/0.0` because that value
-    /// carries a sign bit; Icarus normalises it to `nan`, which is what we
+    /// carries a sign bit; a reference simulator normalises it to `nan`, which is what we
     /// reproduce here.) The caller layers on the `+` flag for the positive
     /// forms, exactly as it does for a finite value.
     fn nonfinite_float(x: f64, upper: bool) -> Option<String> {
@@ -42371,14 +42371,14 @@ impl Simulator {
         )
     }
 
-    /// §21.2.1.2 hex/binary/octal field padding. Icarus (and C) pad a bare
+    /// §21.2.1.2 hex/binary/octal field padding. a reference simulator (and C) pad a bare
     /// `%Nh` with SPACES around the natural full-width form (`8'h0f` -> `  0f`
     /// for `%4h`); the leading-`0` flag both selects the minimal
     /// (leading-zero-trimmed) form AND zero-pads it (`%04h` -> `000f`). A `-`
     /// flag left-justifies with trailing spaces. Passing `full` (not a
     /// pre-trimmed core) lets us honour the flag correctly.
     fn push_radix(result: &mut String, full: &str, width: usize, left_align: bool, zero_pad: bool) {
-        // Icarus' radix-field model (matched byte-for-byte):
+        // a reference simulator' radix-field model (matched byte-for-byte):
         //   * No `0` flag: always the natural full-vector form, space-padded
         //     (`%4h` of 8'h0f -> "  0f", `%-4h` -> "0f  ").
         //   * `0` flag + right-justified + explicit width: natural form,

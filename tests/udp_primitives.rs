@@ -1,7 +1,6 @@
 //! IEEE 1800-2017 §29 User-Defined Primitive (UDP) regression tests.
 //!
-//! Every expected value below was produced by the reference simulator
-//! Icarus Verilog (`iverilog -g2012`) and byte-matched against xezim. The
+//! Every expected value below was produced by a reference simulator and byte-matched against xezim. The
 //! cases mirror the §29 feature matrix:
 //!   1. combinational mux (§29.3) + and/xor
 //!   2. edge DFF (§29.5, `(01)` clock)
@@ -66,7 +65,7 @@ fn assert_trace(name: &str, src: &str, extra: &[&str], expected: &[&str]) {
     assert_eq!(
         got,
         expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        "\nUDP trace mismatch for `{name}` (expected = Icarus iverilog -g2012):\n\
+        "\nUDP trace mismatch for `{name}` (expected = a reference simulator):\n\
          got:\n  {}\nexpected:\n  {}\n",
         got.join("\n  "),
         expected.join("\n  "),
@@ -244,7 +243,7 @@ endmodule
 }
 
 // 5. `initial` start state (§29.6): the t=0 clk x->0 edge is unmatched, so
-// Icarus clobbers the initial 1 to x immediately.
+// a reference simulator clobbers the initial 1 to x immediately.
 #[test]
 fn initial_state() {
     let src = r#"
@@ -414,7 +413,7 @@ endmodule
 /// each stage captures the PREVIOUS stage's OLD value on the clock edge, not
 /// the new one. A comb-style immediate output write collapses the chain
 /// (every stage sees the new value in one edge). Verified against a commercial
-/// simulator AND Icarus: `xxx1 -> xx10 -> x100 -> 1000`. Regression guard for
+/// simulator AND a reference simulator: `xxx1 -> xx10 -> x100 -> 1000`. Regression guard for
 /// the NBA deferral of sequential UDP outputs.
 #[test]
 fn sequential_udp_chain_shifts_one_stage_per_clock() {

@@ -169,7 +169,7 @@ endmodule
     );
     assert_eq!(var_line(&vcd, "a"), format!("$var reg 4 {} a [3:0] $end", id_of(&vcd, "a")));
     // `bx` — an all-x vector left-extends back to full width (§21.7.2.1), and is
-    // what Icarus writes. See `leading_run_suppression_matches_icarus_...`.
+    // what a reference simulator writes. See `leading_run_suppression_matches_reference_...`.
     assert_eq!(records(&vcd, "a"), vec!["bx", "b1", "b10"]);
 }
 
@@ -538,7 +538,7 @@ endmodule
 
 /// §21.7.2.1: "several variables can be mapped to the same identifier code if
 /// the variables would always have identical values" — which is exactly a net
-/// connected through an instance port. Verilator and Icarus both give
+/// connected through an instance port. Verilator and a reference simulator both give
 /// `src_bus`/`u_sub.din` ONE code and emit ONE value-change record per change;
 /// xezim gave them separate codes and wrote every change TWICE (three times at
 /// three levels), roughly doubling the file on any hierarchical design and
@@ -580,7 +580,7 @@ fn port_connected_nets_share_one_identifier_code() {
 
 /// §21.7.2.1: only a WHOLE-net actual is the same object as the formal. A
 /// bit-select, a concatenation or an expression actual is a distinct object —
-/// Verilator and Icarus both give those their own identifier code — so the
+/// Verilator and a reference simulator both give those their own identifier code — so the
 /// aliasing must not over-reach and collapse them.
 #[test]
 fn a_port_bound_to_a_bit_select_concat_or_expression_is_not_aliased() {
@@ -688,13 +688,13 @@ endmodule
 
 /// §21.7.2.1 value-change records: a reader LEFT-EXTENDS a value shorter than
 /// the `$var` width with its leftmost character — `x` extends with x, `z` with
-/// z, anything else with 0. Icarus therefore collapses a leading run of x (or of
+/// z, anything else with 0. a reference simulator therefore collapses a leading run of x (or of
 /// z) to a single character, just as it collapses a leading run of zeros; xezim
 /// spelled x/z runs out in full. The one case that may NOT collapse is a leading
 /// run of ZEROS in front of an x/z: `8'b000000x1` → `b0x1`, never `bx1` (which
 /// reads back as `8'bxxxxxxx1`).
 #[test]
-fn leading_run_suppression_matches_icarus_for_every_vector_shape() {
+fn leading_run_suppression_matches_reference_for_every_vector_shape() {
     let vcd = dump(
         "leadrun",
         r#"
@@ -717,7 +717,7 @@ module tb;
 endmodule
 "#,
     );
-    // Each pair is exactly what `iverilog`/`vvp` writes for the same assignment.
+    // Each pair is exactly what `a reference simulator`/`vvp` writes for the same assignment.
     let expected = [
         ("v0", "b0x1"),
         ("v1", "bz0011"),
@@ -744,10 +744,10 @@ endmodule
 /// §21.7.2.1 `var_type` / §6.5: a variable cannot mix continuous and procedural
 /// drivers, so an object driven ONLY by a continuous assign — or by an instance
 /// output port, which inlining lowers to one — has no procedural driver and is a
-/// net. Icarus types exactly those `wire`; xezim typed every `logic` `reg`, so
+/// net. a reference simulator types exactly those `wire`; xezim typed every `logic` `reg`, so
 /// GTKWave coloured driven nets as registers.
 #[test]
-fn a_variable_with_only_a_continuous_driver_is_typed_wire_like_icarus() {
+fn a_variable_with_only_a_continuous_driver_is_typed_wire_like_reference() {
     let vcd = dump(
         "wirekind",
         r#"

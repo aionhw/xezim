@@ -1,5 +1,5 @@
-//! Automated test runner for iverilog PR regression tests.
-//! Tests are from the prtest collection of iverilog bug-fix verification files.
+//! Automated test runner for a reference simulator PR regression tests.
+//! Tests are from the prtest collection of a reference simulator bug-fix verification files.
 //!
 //! Each test parses and simulates a .v file, checking for "PASSED" in output.
 

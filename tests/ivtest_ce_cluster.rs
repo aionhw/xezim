@@ -1,4 +1,4 @@
-//! Ratchet for the compile-error (CE) cluster of the Icarus `ivtest` suite:
+//! Ratchet for the compile-error (CE) cluster of the a reference simulator `ivtest` suite:
 //! illegal SystemVerilog that xezim must REJECT (non-zero exit / elaboration
 //! error) rather than silently accept.
 //!
