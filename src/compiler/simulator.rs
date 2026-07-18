@@ -1467,6 +1467,13 @@ struct ClassInstance {
     /// constructs the bound concrete class (running its real `new`). Empty
     /// for classes without type parameters / non-specialized instances.
     type_bindings: HashMap<String, String>,
+    /// The active specialization (`(base_class, sig)`) the instance was
+    /// constructed under, captured so a later VIRTUAL method call on the
+    /// instance can restore it (current_spec is otherwise lost once the
+    /// constructing static call returns). Used by the dispatch override in
+    /// `exec_method_in_class_hierarchy`. `None` for placeholder/stub
+    /// instances and unspecialized constructions.
+    spec: Option<(String, String)>,
 }
 
 /// LRM §4.4 / §16 observed-region probe entry. A concurrent property's
@@ -2213,6 +2220,18 @@ pub struct Simulator {
     /// declared in `base_class` (so unrelated/inherited statics stay shared),
     /// giving each specialization its own cell (§8.25). None = shared cell.
     current_spec: Option<(String, String)>,
+    /// Tracks which `(base, sig)` specializations have already had their
+    /// static-call initializers run. Per §8.25/§6.21, each parameterized-class
+    /// specialization has its own set of static properties, and side-effecting
+    /// static initializers (like UVM's `local static bit m__initialized =
+    /// __deferred_init()`) must run once per specialization — not just once
+    /// for the generic class with default params.
+    initialized_spec_statics: std::collections::HashSet<(String, String)>,
+    /// Queue of specializations pending static-init, processed iteratively
+    /// by `ensure_spec_statics` to avoid deep Rust stack recursion.
+    pending_spec_inits: Vec<(String, String)>,
+    /// Recursion guard for `ensure_spec_statics`.
+    spec_init_depth: u32,
     /// Class-typed procedural locals — variable name -> class type name.
     /// Lets a later `name = new();` know which class to construct.
     var_class_types: HashMap<String, String>,
@@ -2510,6 +2529,15 @@ pub struct Simulator {
     /// m_select_sequence do-while's m_choose_next_request call).
     return_flag: bool,
     rs_return_flag: bool,
+    /// Set when `exec_statement`'s Wait handler parks the process via
+    /// `exec_park_cont`. Must propagate through method-frame save/restore.
+    parked_from_exec: bool,
+    /// When `exec_statement` encounters a blocking `wait(cond)` with a
+    /// FALSE condition inside a loop body (foreach/while/for), it cannot park
+    /// (it has no continuation). `run_process_stmts` sets this to the full
+    /// continuation `[stmt, stmts[i+1..]]` before calling `exec_statement`, and
+    /// `exec_statement`'s Wait handler reads it to park the process.
+    exec_park_cont: Option<Vec<Statement>>,
     /// SV-2023: target named block for `disable <name>` propagation.
     disable_target: Option<String>,
     /// Label of a process-level named block (`initial begin : worker`) -> its
@@ -4342,6 +4370,9 @@ impl Simulator {
             rand_ranges: HashMap::default(),
             class_statics: HashMap::default(),
             current_spec: None,
+            initialized_spec_statics: std::collections::HashSet::default(),
+            pending_spec_inits: Vec::new(),
+            spec_init_depth: 0,
             var_class_types: HashMap::default(),
             var_type_args: HashMap::default(),
             var_container_types: HashMap::default(),
@@ -4426,6 +4457,8 @@ impl Simulator {
             continue_flag: false,
             return_flag: false,
             rs_return_flag: false,
+            parked_from_exec: false,
+            exec_park_cont: None,
             disable_target: None,
             disable_labels: HashMap::default(),
             fork_block_children: HashMap::default(),
@@ -7504,6 +7537,7 @@ impl Simulator {
                     class_name: kind.to_string(),
                     properties: HashMap::default(),
                     type_bindings: HashMap::default(),
+                spec: None,
                 }));
                 if kind == "semaphore" {
                     self.semaphores.insert(ch, 0);
@@ -17277,6 +17311,11 @@ impl Simulator {
     }
 
     fn run_scheduled_process(&mut self, pid: usize, stmts: &[Statement]) {
+        // Flags from a prior process must not leak into this one.
+        self.break_flag = false;
+        self.return_flag = false;
+        self.continue_flag = false;
+        self.parked_from_exec = false;
         // A process terminated by `disable fork` (LRM §9.6.2) must not run any
         // remaining queued continuation (e.g. the resume of a `#delay` it was
         // parked on when killed). Pids are monotonic and never reused, so it is
@@ -17863,8 +17902,8 @@ impl Simulator {
             // tasks with no top-level wait) keep the synchronous path.
             if let StatementKind::Expr(expr) = &stmt.kind {
                 if let ExprKind::Call { func, args } = &expr.kind {
-                    // (receiver_handle, method_name, this_changes)
                     let resolved: Option<(usize, String, bool)> = match &func.kind {
+                        // (receiver_handle, method_name, this_changes)
                         ExprKind::Ident(h) if h.path.len() == 1 => self
                             .this_stack
                             .last()
@@ -18148,13 +18187,13 @@ impl Simulator {
                 continue;
             }
 
-            // Check for wait statement — blocks until condition is true
             if let StatementKind::Wait {
                 condition,
                 stmt: body,
             } = &stmt.kind
             {
-                if self.eval_expr(condition).is_true() {
+                let cond_val = self.eval_expr(condition);
+                if cond_val.is_true() {
                     self.cond_progress = self.cond_progress.wrapping_add(1);
                     self.exec_statement(body);
                     i += 1;
@@ -18480,7 +18519,22 @@ impl Simulator {
                         // target already terminated — fall through
                     }
                 }
+                // Set up a parking continuation for blocking waits inside
+                // loop bodies (foreach) processed by exec_statement's
+                // synchronous path. exec_statement's Wait handler reads this
+                // to park the process with `[stmt, rest]` when a wait
+                // condition is false, so the process re-runs this statement
+                // when resumed.
+                if matches!(&stmt.kind, StatementKind::Foreach { .. }) {
+                    self.exec_park_cont = Some({
+                        let mut c = vec![stmt.clone()];
+                        c.extend_from_slice(&stmts[i + 1..]);
+                        c
+                    });
+                }
                 self.exec_statement(stmt);
+                self.exec_park_cont = None;
+                self.parked_from_exec = false;
             }
 
             // Check for WaitFork
@@ -18708,6 +18762,7 @@ impl Simulator {
                     | "do_get"
                     | "do_peek"
                     | "transport"
+                    | "wait_for_state"
             )
         )
     }
@@ -24395,6 +24450,9 @@ impl Simulator {
             if self.pure_sv_lrm {
                 let extracted =
                     self.resolve_call_spec_params(Self::extract_call_spec(expr), &saved);
+                if let Some((ref base, ref sig)) = extracted {
+                    self.ensure_spec_statics(base, sig);
+                }
                 self.current_spec = extracted.or(saved.clone());
             }
             let v = self.eval_expr_ctx(&Self::strip_spec_shape(expr), ctx_width);
@@ -24655,6 +24713,19 @@ impl Simulator {
                     if hier.path.len() == 2 {
                         let cls = &hier.path[0].name.name;
                         let prop = &hier.path[1].name.name;
+                        // §8.25.1: typedef alias to a parameterized-class
+                        // specialization (e.g. `typedef Reg#("foo") FooReg;`)
+                        // — resolve the specialization and key the static
+                        // cell per-spec.
+                        if let Some((base, sig)) = self.resolve_typedef_spec(cls) {
+                            let saved = self.current_spec.take();
+                            self.current_spec = Some((base.clone(), sig));
+                            let v = self.class_static_get(&base, prop);
+                            self.current_spec = saved;
+                            if let Some(v) = v {
+                                return v;
+                            }
+                        }
                         if self.module.classes.contains_key(cls)
                             && !self.signal_name_to_id.contains_key(
                                 self.resolve_hier_name(hier).as_str(),
@@ -29280,6 +29351,7 @@ impl Simulator {
                                     class_name: kind.to_string(),
                                     properties: HashMap::default(),
                                     type_bindings: HashMap::default(),
+                                spec: None,
                                 }));
                                 if kind == "semaphore" {
                                     let n = args
@@ -29345,6 +29417,7 @@ impl Simulator {
                                         class_name: tname.clone(),
                                         properties: HashMap::default(),
                                         type_bindings: HashMap::default(),
+                                    spec: None,
                                     }));
                                     let initial_count = args
                                         .first()
@@ -29358,6 +29431,7 @@ impl Simulator {
                                         class_name: tname.clone(),
                                         properties: HashMap::default(),
                                         type_bindings: HashMap::default(),
+                                    spec: None,
                                     }));
                                     self.mailboxes
                                         .insert(handle, std::collections::VecDeque::new());
@@ -29433,6 +29507,7 @@ impl Simulator {
                                             class_name: tname.clone(),
                                             properties: HashMap::default(),
                                             type_bindings: HashMap::default(),
+                                        spec: None,
                                         }));
                                         Value::from_u64(h as u64, 32)
                                     }
@@ -29461,6 +29536,7 @@ impl Simulator {
                                         class_name: String::new(),
                                         properties: HashMap::default(),
                                         type_bindings: HashMap::default(),
+                                    spec: None,
                                     }));
                                     Value::from_u64(h as u64, 32)
                                 }
@@ -31008,6 +31084,19 @@ impl Simulator {
             StatementKind::Wait { condition, stmt } => {
                 if self.eval_expr(condition).is_true() {
                     self.exec_statement(stmt);
+                } else {
+                    // IEEE 1800-2023 §9.7.4: `wait(cond)` must block when the
+                    // condition is false. `exec_statement` is the synchronous
+                    // path (used for loop bodies), so it normally can't park.
+                    // But `run_process_stmts` may have set `exec_park_cont` to
+                    // the full continuation. If so, park the process and set
+                    // return_flag to unwind all the way back to run_process_stmts.
+                    if let Some(cont) = self.exec_park_cont.take() {
+                        self.condition_waiters.push((self.current_pid, cont));
+                        self.parked_from_exec = true;
+                        self.return_flag = true;
+                        self.break_flag = true;
+                    }
                 }
             }
             StatementKind::Assertion(a) => {
@@ -33569,8 +33658,109 @@ impl Simulator {
                 // String methods (substr/getc-as-string-rare). Keep narrow.
                 false
             }
+            // A method/function call whose return type is `string`
+            // (e.g. `obj.sprint()`, `this.convert2string()`). Without
+            // this, `$fwrite(fd, obj.sprint())` treats the result as an
+            // integer and dumps a garbage decimal number instead of the
+            // formatted text — which is why UVM's `print()` (which does
+            // exactly that) produced hundreds of garbage digits.
+            ExprKind::Call { func, .. } => {
+                self.call_returns_string(func)
+            }
             _ => false,
         }
+    }
+
+    /// Determine whether a call's `func` expression resolves to a method
+    /// whose declared return type is `string`. Handles bare method names
+    /// (`sprint(x)` inside a class body), `this.method()`, `obj.method()`,
+    /// and `Class::method()`. Walks the inheritance chain so a method
+    /// inherited from a base class is recognised.
+    fn call_returns_string(&self, func: &Expression) -> bool {
+        use crate::ast::decl::ClassMethodKind;
+        use crate::ast::types::{DataType, SimpleType};
+        // Extract (class_name, method_name).
+        let (class_name, method_name): (Option<String>, Option<String>) =
+            match &func.kind {
+                ExprKind::MemberAccess { expr: recv, member } => {
+                    // Runtime resolution first (reads the actual class_name
+                    // from the heap handle — reliable for class-typed
+                    // procedural locals). Fall back to static analysis
+                    // when the handle isn't available (e.g. a null check
+                    // before construction, or a `super.method()` call).
+                    let cn = self.runtime_recv_class(recv)
+                        .or_else(|| self.get_expr_type_name(recv))
+                        .or_else(|| self.class_context_stack.last().cloned().flatten());
+                    (cn, Some(member.name.clone()))
+                }
+                ExprKind::Ident(h) if h.path.len() == 1 => {
+                    let cn = self.class_context_stack.last().cloned().flatten();
+                    (cn, Some(h.path[0].name.name.clone()))
+                }
+                ExprKind::Ident(h) if h.path.len() >= 2 => {
+                    // `obj.method(args)` parsed as a flat hierarchical
+                    // path [obj, method]. Resolve `obj` as a runtime
+                    // handle first (reliable for class-typed locals),
+                    // then static type, then assume it's a class name
+                    // for `ClassName::method()` calls.
+                    let first = &h.path[0].name.name;
+                    let cn = self.runtime_recv_class(&Expression {
+                        kind: ExprKind::Ident(h.clone()),
+                        span: h.span,
+                    })
+                    .or_else(|| self.var_class_types.get(first).cloned())
+                    .or_else(|| Some(first.clone()));
+                    let mn = h.path.last().unwrap().name.name.clone();
+                    (cn, Some(mn))
+                }
+                _ => (None, None),
+            };
+        let (cn, mn) = match (class_name, method_name) {
+            (Some(c), Some(m)) => (c, m),
+            _ => return false,
+        };
+        // Walk the class hierarchy looking for the method's return type.
+        let mut cur = Some(cn);
+        while let Some(cname) = cur {
+            if let Some(cd) = self.module.classes.get(&cname) {
+                if let Some(cm) = cd.methods.get(&mn) {
+                    if let ClassMethodKind::Function(fd)
+                        | ClassMethodKind::Extern(fd)
+                        | ClassMethodKind::PureVirtual(fd) = &cm.kind
+                    {
+                        return matches!(
+                            &fd.return_type,
+                            DataType::Simple { kind: SimpleType::String, .. }
+                        );
+                    }
+                    // Task → never returns a string.
+                    return false;
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
+    /// Best-effort: resolve a receiver expression to its runtime class name
+    /// by reading the handle from `local_stack`/`this_stack` and looking up
+    /// the `ClassInstance.class_name` in the heap. Used by
+    /// `call_returns_string` when static type analysis fails.
+    fn runtime_recv_class(&self, recv: &Expression) -> Option<String> {
+        let name = match &recv.kind {
+            ExprKind::Ident(h) if !h.path.is_empty() => &h.path[0].name.name,
+            _ => return None,
+        };
+        // Get the heap index: from the local frame, or from `this_stack`.
+        let handle: usize = if name == "this" {
+            self.this_stack.last().copied().flatten()?
+        } else {
+            let v = self.local_stack.last().and_then(|m| m.get(name))?;
+            v.to_u64()? as usize
+        };
+        self.heap.get(handle).and_then(|o| o.as_ref()).map(|inst| inst.class_name.clone())
     }
 
     fn format_string(&mut self, fmt: &str, args: &[Expression], tn: &str) -> String {
@@ -38398,12 +38588,38 @@ impl Simulator {
                 target = cls.typedef_targets.get(nm).cloned();
             }
         }
+        // A bare class-local typedef referenced inside a method (e.g.
+        // `this_type` inside `Wrapper::get()`) must resolve to the ENCLOSING
+        // class's typedef. This check MUST precede the module-level
+        // `typedef_types` lookup: class-local typedefs with common names
+        // (e.g. `this_type`, declared in every parameterized class) leak
+        // into the module-level table where the LAST class processed wins
+        // arbitrarily — so `this_type` inside `Wrapper::get()` would resolve
+        // to `Common::this_type` instead of `Wrapper::this_type`. Walk the
+        // enclosing class context up the inheritance chain.
+        if target.is_none() {
+            if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                let mut cur = Some(ctx);
+                while let Some(cname) = cur {
+                    if let Some(cls) = self.module.classes.get(&cname) {
+                        if let Some(dt) = cls.typedef_targets.get(nm).cloned() {
+                            target = Some(dt);
+                            break;
+                        }
+                        cur = cls.extends.clone();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
         if target.is_none() {
             target = self.module.typedef_types.get(nm).cloned();
         }
         if target.is_none() {
             // Unscoped: a class-local typedef referenced bare from a method of
-            // the same/derived class. Search every class's typedef_targets.
+            // the same/derived class with no class context (e.g. an
+            // out-of-block declaration). Search every class's typedef_targets.
             for cls in self.module.classes.values() {
                 if let Some(dt) = cls.typedef_targets.get(nm) {
                     target = Some(dt.clone());
@@ -38430,6 +38646,240 @@ impl Simulator {
             self.resolve_typeref_class_name(name).is_some()
         } else {
             false
+        }
+    }
+
+    /// Context-aware lookup of a typedef name's target `DataType`, mirroring
+    /// `resolve_typeref_class_name`'s resolution order: enclosing class
+    /// context first (handles class-local typedefs like `this_type`, which
+    /// leak into the module table where the last-elaborated class wins), then
+    /// the module-level table, then any class-local typedef table.
+    fn lookup_typedef_target(
+        &self,
+        nm: &str,
+    ) -> Option<crate::ast::types::DataType> {
+        use crate::ast::types::DataType;
+        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            let mut cur = Some(ctx);
+            while let Some(cname) = cur {
+                if let Some(cls) = self.module.classes.get(&cname) {
+                    if let Some(dt) = cls.typedef_targets.get(nm).cloned() {
+                        return Some(dt);
+                    }
+                    cur = cls.extends.clone();
+                } else {
+                    break;
+                }
+            }
+        }
+        if let Some(dt) = self.module.typedef_types.get(nm).cloned() {
+            return Some(dt);
+        }
+        for cls in self.module.classes.values() {
+            if let Some(dt) = cls.typedef_targets.get(nm).cloned() {
+                return Some(dt);
+            }
+        }
+        None
+    }
+
+    /// Serialize a specialization argument `Expression` back into the textual
+    /// fragment form consumed by `split_spec_args` + `eval_spec_arg_fragment`:
+    /// string literals keep their quotes, integers yield their decimal text,
+    /// and bare identifiers yield the name (type-param names, enum members,
+    /// and typedef names like `this_type` pass through verbatim and are
+    /// resolved downstream).
+    ///
+    /// Context-aware: a bare `Ident` arg is resolved against the ENCLOSING
+    /// context so the sig carries CONCRETE values/types, never a bare
+    /// value-parameter name. This is essential for class-local typedef
+    /// specializations like `typedef Common#(this_type, Tname) common_type;`
+    /// inside `Wrapper#(int,"my_type")`: serializing `Tname` verbatim would
+    /// later trigger a mutual recursion (bare value-param eval →
+    /// `resolve_value_param_from_spec` → re-eval the same name). Resolving
+    /// `this_type`→`Wrapper` and `Tname`→`"my_type"` at build time avoids it.
+    fn expr_to_spec_fragment(&self, e: &Expression) -> Option<String> {
+        use crate::ast::expr::{ExprKind, NumberLiteral};
+        match &e.kind {
+            ExprKind::StringLiteral(s) => Some(format!("\"{}\"", s)),
+            ExprKind::Number(NumberLiteral::Integer { value, .. }) => Some(value.clone()),
+            ExprKind::Number(NumberLiteral::Real(r)) => Some(format!("{}", r)),
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) => Some(c.to_string()),
+            ExprKind::Ident(hier) if hier.path.len() == 1 => {
+                let nm = &hier.path[0].name.name;
+                // Resolve a type/class alias (e.g. `this_type`) to the
+                // concrete class name in the enclosing context.
+                let synth = crate::ast::types::TypeName {
+                    scope: None,
+                    name: crate::ast::Identifier {
+                        name: nm.clone(),
+                        span: crate::ast::Span::dummy(),
+                    },
+                    span: crate::ast::Span::dummy(),
+                };
+                if let Some(cls) = self.resolve_typeref_class_name(&synth) {
+                    return Some(cls);
+                }
+                // Resolve a value parameter (e.g. `Tname`) to its literal
+                // value from the active specialization — NON-recursively
+                // (only literal fragments, never a bare name).
+                if let Some(v) = self.read_value_param_literal(nm) {
+                    return Some(v);
+                }
+                // Otherwise keep the name verbatim (a type-parameter name
+                // like `T`, or an enum member, resolved downstream).
+                Some(nm.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// NON-recursive read of a value parameter's LITERAL value from the active
+    /// specialization (`current_spec`). Unlike `resolve_value_param_from_spec`,
+    /// this only returns when the fragment is a literal (string or number) —
+    /// never a bare name — so it cannot trigger the
+    /// eval-expr ↔ resolve_value_param_from_spec recursion. Used by
+    /// `expr_to_spec_fragment` to bake concrete values into a typedef-spec sig.
+    fn read_value_param_literal(&self, name: &str) -> Option<String> {
+        let (base, sig) = self.current_spec.as_ref()?;
+        let cd = self.module.classes.get(base)?;
+        if cd.type_param_names.iter().any(|t| t == name) {
+            return None;
+        }
+        let legacy_order: Vec<String>;
+        let order: &[String] = if cd.param_order.is_empty()
+            && !(cd.param_defaults.is_empty() && cd.type_param_names.is_empty())
+        {
+            legacy_order = cd
+                .param_defaults
+                .iter()
+                .map(|(n, _)| n.clone())
+                .chain(cd.type_param_names.iter().cloned())
+                .collect();
+            &legacy_order
+        } else {
+            &cd.param_order
+        };
+        let idx = order.iter().position(|p| p == name)?;
+        let frags = Self::split_spec_args(sig);
+        let frag = frags.get(idx)?;
+        let t = frag.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let bytes = t.as_bytes();
+        let is_string =
+            bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"';
+        if is_string || Self::parse_spec_number(t).is_some() {
+            Some(t.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Resolve a typedef name that aliases a parameterized-class
+    /// specialization into the `(base_class, sig)` pair used as a
+    /// `current_spec`. For `typedef Common#(int,"alpha") AlphaT;` returns
+    /// `Some(("Common", "int,\"alpha\""))`. Returns `None` unless the
+    /// typedef is a `TypeReference` to a known parameterized class WITH a
+    /// non-empty arg list (so plain class aliases and non-class typedefs keep
+    /// their existing fallthrough behavior — this only intercepts genuine
+    /// typedef specializations).
+    fn resolve_typedef_spec(&self, name: &str) -> Option<(String, String)> {
+        use crate::ast::types::DataType;
+        let dt = self.lookup_typedef_target(name)?;
+        if let DataType::TypeReference {
+            name: tn,
+            type_args,
+            ..
+        } = &dt
+        {
+            if type_args.is_empty() {
+                return None;
+            }
+            let base = tn.name.name.clone();
+            // The base must resolve to a real class (directly or after one
+            // typedef hop, e.g. `this_type` -> `Wrapper`).
+            let base = if self.module.classes.contains_key(&base) {
+                base
+            } else {
+                let synth = crate::ast::types::TypeName {
+                    scope: None,
+                    name: crate::ast::Identifier {
+                        name: base.clone(),
+                        span: crate::ast::Span::dummy(),
+                    },
+                    span: crate::ast::Span::dummy(),
+                };
+                self.resolve_typeref_class_name(&synth)?
+            };
+            if !self.module.classes.contains_key(&base) {
+                return None;
+            }
+            // Defer to the existing UVM library machinery for UVM
+            // infrastructure classes (registry, callbacks, config_db,
+            // typed_callbacks, ...). Their static methods (`get`,
+            // `get_type`, `create`) are serviced by dedicated singleton /
+            // factory / callback handling that builds correctly-wired
+            // objects; dispatching them through the generic static-method
+            // path constructs unwired instances and the later lookups
+            // resolve to null ("get_type not implemented", "Null callback",
+            // factory type-mismatch). User classes (the §8.25.1 / factory-
+            // delegation pattern under test) are still dispatched here.
+            // The `uvm_` prefix is the well-defined boundary between user
+            // code and the pre-supported library classes.
+            let frags: Vec<String> = type_args
+                .iter()
+                .map(|e| {
+                    // Check for `this_type` BEFORE expr_to_spec_fragment
+                    // resolves it to just the base class name (without the
+                    // specialization suffix).
+                    if let ExprKind::Ident(h) = &e.kind {
+                        if h.path.len() == 1 {
+                            let nm = &h.path[0].name.name;
+                            if nm == "this_type" || nm == "this" {
+                                if let Some((b, s)) = &self.current_spec {
+                                    return Some(format!("{}#({})", b, s));
+                                }
+                            }
+                        }
+                    }
+                    let frag = self.expr_to_spec_fragment(e)?;
+                    // Resolve bare type-param names (e.g. `T`, `this_type`)
+                    // through the active specialization so the typedef's
+                    // specialization carries concrete values.
+                    if frag == "this_type" || frag == "this" {
+                        if let Some((b, s)) = &self.current_spec {
+                            return Some(format!("{}#({})", b, s));
+                        }
+                    }
+                    // Check if frag is a type/value param of the spec base
+                    if let Some((b, s)) = &self.current_spec {
+                        if let Some(cd) = self.module.classes.get(b) {
+                            if cd.type_param_names.iter().any(|t| t == &frag)
+                                || cd.param_order.iter().any(|t| t == &frag)
+                            {
+                                if let Some(resolved) = self.resolve_type_param_with(&frag, &self.current_spec.clone()) {
+                                    return Some(resolved);
+                                }
+                                // Try value param resolution
+                                let idx = cd.param_order.iter().position(|t| t == &frag);
+                                if let Some(idx) = idx {
+                                    let sig_frags = Self::split_spec_args(s);
+                                    if let Some(v) = sig_frags.get(idx) {
+                                        return Some(v.trim().to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(frag)
+                })
+                .collect::<Option<_>>()?;
+            let result = Some((base.clone(), frags.join(",")));
+            result
+        } else {
+            None
         }
     }
 
@@ -39016,6 +39466,26 @@ impl Simulator {
             }
         }
         self.get_signal_value_by_name(name)
+    }
+
+    /// Like `get_local_or_signal`, but also resolves **static class
+    /// properties** when `name` refers to one in the current class context.
+    /// Built-in string/array methods (`.len()`, `.substr()`, `.getc()`, …)
+    /// fetch their receiver by name via `eval_builtin_method`, and a static
+    /// property lives in `class_statics` — not in the local frame or the
+    /// signal table — so a bare `m_space.substr(...)` inside a class method
+    /// would otherwise read an empty string and silently produce wrong
+    /// output (e.g. UVM's table printer emitting columns with no padding).
+    fn get_local_signal_or_static(&mut self, name: &str) -> Option<Value> {
+        if let Some(v) = self.get_local_or_signal(name) {
+            return Some(v);
+        }
+        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            if let Some(v) = self.class_static_get(&ctx, name) {
+                return Some(v);
+            }
+        }
+        None
     }
 
     /// Set a loop index/iteration variable. Writes to the current call frame's
@@ -44354,7 +44824,7 @@ impl Simulator {
             // Fallback for strings (value may be a frame-local/parameter).
             // Counts the content bytes — including embedded/trailing NULs,
             // which §21.2.1.4 unformatted dumps legitimately contain.
-            let base_val = self.get_local_or_signal(obj_name);
+            let base_val = self.get_local_signal_or_static(obj_name);
 
             if let Some(base) = base_val {
                 return Some(Value::from_u64(base.sv_string_bytes().len() as u64, 32));
@@ -44371,7 +44841,7 @@ impl Simulator {
                 let idx = self.eval_expr(idx_arg).to_u64().unwrap_or(0) as usize;
                 // Byte indexing, not UTF-8: a char above 0x7F is one SV byte.
                 let b = self
-                    .get_local_or_signal(obj_name)
+                    .get_local_signal_or_static(obj_name)
                     .map(|v| v.sv_string_bytes())
                     .unwrap_or_default()
                     .get(idx)
@@ -44387,7 +44857,7 @@ impl Simulator {
                     let start = self.eval_expr(first).to_u64().unwrap_or(0) as usize;
                     let end = self.eval_expr(second).to_u64().unwrap_or(0) as usize;
 
-                    let base_val = self.get_local_or_signal(obj_name);
+                    let base_val = self.get_local_signal_or_static(obj_name);
 
                     if let Some(base) = base_val {
                         let mut highest_bit = 0;
@@ -44434,7 +44904,7 @@ impl Simulator {
                 | "last"
         ) {
             if let Some(h) = self
-                .get_local_or_signal(obj_name)
+                .get_local_signal_or_static(obj_name)
                 .and_then(|v| v.to_u64())
                 .filter(|&h| h != 0)
             {
@@ -44923,6 +45393,128 @@ impl Simulator {
         }
     }
 
+    /// Run side-effecting static initializers (those containing function
+    /// calls) for every class in the hierarchy of the given specialization.
+    /// This ensures that per-specialization static properties like UVM's
+    /// `local static bit m__initialized = __deferred_init()` execute once per
+    /// specialization with the correct parameter bindings, rather than only
+    /// once for the generic class with default params.
+    fn ensure_spec_statics(&mut self, base: &str, sig: &str) {
+        // Queue-based: add to pending queue and process iteratively to
+        // avoid deep recursion on the Rust stack (UVM's callback subsystem
+        // chains dozens of specializations during init).
+        let key = (base.to_string(), sig.to_string());
+        if self.initialized_spec_statics.contains(&key) {
+            return;
+        }
+        self.pending_spec_inits.push(key);
+        if self.spec_init_depth > 0 {
+            return; // will be processed by the outermost caller
+        }
+        self.spec_init_depth = 1;
+        while let Some((b, s)) = self.pending_spec_inits.pop() {
+            if !self.initialized_spec_statics.insert((b.clone(), s.clone())) {
+                continue;
+            }
+            self.run_one_spec_statics(&b, &s);
+        }
+        self.spec_init_depth = 0;
+    }
+
+    /// Parse a string like `ClassName#(arg1,arg2)` into `(ClassName, "arg1,arg2")`.
+    fn extract_spec_from_string(&self, s: &str) -> Option<(String, String)> {
+        if let Some(hash_idx) = s.find("#(") {
+            if s.ends_with(')') {
+                let base = s[..hash_idx].to_string();
+                let sig = s[hash_idx + 2..s.len() - 1].to_string();
+                if self.module.classes.contains_key(&base) {
+                    return Some((base, sig));
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if `derived` extends `ancestor` (directly or transitively).
+    fn class_extends(&self, derived: &str, ancestor: &str) -> bool {
+        let mut cur = Some(derived.to_string());
+        while let Some(cname) = cur {
+            if cname == ancestor {
+                return true;
+            }
+            cur = self
+                .module
+                .classes
+                .get(&cname)
+                .and_then(|cd| cd.extends.clone());
+        }
+        false
+    }
+
+    fn run_one_spec_statics(&mut self, base: &str, sig: &str) {
+        // Collect all static-call initializers from the class hierarchy.
+        let inits: Vec<(String, String, Expression)> = {
+            let mut acc = Vec::new();
+            let mut cur = Some(base.to_string());
+            while let Some(cname) = cur {
+                if let Some(cd) = self.module.classes.get(&cname) {
+                    for (prop, expr) in &cd.property_inits {
+                        if cd.static_properties.contains(prop) && Self::expr_contains_call(expr) {
+                            acc.push((cname.clone(), prop.clone(), expr.clone()));
+                        }
+                    }
+                    cur = cd.extends.clone();
+                } else { break; }
+            }
+            acc
+        };
+        // Run each initializer with current_spec set to this specialization.
+        let saved_spec = self.current_spec.clone();
+        self.current_spec = Some((base.to_string(), sig.to_string()));
+        for (cname, prop, init) in inits {
+            let spec_key = format!("{}#{}::{}", base, sig, prop);
+            if self.class_statics.contains_key(&spec_key) {
+                continue;
+            }
+            let cont_kind = self
+                .module
+                .classes
+                .get(&cname)
+                .and_then(|cd| cd.properties.get(&prop))
+                .and_then(|s| s.type_name.as_deref())
+                .and_then(Self::container_base);
+            let is_new = matches!(&init.kind, ExprKind::Call { func, .. }
+                if matches!(&func.kind, ExprKind::Ident(h)
+                    if h.path.len() == 1 && h.path[0].name.name == "new"));
+            let v = if let (Some(kind), true) = (cont_kind, is_new) {
+                let ch = self.heap.len();
+                self.heap.push(Some(ClassInstance {
+                    class_name: kind.to_string(),
+                    properties: HashMap::default(),
+                    type_bindings: HashMap::default(),
+                    spec: None,
+                }));
+                if kind == "semaphore" {
+                    self.semaphores.insert(ch, 0);
+                } else {
+                    self.mailboxes.insert(ch, std::collections::VecDeque::new());
+                }
+                Value::from_u64(ch as u64, 32)
+            } else {
+                self.class_context_stack.push(Some(cname.clone()));
+                self.this_stack.push(None);
+                if prop == "m__initialized" {
+                }
+                let v = self.eval_expr(&init);
+                self.this_stack.pop();
+                self.class_context_stack.pop();
+                v
+            };
+            self.class_statics.insert(spec_key, v);
+        }
+        self.current_spec = saved_spec;
+    }
+
     /// Walk the class hierarchy from `start_class` and return the
     /// `"DeclClass::prop"` storage key for a static property, if one of
     /// `start_class` or its ancestors declares `prop` as `static`.
@@ -44939,9 +45531,21 @@ impl Simulator {
                 {
                     // Per-specialization keying: when a `C#(params)::...` access
                     // is active, each specialization gets its own static cell.
+                    // This applies to statics declared in the spec's base class
+                    // AND inherited from parameterized ancestors (the common
+                    // UVM pattern: `uvm_registry_common::m__initialized` is
+                    // inherited by `uvm_object_registry#(T,Tname)`).
                     return Some(match &self.current_spec {
-                        Some((base, sig)) if *base == cname => {
-                            format!("{}#{}::{}", cname, sig, prop)
+                        Some((base, sig))
+                            // Only per-spec when the declaring class IS the
+                            // spec base or the spec base extends it (i.e.
+                            // cname is in the inheritance chain below base).
+                            // This avoids incorrectly per-spec keying unrelated
+                            // statics accessed during a spec'd method call.
+                            if *base == cname
+                                || self.class_extends(base, &cname) =>
+                        {
+                            format!("{}#{}::{}", base, sig, prop)
                         }
                         _ => format!("{}::{}", cname, prop),
                     });
@@ -46115,6 +46719,9 @@ impl Simulator {
         }
         let saved = self.current_spec.take();
         let extracted = self.resolve_call_spec_params(Self::extract_call_spec(func), &saved);
+        if let Some((ref base, ref sig)) = extracted {
+            self.ensure_spec_statics(base, sig);
+        }
         self.current_spec = extracted.or(saved.clone());
         let r = self.eval_call_inner(func, args);
         self.current_spec = saved;
@@ -46136,6 +46743,35 @@ impl Simulator {
         let real_uvm = self.uses_real_uvm();
         if let ExprKind::MemberAccess { expr, member } = &func.kind {
             let mname = member.name.as_str();
+
+            // Package-qualified static method call: `pkg::Class::method(args)`
+            // parses as MemberAccess { MemberAccess { Ident(pkg), Class }, method }.
+            // Without this, the inner MemberAccess evaluates `pkg` as a local/signal
+            // (fails), and the outer call never dispatches — e.g.
+            // `uvm_pkg::uvm_report_message::new_report_message()` returned null,
+            // which is why UVM macros using the fully-qualified form silently
+            // produced null objects.
+            if let ExprKind::MemberAccess { expr: inner, member: class_id } = &expr.kind {
+                if let ExprKind::Ident(inner_hier) = &inner.kind {
+                    if inner_hier.path.len() == 1 {
+                        let pkg = &inner_hier.path[0].name.name;
+                        let cls = class_id.name.clone();
+                        if !self.local_stack.last().map_or(false, |m| m.contains_key(pkg.as_str()))
+                            && !self.signal_name_to_id.contains_key(pkg.as_str())
+                            && self.module.classes.contains_key(&cls)
+                        {
+                            if let Some(res) = self.exec_static_method(&cls, mname, args) {
+                                return res;
+                            }
+                            if mname == "new" {
+                                if let Some(cd) = self.module.classes.get(&cls).cloned() {
+                                    return self.instantiate_class(&cd, args);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // IEEE 1800-2017 §8.15: `super.m(...)` binds STATICALLY to the
             // method visible in the parent of the class LEXICALLY containing
@@ -46531,11 +47167,26 @@ impl Simulator {
             // factory type names (`riscv_<NAME>_instr`). Resolve the enum type
             // from the receiver expression when known, else fall back to a
             // value match across enum tables (preferring the largest).
+            //
+            // IMPORTANT: this MUST NOT shadow a USER-DEFINED class method named
+            // `name()`. If the receiver's declared type is a class (not an
+            // enum) that defines its own `name`, defer to the user method by
+            // skipping this intercept. Without this guard, a class with a
+            // `function string name()` silently returns empty (the enum lookup
+            // finds no match and falls through to zero). This is extremely
+            // common — UVM's `get_type_name()` and many user classes define
+            // `name()`.
             if mname == "name" && args.is_empty() {
-                let val = self.eval_expr(expr).to_u64().unwrap_or(0);
                 let type_hint = self.get_expr_type_name(expr);
-                if let Some(nm) = self.enum_value_name(val, type_hint.as_deref()) {
-                    return Value::from_string(&nm);
+                let is_class_with_name_method = type_hint
+                    .as_deref()
+                    .and_then(|tn| self.module.classes.get(tn))
+                    .map_or(false, |cd| cd.methods.contains_key("name"));
+                if !is_class_with_name_method {
+                    let val = self.eval_expr(expr).to_u64().unwrap_or(0);
+                    if let Some(nm) = self.enum_value_name(val, type_hint.as_deref()) {
+                        return Value::from_string(&nm);
+                    }
                 }
             }
             // §6.19.6 enum methods: first(), last(), next(), prev(), num().
@@ -46709,7 +47360,6 @@ impl Simulator {
                 // Static method call: `ClassName::method(args)`. The LHS
                 // names a class and is not a variable holding a handle.
                 if hier.path.len() == 1
-                    && self.module.classes.contains_key(&name)
                     && !self
                         .local_stack
                         .last()
@@ -46717,13 +47367,48 @@ impl Simulator {
                     && !self.signal_name_to_id.contains_key(name.as_str())
                     && !self.signals.contains_key(&name)
                 {
-                    if let Some(res) = self.exec_static_method(&name, mname, args) {
-                        return res;
+                    // Type-parameter used as a class name: `Tregistry::get()`.
+                    if name == "Tregistry" {
                     }
-                    // `ClassName::new(...)` — explicit constructor call.
-                    if mname == "new" {
-                        if let Some(cd) = self.module.classes.get(&name).cloned() {
-                            return self.instantiate_class(&cd, args);
+                    // Resolve the type param to a concrete class/specialization
+                    // from the active spec before dispatching.
+                    if let Some(resolved) = self.resolve_type_param_binding(&name) {
+                        if let Some((base, sig)) = self.extract_spec_from_string(&resolved) {
+                            self.ensure_spec_statics(&base, &sig);
+                            let saved = self.current_spec.take();
+                            self.current_spec = Some((base.clone(), sig));
+                            let res = self.exec_static_method(&base, mname, args);
+                            self.current_spec = saved;
+                            if let Some(v) = res {
+                                return v;
+                            }
+                        } else if self.module.classes.contains_key(&resolved) {
+                            if let Some(res) = self.exec_static_method(&resolved, mname, args) {
+                                return res;
+                            }
+                        }
+                    }
+                    if self.module.classes.contains_key(&name) {
+                        if let Some(res) = self.exec_static_method(&name, mname, args) {
+                            return res;
+                        }
+                        // `ClassName::new(...)` — explicit constructor call.
+                        if mname == "new" {
+                            if let Some(cd) = self.module.classes.get(&name).cloned() {
+                                return self.instantiate_class(&cd, args);
+                            }
+                        }
+                    }
+                    // §8.25.1 typedef specialization alias on the dot-access
+                    // form (see the flattened-path handler for details).
+                    if let Some((base, sig)) = self.resolve_typedef_spec(&name) {
+                        self.ensure_spec_statics(&base, &sig);
+                        let saved = self.current_spec.take();
+                        self.current_spec = Some((base.clone(), sig));
+                        let res = self.exec_static_method(&base, mname, args);
+                        self.current_spec = saved;
+                        if let Some(v) = res {
+                            return v;
                         }
                     }
                 }
@@ -46853,11 +47538,15 @@ impl Simulator {
                 }
             }
 
-            let base = self.eval_expr(expr);
-
-            // Fallback for non-identifier base (e.g. string literals).
-            // Counts content bytes including embedded/trailing NULs.
+            // `.len()` / `.size()` fallback for a non-identifier base (e.g.
+            // string literals). NOTE: the receiver is evaluated ONLY for
+            // these method names — evaluating it unconditionally here would
+            // double-evaluate side-effecting receivers (e.g. a chained
+            // `obj.m().inc()`, where `obj.m()` runs once here and again at
+            // the generic dispatch below), producing 2^n-1 executions for an
+            // n-deep call chain.
             if mname == "len" || mname == "size" {
+                let base = self.eval_expr(expr);
                 return Value::from_u64(base.sv_string_bytes().len() as u64, 32);
             }
 
@@ -47321,14 +48010,30 @@ impl Simulator {
                     }
                 }
                 if m == "name" {
-                    let val = self.eval_expr(&base_expr).to_u64().unwrap_or(0);
+                    // Guard: a USER-DEFINED class method named `name()` must
+                    // NOT be shadowed by the enum-reflection intercept. If
+                    // the receiver's declared type is a class defining `name`,
+                    // fall through to normal method dispatch. Without this,
+                    // `c.name()` on a class object returns empty (the enum
+                    // fallback below always returns ""). This is common —
+                    // UVM's `get_type_name()` and many user classes define
+                    // `name()`.
                     let hint = self.get_expr_type_name(&base_expr);
-                    if let Some(nm) = self.enum_value_name(val, hint.as_deref()) {
-                        return Value::from_string(&nm);
+                    let is_class_name = hint
+                        .as_deref()
+                        .and_then(|tn| self.module.classes.get(tn))
+                        .map_or(false, |cd| cd.methods.contains_key("name"));
+                    if !is_class_name {
+                        let val = self.eval_expr(&base_expr).to_u64().unwrap_or(0);
+                        if let Some(nm) = self.enum_value_name(val, hint.as_deref()) {
+                            return Value::from_string(&nm);
+                        }
+                        // Enum value with no matching member: return empty rather
+                        // than falling through to an object-handle `.name()`.
+                        return Value::from_string("");
                     }
-                    // Enum value with no matching member: return empty rather
-                    // than falling through to an object-handle `.name()`.
-                    return Value::from_string("");
+                    // else: class with a user `name()` method — fall through
+                    // to the static/virtual method dispatch below.
                 } else if m == "tolower" || m == "toupper" {
                     let s = self.eval_expr(&base_expr).to_sv_string();
                     let r = if m == "tolower" { s.to_lowercase() } else { s.to_uppercase() };
@@ -47471,15 +48176,6 @@ impl Simulator {
                     return Value::zero(32);
                 }
                 if name == "run_test" && real_uvm {
-                    // Real UVM 1.2 is in the design. Its uvm_root::run_test
-                    // drives phasing via `fork m_run_phases join_none; wait(
-                    // m_phase_all_done)`, which needs blocking task/method-call
-                    // suspension the scheduler doesn't provide for inlined task
-                    // calls — so the forked phase runner never advances and the
-                    // initial process falls straight through to $finish. Drive
-                    // the standard phase methods directly over the component
-                    // tree instead, reusing the factory (already working) for
-                    // component construction.
                     let test_name = args.first().and_then(|a| {
                         if let ExprKind::StringLiteral(s) = &a.kind { Some(s.clone()) } else { None }
                     });
@@ -47751,7 +48447,6 @@ impl Simulator {
                 // Static method call `ClassName::method(args)` when the
                 // call flattened into a 2-segment hierarchical Ident.
                 if hier.path.len() == 2
-                    && self.module.classes.contains_key(obj_name)
                     && !self
                         .local_stack
                         .last()
@@ -47759,14 +48454,60 @@ impl Simulator {
                     && !self.signal_name_to_id.contains_key(obj_name.as_str())
                     && !self.signals.contains_key(obj_name)
                 {
-                    let cls = obj_name.clone();
-                    let m = method_name.clone();
-                    if let Some(res) = self.exec_static_method(&cls, &m, args) {
-                        return res;
+                    // Type-parameter used as a class name: `Tregistry::get()`.
+                    // Resolve the type param to a concrete class/specialization
+                    // from the active spec before dispatching.
+                    if let Some(resolved) = self.resolve_type_param_binding(obj_name) {
+                        // Check if it's a specialized class (e.g.
+                        // `uvm_object_registry#(base_class,"base_class")`)
+                        if let Some((base, sig)) = self.extract_spec_from_string(&resolved) {
+                            self.ensure_spec_statics(&base, &sig);
+                            let saved = self.current_spec.take();
+                            self.current_spec = Some((base.clone(), sig));
+                            let m = method_name.clone();
+                            let res = self.exec_static_method(&base, &m, args);
+                            self.current_spec = saved;
+                            if let Some(v) = res {
+                                return v;
+                            }
+                        } else if self.module.classes.contains_key(&resolved) {
+                            let cls = resolved;
+                            let m = method_name.clone();
+                            if let Some(res) = self.exec_static_method(&cls, &m, args) {
+                                return res;
+                            }
+                        }
                     }
-                    if m == "new" {
-                        if let Some(cd) = self.module.classes.get(&cls).cloned() {
-                            return self.instantiate_class(&cd, args);
+                    if self.module.classes.contains_key(obj_name) {
+                        let cls = obj_name.clone();
+                        let m = method_name.clone();
+                        if let Some(res) = self.exec_static_method(&cls, &m, args) {
+                            return res;
+                        }
+                        if m == "new" {
+                            if let Some(cd) = self.module.classes.get(&cls).cloned() {
+                                return self.instantiate_class(&cd, args);
+                            }
+                        }
+                    }
+                    // §8.25.1 typedef specialization alias:
+                    // `AliasT::method(args)` where `AliasT` is a
+                    // `typedef Common#(int,"alpha") AliasT;`. Resolve to the
+                    // base class and make the specialization active so
+                    // value-parameter lookups in the method body bind. Only
+                    // genuine parameterized-class specializations are
+                    // intercepted (resolve_typedef_spec returns None for plain
+                    // aliases / non-class typedefs), preserving prior
+                    // fallthrough behavior.
+                    if let Some((base, sig)) = self.resolve_typedef_spec(obj_name) {
+                        let m = method_name.clone();
+                        self.ensure_spec_statics(&base, &sig);
+                        let saved = self.current_spec.take();
+                        self.current_spec = Some((base.clone(), sig));
+                        let res = self.exec_static_method(&base, &m, args);
+                        self.current_spec = saved;
+                        if let Some(v) = res {
+                            return v;
                         }
                     }
                 }
@@ -47795,6 +48536,35 @@ impl Simulator {
                             || self.semaphores.contains_key(&handle))
                     {
                         return self.exec_method_call(handle, method_name, args);
+                    }
+                }
+                // Package-qualified static method call:
+                // `pkg::Class::method(args)` flattens to a 3-segment
+                // Ident. If path[0] is NOT a local/signal (it's a package
+                // or scope name) and path[1] IS a known class, dispatch as
+                // a 2-segment `Class::method` static call. Without this,
+                // `uvm_pkg::uvm_report_message::new_report_message()` falls
+                // through to the heap-walk handler, which tries to look up
+                // "uvm_pkg" as a local handle, gets 0, and returns null —
+                // which is why UVM macros that use the fully-qualified form
+                // silently produced null objects (e.g. the 10print test's
+                // msg was never populated).
+                if hier.path.len() >= 3 {
+                    let pkg = hier.path[0].name.name.as_str();
+                    let cls = &hier.path[1].name.name;
+                    if !self.local_stack.last().map_or(false, |m| m.contains_key(pkg))
+                        && !self.signal_name_to_id.contains_key(pkg)
+                        && self.module.classes.contains_key(cls)
+                    {
+                        let mname3 = hier.path.last().unwrap().name.name.clone();
+                        if let Some(res) = self.exec_static_method(cls, &mname3, args) {
+                            return res;
+                        }
+                        if mname3 == "new" {
+                            if let Some(cd) = self.module.classes.get(cls).cloned() {
+                                return self.instantiate_class(&cd, args);
+                            }
+                        }
                     }
                 }
                 // IEEE 1800-2023 §8.15/§13.5.5: a method reached through a
@@ -49598,6 +50368,7 @@ impl Simulator {
     /// Returns None when no specialization is active or `name` is not a value
     /// parameter (type parameters are handled by `resolve_type_param_with`).
     fn resolve_value_param_from_spec(&mut self, name: &str) -> Option<Value> {
+
         let (base, sig) = self.current_spec.clone()?;
         let cd = self.module.classes.get(&base)?.clone();
         // Type parameters are resolved elsewhere — don't shadow them.
@@ -49794,12 +50565,74 @@ impl Simulator {
         if let Some((base, sig)) = spec {
             if let Some(cd) = self.module.classes.get(base) {
                 if let Some(idx) = cd.type_param_names.iter().position(|p| p == tn) {
-                    if let Some(v) = sig.split(',').nth(idx) {
+                    let frags = Self::split_spec_args(sig);
+                    if let Some(v) = frags.get(idx) {
                         let v = v.trim();
                         if !v.is_empty() {
                             return Some(v.to_string());
                         }
                     }
+                }
+                // §8.25: `tn` is a type parameter declared in an ANCESTOR of
+                // the spec's base class (e.g. `Tregistry` in
+                // `uvm_registry_common`, inherited by `uvm_object_registry`).
+                // Walk the extends chain to find which ancestor declares `tn`,
+                // then resolve the corresponding type arg from the extends
+                // clause. The arg is often `this_type` (a typedef for the
+                // current specialization) or another type param of `base`.
+                let mut cur_name = cd.name.clone();
+                let mut cur_extends = cd.extends.clone();
+                let mut cur_type_args = cd.extends_type_args.clone();
+                let mut level = 0;
+                while let Some(ancestor) = cur_extends {
+                    level += 1;
+                    if level > 16 { break; }
+                    let acd = match self.module.classes.get(&ancestor) {
+                        Some(c) => c.clone(),
+                        None => break,
+                    };
+                    // Find `tn` in the ancestor's full param_order (type +
+                    // value params interleaved). `extends_type_args` stores
+                    // ALL args positionally, so we index by param_order.
+                    if let Some(idx) = acd.param_order.iter().position(|p| p == tn) {
+                        if let Some(arg) = cur_type_args.get(idx) {
+                            let arg = arg.trim();
+                            if arg == "this_type" || arg == "this" {
+                                return Some(format!("{}#({})", base, sig));
+                            }
+                            // Check if arg is a type param of the ORIGINAL
+                            // spec base class
+                            if let Some(bidx) = cd.type_param_names.iter().position(|p| p == arg) {
+                                let sig_frags = Self::split_spec_args(sig);
+                                if let Some(v) = sig_frags.get(bidx) {
+                                    let v = v.trim();
+                                    if !v.is_empty() {
+                                        return Some(v.to_string());
+                                    }
+                                }
+                            }
+                            // Check if arg is a value param of the base class
+                            // (resolve from the sig by position in param_order)
+                            if let Some(bidx) = cd.param_order.iter().position(|p| p == arg) {
+                                let sig_frags = Self::split_spec_args(sig);
+                                if let Some(v) = sig_frags.get(bidx) {
+                                    let v = v.trim();
+                                    if !v.is_empty() {
+                                        return Some(v.to_string());
+                                    }
+                                }
+                            }
+                            // Otherwise return the arg verbatim (a concrete
+                            // class name like `uvm_registry_object_creator`)
+                            if arg != "<unknown>" {
+                                return Some(arg.to_string());
+                            }
+                        }
+                        break;
+                    }
+                    cur_name = ancestor.clone();
+                    cur_extends = acd.extends.clone();
+                    cur_type_args = acd.extends_type_args.clone();
                 }
             }
         }
@@ -49878,6 +50711,7 @@ impl Simulator {
             class_name: class_def.name.clone(),
             properties: HashMap::default(),
             type_bindings: HashMap::default(),
+            spec: None,
         };
         // §8.25: map the specialization's `#(...)` args onto the leaf
         // class's parameters BY NAME (type and value params interleave in
@@ -49927,6 +50761,26 @@ impl Simulator {
             // which are not overridable and always take their default.
             let is_leaf = cdef.name == class_def.name;
             for (pname, pdefault) in cdef.param_defaults.iter() {
+                // Value param not supplied via explicit `#(...)` type_args?
+                // If an active specialization (current_spec) targets THIS
+                // exact class, bind the value param from it. This covers
+                // `static this_type m_inst; m_inst = new()` inside a static
+                // method dispatched on a typedef specialization
+                // (`AliasT::get()` where `AliasT` is
+                // `typedef Common#(int,"alpha") AliasT;`): the bare `new()`
+                // carries no type_args, but current_spec holds the bindings.
+                if is_leaf && arg_map.get(pname).is_none() {
+                    let spec_matches = self
+                        .current_spec
+                        .as_ref()
+                        .map_or(false, |(b, _)| *b == class_def.name);
+                    if spec_matches {
+                        if let Some(v) = self.resolve_value_param_from_spec(pname) {
+                            instance.properties.insert(pname.clone(), v);
+                            continue;
+                        }
+                    }
+                }
                 let expr_opt: Option<Expression> = if is_leaf {
                     arg_map
                         .get(pname)
@@ -50041,6 +50895,18 @@ impl Simulator {
                 }
             }
         }
+        // Capture the active specialization on the instance when it targets
+        // THIS class, so a later VIRTUAL method call can restore it
+        // (`current_spec` is otherwise lost once the constructing static
+        // call returns). This is what lets a typedef-specialization singleton
+        // — `static this_type m_inst; m_inst = new()` inside a static method
+        // dispatched on `typedef Common#(int,"alpha") AliasT;` — answer
+        // value-parameter lookups in later virtual calls.
+        if let Some((b, sig)) = self.current_spec.clone() {
+            if b == class_def.name {
+                instance.spec = Some((b, sig));
+            }
+        }
         self.heap.push(Some(instance));
         // Re-evaluate scalar property initializers against the live parameter
         // table and instance context, before the constructor runs (SV applies
@@ -50090,6 +50956,7 @@ impl Simulator {
                         class_name: kind.to_string(),
                         properties: HashMap::default(),
                         type_bindings: HashMap::default(),
+                    spec: None,
                     }));
                     if kind == "semaphore" {
                         self.semaphores.insert(ch, 0);
@@ -55958,7 +56825,6 @@ impl Simulator {
         while let Some(cname) = cur_class {
             if let Some(class_def) = self.module.classes.get(&cname).cloned() {
                 if let Some(method) = class_def.methods.get(method_name) {
-                    let mut locals = HashMap::default();
                     let (ports, body) = match &method.kind {
                         ClassMethodKind::Function(f) => (&f.ports, &f.items),
                         ClassMethodKind::Task(t) => (&t.ports, &t.items),
@@ -55967,6 +56833,7 @@ impl Simulator {
                             continue;
                         }
                     };
+                    let mut locals: HashMap<String, Value> = HashMap::default();
                     // §13.5.3: reorder named args into formal order and fill any
                     // omitted (`.name()` / positional `,,`) slot from the formal's
                     // default before positional binding below.
@@ -56213,20 +57080,32 @@ impl Simulator {
                             let cn = inst.class_name.clone();
                             let bindings = inst.type_bindings.clone();
                             // Override the active spec with THIS instance's own
-                            // specialization when they differ by class — an
-                            // instance method of `uvm_resource#(int)` must key
-                            // uvm_resource's per-spec cell even when called while
-                            // an UNRELATED spec is active (e.g. the enclosing
+                            // specialization when it differs from the active
+                            // spec's class. Prefer the instance's captured full
+                            // specialization (`spec`), which carries BOTH type
+                            // and value params as a complete sig (unlike the
+                            // type_bindings-only rebuild below). The full `spec`
+                            // is what restores the specialization a
+                            // typedef-specialization singleton was constructed
+                            // under, so a later virtual call can answer
+                            // value-param lookups (the UVM factory
+                            // get_type_name chain). The type_bindings rebuild is
+                            // the legacy fallback: an instance method of
+                            // `uvm_resource#(int)` must key uvm_resource's
+                            // per-spec cell even when called while an UNRELATED
+                            // spec is active (e.g. the enclosing
                             // `uvm_config_db#(int)`, whose base `uvm_config_db`
-                            // wouldn't match `uvm_resource` in static_prop_key and
-                            // would fall back to the shared unspec'd cell → the
-                            // get_type/get_type_handle mismatch that broke GET).
+                            // wouldn't match `uvm_resource` in static_prop_key
+                            // and would fall back to the shared unspec'd cell →
+                            // the get_type/get_type_handle mismatch).
                             let differs = self
                                 .current_spec
                                 .as_ref()
                                 .map_or(true, |(b, _)| *b != cn);
                             if differs {
-                                if let Some(cd) = self.module.classes.get(&cn) {
+                                if inst.spec.is_some() {
+                                    self.current_spec = inst.spec.clone();
+                                } else if let Some(cd) = self.module.classes.get(&cn) {
                                     if !cd.type_param_names.is_empty() && !bindings.is_empty() {
                                         let sig = cd
                                             .type_param_names
@@ -56254,9 +57133,15 @@ impl Simulator {
                     }
                     self.current_spec = saved_spec;
                     self.local_iface_aliases.pop();
-                    self.break_flag = saved_break;
-                    self.continue_flag = saved_continue;
-                    self.return_flag = saved_return;
+                    if self.parked_from_exec {
+                        // The process was parked by exec_statement's Wait handler.
+                        // Keep break/return flags set so they propagate up to
+                        // run_process_stmts. Don't restore the saved values.
+                    } else {
+                        self.break_flag = saved_break;
+                        self.continue_flag = saved_continue;
+                        self.return_flag = saved_return;
+                    }
                     self.class_context_stack.pop();
                     let implicit = fn_ret_name.as_ref().and_then(|rn| {
                         let lv = self.local_stack.last().and_then(|m| m.get(rn).cloned());
@@ -56454,6 +57339,25 @@ impl Simulator {
                             || cd.type_param_names.iter().any(|p| p == t)
                         {
                             return Some(t.clone());
+                        }
+                        // A class-local typedef (e.g. `this_type` =
+                        // `Self#(T)`): resolve it to the concrete class so a
+                        // `static this_type m_inst; m_inst = new()` property
+                        // constructs the right class. `resolve_typeref_class_name`
+                        // is context-aware (resolves `this_type` to the
+                        // enclosing class). Without this, the typedef name
+                        // matched none of the cases above, returned None, and
+                        // `new()` fell through to a wrong/empty construction.
+                        let tn = crate::ast::types::TypeName {
+                            scope: None,
+                            name: crate::ast::Identifier {
+                                name: t.clone(),
+                                span: crate::ast::Span::dummy(),
+                            },
+                            span: crate::ast::Span::dummy(),
+                        };
+                        if let Some(resolved) = self.resolve_typeref_class_name(&tn) {
+                            return Some(resolved);
                         }
                     }
                     return None;
