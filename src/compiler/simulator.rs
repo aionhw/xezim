@@ -32574,6 +32574,82 @@ impl Simulator {
                     }
                 }
             }
+            // Verdi's FSDB dump tasks mapped onto xezim's native FST dump
+            // machinery (FSDB is a proprietary format; FST is the closest
+            // compact binary equivalent and Verdi-class viewers read it).
+            // The rewritten path swaps a .fsdb extension for .fst.
+            "$fsdbDumpfile" => {
+                let path = args
+                    .first()
+                    .map(|a| self.system_string_arg(a))
+                    .unwrap_or_default();
+                let path = if path.is_empty() {
+                    "xezim.fst".to_string()
+                } else if let Some(stem) = path.strip_suffix(".fsdb") {
+                    format!("{}.fst", stem)
+                } else {
+                    format!("{}.fst", path)
+                };
+                self.warn_system_task_once(
+                    "$fsdbDump(note)",
+                    &format!(
+                        "Note: $fsdbDumpfile is not FSDB — writing FST to {} instead",
+                        path
+                    ),
+                );
+                self.fst_file = Some(path);
+            }
+            // `$fsdbDumpvars([depth[, scope]...])` — starts the FST dump.
+            // Scope arguments narrow the dump like $dumpvars; the depth
+            // argument is accepted but not depth-filtered (whole subtree).
+            "$fsdbDumpvars" => {
+                if self.fst_file.is_none() {
+                    self.fst_file = Some("xezim.fst".to_string());
+                }
+                self.warn_system_task_once(
+                    "$fsdbDump(note)",
+                    &format!(
+                        "Note: $fsdbDumpfile is not FSDB — writing FST to {} instead",
+                        self.fst_file.clone().unwrap_or_default()
+                    ),
+                );
+                let mut scopes: Vec<String> = Vec::new();
+                for a in args.iter().skip(1) {
+                    if let ExprKind::Ident(hier) = &a.kind {
+                        let s = self.resolve_hier_name(hier);
+                        if !s.is_empty() {
+                            scopes.push(s);
+                        }
+                    }
+                }
+                self.fst_scopes = scopes;
+                if self.fst_writer.is_none() {
+                    self.fst_start_dump();
+                }
+            }
+            // VCS's VPD (vcdplus) control tasks mapped onto the plain VCD
+            // machinery: on first use starts a VCD dump of the whole design
+            // into "vcdplus.vcd"; later calls resume/suspend like
+            // $dumpon/$dumpoff.
+            "$vcdpluson" => {
+                self.warn_system_task_once(
+                    "$vcdpluson",
+                    "Note: $vcdpluson is not VPD — writing VCD to vcdplus.vcd instead",
+                );
+                if self.vcd_writer.is_none() {
+                    if self.vcd_file.is_none() {
+                        self.vcd_file = Some("vcdplus.vcd".to_string());
+                    }
+                    self.vcd_filter_scopes = Vec::new();
+                    self.vcd_dump_depth = 0;
+                    self.vcd_start_dump();
+                } else {
+                    self.vcd_dump_on();
+                }
+            }
+            "$vcdplusoff" => {
+                self.vcd_dump_off();
+            }
             "$dumpvars" => {
                 // §21.7.1.4 `$dumpvars(level, scope_or_var, ...)`.
                 // arg[0] is the DEPTH: 0 = every level below each named scope,

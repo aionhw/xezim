@@ -228,6 +228,73 @@ endmodule
     assert_ne!(done, 1, "simulation must stop before #1 after a missing SDF file");
 }
 
+// ---------------------------------------------------------------- group 6
+
+#[test]
+fn fsdb_dump_tasks_write_fst() {
+    let dir = std::env::temp_dir().join(format!("xezim_fsdb_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fsdb = dir.join("wave.fsdb");
+    let fst = dir.join("wave.fst");
+    let src = format!(
+        r#"
+`timescale 1ns/1ns
+module tb;
+  reg clk = 0;
+  reg [3:0] cnt = 0;
+  always #5 clk = ~clk;
+  always @(posedge clk) cnt <= cnt + 1;
+  initial begin
+    $fsdbDumpfile("{fsdb}");
+    $fsdbDumpvars(0, tb);
+    #40 $finish;
+  end
+endmodule
+"#,
+        fsdb = fsdb.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    let meta = std::fs::metadata(&fst).expect(".fsdb path must be rewritten to .fst");
+    assert!(meta.len() > 0, "FST dump must not be empty");
+    assert!(
+        sim.warned_system_task_names().iter().any(|n| n.contains("$fsdbDump")),
+        "one fsdb mapping note must be recorded"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn vcdpluson_maps_to_vcd() {
+    let dir = std::env::temp_dir().join(format!("xezim_vcdplus_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let vcd = dir.join("plus.vcd");
+    let src = format!(
+        r#"
+`timescale 1ns/1ns
+module tb;
+  reg clk = 0;
+  always #5 clk = ~clk;
+  initial begin
+    $dumpfile("{vcd}");
+    $vcdpluson;
+    #20 $vcdplusoff;
+    #20 $finish;
+  end
+endmodule
+"#,
+        vcd = vcd.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    let text = std::fs::read_to_string(&vcd).expect("VCD file must exist");
+    assert!(text.contains("$enddefinitions"), "VCD must have a header");
+    assert!(text.contains("#5"), "VCD must record changes while on");
+    assert!(
+        sim.warned_system_task_names().contains(&"$vcdpluson".to_string()),
+        "one vcdplus mapping note must be recorded"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn handled_names_do_not_trip_unknown_warning() {
     // Function-only names in statement position (result discarded) and
