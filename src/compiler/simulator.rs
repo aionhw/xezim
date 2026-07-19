@@ -10895,7 +10895,16 @@ impl Simulator {
                 // change of `s`. Route those through the edge path, which fires
                 // exactly on a change of a listed signal.
                 let self_ref = Self::body_is_self_referential(&body);
-                if all_level && !has_named_event && !self_ref {
+                // A body with a BLOCKING control (`#delay`, inner `@event`,
+                // `wait`) cannot go through the comb-settle path — that path
+                // strips the `@()` and re-runs the body in a zero-time settle
+                // loop, which drops the delay and (for `always @(a) #5 z=a`)
+                // spins/starves the rest of the schedule. The edge path DOES
+                // honor a delayed body (same as `always @(posedge clk) #1 q=d`),
+                // so route a blocking-bodied level block there instead.
+                if all_level && !has_named_event && !self_ref
+                    && !self.stmt_is_blocking(&body)
+                {
                     return Some(AlwaysBlock {
                         kind: ab.kind,
                         stmt: body,
