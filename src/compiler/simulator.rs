@@ -26956,32 +26956,47 @@ impl Simulator {
                     Value::from_u64(v.has_xz() as u64, 1)
                 }
                 "$realtobits" => {
+                    // §20.5: return the 64-bit IEEE-754 pattern of the real as an
+                    // INTEGER bit-vector (not a real), so it can be indexed/stored
+                    // as bits. `v` is a real Value whose bits already are the
+                    // pattern; re-emit them as a plain 64-bit integer.
                     let v = args
                         .first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
-                    v
+                    Value::from_u64(v.to_f64().to_bits(), 64)
                 }
                 "$bitstoreal" => {
+                    // §20.5: reinterpret the 64-bit pattern as an IEEE-754 double.
+                    // The old pass-through left is_real=false, so the bits were
+                    // read as a huge integer (0x3FF0000000000000 -> 4.6e18 instead
+                    // of 1.0). Rebuild the real from the raw bits.
                     let v = args
                         .first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
-                    v
+                    Value::from_f64(f64::from_bits(v.to_u64().unwrap_or(0)))
                 }
                 "$itor" => {
+                    // §20.4: convert a (signed) integer to real. `to_u64` read a
+                    // negative arg as a huge unsigned value ($itor(-5) -> 4.29e9);
+                    // `to_i64` honors the operand's signedness so -5 -> -5.0.
                     let v = args
                         .first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(32));
-                    Value::from_f64(v.to_u64().unwrap_or(0) as f64)
+                    Value::from_f64(v.to_i64().unwrap_or(0) as f64)
                 }
                 "$rtoi" => {
+                    // §20.4: returns `integer` (a SIGNED 32-bit type). Mark the
+                    // result signed so %d prints e.g. -3, not 4294967293.
                     let v = args
                         .first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
-                    Self::real_trunc_to_int(v.to_f64(), 32)
+                    let mut r = Self::real_trunc_to_int(v.to_f64(), 32);
+                    r.is_signed = true;
+                    r
                 }
                 "$ceil" => {
                     let v = args
