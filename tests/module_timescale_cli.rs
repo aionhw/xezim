@@ -226,3 +226,47 @@ endmodule
     let l = o.find("LEAF t=1").unwrap();
     assert!(m < l, "mid fires before leaf: {}", o);
 }
+
+// --- cross-file `timescale sticky vs --module-timescale (two source files) ---
+
+/// Run xezim over TWO source files with the given args; return (stdout+stderr).
+fn run_two(args: &[&str], file_a: &str, file_b: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir();
+    let pa = dir.join(format!("mts2a_{}_{}.sv", std::process::id(), n));
+    let pb = dir.join(format!("mts2b_{}_{}.sv", std::process::id(), n));
+    std::fs::write(&pa, file_a).unwrap();
+    std::fs::write(&pb, file_b).unwrap();
+    let bin = env!("CARGO_BIN_EXE_xezim");
+    let mut cmd = Command::new(bin);
+    cmd.arg("--sv2017").arg("--max-time").arg("10000000");
+    for a in args { cmd.arg(a); }
+    cmd.arg(&pa).arg(&pb);
+    let out = cmd.output().expect("run xezim");
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    text
+}
+
+// File A carries a `timescale; file B's module has NONE of its own. The
+// directive must not stick across the file boundary and block the CLI:
+// --module-timescale must win for the directive-less module.
+const FILE_A: &str = "`timescale 1ns/1ps\nmodule othermod; endmodule\n";
+const FILE_B: &str = "module sf2; initial $printtimescale; endmodule\n";
+
+#[test]
+fn module_timescale_overrides_cross_file_inherited() {
+    let o = run_two(&["--module-timescale", "1ps/1ps", "-s", "sf2", "--dump-timescales"], FILE_A, FILE_B);
+    assert!(o.contains("sf2                          1ps / 1ps") || o.contains("(sf2) is 1ps / 1ps"),
+        "--module-timescale must override the cross-file-inherited 1ns/1ps; got:\n{}", o);
+}
+
+#[test]
+fn cross_file_inherited_kept_without_cli() {
+    // No --module-timescale: the single-compilation-unit sticky behavior is
+    // preserved, so sf2 inherits 1ns/1ps from file A (backward compatible).
+    let o = run_two(&["-s", "sf2", "--dump-timescales"], FILE_A, FILE_B);
+    assert!(o.contains("(sf2) is 1ns / 1ps") || o.contains("sf2                          1ns / 1ps"),
+        "without CLI, sf2 keeps the inherited 1ns/1ps; got:\n{}", o);
+}
