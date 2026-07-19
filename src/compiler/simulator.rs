@@ -49040,6 +49040,27 @@ impl Simulator {
                 let mut segs: Vec<&str> = vec![head_owned.as_str()];
                 segs.extend(hier.path[1..].iter().map(|s| s.name.name.as_str()));
                 let full = segs.join(".");
+                // Nested cross-module call: `l.deep()` invoked from inside a
+                // subroutine already running in scope `m` flattens to
+                // `m.l.deep`. When the bare dotted name is not itself a known
+                // subroutine, retry with the caller's resolve-hint scope
+                // prepended so the enclosing instance is honored.
+                let full = if self.module.functions.contains_key(&full)
+                    || self.module.tasks.contains_key(&full)
+                {
+                    full
+                } else if let Some(h) = self.name_resolve_hint.borrow().clone() {
+                    let prefixed = format!("{}.{}", h, full);
+                    if self.module.functions.contains_key(&prefixed)
+                        || self.module.tasks.contains_key(&prefixed)
+                    {
+                        prefixed
+                    } else {
+                        full
+                    }
+                } else {
+                    full
+                };
                 let scope = full.rsplit_once('.').map(|(s, _)| s.to_string());
                 if let Some(fd) = self.module.functions.get(&full).cloned() {
                     let saved = self.name_resolve_hint.borrow().clone();
