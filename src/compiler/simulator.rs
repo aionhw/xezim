@@ -50272,14 +50272,43 @@ impl Simulator {
                         })
                         .collect();
                     let cov = if explicit.is_empty() {
-                        // Auto-binned coverpoint: covered once anything
-                        // was sampled.
-                        let sampled = insts.iter().any(|i| {
-                            i.point_hits
-                                .get(&cp_name)
-                                .map_or(false, |h| !h.is_empty())
-                        });
-                        if sampled { 1.0 } else { 0.0 }
+                        // §19.5.1 auto bins: the coverpoint range is divided into
+                        // up to `auto_bin_max` (default 64) bins; coverage is the
+                        // fraction of those bins hit — NOT 100% the moment
+                        // anything is sampled. Width comes from a sampled value
+                        // (all share the coverpoint's width).
+                        const AUTO_BIN_MAX: u64 = 64;
+                        let width = insts
+                            .iter()
+                            .filter_map(|i| i.point_hits.get(&cp_name))
+                            .flat_map(|h| h.iter())
+                            .next()
+                            .map(|v| v.width)
+                            .unwrap_or(1);
+                        let value_space =
+                            if width >= 63 { u64::MAX } else { 1u64 << width };
+                        let total_bins = value_space.min(AUTO_BIN_MAX);
+                        let group = (value_space / AUTO_BIN_MAX).max(1);
+                        let mut bins_hit: std::collections::HashSet<u64> =
+                            std::collections::HashSet::new();
+                        for i in insts {
+                            if let Some(h) = i.point_hits.get(&cp_name) {
+                                for v in h {
+                                    let val = v.to_u64().unwrap_or(0);
+                                    let bin = if value_space <= AUTO_BIN_MAX {
+                                        val
+                                    } else {
+                                        val / group
+                                    };
+                                    bins_hit.insert(bin);
+                                }
+                            }
+                        }
+                        if total_bins == 0 {
+                            0.0
+                        } else {
+                            (bins_hit.len() as f64 / total_bins as f64).min(1.0)
+                        }
                     } else {
                         let hit = explicit
                             .iter()
@@ -50304,12 +50333,49 @@ impl Simulator {
                             .join("_")
                     });
                     let cov = if cr.bins.is_empty() {
-                        let sampled = insts.iter().any(|i| {
-                            i.cross_hits
-                                .get(&cr_name)
-                                .map_or(false, |h| !h.is_empty())
-                        });
-                        if sampled { 1.0 } else { 0.0 }
+                        // §19.6 auto cross bins: the cross's bin count is the
+                        // PRODUCT of its constituent coverpoints' auto-bin counts;
+                        // coverage is the fraction of those hit — NOT 100% the
+                        // moment any tuple is sampled. Per-element widths come
+                        // from a sampled tuple.
+                        const AUTO_BIN_MAX: u64 = 64;
+                        let sample_tuple = insts
+                            .iter()
+                            .filter_map(|i| i.cross_hits.get(&cr_name))
+                            .flat_map(|h| h.iter())
+                            .next();
+                        if let Some(tup) = sample_tuple {
+                            let widths: Vec<u32> = tup.iter().map(|v| v.width).collect();
+                            let bins_of = |w: u32| -> u64 {
+                                (if w >= 63 { u64::MAX } else { 1u64 << w }).min(AUTO_BIN_MAX)
+                            };
+                            let total: u64 = widths
+                                .iter()
+                                .map(|&w| bins_of(w))
+                                .fold(1u64, |a, b| a.saturating_mul(b));
+                            let mut hit: std::collections::HashSet<Vec<u64>> =
+                                std::collections::HashSet::new();
+                            for i in insts {
+                                if let Some(h) = i.cross_hits.get(&cr_name) {
+                                    for t in h {
+                                        let key: Vec<u64> = t
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(k, v)| {
+                                                let w = *widths.get(k).unwrap_or(&1);
+                                                let vs = if w >= 63 { u64::MAX } else { 1u64 << w };
+                                                let val = v.to_u64().unwrap_or(0);
+                                                if vs <= AUTO_BIN_MAX { val } else { val / (vs / AUTO_BIN_MAX).max(1) }
+                                            })
+                                            .collect();
+                                        hit.insert(key);
+                                    }
+                                }
+                            }
+                            if total == 0 { 0.0 } else { (hit.len() as f64 / total as f64).min(1.0) }
+                        } else {
+                            0.0
+                        }
                     } else {
                         let hit = cr
                             .bins
