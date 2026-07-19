@@ -16183,6 +16183,20 @@ impl Simulator {
                             }),
                     );
                 }
+                // `ForeverTail` carries the same forever body as `Forever`
+                // (it is the resume sentinel), so classify it identically.
+                StatementKind::ForeverTail { body } => {
+                    let inner: &[Statement] = match &body.kind {
+                        StatementKind::SeqBlock { stmts, .. } => stmts,
+                        _ => std::slice::from_ref(&**body),
+                    };
+                    return Some(
+                        self.classify_stall_stmts(inner, depth + 1, src_file)
+                            .unwrap_or_else(|| {
+                                "loop body has no timing control — never yields".to_string()
+                            }),
+                    );
+                }
                 StatementKind::SeqBlock { stmts: inner, .. } => {
                     if let Some(r) = self.classify_stall_stmts(inner, depth + 1, src_file) {
                         return Some(r);
@@ -18563,17 +18577,47 @@ impl Simulator {
                 }
             }
 
-            // Check for forever with delays/events
+            // Check for forever with delays/events. FIRST entry only — the
+            // body's first iteration runs inside `exec_forever_sched`, which
+            // re-appends a `ForeverTail` sentinel (not `Forever`) so that on
+            // RESUME after a suspension the `ForeverTail` arm below runs the
+            // break/continue/return gate. Gating here on first entry was the
+            // old approach: it deadlocked a `forever` whose body only raises
+            // a control flag AFTER its first iteration blocks (a stale or
+            // transient flag fired before the
+            // body ran even once. The sentinel split (first entry vs re-entry)
+            // is what makes `break` safe now. (§9.3.3)
             if let StatementKind::Forever { body } = &stmt.kind {
-                // NOTE: a `break` inside a blocking `forever` body is not
-                // honoured here. Unlike while/repeat, gating forever on entry
-                // regresses UVM driver/sequencer forever-loops (3414, 4194):
-                // they re-enter every cycle and the per-entry gate call, plus
-                // any transient flag, perturbs timing enough to TIMEOUT under
-                // suite load, with zero tests improved. forever-with-break is
-                // vanishingly rare (drivers loop indefinitely by design). If
-                // needed later, handle break inside exec_forever_sched at the
-                // re-append site instead of a top-of-arm gate. (§9.3.3)
+                self.exec_forever_sched(pid, body, &stmts[i + 1..]);
+                return;
+            }
+
+            // INTERNAL: `ForeverTail` continuation sentinel — re-entry point
+            // for a blocking-body `forever` after its body suspended (via
+            // `exec_forever_sched`'s event/delay/blocking continuation). The
+            // body statements up to the suspension point have just run; a
+            // `break`/`continue`/`return` raised anywhere in that body slice
+            // is honoured HERE (§9.3.3), which the old `Forever` re-append
+            // silently dropped.
+            if let StatementKind::ForeverTail { body } = &stmt.kind {
+                // `return` from an inlined task body: do NOT consume — unwind
+                // to the task's ScopePop (the top-of-loop return_flag skip
+                // drives it). Exit this forever.
+                if self.return_flag {
+                    i += 1;
+                    continue;
+                }
+                // `break` exits the forever; consume break+continue.
+                if self.break_flag {
+                    self.break_flag = false;
+                    self.continue_flag = false;
+                    i += 1;
+                    continue;
+                }
+                // `continue` (or no flag): consume it and run the next
+                // iteration. exec_forever_sched re-appends another
+                // ForeverTail, so this gate runs again on the next resume.
+                self.continue_flag = false;
                 self.exec_forever_sched(pid, body, &stmts[i + 1..]);
                 return;
             }
@@ -19576,7 +19620,7 @@ impl Simulator {
                         let mut cont = vec![*tbody.clone()];
                         cont.extend_from_slice(&body_stmts[i + 1..]);
                         cont.push(Statement::new(
-                            StatementKind::Forever {
+                            StatementKind::ForeverTail {
                                 body: Box::new(body.clone()),
                             },
                             body.span,
@@ -19599,7 +19643,7 @@ impl Simulator {
                             let mut cont = vec![*tbody.clone()];
                             cont.extend_from_slice(&body_stmts[i + 1..]);
                             cont.push(Statement::new(
-                                StatementKind::Forever {
+                                StatementKind::ForeverTail {
                                     body: Box::new(body.clone()),
                                 },
                                 body.span,
@@ -19626,7 +19670,7 @@ impl Simulator {
                 let mut cont: Vec<Statement> = vec![s.clone()];
                 cont.extend_from_slice(&body_stmts[i + 1..]);
                 cont.push(Statement::new(
-                    StatementKind::Forever {
+                    StatementKind::ForeverTail {
                         body: Box::new(body.clone()),
                     },
                     body.span,
@@ -28938,6 +28982,7 @@ impl Simulator {
             // suspend-aware `run_process_stmts` stream. If reached here
             // (synchronous exec), it is a no-op.
             StatementKind::ForeachTail { .. } => {}
+            StatementKind::ForeverTail { .. } => {}
             StatementKind::Expr(expr) => self.exec_expr_stmt(expr),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
                 // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)
