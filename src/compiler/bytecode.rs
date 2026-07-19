@@ -2207,7 +2207,12 @@ impl<'a> BytecodeCompiler<'a> {
                 v.is_signed = *signed;
                 Some(v)
             }
-            NumberLiteral::Real(f) => Some(Value::from_u64(*f as u64, 64)),
+            // A real literal must keep its fractional value as IEEE-754 bits so
+            // the VM's real-aware arithmetic sees a real operand. The old
+            // `*f as u64` truncated `4.4`→`4` and `5.5`→`5`, turning a comb/
+            // cont-assign `(1.0/4.4)*1000.0` into integer `1/4*1000 = 0` (the
+            // PLL clamp-mode `vcofbperiod` went to 0 → a #0 vclk livelock).
+            NumberLiteral::Real(f) => Some(Value::from_f64(*f)),
             // Time literal magnitude in tick units (1 ns), matching the
             // interpreter's value-context handling.
             NumberLiteral::Time(s) => Some(Value::from_u64((*s * 1e9) as u64, 64)),

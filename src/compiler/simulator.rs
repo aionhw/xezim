@@ -3132,6 +3132,14 @@ pub struct Simulator {
     /// zero-delay livelock. Generous by default (real designs settle in a
     /// handful); tune with XEZIM_STALL_LIMIT, 0 disables the check.
     stall_limit: u64,
+    /// Set by the per-pid stall check inside `run_process_stmts` when a single
+    /// process spins past `stall_limit` at one timestamp (e.g. an
+    /// `always #(period) clk=~clk` whose real period glitched to 0). Instead of
+    /// aborting there, it flags the outer loop to attempt a defer-and-advance
+    /// to the next scheduled event (commercial-sim parity) — a #0 spinner whose
+    /// driving value recovers once time moves resumes; only a livelock with
+    /// nothing scheduled ahead is fatal. See `try_break_zero_delay_livelock`.
+    zero_delay_defer_pending: bool,
     prof_fallback_insns: u64,
     prof_fallback_by_reason: HashMap<&'static str, (u64, u64)>,
     prof_settle_dc_ns: u64,
@@ -4706,6 +4714,7 @@ impl Simulator {
             forever_depth: 0,
             constraint_cmp_unsigned: false,
             stall_iters: 0,
+            zero_delay_defer_pending: false,
             stall_time: 0,
             stall_pid_hits: HashMap::default(),
             stall_limit: std::env::var("XEZIM_STALL_LIMIT")
@@ -15710,6 +15719,53 @@ impl Simulator {
         line
     }
 
+    /// Attempt to break a zero-delay (delta) livelock by deferring every
+    /// process stuck at the current timestamp to the next scheduled event and
+    /// advancing time to it. Returns true if it advanced, false if NOTHING is
+    /// scheduled ahead (a genuine unbreakable livelock — the caller then
+    /// reports and finishes). Shared by the outer-loop stall detector and the
+    /// per-pid spinner check inside `run_process_stmts`.
+    ///
+    /// The clock-generator and delayed-update candidates are computed FRESH
+    /// here rather than taken from the caller: when this runs from inside a
+    /// tick (the per-pid path), `fire_clock_generators` has already toggled the
+    /// clocks and advanced their `next_toggle_time`, so any value the outer
+    /// loop computed before the tick is stale (it would filter out the clock's
+    /// already-advanced edge and skip past it, stranding the clock in the past).
+    fn try_break_zero_delay_livelock(&mut self) -> bool {
+        let next_clk_time = self
+            .clock_generators
+            .iter()
+            .map(|c| c.next_toggle_time)
+            .min();
+        let next_delayed = self.next_delayed_time();
+        let future = self
+            .event_queue
+            .next_time_after(self.time)
+            .into_iter()
+            .chain(next_clk_time.filter(|&t| t > self.time))
+            .chain(next_delayed.filter(|&t| t > self.time))
+            .chain(self.uvm_pending_end.filter(|&t| t > self.time))
+            .min()
+            .filter(|&t| t <= self.max_time);
+        let Some(ft) = future else {
+            return false;
+        };
+        let stuck = self.event_queue.remove(self.time);
+        for (p, c) in stuck {
+            self.event_queue.schedule(ft, p, c);
+        }
+        let inact = std::mem::take(&mut self.inactive_queue);
+        for (p, c) in inact {
+            self.event_queue.schedule(ft, p, c);
+        }
+        self.time = ft;
+        self.stall_iters = 0;
+        self.stall_time = ft;
+        self.stall_pid_hits.clear();
+        true
+    }
+
     fn report_zero_delay_stall(&mut self, running: Option<(usize, &[Statement])>) {
         let mut top: Vec<(usize, u64)> =
             self.stall_pid_hits.iter().map(|(p, c)| (*p, *c)).collect();
@@ -16163,7 +16219,7 @@ impl Simulator {
             );
         }
         while !batch.is_empty() {
-            if self.finished {
+            if self.finished || self.zero_delay_defer_pending {
                 break;
             }
             let (pid, stmts) = batch.remove(0);
@@ -16269,7 +16325,9 @@ impl Simulator {
         // flip another's), so iterate to a fixpoint. Stop when a full round
         // advances no waiter (the rest are waiting on a future-time change).
         let mut guard = 0u32;
-        while !self.condition_waiters.is_empty() && !self.finished {
+        while !self.condition_waiters.is_empty() && !self.finished
+            && !self.zero_delay_defer_pending
+        {
             guard += 1;
             if guard > 10000 {
                 break;
@@ -16280,7 +16338,7 @@ impl Simulator {
                 self.event_queue.schedule(self.time, cpid, cont);
             }
             let mut batch = self.event_queue.remove(self.time);
-            while !batch.is_empty() && !self.finished {
+            while !batch.is_empty() && !self.finished && !self.zero_delay_defer_pending {
                 let (bpid, stmts) = batch.remove(0);
                 let t_now = self.time;
                 for (p, s) in batch.drain(..) {
@@ -16528,6 +16586,13 @@ impl Simulator {
                 self.stall_iters = 0;
                 self.stall_time = next_time;
                 self.stall_pid_hits.clear();
+                // Time advanced on its own — any spinner that asked to be
+                // deferred resolved itself, so DON'T service a stale defer
+                // request (it would fire at the new time and jump past a clock
+                // toggle that is due there). Let run_one_tick process the new
+                // time; if the spinner re-arms, the per-pid check re-flags it
+                // with fresh clock/queue state.
+                self.zero_delay_defer_pending = false;
             } else {
                 // Time did NOT advance this iteration. That is normal for a few
                 // delta cycles; it is a livelock if it never ends.
@@ -16538,40 +16603,26 @@ impl Simulator {
                     self.stall_iters = 1;
                 }
                 if self.stall_limit > 0 && self.stall_iters > self.stall_limit {
-                    // Try to BREAK the zero-delay livelock: if real events are
-                    // scheduled AHEAD, defer the stuck current-time processes to
-                    // the next future event and advance time — a commercial
-                    // simulator lets time move past a #0 spinner (e.g. a
-                    // `#(period)` clock gen whose period is 0 during reset) once
-                    // its input is set later, rather than aborting the whole run.
-                    // Only a livelock with NOTHING ahead is fatal.
-                    let future = self
-                        .event_queue
-                        .next_time_after(self.time)
-                        .into_iter()
-                        .chain(next_clk_time.filter(|&t| t > self.time))
-                        .chain(next_delayed.filter(|&t| t > self.time))
-                        .chain(self.uvm_pending_end.filter(|&t| t > self.time))
-                        .min()
-                        .filter(|&t| t <= self.max_time);
-                    if let Some(ft) = future {
-                        let stuck = self.event_queue.remove(self.time);
-                        for (p, c) in stuck {
-                            self.event_queue.schedule(ft, p, c);
-                        }
-                        let inact = std::mem::take(&mut self.inactive_queue);
-                        for (p, c) in inact {
-                            self.event_queue.schedule(ft, p, c);
-                        }
-                        self.time = ft;
-                        self.stall_iters = 0;
-                        self.stall_time = ft;
-                        self.stall_pid_hits.clear();
-                    } else {
+                    // Try to BREAK the zero-delay livelock by deferring the stuck
+                    // current-time processes to the next scheduled event. Only a
+                    // livelock with NOTHING ahead is fatal.
+                    if !self.try_break_zero_delay_livelock() {
                         self.report_zero_delay_stall(None);
                         self.finished = true;
                         break;
                     }
+                }
+            }
+            // A per-pid spinner inside run_one_tick (an `always #(period)` block
+            // whose real period glitched to 0) asked the outer loop to break the
+            // livelock rather than abort. Attempt the same defer-and-advance;
+            // fatal only if nothing is scheduled ahead.
+            if self.zero_delay_defer_pending {
+                self.zero_delay_defer_pending = false;
+                if !self.try_break_zero_delay_livelock() {
+                    self.report_zero_delay_stall(None);
+                    self.finished = true;
+                    break;
                 }
             }
             if self.time > old_time && !self.dpi_next_time_cbs.is_empty() {
@@ -17765,8 +17816,17 @@ impl Simulator {
             // queue at the current time, so a self-rescheduling process never
             // reaches the outer event loop — the check has to live here.
             if *hits > self.stall_limit {
-                self.report_zero_delay_stall(Some((pid, stmts)));
-                self.finished = true;
+                // A single process re-arming this many times at one timestamp is
+                // a zero-delay livelock (e.g. `always #(period) clk=~clk` whose
+                // real `period` momentarily glitched to 0). Rather than abort the
+                // whole run here, RE-PARK this un-executed activation at the
+                // current time and ask the outer event loop to defer-and-advance
+                // to the next scheduled event — a commercial simulator lets time
+                // move past a #0 spinner once its driving value recovers (here,
+                // once an `irefclk` edge updates the measured period). The outer
+                // loop declares it fatal only if nothing is scheduled ahead.
+                self.event_queue.schedule(self.time, pid, stmts.to_vec());
+                self.zero_delay_defer_pending = true;
                 return;
             }
         }
