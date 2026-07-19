@@ -1026,6 +1026,15 @@ struct MailboxGetWaiter {
     is_peek: bool,
 }
 
+/// §15.4.1 — a process blocked on `mailbox.put(v)` because a BOUNDED mailbox is
+/// full. The value is captured at the (blocking) call; when a `get`/`try_get`
+/// frees a slot the value is stored and `cont` is rescheduled.
+struct MailboxPutWaiter {
+    pid: usize,
+    value: Value,
+    cont: Vec<Statement>,
+}
+
 /// A process waiting for a signal edge event.
 #[derive(Debug, Clone)]
 struct EventWaiter {
@@ -2272,6 +2281,12 @@ pub struct Simulator {
     queue_frame_saves: Vec<HashMap<String, Vec<(String, Value)>>>,
     /// Built-in mailboxes (handle -> queue of values)
     mailboxes: HashMap<usize, std::collections::VecDeque<Value>>,
+    /// §15.4.1 bounded-mailbox capacity (handle -> bound). Absent or 0 means
+    /// UNBOUNDED — `try_put` never fails and `put` never blocks. `new(N)` with
+    /// N>0 records N here; a full box rejects `try_put` and parks `put`.
+    mailbox_bound: HashMap<usize, usize>,
+    /// Producers parked on `put` to a full bounded mailbox (handle -> queue).
+    mailbox_put_waiters: HashMap<usize, std::collections::VecDeque<MailboxPutWaiter>>,
     /// §18.13 rand_mode: per-instance set of rand properties whose
     /// randomization is currently disabled. `obj.x.rand_mode(0)` adds "x".
     /// `obj.rand_mode(0)` disables ALL rand props.
@@ -4384,6 +4399,8 @@ impl Simulator {
             string_signals: HashSet::default(),
             queue_frame_saves: Vec::new(),
             mailboxes: HashMap::default(),
+            mailbox_bound: HashMap::default(),
+            mailbox_put_waiters: HashMap::default(),
             rand_mode_disabled: HashMap::default(),
             constraint_mode_disabled: HashMap::default(),
             static_constraint_disabled: HashSet::default(),
@@ -18113,6 +18130,29 @@ impl Simulator {
                             }
                         }
                     }
+                    // §15.4.1: blocking `mailbox.put(v)` on a FULL bounded
+                    // mailbox. Capture the value now, park the producer, and
+                    // return; a later get/try_get admits it and resumes here.
+                    if method == "put" && !args.is_empty() {
+                        if let Some(recv) = recv_expr_opt.clone() {
+                            let recv_val = self.eval_expr(&recv);
+                            let handle = recv_val.to_u64().unwrap_or(0) as usize;
+                            let bound = self.mailbox_bound.get(&handle).copied().unwrap_or(0);
+                            if bound > 0 {
+                                let len =
+                                    self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
+                                if len >= bound {
+                                    let value = self.eval_expr(&args[0]);
+                                    let cont: Vec<Statement> = stmts[i + 1..].to_vec();
+                                    self.mailbox_put_waiters
+                                        .entry(handle)
+                                        .or_insert_with(std::collections::VecDeque::new)
+                                        .push_back(MailboxPutWaiter { pid, value, cont });
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     // §15.3.3: blocking `semaphore.get(n)` on an under-full
                     // semaphore. Park until a `put` raises the count enough; the
                     // decrement happens at wake. A get that CAN proceed falls
@@ -18777,6 +18817,11 @@ impl Simulator {
                     | "try_next_item"
                     | "peek"
                     | "get"
+                    // §15.4.1: `put` blocks on a FULL bounded mailbox, so a
+                    // block containing one must flatten into the suspend-aware
+                    // runner. A non-mailbox / unbounded `put` simply falls
+                    // through the park handler (its handle has no bound).
+                    | "put"
                     | "wait_for_sequences"
                     | "get_response"
                     | "finish_item"
@@ -29442,6 +29487,7 @@ impl Simulator {
                                 } else {
                                     self.mailboxes
                                         .insert(handle, std::collections::VecDeque::new());
+                                    self.record_mailbox_bound(handle, args);
                                 }
                                 self.assign_value(lvalue, &Value::from_u64(handle as u64, 32).resize(w));
                                 if !self.in_edge_block {
@@ -29515,6 +29561,7 @@ impl Simulator {
                                     }));
                                     self.mailboxes
                                         .insert(handle, std::collections::VecDeque::new());
+                                    self.record_mailbox_bound(handle, args);
                                     Value::from_u64(handle as u64, 32)
                                 } else if let Some(class_def) =
                                     self.module.classes.get(&tname).cloned()
@@ -37352,6 +37399,44 @@ impl Simulator {
                     }
                 }
                 _ => break,
+            }
+        }
+    }
+
+    /// §15.4.1 — record a bounded mailbox's capacity from its `new(N)` arg.
+    /// N absent or 0 leaves it unbounded (no entry).
+    fn record_mailbox_bound(&mut self, handle: usize, args: &[Expression]) {
+        let bound = args
+            .first()
+            .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as usize)
+            .unwrap_or(0);
+        if bound > 0 {
+            self.mailbox_bound.insert(handle, bound);
+        }
+    }
+
+    /// §15.4.1 — a slot just freed on a bounded mailbox: admit one parked `put`
+    /// (store its value, resume the producer). No-op for an unbounded mailbox or
+    /// when no producer is waiting.
+    fn admit_mailbox_put_waiter(&mut self, handle: usize) {
+        let bound = self.mailbox_bound.get(&handle).copied().unwrap_or(0);
+        if bound == 0 {
+            return;
+        }
+        let len = self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
+        if len >= bound {
+            return;
+        }
+        if let Some(w) = self
+            .mailbox_put_waiters
+            .get_mut(&handle)
+            .and_then(|q| q.pop_front())
+        {
+            self.mailboxes.get_mut(&handle).unwrap().push_back(w.value);
+            if w.cont.is_empty() {
+                self.child_finished(w.pid);
+            } else {
+                self.event_queue.schedule(self.time, w.pid, w.cont);
             }
         }
     }
@@ -47631,6 +47716,7 @@ impl Simulator {
                             let w = self.infer_lhs_width(arg);
                             self.assign_value(arg, &val.resize(w));
                         }
+                        self.admit_mailbox_put_waiter(handle);
                         return Value::zero(32);
                     } else {
                         // BLOCKING: simplified, just retry later or return for now
@@ -47674,6 +47760,7 @@ impl Simulator {
                     if let (Some(v), Some(arg)) = (val, args.first()) {
                         let w = self.infer_lhs_width(arg);
                         self.assign_value(arg, &v.resize(w));
+                        self.admit_mailbox_put_waiter(handle);
                         return Value::from_u64(1, 32);
                     }
                     return Value::zero(32);
@@ -51461,10 +51548,24 @@ impl Simulator {
                         let w = self.infer_lhs_width(arg);
                         self.assign_value(arg, &v.resize(w));
                     }
+                    // A consuming `get` frees a slot — admit a parked producer.
+                    if method_name == "get" {
+                        self.admit_mailbox_put_waiter(handle);
+                    }
                     return Value::zero(32);
                 }
                 "try_put" => {
                     if let Some(arg) = args.first() {
+                        // §15.4.1: a bounded mailbox that is full rejects try_put
+                        // (returns 0). A full box has no parked get-waiter (those
+                        // park only on empty), so len>=bound is the whole test.
+                        let bound = self.mailbox_bound.get(&handle).copied().unwrap_or(0);
+                        if bound > 0 {
+                            let len = self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
+                            if len >= bound {
+                                return Value::zero(32);
+                            }
+                        }
                         let v = self.eval_expr(arg);
                         let waiter = self
                             .mailbox_get_waiters
@@ -51491,6 +51592,9 @@ impl Simulator {
                     if let (Some(v), Some(arg)) = (val, args.first()) {
                         let w = self.infer_lhs_width(arg);
                         self.assign_value(arg, &v.resize(w));
+                        if method_name == "try_get" {
+                            self.admit_mailbox_put_waiter(handle);
+                        }
                         return Value::from_u64(1, 32);
                     }
                     return Value::zero(32);
