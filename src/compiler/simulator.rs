@@ -26322,6 +26322,180 @@ impl Simulator {
         None
     }
 
+    /// Resolve a packed-struct lvalue to `(base_signal, field_prefix, layout,
+    /// base_offset, width)` for assignment-pattern packing. `layout` is the
+    /// base signal's flattened `(dotted_field, offset, width)` list; `prefix`
+    /// is the field path being written (`""` for the whole base signal);
+    /// `base_offset`/`width` locate that field's slice within the base value.
+    /// Returns None when the lvalue is not a registered packed struct (caller
+    /// then falls back to the generic path).
+    fn resolve_packed_struct_target(
+        &mut self,
+        lvalue: &Expression,
+        items: &[AssignmentPatternItem],
+    ) -> Option<(String, String, Vec<(String, u32, u32)>, u32, u32)> {
+        // Keyed/Typed items denote associative or type-keyed aggregates, not a
+        // by-member struct pack — leave those to the existing paths.
+        if items.iter().any(|it| {
+            matches!(
+                it,
+                AssignmentPatternItem::Keyed(..) | AssignmentPatternItem::Typed(..)
+            )
+        }) {
+            return None;
+        }
+        let flat = self.flat_member_name(lvalue)?;
+        let (obj_name, prefix) = match flat.split_once('.') {
+            Some((o, p)) => (o.to_string(), p.to_string()),
+            None => (flat.clone(), String::new()),
+        };
+        let layout = self.module.packed_struct_fields.get(&obj_name).cloned()?;
+        let (base_offset, width) = if prefix.is_empty() {
+            // Whole base signal: span is the max (offset + width) over fields.
+            let total = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+            (0, total)
+        } else {
+            // A member: must itself be a registered field (sub-struct or leaf).
+            let (_, o, w) = layout.iter().find(|(k, _, _)| *k == prefix)?;
+            (*o, *w)
+        };
+        Some((obj_name, prefix, layout, base_offset, width))
+    }
+
+    /// Pack a named/ordered/default assignment pattern into a PACKED struct
+    /// target and store it in place (blocking assign).
+    ///
+    /// The generic `eval_expr` path concatenates pattern items blind to the
+    /// target layout, so any member expression that isn't exactly its member
+    /// width (e.g. an unsized `'0`, which is 32 bits) shifts every subsequent
+    /// field and corrupts the packed value. Here each item is resized to its
+    /// own member width and dropped at its absolute bit offset instead; nested
+    /// patterns on sub-struct members recurse. Returns false (caller falls back
+    /// to the generic path) when the lvalue is not a registered packed struct.
+    fn try_assign_packed_struct_pattern(
+        &mut self,
+        lvalue: &Expression,
+        items: &[AssignmentPatternItem],
+    ) -> bool {
+        let Some((obj_name, prefix, layout, _base_off, _w)) =
+            self.resolve_packed_struct_target(lvalue, items)
+        else {
+            return false;
+        };
+        // Write straight into the whole base value at absolute offsets, so a
+        // member assign leaves its sibling members untouched.
+        let Some(mut acc) = self.get_local_or_signal(&obj_name) else {
+            return false;
+        };
+        if !self.apply_packed_struct_pattern(&mut acc, &layout, &prefix, 0, items) {
+            return false;
+        }
+        self.set_local_or_signal(&obj_name, acc);
+        true
+    }
+
+    /// Evaluate a named/ordered/default assignment pattern targeting a PACKED
+    /// struct lvalue and return the correctly-laid-out value at the LVALUE's
+    /// own width (0-based within the target field). For NBA / continuous
+    /// assigns, whose scheduling drives the resolved (possibly sub-member)
+    /// target — driving the whole base signal instead would clobber sibling
+    /// members updated in the same step. Returns None when the lvalue is not a
+    /// registered packed struct.
+    fn eval_packed_struct_pattern(
+        &mut self,
+        lvalue: &Expression,
+        items: &[AssignmentPatternItem],
+    ) -> Option<Value> {
+        let (obj_name, prefix, layout, base_off, width) =
+            self.resolve_packed_struct_target(lvalue, items)?;
+        // Seed from the current field value so members the pattern omits keep
+        // their prior contents.
+        let base_val = self.get_local_or_signal(&obj_name)?;
+        let mut acc = Value::zero(width);
+        for b in 0..width {
+            acc.set_bit(b as usize, base_val.get_bit((base_off + b) as usize));
+        }
+        if !self.apply_packed_struct_pattern(&mut acc, &layout, &prefix, base_off, items) {
+            return None;
+        }
+        Some(acc)
+    }
+
+    /// Write each member of a packed-struct assignment pattern into `acc` at
+    /// `absolute_offset - base_offset`. `layout` is the base signal's flattened
+    /// `(dotted_field, offset, width)` list; `prefix` is the field path of the
+    /// struct being written (`""` for the whole base signal). Pass
+    /// `base_offset = 0` with a whole-base `acc` to write at absolute offsets,
+    /// or the field's offset with a field-width `acc` to write 0-based within
+    /// it. Recurses for nested sub-struct patterns. Returns false when `prefix`
+    /// names no struct (it has no direct child fields in the layout).
+    fn apply_packed_struct_pattern(
+        &mut self,
+        acc: &mut Value,
+        layout: &[(String, u32, u32)],
+        prefix: &str,
+        base_offset: u32,
+        items: &[AssignmentPatternItem],
+    ) -> bool {
+        let pfx = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}.", prefix)
+        };
+        // Direct children of `prefix`: keys of the form "<pfx><leaf>" whose leaf
+        // has no further '.' (deeper leaves belong to a nested sub-struct).
+        let mut children: Vec<(String, String, u32, u32)> = Vec::new();
+        for (k, off, w) in layout {
+            if let Some(rest) = k.strip_prefix(&pfx) {
+                if !rest.is_empty() && !rest.contains('.') {
+                    children.push((k.clone(), rest.to_string(), *off, *w));
+                }
+            }
+        }
+        if children.is_empty() {
+            return false;
+        }
+        // The first-declared member is the MSB, i.e. the highest offset. Ordered
+        // items bind in declaration order.
+        children.sort_by(|a, b| b.2.cmp(&a.2));
+
+        let mut named: HashMap<&str, &Expression> = HashMap::default();
+        let mut ordered: Vec<&Expression> = Vec::new();
+        let mut default: Option<&Expression> = None;
+        for it in items {
+            match it {
+                AssignmentPatternItem::Named(id, e) => {
+                    named.insert(id.name.as_str(), e);
+                }
+                AssignmentPatternItem::Ordered(e) => ordered.push(e),
+                AssignmentPatternItem::Default(e) => default = Some(e),
+                _ => {}
+            }
+        }
+
+        for (i, (full, leaf, off, w)) in children.iter().enumerate() {
+            let expr = named
+                .get(leaf.as_str())
+                .copied()
+                .or_else(|| ordered.get(i).copied())
+                .or(default);
+            let Some(e) = expr else { continue };
+            // A nested pattern on a sub-struct member recurses so each of ITS
+            // members lands at the right offset too.
+            if let ExprKind::AssignmentPattern(sub) = &e.kind {
+                if self.apply_packed_struct_pattern(acc, layout, full, base_offset, sub) {
+                    continue;
+                }
+            }
+            let piece = self.eval_expr_ctx(e, *w).resize(*w);
+            let dst = off - base_offset;
+            for b in 0..*w {
+                acc.set_bit((dst + b) as usize, piece.get_bit(b as usize));
+            }
+        }
+        true
+    }
+
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
         // §18.4: writing a member of a struct/union CLASS property goes to the
         // aggregate's own storage — for a packed struct/union that means
@@ -32287,6 +32461,19 @@ impl Simulator {
                         return;
                     }
                 }
+                // A named/ordered/default pattern written to a PACKED struct
+                // must be laid out by member OFFSET, not blind-concatenated:
+                // an unsized `'0` (32 bits) or any other non-member-width item
+                // would otherwise shift every field. Fall through untouched when
+                // the lvalue is not a registered packed struct.
+                if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
+                    if self.try_assign_packed_struct_pattern(lvalue, items) {
+                        if !self.in_edge_block {
+                            self.settle_combinatorial();
+                        }
+                        return;
+                    }
+                }
                 // `d[i] = new[n]` on an array of dynamic arrays (§7.5.1): the
                 // ELEMENT is the dynamic array. Only a bare-identifier lvalue ever
                 // got its size shadow written, so `d[i].size()` reported the
@@ -34031,7 +34218,15 @@ impl Simulator {
                     }
                     None => rvalue,
                 };
-                let val = self.eval_expr(rvalue);
+                // A named/ordered/default pattern driven onto a PACKED struct
+                // (or sub-member) must be laid out by member offset, not
+                // blind-concatenated — see try_assign_packed_struct_pattern.
+                let val = match &rvalue.kind {
+                    ExprKind::AssignmentPattern(items) => self
+                        .eval_packed_struct_pattern(lvalue, items)
+                        .unwrap_or_else(|| self.eval_expr(rvalue)),
+                    _ => self.eval_expr(rvalue),
+                };
                 // LRM §14.4: clocking-block output drive
                 // `cb.<out_sig> <= val`. Defer to the cb's next clock
                 // edge (output skew) instead of driving now.
