@@ -27442,10 +27442,24 @@ impl Simulator {
                                 self.lookup_signal_width(&aname).unwrap_or(0)
                             };
                             let sel = dims.as_ref().and_then(|d| d.get(dim.saturating_sub(1)));
+                            let n_unpacked = dims.as_ref().map(|d| d.len()).unwrap_or(0);
                             let (lo, hi, descending) = if let Some(&(l, h)) = sel {
                                 let desc = dim == 1
                                     && self.module.descending_arrays.contains(&aname);
                                 (l, h, desc)
+                            } else if let Some(&(l, r)) = self
+                                .module
+                                .packed_full_dims
+                                .get(&aname)
+                                .and_then(|pd| pd.get(dim.saturating_sub(1).saturating_sub(n_unpacked)))
+                            {
+                                // §7.4.5: dimensions number unpacked-first, then
+                                // packed. A multi-D packed vector (`logic
+                                // [3:0][7:0]`) has per-dimension bounds in
+                                // packed_full_dims (declared left,right) — without
+                                // this the query collapsed to the FLATTENED vector,
+                                // so `$left([3:0][7:0])` returned 31, not 3.
+                                (l.min(r), l.max(r), l > r)
                             } else {
                                 (0i64, packed_w as i64 - 1, true)
                             };
