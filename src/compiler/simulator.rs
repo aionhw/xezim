@@ -24420,6 +24420,15 @@ impl Simulator {
                         }
                     }
                 }
+                if let Some(bound) = self.indexed_iface_alias_for(expr) {
+                    let target = format!("{}.{}", bound, member.name);
+                    let prev = self.get_signal_value_by_name(&target);
+                    let w = prev.as_ref().map(|v| v.width).unwrap_or(val.width);
+                    let resized = val.resize(w);
+                    let changed = prev.as_ref() != Some(&resized);
+                    self.set_signal_value_by_name(&target, resized);
+                    return changed;
+                }
                 // Unpacked aggregates keep every leaf in its own signal
                 // (`arr[i].m`, `c.nodes[i].m`) — there is no contiguous bit
                 // layout to slice, and a `real` member has no bit offset. If the
@@ -27790,6 +27799,15 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // §25.10: member access through an indexed plain virtual-
+                // interface array (`vifs[i].data`). Resolve the element alias
+                // before generic flattened aggregate handling creates/reads a
+                // phantom `vifs[i].data` value.
+                if let Some(bound) = self.indexed_iface_alias_for(expr) {
+                    return self
+                        .get_signal_value_by_name(&format!("{}.{}", bound, member.name))
+                        .unwrap_or_else(|| Value::new(1));
+                }
                 // §18.4: member of a struct/union CLASS property — read through
                 // the aggregate's storage (a bit slice for a packed struct/
                 // union, so a union's members alias). Must precede the flat
@@ -46328,6 +46346,26 @@ impl Simulator {
                     .and_then(|cn| self.module.classes.get(&cn))
                     .map_or(false, |cd| cd.virtual_iface_properties.contains_key(name));
                 if is_viface_var && !shadows_class_prop {
+                    // §25.10: whole-array binding (`vifs = interfaces`). Each
+                    // virtual-interface element is an independent alias to the
+                    // corresponding structural interface instance.
+                    if let Some(&(lo, hi, _)) = self.module.arrays.get(name) {
+                        if let ExprKind::Ident(rhs_h) = &rvalue.kind {
+                            if rhs_h.path.len() == 1 && rhs_h.path[0].selects.is_empty() {
+                                let rhs_base = &rhs_h.path[0].name.name;
+                                let targets: Vec<String> = (lo..=hi)
+                                    .map(|idx| format!("{}[{}]", rhs_base, idx))
+                                    .collect();
+                                if targets.iter().all(|target| self.is_interface_instance(target)) {
+                                    for (idx, target) in (lo..=hi).zip(targets) {
+                                        self.viface_var_aliases
+                                            .insert(format!("{}[{}]", name, idx), target);
+                                    }
+                                    return true;
+                                }
+                            }
+                        }
+                    }
                     if matches!(&rvalue.kind, ExprKind::Null) {
                         // Clear the alias, then FALL THROUGH so the normal
                         // value path stores the null handle — keeping a
@@ -46698,6 +46736,20 @@ impl Simulator {
             return None; // fast path: no vif variables bound anywhere
         }
         self.viface_var_aliases.get(name).cloned()
+    }
+
+    fn indexed_iface_alias_for(&self, expr: &Expression) -> Option<String> {
+        let ExprKind::Index { expr: base, index } = &expr.kind else {
+            return None;
+        };
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let idx = self.eval_scalar_self(index)?;
+        self.iface_alias_for(&format!("{}[{}]", h.path[0].name.name, idx))
     }
 
     /// Is `path` an elaborated INTERFACE instance (e.g. `bus` of
@@ -47420,6 +47472,30 @@ impl Simulator {
         } else {
             func
         };
+        // A subroutine declared in a named generate-for scope is addressed as
+        // `block[index].task(...)`. Elaboration stores each iteration under
+        // that exact hierarchical key.
+        if let ExprKind::MemberAccess { expr: base, member } = &func.kind {
+            if let ExprKind::Index { expr: scope, index } = &base.kind {
+                if let ExprKind::Ident(h) = &scope.kind {
+                    if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                        if let Some(idx) = self.eval_scalar_self(index) {
+                            let name = format!(
+                                "{}[{}].{}",
+                                h.path[0].name.name, idx, member.name
+                            );
+                            if let Some(fd) = self.module.functions.get(&name).cloned() {
+                                return self.exec_function_call(&fd, args);
+                            }
+                            if let Some(td) = self.module.tasks.get(&name).cloned() {
+                                self.exec_task_call(&td, args);
+                                return Value::zero(32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Intercept UVM method calls
         let real_uvm = self.uses_real_uvm();
         if let ExprKind::MemberAccess { expr, member } = &func.kind {
