@@ -2713,6 +2713,16 @@ pub struct Simulator {
     edge_parallel_work: Vec<usize>,
     edge_sequential_work: Vec<usize>,
     nba_queue: Vec<NbaEntry>,
+    /// §15.5.2 `->> e` nonblocking event triggers: fired when the NBA region
+    /// flushes, not in the active region (a same-slot `.triggered` read in an
+    /// active/inactive process must still see 0).
+    pending_nba_triggers: Vec<String>,
+    /// §15.5.5 event variables are HANDLES to synchronization objects:
+    /// `ev_alias = ev_b` makes both names one object. Maps an event variable
+    /// (or element key `arr[i]`) to the event it currently aliases;
+    /// `EVENT_NULL_KEY` marks a null handle. Trigger/`.triggered`/wait_order
+    /// all chase this map to the canonical key first.
+    event_aliases: HashMap<String, String>,
     /// Fast-path NBA buffer: pre-resolved (signal_id, value) pairs.
     nba_fast: Vec<NbaFast>,
     /// Reverse index: signal_id → most recent index in `nba_fast` for that
@@ -4810,6 +4820,8 @@ impl Simulator {
             edge_parallel_work: Vec::new(),
             edge_sequential_work: Vec::new(),
             nba_queue: Vec::new(),
+            pending_nba_triggers: Vec::new(),
+            event_aliases: HashMap::default(),
             nba_fast: Vec::new(),
             // Named signals stay on the dense hot path. Unnamed large-array
             // elements use NbaFastIndex's sparse tail.
@@ -20542,6 +20554,128 @@ impl Simulator {
             }
 
             // Check for timing control — delay or event
+            // §15.5.3 wait_order (a, b, c) pass else fail — a state machine
+            // over the event list. Each step parks the process on ALL not-yet-
+            // expected events (so an out-of-order fire wakes us too), with the
+            // continuation re-entering this statement `armed`. On wake the
+            // `event_triggered_time` stamps identify which event fired: the
+            // expected one advances the sequence (completing it runs `pass`),
+            // any later one runs `fail` (or a loud warning without an else).
+            if let StatementKind::WaitOrder {
+                events,
+                pass,
+                fail,
+                armed,
+                idx,
+                span,
+            } = &stmt.kind
+            {
+                let k = *idx as usize;
+                let n = events.len();
+                let stamp_now = |sim: &Self, nm: &str| -> bool {
+                    let now = sim.time;
+                    let canon = sim.resolve_event_key(nm);
+                    if sim.event_triggered_time.get(canon.as_str()) == Some(&now) {
+                        return true;
+                    }
+                    let pref = format!("{}.{}", sim.module.name, canon);
+                    sim.event_triggered_time.get(pref.as_str()) == Some(&now)
+                };
+                let mut next_k = k;
+                let mut outcome: Option<bool> = None; // Some(true)=pass, Some(false)=fail
+                if *armed {
+                    let expected_fired = k < n && stamp_now(self, &events[k].name);
+                    let later_fired = events[k.saturating_add(1)..]
+                        .iter()
+                        .any(|e| stamp_now(self, &e.name));
+                    if expected_fired {
+                        if k + 1 == n {
+                            outcome = Some(true);
+                        } else {
+                            next_k = k + 1;
+                        }
+                    } else if later_fired {
+                        outcome = Some(false);
+                    }
+                    // Neither fired this slot (spurious wake): re-park at k.
+                }
+                match outcome {
+                    Some(ok) => {
+                        let action = if ok { pass } else { fail };
+                        if !ok && fail.is_none() {
+                            eprintln!(
+                                "[xezim][warning] wait_order sequence violation at time {}: an event fired out of order and the construct has no else clause (IEEE 1800-2017 §15.5.3)",
+                                self.time
+                            );
+                        }
+                        let mut cont: Vec<Statement> = Vec::new();
+                        if let Some(a) = action {
+                            match &a.kind {
+                                StatementKind::SeqBlock { stmts: b, .. } => {
+                                    cont.extend_from_slice(b)
+                                }
+                                _ => cont.push((**a).clone()),
+                            }
+                        }
+                        cont.extend_from_slice(&stmts[i + 1..]);
+                        self.run_process_stmts(pid, &cont);
+                        return;
+                    }
+                    None => {
+                        // Park on events[next_k..]; continuation re-enters armed.
+                        let evs: Vec<crate::ast::stmt::EventExpr> = events[next_k..]
+                            .iter()
+                            .map(|id| crate::ast::stmt::EventExpr {
+                                edge: None,
+                                expr: Expression::new(
+                                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                                        root: None,
+                                        path: vec![crate::ast::expr::HierPathSegment {
+                                            name: id.clone(),
+                                            selects: Vec::new(),
+                                        }],
+                                        span: *span,
+                                        cached_signal_id: std::cell::Cell::new(None),
+                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                    }),
+                                    *span,
+                                ),
+                                iff: None,
+                                span: *span,
+                            })
+                            .collect();
+                        let sens =
+                            self.event_to_sens(&crate::ast::stmt::EventControl::EventExpr(evs));
+                        let mut cont = vec![Statement::new(
+                            StatementKind::WaitOrder {
+                                events: events.clone(),
+                                pass: pass.clone(),
+                                fail: fail.clone(),
+                                armed: true,
+                                idx: next_k as u32,
+                                span: *span,
+                            },
+                            stmt.span,
+                        )];
+                        cont.extend_from_slice(&stmts[i + 1..]);
+                        if !sens.is_empty()
+                            && sens.iter().any(|s| {
+                                self.signal_name_to_id.contains_key(s.signal_name.as_str())
+                            })
+                        {
+                            self.event_waiters
+                                .push(self.make_event_waiter(pid, sens, cont));
+                        } else {
+                            eprintln!(
+                                "[xezim][warning] wait_order at time {}: none of the named events resolve to declared events; process will not resume (IEEE 1800-2017 §15.5.3)",
+                                self.time
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
+
             if let StatementKind::TimingControl {
                 control,
                 stmt: body,
@@ -21326,6 +21460,7 @@ impl Simulator {
         match &stmt.kind {
             StatementKind::TimingControl { .. } => true,
             StatementKind::Wait { .. } => true,
+            StatementKind::WaitOrder { .. } => true,
             // §9.6.1: `wait fork` suspends until all descendants finish —
             // inside a begin-block it must route through the suspend-aware
             // runner (the plain exec arm is a no-op).
@@ -22038,6 +22173,13 @@ impl Simulator {
         for entry in queue {
             if let Some(lhs) = entry.lhs {
                 self.assign_value(&lhs, &entry.value);
+            }
+        }
+        // §15.5.2 deferred `->>` triggers fire with the NBA flush.
+        if !self.pending_nba_triggers.is_empty() {
+            let evs = std::mem::take(&mut self.pending_nba_triggers);
+            for ev in evs {
+                self.fire_named_event(&ev);
             }
         }
     }
@@ -27630,18 +27772,11 @@ impl Simulator {
                 {
                     let mut head = hier.clone();
                     head.path.pop();
-                    let bare = head
-                        .path
-                        .last()
-                        .map(|s| s.name.name.clone())
-                        .unwrap_or_default();
-                    let resolved = self.resolve_hier_name(&head);
+                    let head_expr =
+                        Expression::new(ExprKind::Ident(head), expr.span);
                     let fired = self
-                        .event_triggered_time
-                        .get(&bare)
-                        .copied()
-                        .or_else(|| self.event_triggered_time.get(&resolved).copied())
-                        .map_or(false, |t| t == self.time);
+                        .event_triggered_now(&head_expr)
+                        .unwrap_or(false);
                     return if fired {
                         Value::ones(1)
                     } else {
@@ -30734,24 +30869,11 @@ impl Simulator {
                 // slot as this query. `EventTrigger` stamps
                 // `event_triggered_time[name] = self.time`.
                 if member.name == "triggered" {
-                    if let ExprKind::Ident(hier) = &expr.kind {
-                        let bare = hier
-                            .path
-                            .last()
-                            .map(|s| s.name.name.clone())
-                            .unwrap_or_default();
-                        let resolved = self.resolve_hier_name(hier);
-                        let fired = self
-                            .event_triggered_time
-                            .get(&bare)
-                            .copied()
-                            .or_else(|| self.event_triggered_time.get(&resolved).copied())
-                            .map_or(false, |t| t == self.time);
-                        return if fired {
-                            Value::ones(1)
-                        } else {
-                            Value::zero(1)
-                        };
+                    if let Some(fired) = self.event_triggered_now(expr) {
+                        return if fired { Value::ones(1) } else { Value::zero(1) };
+                    }
+                    if matches!(expr.kind, ExprKind::Ident(_)) {
+                        return Value::zero(1);
                     }
                 }
                 // §9.7 `process::status()`: return the state enum. Previously
@@ -31414,6 +31536,11 @@ impl Simulator {
             StatementKind::ForeachTail { .. } => {}
             StatementKind::Expr(expr) => self.exec_expr_stmt(expr),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
+                // §15.5.5: `event_var = other_event / null / q[i]` re-binds
+                // the HANDLE, it does not copy a value.
+                if self.try_event_handle_assign(lvalue, rvalue) {
+                    return;
+                }
                 // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)
                 // is evaluated exactly ONCE. The assign_value machinery
                 // re-evaluates the index in several candidate branches, so
@@ -34752,18 +34879,20 @@ impl Simulator {
                     // this a local `pkt_t p;` keeps `p` and `p.field` in
                     // separate storage (a whole write doesn't reach members and
                     // vice-versa). Unpacked structs are intentionally excluded.
-                    if d.dimensions.is_empty() {
-                        // §6.17: an `event` local becomes a real event —
-                        // `->e` / `@(e)` resolve through module.events.
-                        if matches!(
-                            data_type,
-                            crate::ast::types::DataType::Simple {
-                                kind: crate::ast::types::SimpleType::Event,
-                                ..
-                            }
-                        ) {
-                            self.module.events.insert(d.name.name.clone());
+                    // §6.17: an `event` local becomes a real event —
+                    // `->e` / `@(e)` resolve through module.events. Arrays
+                    // and queues of events register their BASE name so
+                    // element refs (`ev_arr[i]`) are recognized as events.
+                    if matches!(
+                        data_type,
+                        crate::ast::types::DataType::Simple {
+                            kind: crate::ast::types::SimpleType::Event,
+                            ..
                         }
+                    ) {
+                        self.module.events.insert(d.name.name.clone());
+                    }
+                    if d.dimensions.is_empty() {
                         // Declared type of a scalar local: the member-wise
                         // struct copy (`u2 = u1`) resolves the element type
                         // through var_decl_types, which only module-scope
@@ -35603,8 +35732,198 @@ impl Simulator {
                     }
                 }
             }
-            StatementKind::EventTrigger { name, .. } => {
-                let raw = name.name.clone();
+            StatementKind::EventTrigger { name, nonblocking, .. } => {
+                if *nonblocking {
+                    // §15.5.2: defer to the NBA region of the current slot.
+                    self.pending_nba_triggers.push(name.name.clone());
+                    return;
+                }
+                self.fire_named_event(&name.name);
+            }
+            StatementKind::Coverpoint { .. } | StatementKind::Cross { .. } => {}
+            StatementKind::WaitOrder { .. } => {
+                // The synchronous executor cannot suspend; wait_order is
+                // handled on the process path (run_process_stmts). Reaching
+                // here means the construct sat in a context that never
+                // inlines — warn rather than silently drop.
+                eprintln!(
+                    "[xezim][warning] wait_order reached the non-suspending execution path and was skipped (IEEE 1800-2017 §15.5.3)"
+                );
+            }
+        }
+    }
+
+    /// §15.5.5 null event handle sentinel (`ev = null`).
+    const EVENT_NULL_KEY: &'static str = "\x01evnull";
+
+    /// Chase the §15.5.5 alias map to the canonical synchronization-object
+    /// key for an event name (bounded, alias chains are user-built).
+    fn resolve_event_key(&self, name: &str) -> String {
+        let mut cur = name;
+        for _ in 0..16 {
+            match self.event_aliases.get(cur) {
+                Some(next) => cur = next,
+                None => break,
+            }
+        }
+        cur.to_string()
+    }
+
+    /// If `e` is a plain reference to an event variable (optionally with a
+    /// constant/variable element select: `ev`, `ev_arr[i]`), return its
+    /// storage key (`ev` / `ev_arr[3]`). Detection is by the declared-events
+    /// set, so ordinary signals never take this path.
+    fn event_ref_key(&mut self, e: &Expression) -> Option<String> {
+        // Trailing element select parses as Index (`ev_arr[1]` as a full
+        // expression); mid-path selects live on the Ident segment
+        // (`ev_arr[1].triggered`). Accept both shapes.
+        if let ExprKind::Index { expr, index } = &e.kind {
+            if let ExprKind::Ident(h) = &expr.kind {
+                if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    let base = h.path[0].name.name.as_str();
+                    if self.module.events.contains(base) {
+                        let base = base.to_string();
+                        let idx_expr = (**index).clone();
+                        let i = self.eval_expr(&idx_expr).to_i64().unwrap_or(0);
+                        return Some(format!("{}[{}]", base, i));
+                    }
+                }
+            }
+            return None;
+        }
+        let hier = match &e.kind {
+            ExprKind::Ident(h) => h,
+            _ => return None,
+        };
+        if hier.path.len() != 1 {
+            return None;
+        }
+        let seg = &hier.path[0];
+        let base = seg.name.name.as_str();
+        if !self.module.events.contains(base) {
+            return None;
+        }
+        if seg.selects.is_empty() {
+            return Some(base.to_string());
+        }
+        let mut key = base.to_string();
+        let sels = seg.selects.clone();
+        for sel in &sels {
+            let i = self.eval_expr(sel).to_i64().unwrap_or(0);
+            key = format!("{}[{}]", key, i);
+        }
+        Some(key)
+    }
+
+    /// §15.5.5 handle-assignment interception for `lhs = rhs` where `lhs`
+    /// is an event variable. Returns true when the statement was consumed
+    /// as an alias/null re-binding (the caller must then skip the normal
+    /// value assignment).
+    fn try_event_handle_assign(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        let Some(lkey) = self.event_ref_key(lvalue) else {
+            return false;
+        };
+        if matches!(rvalue.kind, ExprKind::Null) {
+            self.event_aliases
+                .insert(lkey, Self::EVENT_NULL_KEY.to_string());
+            return true;
+        }
+        if let Some(rkey) = self.event_ref_key(rvalue) {
+            let target = self.resolve_event_key(&rkey);
+            if target == lkey {
+                self.event_aliases.remove(&lkey);
+            } else {
+                self.event_aliases.insert(lkey, target);
+            }
+            return true;
+        }
+        // A handle pulled out of a container (`e = q[0]`): the container
+        // stores the sync-object key as a string (see queue_store_elem).
+        let v = self.eval_expr(rvalue);
+        let sv = v.to_sv_string();
+        if !sv.is_empty()
+            && (self.module.events.contains(sv.as_str())
+                || self.event_aliases.contains_key(sv.as_str())
+                || self.event_triggered_time.contains_key(sv.as_str()))
+        {
+            let target = self.resolve_event_key(&sv);
+            self.event_aliases.insert(lkey, target);
+            return true;
+        }
+        false
+    }
+
+    /// §15.5.3 `.triggered` truth for an event reference (aliases chased,
+    /// element keys and container-stored string handles included). None if
+    /// `e` is not recognizably an event reference.
+    fn event_triggered_now(&mut self, e: &Expression) -> Option<bool> {
+        let now = self.time;
+        let mut keys: Vec<String> = Vec::new();
+        if let Some(k) = self.event_ref_key(e) {
+            keys.push(k);
+        }
+        if let ExprKind::Ident(h) = &e.kind {
+            if let Some(seg) = h.path.last() {
+                if seg.selects.is_empty() {
+                    keys.push(seg.name.name.clone());
+                }
+            }
+            keys.push(self.resolve_hier_name(h));
+        }
+        // Container element (`q[0].triggered`): the element VALUE is the key.
+        if let ExprKind::Ident(h) = &e.kind {
+            if h.path.len() == 1 && !h.path[0].selects.is_empty() {
+                let v = self.eval_expr(e);
+                let sv = v.to_sv_string();
+                if !sv.is_empty()
+                    && (self.module.events.contains(sv.as_str())
+                        || self.event_aliases.contains_key(sv.as_str())
+                        || self.event_triggered_time.contains_key(sv.as_str()))
+                {
+                    keys.push(sv);
+                }
+            }
+        }
+        if keys.is_empty() {
+            return None;
+        }
+        let mut known_event = false;
+        for k in &keys {
+            let canon = self.resolve_event_key(k);
+            if canon == Self::EVENT_NULL_KEY {
+                known_event = true;
+                continue;
+            }
+            if self.event_triggered_time.get(canon.as_str()) == Some(&now) {
+                return Some(true);
+            }
+            if self.module.events.contains(canon.as_str())
+                || self.event_triggered_time.contains_key(canon.as_str())
+            {
+                known_event = true;
+            }
+        }
+        if known_event {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Fire a named event NOW: toggle its 1-bit signal (the edge `@(e)`
+    /// waiters arm on) and stamp `event_triggered_time` for `.triggered`.
+    /// Shared by the blocking `-> e` statement and the NBA-region flush of
+    /// deferred `->> e` triggers.
+    fn fire_named_event(&mut self, raw_name: &str) {
+        // §15.5.5: the name is a handle — fire the object it references.
+        let canon = self.resolve_event_key(raw_name);
+        if canon == Self::EVENT_NULL_KEY {
+            return; // triggering a null handle is a no-op
+        }
+        let raw_name: &str = &canon;
+        {
+            {
+                let raw = raw_name.to_string();
                 let trimmed = raw.trim_start_matches('.').to_string();
                 let mut candidates = Vec::new();
                 candidates.push(raw.clone());
@@ -35645,13 +35964,12 @@ impl Simulator {
                 // lookup failed because the event was never registered as a
                 // signal — `.triggered` still reads correctly).
                 self.event_triggered_time
-                    .insert(name.name.clone(), self.time);
+                    .insert(raw_name.to_string(), self.time);
                 // Settle combinatorial logic but defer edge-triggered blocks
                 // (always @(e)) to the main event loop so the triggering
                 // process sees pre-event state until its next delay/wait.
                 self.settle_combinatorial();
             }
-            StatementKind::Coverpoint { .. } | StatementKind::Cross { .. } => {}
         }
     }
 
@@ -47518,6 +47836,14 @@ impl Simulator {
     /// each member in its own signal, so writing one packed value (what
     /// `push_back` used to do) loses every member.
     fn queue_store_elem(&mut self, obj_name: &str, elem: &str, arg: &Expression) {
+        // §15.5.5: pushing an event variable stores its synchronization-object
+        // KEY (a string), so a handle later pulled out of the container
+        // (`e = q[0]`, `q[0].triggered`) still names the same object.
+        if let Some(k) = self.event_ref_key(arg) {
+            let canon = self.resolve_event_key(&k);
+            self.set_signal_value_by_name(elem, Value::from_string(&canon));
+            return;
+        }
         // §7.4.5: a queue of FIXED arrays (`int q[$][4]`) stores each row's
         // elements at `q[i][j]` — evaluating the row to one packed value
         // would land in a phantom scalar `q[i]` that no read ever visits.
