@@ -44082,6 +44082,13 @@ impl Simulator {
     }
 
     fn class_of_var(&self, vname: &str) -> Option<String> {
+        // A class name IS its own class — `ClassName::static_prop` writes
+        // and reads route here with vname = the class name. Without this,
+        // `container::the_obj = new` fails to find the static cell and the
+        // write is silently lost.
+        if self.module.classes.contains_key(vname) {
+            return Some(vname.to_string());
+        }
         // Procedural locals record their class at VarDecl exec time.
         if let Some(c) = self.var_class_types.get(vname) {
             if self.module.classes.contains_key(c) {
@@ -47947,6 +47954,18 @@ impl Simulator {
             ExprKind::MemberAccess { expr: base, member } => match &base.kind {
                 ExprKind::This => obj_member(self, "this", &member.name),
                 ExprKind::Ident(bh) if bh.path.len() == 1 => {
+                    // `ClassName::static_collection.first(ref k)` — when the
+                    // base is a CLASS name (not an object variable) and the
+                    // member is a static associative-array collection, return
+                    // the bare member name (static collections are stored
+                    // globally by bare name). Without this, obj_member treats
+                    // the class name as an object handle (0 → None), and the
+                    // assoc-array first()/next() iteration silently fails.
+                    if self.module.classes.contains_key(&bh.path[0].name.name)
+                        && self.is_associative_array(&member.name)
+                    {
+                        return Some(member.name.clone());
+                    }
                     obj_member(self, &bh.path[0].name.name, &member.name)
                 }
                 // `arr[i].member` — base is an array INDEX expression.
@@ -50258,6 +50277,28 @@ impl Simulator {
                 let obj_name = &hier.path[0].name.name;
                 let method_name = &hier.path.last().unwrap().name.name;
 
+                // `ClassName::static_collection.first(ref k)` flattened into
+                // `Ident([class, collection, method])`: when path[0] is a
+                // CLASS name (not an object) and path[1] is a static assoc-
+                // array collection, route the builtin method to the
+                // collection's bare name (static collections are stored
+                // globally by bare name). Without this, obj_name resolves to
+                // the class name and first()/next() iteration silently fails.
+                if hier.path.len() >= 3
+                    && self.module.classes.contains_key(obj_name)
+                    && self.is_associative_array(&hier.path[1].name.name)
+                    && matches!(
+                        method_name.as_str(),
+                        "first" | "last" | "next" | "prev"
+                            | "num" | "size" | "exists" | "delete"
+                    )
+                {
+                    let coll = hier.path[1].name.name.clone();
+                    if let Some(res) = self.eval_builtin_method(&coll, method_name, args) {
+                        return res;
+                    }
+                }
+
                 // §18.13 rand_mode / constraint_mode flattened into a hier
                 // Ident: `obj.x.rand_mode(0)` parses as Ident([o, x, rand_mode])
                 // rather than nested MemberAccess.
@@ -50465,12 +50506,26 @@ impl Simulator {
                 // only catches ordinary user methods on nested objects.)
                 if hier.path.len() >= 3 {
                     let head = hier.path[0].name.name.as_str();
-                    let mut handle = if head == "this" {
-                        self.this_stack.last().copied().flatten().unwrap_or(0)
+                    let (mut handle, loop_start) = if head == "this" {
+                        (self.this_stack.last().copied().flatten().unwrap_or(0), 1)
+                    } else if self.module.classes.contains_key(head) {
+                        // `ClassName::static_prop.method()`: path[0] is a
+                        // CLASS, not an object variable. Resolve the static
+                        // property (path[1]) handle via static_prop_key, then
+                        // walk path[2..] (skip the already-resolved path[1]).
+                        // Without this, methods called on objects held in
+                        // static properties never bind `this` and silently
+                        // no-op — instance member writes are lost.
+                        let h = self.static_prop_key(head, &hier.path[1].name.name)
+                            .and_then(|k| self.class_statics.get(&k))
+                            .and_then(|v| v.to_u64())
+                            .map(|h| h as usize)
+                            .unwrap_or(0);
+                        (h, 2)
                     } else {
-                        self.eval_ident_handle(head).unwrap_or(0)
+                        (self.eval_ident_handle(head).unwrap_or(0), 1)
                     };
-                    for seg in &hier.path[1..hier.path.len() - 1] {
+                    for seg in &hier.path[loop_start..hier.path.len() - 1] {
                         if handle == 0 {
                             break;
                         }
@@ -59909,6 +59964,18 @@ impl Simulator {
                                 return Some(t);
                             }
                         }
+                    }
+                }
+                // `ClassName::static_prop` (2-segment): look up the static
+                // property's declared type. Needed for bare `new` type
+                // inference (`container::the_obj = new`) — without this,
+                // get_expr_type_name returns None and the construction is
+                // skipped, leaving the static property null.
+                if hier.path.len() == 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                    let cls = &hier.path[0].name.name;
+                    let prop = &hier.path[1].name.name;
+                    if let Some(t) = self.class_prop_type_named(cls, prop) {
+                        return Some(t);
                     }
                 }
                 None
