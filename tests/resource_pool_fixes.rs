@@ -23,8 +23,14 @@
 use std::process::Command;
 
 fn xezim() -> String {
-    let base = env!("CARGO_MANIFEST_DIR");
-    format!("{}/target/debug/xezim", base)
+    // Resolve the sibling CLI binary from the test binary's own location so
+    // this works for both debug and release profiles.
+    let mut p = std::env::current_exe().expect("current_exe");
+    p.pop();
+    if p.ends_with("deps") {
+        p.pop();
+    }
+    p.join("xezim").to_string_lossy().into_owned()
 }
 
 fn run(src: &str, tag: &str) -> String {

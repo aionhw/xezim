@@ -38,6 +38,8 @@ fn run_monitor(name: &str, src: &str, extra: &[&str]) -> Vec<String> {
     std::fs::write(&sv, src).expect("write sv");
 
     let mut cmd = Command::new(xezim_bin());
+    // Elaboration-time warnings vanish on design-cache hits; force a cold run.
+    cmd.env("XEZIM_NO_CACHE", "1");
     cmd.arg("--simulate").arg(&sv);
     for a in extra {
         cmd.arg(a);
@@ -333,6 +335,7 @@ module BUFX1(output q, input a); udp_buf u(q, a); endmodule
 
     let run = |args: &[&str]| {
         let out = Command::new(xezim_bin())
+            .env("XEZIM_NO_CACHE", "1")
             .current_dir(&dir)
             .args(args)
             .output()
@@ -480,6 +483,7 @@ module tb; reg a,b; wire q; udp_bad u(q,a,b);
 endmodule
 "#).expect("write");
     let out = Command::new(xezim_bin())
+        .env("XEZIM_NO_CACHE", "1")
         .arg("--simulate").arg(&sv)
         .output().expect("run xezim");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -523,4 +527,54 @@ endmodule
     assert!(o.contains("C2 xx10"), "stage 2:\n{}", o);
     assert!(o.contains("C3 x100"), "stage 3:\n{}", o);
     assert!(o.contains("C4 1000"), "stage 4 (shifted through):\n{}", o);
+}
+
+#[test]
+fn primitive_verbose_reports_kind_values_and_implicit_nets() {
+    // --primitive-verbose v2: header carries sequential/comb + row count +
+    // init, terminals show their current value, §6.10 implicit nets are
+    // flagged (the dropped-cell signature), and a summary line closes.
+    let dir = std::env::temp_dir().join("xezim_pv2_test");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let sv = dir.join("pv2.v");
+    std::fs::write(
+        &sv,
+        "`timescale 1ns/1ns\n\
+         primitive udp_b (q, a); output q; input a;\n\
+           table 0 : 1 ; 1 : 0 ; endtable\n\
+         endprimitive\n\
+         module top;\n\
+           reg a = 0; wire q;\n\
+           assign dangling = floating;\n\
+           udp_b u0 (q, floating);\n\
+           initial #2 $finish;\n\
+         endmodule\n",
+    )
+    .expect("write sv");
+    let out = std::process::Command::new(xezim_bin())
+        .env("XEZIM_NO_CACHE", "1")
+        .arg(&sv)
+        .arg("--primitive-verbose")
+        .arg("-xenowarn")
+        .arg("--max-time")
+        .arg("10")
+        .output()
+        .expect("run xezim");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("combinational, 2 table row(s), init=x"),
+        "missing kind/rows/init on the header:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("[IMPLICIT NET"),
+        "implicit-net terminal not flagged:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("UDP summary: 1 instance(s)")
+            && stderr.contains("1 terminal(s) on implicit nets"),
+        "missing summary line:\n{}",
+        stderr
+    );
 }

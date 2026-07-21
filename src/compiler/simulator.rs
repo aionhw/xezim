@@ -15393,28 +15393,74 @@ impl Simulator {
         // an immediate release. No-op on non-glibc platforms.
     }
 
+    /// `--primitive-verbose` terminal annotation: the net's current 4-state
+    /// value at lowering time plus an IMPLICIT-NET marker. A UDP terminal
+    /// landing on a §6.10 implicit 1-bit net is the classic signature of a
+    /// dangling pin from a dropped/unresolved cell — flag it loudly.
+    fn udp_terminal_note(&self, sig_id: usize, bit: u32) -> String {
+        let name = self.name_for_id(sig_id);
+        let code = self
+            .signal_table
+            .get(sig_id)
+            .map(|v| v.get_bit_code(bit as usize))
+            .unwrap_or(2);
+        let val = ['0', '1', 'x', 'z'][code as usize % 4];
+        let implicit = if self.module.implicit_nets.contains(name) {
+            " [IMPLICIT NET — undeclared identifier, check for a dropped/unresolved cell]"
+        } else {
+            ""
+        };
+        let width = self
+            .signal_table
+            .get(sig_id)
+            .map(|v| v.width)
+            .unwrap_or(1);
+        if width > 1 {
+            format!(" = {} (of {}-bit vector){}", val, width, implicit)
+        } else {
+            format!(" = {}{}", val, implicit)
+        }
+    }
+
     /// IEEE 1800-2017 §29: turn each flattened `UdpInstance` into a comb entry
     /// (`CombItem::Udp{idx}`) plus a `UdpRuntime` state slot. Terminal nets are
     /// resolved to single-bit refs; unresolved/multibit terminals emit a loud
     /// warning and the instance is dropped (output left undriven).
     fn build_udp_entries(&mut self, entries: &mut Vec<CombEntry>) {
         let insts = std::mem::take(&mut self.module.udp_instances);
+        let pv_total = insts.len();
+        let mut pv_seq = 0usize;
+        let mut pv_dropped = 0usize;
+        let mut pv_const_terms = 0usize;
+        let mut pv_implicit_terms = 0usize;
         // `--primitive-verbose`: print every UDP instance with its source
         // location and each terminal's resolution (net + bit, constant, or
         // failure), so a dropped vendor cell can be diagnosed from the log
         // without the design sources at hand.
         let pv = xezim_core::primitive_verbose();
         for inst in insts {
+            if inst.is_sequential {
+                pv_seq += 1;
+            }
             if pv {
                 let loc = self
                     .span_file_line_in(inst.output.span, None)
                     .unwrap_or_else(|| format!("source offset {}", inst.output.span.start));
                 eprintln!(
-                    "[primitive-verbose] UDP '{}' instance '{}' ({}) — {} input terminal(s)",
+                    "[primitive-verbose] UDP '{}' instance '{}' ({}) — {} input terminal(s), \
+                     {}, {} table row(s), init={}{}",
                     inst.udp_name,
                     inst.inst_path,
                     loc,
-                    inst.inputs.len()
+                    inst.inputs.len(),
+                    if inst.is_sequential { "sequential" } else { "combinational" },
+                    inst.rows.len(),
+                    inst.init.unwrap_or('x'),
+                    if inst.delay > 0 {
+                        format!(", delay={} tick(s)", inst.delay)
+                    } else {
+                        String::new()
+                    }
                 );
             }
             // Resolve output + input terminals to single bit refs.
@@ -15422,9 +15468,10 @@ impl Simulator {
                 Some(b) => {
                     if pv {
                         eprintln!(
-                            "[primitive-verbose]   out  -> net '{}' bit {}",
+                            "[primitive-verbose]   out  -> net '{}' bit {}{}",
                             self.name_for_id(b.sig_id as usize),
-                            b.bit
+                            b.bit,
+                            self.udp_terminal_note(b.sig_id as usize, b.bit)
                         );
                     }
                     b
@@ -15437,6 +15484,7 @@ impl Simulator {
                          Consequence: this instance is DROPPED; its output is left UNDRIVEN.\n\
                          ========================================================================\n",
                         inst.udp_name, inst.inst_path);
+                    pv_dropped += 1;
                     continue;
                 }
             };
@@ -15444,12 +15492,20 @@ impl Simulator {
             let mut bad: Option<(usize, String)> = None;
             for (ti, e) in inst.inputs.iter().enumerate() {
                 if let Some(b) = self.try_resolve_bit_ref(e, None) {
+                    if self
+                        .module
+                        .implicit_nets
+                        .contains(self.name_for_id(b.sig_id as usize))
+                    {
+                        pv_implicit_terms += 1;
+                    }
                     if pv {
                         eprintln!(
-                            "[primitive-verbose]   in#{} -> net '{}' bit {}",
+                            "[primitive-verbose]   in#{} -> net '{}' bit {}{}",
                             ti,
                             self.name_for_id(b.sig_id as usize),
-                            b.bit
+                            b.bit,
+                            self.udp_terminal_note(b.sig_id as usize, b.bit)
                         );
                     }
                     in_refs.push(b);
@@ -15474,6 +15530,7 @@ impl Simulator {
                             ['0', '1', 'x', 'z'][code as usize % 4]
                         );
                     }
+                    pv_const_terms += 1;
                     in_refs.push(BitRef {
                         sig_id: u32::MAX,
                         bit: code,
@@ -15508,6 +15565,7 @@ impl Simulator {
                      ========================================================================\n",
                     inst.udp_name, inst.inst_path, ti, desc
                 );
+                pv_dropped += 1;
                 continue;
             }
 
@@ -15547,6 +15605,25 @@ impl Simulator {
                 span: inst.span,
             });
             self.has_udp = true;
+        }
+        if pv && pv_total > 0 {
+            eprintln!(
+                "[primitive-verbose] UDP summary: {} instance(s) — {} sequential, {} combinational, \
+                 {} DROPPED (unresolved terminal), {} constant-tied terminal(s), \
+                 {} terminal(s) on implicit nets{}",
+                pv_total,
+                pv_seq,
+                pv_total - pv_seq,
+                pv_dropped,
+                pv_const_terms,
+                pv_implicit_terms,
+                if pv_implicit_terms > 0 {
+                    " — implicit-net terminals usually mean a cell model was dropped or \
+                     unresolved upstream; search the log for its instance"
+                } else {
+                    ""
+                }
+            );
         }
         // A UDP output initializes to x (a reference simulator), not the undriven-wire z — a
         // sequential UDP to its `initial` start state (default x), a
@@ -20680,7 +20757,6 @@ impl Simulator {
                         i += 1;
                         continue;
                     }
-
                     // Unroll: execute body once, then schedule rest
                     let remaining_n = n - 1;
                     let mut cont = Vec::new();
@@ -20783,7 +20859,10 @@ impl Simulator {
             {
                 // Pattern case (`case(x) matches p: ...`) binds variables;
                 // delegate to the synchronous path which performs the bindings.
-                if !items.iter().any(|i| i.pattern.is_some()) {
+                // Likewise a case with NO blocking arm: `exec_statement(Case)`
+                // owns the §12.5.3 unique/unique0/priority violation checks,
+                // so only intercept when some arm can actually suspend.
+                if !items.iter().any(|i| i.pattern.is_some()) && self.stmt_is_blocking(stmt) {
                     let val = self.eval_expr(expr);
                     let chosen: Option<&Statement> = items.iter().find_map(|item| {
                         if item.is_default {
@@ -30589,6 +30668,15 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // §25.10: member access through an indexed plain virtual-
+                // interface array (`vifs[i].data`). Resolve the element alias
+                // before generic flattened aggregate handling creates/reads a
+                // phantom `vifs[i].data` value.
+                if let Some(bound) = self.indexed_iface_alias_for(expr) {
+                    return self
+                        .get_signal_value_by_name(&format!("{}.{}", bound, member.name))
+                        .unwrap_or_else(|| Value::new(1));
+                }
                 // `ClassName::ENUM_CONST` / `ClassName::static_prop`: when the
                 // parser represents a class-scoped name as
                 // `MemberAccess(Ident([ClassName]), member)` (notably inside a
@@ -30605,15 +30693,6 @@ impl Simulator {
                             return v;
                         }
                     }
-                }
-                // §25.10: member access through an indexed plain virtual-
-                // interface array (`vifs[i].data`). Resolve the element alias
-                // before generic flattened aggregate handling creates/reads a
-                // phantom `vifs[i].data` value.
-                if let Some(bound) = self.indexed_iface_alias_for(expr) {
-                    return self
-                        .get_signal_value_by_name(&format!("{}.{}", bound, member.name))
-                        .unwrap_or_else(|| Value::new(1));
                 }
                 // §18.4: member of a struct/union CLASS property — read through
                 // the aggregate's storage (a bit slice for a packed struct/
@@ -57221,8 +57300,17 @@ impl Simulator {
             }
         }
         // uvm_root::run_test calls report_server.report_summarize() after the
-        // report phase — emit the summary block.
-        self.emit_uvm_report_summary();
+        // report phase — emit the summary block. Only when the run showed any
+        // UVM evidence (components, objections, or tallied reports): a pure-SV
+        // design that merely drains its event loop must not end with a UVM
+        // Report Summary.
+        if !comps.is_empty()
+            || self.uvm_obj_raised
+            || self.uvm_sev_counts.iter().any(|&c| c > 0)
+            || !self.uvm_id_counts.is_empty()
+        {
+            self.emit_uvm_report_summary();
+        }
     }
 
     /// Triggered when the run-phase objection count returns to 0 (after a
