@@ -96,7 +96,7 @@ fn design_cache_key(
     top_module_name: Option<&str>,
     include_dirs: &[String],
     defines: &[(String, Option<String>)],
-) -> String {
+) -> (String, Vec<String>) {
     let mut hash = CacheHash::new();
     hash.bytes(XEZIM_BYTECODE_MAGIC);
     hash.text(env!("CARGO_PKG_VERSION"));
@@ -133,10 +133,19 @@ fn design_cache_key(
         hash.text(name);
         hash.text(value.as_deref().unwrap_or(""));
     }
+    // Keep the per-file preprocessed text: on a cache HIT the caller feeds
+    // it back into `elab.source_texts` so runtime diagnostics (e.g. the
+    // zero-delay stall report) resolve spans to `file:line` exactly as a
+    // fresh parse would — the artifact itself skips the (large) texts.
+    // `begin_top_level_file` matches the parse-time preprocessor state.
+    let mut preprocessed_texts: Vec<String> = Vec::with_capacity(sources.len());
     for (idx, source) in sources.iter().enumerate() {
         let source_path = source_paths.get(idx).map(std::path::PathBuf::from);
         hash.text(source_paths.get(idx).map_or("", String::as_str));
-        hash.text(&pp.preprocess_file(source, source_path.as_deref()));
+        pp.begin_top_level_file();
+        let text = pp.preprocess_file(source, source_path.as_deref());
+        hash.text(&text);
+        preprocessed_texts.push(text);
     }
 
     let mut dependencies = config.dependency_files.clone();
@@ -163,7 +172,7 @@ fn design_cache_key(
             Err(err) => hash.text(&format!("<unreadable:{:?}>", err.kind())),
         }
     }
-    hash.finish()
+    (hash.finish(), preprocessed_texts)
 }
 
 fn read_design_cache(config: &DesignCacheConfig, key: &str) -> Option<elaborate::ElaboratedModule> {
@@ -227,6 +236,7 @@ mod design_cache_tests {
             &["include".to_string()],
             &[("FEATURE".to_string(), Some("1".to_string()))],
         )
+        .0
     }
 
     #[test]
@@ -678,15 +688,27 @@ pub fn simulate_multi(
         .map(|s| intra_delay::rewrite_intra_assignment_delays(s))
         .collect();
     let cache = design_cache_config();
+    let mut cache_pp_texts: Vec<String> = Vec::new();
     let cache_key = cache.as_ref().map(|config| {
-        design_cache_key(config, &sources, source_paths, top_module_name, include_dirs, defines)
+        let (key, texts) =
+            design_cache_key(config, &sources, source_paths, top_module_name, include_dirs, defines);
+        cache_pp_texts = texts;
+        key
     });
     let cached_elab = cache
         .as_ref()
         .zip(cache_key.as_deref())
         .and_then(|(config, key)| read_design_cache(config, key));
 
-    let elab = if let Some(elab) = cached_elab {
+    let elab = if let Some(mut elab) = cached_elab {
+        // The artifact skips the (large) preprocessed texts; refill them from
+        // the cache-key pass so runtime diagnostics keep `file:line`
+        // resolution on cache hits. `source_files` / `src_file_of_module`
+        // travel inside the artifact.
+        elab.source_texts = std::mem::take(&mut cache_pp_texts);
+        if elab.source_files.is_empty() {
+            elab.source_files = source_paths.to_vec();
+        }
         elab
     } else {
         let (definitions, mut elab) = parse_and_elaborate_multi(
