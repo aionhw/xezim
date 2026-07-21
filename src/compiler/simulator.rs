@@ -1131,6 +1131,10 @@ struct MailboxPutWaiter {
 #[derive(Debug, Clone)]
 struct EventWaiter {
     pid: usize,
+    /// Simulation time when this waiter parked. Drives the hang report:
+    /// waiters sorted oldest-first expose "who has been stuck longest",
+    /// and `arm_bits` tells whether the awaited signals ever moved since.
+    parked_time: u64,
     /// Pre-resolved signal IDs for O(1) edge checking. The unresolved
     /// `Vec<Sensitivity>` mirror was set at construction but never
     /// consulted afterwards — dropped.
@@ -16768,6 +16772,83 @@ impl Simulator {
     }
 
     /// Create an EventWaiter with pre-resolved sensitivity IDs for O(1) edge checking.
+    /// Hang diagnosis: print the longest-parked event waiters — who is
+    /// stuck, on which signals, since when, and whether those signals have
+    /// EVER changed since the waiter parked (`arm_bits` comparison). A
+    /// dead-clock/reset hang shows up as old waiters whose awaited signals
+    /// are all "unchanged since parked". Printed automatically when the run
+    /// ends by --max-time without $finish, and (abbreviated) with
+    /// XEZIM_PROGRESS ticks.
+    fn report_parked_waiters(&mut self, max_n: usize) {
+        if self.event_waiters.is_empty() && self.condition_waiters.is_empty() {
+            return;
+        }
+        let mut order: Vec<usize> = (0..self.event_waiters.len()).collect();
+        order.sort_by_key(|&i| self.event_waiters[i].parked_time);
+        eprintln!(
+            "[xezim][hang-report] {} event waiter(s), {} condition waiter(s) parked at sim time {}; oldest first:",
+            self.event_waiters.len(),
+            self.condition_waiters.len(),
+            self.time
+        );
+        for &i in order.iter().take(max_n) {
+            let w = &self.event_waiters[i];
+            let age = self.time.saturating_sub(w.parked_time);
+            let mut sens_desc: Vec<String> = Vec::new();
+            for (k, sid) in w.resolved_sensitivities.iter().enumerate() {
+                let edge = match sid.edge {
+                    EdgeKind::Posedge => "posedge ",
+                    EdgeKind::Negedge => "negedge ",
+                    EdgeKind::AnyEdge => "",
+                };
+                let cur = self.signal_table[sid.signal_id].raw_bits();
+                let armed = w.arm_bits.get(k).copied().unwrap_or((0, 0));
+                let moved = if cur == armed {
+                    "UNCHANGED since parked"
+                } else {
+                    "has changed"
+                };
+                let code = self.signal_table[sid.signal_id].get_bit_code(0);
+                sens_desc.push(format!(
+                    "{}{} (now {}, {})",
+                    edge,
+                    self.name_for_id(sid.signal_id),
+                    ['0', '1', 'x', 'z'][code as usize % 4],
+                    moved
+                ));
+            }
+            let loc = w
+                .continuation
+                .first()
+                .and_then(|st| self.span_file_line_in(st.span, None))
+                .unwrap_or_else(|| "<unknown location>".to_string());
+            let origin = self
+                .process_origin
+                .get(&w.pid)
+                .map(|(_, kind)| *kind)
+                .unwrap_or("process");
+            eprintln!(
+                "[xezim][hang-report]   pid {} ({}) waiting {} tick(s) (since t={}) on @({}) — resumes at {}",
+                w.pid,
+                origin,
+                age,
+                w.parked_time,
+                sens_desc.join(" or "),
+                loc
+            );
+        }
+        for (pid, cont) in self.condition_waiters.iter().take(max_n) {
+            let loc = cont
+                .first()
+                .and_then(|st| self.span_file_line_in(st.span, None))
+                .unwrap_or_else(|| "<unknown location>".to_string());
+            eprintln!(
+                "[xezim][hang-report]   pid {} blocked in wait(condition) — resumes at {}",
+                pid, loc
+            );
+        }
+    }
+
     fn make_event_waiter(
         &self,
         pid: usize,
@@ -16799,6 +16880,7 @@ impl Simulator {
         // EventWaiter only carries the resolved IDs from here on.
         EventWaiter {
             pid,
+            parked_time: self.time,
             resolved_sensitivities: resolved,
             arm_bits,
             continuation,
@@ -17991,6 +18073,28 @@ impl Simulator {
                     self.stall_iters,
                     self.prof_edges_fired, self.nba_fast.len() + self.nba_queue.len(),
                     self.event_waiters.len());
+                // Oldest parked waiter one-liner: an ancient waiter whose
+                // signals never moved is the signature of a dead-clock hang.
+                if let Some(w) = self.event_waiters.iter().min_by_key(|w| w.parked_time) {
+                    let age = self.time.saturating_sub(w.parked_time);
+                    let all_dead = w
+                        .resolved_sensitivities
+                        .iter()
+                        .zip(w.arm_bits.iter())
+                        .all(|(sid, &armed)| self.signal_table[sid.signal_id].raw_bits() == armed);
+                    let first_sig = w
+                        .resolved_sensitivities
+                        .first()
+                        .map(|sid| self.name_for_id(sid.signal_id).to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    eprintln!(
+                        "[PROGRESS] oldest waiter: pid {} on '{}' for {} tick(s){}",
+                        w.pid,
+                        first_sig,
+                        age,
+                        if all_dead { " — awaited signal(s) UNCHANGED since parked" } else { "" }
+                    );
+                }
                 if let Some((bi, count)) = self.hottest_stall_edge_block() {
                     if let Some(line) = self.edge_block_stall_identity(bi, count) {
                         eprintln!("[PROGRESS] hottest edge block:");
@@ -18055,6 +18159,13 @@ impl Simulator {
             });
 
             if next_time > self.max_time {
+                if !self.finished {
+                    eprintln!(
+                        "[xezim][hang-report] simulation reached --max-time ({} ticks) without $finish",
+                        self.max_time
+                    );
+                    self.report_parked_waiters(8);
+                }
                 break;
             }
             let old_time = self.time;
