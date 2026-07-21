@@ -1,5 +1,5 @@
-//! Adaptive event-edge filtering must accelerate continuously changing flops,
-//! then return to snapshot comparisons when their inputs become stable.
+//! The legacy adaptive event-edge path must accelerate continuously changing
+//! flops, then return to snapshot comparisons when inputs become stable.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -58,6 +58,9 @@ endmodule
     .expect("write test source");
 
     let result = Command::new(xezim_bin())
+        // ARMED filtering supersedes epochs by default. Keep this test focused
+        // on the fallback path retained for XEZIM_ARMED_EDGE=0.
+        .env("XEZIM_ARMED_EDGE", "0")
         .args(["--simulate", "-s", "top"])
         .arg(&source)
         .output()

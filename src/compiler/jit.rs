@@ -898,7 +898,7 @@ mod enabled {
         nba_range_ref: FuncRef,
         nba_bit_ref: FuncRef,
         blk_range_ref: FuncRef,
-        load_array_ref: FuncRef,
+        _load_array_ref: FuncRef,
     ) -> Result<(), ()> {
         use Insn::*;
         match insn {
@@ -1193,16 +1193,12 @@ mod enabled {
                 let result = builder.ins().band(shifted, mc);
                 builder.ins().stack_store(result, regs[*dest as usize], 0);
             }
-            LoadArrayElem(dest, name, idx_reg) => {
-                let pointer_type = builder.func.dfg.value_type(sim_ptr);
-                let name_ptr = builder.ins().iconst(pointer_type, name.as_ptr() as i64);
-                let idx = builder
-                    .ins()
-                    .stack_load(types::I64, regs[*idx_reg as usize], 0);
-                let call = builder.ins().call(load_array_ref, &[sim_ptr, name_ptr, idx]);
-                let val = builder.inst_results(call)[0];
-                builder.ins().stack_store(val, regs[*dest as usize], 0);
-            }
+            // ArrayOperand is no longer a raw C string. Passing its String
+            // buffer to xezim_jit_load_array_elem (which expects a CStr) is
+            // both unterminated and loses the dense-array metadata. Keep
+            // dynamic array blocks on the interpreter until the JIT bridge
+            // accepts a resolved array descriptor.
+            LoadArrayElem(..) => return Err(()),
             _ => return Err(()),
         }
         Ok(())

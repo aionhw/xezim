@@ -19,7 +19,7 @@ type RegId = u16;
 /// Bytecode instruction set. Stack-free, register-based design.
 /// Each instruction specifies source and destination registers explicitly,
 /// enabling the VM to iterate a flat Vec<Insn> with predictable memory access.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Insn {
     /// Load a constant value into a register. `Box<Value>` keeps the
     /// variant small (8 B instead of 32 B for the inline Value) — LoadConst
@@ -139,16 +139,39 @@ pub enum Insn {
     /// Boxed payload keeps the variant at 8 B (Box ptr) instead of
     /// 24 B (Arc + fat-ptr str). StmtFallback is the AST-interpreter
     /// escape hatch — its dispatch cost dwarfs an extra deref.
-    StmtFallback(Box<(Arc<Statement>, &'static str)>),
+    StmtFallback(Box<(Arc<Statement>, Arc<str>)>),
 
     SetSigned(RegId),
     Nop,
+
+    /// Fused `LoadSignal` + `RangeSelectConst`: dest = signal_table[sig][left:right].
+    /// Produced by the `finish()` peephole when the loaded register is dead
+    /// after the select. Reads the slice straight out of the signal — decisive
+    /// for wide (>64-bit) signals, where `LoadSignal` would copy the whole
+    /// `Wide` storage (1 byte/bit) into a VM register only to slice a few
+    /// bits out. Also removes one dispatch + one 32-byte register write.
+    LoadSignalRange(RegId, usize, u32, u32), // (dest, signal_id, left, right)
+    /// Fused `LoadSignal` + `BitSelectConst`: dest = signal_table[sig][index].
+    LoadSignalBit(RegId, usize, u32), // (dest, signal_id, index)
+
+    /// Fused `LoadConst` + `NbaAssign`: signal_table[id] <= K. The dominant
+    /// reset-value NBA shape (33M dynamic pairs on the c910 memcpy census) —
+    /// skips one dispatch and one 32-byte register write per execution.
+    NbaAssignConst(usize, Box<Value>, u32), // (signal_id, const, width)
+    /// Fused `LogNot` + `BranchIfFalse`: jump unless the register is
+    /// DEFINITE zero (`is_nonzero() == Some(false)`) — the exact composition
+    /// of `logic_not` (Some(true)→0, Some(false)→1, None→X) with
+    /// `!is_true(..)`, so X conditions branch exactly as before.
+    BranchUnlessZero(RegId, u32), // (cond_reg, jump_target)
+    /// Fused `LoadSignal` + `BranchIfFalse`: jump unless
+    /// signal_table[id].is_true() — no register copy of the signal.
+    BranchIfSignalFalse(usize, u32), // (signal_id, jump_target)
 }
 
 /// Pre-resolved unpacked-array addressing embedded in bytecode. The name is
 /// retained for diagnostics and the rare unresolved fallback, while normal
 /// execution uses only the dense base/range fields.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ArrayOperand {
     Dense {
         name: String,
@@ -168,7 +191,7 @@ impl ArrayOperand {
 }
 
 /// A compiled bytecode program for one always block or continuous assign.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompiledBlock {
     pub instructions: Vec<Insn>,
     pub num_regs: u32,
@@ -242,8 +265,8 @@ pub struct BytecodeCompiler<'a> {
     /// which case the compiler can only catch the literal-operand case.
     string_signals: Option<&'a HashSet<String>>,
     /// Base names of 2D/ND UNPACKED arrays. When a continuous-assign LHS
-    /// `m[0][j]` (outer index 0) targets one of these, the flattening
-    /// short-circuit (`flattened_outer_zero_signal_id`) must NOT fire — the
+    /// `m[0][j]` targets one of these, the flattening short-circuit
+    /// (`flattened_outer_const_signal_id`) must NOT fire — the
     /// bogus scalar signal `m` would otherwise catch a bit-select write and
     /// silently drop the element. None = no info (older callers); the guard
     /// then only excludes 1D/packed bases as before. Set via
@@ -468,7 +491,7 @@ impl<'a> BytecodeCompiler<'a> {
                 .unwrap_or_else(|| Self::stmt_kind_label(stmt));
             self.emit(Insn::StmtFallback(Box::new((
                 Arc::new(stmt.clone()),
-                reason,
+                Arc::from(reason),
             ))));
             true
         } else {
@@ -628,13 +651,17 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
-    fn flattened_outer_zero_signal_id(&self, expr: &Expression) -> Option<usize> {
+    fn flattened_outer_const_signal_id(&self, expr: &Expression) -> Option<usize> {
         let ExprKind::Index { expr: base, index } = &expr.kind else {
             return None;
         };
-        if self.eval_const_expr(index)? != 0 {
-            return None;
-        }
+        // Generated-loop expansion has already selected the unpacked element
+        // and baked its index into the hierarchical instance path. The AST
+        // retains the now-redundant constant select (`flat[i][bit]`), while
+        // the signal table contains `flat` as the selected packed element.
+        // Accept every constant here, not only zero; the shape guards below
+        // keep real unpacked and multi-dimensional packed arrays out.
+        self.eval_const_expr(index)?;
         let ExprKind::Ident(hier) = &base.kind else {
             return None;
         };
@@ -649,9 +676,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
         // A genuine 2D/ND UNPACKED array (`logic [7:0] m [2][2]`) also carries
         // a bogus scalar signal for its base name; `m[0][j]` must select the
-        // element (interpreter path), NOT bit-select that scalar. Only `[0]`
-        // hit this — `m[1][j]` already bailed because index != 0 — so the row-0
-        // writes were silently dropped.
+        // element (interpreter path), NOT bit-select that scalar.
         if self.is_multi_dim_array(hier) {
             return None;
         }
@@ -775,7 +800,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.next_reg = start_reg;
             self.emit(Insn::StmtFallback(Box::new((
                 Arc::new(stmt.clone()),
-                reason,
+                Arc::from(reason),
             ))));
             self.bail_reason = saved_reason;
             self.register_overflow = saved_overflow;
@@ -1797,7 +1822,7 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
-                if let Some(id) = self.flattened_outer_zero_signal_id(expr) {
+                if let Some(id) = self.flattened_outer_const_signal_id(expr) {
                     if let Some(idx_reg) = self.compile_expr(index, 0) {
                         self.emit(Insn::NbaAssignBitDyn(id, idx_reg, val_reg));
                         return true;
@@ -1861,7 +1886,7 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
-                if let Some(id) = self.flattened_outer_zero_signal_id(expr) {
+                if let Some(id) = self.flattened_outer_const_signal_id(expr) {
                     match kind {
                         RangeKind::Constant => {
                             if let (Some(hi), Some(lo)) =
@@ -2071,7 +2096,7 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
-                if let Some(id) = self.flattened_outer_zero_signal_id(expr) {
+                if let Some(id) = self.flattened_outer_const_signal_id(expr) {
                     if let Some(idx_reg) = self.compile_expr(index, 0) {
                         self.emit(Insn::BlockingAssignBitDyn(id, idx_reg, val_reg));
                         return true;
@@ -2160,7 +2185,7 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
-                if let Some(id) = self.flattened_outer_zero_signal_id(expr) {
+                if let Some(id) = self.flattened_outer_const_signal_id(expr) {
                     match kind {
                         RangeKind::Constant => {
                             if let (Some(hi), Some(lo)) =
@@ -2577,13 +2602,9 @@ impl<'a> BytecodeCompiler<'a> {
             // Time literal magnitude in tick units (1 ns), matching the
             // interpreter's value-context handling.
             NumberLiteral::Time(s) => Some(Value::from_u64((*s * 1e9) as u64, 64)),
-            NumberLiteral::UnbasedUnsized(c) => Some(match c {
-                '0' => Value::zero(32),
-                '1' => Value::ones(32),
-                'x' | 'X' => Value::new(32),
-                'z' | 'Z' => Value::all_z(32),
-                _ => Value::new(32),
-            }),
+            // §5.7.1: unbased-unsized literal — a 1-bit FILL value; the Value
+            // binary ops and resize replicate it to the consuming context.
+            NumberLiteral::UnbasedUnsized(c) => Some(Value::fill_of(*c)),
         }
     }
 
@@ -2758,6 +2779,7 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn finish(mut self) -> CompiledBlock {
         debug_assert!(!self.register_overflow);
+        Self::fuse_load_selects(&mut self.insns);
         // Trim unused capacity. `Vec::push` doubles the backing buffer
         // when it overflows, so a freshly compiled block can sit on
         // up to ~50% slack capacity. With ~100K CompiledBlocks on
@@ -2769,11 +2791,282 @@ impl<'a> BytecodeCompiler<'a> {
             instructions: self.insns,
         }
     }
+
+    /// Does `insn` read register `r`? Conservative: unknown/AST-fallback
+    /// instructions report `true`. Used by the fuse peephole's liveness
+    /// check — a wrong `false` here would fuse away a load whose register
+    /// is still consumed later, so every variant must be enumerated.
+    fn insn_reads_reg(insn: &Insn, r: RegId) -> bool {
+        match insn {
+            Insn::LoadConst(..)
+            | Insn::LoadSignal(..)
+            | Insn::LoadSignalSigned(..)
+            | Insn::LoadSignalRange(..)
+            | Insn::LoadSignalBit(..)
+            | Insn::NbaAssignConst(..)
+            | Insn::BranchIfSignalFalse(..)
+            | Insn::Jump(..)
+            | Insn::Nop => false,
+            Insn::BranchUnlessZero(c, _) => *c == r,
+            // In-place mutators read their register.
+            Insn::Resize(a, _) | Insn::SetSigned(a) => *a == r,
+            Insn::Add(_, l, rr)
+            | Insn::Sub(_, l, rr)
+            | Insn::Mul(_, l, rr)
+            | Insn::Div(_, l, rr)
+            | Insn::Mod(_, l, rr)
+            | Insn::BitAnd(_, l, rr)
+            | Insn::BitOr(_, l, rr)
+            | Insn::BitXor(_, l, rr)
+            | Insn::BitXnor(_, l, rr)
+            | Insn::LogAnd(_, l, rr)
+            | Insn::LogOr(_, l, rr)
+            | Insn::Eq(_, l, rr)
+            | Insn::Neq(_, l, rr)
+            | Insn::CaseEq(_, l, rr)
+            | Insn::CasezEq(_, l, rr)
+            | Insn::CasexEq(_, l, rr)
+            | Insn::Lt(_, l, rr)
+            | Insn::Leq(_, l, rr)
+            | Insn::Gt(_, l, rr)
+            | Insn::Geq(_, l, rr)
+            | Insn::Shl(_, l, rr)
+            | Insn::Shr(_, l, rr)
+            | Insn::AShr(_, l, rr) => *l == r || *rr == r,
+            Insn::BitNot(_, s)
+            | Insn::LogNot(_, s)
+            | Insn::Negate(_, s)
+            | Insn::ReduceAnd(_, s)
+            | Insn::ReduceOr(_, s)
+            | Insn::ReduceXor(_, s)
+            | Insn::Move(_, s)
+            | Insn::Replicate(_, s, _) => *s == r,
+            Insn::BitSelect(_, b, i) => *b == r || *i == r,
+            Insn::BitSelectConst(_, b, _) => *b == r,
+            Insn::RangeSelect(_, b, l, rr) => *b == r || *l == r || *rr == r,
+            Insn::RangeSelectConst(_, b, _, _) => *b == r,
+            Insn::Concat(_, parts) => parts.iter().any(|p| *p == r),
+            Insn::BranchIfFalse(c, _) => *c == r,
+            Insn::Select(_, c, t, e) => *c == r || *t == r || *e == r,
+            Insn::NbaAssign(_, v, _) | Insn::BlockingAssign(_, v, _) => *v == r,
+            Insn::NbaAssignRange(_, _, _, v) | Insn::BlockingAssignRange(_, _, _, v) => *v == r,
+            Insn::NbaAssignRangeDyn(_, h, l, v) | Insn::BlockingAssignRangeDyn(_, h, l, v) => {
+                *h == r || *l == r || *v == r
+            }
+            Insn::NbaAssignBitDyn(_, i, v) | Insn::BlockingAssignBitDyn(_, i, v) => {
+                *i == r || *v == r
+            }
+            Insn::LoadArrayElem(_, _, i) => *i == r,
+            Insn::NbaAssignArray(_, i, v, _) | Insn::BlockingAssignArray(_, i, v, _) => {
+                *i == r || *v == r
+            }
+            Insn::NbaAssignArrayRange(_, i, h, l, v)
+            | Insn::BlockingAssignArrayRange(_, i, h, l, v) => {
+                *i == r || *h == r || *l == r || *v == r
+            }
+            // AST fallback can read anything through the interpreter.
+            Insn::StmtFallback(..) => true,
+        }
+    }
+
+    /// Peephole: fuse `LoadSignal(t, s); RangeSelectConst(d, t, l, r)` into
+    /// `LoadSignalRange(d, s, l, r)` (and the BitSelectConst analogue) when
+    /// the loaded register `t` is dead afterwards. The second slot becomes a
+    /// `Nop` so every branch target in the block stays valid. Skipped when a
+    /// jump lands ON the select (the fused load would then be bypassed), or
+    /// when `t` is read again later — unless the select overwrote `t`
+    /// itself (d == t), which destroys the raw value anyway.
+    /// `XEZIM_FUSE=0` disables the pass (A/B escape hatch).
+    fn fuse_load_selects(insns: &mut [Insn]) {
+        use std::sync::OnceLock;
+        // Bit-set: 1 = load+range, 2 = load+bit, 4 = const-NBA, 8 = branch
+        // fusions. Default = all on; named values select one family for A/B
+        // bisection.
+        static MODE: OnceLock<u8> = OnceLock::new();
+        let mode = *MODE.get_or_init(|| match std::env::var("XEZIM_FUSE").as_deref() {
+            Ok("0") => 0,
+            Ok("range") => 1,
+            Ok("bit") => 2,
+            Ok("nba") => 4,
+            Ok("branch") => 8,
+            _ => 0xF,
+        });
+        if mode == 0 || insns.len() < 2 {
+            return;
+        }
+        // Branch targets: fusing must not change what a jump lands on.
+        let mut is_target = vec![false; insns.len() + 1];
+        for insn in insns.iter() {
+            match insn {
+                Insn::BranchIfFalse(_, t)
+                | Insn::BranchUnlessZero(_, t)
+                | Insn::BranchIfSignalFalse(_, t)
+                | Insn::Jump(t) => {
+                    if (*t as usize) < is_target.len() {
+                        is_target[*t as usize] = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Second family: pairs whose fused form has NO destination register —
+        // the first insn's register must simply be dead everywhere else.
+        //   LoadConst K ; NbaAssign(sig, k, w)        → NbaAssignConst
+        //   LogNot(d,s) ; BranchIfFalse(d, T)         → BranchUnlessZero(s, T)
+        //   LoadSignal(t,s) ; BranchIfFalse(t, T)     → BranchIfSignalFalse(s, T)
+        for i in 0..insns.len() - 1 {
+            if is_target[i + 1] {
+                continue;
+            }
+            let (dead_reg, repl) = match (&insns[i], &insns[i + 1]) {
+                (Insn::LoadConst(c, k), &Insn::NbaAssign(sig, v, w))
+                    if v == *c && (mode & 4) != 0 =>
+                {
+                    // Pre-resize at fuse time — the exec arm then only
+                    // compares + clones-on-change, never resizes.
+                    (*c, Insn::NbaAssignConst(sig, Box::new(k.resize_for_assign(w)), w))
+                }
+                (&Insn::LogNot(d, s), &Insn::BranchIfFalse(c, t))
+                    if c == d && (mode & 8) != 0 =>
+                {
+                    (d, Insn::BranchUnlessZero(s, t))
+                }
+                (&Insn::LoadSignal(r, sig), &Insn::BranchIfFalse(c, t))
+                    if c == r && (mode & 8) != 0 =>
+                {
+                    (r, Insn::BranchIfSignalFalse(sig, t))
+                }
+                _ => continue,
+            };
+            // The fused form never writes `dead_reg`, so ANY other read of it
+            // in the block blocks the fusion (no d==t exemption here).
+            let consumed = insns
+                .iter()
+                .enumerate()
+                .any(|(j, x)| j != i && j != i + 1 && Self::insn_reads_reg(x, dead_reg));
+            if consumed {
+                continue;
+            }
+            insns[i] = repl;
+            insns[i + 1] = Insn::Nop;
+        }
+
+        for i in 0..insns.len() - 1 {
+            let &Insn::LoadSignal(t, sig) = &insns[i] else {
+                continue;
+            };
+            if is_target[i + 1] {
+                continue;
+            }
+            let fused = match &insns[i + 1] {
+                &Insn::RangeSelectConst(d, b, l, r) if b == t && (mode & 1) != 0 => {
+                    Some((d, Insn::LoadSignalRange(d, sig, l, r)))
+                }
+                &Insn::BitSelectConst(d, b, idx) if b == t && (mode & 2) != 0 => {
+                    Some((d, Insn::LoadSignalBit(d, sig, idx)))
+                }
+                _ => None,
+            };
+            let Some((d, repl)) = fused else { continue };
+            // Liveness: the raw loaded value must not be consumed anywhere
+            // else in the block. Registers are allocated fresh per value
+            // (alloc_reg never reuses ids within a block), so any read of
+            // `t` outside the pair consumes THIS load — scan the whole
+            // block (not just later pcs) so backward jumps can't smuggle a
+            // read of `t` past a suffix-only check. d == t overwrites the
+            // raw value in the same pair, making later reads safe.
+            if d != t {
+                let consumed = insns
+                    .iter()
+                    .enumerate()
+                    .any(|(j, x)| j != i && j != i + 1 && Self::insn_reads_reg(x, t));
+                if consumed {
+                    continue;
+                }
+            }
+            insns[i] = repl;
+            insns[i + 1] = Insn::Nop;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ident_expr(name: &str) -> Expression {
+        let span = crate::ast::Span::dummy();
+        Expression::new(
+            ExprKind::Ident(HierarchicalIdentifier {
+                root: None,
+                path: vec![HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: name.to_owned(),
+                        span,
+                    },
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            span,
+        )
+    }
+
+    fn indexed_expr(name: &str, index: char) -> Expression {
+        let span = crate::ast::Span::dummy();
+        Expression::new(
+            ExprKind::Index {
+                expr: Box::new(ident_expr(name)),
+                index: Box::new(Expression::new(
+                    ExprKind::Number(NumberLiteral::UnbasedUnsized(index)),
+                    span,
+                )),
+            },
+            span,
+        )
+    }
+
+    #[test]
+    fn generated_nonzero_outer_index_resolves_to_flattened_signal() {
+        let mut signals: HashMap<Arc<str>, usize> = HashMap::default();
+        signals.insert(Arc::from("flat"), 0);
+        let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
+        let widths: HashMap<String, u32> = HashMap::default();
+        let compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
+
+        assert_eq!(
+            compiler.flattened_outer_const_signal_id(&indexed_expr("flat", '1')),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn genuine_array_shapes_do_not_resolve_as_flattened_signals() {
+        let mut signals: HashMap<Arc<str>, usize> = HashMap::default();
+        signals.insert(Arc::from("flat"), 0);
+        let widths: HashMap<String, u32> = HashMap::default();
+        let expr = indexed_expr("flat", '1');
+
+        let mut arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
+        arrays.insert("flat".to_owned(), (0, 3, 160));
+        let compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
+        assert_eq!(compiler.flattened_outer_const_signal_id(&expr), None);
+
+        let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
+        let mut packed_elem_widths: HashMap<String, u32> = HashMap::default();
+        packed_elem_widths.insert("flat".to_owned(), 32);
+        let mut compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
+        compiler.set_packed_elem_widths(&packed_elem_widths);
+        assert_eq!(compiler.flattened_outer_const_signal_id(&expr), None);
+
+        let mut multi_dim_arrays: HashSet<String> = HashSet::default();
+        multi_dim_arrays.insert("flat".to_owned());
+        let mut compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
+        compiler.set_multi_dim_arrays(&multi_dim_arrays);
+        assert_eq!(compiler.flattened_outer_const_signal_id(&expr), None);
+    }
 
     #[test]
     fn register_ids_do_not_wrap_at_u16_limit() {

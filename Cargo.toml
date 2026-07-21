@@ -15,7 +15,7 @@ sv-parser = { path = "../xezim-core/xezim-parser" }
 libloading = "0.8"
 libffi = "3"
 libc = "0.2"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 bincode = "1.3"
 mimalloc = "0.1"
 # JIT: enabled with `--features jit`. Kept optional to avoid adding the

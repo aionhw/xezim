@@ -16,11 +16,297 @@ use xezim_core::elaborate;
 // Re-export xezim-core surface so existing `xezim::...` paths keep working.
 pub use xezim_core::{
     ast, diagnostics, lexer, log_eprintln, log_println, parse, parse_and_elaborate_multi,
-    parse_str, preprocessor, read_compiled, set_library_cli, set_module_timescale_cli, sv_parser,
+    parse_str, preprocessor, read_compiled, set_implicit_net_warn, set_library_cli,
+    set_module_timescale_cli, sv_parser,
     LibraryCli,
     tokenize_file, write_compiled, ModuleTimescaleCli, ParseResult, SourceDefinition,
     XEZIM_BYTECODE_MAGIC,
 };
+
+/// Content-addressed cache for elaborated designs. The payload uses the
+/// versioned `.xezbc` format, so cache hits skip parsing and elaboration while
+/// runtime state is still rebuilt for each simulation.
+#[derive(Clone, Debug)]
+pub struct DesignCacheConfig {
+    pub directory: std::path::PathBuf,
+    /// CLI semantics not represented directly by the preprocessed sources.
+    pub semantic_salt: String,
+    /// Library files that may be adopted on demand during elaboration.
+    pub dependency_files: Vec<std::path::PathBuf>,
+}
+
+static DESIGN_CACHE_CONFIG: std::sync::OnceLock<std::sync::Mutex<Option<DesignCacheConfig>>> =
+    std::sync::OnceLock::new();
+
+/// Enable or disable the elaborated-design cache for subsequent library calls.
+/// The library stays cache-free unless an embedding application opts in.
+pub fn set_design_cache(config: Option<DesignCacheConfig>) {
+    let cell = DESIGN_CACHE_CONFIG.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut slot) = cell.lock() {
+        *slot = config;
+    }
+}
+
+fn design_cache_config() -> Option<DesignCacheConfig> {
+    DESIGN_CACHE_CONFIG
+        .get()
+        .and_then(|cell| cell.lock().ok().and_then(|slot| slot.clone()))
+}
+
+/// Deterministic 128-bit content hash. This is a cache key, not a security
+/// boundary. Length framing prevents ambiguous concatenations.
+struct CacheHash {
+    a: u64,
+    b: u64,
+}
+
+impl CacheHash {
+    fn new() -> Self {
+        Self {
+            a: 0xcbf29ce484222325,
+            b: 0x84222325cbf29ce4,
+        }
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.a ^= bytes.len() as u64;
+        self.a = self.a.wrapping_mul(0x100000001b3);
+        self.b ^= (bytes.len() as u64).rotate_left(31);
+        self.b = self.b.wrapping_mul(0x9e3779b185ebca87);
+        for &byte in bytes {
+            self.a ^= byte as u64;
+            self.a = self.a.wrapping_mul(0x100000001b3);
+            self.b ^= (byte as u64).wrapping_add(0x9d);
+            self.b = self.b.wrapping_mul(0x9e3779b185ebca87);
+        }
+    }
+
+    fn text(&mut self, text: &str) {
+        self.bytes(text.as_bytes());
+    }
+
+    fn finish(&self) -> String {
+        format!("{:016x}{:016x}", self.a, self.b)
+    }
+}
+
+fn design_cache_key(
+    config: &DesignCacheConfig,
+    sources: &[String],
+    source_paths: &[String],
+    top_module_name: Option<&str>,
+    include_dirs: &[String],
+    defines: &[(String, Option<String>)],
+) -> (String, Vec<String>) {
+    let mut hash = CacheHash::new();
+    hash.bytes(XEZIM_BYTECODE_MAGIC);
+    hash.text(env!("CARGO_PKG_VERSION"));
+    hash.text(&config.semantic_salt);
+    hash.text(top_module_name.unwrap_or(""));
+
+    // Invalidate after a local rebuild even when the package version did not
+    // change, since the executable may contain elaboration fixes.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Ok(meta) = std::fs::metadata(exe) {
+            hash.bytes(&meta.len().to_le_bytes());
+            if let Ok(modified) = meta.modified() {
+                if let Ok(age) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    hash.bytes(&age.as_nanos().to_le_bytes());
+                }
+            }
+        }
+    }
+
+    // Hash the same preprocessed text that elaboration sees. This makes
+    // nested `include contents part of the key without scanning unrelated
+    // files in broad include search directories.
+    let mut pp = preprocessor::Preprocessor::new();
+    for dir in include_dirs {
+        pp.add_include_dir(std::path::PathBuf::from(dir));
+        hash.text(dir);
+    }
+    for (name, value) in defines {
+        pp.define(name.clone(), preprocessor::MacroDef {
+            name: name.clone(),
+            params: None,
+            body: value.clone().unwrap_or_default(),
+        });
+        hash.text(name);
+        hash.text(value.as_deref().unwrap_or(""));
+    }
+    // Keep the per-file preprocessed text: on a cache HIT the caller feeds
+    // it back into `elab.source_texts` so runtime diagnostics (e.g. the
+    // zero-delay stall report) resolve spans to `file:line` exactly as a
+    // fresh parse would — the artifact itself skips the (large) texts.
+    // `begin_top_level_file` matches the parse-time preprocessor state.
+    let mut preprocessed_texts: Vec<String> = Vec::with_capacity(sources.len());
+    for (idx, source) in sources.iter().enumerate() {
+        let source_path = source_paths.get(idx).map(std::path::PathBuf::from);
+        hash.text(source_paths.get(idx).map_or("", String::as_str));
+        pp.begin_top_level_file();
+        let text = pp.preprocess_file(source, source_path.as_deref());
+        hash.text(&text);
+        preprocessed_texts.push(text);
+    }
+
+    let mut dependencies = config.dependency_files.clone();
+    dependencies.sort();
+    dependencies.dedup();
+    for path in dependencies {
+        hash.text(&path.to_string_lossy());
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let source = String::from_utf8_lossy(&bytes);
+                let mut dep_pp = preprocessor::Preprocessor::new();
+                for dir in include_dirs {
+                    dep_pp.add_include_dir(std::path::PathBuf::from(dir));
+                }
+                for (name, value) in defines {
+                    dep_pp.define(name.clone(), preprocessor::MacroDef {
+                        name: name.clone(),
+                        params: None,
+                        body: value.clone().unwrap_or_default(),
+                    });
+                }
+                hash.text(&dep_pp.preprocess_file(&source, Some(&path)));
+            }
+            Err(err) => hash.text(&format!("<unreadable:{:?}>", err.kind())),
+        }
+    }
+    (hash.finish(), preprocessed_texts)
+}
+
+fn read_design_cache(config: &DesignCacheConfig, key: &str) -> Option<elaborate::ElaboratedModule> {
+    let path = config.directory.join(format!("{}.xezbc", key));
+    if !path.is_file() {
+        eprintln!("[CACHE] miss {}", key);
+        return None;
+    }
+    match read_compiled(path.to_string_lossy().as_ref()) {
+        Ok(Some(elab)) => {
+            eprintln!("[CACHE] hit {} ({})", key, path.display());
+            Some(elab)
+        }
+        Ok(None) => {
+            eprintln!("[CACHE] invalid artifact {}; rebuilding", path.display());
+            let _ = std::fs::remove_file(path);
+            None
+        }
+        Err(err) => {
+            eprintln!("[CACHE] cannot load {}: {}; rebuilding", path.display(), err);
+            let _ = std::fs::remove_file(path);
+            None
+        }
+    }
+}
+
+fn write_design_cache(config: &DesignCacheConfig, key: &str, elab: &elaborate::ElaboratedModule) {
+    if let Err(err) = std::fs::create_dir_all(&config.directory) {
+        eprintln!("[CACHE] cannot create {}: {}; continuing without cache",
+                  config.directory.display(), err);
+        return;
+    }
+    let final_path = config.directory.join(format!("{}.xezbc", key));
+    let temp_path = config.directory.join(format!(".{}.{}.tmp", key, std::process::id()));
+    if let Err(err) = write_compiled(elab, temp_path.to_string_lossy().as_ref()) {
+        eprintln!("[CACHE] cannot write {}: {}", temp_path.display(), err);
+        let _ = std::fs::remove_file(temp_path);
+        return;
+    }
+    if let Err(err) = std::fs::rename(&temp_path, &final_path) {
+        // A concurrent process may have populated the same content key first.
+        if !final_path.is_file() {
+            eprintln!("[CACHE] cannot publish {}: {}", final_path.display(), err);
+        }
+        let _ = std::fs::remove_file(temp_path);
+        return;
+    }
+    eprintln!("[CACHE] stored {} ({})", key, final_path.display());
+}
+
+#[cfg(test)]
+mod design_cache_tests {
+    use super::*;
+
+    fn key(config: &DesignCacheConfig, source: &str, top: Option<&str>) -> String {
+        design_cache_key(
+            config,
+            &[source.to_string()],
+            &["design.sv".to_string()],
+            top,
+            &["include".to_string()],
+            &[("FEATURE".to_string(), Some("1".to_string()))],
+        )
+        .0
+    }
+
+    #[test]
+    fn design_cache_key_is_stable_and_tracks_semantics() {
+        let base = DesignCacheConfig {
+            directory: std::path::PathBuf::from("unused"),
+            semantic_salt: "sv2023=true;strict=true".to_string(),
+            dependency_files: Vec::new(),
+        };
+        assert_eq!(key(&base, "module top; endmodule", Some("top")),
+                   key(&base, "module top; endmodule", Some("top")));
+        assert_ne!(key(&base, "module top; endmodule", Some("top")),
+                   key(&base, "module top; wire x; endmodule", Some("top")));
+        assert_ne!(key(&base, "module top; endmodule", Some("top")),
+                   key(&base, "module top; endmodule", Some("other")));
+
+        let mut different_mode = base.clone();
+        different_mode.semantic_salt = "sv2023=false;strict=true".to_string();
+        assert_ne!(key(&base, "module top; endmodule", Some("top")),
+                   key(&different_mode, "module top; endmodule", Some("top")));
+    }
+
+    #[test]
+    fn design_cache_key_tracks_library_contents() {
+        let unique = format!("xezim-cache-key-{}-{:?}.sv", std::process::id(),
+                             std::thread::current().id());
+        let path = std::env::temp_dir().join(unique);
+        std::fs::write(&path, "module cell; endmodule\n").unwrap();
+        let config = DesignCacheConfig {
+            directory: std::path::PathBuf::from("unused"),
+            semantic_salt: String::new(),
+            dependency_files: vec![path.clone()],
+        };
+        let before = key(&config, "module top; endmodule", Some("top"));
+        std::fs::write(&path, "module cell; wire changed; endmodule\n").unwrap();
+        let after = key(&config, "module top; endmodule", Some("top"));
+        let _ = std::fs::remove_file(path);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn design_cache_key_tracks_included_contents() {
+        let unique = format!("xezim-cache-include-{}-{:?}", std::process::id(),
+                             std::thread::current().id());
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        let header = dir.join("defs.svh");
+        std::fs::write(&header, "`define WIDTH 8\n").unwrap();
+        let source = "`include \"defs.svh\"\nmodule top; logic [`WIDTH-1:0] x; endmodule\n";
+        let config = DesignCacheConfig {
+            directory: std::path::PathBuf::from("unused"),
+            semantic_salt: String::new(),
+            dependency_files: Vec::new(),
+        };
+        let source_path = dir.join("design.sv").to_string_lossy().into_owned();
+        let include_dir = dir.to_string_lossy().into_owned();
+        let before = design_cache_key(
+            &config, &[source.to_string()], &[source_path.clone()], Some("top"),
+            &[include_dir.clone()], &[],
+        );
+        std::fs::write(&header, "`define WIDTH 16\n").unwrap();
+        let after = design_cache_key(
+            &config, &[source.to_string()], &[source_path], Some("top"),
+            &[include_dir], &[],
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        assert_ne!(before, after);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Static variable initializers that call simulation-time system functions
@@ -402,43 +688,78 @@ pub fn simulate_multi(
         .iter()
         .map(|s| intra_delay::rewrite_intra_assignment_delays(s))
         .collect();
-    let (definitions, mut elab) = parse_and_elaborate_multi(
-        &sources,
-        top_module_name,
-        include_dirs,
-        source_paths,
-        defines,
-    )?;
+    let cache = design_cache_config();
+    let mut cache_pp_texts: Vec<String> = Vec::new();
+    let cache_key = cache.as_ref().map(|config| {
+        let (key, texts) =
+            design_cache_key(config, &sources, source_paths, top_module_name, include_dirs, defines);
+        cache_pp_texts = texts;
+        key
+    });
+    let cached_elab = cache
+        .as_ref()
+        .zip(cache_key.as_deref())
+        .and_then(|(config, key)| read_design_cache(config, key));
 
-    // §18.5.1: recover any out-of-class constraint body that the class-table
-    // repopulation in `inline_instantiations` dropped.
-    reinstall_ooc_constraint_bodies(&sources, source_paths, include_dirs, defines, &mut elab);
-
-    // Second-pass `should_fail` lint (additive — reuses the elaboration above,
-    // no extra cost; does not alter elaborate/simulate behavior). Rejecting
-    // here makes `:type: simulation` should_fail tests exit non-zero too, not
-    // just the `--compile` path.
-    {
-        let dv: Vec<&SourceDefinition> = definitions.values().collect();
-        let lint = should_fail_lint::lint_should_fail(&dv, &elab);
-        if !lint.is_empty() {
-            return Err(lint.join("; "));
+    let elab = if let Some(mut elab) = cached_elab {
+        // The artifact skips the (large) preprocessed texts; refill them from
+        // the cache-key pass so runtime diagnostics keep `file:line`
+        // resolution on cache hits. `source_files` / `src_file_of_module`
+        // travel inside the artifact.
+        elab.source_texts = std::mem::take(&mut cache_pp_texts);
+        if elab.source_files.is_empty() {
+            elab.source_files = source_paths.to_vec();
         }
-    }
+        elab
+    } else {
+        let (definitions, mut elab) = parse_and_elaborate_multi(
+            &sources,
+            top_module_name,
+            include_dirs,
+            source_paths,
+            defines,
+        )?;
 
-    // §6.21: static initializers calling simulation-time system functions
-    // were const-folded to garbage by elaboration — re-issue them as time-0
-    // static-init assignments before the AST is dropped (issue #26).
-    defer_static_syscall_inits(&definitions, &mut elab);
+        // §18.5.1: recover any out-of-class constraint body that the class-table
+        // repopulation in `inline_instantiations` dropped.
+        reinstall_ooc_constraint_bodies(&sources, source_paths, include_dirs, defines, &mut elab);
 
-    // Drop the parsed-AST table now that elaborate has produced ElaboratedModule.
-    // Nothing downstream (Simulator::new, sim.run, SDF parse) needs it. Without
-    // this the AHashMap<String, SourceDefinition> (Rc<ModuleDeclaration> for
-    // ~hundreds of c910 modules) sits in RSS for the entire 3-min simulation.
-    // Measured: c910 hello peak 9.98 GB → ~8 GB after explicit drop.
-    drop(definitions);
+        // Second-pass `should_fail` lint (additive — reuses the elaboration above,
+        // no extra cost; does not alter elaborate/simulate behavior). Rejecting
+        // here makes `:type: simulation` should_fail tests exit non-zero too, not
+        // just the `--compile` path.
+        {
+            let dv: Vec<&SourceDefinition> = definitions.values().collect();
+            let lint = should_fail_lint::lint_should_fail(&dv, &elab);
+            if !lint.is_empty() {
+                return Err(lint.join("; "));
+            }
+        }
+
+        // §6.21: static initializers calling simulation-time system functions
+        // were const-folded to garbage by elaboration — re-issue them as time-0
+        // static-init assignments before the AST is dropped (issue #26).
+        defer_static_syscall_inits(&definitions, &mut elab);
+
+        // Drop the parsed AST before constructing runtime state.
+        drop(definitions);
+
+        if let Some((config, key)) = cache.as_ref().zip(cache_key.as_deref()) {
+            // Pending rewrite contexts are intentionally omitted from the
+            // artifact format; materialize them before publishing a complete
+            // elaborated design.
+            elab.materialize_pending();
+            write_design_cache(config, key, &elab);
+        }
+        elab
+    };
 
     let mut sim = compiler::Simulator::new(elab, max_time);
+    if let Some((config, key)) = cache.as_ref().zip(cache_key.as_deref()) {
+        sim.set_prepared_comb_cache_path(Some(
+            config.directory.join(format!("{}.xezcomb", key)),
+        ));
+    }
     if let Some(limit) = settle_limit {
         sim.settle_limit = limit;
     }

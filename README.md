@@ -306,6 +306,8 @@ Common options:
 | `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects) |
 | `--sdf <file>` `--sdf-{min,typ,max}` | Annotate standard delays |
 | `--sim_debug` | Print `[DEBUG]` / `[OPT]` diagnostics |
+| `--cache-dir <dir>` | Select the automatic elaborated-design cache directory |
+| `--no-cache` | Disable the automatic elaborated-design cache |
 | `-l`, `--log <file>` | Redirect all stdout/stderr — including DPI/VPI C output — to a log file |
 | `-v <file>` | Library file: modules compiled only to resolve unresolved instantiations |
 | `-y <dir>` | Library directory: `<module>.<ext>` loaded on demand |
@@ -322,6 +324,9 @@ Selected env knobs (off by default unless noted):
 | `XEZIM_EVENT_EDGE=1` | Skip gateable clocked flop fires whose data is unchanged (1.13-1.30× wall on c910/c906) |
 | `XEZIM_INIT_ZERO=1` | Coerce X-initialized signals/arrays to 0 (required for some C910/C906 workloads, e.g. cmark) |
 | `XEZIM_PROGRESS=N` | Emit a `[PROGRESS]` line every N wall-seconds (sim_time, iters, edges_fired, nba_q) |
+| `XEZIM_CACHE_DIR=<dir>` | Override the elaborated-design cache directory |
+| `XEZIM_NO_CACHE=1` | Disable the automatic elaborated-design cache |
+| `XEZIM_COMPILE_PHASES=1` | Report detailed simulator compilation phase timings |
 
 Example — run the picorv32 testbench against a gate-level netlist:
 
@@ -329,6 +334,22 @@ Example — run the picorv32 testbench against a gate-level netlist:
 ./target/release/xezim testbench.v synth.v \
     +firmware=firmware/firmware.hex --max-time 50000000
 ```
+
+## Warm design cache
+
+Simulation mode stores a content-addressed elaborated design and compiled
+combinational worklist after the first run, then reuses both on identical later
+runs. A cache hit skips parsing, elaboration, and combinational dependency-index
+construction, while simulator state, plusargs, time-zero initialization, and
+event scheduling are rebuilt for every invocation. Timing-annotated and UDP
+designs conservatively rebuild the worklist. The key covers source and library
+contents, defines, include paths, top selection, language/strictness, timescale
+and delay settings, and the xezim executable build.
+
+The default directory is `$XEZIM_CACHE_DIR`, then
+`$XDG_CACHE_HOME/xezim/designs`, then `$HOME/.cache/xezim/designs`. Use
+`--cache-dir` for a workload-local cache or `--no-cache` for a cold run. Xezim
+prints `[CACHE] miss`, `[CACHE] stored`, or `[CACHE] hit` on stderr.
 
 ## Module-timescale extension
 
@@ -441,4 +462,3 @@ See the `LICENSE` file for details.
 * Icarus Verilog project for the public test suite
 * The Rust community
 * Open-source EDA projects
-

@@ -1,5 +1,41 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+fn default_design_cache_dir() -> PathBuf {
+    if let Some(path) = env::var_os("XEZIM_CACHE_DIR").filter(|p| !p.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = env::var_os("XDG_CACHE_HOME").filter(|p| !p.is_empty()) {
+        return PathBuf::from(path).join("xezim").join("designs");
+    }
+    if let Some(home) = env::var_os("HOME").filter(|p| !p.is_empty()) {
+        return PathBuf::from(home).join(".cache").join("xezim").join("designs");
+    }
+    PathBuf::from(".xezim-cache")
+}
+
+fn design_dependency_files(
+    lib_files: &[String],
+    lib_dirs: &[String],
+    lib_exts: Option<&[String]>,
+) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = lib_files.iter().map(PathBuf::from).collect();
+    let default_exts = ["v".to_string(), "sv".to_string(), "V".to_string()];
+    let exts = lib_exts.unwrap_or(&default_exts);
+    for dir in lib_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(ext) = path.extension().and_then(|s| s.to_str()) else { continue };
+            if path.is_file() && exts.iter().any(|candidate| candidate == ext) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
 
 /// Read a u64 from /proc/<pid|self>/status or /proc/meminfo by key (kB units).
 fn proc_kb(path: &str, key: &str) -> Option<u64> {
@@ -72,7 +108,7 @@ fn print_usage() {
     eprintln!("  --preprocess     Run the preprocessor only; emit expanded text");
     eprintln!("  --dump-tokens    With --parse, print the token stream");
     eprintln!("  --dump-ast       With --parse, print the AST");
-    eprintln!("  --max-time <n>   Set maximum simulation time (default: 100000)");
+    eprintln!("  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)");
     eprintln!("  --sim_debug      Enable simulator [DEBUG]/[OPT] output");
     eprintln!("  --dump-timescales  Print each module's timescale before the run (no source");
     eprintln!("                     $printtimescale needed); flags modules with no `timescale.");
@@ -84,6 +120,9 @@ fn print_usage() {
     eprintln!("                     overrides a `timeunit`/`timeprecision` decl or an active `timescale.");
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
     eprintln!("                   n>=2 offloads stdout writes to a background thread.");
+    eprintln!("  --cache-dir <dir> Store/reuse content-addressed elaborated designs");
+    eprintln!("                    (default: $XEZIM_CACHE_DIR or $XDG_CACHE_HOME/xezim/designs).");
+    eprintln!("  --no-cache       Disable the automatic elaborated-design cache.");
     eprintln!("  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>
   -v <file>        Library file: modules compiled only to resolve instantiations
   --primitive-verbose  Show parse/adoption diagnostics for explicit -v files
@@ -176,6 +215,47 @@ fn parse_timescale_value(d: &str) -> Result<(i32, i32), String> {
 
 /// Build the `--module-timescale` configuration from raw option strings,
 /// validating units and detecting conflicting named assignments.
+/// Parse a `--max-time` value: a bare number is NANOSECONDS (historical
+/// default), an attached suffix selects the unit: `30000000ps`, `30us`,
+/// `1ms`, `2s` (case-insensitive; `us` or `µs`). Returns nanoseconds.
+/// A customer run set `--max-time 30000000` intending picoseconds under a
+/// 1ps timescale and got 30 ms — the unit was invisible and unspellable.
+fn parse_max_time(raw: &str) -> Result<u64, String> {
+    let t = raw.trim();
+    let lower = t.to_ascii_lowercase();
+    let (num_str, factor_ns): (&str, f64) = if let Some(n) = lower.strip_suffix("ps") {
+        (n, 1e-3)
+    } else if let Some(n) = lower.strip_suffix("ns") {
+        (n, 1.0)
+    } else if let Some(n) = lower.strip_suffix("µs") {
+        (n, 1e3)
+    } else if let Some(n) = lower.strip_suffix("us") {
+        (n, 1e3)
+    } else if let Some(n) = lower.strip_suffix("ms") {
+        (n, 1e6)
+    } else if let Some(n) = lower.strip_suffix('s') {
+        (n, 1e9)
+    } else {
+        (lower.as_str(), 1.0)
+    };
+    let num: f64 = num_str
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid --max-time value '{}' (expected <n>[ps|ns|us|ms|s])", raw))?;
+    if !(num > 0.0) {
+        return Err(format!("--max-time must be positive, got '{}'", raw));
+    }
+    let ns = num * factor_ns;
+    let rounded = ns.round();
+    if rounded < 1.0 {
+        return Err(format!(
+            "--max-time '{}' is below 1 ns; the cap is tracked in whole nanoseconds",
+            raw
+        ));
+    }
+    Ok(rounded as u64)
+}
+
 fn build_module_timescale_cli(raw: &[String]) -> Result<xezim::ModuleTimescaleCli, String> {
     let mut cli = xezim::ModuleTimescaleCli::default();
     for spec in raw {
@@ -433,6 +513,7 @@ fn process_command_file(
     lib_exts: &mut Option<Vec<String>>,
     nospecify: &mut bool,
     primitive_verbose: &mut bool,
+    module_timescale_args: &mut Vec<String>,
 ) -> Result<(), String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Cannot read command file '{}': {}", path, e))?;
@@ -522,6 +603,7 @@ fn process_command_file(
                             lib_exts,
                             nospecify,
                             primitive_verbose,
+                            module_timescale_args,
                         )?;
                     }
                 }
@@ -549,6 +631,7 @@ fn process_command_file(
                         lib_exts,
                         nospecify,
                         primitive_verbose,
+                        module_timescale_args,
                     )?;
                 }
                 _ if t.starts_with("+incdir+") => {
@@ -557,14 +640,54 @@ fn process_command_file(
                 "--primitive-verbose" => {
                     *primitive_verbose = true;
                 }
+                "-xenowarn" => {
+                    xezim::set_implicit_net_warn(false);
+                }
                 _ if t.starts_with("+define+") => {
                     push_plus_define(t, defines);
                 }
                 _ if handle_gls_flag(t) => {}
+                // `--module-timescale <v>` / `--module-timescale=<v>` inside an
+                // args file (a customer args file used the `=` form; it was
+                // silently ignored and every no-`timescale module fell back to
+                // the default — see the warn arm below).
+                "--module-timescale" => {
+                    if i + 1 < toks.len() {
+                        i += 1;
+                        module_timescale_args.push(toks[i].to_string());
+                    }
+                }
+                _ if t.starts_with("--module-timescale=") => {
+                    module_timescale_args.push(t["--module-timescale=".len()..].to_string());
+                }
+                // xrun-compat seed aliases: `-svseed <n>` / `-svseed=<n>`
+                // (and `-seed` likewise) lower onto the `+seed=` plusarg the
+                // simulator already consumes.
+                "-svseed" | "-seed" => {
+                    if i + 1 < toks.len() {
+                        i += 1;
+                        plusargs.push(format!("+seed={}", toks[i]));
+                    }
+                }
+                _ if t.starts_with("-svseed=") => {
+                    plusargs.push(format!("+seed={}", &t["-svseed=".len()..]));
+                }
+                _ if t.starts_with("-seed=") => {
+                    plusargs.push(format!("+seed={}", &t["-seed=".len()..]));
+                }
                 _ if t.starts_with('+') => {
                     plusargs.push(t.to_string());
                 }
-                _ if t.starts_with('-') => {}
+                _ if t.starts_with('-') => {
+                    // An option this parser does not understand. NEVER swallow
+                    // it silently — a customer args file lost its
+                    // `--module-timescale=` (timescale silently defaulted) and
+                    // nearly its seed to exactly that.
+                    eprintln!(
+                        "[xezim][warning] ignored unrecognized option '{}' in args file '{}'",
+                        t, path
+                    );
+                }
                 _ => {
                     source_files.push(resolve_rel(base, t));
                 }
@@ -614,6 +737,10 @@ fn redirect_stdio_to_log(path: &str) -> std::io::Result<()> {
 
 fn main() {
     spawn_memory_watchdog();
+    // Install the SIGUSR1 hang-report handler before compile: a user poking a
+    // seemingly-hung run during a long elaboration must not kill it (the
+    // default SIGUSR1 action is termination).
+    xezim::compiler::simulator::install_hang_report_handler();
 
     // Default to IEEE 1800-2023 mode. SV-2023 is additive over -2017, so
     // valid -2017 code stays valid; pass `--sv2017` to opt back to the
@@ -645,6 +772,11 @@ fn main() {
     }
     let mut mode: Mode = Mode::Simulate;
     let mut mode_explicit = false;
+    let mut sv2023_mode = true;
+    let mut strict_checks = true;
+    let mut source_delay_select: u8 = 1;
+    let mut design_cache_enabled = env::var("XEZIM_NO_CACHE").ok().as_deref() != Some("1");
+    let mut design_cache_dir: Option<PathBuf> = None;
     let mut verbose = false;
     let mut _output_file: Option<String> = None;
     let mut lib_dirs: Vec<String> = Vec::new();
@@ -762,6 +894,7 @@ fn main() {
                         &mut lib_exts,
                         &mut nospecify,
                         &mut primitive_verbose,
+                        &mut module_timescale_args,
                     ) {
                         Ok(()) => {}
                         Err(e) => {
@@ -783,6 +916,7 @@ fn main() {
                     &mut lib_exts,
                     &mut nospecify,
                     &mut primitive_verbose,
+                    &mut module_timescale_args,
                 ) {
                     Ok(()) => {}
                     Err(e) => {
@@ -830,18 +964,21 @@ fn main() {
             // no --sdf-min/typ/max was given, the SDF annotation too.
             "+mindelays" | "-mindelays" => {
                 xezim::sv_parser::set_delay_select(0);
+                source_delay_select = 0;
                 if sdf_select.is_none() {
                     sdf_select = Some(xezim::compiler::sdf::DelaySelect::Min);
                 }
             }
             "+typdelays" | "-typdelays" => {
                 xezim::sv_parser::set_delay_select(1);
+                source_delay_select = 1;
                 if sdf_select.is_none() {
                     sdf_select = Some(xezim::compiler::sdf::DelaySelect::Typ);
                 }
             }
             "+maxdelays" | "-maxdelays" => {
                 xezim::sv_parser::set_delay_select(2);
+                source_delay_select = 2;
                 if sdf_select.is_none() {
                     sdf_select = Some(xezim::compiler::sdf::DelaySelect::Max);
                 }
@@ -872,6 +1009,11 @@ fn main() {
             }
             "--primitive-verbose" => {
                 primitive_verbose = true;
+            }
+            // Suppress §6.10 implicit 1-bit net warnings (gate-level designs
+            // with unresolved vendor cells can emit thousands).
+            "-xenowarn" => {
+                xezim::set_implicit_net_warn(false);
             }
             "-V" => {
                 print_version();
@@ -912,17 +1054,21 @@ fn main() {
             "--sv2023" => {
                 // No-op now (default), kept for back-compat with existing scripts.
                 sv_parser::set_sv2023(true);
+                sv2023_mode = true;
             }
             "--sv2017" => {
                 sv_parser::set_sv2023(false);
+                sv2023_mode = false;
             }
             // Strict negative-test diagnostics (reject LRM-illegal constructs).
             // ON by default; `--no-strict` (alias `--lenient`) turns it off.
             "--strict" => {
                 sv_parser::set_strict_checks(true);
+                strict_checks = true;
             }
             "--no-strict" | "--lenient" => {
                 sv_parser::set_strict_checks(false);
+                strict_checks = false;
             }
             "--dump-tokens" => {
                 dump_tokens = true;
@@ -939,7 +1085,22 @@ fn main() {
             "--max-time" => {
                 i += 1;
                 if i < args.len() {
-                    max_time = args[i].parse().unwrap_or(100_000);
+                    match parse_max_time(&args[i]) {
+                        Ok(v) => max_time = v,
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            _ if arg.starts_with("--max-time=") => {
+                match parse_max_time(&arg["--max-time=".len()..]) {
+                    Ok(v) => max_time = v,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
                 }
             }
             "--settle-limit" => {
@@ -1071,6 +1232,22 @@ fn main() {
             _ if arg.starts_with("--threads=") => {
                 threads = arg["--threads=".len()..].parse().unwrap_or(1).max(1);
             }
+            "--cache-dir" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --cache-dir requires a directory");
+                    std::process::exit(1);
+                }
+                design_cache_dir = Some(PathBuf::from(&args[i]));
+                design_cache_enabled = true;
+            }
+            _ if arg.starts_with("--cache-dir=") => {
+                design_cache_dir = Some(PathBuf::from(&arg["--cache-dir=".len()..]));
+                design_cache_enabled = true;
+            }
+            "--no-cache" => {
+                design_cache_enabled = false;
+            }
             "--emit-hypergraph" => {
                 i += 1;
                 if i < args.len() {
@@ -1163,6 +1340,22 @@ fn main() {
                     module_timescale_args.push(args[i].clone());
                 }
             }
+            _ if arg.starts_with("--module-timescale=") => {
+                module_timescale_args.push(arg["--module-timescale=".len()..].to_string());
+            }
+            // xrun-compat seed aliases (undocumented): lower onto `+seed=`.
+            "-svseed" | "-seed" => {
+                i += 1;
+                if i < args.len() {
+                    plusargs.push(format!("+seed={}", args[i]));
+                }
+            }
+            _ if arg.starts_with("-svseed=") => {
+                plusargs.push(format!("+seed={}", &arg["-svseed=".len()..]));
+            }
+            _ if arg.starts_with("-seed=") => {
+                plusargs.push(format!("+seed={}", &arg["-seed=".len()..]));
+            }
             _ if arg.starts_with('-') => {
                 eprintln!("Warning: unknown flag '{}' (ignored)", arg);
             }
@@ -1233,7 +1426,7 @@ suppressed but the explicit SDF annotation still applies."
             );
         }
     }
-    if !lib_dirs.is_empty() || !lib_files.is_empty() || lib_exts.is_some() {
+    if !lib_dirs.is_empty() || !lib_files.is_empty() || lib_exts.is_some() || primitive_verbose {
         xezim::set_library_cli(xezim::LibraryCli {
             lib_files: lib_files.clone(),
             lib_dirs: lib_dirs.clone(),
@@ -1249,6 +1442,23 @@ suppressed but the explicit SDF annotation still applies."
         }
     }
 
+    if design_cache_enabled && mode == Mode::Simulate {
+        let directory = design_cache_dir.clone().unwrap_or_else(default_design_cache_dir);
+        let dependency_files = design_dependency_files(&lib_files, &lib_dirs, lib_exts.as_deref());
+        let semantic_salt = format!(
+            "sv2023={};strict={};delay_select={};module_timescale={:?};lib_dirs={:?};lib_files={:?};lib_exts={:?};nospecify={}",
+            sv2023_mode, strict_checks, source_delay_select, module_timescale_args,
+            lib_dirs, lib_files, lib_exts, nospecify,
+        );
+        xezim::set_design_cache(Some(xezim::DesignCacheConfig {
+            directory,
+            semantic_salt,
+            dependency_files,
+        }));
+    } else {
+        xezim::set_design_cache(None);
+    }
+
     // Fast path: if the only source file is a xezim compiled artifact, load
     // it and jump straight to simulation (skip parse + elaborate).
     if source_files.len() == 1 && mode == Mode::Simulate {
@@ -1262,7 +1472,7 @@ suppressed but the explicit SDF annotation still applies."
                     Ok(Some(elab)) => {
                         println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
                         println!("Loaded compiled: {}", sf);
-                        println!("Max time: {}", max_time);
+                        println!("Max time: {} ns", max_time);
                         println!("------------------------------");
                         let total_start = std::time::Instant::now();
                         xezim::compiler::simulator::set_sim_debug(sim_debug);
@@ -1532,7 +1742,7 @@ suppressed but the explicit SDF annotation still applies."
     }
 
     println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
-    println!("Max time: {}", max_time);
+    println!("Max time: {} ns", max_time);
     println!("------------------------------");
     xezim::compiler::simulator::set_sim_debug(sim_debug);
     xezim::compiler::simulator::set_dump_timescales(dump_timescales);
