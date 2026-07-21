@@ -37201,6 +37201,23 @@ impl Simulator {
                 if let Some(w) = self.lookup_signal_width(&n) {
                     return w;
                 }
+                // A method formal or local variable has no signal entry —
+                // infer from the local's current Value width. Without this,
+                // `infer_width` fell back to 1 for ref parameters of
+                // class-handle type, truncating assoc-array `first(ref k)` /
+                // `next(ref k)` key writeback to a single bit (handle 2 → 0).
+                if h.path.len() == 1 {
+                    let name = &h.path[0].name.name;
+                    if let Some(w) = self
+                        .local_stack
+                        .last()
+                        .and_then(|m| m.get(name))
+                        .map(|v| v.width)
+                        .filter(|w| *w > 1)
+                    {
+                        return w;
+                    }
+                }
                 // A packed struct/union member (`word3.high`) has no leaf
                 // signal; its width comes from the parent's field layout. Needed
                 // so a concatenation LHS (`{word3.high, word3.low} = ...`) splits
@@ -49937,8 +49954,16 @@ impl Simulator {
                     let s = self.eval_expr(&base_expr).to_sv_string();
                     let r = if m == "tolower" { s.to_lowercase() } else { s.to_uppercase() };
                     return Value::from_string(&r);
-                } else {
-                    // atoi / atohex / atooct / atobin
+                } else if matches!(m.as_str(), "atoi" | "atohex" | "atooct" | "atobin") {
+                    // atoi / atohex / atooct / atobin only — the enum-method
+                    // names (first/last/next/prev/num) that also enter this
+                    // block must NOT fall through to the string-to-number
+                    // parse: a non-enum receiver (e.g. a class object whose
+                    // type defines a user `num()` method) must reach normal
+                    // method dispatch below. Without this guard,
+                    // `holder::the_pool.num()` parsed the object handle as a
+                    // decimal string and returned 0, silently swallowing the
+                    // user method call.
                     let s = self.eval_expr(&base_expr).to_sv_string();
                     let s = s.trim();
                     let (neg, body) = match s.strip_prefix('-') {
