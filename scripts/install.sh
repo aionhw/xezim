@@ -19,6 +19,14 @@
 
 set -euo pipefail
 
+# ---- Parse --local flag ----
+LOCAL_MODE=false
+for arg in "$@"; do
+    case "$arg" in
+        --local) LOCAL_MODE=true ;;
+    esac
+done
+
 # ---- Config ----
 WORKSPACE="$HOME/xezim-workspace"
 GITHUB_ORG="aionhw"
@@ -105,13 +113,20 @@ detect_os() {
 install_rust() {
     info "Checking Rust toolchain..."
     if command -v rustc &>/dev/null; then
-        RUST_VER=$(rustc --version | awk '{print $2}')
-        log "Rust already installed: v${RUST_VER}"
-        RUST_MAJOR=$(echo "$RUST_VER" | cut -d. -f1)
-        RUST_MINOR=$(echo "$RUST_VER" | cut -d. -f2)
-        if [ "$RUST_MAJOR" -lt 1 ] || ([ "$RUST_MAJOR" -eq 1 ] && [ "$RUST_MINOR" -lt 75 ]); then
-            warn "Rust ${RUST_VER} is below minimum 1.75. Updating..."
-            rustup update stable
+        RUST_VER=$(rustc --version 2>/dev/null | awk '{print $2}') || true
+        if [ -n "$RUST_VER" ]; then
+            log "Rust already installed: v${RUST_VER}"
+            RUST_MAJOR=$(echo "$RUST_VER" | cut -d. -f1)
+            RUST_MINOR=$(echo "$RUST_VER" | cut -d. -f2)
+            if [ "$RUST_MAJOR" -lt 1 ] || ([ "$RUST_MAJOR" -eq 1 ] && [ "$RUST_MINOR" -lt 75 ]); then
+                warn "Rust ${RUST_VER} is below minimum 1.75. Updating..."
+                rustup update stable
+            fi
+        else
+            # rustup shim exists but no toolchain installed — set default
+            rustup default stable 2>/dev/null || true
+            RUST_VER=$(rustc --version 2>/dev/null | awk '{print $2}') || true
+            [ -n "$RUST_VER" ] && log "Rust ready: v${RUST_VER}"
         fi
     else
         warn "Rust not found. Installing via rustup..."
@@ -135,6 +150,11 @@ install_rust() {
 
 # ---- Clone / update repositories ----
 clone_repos() {
+    if $LOCAL_MODE; then
+        info "Using local checkout..."
+        return
+    fi
+
     info "Setting up workspace at ${WORKSPACE}..."
     mkdir -p "$WORKSPACE"
 
@@ -148,7 +168,6 @@ clone_repos() {
         else
             info "Cloning $repo..."
             git clone --quiet --depth 1 "$repo_url" "$repo_dir"
-            # Shallow fetch tags for version detection
             cd "$repo_dir" && git fetch --depth 1 --tags --quiet 2>/dev/null || true
         fi
         log "$repo ready."
@@ -158,6 +177,21 @@ clone_repos() {
         fail "xezim-core/xezim-parser not found! Clone may be incomplete."
     fi
     log "Workspace ready."
+}
+
+# ---- Verify workspace (local or cloned) ----
+verify_workspace() {
+    if $LOCAL_MODE; then
+        local local_dir
+        local_dir="$(cd "$(dirname "$0")/.." && pwd)"
+        # Ensure xezim-core is a sibling
+        if [ ! -d "$local_dir/../xezim-core/xezim-parser" ]; then
+            info "Cloning xezim-core as sibling..."
+            git clone --quiet --depth 1 "https://github.com/${GITHUB_ORG}/xezim-core.git" "$local_dir/../xezim-core"
+        fi
+        WORKSPACE="$(cd "$local_dir/.." && pwd)"
+        log "Local workspace: $WORKSPACE"
+    fi
 }
 
 # ---- Detect tag and checkout ----
@@ -330,6 +364,7 @@ echo ""
 
 install_rust
 clone_repos
+verify_workspace
 resolve_tag
 
 # Quick exit if xezim already matches the target tag
