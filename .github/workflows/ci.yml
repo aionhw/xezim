@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write  # needed to post auto-fix suggestions on PRs
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+      # Clone xezim-core as sibling — required for cargo fmt/clippy to resolve path = "../xezim-core"
+      - name: Clone xezim-core
+        run: git clone --depth 1 https://github.com/aionhw/xezim-core.git ../xezim-core
+      - name: Check formatting
+        id: fmt
+        run: cargo fmt --check
+      - name: Post auto-fix suggestion
+        if: steps.fmt.outcome == 'failure' && github.event_name == 'pull_request'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ## ❌ Formatting check failed
+
+            The `cargo fmt` check found code that doesn't follow Rust style conventions.
+
+            **To fix:** Comment `/fix-lint` on this PR — it will run `cargo fmt` and push the fixes automatically.
+      # Clippy scoped to xezim only (--no-deps ignores sibling repo warnings)
+      - name: Lint
+        id: clippy
+        run: cargo clippy --no-deps -p xezim
+        continue-on-error: true  # FIXME: remove once source warnings are cleaned up
+      # Posts a PR comment when clippy finds issues, so user knows to run /fix-lint
+      - name: Post auto-fix suggestion
+        if: steps.clippy.outcome == 'failure' && github.event_name == 'pull_request'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ## ⚠️ Clippy has suggestions
+
+            `cargo clippy` found some code patterns that could be improved.
+
+            **To fix:** Comment `/fix-lint` on this PR — it will run `cargo clippy --fix` and `cargo fmt` automatically.
+
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tests the install script end-to-end: clones both repos, builds, and installs xezim
+      - name: Run installer
+        run: |
+          bash scripts/install.sh
+
+      - name: Verify xezim
+        run: |
+          ~/xezim-workspace/xezim/target/release/xezim --help
+          ~/xezim-workspace/xezim/target/release/xezim --version
+
+      - name: Run smoke test
+        run: |
+          cd ~/xezim-workspace/xezim
+          ./target/release/xezim --version
+
+      - name: Run test suite
+        run: |
+          cd ~/xezim-workspace/xezim
+          cargo test --release
+
+  install-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run installer
+        run: .\scripts\install.ps1
+
+      - name: Verify xezim
+        run: |
+          $bin = "$env:USERPROFILE\xezim-workspace\xezim\target\release\xezim.exe"
+          & $bin --help
+          & $bin --version

@@ -1,0 +1,44 @@
+name: Fix Lint
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  fix-lint:
+    if: >-
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/fix-lint')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+
+      - name: Clone xezim-core (sibling dependency)
+        run: git clone --depth 1 https://github.com/aionhw/xezim-core.git ../xezim-core
+
+      - name: Auto-fix formatting
+        run: cargo fmt
+
+      - name: Auto-fix clippy
+        run: cargo clippy --fix --no-deps -p xezim --allow-dirty 2>&1 || true
+
+      - name: Re-format after clippy fixes
+        run: cargo fmt
+
+      - name: Commit and push fixes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "style: apply cargo fmt and clippy --fix (auto)"
+          commit_user_name: "fix-lint[bot]"
+          commit_user_email: "fix-lint[bot]@users.noreply.github.com"
