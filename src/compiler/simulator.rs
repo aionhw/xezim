@@ -5218,6 +5218,7 @@ impl Simulator {
                             .map_or(false, |cb| {
                                 cb.instructions.iter().any(|i| match i {
                                     super::bytecode::Insn::NbaAssign(s, _, _)
+                                    | super::bytecode::Insn::NbaAssignConst(s, _, _)
                                     | super::bytecode::Insn::NbaAssignRange(s, _, _, _) => {
                                         *s == sid
                                     }
@@ -5239,7 +5240,8 @@ impl Simulator {
                                     super::bytecode::Insn::LoadSignal(_, s)
                                     | super::bytecode::Insn::LoadSignalSigned(_, s)
                                     | super::bytecode::Insn::LoadSignalRange(_, s, _, _)
-                                    | super::bytecode::Insn::LoadSignalBit(_, s, _) if *s == sid)
+                                    | super::bytecode::Insn::LoadSignalBit(_, s, _)
+                                    | super::bytecode::Insn::BranchIfSignalFalse(s, _) if *s == sid)
                                 })
                             })
                     })
@@ -5384,13 +5386,15 @@ impl Simulator {
                     super::bytecode::Insn::LoadSignal(_, sid)
                     | super::bytecode::Insn::LoadSignalSigned(_, sid)
                     | super::bytecode::Insn::LoadSignalRange(_, sid, _, _)
-                    | super::bytecode::Insn::LoadSignalBit(_, sid, _) => {
+                    | super::bytecode::Insn::LoadSignalBit(_, sid, _)
+                    | super::bytecode::Insn::BranchIfSignalFalse(sid, _) => {
                         if !reads_of[bi].contains(sid) {
                             reads_of[bi].push(*sid);
                             readers_of_sig.entry(*sid).or_default().push(bi);
                         }
                     }
                     super::bytecode::Insn::NbaAssign(sid, _, _)
+                    | super::bytecode::Insn::NbaAssignConst(sid, _, _)
                     | super::bytecode::Insn::NbaAssignRange(sid, _, _, _) => {
                         if !writes_of[bi].contains(sid) {
                             writes_of[bi].push(*sid);
@@ -5596,6 +5600,7 @@ impl Simulator {
                         break;
                     }
                     Insn::NbaAssign(id, _, _)
+                    | Insn::NbaAssignConst(id, _, _)
                     | Insn::NbaAssignRange(id, _, _, _)
                     | Insn::NbaAssignBitDyn(id, _, _) => {
                         let owner = lp_writer.get(*id).copied().unwrap_or(None);
@@ -5664,6 +5669,7 @@ impl Simulator {
             for insn in &cb.instructions {
                 let sig_id = match insn {
                     Insn::NbaAssign(id, _, _) => *id,
+                    Insn::NbaAssignConst(id, _, _) => *id,
                     Insn::NbaAssignRange(id, _, _, _) => *id,
                     Insn::NbaAssignBitDyn(id, _, _) => *id,
                     Insn::NbaAssignRangeDyn(id, _, _, _) => *id,
@@ -5811,8 +5817,10 @@ impl Simulator {
                     super::bytecode::Insn::LoadSignal(_, sid)
                     | super::bytecode::Insn::LoadSignalSigned(_, sid)
                     | super::bytecode::Insn::LoadSignalRange(_, sid, _, _)
-                    | super::bytecode::Insn::LoadSignalBit(_, sid, _) => *sid,
+                    | super::bytecode::Insn::LoadSignalBit(_, sid, _)
+                    | super::bytecode::Insn::BranchIfSignalFalse(sid, _) => *sid,
                     super::bytecode::Insn::NbaAssign(sid, _, _)
+                    | super::bytecode::Insn::NbaAssignConst(sid, _, _)
                     | super::bytecode::Insn::NbaAssignRange(sid, _, _, _) => *sid,
                     _ => continue,
                 };
@@ -8497,6 +8505,7 @@ impl Simulator {
                     for ins in &compiled.instructions {
                         match ins {
                             Insn::NbaAssign(..)
+                            | Insn::NbaAssignConst(..)
                             | Insn::NbaAssignRange(..)
                             | Insn::NbaAssignRangeDyn(..)
                             | Insn::NbaAssignBitDyn(..)
@@ -8561,6 +8570,7 @@ impl Simulator {
                     matches!(
                         i,
                         Insn::NbaAssign(..)
+                            | Insn::NbaAssignConst(..)
                             | Insn::NbaAssignRange(..)
                             | Insn::NbaAssignRangeDyn(..)
                             | Insn::NbaAssignBitDyn(..)
@@ -8753,7 +8763,9 @@ impl Simulator {
                 let touched_id = match insn {
                     Insn::LoadSignal(_, id) | Insn::LoadSignalSigned(_, id) => Some(*id),
                     Insn::LoadSignalRange(_, id, _, _) | Insn::LoadSignalBit(_, id, _) => Some(*id),
+                    Insn::BranchIfSignalFalse(id, _) => Some(*id),
                     Insn::NbaAssign(id, _, _) => Some(*id),
+                    Insn::NbaAssignConst(id, _, _) => Some(*id),
                     Insn::NbaAssignRange(id, _, _, _) => Some(*id),
                     Insn::NbaAssignBitDyn(id, _, _) => Some(*id),
                     Insn::NbaAssignRangeDyn(id, _, _, _) => Some(*id),
@@ -9563,6 +9575,7 @@ impl Simulator {
                 for insn in &cb.instructions {
                     let wid = match insn {
                         Insn::NbaAssign(id, _, _)
+                        | Insn::NbaAssignConst(id, _, _)
                         | Insn::NbaAssignRange(id, _, _, _)
                         | Insn::NbaAssignBitDyn(id, _, _)
                         | Insn::NbaAssignRangeDyn(id, _, _, _) => Some(*id),
@@ -10748,6 +10761,7 @@ impl Simulator {
             for insn in &cb.instructions {
                 let wid = match insn {
                     Insn::NbaAssign(id, _, _)
+                    | Insn::NbaAssignConst(id, _, _)
                     | Insn::NbaAssignRange(id, _, _, _)
                     | Insn::NbaAssignBitDyn(id, _, _)
                     | Insn::NbaAssignRangeDyn(id, _, _, _) => Some(*id),
@@ -10787,6 +10801,7 @@ impl Simulator {
             for insn in &cb.instructions {
                 let wid = match insn {
                     Insn::NbaAssign(id, _, _)
+                    | Insn::NbaAssignConst(id, _, _)
                     | Insn::NbaAssignRange(id, _, _, _)
                     | Insn::NbaAssignBitDyn(id, _, _)
                     | Insn::NbaAssignRangeDyn(id, _, _, _) => Some(*id),
@@ -10803,7 +10818,8 @@ impl Simulator {
                 if let Insn::LoadSignal(_, id)
                 | Insn::LoadSignalSigned(_, id)
                 | Insn::LoadSignalRange(_, id, _, _)
-                | Insn::LoadSignalBit(_, id, _) = insn
+                | Insn::LoadSignalBit(_, id, _)
+                | Insn::BranchIfSignalFalse(id, _) = insn
                 {
                     if *id < n_signals {
                         read_edge[*id] |= 1 << blp;
@@ -11717,6 +11733,7 @@ impl Simulator {
                             matches!(
                                 i,
                                 super::bytecode::Insn::NbaAssign(..)
+                                    | super::bytecode::Insn::NbaAssignConst(..)
                                     | super::bytecode::Insn::NbaAssignRange(..)
                                     | super::bytecode::Insn::NbaAssignRangeDyn(..)
                                     | super::bytecode::Insn::NbaAssignBitDyn(..)
@@ -11894,6 +11911,7 @@ impl Simulator {
                 for insn in &cb.instructions {
                     let id = match insn {
                         super::bytecode::Insn::NbaAssign(id, _, _)
+                        | super::bytecode::Insn::NbaAssignConst(id, _, _)
                         | super::bytecode::Insn::NbaAssignRange(id, _, _, _)
                         | super::bytecode::Insn::NbaAssignBitDyn(id, _, _)
                         | super::bytecode::Insn::NbaAssignRangeDyn(id, _, _, _) => *id,
@@ -12059,6 +12077,7 @@ impl Simulator {
                 for insn in &cb.instructions {
                     let id = match insn {
                         Insn::NbaAssign(id, _, _)
+                        | Insn::NbaAssignConst(id, _, _)
                         | Insn::NbaAssignRange(id, _, _, _)
                         | Insn::NbaAssignBitDyn(id, _, _)
                         | Insn::NbaAssignRangeDyn(id, _, _, _) => *id,
@@ -12302,6 +12321,30 @@ impl Simulator {
                 }
                 Insn::BranchIfFalse(reg, target) => {
                     if !vm_regs[*reg as usize].is_true() {
+                        pc = *target as usize;
+                        continue;
+                    }
+                }
+                Insn::NbaAssignConst(sig_id, k, _width) => {
+                    // Const pre-resized at fuse time: compare, clone only on change.
+                    if signal_table[*sig_id] != **k {
+                        nba_out.push(NbaFast {
+                            signal_id: *sig_id,
+                            value: (**k).clone(),
+                            block_index,
+                        });
+                    }
+                }
+                Insn::BranchUnlessZero(reg, target) => {
+                    // Fused LogNot+BranchIfFalse: jump unless DEFINITE zero —
+                    // exact composition of logic_not with !is_true (X branches).
+                    if vm_regs[*reg as usize].is_nonzero() != Some(false) {
+                        pc = *target as usize;
+                        continue;
+                    }
+                }
+                Insn::BranchIfSignalFalse(sig_id, target) => {
+                    if !signal_table[*sig_id].is_true() {
                         pc = *target as usize;
                         continue;
                     }
@@ -12671,6 +12714,30 @@ impl Simulator {
                 }
                 Insn::BranchIfFalse(reg, target) => {
                     if !vm_regs[*reg as usize].is_true() {
+                        pc = *target as usize;
+                        continue;
+                    }
+                }
+                Insn::NbaAssignConst(sig_id, k, _width) => {
+                    // Const pre-resized at fuse time: compare, clone only on change.
+                    if view[*sig_id] != **k {
+                        nba_out.push(NbaFast {
+                            signal_id: *sig_id,
+                            value: (**k).clone(),
+                            block_index,
+                        });
+                    }
+                }
+                Insn::BranchUnlessZero(reg, target) => {
+                    // Fused LogNot+BranchIfFalse: jump unless DEFINITE zero —
+                    // exact composition of logic_not with !is_true (X branches).
+                    if vm_regs[*reg as usize].is_nonzero() != Some(false) {
+                        pc = *target as usize;
+                        continue;
+                    }
+                }
+                Insn::BranchIfSignalFalse(sig_id, target) => {
+                    if !view[*sig_id].is_true() {
                         pc = *target as usize;
                         continue;
                     }
@@ -13204,6 +13271,33 @@ impl Simulator {
                 }
                 Insn::BranchIfFalse(reg, target) => {
                     if !self.vm_regs[*reg as usize].is_true() {
+                        pc = *target as usize;
+                        continue;
+                    }
+                }
+                Insn::NbaAssignConst(sig_id, k, _width) => {
+                    // Const pre-resized at fuse time: compare, clone only on change.
+                    if self.signal_table[*sig_id] != **k {
+                        self.nba_fast_index.insert(*sig_id, self.nba_fast.len());
+                        self.nba_fast.push(NbaFast {
+                            block_index: 0,
+                            signal_id: *sig_id,
+                            value: (**k).clone(),
+                        });
+                    } else {
+                        self.prof_nba_elided += 1;
+                    }
+                }
+                Insn::BranchUnlessZero(reg, target) => {
+                    // Fused LogNot+BranchIfFalse: jump unless DEFINITE zero —
+                    // exact composition of logic_not with !is_true (X branches).
+                    if self.vm_regs[*reg as usize].is_nonzero() != Some(false) {
+                        pc = *target as usize;
+                        continue;
+                    }
+                }
+                Insn::BranchIfSignalFalse(sig_id, target) => {
+                    if !self.signal_table[*sig_id].is_true() {
                         pc = *target as usize;
                         continue;
                     }
@@ -17948,6 +18042,8 @@ impl Simulator {
     fn print_edge_block_stats(&self) {
         let mut opcode_counts: std::collections::HashMap<&'static str, u64> =
             std::collections::HashMap::new();
+        let mut pair_counts: std::collections::HashMap<(&'static str, &'static str), u64> =
+            std::collections::HashMap::new();
         let mut blocks: Vec<(u64, u64, usize, usize, u32, String)> = Vec::new();
 
         for (idx, count) in self.edge_block_exec_counts.iter().copied().enumerate() {
@@ -17964,6 +18060,21 @@ impl Simulator {
                     .or_insert(0) += count;
                 if let Some(id) = Self::edge_insn_signal_id(insn) {
                     max_width = max_width.max(self.signal_widths.get(id).copied().unwrap_or(0));
+                }
+            }
+            // Adjacent-pair census for fusion targeting: what consumes each
+            // LoadConst, and what feeds each BranchIfFalse.
+            for w in cb.instructions.windows(2) {
+                use super::bytecode::Insn;
+                if matches!(w[0], Insn::LoadConst(..)) {
+                    *pair_counts
+                        .entry(("LoadConst>", Self::edge_opcode_name(&w[1])))
+                        .or_insert(0) += count;
+                }
+                if matches!(w[1], Insn::BranchIfFalse(..)) {
+                    *pair_counts
+                        .entry((">BranchIfFalse", Self::edge_opcode_name(&w[0])))
+                        .or_insert(0) += count;
                 }
             }
             let scope = self
@@ -17988,6 +18099,13 @@ impl Simulator {
         eprintln!("[EDGE_STATS] top opcodes by dynamic count:");
         for (name, count) in op_vec.into_iter().take(24) {
             eprintln!("[EDGE_STATS]   {:>24}: {}", name, count);
+        }
+
+        let mut pair_vec: Vec<_> = pair_counts.into_iter().collect();
+        pair_vec.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        eprintln!("[EDGE_STATS] top fusion-candidate pairs by dynamic count:");
+        for ((tag, other), count) in pair_vec.into_iter().take(20) {
+            eprintln!("[EDGE_STATS]   {:>16} {:<24}: {}", tag, other, count);
         }
 
         blocks.sort_by_key(|(dyn_insns, _, _, _, _, _)| std::cmp::Reverse(*dyn_insns));
@@ -18046,6 +18164,9 @@ impl Simulator {
             Insn::Select(..) => "Select",
             Insn::Jump(..) => "Jump",
             Insn::NbaAssign(..) => "NbaAssign",
+            Insn::NbaAssignConst(..) => "NbaAssignConst",
+            Insn::BranchUnlessZero(..) => "BranchUnlessZero",
+            Insn::BranchIfSignalFalse(..) => "BranchIfSignalFalse",
             Insn::NbaAssignRange(..) => "NbaAssignRange",
             Insn::NbaAssignRangeDyn(..) => "NbaAssignRangeDyn",
             Insn::NbaAssignBitDyn(..) => "NbaAssignBitDyn",
@@ -18075,6 +18196,8 @@ impl Simulator {
             | Insn::LoadSignalRange(_, id, _, _)
             | Insn::LoadSignalBit(_, id, _)
             | Insn::NbaAssign(id, _, _)
+            | Insn::NbaAssignConst(id, _, _)
+            | Insn::BranchIfSignalFalse(id, _)
             | Insn::NbaAssignRange(id, _, _, _)
             | Insn::NbaAssignRangeDyn(id, _, _, _)
             | Insn::NbaAssignBitDyn(id, _, _)
@@ -37583,7 +37706,8 @@ impl Simulator {
                     Insn::LoadSignal(_, s)
                     | Insn::LoadSignalSigned(_, s)
                     | Insn::LoadSignalRange(_, s, _, _)
-                    | Insn::LoadSignalBit(_, s, _) => {
+                    | Insn::LoadSignalBit(_, s, _)
+                    | Insn::BranchIfSignalFalse(s, _) => {
                         if seen.insert(*s as u32) {
                             reads.push(*s as u32);
                         }
@@ -37743,6 +37867,8 @@ impl Simulator {
                 | Insn::LoadSignalRange(_, id, ..)
                 | Insn::LoadSignalBit(_, id, _)
                 | Insn::NbaAssign(id, ..)
+                | Insn::NbaAssignConst(id, ..)
+                | Insn::BranchIfSignalFalse(id, _)
                 | Insn::NbaAssignRange(id, ..)
                 | Insn::NbaAssignRangeDyn(id, ..)
                 | Insn::NbaAssignBitDyn(id, ..)

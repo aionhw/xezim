@@ -153,6 +153,19 @@ pub enum Insn {
     LoadSignalRange(RegId, usize, u32, u32), // (dest, signal_id, left, right)
     /// Fused `LoadSignal` + `BitSelectConst`: dest = signal_table[sig][index].
     LoadSignalBit(RegId, usize, u32), // (dest, signal_id, index)
+
+    /// Fused `LoadConst` + `NbaAssign`: signal_table[id] <= K. The dominant
+    /// reset-value NBA shape (33M dynamic pairs on the c910 memcpy census) —
+    /// skips one dispatch and one 32-byte register write per execution.
+    NbaAssignConst(usize, Box<Value>, u32), // (signal_id, const, width)
+    /// Fused `LogNot` + `BranchIfFalse`: jump unless the register is
+    /// DEFINITE zero (`is_nonzero() == Some(false)`) — the exact composition
+    /// of `logic_not` (Some(true)→0, Some(false)→1, None→X) with
+    /// `!is_true(..)`, so X conditions branch exactly as before.
+    BranchUnlessZero(RegId, u32), // (cond_reg, jump_target)
+    /// Fused `LoadSignal` + `BranchIfFalse`: jump unless
+    /// signal_table[id].is_true() — no register copy of the signal.
+    BranchIfSignalFalse(usize, u32), // (signal_id, jump_target)
 }
 
 /// Pre-resolved unpacked-array addressing embedded in bytecode. The name is
@@ -2792,8 +2805,11 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::LoadSignalSigned(..)
             | Insn::LoadSignalRange(..)
             | Insn::LoadSignalBit(..)
+            | Insn::NbaAssignConst(..)
+            | Insn::BranchIfSignalFalse(..)
             | Insn::Jump(..)
             | Insn::Nop => false,
+            Insn::BranchUnlessZero(c, _) => *c == r,
             // In-place mutators read their register.
             Insn::Resize(a, _) | Insn::SetSigned(a) => *a == r,
             Insn::Add(_, l, rr)
@@ -2865,13 +2881,17 @@ impl<'a> BytecodeCompiler<'a> {
     /// `XEZIM_FUSE=0` disables the pass (A/B escape hatch).
     fn fuse_load_selects(insns: &mut [Insn]) {
         use std::sync::OnceLock;
-        // 0 = off, 1 = range only, 2 = bit only, 3 = both (default).
+        // Bit-set: 1 = load+range, 2 = load+bit, 4 = const-NBA, 8 = branch
+        // fusions. Default = all on; named values select one family for A/B
+        // bisection.
         static MODE: OnceLock<u8> = OnceLock::new();
         let mode = *MODE.get_or_init(|| match std::env::var("XEZIM_FUSE").as_deref() {
             Ok("0") => 0,
             Ok("range") => 1,
             Ok("bit") => 2,
-            _ => 3,
+            Ok("nba") => 4,
+            Ok("branch") => 8,
+            _ => 0xF,
         });
         if mode == 0 || insns.len() < 2 {
             return;
@@ -2880,7 +2900,10 @@ impl<'a> BytecodeCompiler<'a> {
         let mut is_target = vec![false; insns.len() + 1];
         for insn in insns.iter() {
             match insn {
-                Insn::BranchIfFalse(_, t) | Insn::Jump(t) => {
+                Insn::BranchIfFalse(_, t)
+                | Insn::BranchUnlessZero(_, t)
+                | Insn::BranchIfSignalFalse(_, t)
+                | Insn::Jump(t) => {
                     if (*t as usize) < is_target.len() {
                         is_target[*t as usize] = true;
                     }
@@ -2888,6 +2911,48 @@ impl<'a> BytecodeCompiler<'a> {
                 _ => {}
             }
         }
+        // Second family: pairs whose fused form has NO destination register —
+        // the first insn's register must simply be dead everywhere else.
+        //   LoadConst K ; NbaAssign(sig, k, w)        → NbaAssignConst
+        //   LogNot(d,s) ; BranchIfFalse(d, T)         → BranchUnlessZero(s, T)
+        //   LoadSignal(t,s) ; BranchIfFalse(t, T)     → BranchIfSignalFalse(s, T)
+        for i in 0..insns.len() - 1 {
+            if is_target[i + 1] {
+                continue;
+            }
+            let (dead_reg, repl) = match (&insns[i], &insns[i + 1]) {
+                (Insn::LoadConst(c, k), &Insn::NbaAssign(sig, v, w))
+                    if v == *c && (mode & 4) != 0 =>
+                {
+                    // Pre-resize at fuse time — the exec arm then only
+                    // compares + clones-on-change, never resizes.
+                    (*c, Insn::NbaAssignConst(sig, Box::new(k.resize_for_assign(w)), w))
+                }
+                (&Insn::LogNot(d, s), &Insn::BranchIfFalse(c, t))
+                    if c == d && (mode & 8) != 0 =>
+                {
+                    (d, Insn::BranchUnlessZero(s, t))
+                }
+                (&Insn::LoadSignal(r, sig), &Insn::BranchIfFalse(c, t))
+                    if c == r && (mode & 8) != 0 =>
+                {
+                    (r, Insn::BranchIfSignalFalse(sig, t))
+                }
+                _ => continue,
+            };
+            // The fused form never writes `dead_reg`, so ANY other read of it
+            // in the block blocks the fusion (no d==t exemption here).
+            let consumed = insns
+                .iter()
+                .enumerate()
+                .any(|(j, x)| j != i && j != i + 1 && Self::insn_reads_reg(x, dead_reg));
+            if consumed {
+                continue;
+            }
+            insns[i] = repl;
+            insns[i + 1] = Insn::Nop;
+        }
+
         for i in 0..insns.len() - 1 {
             let &Insn::LoadSignal(t, sig) = &insns[i] else {
                 continue;
