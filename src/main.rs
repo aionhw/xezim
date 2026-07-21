@@ -472,6 +472,7 @@ fn process_command_file(
     lib_exts: &mut Option<Vec<String>>,
     nospecify: &mut bool,
     primitive_verbose: &mut bool,
+    module_timescale_args: &mut Vec<String>,
 ) -> Result<(), String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Cannot read command file '{}': {}", path, e))?;
@@ -561,6 +562,7 @@ fn process_command_file(
                             lib_exts,
                             nospecify,
                             primitive_verbose,
+                            module_timescale_args,
                         )?;
                     }
                 }
@@ -588,6 +590,7 @@ fn process_command_file(
                         lib_exts,
                         nospecify,
                         primitive_verbose,
+                        module_timescale_args,
                     )?;
                 }
                 _ if t.starts_with("+incdir+") => {
@@ -603,10 +606,47 @@ fn process_command_file(
                     push_plus_define(t, defines);
                 }
                 _ if handle_gls_flag(t) => {}
+                // `--module-timescale <v>` / `--module-timescale=<v>` inside an
+                // args file (a customer args file used the `=` form; it was
+                // silently ignored and every no-`timescale module fell back to
+                // the default — see the warn arm below).
+                "--module-timescale" => {
+                    if i + 1 < toks.len() {
+                        i += 1;
+                        module_timescale_args.push(toks[i].to_string());
+                    }
+                }
+                _ if t.starts_with("--module-timescale=") => {
+                    module_timescale_args.push(t["--module-timescale=".len()..].to_string());
+                }
+                // xrun-compat seed aliases: `-svseed <n>` / `-svseed=<n>`
+                // (and `-seed` likewise) lower onto the `+seed=` plusarg the
+                // simulator already consumes.
+                "-svseed" | "-seed" => {
+                    if i + 1 < toks.len() {
+                        i += 1;
+                        plusargs.push(format!("+seed={}", toks[i]));
+                    }
+                }
+                _ if t.starts_with("-svseed=") => {
+                    plusargs.push(format!("+seed={}", &t["-svseed=".len()..]));
+                }
+                _ if t.starts_with("-seed=") => {
+                    plusargs.push(format!("+seed={}", &t["-seed=".len()..]));
+                }
                 _ if t.starts_with('+') => {
                     plusargs.push(t.to_string());
                 }
-                _ if t.starts_with('-') => {}
+                _ if t.starts_with('-') => {
+                    // An option this parser does not understand. NEVER swallow
+                    // it silently — a customer args file lost its
+                    // `--module-timescale=` (timescale silently defaulted) and
+                    // nearly its seed to exactly that.
+                    eprintln!(
+                        "[xezim][warning] ignored unrecognized option '{}' in args file '{}'",
+                        t, path
+                    );
+                }
                 _ => {
                     source_files.push(resolve_rel(base, t));
                 }
@@ -809,6 +849,7 @@ fn main() {
                         &mut lib_exts,
                         &mut nospecify,
                         &mut primitive_verbose,
+                        &mut module_timescale_args,
                     ) {
                         Ok(()) => {}
                         Err(e) => {
@@ -830,6 +871,7 @@ fn main() {
                     &mut lib_exts,
                     &mut nospecify,
                     &mut primitive_verbose,
+                    &mut module_timescale_args,
                 ) {
                     Ok(()) => {}
                     Err(e) => {
@@ -1237,6 +1279,22 @@ fn main() {
                 if i < args.len() {
                     module_timescale_args.push(args[i].clone());
                 }
+            }
+            _ if arg.starts_with("--module-timescale=") => {
+                module_timescale_args.push(arg["--module-timescale=".len()..].to_string());
+            }
+            // xrun-compat seed aliases (undocumented): lower onto `+seed=`.
+            "-svseed" | "-seed" => {
+                i += 1;
+                if i < args.len() {
+                    plusargs.push(format!("+seed={}", args[i]));
+                }
+            }
+            _ if arg.starts_with("-svseed=") => {
+                plusargs.push(format!("+seed={}", &arg["-svseed=".len()..]));
+            }
+            _ if arg.starts_with("-seed=") => {
+                plusargs.push(format!("+seed={}", &arg["-seed=".len()..]));
             }
             _ if arg.starts_with('-') => {
                 eprintln!("Warning: unknown flag '{}' (ignored)", arg);
