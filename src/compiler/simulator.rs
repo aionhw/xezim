@@ -7446,7 +7446,7 @@ impl Simulator {
                         .get(i)
                         .map(|e| self.eval_expr(e))
                         .unwrap_or_else(|| Value::zero(*width));
-                    let (mut aval, mut bval) = Self::dpi_value_to_logic_words(&vv, *width);
+                    let (aval, bval) = Self::dpi_value_to_logic_words(&vv, *width);
                     // CRITICAL: store in Vec FIRST, then capture pointer.
                     // Otherwise Vec push may reallocate, invalidating the pointer.
                     logic_aval.push(aval);
@@ -27629,6 +27629,7 @@ impl Simulator {
                         Value::zero(32)
                     }
                 }
+                // §6.24.1 literal size cast `N'(x)` — lowered by the parser.
                 "$__xz_size_cast" => {
                     let n = args
                         .first()
@@ -28071,7 +28072,7 @@ impl Simulator {
                 }
                 // §21.3.8 `$feof(fd)`: returns nonzero if the file is at EOF.
                 "$feof" => {
-                    use std::io::{Read, Seek, SeekFrom};
+                    use std::io::{Seek, SeekFrom};
                     let fd = args
                         .first()
                         .map(|a| self.eval_file_handle_arg(a))
@@ -28425,21 +28426,6 @@ impl Simulator {
                     let v = real1(args, &mut |a| self.eval_expr(a));
                     Value::from_f64(v.atanh())
                 }
-                "$clog2" => {
-                    let v = args
-                        .first()
-                        .map(|a| self.eval_expr(a))
-                        .unwrap_or(Value::zero(32));
-                    let n = v.to_u64().unwrap_or(0);
-                    Value::from_u64(
-                        if n <= 1 {
-                            0
-                        } else {
-                            64 - (n - 1).leading_zeros() as u64
-                        },
-                        32,
-                    )
-                }
                 // §6.24.1 TYPE cast `int'(x)` / `real'(x)` — lowered by the
                 // parser. A real → integral cast ROUNDS (§6.12.2); an integral
                 // → real cast widens; otherwise resize to the type's width and
@@ -28535,54 +28521,6 @@ impl Simulator {
                     }
                     // Unknown cast target: pass the operand through unchanged.
                     return inner_v;
-                }
-                // §20.8.2 real math library.
-                "$sin" | "$cos" | "$tan" | "$asin" | "$acos" | "$atan" | "$sinh" | "$cosh"
-                | "$tanh" | "$asinh" | "$acosh" | "$atanh" => {
-                    let x = args
-                        .first()
-                        .map(|a| self.eval_expr(a).to_f64())
-                        .unwrap_or(0.0);
-                    let r = match name.as_str() {
-                        "$sin" => x.sin(),
-                        "$cos" => x.cos(),
-                        "$tan" => x.tan(),
-                        "$asin" => x.asin(),
-                        "$acos" => x.acos(),
-                        "$atan" => x.atan(),
-                        "$sinh" => x.sinh(),
-                        "$cosh" => x.cosh(),
-                        "$tanh" => x.tanh(),
-                        "$asinh" => x.asinh(),
-                        "$acosh" => x.acosh(),
-                        _ => x.atanh(),
-                    };
-                    Value::from_f64(r)
-                }
-                "$atan2" | "$hypot" => {
-                    let x = args
-                        .first()
-                        .map(|a| self.eval_expr(a).to_f64())
-                        .unwrap_or(0.0);
-                    let y = args
-                        .get(1)
-                        .map(|a| self.eval_expr(a).to_f64())
-                        .unwrap_or(0.0);
-                    Value::from_f64(if name == "$atan2" {
-                        x.atan2(y)
-                    } else {
-                        x.hypot(y)
-                    })
-                }
-                // §6.24.1 literal size cast `N'(x)` — lowered by the parser.
-                "$__xz_size_cast" => {
-                    let n = args
-                        .first()
-                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(32))
-                        .unwrap_or(32) as u32;
-                    args.get(1)
-                        .map(|a| self.eval_expr(a).resize(n.max(1)))
-                        .unwrap_or_else(|| Value::zero(n.max(1)))
                 }
                 "$shortrealtobits" => {
                     let v = args
@@ -29217,7 +29155,7 @@ impl Simulator {
                         // matching the base_val width (handles queue elements
                         // where the element type isn't directly registered for
                         // the queue variable name).
-                        for (td_name, td) in &self.module.typedef_types {
+                        for (_td_name, td) in &self.module.typedef_types {
                             let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
                             if let Some(fields) = Self::struct_field_layout(&resolved) {
                                 let total_w: u32 = fields.iter().map(|(_, _, w, _)| w).sum();
@@ -33674,7 +33612,6 @@ impl Simulator {
                                 }
                                 continue;
                             }
-                            _ => {}
                         }
                     }
                     if let Some((lo, hi)) = range {
@@ -37382,7 +37319,6 @@ impl Simulator {
     /// latent JIT codegen bugs.  Keep signal_has_xz updates limited to
     /// `write_sig!` (full-Value writes) for backward-compatible JIT
     /// behavior.
-    #[inline(always)]
     /// Dirty-driven edge detect: record a write to signal `id` so check_edges
     /// can later scan only changed edge-sensitive positions. No-op (one bool
     /// load) unless XEZIM_DIRTY_EDGE / _SHADOW is active.
@@ -61788,7 +61724,7 @@ union s_vpi_value_union {
 }
 
 #[repr(C)]
-struct s_vpi_value {
+pub struct s_vpi_value {
     format: libc::c_int,
     value: s_vpi_value_union,
 }
@@ -63208,7 +63144,7 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
     // A constant argument carries its own value and needs no simulator.
     if h.kind == VpiKind::Constant {
         let ok = match &h.value {
-            Some(v) => fill_vpi_value(v, 0, vp),
+            Some(v) => fill_vpi_value(v, 0, Some(h.type_code), vp),
             None => false,
         };
         if !ok {
@@ -63250,7 +63186,7 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
             }
         };
         let current_time = sim.time;
-        fill_vpi_value(&val, current_time, vp)
+        fill_vpi_value(&val, current_time, Some(h.type_code), vp)
     })
     .unwrap_or(false);
 
@@ -63271,18 +63207,26 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
 /// Shared by `vpi_get_value` and the value-change dispatcher, so a
 /// callback sees its trigger object's value in exactly the format a
 /// direct read would have produced.
-fn fill_vpi_value(val: &Value, _current_time: u64, vp: &mut s_vpi_value) -> bool {
+fn fill_vpi_value(
+    val: &Value,
+    _current_time: u64,
+    obj_type_code: Option<libc::c_int>,
+    vp: &mut s_vpi_value,
+) -> bool {
     {
         // vpiObjTypeVal: the simulator picks the object's natural format
         // and reports which one it chose in `format`.
         let mut format = vp.format;
         if format == vpi::OBJ_TYPE_VAL {
-            format = if val.is_real {
-                vpi::REAL_VAL
-            } else if val.width <= 32 {
-                vpi::INT_VAL
-            } else {
-                vpi::VECTOR_VAL
+            format = match obj_type_code {
+                // Preserve declaration-typed object flavor when known.
+                Some(vpi::STRING_VAR) => vpi::STRING_VAL,
+                Some(vpi::TIME_VAR) => vpi::TIME_VAL,
+                Some(vpi::REAL_VAR) | Some(vpi::SHORT_REAL_VAR) => vpi::REAL_VAL,
+                Some(vpi::BIT_VAR) if val.width <= 1 => vpi::SCALAR_VAL,
+                _ if val.is_real => vpi::REAL_VAL,
+                _ if val.width <= 32 => vpi::INT_VAL,
+                _ => vpi::VECTOR_VAL,
             };
             vp.format = format;
         }
@@ -63366,7 +63310,12 @@ fn dispatch_vpi_cb(
         value: s_vpi_value_union { integer: 0 },
     };
     let filled = match (reason, &signal_val) {
-        (vpi::CB_VALUE_CHANGE, Some(v)) => fill_vpi_value(v, current_time, &mut value),
+        (vpi::CB_VALUE_CHANGE, Some(v)) => {
+            let obj_type_code = unsafe {
+                vpi_deref(cb.obj as *mut libc::c_void).map(|h| h.type_code)
+            };
+            fill_vpi_value(v, current_time, obj_type_code, &mut value)
+        }
         _ => false,
     };
     if !filled {
