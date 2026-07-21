@@ -737,6 +737,10 @@ fn redirect_stdio_to_log(path: &str) -> std::io::Result<()> {
 
 fn main() {
     spawn_memory_watchdog();
+    // Install the SIGUSR1 hang-report handler before compile: a user poking a
+    // seemingly-hung run during a long elaboration must not kill it (the
+    // default SIGUSR1 action is termination).
+    xezim::compiler::simulator::install_hang_report_handler();
 
     // Default to IEEE 1800-2023 mode. SV-2023 is additive over -2017, so
     // valid -2017 code stays valid; pass `--sv2017` to opt back to the

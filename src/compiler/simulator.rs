@@ -1128,6 +1128,27 @@ struct MailboxPutWaiter {
 }
 
 /// A process waiting for a signal edge event.
+/// SIGUSR1 -> on-demand hang report from a live run (`kill -USR1 <pid>`).
+/// The handler only flips a flag; the simulation loop prints the report at
+/// the next iteration boundary (async-signal-safe).
+static HANG_REPORT_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn hang_report_signal_handler(_sig: libc::c_int) {
+    HANG_REPORT_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+pub fn install_hang_report_handler() {
+    unsafe {
+        libc::signal(libc::SIGUSR1, hang_report_signal_handler as usize);
+    }
+}
+
+#[cfg(not(unix))]
+pub fn install_hang_report_handler() {}
+
 #[derive(Debug, Clone)]
 struct EventWaiter {
     pid: usize,
@@ -7861,6 +7882,8 @@ impl Simulator {
     }
 
     pub fn run(&mut self) {
+        // `kill -USR1 <pid>` on a live run prints the hang report.
+        install_hang_report_handler();
         self.compile();
         self.simulate();
     }
@@ -16772,6 +16795,131 @@ impl Simulator {
     }
 
     /// Create an EventWaiter with pre-resolved sensitivity IDs for O(1) edge checking.
+    /// Render a signal's current value compactly for hang diagnostics.
+    fn hang_sig_value(&self, id: usize) -> String {
+        let w = self.signal_widths.get(id).copied().unwrap_or(1);
+        if w == 1 {
+            ['0', '1', 'x', 'z'][self.signal_table[id].get_bit_code(0) as usize % 4].to_string()
+        } else if self.signal_table[id].has_unknown() {
+            format!("{}'(has x/z)", w)
+        } else {
+            format!("{}'h{:x}", w, self.signal_table[id].to_u64().unwrap_or(0))
+        }
+    }
+
+    /// Walk a signal's driver cone backwards and append one line per hop:
+    /// which block/assign drives it, and what THAT reads (with current
+    /// values). Turns "resp_vld never moved" into "resp_vld <= flop clocked
+    /// by gclk (now 0) <- gclk = clk & gclk_en with gclk_en=0". Depth-capped
+    /// and cycle-safe; a signal with NO driver is called out explicitly —
+    /// that is the signature of a dropped instance output.
+    fn describe_driver_chain(
+        &self,
+        sig_id: usize,
+        indent: usize,
+        depth: usize,
+        visited: &mut std::collections::HashSet<usize>,
+    ) {
+        if depth == 0 || !visited.insert(sig_id) {
+            return;
+        }
+        let pad = " ".repeat(indent);
+        // Free-running clock generator?
+        if let Some(cg) = self.clock_generators.iter().find(|c| c.signal_id == sig_id) {
+            eprintln!(
+                "[xezim][hang-report]{}'{}' is a free-running clock (half-period {}) — alive",
+                pad,
+                self.name_for_id(sig_id),
+                cg.half_period
+            );
+            return;
+        }
+        // Edge blocks (flops) writing it: clock/sensitivity is the lead.
+        let mut found = false;
+        for (bi, cb) in self.compiled_edge_blocks.iter().enumerate() {
+            let Some(cb) = cb else { continue };
+            use super::bytecode::Insn;
+            let writes = cb.instructions.iter().any(|i| {
+                matches!(i,
+                    Insn::NbaAssign(id, ..) | Insn::NbaAssignConst(id, ..)
+                    | Insn::NbaAssignRange(id, ..) | Insn::NbaAssignRangeDyn(id, ..)
+                    | Insn::NbaAssignBitDyn(id, ..)
+                    | Insn::BlockingAssign(id, ..) | Insn::BlockingAssignRange(id, ..)
+                    | Insn::BlockingAssignRangeDyn(id, ..) | Insn::BlockingAssignBitDyn(id, ..)
+                        if *id == sig_id)
+            });
+            if !writes {
+                continue;
+            }
+            found = true;
+            let ident = self
+                .edge_block_stall_identity(bi, 0)
+                .unwrap_or_else(|| "                 edge-sensitive block".to_string());
+            eprintln!(
+                "[xezim][hang-report]{}'{}' (now {}) written by:",
+                pad,
+                self.name_for_id(sig_id),
+                self.hang_sig_value(sig_id)
+            );
+            eprintln!("[xezim][hang-report]{}{}", pad, ident.trim_start());
+            if let Some(block) = self.edge_blocks.get(bi) {
+                for sid in block.resolved_sensitivities.iter().take(4) {
+                    let edge = match sid.edge {
+                        EdgeKind::Posedge => "posedge ",
+                        EdgeKind::Negedge => "negedge ",
+                        EdgeKind::AnyEdge => "",
+                    };
+                    eprintln!(
+                        "[xezim][hang-report]{}  sensitive to {}{} (now {})",
+                        pad,
+                        edge,
+                        self.name_for_id(sid.signal_id),
+                        self.hang_sig_value(sid.signal_id)
+                    );
+                    self.describe_driver_chain(sid.signal_id, indent + 4, depth - 1, visited);
+                }
+            }
+            break;
+        }
+        if found {
+            return;
+        }
+        // Combinational entry writing it: reads are the fan-in.
+        for e in &self.comb_entries {
+            if !e.write_signal_ids.contains(&sig_id) {
+                continue;
+            }
+            found = true;
+            let reads: Vec<String> = e
+                .read_signal_ids
+                .iter()
+                .take(6)
+                .map(|&r| format!("{}={}", self.name_for_id(r), self.hang_sig_value(r)))
+                .collect();
+            eprintln!(
+                "[xezim][hang-report]{}'{}' (now {}) driven combinationally from: {}{}",
+                pad,
+                self.name_for_id(sig_id),
+                self.hang_sig_value(sig_id),
+                reads.join(", "),
+                if e.read_signal_ids.len() > 6 { ", ..." } else { "" }
+            );
+            for &r in e.read_signal_ids.iter().take(4) {
+                self.describe_driver_chain(r, indent + 4, depth - 1, visited);
+            }
+            break;
+        }
+        if !found {
+            eprintln!(
+                "[xezim][hang-report]{}'{}' (now {}) has NO driver — undriven \
+                 (check for a dropped/unresolved instance driving it)",
+                pad,
+                self.name_for_id(sig_id),
+                self.hang_sig_value(sig_id)
+            );
+        }
+    }
+
     /// Hang diagnosis: print the longest-parked event waiters — who is
     /// stuck, on which signals, since when, and whether those signals have
     /// EVER changed since the waiter parked (`arm_bits` comparison). A
@@ -16836,6 +16984,18 @@ impl Simulator {
                 sens_desc.join(" or "),
                 loc
             );
+            // For signals that never moved, walk the driver cone to the root.
+            let dead: Vec<usize> = w
+                .resolved_sensitivities
+                .iter()
+                .zip(w.arm_bits.iter())
+                .filter(|(sid, &armed)| self.signal_table[sid.signal_id].raw_bits() == armed)
+                .map(|(sid, _)| sid.signal_id)
+                .collect();
+            let mut visited = std::collections::HashSet::new();
+            for d in dead {
+                self.describe_driver_chain(d, 5, 4, &mut visited);
+            }
         }
         for (pid, cont) in self.condition_waiters.iter().take(max_n) {
             let loc = cont
@@ -18067,6 +18227,10 @@ impl Simulator {
         }
         while !self.finished && iters < max_iters {
             iters += 1;
+            if HANG_REPORT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[xezim][hang-report] on-demand report (SIGUSR1) at sim time {}:", self.time);
+                self.report_parked_waiters(12);
+            }
             if progress_interval > 0 && sim_start.elapsed() >= next_progress {
                 eprintln!("[PROGRESS] wall={:.1}s sim_time={} iters={} delta_cycles={} edges_fired={} nba_q={} waiters={}",
                     sim_start.elapsed().as_secs_f64(), self.time, iters,
