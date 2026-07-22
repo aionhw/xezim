@@ -194,7 +194,7 @@ fn nospecify() -> bool {
     NOSPECIFY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Structural-delay mode (VCS/Questa/Xcelium GLS): 0 = normal (specify/SDF path
+/// Structural-delay mode (commercial-simulator GLS convention): 0 = normal (specify/SDF path
 /// delays apply), 1 = `+delay_mode_zero` (all structural delays forced to 0 —
 /// fast functional GLS), 2 = `+delay_mode_unit` (every nonzero structural delay
 /// becomes 1 time unit). Affects specify path delays and SDF back-annotation;
