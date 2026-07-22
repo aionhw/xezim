@@ -12463,9 +12463,19 @@ impl Simulator {
                     vm_regs[*d as usize] = vm_regs[*base as usize].bit_select(*idx as usize);
                 }
                 Insn::RangeSelect(d, base, l, r) => {
-                    let li = vm_regs[*l as usize].to_u64().unwrap_or(0) as usize;
-                    let ri = vm_regs[*r as usize].to_u64().unwrap_or(0) as usize;
-                    vm_regs[*d as usize] = vm_regs[*base as usize].range_select(li, ri);
+                    // §11.5.1: bounds are 32-bit index arithmetic; a `[l -: W]`
+                    // whose low bound went negative wraps to a large u32. Recover
+                    // the signed value and, only when the low bound is <0, take
+                    // the x-filling signed path (the fast path handles the common
+                    // in-range + high-overrun cases).
+                    let a = (vm_regs[*l as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
+                    let b = (vm_regs[*r as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    vm_regs[*d as usize] = if lo < 0 {
+                        vm_regs[*base as usize].range_select_signed(hi, lo)
+                    } else {
+                        vm_regs[*base as usize].range_select(hi as usize, lo as usize)
+                    };
                 }
                 Insn::RangeSelectConst(d, base, l, r) => {
                     vm_regs[*d as usize] =
@@ -12880,9 +12890,19 @@ impl Simulator {
                     vm_regs[*d as usize] = vm_regs[*base as usize].bit_select(*idx as usize);
                 }
                 Insn::RangeSelect(d, base, l, r) => {
-                    let li = vm_regs[*l as usize].to_u64().unwrap_or(0) as usize;
-                    let ri = vm_regs[*r as usize].to_u64().unwrap_or(0) as usize;
-                    vm_regs[*d as usize] = vm_regs[*base as usize].range_select(li, ri);
+                    // §11.5.1: bounds are 32-bit index arithmetic; a `[l -: W]`
+                    // whose low bound went negative wraps to a large u32. Recover
+                    // the signed value and, only when the low bound is <0, take
+                    // the x-filling signed path (the fast path handles the common
+                    // in-range + high-overrun cases).
+                    let a = (vm_regs[*l as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
+                    let b = (vm_regs[*r as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    vm_regs[*d as usize] = if lo < 0 {
+                        vm_regs[*base as usize].range_select_signed(hi, lo)
+                    } else {
+                        vm_regs[*base as usize].range_select(hi as usize, lo as usize)
+                    };
                 }
                 Insn::RangeSelectConst(d, base, l, r) => {
                     vm_regs[*d as usize] =
@@ -13474,9 +13494,15 @@ impl Simulator {
                         self.vm_regs[*base as usize].bit_select(*idx as usize);
                 }
                 Insn::RangeSelect(d, base, l, r) => {
-                    let li = self.vm_regs[*l as usize].to_u64().unwrap_or(0) as usize;
-                    let ri = self.vm_regs[*r as usize].to_u64().unwrap_or(0) as usize;
-                    self.vm_regs[*d as usize] = self.vm_regs[*base as usize].range_select(li, ri);
+                    // §11.5.1 signed low-bound recovery — see the twin site.
+                    let a = (self.vm_regs[*l as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
+                    let b = (self.vm_regs[*r as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    self.vm_regs[*d as usize] = if lo < 0 {
+                        self.vm_regs[*base as usize].range_select_signed(hi, lo)
+                    } else {
+                        self.vm_regs[*base as usize].range_select(hi as usize, lo as usize)
+                    };
                 }
                 Insn::RangeSelectConst(d, base, l, r) => {
                     self.vm_regs[*d as usize] =
@@ -29407,7 +29433,18 @@ impl Simulator {
                 let result = match kind {
                     RangeKind::Constant => base.range_select(l, r),
                     RangeKind::IndexedUp => base.range_select(l + r - 1, l),
-                    RangeKind::IndexedDown => base.range_select(l, l.saturating_sub(r - 1)),
+                    RangeKind::IndexedDown => {
+                        // §11.5.1: `[l -: r]` selects r bits down from l. When
+                        // `l < r-1` the low bound is negative — those bits read
+                        // x, and saturating to 0 would drop them AND shrink the
+                        // width. Use the signed-bound select in that case.
+                        let lo_signed = l as i64 - (r as i64 - 1);
+                        if lo_signed >= 0 {
+                            base.range_select(l, lo_signed as usize)
+                        } else {
+                            base.range_select_signed(l as i64, lo_signed)
+                        }
+                    }
                 };
                 result
             }
