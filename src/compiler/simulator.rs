@@ -19422,6 +19422,48 @@ impl Simulator {
                 }
             }
 
+            // Working-set summary: how many DISTINCT signals ever toggle
+            // (the true hot set that must live in cache) and how spread out
+            // their ids are (spatial-locality proxy). Compare vs L2 (1 MiB) /
+            // L3 (16.5 MiB) to judge cache fit.
+            {
+                let mut hot = 0usize;
+                let mut min_id = usize::MAX;
+                let mut max_id = 0usize;
+                for (id, &count) in self.signal_toggle_counts.iter().enumerate() {
+                    if count == 0 {
+                        continue;
+                    }
+                    hot += 1;
+                    min_id = min_id.min(id);
+                    max_id = max_id.max(id);
+                }
+                let vsz = std::mem::size_of::<Value>();
+                let hot_bytes = hot * vsz;
+                let span = if hot > 0 { max_id - min_id + 1 } else { 0 };
+                let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+                eprintln!();
+                eprintln!(
+                    "  [WORKING-SET] hot(toggling) signals = {} of {} ({:.1}%)",
+                    hot,
+                    self.signal_toggle_counts.len(),
+                    100.0 * hot as f64 / self.signal_toggle_counts.len().max(1) as f64
+                );
+                eprintln!(
+                    "  [WORKING-SET] hot Value bytes = {:.2} MiB  (=> {:.1}x L2 / {:.2}x L3)",
+                    mib(hot_bytes),
+                    hot_bytes as f64 / (1024.0 * 1024.0),
+                    hot_bytes as f64 / (16.5 * 1024.0 * 1024.0)
+                );
+                eprintln!(
+                    "  [WORKING-SET] id span = {} (ids {}..{}); density = {:.1}% of the span is hot",
+                    span,
+                    min_id,
+                    max_id,
+                    100.0 * hot as f64 / span.max(1) as f64
+                );
+            }
+
             let mut sorted: Vec<_> = block_toggles.into_iter().collect();
             sorted.sort_by(|a, b| b.1.cmp(&a.1));
             sorted.truncate(10);
