@@ -1,6 +1,6 @@
 [package]
 name = "xezim"
-version = "0.9.6"
+version = "0.9.7"
 build = "src/build.rs"
 edition = "2021"
 rust-version = "1.85.1"
