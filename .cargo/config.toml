@@ -1,0 +1,8 @@
+# The simulator evaluates deeply recursive SystemVerilog expressions (concat
+# chains, nested member access, recursive functions, parameterized class
+# construction) whose evaluation in DEBUG builds can exceed Rust's default
+# 2 MB test-thread stack. Raise the minimum for cargo-invoked processes.
+# Release builds (optimised, smaller frames) do not need this, but it is
+# harmless there.
+[env]
+RUST_MIN_STACK = "33554432"

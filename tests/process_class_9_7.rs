@@ -197,3 +197,60 @@ fn suspend_then_resume() {
         msgs
     );
 }
+
+// ── await() inside a forever loop body must block, not spin ─────────────
+// A `process_handle.await()` call nested in a `forever` body is routed
+// through `exec_forever_sched` → `run_process_stmts` (because `await` is
+// recognized as blocking). Without the detection, `exec_forever_sched`
+// ran the await via the synchronous `exec_statement`, which treated it as a
+// void method call returning immediately — the forever body busy-spun,
+// repeatedly re-checking state that hadn't changed.
+
+const AWAIT_IN_FOREVER_SRC: &str = r#"
+module top;
+  process captured_proc;
+  int target_started;
+  int await_loops;
+
+  // The "target" task: captures its own process handle, signals it started,
+  // then blocks forever (never terminates during the test window).
+  task automatic the_target();
+    captured_proc = process::self();
+    target_started = 1;
+    wait (0);
+  endtask
+
+  // The "monitor": forever awaits the target. If await() works, the loop
+  // body never completes a full iteration (the target never terminates).
+  task automatic the_monitor();
+    forever begin
+      captured_proc.await();
+      await_loops = await_loops + 1;
+    end
+  endtask
+
+  initial begin
+    fork the_target(); join_none
+    wait (target_started == 1);
+    fork the_monitor(); join_none
+    #5;
+    $display("RESULT await_loops=%0d", await_loops);
+    $finish;
+  end
+endmodule
+"#;
+
+#[test]
+fn await_in_forever_body_blocks() {
+    let sim = simulate(AWAIT_IN_FOREVER_SRC, 1000).expect("simulate failed");
+    let msgs = messages(&sim);
+    // The target is permanently blocked (wait(0)), so await() must never
+    // return — await_loops stays 0. Without the fix, await() fell through to
+    // exec_statement (treated as a void call), the forever busy-spun, and
+    // await_loops ran to ~100000.
+    assert!(
+        msgs.iter().any(|m| m == "RESULT await_loops=0"),
+        "await() inside a forever body must block while the target is alive; got {:?}",
+        msgs
+    );
+}

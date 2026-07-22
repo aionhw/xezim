@@ -17986,6 +17986,20 @@ impl Simulator {
                             }),
                     );
                 }
+                // `ForeverTail` carries the same forever body as `Forever`
+                // (it is the resume sentinel), so classify it identically.
+                StatementKind::ForeverTail { body } => {
+                    let inner: &[Statement] = match &body.kind {
+                        StatementKind::SeqBlock { stmts, .. } => stmts,
+                        _ => std::slice::from_ref(&**body),
+                    };
+                    return Some(
+                        self.classify_stall_stmts(inner, depth + 1, src_file)
+                            .unwrap_or_else(|| {
+                                "loop body has no timing control — never yields".to_string()
+                            }),
+                    );
+                }
                 StatementKind::SeqBlock { stmts: inner, .. } => {
                     if let Some(r) = self.classify_stall_stmts(inner, depth + 1, src_file) {
                         return Some(r);
@@ -20842,25 +20856,63 @@ impl Simulator {
                 }
             }
 
-            // Check for forever with delays/events
+            // Check for forever with delays/events. FIRST entry only — the
+            // body's first iteration runs inside `exec_forever_sched`, which
+            // re-appends a `ForeverTail` sentinel (not `Forever`) so that on
+            // RESUME after a suspension the `ForeverTail` arm below runs the
+            // break/continue/return gate. Gating here on first entry was the
+            // old approach: it deadlocked a `forever` whose body only raises
+            // a control flag AFTER its first iteration blocks (a stale or
+            // transient flag fired before the
+            // body ran even once. The sentinel split (first entry vs re-entry)
+            // is what makes `break` safe now. (§9.3.3)
             if let StatementKind::Forever { body } = &stmt.kind {
-                // NOTE: a `break` inside a blocking `forever` body is not
-                // honoured here. Unlike while/repeat, gating forever on entry
-                // regresses UVM driver/sequencer forever-loops (3414, 4194):
-                // they re-enter every cycle and the per-entry gate call, plus
-                // any transient flag, perturbs timing enough to TIMEOUT under
-                // suite load, with zero tests improved. forever-with-break is
-                // vanishingly rare (drivers loop indefinitely by design). If
-                // needed later, handle break inside exec_forever_sched at the
-                // re-append site instead of a top-of-arm gate. (§9.3.3)
                 self.exec_forever_sched(pid, body, &stmts[i + 1..]);
                 return;
             }
 
-            // Check for repeat bodies that can suspend, including calls to
-            // blocking user tasks whose waits are not syntactically in-body.
+            // INTERNAL: `ForeverTail` continuation sentinel — re-entry point
+            // for a blocking-body `forever` after its body suspended (via
+            // `exec_forever_sched`'s event/delay/blocking continuation). The
+            // body statements up to the suspension point have just run; a
+            // `break`/`continue`/`return` raised anywhere in that body slice
+            // is honoured HERE (§9.3.3), which the old `Forever` re-append
+            // silently dropped.
+            if let StatementKind::ForeverTail { body } = &stmt.kind {
+                // `return` from an inlined task body: do NOT consume — unwind
+                // to the task's ScopePop (the top-of-loop return_flag skip
+                // drives it). Exit this forever.
+                if self.return_flag {
+                    i += 1;
+                    continue;
+                }
+                // `break` exits the forever; consume break+continue.
+                if self.break_flag {
+                    self.break_flag = false;
+                    self.continue_flag = false;
+                    i += 1;
+                    continue;
+                }
+                // `continue` (or no flag): consume it and run the next
+                // iteration. exec_forever_sched re-appends another
+                // ForeverTail, so this gate runs again on the next resume.
+                self.continue_flag = false;
+                self.exec_forever_sched(pid, body, &stmts[i + 1..]);
+                return;
+            }
+
+            // Check for repeat with event waits inside
             if let StatementKind::Repeat { count, body } = &stmt.kind {
                 let n = self.eval_expr(count).to_u64().unwrap_or(0);
+                // Mirror the While/For arms: unroll not only when the body has
+                // a direct `@event`/`#delay`, but also when it blocks via a
+                // CALL to a task whose own body contains a `wait`/`#delay`/
+                // `@event` (a loop like `repeat(N) obj.do_step();` where
+                // do_step() blocks). Otherwise the repeat falls through to the
+                // SYNCHRONOUS exec_statement, the body's calls are never
+                // inlined (Stage 1b), and their nested `wait`s fall through
+                // (IEEE 1800-2023 §9.7.4: a false `wait(cond)` must suspend)
+                // instead of parking the process, busy-spinning the loop.
                 if self.stmt_has_event_wait(body) || self.stmt_is_blocking(body) {
                     // n == 0 (initial count zero, or the natural-exhaustion
                     // sentinel re-entering after the final iteration's body):
@@ -21493,6 +21545,27 @@ impl Simulator {
         }
     }
 
+    /// §9.7: structurally check if `expr` is a `handle.await()` call on a
+    /// process handle (no `&mut self` needed — a static shape check). Used by
+    /// `stmt_is_blocking` so that a `forever { h.await(); ... }` body is
+    /// detected as blocking and routed through `run_process_stmts`, where the
+    /// await is intercepted and the process parks in `await_waiters`.
+    fn expr_is_proc_await(expr: &Expression) -> bool {
+        if let ExprKind::Call { func, args } = &expr.kind {
+            if args.is_empty() {
+                // MemberAccess form: `job.await()`
+                if let ExprKind::MemberAccess { member, .. } = &func.kind {
+                    return member.name.as_str() == "await";
+                }
+                // Flattened Ident form: `job.await` parses as Ident([job, await])
+                if let ExprKind::Ident(hier) = &func.kind {
+                    return hier.path.len() == 2 && hier.path[1].name.name == "await";
+                }
+            }
+        }
+        false
+    }
+
     /// Check if any statements contain blocking constructs (timing, events, wait).
     fn stmts_have_blocking(&self, stmts: &[Statement]) -> bool {
         stmts.iter().any(|s| self.stmt_is_blocking(s))
@@ -21548,6 +21621,15 @@ impl Simulator {
             // (m_select_sequence's waits, m_req_fifo.peek) to reach the
             // suspend-aware path. Recognise the canonical blocking task names.
             StatementKind::Expr(e) => {
+                // §9.7: `process_handle.await()` blocks the calling process
+                // until the target terminates. A `forever { h.await(); ... }`
+                // body (the sequencer's re-arbitration fork) must be detected
+                // as blocking so exec_forever_sched routes it through
+                // run_process_stmts, where the await is intercepted and the
+                // process parks in await_waiters instead of busy-spinning.
+                if Self::expr_is_proc_await(e) {
+                    return true;
+                }
                 // Follow user task calls into their bodies so blocking tasks
                 // reached through loop/conditional bodies still use the
                 // suspend-aware runner. The name whitelist remains useful for
@@ -21902,7 +21984,7 @@ impl Simulator {
                         let mut cont = vec![*tbody.clone()];
                         cont.extend_from_slice(&body_stmts[i + 1..]);
                         cont.push(Statement::new(
-                            StatementKind::Forever {
+                            StatementKind::ForeverTail {
                                 body: Box::new(body.clone()),
                             },
                             body.span,
@@ -21925,7 +22007,7 @@ impl Simulator {
                             let mut cont = vec![*tbody.clone()];
                             cont.extend_from_slice(&body_stmts[i + 1..]);
                             cont.push(Statement::new(
-                                StatementKind::Forever {
+                                StatementKind::ForeverTail {
                                     body: Box::new(body.clone()),
                                 },
                                 body.span,
@@ -21951,7 +22033,7 @@ impl Simulator {
                 let mut cont: Vec<Statement> = vec![s.clone()];
                 cont.extend_from_slice(&body_stmts[i + 1..]);
                 cont.push(Statement::new(
-                    StatementKind::Forever {
+                    StatementKind::ForeverTail {
                         body: Box::new(body.clone()),
                     },
                     body.span,
@@ -26014,6 +26096,77 @@ impl Simulator {
                             return true;
                         }
                     }
+                    // `ClassName::static_obj_handle.member...` (3+ segments):
+                    // the head names a class whose STATIC property (segment 1)
+                    // holds an object handle; the remaining segments are member
+                    // writes on that object. Needed for
+                    // `ClassName::obj.member = new(...)` / `= handle` so the
+                    // write reaches the real heap object reached through the
+                    // static-property chain (e.g. UVM's `m_t_inst.m_tw_cb_q`).
+                    if hier.path.len() >= 3
+                        && hier.path.iter().all(|s| s.selects.is_empty())
+                    {
+                        let cls = &hier.path[0].name.name;
+                        let sprop = &hier.path[1].name.name;
+                        if self.module.classes.contains_key(cls)
+                            && self.static_prop_key(cls, sprop).is_some()
+                        {
+                            let cur0 = self
+                                .static_prop_key(cls, sprop)
+                                .and_then(|k| self.class_statics.get(&k))
+                                .and_then(|v| v.to_u64())
+                                .map(|h| h as usize)
+                                .unwrap_or(0);
+                            if cur0 != 0 && cur0 < self.heap.len() {
+                                let mut cur = cur0;
+                                let mut done = false;
+                                for i in 2..hier.path.len() {
+                                    if cur == 0 || cur >= self.heap.len() {
+                                        break;
+                                    }
+                                    let mname = hier.path[i].name.name.clone();
+                                    if i == hier.path.len() - 1 {
+                                        // If the final member is a STATIC
+                                        // property of the reached object's
+                                        // class, write the shared static cell
+                                        // (the read path resolves it there).
+                                        // Otherwise write the instance property.
+                                        let cn = self
+                                            .heap
+                                            .get(cur)
+                                            .and_then(|o| o.as_ref())
+                                            .map(|inst| inst.class_name.clone());
+                                        if let Some(cn) = cn {
+                                            if self.static_prop_key(&cn, &mname).is_some()
+                                                && self.class_static_set(
+                                                    &cn,
+                                                    &mname,
+                                                    val.clone(),
+                                                )
+                                            {
+                                                done = true;
+                                            }
+                                        }
+                                        if !done {
+                                            let fitted =
+                                                self.fit_class_prop(cur, &mname, val);
+                                            if let Some(Some(inst)) = self.heap.get_mut(cur) {
+                                                inst.properties.insert(mname, fitted);
+                                                done = true;
+                                            }
+                                        }
+                                    } else if let Some(h) = self.member_handle(cur, &mname) {
+                                        cur = h;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if done {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
                     let obj_name = &hier.path[0].name.name;
                     {
                         let sub = hier.path[1..]
@@ -28319,31 +28472,47 @@ impl Simulator {
                             return v;
                         }
                     }
-                    let val = if let Some(locals) = self.local_stack.last() {
-                        locals.get(obj_name).cloned()
-                    } else {
-                        self.get_signal_value_by_name(obj_name)
-                    };
-                    if let Some(v) = val {
-                        let mut cur_handle = v.to_u64().unwrap_or(0) as usize;
+                    // Resolve the head to a handle from any storage: a
+                    // static class property (e.g. `the_mid` inside a static
+                    // method), a local, a `this` property, or a signal.
+                    // `eval_ident_handle` covers local/this/static; signals
+                    // need an explicit fallback.
+                    let mut cur_handle = self
+                        .eval_ident_handle(obj_name)
+                        .filter(|&h| h != 0 && h < self.heap.len())
+                        .or_else(|| {
+                            self.local_stack
+                                .last()
+                                .and_then(|m| m.get(obj_name))
+                                .and_then(|v| v.to_u64())
+                                .map(|h| h as usize)
+                                .filter(|&h| h != 0 && h < self.heap.len())
+                        })
+                        .or_else(|| {
+                            self.get_signal_value_by_name(obj_name)
+                                .and_then(|v| v.to_u64())
+                                .map(|h| h as usize)
+                                .filter(|&h| h != 0 && h < self.heap.len())
+                        });
+                    while let Some(h) = cur_handle {
                         for i in 1..hier.path.len() {
-                            if cur_handle == 0 || cur_handle >= self.heap.len() {
+                            if h == 0 || h >= self.heap.len() {
+                                cur_handle = None;
                                 break;
                             }
-                            if let Some(Some(inst)) = self.heap.get(cur_handle) {
-                                let member_name = &hier.path[i].name.name;
-                                if let Some(mval) = inst.properties.get(member_name) {
-                                    if i == hier.path.len() - 1 {
-                                        return mval.clone();
-                                    }
-                                    cur_handle = mval.to_u64().unwrap_or(0) as usize;
-                                } else {
-                                    break;
+                            let member_name = &hier.path[i].name.name;
+                            if let Some(mval) = self.read_member_value(h, member_name) {
+                                if i == hier.path.len() - 1 {
+                                    return mval;
                                 }
+                                cur_handle =
+                                    Some(mval.to_u64().unwrap_or(0) as usize);
                             } else {
+                                cur_handle = None;
                                 break;
                             }
                         }
+                        break;
                     }
                 }
                 self.fast_signal_read(hier)
@@ -31650,6 +31819,7 @@ impl Simulator {
             // suspend-aware `run_process_stmts` stream. If reached here
             // (synchronous exec), it is a no-op.
             StatementKind::ForeachTail { .. } => {}
+            StatementKind::ForeverTail { .. } => {}
             StatementKind::Expr(expr) => self.exec_expr_stmt(expr),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
                 // §15.5.5: `event_var = other_event / null / q[i]` re-binds
@@ -40204,6 +40374,23 @@ impl Simulator {
                 if let Some(w) = self.lookup_signal_width(&n) {
                     return w;
                 }
+                // A method formal or local variable has no signal entry —
+                // infer from the local's current Value width. Without this,
+                // `infer_width` fell back to 1 for ref parameters of
+                // class-handle type, truncating assoc-array `first(ref k)` /
+                // `next(ref k)` key writeback to a single bit (handle 2 → 0).
+                if h.path.len() == 1 {
+                    let name = &h.path[0].name.name;
+                    if let Some(w) = self
+                        .local_stack
+                        .last()
+                        .and_then(|m| m.get(name))
+                        .map(|v| v.width)
+                        .filter(|w| *w > 1)
+                    {
+                        return w;
+                    }
+                }
                 // A packed struct/union member (`word3.high`) has no leaf
                 // signal; its width comes from the parent's field layout. Needed
                 // so a concatenation LHS (`{word3.high, word3.low} = ...`) splits
@@ -47294,6 +47481,13 @@ impl Simulator {
     }
 
     fn class_of_var(&self, vname: &str) -> Option<String> {
+        // A class name IS its own class — `ClassName::static_prop` writes
+        // and reads route here with vname = the class name. Without this,
+        // `container::the_obj = new` fails to find the static cell and the
+        // write is silently lost.
+        if self.module.classes.contains_key(vname) {
+            return Some(vname.to_string());
+        }
         // Procedural locals record their class at VarDecl exec time.
         if let Some(c) = self.var_class_types.get(vname) {
             if self.module.classes.contains_key(c) {
@@ -51326,6 +51520,18 @@ impl Simulator {
             ExprKind::MemberAccess { expr: base, member } => match &base.kind {
                 ExprKind::This => obj_member(self, "this", &member.name),
                 ExprKind::Ident(bh) if bh.path.len() == 1 => {
+                    // `ClassName::static_collection.first(ref k)` — when the
+                    // base is a CLASS name (not an object variable) and the
+                    // member is a static associative-array collection, return
+                    // the bare member name (static collections are stored
+                    // globally by bare name). Without this, obj_member treats
+                    // the class name as an object handle (0 → None), and the
+                    // assoc-array first()/next() iteration silently fails.
+                    if self.module.classes.contains_key(&bh.path[0].name.name)
+                        && self.is_associative_array(&member.name)
+                    {
+                        return Some(member.name.clone());
+                    }
                     obj_member(self, &bh.path[0].name.name, &member.name)
                 }
                 // `arr[i].member` — base is an array INDEX expression.
@@ -51514,6 +51720,54 @@ impl Simulator {
         None
     }
 
+    /// Read `handle.member` as a VALUE (handle or scalar): instance property
+    /// first, then the instance's CLASS static cell. Mirrors `member_handle`
+    /// for the value-reading path used by `eval_expr`.
+    fn read_member_value(&self, handle: usize, member: &str) -> Option<Value> {
+        if let Some(v) = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .and_then(|i| i.properties.get(member).cloned())
+        {
+            return Some(v);
+        }
+        let cn = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let key = self.static_prop_key(&cn, member)?;
+        self.class_statics.get(&key).cloned()
+    }
+
+    /// Resolve a handle for `handle.member`: try the instance property first,
+    /// then fall back to the instance's CLASS static cell (§8.25: a static
+    /// property accessed through an instance handle refers to the class's
+    /// shared static). Returns None if neither holds a handle.
+    fn member_handle(&self, handle: usize, member: &str) -> Option<usize> {
+        if let Some(h) = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .and_then(|i| i.properties.get(member))
+            .and_then(|v| v.to_u64())
+            .map(|h| h as usize)
+        {
+            return Some(h);
+        }
+        let cn = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let key = self.static_prop_key(&cn, member)?;
+        self.class_statics
+            .get(&key)
+            .and_then(|v| v.to_u64())
+            .map(|h| h as usize)
+    }
+
     /// Resolve a handle-valued expression (`h`, `arr[i]`) to its heap handle in
     /// a `&self` context, applying instance scoping for member-array bases.
     fn eval_handle_expr(&self, expr: &Expression) -> Option<usize> {
@@ -51531,13 +51785,7 @@ impl Simulator {
                     if handle == 0 {
                         return None;
                     }
-                    handle = self
-                        .heap
-                        .get(handle)
-                        .and_then(|o| o.as_ref())
-                        .and_then(|i| i.properties.get(&seg.name.name))
-                        .and_then(|v| v.to_u64())
-                        .map(|h| h as usize)?;
+                    handle = self.member_handle(handle, &seg.name.name)?;
                 }
                 Some(handle)
             }
@@ -51567,12 +51815,7 @@ impl Simulator {
                 if bh == 0 {
                     return None;
                 }
-                self.heap
-                    .get(bh)
-                    .and_then(|o| o.as_ref())
-                    .and_then(|i| i.properties.get(&member.name))
-                    .and_then(|v| v.to_u64())
-                    .map(|h| h as usize)
+                self.member_handle(bh, &member.name)
             }
             ExprKind::Index { expr: base, index } => {
                 if let ExprKind::Ident(bh) = &base.kind {
@@ -53374,8 +53617,16 @@ impl Simulator {
                         s.to_uppercase()
                     };
                     return Value::from_string(&r);
-                } else {
-                    // atoi / atohex / atooct / atobin
+                } else if matches!(m.as_str(), "atoi" | "atohex" | "atooct" | "atobin") {
+                    // atoi / atohex / atooct / atobin only — the enum-method
+                    // names (first/last/next/prev/num) that also enter this
+                    // block must NOT fall through to the string-to-number
+                    // parse: a non-enum receiver (e.g. a class object whose
+                    // type defines a user `num()` method) must reach normal
+                    // method dispatch below. Without this guard,
+                    // `holder::the_pool.num()` parsed the object handle as a
+                    // decimal string and returned 0, silently swallowing the
+                    // user method call.
                     let s = self.eval_expr(&base_expr).to_sv_string();
                     let s = s.trim();
                     let (neg, body) = match s.strip_prefix('-') {
@@ -53718,6 +53969,28 @@ impl Simulator {
                 let obj_name = &hier.path[0].name.name;
                 let method_name = &hier.path.last().unwrap().name.name;
 
+                // `ClassName::static_collection.first(ref k)` flattened into
+                // `Ident([class, collection, method])`: when path[0] is a
+                // CLASS name (not an object) and path[1] is a static assoc-
+                // array collection, route the builtin method to the
+                // collection's bare name (static collections are stored
+                // globally by bare name). Without this, obj_name resolves to
+                // the class name and first()/next() iteration silently fails.
+                if hier.path.len() >= 3
+                    && self.module.classes.contains_key(obj_name)
+                    && self.is_associative_array(&hier.path[1].name.name)
+                    && matches!(
+                        method_name.as_str(),
+                        "first" | "last" | "next" | "prev"
+                            | "num" | "size" | "exists" | "delete"
+                    )
+                {
+                    let coll = hier.path[1].name.name.clone();
+                    if let Some(res) = self.eval_builtin_method(&coll, method_name, args) {
+                        return res;
+                    }
+                }
+
                 // §18.13 rand_mode / constraint_mode flattened into a hier
                 // Ident: `obj.x.rand_mode(0)` parses as Ident([o, x, rand_mode])
                 // rather than nested MemberAccess.
@@ -53942,12 +54215,26 @@ impl Simulator {
                 // only catches ordinary user methods on nested objects.)
                 if hier.path.len() >= 3 {
                     let head = hier.path[0].name.name.as_str();
-                    let mut handle = if head == "this" {
-                        self.this_stack.last().copied().flatten().unwrap_or(0)
+                    let (mut handle, loop_start) = if head == "this" {
+                        (self.this_stack.last().copied().flatten().unwrap_or(0), 1)
+                    } else if self.module.classes.contains_key(head) {
+                        // `ClassName::static_prop.method()`: path[0] is a
+                        // CLASS, not an object variable. Resolve the static
+                        // property (path[1]) handle via static_prop_key, then
+                        // walk path[2..] (skip the already-resolved path[1]).
+                        // Without this, methods called on objects held in
+                        // static properties never bind `this` and silently
+                        // no-op — instance member writes are lost.
+                        let h = self.static_prop_key(head, &hier.path[1].name.name)
+                            .and_then(|k| self.class_statics.get(&k))
+                            .and_then(|v| v.to_u64())
+                            .map(|h| h as usize)
+                            .unwrap_or(0);
+                        (h, 2)
                     } else {
-                        self.eval_ident_handle(head).unwrap_or(0)
+                        (self.eval_ident_handle(head).unwrap_or(0), 1)
                     };
-                    for seg in &hier.path[1..hier.path.len() - 1] {
+                    for seg in &hier.path[loop_start..hier.path.len() - 1] {
                         if handle == 0 {
                             break;
                         }
@@ -63860,6 +64147,42 @@ impl Simulator {
                         }
                     }
                 }
+                // `ClassName::static_prop` (2-segment): look up the static
+                // property's declared type. Needed for bare `new` type
+                // inference (`container::the_obj = new`) — without this,
+                // get_expr_type_name returns None and the construction is
+                // skipped, leaving the static property null.
+                if hier.path.len() == 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                    let cls = &hier.path[0].name.name;
+                    let prop = &hier.path[1].name.name;
+                    if let Some(t) = self.class_prop_type_named(cls, prop) {
+                        return Some(t);
+                    }
+                }
+                // `ClassName::static_obj_handle.member...` (3+ segments):
+                // resolve the static property's declared type, then walk the
+                // remaining segments through class property types. Needed for
+                // `ClassName::obj.member = new(...)` type inference — e.g.
+                // UVM's `the_pool.inst = new` where `the_pool` is a static
+                // holding an object whose `member` is itself a class handle.
+                if hier.path.len() >= 3 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                    let cls = &hier.path[0].name.name;
+                    let prop = &hier.path[1].name.name;
+                    if let Some(mut tn) = self.class_prop_type_named(cls, prop) {
+                        let mut ok = true;
+                        for seg in &hier.path[2..] {
+                            if let Some(next) = self.class_prop_type_named(&tn, &seg.name.name) {
+                                tn = next;
+                            } else {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            return Some(tn);
+                        }
+                    }
+                }
                 None
             }
             // LRM §6.19.6: `<enum_var>.next()` / `.prev()` / `.first()`
@@ -63937,6 +64260,14 @@ impl Simulator {
                             if let Some(Some(inst)) = self.heap.get(handle) {
                                 let cn = inst.class_name.clone();
                                 return self.class_prop_type_named(&cn, &member.name);
+                            }
+                        }
+                    } else if bh.path.len() >= 2 && bh.path.iter().all(|s| s.selects.is_empty()) {
+                        // `ClassName::static_obj.member` — resolve the base
+                        // chain's type, then look up the member.
+                        if let Some(tn) = self.get_expr_type_name(base) {
+                            if let Some(mt) = self.class_prop_type_named(&tn, &member.name) {
+                                return Some(mt);
                             }
                         }
                     }
