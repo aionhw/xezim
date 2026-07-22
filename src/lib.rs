@@ -710,8 +710,18 @@ pub fn simulate_multi(
         if elab.source_files.is_empty() {
             elab.source_files = source_paths.to_vec();
         }
+        // A cache HIT skips elaboration, so its diagnostics (implicit-net
+        // warnings, port-width lint, unresolved-module notes, width-underflow)
+        // would silently vanish — replay the ones captured on the cold run.
+        for line in &elab.elab_diagnostics {
+            eprintln!("{}", line);
+        }
         elab
     } else {
+        // Capture elaboration diagnostics so a future warm hit can replay them.
+        if cache.is_some() {
+            xezim_core::elab_diag_capture_begin();
+        }
         let (definitions, mut elab) = parse_and_elaborate_multi(
             &sources,
             top_module_name,
@@ -749,6 +759,9 @@ pub fn simulate_multi(
             // artifact format; materialize them before publishing a complete
             // elaborated design.
             elab.materialize_pending();
+            // Fold the captured elaboration diagnostics into the artifact so a
+            // later warm hit replays them instead of running silent.
+            elab.elab_diagnostics = xezim_core::elab_diag_capture_take();
             write_design_cache(config, key, &elab);
         }
         elab
