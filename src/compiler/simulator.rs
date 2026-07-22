@@ -18694,6 +18694,56 @@ impl Simulator {
         eprintln!("[PROF] settle={:.1}ms edges={:.1}ms nba={:.1}ms process={:.1}ms snap={:.1}ms sched={:.1}ms",
             t_settle as f64/1e6, t_edges as f64/1e6, t_nba as f64/1e6,
             t_process as f64/1e6, t_snap as f64/1e6, t_sched as f64/1e6);
+        if std::env::var("XEZIM_CACHE_FIT").is_ok() {
+            let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+            let vs = std::mem::size_of::<Value>();
+            let ce = std::mem::size_of::<CombEntry>();
+            // Wide-storage heap: only signals wider than 64b carry a Vec<LogicBit>.
+            let mut wide_heap = 0usize;
+            let mut wide_cnt = 0usize;
+            for v in &self.signal_table {
+                if v.width > 64 { wide_cnt += 1; wide_heap += v.width as usize; }
+            }
+            // Per-entry heap (read/write id vecs, scope_hint strings).
+            let mut entry_heap = 0usize;
+            for e in &self.comb_entries {
+                entry_heap += e.read_signal_ids.capacity() * 8
+                    + e.write_signal_ids.capacity() * 8
+                    + e.scope_hint.as_ref().map_or(0, |s| s.capacity());
+            }
+            let st = self.signal_table.capacity() * vs;
+            let ceb = self.comb_entries.capacity() * ce;
+            let sw = self.signal_widths.capacity() * 4;
+            let sr = self.signal_real.capacity();
+            let s2 = self.signal_two_state.capacity();
+            let dof = self.comb_dep_offsets.capacity() * 4;
+            let den = self.comb_dep_entries.capacity() * 4;
+            let strig = self.settle_triggered.capacity();
+            let dsig = self.dirty_signals.capacity();
+            let tog = self.signal_toggle_counts.capacity() * 8;
+            eprintln!("[CACHE-FIT] L1d=32KiB/core L2=1MiB/core L3=16.5MiB shared line=64B");
+            eprintln!("[CACHE-FIT] signals={} entries={} sizeof(Value)={} sizeof(CombEntry)={}",
+                self.signal_table.len(), self.comb_entries.len(), vs, ce);
+            eprintln!("[CACHE-FIT] --- per-signal arrays (indexed by signal id) ---");
+            eprintln!("[CACHE-FIT]   signal_table       {:>9.2} MiB  ({} B/sig, {} sig/line)", mb(st), vs, 64/vs.max(1));
+            eprintln!("[CACHE-FIT]   signal_widths(u32) {:>9.2} MiB", mb(sw));
+            eprintln!("[CACHE-FIT]   signal_real(bool)  {:>9.2} MiB", mb(sr));
+            eprintln!("[CACHE-FIT]   signal_two_state   {:>9.2} MiB", mb(s2));
+            eprintln!("[CACHE-FIT]   dirty_signals      {:>9.2} MiB", mb(dsig));
+            eprintln!("[CACHE-FIT]   signal_toggle(u64) {:>9.2} MiB", mb(tog));
+            eprintln!("[CACHE-FIT]   dep_offsets(u32)   {:>9.2} MiB", mb(dof));
+            eprintln!("[CACHE-FIT]   Wide heap          {:>9.2} MiB  ({} wide signals)", mb(wide_heap), wide_cnt);
+            eprintln!("[CACHE-FIT] --- per-entry arrays (indexed by comb entry) ---");
+            eprintln!("[CACHE-FIT]   comb_entries       {:>9.2} MiB", mb(ceb));
+            eprintln!("[CACHE-FIT]   entry heap(r/w ids){:>9.2} MiB", mb(entry_heap));
+            eprintln!("[CACHE-FIT]   settle_triggered   {:>9.2} MiB", mb(strig));
+            eprintln!("[CACHE-FIT]   dep_entries(u32)   {:>9.2} MiB", mb(den));
+            let per_sig_hot = st + sw + sr + s2 + dsig;
+            eprintln!("[CACHE-FIT] hot per-signal working set (table+width+real+2st+dirty) = {:.2} MiB  => {:.0}x L3",
+                mb(per_sig_hot), per_sig_hot as f64 / (16.5*1024.0*1024.0));
+            eprintln!("[CACHE-FIT] one signal's hot bytes across arrays = {} B (spans {} lines if scattered)",
+                vs+4+1+1+1, ((vs+4+1+1+1)+63)/64);
+        }
         let unresolved = self
             .comb_entries
             .iter()
@@ -25530,8 +25580,13 @@ impl Simulator {
                 match &entries[eidx].item {
                     CombItem::Noop => {}
                     CombItem::FastDirectCopy { dst_id, src_id } => {
-                        // LRM §9.3.1: skip if the destination is forced
-                        if !self.forced_signals.contains_key(dst_id) {
+                        // LRM §9.3.1: skip if the destination is forced.
+                        // The is_empty() short-circuit avoids hashing dst_id on
+                        // every eval — this arm fires ~130M times on c910 and
+                        // forced_signals is empty in the common (no-force) case.
+                        if self.forced_signals.is_empty()
+                            || !self.forced_signals.contains_key(dst_id)
+                        {
                             let (mut sv, mut sx) = self.signal_table[*src_id].raw_bits();
                             // §6.11.1/§10.7: a 2-state destination drops X/Z
                             // (X/Z -> 0) on every write; the raw-bit copy would
@@ -25579,8 +25634,11 @@ impl Simulator {
                     }
                     CombItem::FastDirectFanout { src_id, dst_ids } => {
                         let (src_v, src_x) = self.signal_table[*src_id].raw_bits();
+                        // Hoist the empty-check: skip per-dst hashing entirely
+                        // when nothing is forced (the common case).
+                        let any_forced = !self.forced_signals.is_empty();
                         for &dst_id in dst_ids.iter() {
-                            if self.forced_signals.contains_key(&dst_id) {
+                            if any_forced && self.forced_signals.contains_key(&dst_id) {
                                 continue;
                             }
                             let (mut sv, mut sx) = (src_v, src_x);
