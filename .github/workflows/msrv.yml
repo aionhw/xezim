@@ -1,0 +1,36 @@
+name: MSRV
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Checkout xezim-core
+        uses: actions/checkout@v7
+        with:
+          repository: aionhw/xezim-core
+          path: ../xezim-core
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-msrv-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-msrv-cargo-
+
+      - name: Install cargo-msrv
+        run: cargo install cargo-msrv --locked
+
+      - name: cargo msrv verify
+        run: cargo msrv verify
