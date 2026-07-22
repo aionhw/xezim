@@ -38233,6 +38233,67 @@ impl Simulator {
                                     result.push_str(&format!("'{{{}}}", parts.join(", ")));
                                     continue;
                                 }
+                                // §21.2.1.7: a DIRECT queue/array slice
+                                // (`$display("%p", q[1:3])`) — render the
+                                // element range as a list, not the concatenated
+                                // packed value the raw fallback would print.
+                                if let ExprKind::RangeSelect { expr, left, right, kind } = &arg.kind {
+                                    if matches!(kind, RangeKind::Constant) {
+                                        if let ExprKind::Ident(h) = &expr.kind {
+                                            let nm = self.resolve_hier_name(h);
+                                            let is_coll = self.module.arrays.contains_key(&nm)
+                                                || self.module.dynamic_arrays.contains(&nm);
+                                            if is_coll {
+                                                let is_dyn =
+                                                    self.module.dynamic_arrays.contains(&nm);
+                                                let (arr_lo, arr_hi) = self
+                                                    .module
+                                                    .arrays
+                                                    .get(&nm)
+                                                    .map(|&(lo, hi, _)| (lo, hi))
+                                                    .unwrap_or((0, 0));
+                                                // `$` in the slice resolves to the
+                                                // last valid index (size-1 for a
+                                                // queue/dynamic array).
+                                                let upper = if is_dyn {
+                                                    self.get_queue_size(&nm) as i64 - 1
+                                                } else {
+                                                    arr_hi
+                                                };
+                                                self.dollar_bound.push(upper);
+                                                let mut l =
+                                                    self.eval_expr(left).to_i64().unwrap_or(0);
+                                                let mut r =
+                                                    self.eval_expr(right).to_i64().unwrap_or(0);
+                                                self.dollar_bound.pop();
+                                                if l > r {
+                                                    std::mem::swap(&mut l, &mut r);
+                                                }
+                                                // Clamp to the collection's live
+                                                // element range.
+                                                l = l.max(arr_lo);
+                                                r = r.min(upper);
+                                                let is_str = self.string_signals.contains(&nm);
+                                                let mut parts: Vec<String> = Vec::new();
+                                                for i in l..=r {
+                                                    let en = format!("{}[{}]", nm, i);
+                                                    if let Some(v) =
+                                                        self.get_signal_value_by_name(&en)
+                                                    {
+                                                        parts.push(Self::render_p_value(
+                                                            &v, is_str,
+                                                        ));
+                                                    }
+                                                }
+                                                result.push_str(&format!(
+                                                    "'{{{}}}",
+                                                    parts.join(", ")
+                                                ));
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
                                 let v = self.eval_expr(arg);
                                 result.push_str(&v.to_dec_string());
                             }
