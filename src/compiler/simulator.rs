@@ -1104,6 +1104,20 @@ enum EdgeKind {
     LsbEdge,
 }
 
+impl EdgeKind {
+    /// Prefix used when printing a sensitivity in diagnostics
+    /// (`posedge clk`, `edge bus`, …). Centralised so adding an `EdgeKind`
+    /// variant touches one place, not the ~6 hang-report format sites.
+    const fn print_str(&self) -> &'static str {
+        match self {
+            EdgeKind::Posedge => "posedge ",
+            EdgeKind::Negedge => "negedge ",
+            EdgeKind::AnyEdge => "",
+            EdgeKind::LsbEdge => "edge ",
+        }
+    }
+}
+
 /// LRM §15.4.2: a process blocked inside `mailbox.get(var)` on an empty
 /// mailbox. The next `put` drains this waiter, assigns its value into
 /// `lvalue`, and reschedules `cont` under `pid` at the current time.
@@ -11335,6 +11349,13 @@ impl Simulator {
                 if delay == 0 {
                     return None;
                 }
+                // A runtime-variable delay (`forever #(half) clk = ~clk` with
+                // `half` reprogrammed at runtime) must re-evaluate each toggle,
+                // so it cannot be a fixed-period ClockGen — fall back to the
+                // general forever path (which re-reads the delay every loop).
+                if self.delay_expr_is_dynamic(d_expr) {
+                    return None;
+                }
                 // assign_body (or inner SeqBlock): BA VAR = ~VAR
                 let ba_target = match &assign_body.kind {
                     StatementKind::BlockingAssign { lvalue, rvalue } => (lvalue, rvalue),
@@ -11406,6 +11427,25 @@ impl Simulator {
     }
 
     /// Try to detect `always #N var = ~var` pattern and extract as a ClockGen.
+    /// True if a `#(delay)` expression reads a runtime signal/variable (so its
+    /// value can CHANGE during simulation — e.g. `always #(half) clk = ~clk`
+    /// with `half` reconfigured by a PLL testbench). Such a clock must NOT be
+    /// baked into a fixed-period `ClockGen`; it has to re-evaluate the delay on
+    /// every toggle (the `FastDelayAlways` / general Forever path). A delay of
+    /// only literals/parameters (folded at elaboration, not in
+    /// `signal_name_to_id`) is constant and safe to freeze.
+    fn delay_expr_is_dynamic(&self, d: &Expression) -> bool {
+        let mut reads: HashSet<String> = HashSet::default();
+        Self::collect_expr_reads(d, &self.module, &mut reads);
+        reads.iter().any(|name| {
+            self.signal_name_to_id.contains_key(name.as_str())
+                || {
+                    let suffix = format!(".{}", name);
+                    self.signal_name_to_id.keys().any(|k| k.ends_with(&suffix))
+                }
+        })
+    }
+
     fn try_extract_clock_gen(&self, body: &Statement, half_period: u64) -> Option<ClockGen> {
         // Body should be: var = ~var (blocking assign)
         let assign = match &body.kind {
@@ -11679,7 +11719,11 @@ impl Simulator {
             } = &ab.stmt.kind
             {
                 let delay_val = self.eval_delay_ticks(d);
-                if delay_val > 0 {
+                // A delay that reads a runtime variable (`#(half)` reconfigured
+                // at runtime — the PLL refclk/vco reprogramming pattern) must
+                // re-evaluate every toggle; never freeze it into a fixed
+                // ClockGen (which would keep the ORIGINAL period forever).
+                if delay_val > 0 && !self.delay_expr_is_dynamic(d) {
                     if let Some(clock_gen) = self.try_extract_clock_gen(body, delay_val) {
                         sim_dbg_eprintln!(
                             "[OPT] clock generator: signal {} period {} (always #{} pattern)",
@@ -17066,13 +17110,7 @@ impl Simulator {
             eprintln!("[xezim][hang-report]{}{}", pad, ident.trim_start());
             if let Some(block) = self.edge_blocks.get(bi) {
                 for sid in block.resolved_sensitivities.iter().take(4) {
-                    let edge = match sid.edge {
-                        EdgeKind::Posedge => "posedge ",
-                        EdgeKind::Negedge => "negedge ",
-                        EdgeKind::AnyEdge => "",
-                    EdgeKind::LsbEdge => "edge ",
-                        EdgeKind::LsbEdge => "edge ",
-                    };
+                    let edge = sid.edge.print_str();
                     eprintln!(
                         "[xezim][hang-report]{}  sensitive to {}{} (now {})",
                         pad,
@@ -17148,12 +17186,7 @@ impl Simulator {
             let age = self.time.saturating_sub(w.parked_time);
             let mut sens_desc: Vec<String> = Vec::new();
             for (k, sid) in w.resolved_sensitivities.iter().enumerate() {
-                let edge = match sid.edge {
-                    EdgeKind::Posedge => "posedge ",
-                    EdgeKind::Negedge => "negedge ",
-                    EdgeKind::AnyEdge => "",
-                    EdgeKind::LsbEdge => "edge ",
-                };
+                let edge = sid.edge.print_str();
                 let cur = self.signal_table[sid.signal_id].raw_bits();
                 let armed = w.arm_bits.get(k).copied().unwrap_or((0, 0));
                 let moved = if cur == armed {
@@ -17601,12 +17634,7 @@ impl Simulator {
             .resolved_sensitivities
             .iter()
             .map(|si| {
-                let edge = match si.edge {
-                    EdgeKind::Posedge => "posedge ",
-                    EdgeKind::Negedge => "negedge ",
-                    EdgeKind::AnyEdge => "",
-                    EdgeKind::LsbEdge => "edge ",
-                };
+                let edge = si.edge.print_str();
                 format!("{}{}", edge, self.name_for_id(si.signal_id))
             })
             .collect::<Vec<_>>()
@@ -17957,13 +17985,7 @@ impl Simulator {
                 .resolved_sensitivities
                 .iter()
                 .map(|s| {
-                    let edge = match s.edge {
-                        EdgeKind::Posedge => "posedge ",
-                        EdgeKind::Negedge => "negedge ",
-                        EdgeKind::AnyEdge => "",
-                    EdgeKind::LsbEdge => "edge ",
-                        EdgeKind::LsbEdge => "edge ",
-                    };
+                    let edge = s.edge.print_str();
                     format!("{}{}", edge, self.name_for_id(s.signal_id))
                 })
                 .collect::<Vec<_>>()
@@ -22929,14 +22951,7 @@ impl Simulator {
                     .resolved_sensitivities
                     .iter()
                     .map(|si| {
-                        let edge = match si.edge {
-                            EdgeKind::Posedge => "posedge ",
-                            EdgeKind::Negedge => "negedge ",
-                            EdgeKind::AnyEdge => "",
-                            EdgeKind::LsbEdge => "edge ",
-                    EdgeKind::LsbEdge => "edge ",
-                        EdgeKind::LsbEdge => "edge ",
-                        };
+                        let edge = si.edge.print_str();
                         format!("{}{}", edge, self.name_for_id(si.signal_id))
                     })
                     .collect::<Vec<_>>()

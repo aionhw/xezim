@@ -215,6 +215,55 @@ fn test_sv_30_let_construct() {
 fn test_sv_31_user_defined_nettypes() {
     run_positive_compliance_test("tests_advanced", "31_user_defined_nettypes.sv");
 }
+#[test]
+fn test_sv_32_streaming_operators() {
+    run_positive_compliance_test("tests_advanced", "32_streaming_operators.sv");
+}
+#[test]
+fn test_sv_33_assignment_patterns() {
+    run_positive_compliance_test("tests_advanced", "33_assignment_patterns.sv");
+}
+#[test]
+fn test_sv_34_case_inside_ranges() {
+    run_positive_compliance_test("tests_advanced", "34_case_inside_ranges.sv");
+}
+#[test]
+fn test_sv_35_disable_fork() {
+    run_positive_compliance_test("tests_advanced", "35_disable_fork.sv");
+}
+#[ignore = "unimplemented feature (was dormant/unregistered before PR #48); un-ignore when implemented"]
+#[test]
+fn test_sv_36_tagged_union_patterns() {
+    run_positive_compliance_test("tests_advanced", "36_tagged_union_patterns.sv");
+}
+#[ignore = "unimplemented feature (was dormant/unregistered before PR #48); un-ignore when implemented"]
+#[test]
+fn test_sv_37_z_skip_resolution() {
+    run_positive_compliance_test("tests_advanced", "37_z_skip_resolution.sv");
+}
+#[ignore = "unimplemented feature (was dormant/unregistered before PR #48); un-ignore when implemented"]
+#[test]
+fn test_sv_38_resolver_dispatch() {
+    run_positive_compliance_test("tests_advanced", "38_resolver_dispatch.sv");
+}
+#[ignore = "unimplemented feature (was dormant/unregistered before PR #48); un-ignore when implemented"]
+#[test]
+fn test_sv_39_builtin_nettype_resolution() {
+    run_positive_compliance_test("tests_advanced", "39_builtin_nettype_resolution.sv");
+}
+#[ignore = "unimplemented feature (was dormant/unregistered before PR #48); un-ignore when implemented"]
+#[test]
+fn test_sv_40_struct_nettype_resolution() {
+    run_positive_compliance_test("tests_advanced", "40_struct_nettype_resolution.sv");
+}
+#[test]
+fn test_sv_41_genfor_localparam_idx() {
+    run_positive_compliance_test("tests_advanced", "41_genfor_localparam_idx.sv");
+}
+#[test]
+fn test_sv_42_typeparam_default_resolution() {
+    run_positive_compliance_test("tests_advanced", "42_typeparam_default_resolution.sv");
+}
 
 #[test]
 fn test_sv_neg01_duplicate_declaration() {

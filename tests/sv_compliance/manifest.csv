@@ -39,3 +39,5 @@ file,topic,description
 38_resolver_dispatch.sv,resolution tier 2,user-defined nettype resolver function dispatch
 39_builtin_nettype_resolution.sv,resolution tier 1,per-NetType fold for wand wor triand trior supply
 40_struct_nettype_resolution.sv,resolution tier 2,struct-typed nettype with real field and field-by-field resolver
+41_genfor_localparam_idx.sv,generate-for elaboration,genvar-dependent localparam init substituted per iteration
+42_typeparam_default_resolution.sv,type parameter defaults,non-overridden parameter type default resolved against overridden numeric params

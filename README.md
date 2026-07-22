@@ -114,6 +114,20 @@ and testbench flows. Portable code should not rely on them.
   name in a package/module function that collided with a caller class property
   used to silently alias the property; queue-property access from outside the
   class (`obj.q.push_back(x)`, `%p` of `obj.q`) now resolves correctly.
+* **Gate-level & structural robustness** — multi-dimensional packed arrays of
+  unpacked elements (`arr[i][j]`, §7.4), `foreach` over negative/descending and
+  packed dimensions (§12.7.3), non-ANSI ports completed by a `reg`/`logic`
+  declaration (§23.2.2.1), and per-iteration uniquification of declarations
+  inside **nested** generate-for loops (`for(a) for(b) localparam Idx = f(a,b)`).
+* **Behavioral clocks & PLLs** — a clock generator whose delay reads a runtime
+  variable (`always #(half) clk = ~clk`) now re-evaluates its period every
+  toggle, so a PLL reprogrammed at runtime actually changes frequency; verified
+  against a commercial simulator alongside UDP primitives, tristate/pull
+  strengths, `specify`/timing-check, and divider chains.
+* **Dead-clock watchdog** — `XEZIM_STUCK_CLOCK` flags a process parked on a
+  clock/reset that never changes while the design keeps churning edges (an
+  undriven-net / dropped-cell hang), turning a silent multi-minute grind into an
+  immediate, actionable diagnostic (`warn` by default; `abort` for CI).
 
 ---
 
@@ -424,6 +438,28 @@ The goal is to investigate whether modern software and AI tools can dramatically
 Apache License 2.0
 
 See the `LICENSE` file for details.
+
+---
+
+# Contributors
+
+xezim is developed in the open, and a number of people have improved it through
+pull requests. Thank you to everyone who has contributed — bug fixes, features,
+tests, and tooling all move the project forward:
+
+* **Thomas Burg** — class-system and UVM fixes: static-property chains through
+  object handles (§8.25), associative-array method dispatch and ref-writeback,
+  `ClassName::static_prop` access, parser-gap self-tests, and test-harness
+  hardening.
+* **Oscar Gustafsson** — expanded VPI functionality (`vpi_get_value`,
+  `ObjectValType`), CI setup, and clippy cleanups.
+* **Chen Ben Haroosh** — submodule-inline generate-for elaboration: genvar-
+  dependent declarations and `parameter type` default resolution, plus the
+  accompanying SystemVerilog compliance cases.
+* **Jayaraman RP** — cross-platform installation scripts, including the macOS
+  installer with UVM setup.
+
+New contributors are welcome — see [Development Workflow](#development-workflow).
 
 ---
 
