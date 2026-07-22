@@ -2299,6 +2299,9 @@ pub struct Simulator {
     pub output: Vec<SimOutput>,
     capture_output: bool,
     pub finished: bool,
+    /// Set when the dead-clock watchdog aborted the run (XEZIM_STUCK_CLOCK=abort).
+    /// The CLI reports a non-zero exit so CI/regressions fail fast.
+    pub stuck_clock_aborted: bool,
     compiled: bool,
     pub monitor: Option<(String, Vec<Expression>)>,
     /// `$monitoroff` pauses (not destroys) the monitor; `$monitoron` resumes.
@@ -4732,6 +4735,7 @@ impl Simulator {
             output: Vec::new(),
             capture_output: true,
             finished: false,
+            stuck_clock_aborted: false,
             compiled: false,
             monitor: None,
             monitor_paused: false,
@@ -18425,6 +18429,57 @@ impl Simulator {
         } else {
             std::time::Duration::MAX
         };
+        // ── Dead-clock watchdog ─────────────────────────────────────────────
+        // Signature of a dead-clock hang (undriven net / unresolved cell /
+        // ungenerated behavioral PLL VCO): a process is parked on a clock/reset
+        // that never changes value, while the rest of the design keeps churning
+        // edges (X-propagation) — the sim burns huge wall time making no
+        // functional progress. We track whether the OLDEST parked waiter's
+        // awaited signals stay frozen across a window of (sim ticks, edges,
+        // wall seconds); when all three thresholds are exceeded with the value
+        // unchanged, we emit a prominent actionable diagnostic (and optionally
+        // abort). Keyed on the signal VALUE, not the park cycle, so a waiter
+        // that repeatedly wakes-and-re-parks on a still-dead clock is caught.
+        //
+        //   XEZIM_STUCK_CLOCK = off | warn (default) | abort
+        //   XEZIM_STUCK_CLOCK_TICKS = <sim ticks>   (default 1000, a low floor)
+        //   XEZIM_STUCK_CLOCK_EDGES = <edges>       (default 1000000)
+        //   XEZIM_STUCK_CLOCK_WALL  = <seconds>     (default 20)
+        // All three must be exceeded together, so a healthy sim (its awaited
+        // signal toggles) or a quiet one (few edges) or a fast one (little
+        // wall) never trips. WALL + EDGES are the real gates — in a dead-clock
+        // churn the sim advances very LITTLE sim-time (each tick is expensive),
+        // so TICKS is only a low floor confirming time moved at all (not a
+        // same-timestamp delta storm, which the separate stall detector owns).
+        // Default is WARN — never changes results — with opt-in `abort` for a
+        // fast fail in CI/regressions.
+        let sc_mode = std::env::var("XEZIM_STUCK_CLOCK")
+            .ok()
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|| "warn".to_string());
+        let sc_enabled = sc_mode != "off" && sc_mode != "0";
+        let sc_abort = sc_mode == "abort";
+        let sc_ticks: u64 = std::env::var("XEZIM_STUCK_CLOCK_TICKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_000);
+        let sc_edges: u64 = std::env::var("XEZIM_STUCK_CLOCK_EDGES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_000_000);
+        let sc_wall = std::time::Duration::from_secs(
+            std::env::var("XEZIM_STUCK_CLOCK_WALL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(20),
+        );
+        // Reference snapshot of the monitored waiter's frozen signals.
+        let mut wd_sigs: Vec<usize> = Vec::new();
+        let mut wd_bits: Vec<(u64, u64)> = Vec::new();
+        let mut wd_ref_time: u64 = self.time;
+        let mut wd_ref_edges: u64 = self.prof_edges_fired;
+        let mut wd_ref_wall = sim_start.elapsed();
+        let mut wd_warned = false;
         // O1 flop-fire skip is default-ON (correct-by-construction snapshot
         // compare; ~1.1-1.6x on c910). Set XEZIM_EVENT_EDGE=0 to disable.
         let event_skip = std::env::var("XEZIM_EVENT_EDGE").ok().as_deref() != Some("0");
@@ -18456,6 +18511,61 @@ impl Simulator {
             if HANG_REPORT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("[xezim][hang-report] on-demand report (SIGUSR1) at sim time {}:", self.time);
                 self.report_parked_waiters(12);
+            }
+            // Dead-clock watchdog: cheap periodic check (every 1024 iters).
+            if sc_enabled && !wd_warned && (iters & 1023) == 0 && !self.event_waiters.is_empty() {
+                if let Some(w) = self.event_waiters.iter().min_by_key(|w| w.parked_time) {
+                    let cur_sigs: Vec<usize> =
+                        w.resolved_sensitivities.iter().map(|s| s.signal_id).collect();
+                    let cur_bits: Vec<(u64, u64)> = cur_sigs
+                        .iter()
+                        .map(|&id| self.signal_table[id].raw_bits())
+                        .collect();
+                    // Same monitored signals AND all still at their reference
+                    // value = the awaited clock/reset is frozen.
+                    if !cur_sigs.is_empty() && cur_sigs == wd_sigs && cur_bits == wd_bits {
+                        let d_ticks = self.time.saturating_sub(wd_ref_time);
+                        let d_edges = self.prof_edges_fired.saturating_sub(wd_ref_edges);
+                        let d_wall = sim_start.elapsed().saturating_sub(wd_ref_wall);
+                        if d_ticks >= sc_ticks && d_edges >= sc_edges && d_wall >= sc_wall {
+                            let sig = self.name_for_id(cur_sigs[0]).to_string();
+                            let pid = w.pid;
+                            eprintln!("\n=================== xezim: DEAD-CLOCK WATCHDOG ===================");
+                            eprintln!(
+                                "Process pid {} has been parked on '{}' for {} sim tick(s) with NO\n\
+                                 change to its awaited signal(s), while the design fired {} edges in\n\
+                                 {:.0}s of wall time. '{}' looks like a DEAD clock/reset.",
+                                pid, sig, d_ticks, d_edges, d_wall.as_secs_f64(), sig
+                            );
+                            eprintln!(
+                                "Likely cause: an undriven net, an unresolved/black-boxed cell, or an\n\
+                                 ungenerated behavioral clock (PLL VCO) upstream — search the log for\n\
+                                 '[IMPLICIT NET' and '-v resolution summary' / 'unresolved definition'.\n\
+                                 The simulation is making no functional progress (X-churn)."
+                            );
+                            self.report_parked_waiters(8);
+                            if sc_abort {
+                                eprintln!("Aborting (XEZIM_STUCK_CLOCK=abort). Fix the dead clock/reset, or\n\
+                                           set XEZIM_STUCK_CLOCK=warn to continue.");
+                                eprintln!("=================================================================\n");
+                                self.finished = true;
+                                self.stuck_clock_aborted = true;
+                            } else {
+                                eprintln!("Continuing (set XEZIM_STUCK_CLOCK=abort to stop here; =off to silence).");
+                                eprintln!("=================================================================\n");
+                            }
+                            wd_warned = true; // report once
+                        }
+                    } else {
+                        // Progress (signal changed or a different waiter is
+                        // oldest): reset the reference window.
+                        wd_sigs = cur_sigs;
+                        wd_bits = cur_bits;
+                        wd_ref_time = self.time;
+                        wd_ref_edges = self.prof_edges_fired;
+                        wd_ref_wall = sim_start.elapsed();
+                    }
+                }
             }
             if progress_interval > 0 && sim_start.elapsed() >= next_progress {
                 eprintln!("[PROGRESS] wall={:.1}s sim_time={} iters={} delta_cycles={} edges_fired={} nba_q={} waiters={}",

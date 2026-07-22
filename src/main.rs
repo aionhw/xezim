@@ -1528,6 +1528,9 @@ suppressed but the explicit SDF annotation still applies."
                         if sim.finished {
                             println!("($finish called)");
                         }
+                        if sim.stuck_clock_aborted {
+                            std::process::exit(3);
+                        }
                         return;
                     }
                     Ok(None) => {}
@@ -1817,6 +1820,11 @@ suppressed but the explicit SDF annotation still applies."
             println!("Simulation finished at time {}", sim.time);
             if sim.finished {
                 println!("($finish called)");
+            }
+            if sim.stuck_clock_aborted {
+                // Dead-clock watchdog aborted (XEZIM_STUCK_CLOCK=abort): fail
+                // fast so CI/regressions surface the hang instead of timing out.
+                std::process::exit(3);
             }
         }
         Err(e) => {
