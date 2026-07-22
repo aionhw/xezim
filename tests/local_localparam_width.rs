@@ -63,3 +63,37 @@ endmodule
         out
     );
 }
+
+#[test]
+fn local_localparam_type_inference_siblings() {
+    // Sibling coverage: the untyped-localparam self-determined-width fix must
+    // (a) cover function-local + `parameter` + multi-declarator + wide value,
+    // (b) NOT wrongly widen a `var v` (1-bit logic per §6.8), and
+    // (c) preserve real/string untyped localparams (not force them to int).
+    let src = r#"
+module t;
+  function automatic int f();
+    localparam FQ = 24;
+    return 1200 / FQ;
+  endfunction
+  task automatic run();
+    localparam A = 5, B = 300;        // multi-declarator
+    localparam BIG = 32'hDEADBEEF;    // wide
+    parameter  P = 99;                // `parameter` (not localparam)
+    localparam RR = 2.5;              // untyped real -> stays real
+    localparam SS = "yo";             // untyped string -> stays string
+    var v = 24;                       // §6.8 var -> 1-bit logic -> 0
+    $display("F=%0d A=%0d B=%0d BIG=%h P=%0d RR=%0.1f SS=%s V=%0d",
+             f(), A, B, BIG, P, RR, SS, v);
+  endtask
+  initial begin run(); $finish; end
+endmodule
+"#;
+    let out = line(src);
+    assert!(
+        out.iter()
+            .any(|m| m == "F=50 A=5 B=300 BIG=deadbeef P=99 RR=2.5 SS=yo V=0"),
+        "localparam type-inference siblings wrong; got {:?}",
+        out
+    );
+}

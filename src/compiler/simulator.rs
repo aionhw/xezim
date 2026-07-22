@@ -35186,24 +35186,7 @@ impl Simulator {
                 // the class's content layout (which `resolve_type_width`
                 // may report as 0 for a class with only methods/statics).
                 // A 0 width is never valid for a variable.
-                let mut w = if w0 == 0 { 32 } else { w0 };
-                // §6.20.2: a task/block-local `localparam`/`parameter` with no
-                // explicit type parses to an Implicit-typed VarDecl. Its type
-                // is SELF-DETERMINED from the initializer — for the usual
-                // integer constant that is 32-bit, NOT the 1-bit that
-                // `resolve_type_width` returns for Implicit-no-dims. Without
-                // this widening `localparam Q = 24;` truncates to 1 bit and
-                // reads 0, so `x / Q` divides by zero → x (customer bug: a
-                // task-local `QUANTUM = 24` collapsed a header field to x).
-                if w0 <= 1
-                    && matches!(
-                        data_type,
-                        crate::ast::types::DataType::Implicit { dimensions, .. }
-                            if dimensions.is_empty()
-                    )
-                {
-                    w = 32;
-                }
+                let w = if w0 == 0 { 32 } else { w0 };
                 let two_state = super::elaborate::is_type_two_state(data_type);
                 // LRM §8.4: an uninitialized class handle defaults to
                 // `null`. Treat class-handle types and `chandle` as
