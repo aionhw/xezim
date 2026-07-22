@@ -157,7 +157,7 @@ fn lint_checks_apply_inside_generate() {
     );
 }
 
-/// GLS structural-delay modes (VCS/Questa/Xcelium). `+delay_mode_zero` forces
+/// GLS structural-delay modes (commercial-simulator convention). `+delay_mode_zero` forces
 /// all structural (specify/SDF) delays to 0; `+delay_mode_unit` collapses each
 /// nonzero one to 1 tick. Default keeps the specify path delay. These used to
 /// fall silently into the generic plusarg bucket.

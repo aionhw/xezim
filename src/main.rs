@@ -321,7 +321,7 @@ fn push_plus_libext(arg: &str, lib_exts: &mut Option<Vec<String>>) {
 }
 
 /// Recognize the commercial gate-level-simulation (GLS) delay/timing flag
-/// family (VCS / Questa / Xcelium) so it never falls silently into the generic
+/// family so it never falls silently into the generic
 /// plusarg bucket. Returns true if `flag` was consumed here.
 ///
 /// - `+delay_mode_zero` / `+delay_mode_unit` are MODELED (force structural
@@ -662,7 +662,7 @@ fn process_command_file(
                 _ if t.starts_with("--module-timescale=") => {
                     module_timescale_args.push(t["--module-timescale=".len()..].to_string());
                 }
-                // xrun-compat seed aliases: `-svseed <n>` / `-svseed=<n>`
+                // commercial-simulator-compatible seed aliases: `-svseed <n>` / `-svseed=<n>`
                 // (and `-seed` likewise) lower onto the `+seed=` plusarg the
                 // simulator already consumes.
                 "-svseed" | "-seed" => {
@@ -1354,7 +1354,7 @@ fn main() {
             _ if arg.starts_with("--module-timescale=") => {
                 module_timescale_args.push(arg["--module-timescale=".len()..].to_string());
             }
-            // xrun-compat seed aliases (undocumented): lower onto `+seed=`.
+            // commercial-simulator-compatible seed aliases (undocumented): lower onto `+seed=`.
             "-svseed" | "-seed" => {
                 i += 1;
                 if i < args.len() {
@@ -1527,6 +1527,9 @@ suppressed but the explicit SDF annotation still applies."
                         println!("Simulation finished at time {}", sim.time);
                         if sim.finished {
                             println!("($finish called)");
+                        }
+                        if sim.stuck_clock_aborted {
+                            std::process::exit(3);
                         }
                         return;
                     }
@@ -1817,6 +1820,11 @@ suppressed but the explicit SDF annotation still applies."
             println!("Simulation finished at time {}", sim.time);
             if sim.finished {
                 println!("($finish called)");
+            }
+            if sim.stuck_clock_aborted {
+                // Dead-clock watchdog aborted (XEZIM_STUCK_CLOCK=abort): fail
+                // fast so CI/regressions surface the hang instead of timing out.
+                std::process::exit(3);
             }
         }
         Err(e) => {

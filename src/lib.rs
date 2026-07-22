@@ -570,7 +570,7 @@ fn reinstall_ooc_constraint_bodies(
             elab.classes
                 .get(cn)
                 .and_then(|cd| cd.constraints.get(nn))
-                .map_or(false, |c| c.items.is_empty())
+                .is_some_and(|c| c.items.is_empty())
         })
         .cloned()
         .collect();

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+echo "=== Cleaning previous work library ==="
+if [ -d "work" ]; then
+    rm -rf work
+fi
+echo "=== Creating work library ==="
+vlib work
+echo "=== Compiling SystemVerilog compliance test ==="
+# +acc enables full access visibility for nets/registers
+vlog -sv +acc tests/dpi/force_release_compliance.sv
+echo "=== Running simulation ==="
+# Runs in command-line mode (-c) and executes all simulation steps before quitting
+vsim -c -do "run -all; quit" force_release_compliance

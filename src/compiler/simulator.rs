@@ -579,7 +579,7 @@ struct UdpRuntime {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct BitRef {
+pub struct BitRef {
     sig_id: u32,
     bit: u32,
 }
@@ -692,7 +692,7 @@ fn stmt_has_finish_or_stop(stmt: &Statement) -> bool {
             stmt_has_finish_or_stop(then_stmt)
                 || else_stmt
                     .as_ref()
-                    .map_or(false, |s| stmt_has_finish_or_stop(s))
+                    .is_some_and(|s| stmt_has_finish_or_stop(s))
         }
         SK::Case { items, .. } => items.iter().any(|i| stmt_has_finish_or_stop(&i.stmt)),
         SK::For { body, .. }
@@ -1085,6 +1085,9 @@ struct EdgeFanout {
     posedge: Vec<usize>,
     negedge: Vec<usize>,
     anyedge: Vec<usize>,
+    /// `@(edge x)` blocks — §9.4.2 LSB edge (posedge OR negedge of bit 0),
+    /// NOT the whole-vector change that `anyedge` (`@(x)` level) fires on.
+    lsbedge: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1149,7 +1152,7 @@ extern "C" fn hang_report_signal_handler(_sig: libc::c_int) {
 #[cfg(unix)]
 pub fn install_hang_report_handler() {
     unsafe {
-        libc::signal(libc::SIGUSR1, hang_report_signal_handler as usize);
+        libc::signal(libc::SIGUSR1, hang_report_signal_handler as *const () as usize);
     }
 }
 
@@ -1849,6 +1852,11 @@ struct ProcessContext {
 /// at the body's `ScopePop` sentinel so the process can suspend in between.
 #[derive(Debug, Clone, Default)]
 struct TaskCleanup {
+    /// §21.2.1.7 `%m`: the m_scope_stack to restore on task return (a task
+    /// call RESETS the lexical scope to just the task, since tasks are
+    /// declared at module/package level — the CALLER's scope is not part of
+    /// the callee's `%m`).
+    saved_m_scope: Vec<String>,
     /// Name of the inlined task, for §9.6.2 `disable <task>` bookkeeping
     /// (`active_task_pids`). None for frames without a stable name.
     task_name: Option<String>,
@@ -2301,6 +2309,9 @@ pub struct Simulator {
     pub output: Vec<SimOutput>,
     capture_output: bool,
     pub finished: bool,
+    /// Set when the dead-clock watchdog aborted the run (XEZIM_STUCK_CLOCK=abort).
+    /// The CLI reports a non-zero exit so CI/regressions fail fast.
+    pub stuck_clock_aborted: bool,
     compiled: bool,
     pub monitor: Option<(String, Vec<Expression>)>,
     /// `$monitoroff` pauses (not destroys) the monitor; `$monitoron` resumes.
@@ -2682,6 +2693,10 @@ pub struct Simulator {
     /// (matching real simulators) rather than the top-module name. Pushed in
     /// `exec_function_call` / `exec_task_call` around the body and popped after.
     func_call_stack: Vec<String>,
+    /// §21.2.1.7 `%m` lexical-scope hierarchy WITHIN the current instance:
+    /// task / function / named-block / fork-block names, innermost last.
+    /// Pushed on subroutine/named-block entry, popped on exit.
+    m_scope_stack: Vec<String>,
     /// IEEE 1800-2017 §6.21 / §13.3.1: `static` variables declared inside a
     /// (possibly automatic) subroutine keep ONE persistent storage across all
     /// runtime calls, and their declaration initializer runs only once. Keyed
@@ -3608,7 +3623,7 @@ where
     F: FnMut(&Expression) -> Value,
 {
     (
-        args.get(0).map(|a| eval(a).to_f64()).unwrap_or(0.0),
+        args.first().map(|a| eval(a).to_f64()).unwrap_or(0.0),
         args.get(1).map(|a| eval(a).to_f64()).unwrap_or(0.0),
     )
 }
@@ -3851,7 +3866,7 @@ impl Simulator {
                     Some(UD::Associative {
                         data_type: key_dt, ..
                     }) => {
-                        let is_string_key = key_dt.as_ref().map_or(false, |dt| {
+                        let is_string_key = key_dt.as_ref().is_some_and(|dt| {
                             matches!(
                                 dt.as_ref(),
                                 DataType::Simple {
@@ -4435,7 +4450,7 @@ impl Simulator {
             .filter(|(k, _)| k.ends_with(']'))
             .filter(|(k, _)| {
                 k.rsplit_once('[')
-                    .map_or(false, |(b, _)| module.arrays.contains_key(b))
+                    .is_some_and(|(b, _)| module.arrays.contains_key(b))
             })
             .map(|(k, s)| (k.clone(), s.value.clone()))
             .collect();
@@ -4499,16 +4514,16 @@ impl Simulator {
                 // SoA vectors directly instead of formatting strings that will
                 // be discarded; array_first_id still gives each cell a stable
                 // contiguous signal_id.
-                signal_table.extend(std::iter::repeat(array_init(w)).take(count));
-                signal_widths_vec.extend(std::iter::repeat(w).take(count));
-                signal_signed_vec.extend(std::iter::repeat(false).take(count));
-                signal_real_vec.extend(std::iter::repeat(false).take(count));
+                signal_table.extend(std::iter::repeat_n(array_init(w), count));
+                signal_widths_vec.extend(std::iter::repeat_n(w, count));
+                signal_signed_vec.extend(std::iter::repeat_n(false, count));
+                signal_real_vec.extend(std::iter::repeat_n(false, count));
             }
             // §6.11.1: the array's elements inherit the declared element type's
             // signedness (`byte foo[8]` elements are signed). The push helpers
             // default every element to unsigned, so a signed-element array would
             // otherwise read its cells as unsigned.
-            if module.var_decl_types.get(base).map_or(false, |dt| {
+            if module.var_decl_types.get(base).is_some_and(|dt| {
                     super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
@@ -4736,6 +4751,7 @@ impl Simulator {
             output: Vec::new(),
             capture_output: true,
             finished: false,
+            stuck_clock_aborted: false,
             compiled: false,
             monitor: None,
             monitor_paused: false,
@@ -4840,6 +4856,7 @@ impl Simulator {
             pending_ret_collection: None,
             current_scope: String::new(),
             func_call_stack: Vec::new(),
+            m_scope_stack: Vec::new(),
             static_local_vars: HashMap::default(),
             static_local_syncs: Vec::new(),
             in_const_param_eval: false,
@@ -5402,7 +5419,7 @@ impl Simulator {
                         self.compiled_edge_blocks
                             .get(bi)
                             .and_then(|c| c.as_ref())
-                            .map_or(false, |cb| {
+                            .is_some_and(|cb| {
                                 cb.instructions.iter().any(|i| match i {
                                     super::bytecode::Insn::NbaAssign(s, _, _)
                                     | super::bytecode::Insn::NbaAssignConst(s, _, _)
@@ -5421,7 +5438,7 @@ impl Simulator {
                         self.compiled_edge_blocks
                             .get(bi)
                             .and_then(|c| c.as_ref())
-                            .map_or(false, |cb| {
+                            .is_some_and(|cb| {
                                 cb.instructions.iter().any(|i| {
                                     matches!(i,
                                     super::bytecode::Insn::LoadSignal(_, s)
@@ -5437,11 +5454,10 @@ impl Simulator {
                 // For each writer partition, if any READER is in a
                 // different partition, count one boundary packet.
                 for &wp in &writers {
-                    if readers.iter().any(|&rp| rp != wp) {
-                        if (wp as usize) < boundary.len() {
+                    if readers.iter().any(|&rp| rp != wp)
+                        && (wp as usize) < boundary.len() {
                             boundary[wp as usize] += 1;
                         }
-                    }
                 }
             }
             writeln!(out, "[boundary_packet]").map_err(|e| e.to_string())?;
@@ -5574,20 +5590,18 @@ impl Simulator {
                     | super::bytecode::Insn::LoadSignalSigned(_, sid)
                     | super::bytecode::Insn::LoadSignalRange(_, sid, _, _)
                     | super::bytecode::Insn::LoadSignalBit(_, sid, _)
-                    | super::bytecode::Insn::BranchIfSignalFalse(sid, _) => {
-                        if !reads_of[bi].contains(sid) {
+                    | super::bytecode::Insn::BranchIfSignalFalse(sid, _)
+                        if !reads_of[bi].contains(sid) => {
                             reads_of[bi].push(*sid);
                             readers_of_sig.entry(*sid).or_default().push(bi);
                         }
-                    }
                     super::bytecode::Insn::NbaAssign(sid, _, _)
                     | super::bytecode::Insn::NbaAssignConst(sid, _, _)
-                    | super::bytecode::Insn::NbaAssignRange(sid, _, _, _) => {
-                        if !writes_of[bi].contains(sid) {
+                    | super::bytecode::Insn::NbaAssignRange(sid, _, _, _)
+                        if !writes_of[bi].contains(sid) => {
                             writes_of[bi].push(*sid);
                             writers_of_sig.entry(*sid).or_default().push(bi);
                         }
-                    }
                     _ => {}
                 }
             }
@@ -5643,11 +5657,10 @@ impl Simulator {
                         stack.push(w);
                         on_stack[w] = true;
                         work.push((w, 0));
-                    } else if on_stack[w] {
-                        if idx_of[w] < low[v] {
+                    } else if on_stack[w]
+                        && idx_of[w] < low[v] {
                             low[v] = idx_of[w];
                         }
-                    }
                 } else {
                     // Done with v: maybe pop SCC.
                     if low[v] == idx_of[v] {
@@ -5942,8 +5955,8 @@ impl Simulator {
         // of the same island map to the same vid.
         let mut all_eligible: Vec<usize> = Vec::new();
         for (idx, &is_parallel) in self.edge_block_parallel.iter().enumerate() {
-            if is_parallel {
-                if self
+            if is_parallel
+                && self
                     .compiled_edge_blocks
                     .get(idx)
                     .and_then(|cb| cb.as_ref())
@@ -5951,7 +5964,6 @@ impl Simulator {
                 {
                     all_eligible.push(idx);
                 }
-            }
         }
         if all_eligible.is_empty() {
             return Err("no parallel-eligible edge blocks to partition".to_string());
@@ -6200,7 +6212,7 @@ impl Simulator {
                     Some(v) => v,
                     None => continue,
                 };
-                if vid == 0 || vid - 1 >= parts.len() {
+                if vid == 0 || vid > parts.len() {
                     continue;
                 }
                 let part = parts[vid - 1];
@@ -6290,7 +6302,7 @@ impl Simulator {
     }
 
     #[inline]
-    fn plusarg_payload<'a>(arg: &'a str) -> &'a str {
+    fn plusarg_payload(arg: &str) -> &str {
         arg.strip_prefix('+').unwrap_or(arg)
     }
 
@@ -6436,7 +6448,7 @@ impl Simulator {
         while let Some(fc) = fi.next() {
             if fc == '%' {
                 let mut width = String::new();
-                while fi.peek().map_or(false, |c| c.is_ascii_digit()) {
+                while fi.peek().is_some_and(|c| c.is_ascii_digit()) {
                     width.push(fi.next().unwrap());
                 }
                 let w: usize = width.parse().unwrap_or(usize::MAX);
@@ -6708,7 +6720,7 @@ impl Simulator {
                 } else {
                     (max_idx - start + 1).max(0)
                 };
-                let nbytes_elem = ((width as usize) + 7) / 8;
+                let nbytes_elem = (width as usize).div_ceil(8);
                 let mut total = 0u64;
                 let mut buf = vec![0u8; nbytes_elem];
                 for k in 0..count {
@@ -6732,7 +6744,7 @@ impl Simulator {
         }
         // Integral variable destination.
         let w = self.infer_lhs_width(&args[0]).max(1);
-        let nbytes = ((w as usize) + 7) / 8;
+        let nbytes = (w as usize).div_ceil(8);
         let mut buf = vec![0u8; nbytes];
         let got = self.fread_bytes(fd, &mut buf);
         if got > 0 {
@@ -7353,7 +7365,7 @@ impl Simulator {
     }
 
     fn dpi_value_to_logic_words(v: &Value, width: u32) -> (Vec<u32>, Vec<u32>) {
-        let nwords = ((width + 31) / 32).max(1) as usize;
+        let nwords = width.div_ceil(32).max(1) as usize;
         let mut aval = vec![0u32; nwords];
         let mut bval = vec![0u32; nwords];
         for bit in 0..(width as usize) {
@@ -7471,7 +7483,7 @@ impl Simulator {
                             self.table_modified = true;
                         }
                     } else {
-                        let changed = self.signals.get(&elem_name).map_or(true, |p| *p != val);
+                        let changed = self.signals.get(&elem_name).is_none_or(|p| *p != val);
                         if changed {
                             self.mark_dirty(&elem_name);
                         }
@@ -7928,14 +7940,13 @@ impl Simulator {
                         );
                     }
                 }
-                DpiArgKind::VecBitOut(width) => {
-                    if idx < logic_aval.len() {
+                DpiArgKind::VecBitOut(width)
+                    if idx < logic_aval.len() => {
                         // 2-state: only aval, no bval
                         let out = Self::dpi_logic_words_to_value(&logic_aval[idx], &[], width);
                         let w = self.infer_lhs_width(&expr);
                         self.assign_value(&expr, &out.resize(w));
                     }
-                }
                 _ => {}
             }
         }
@@ -8376,7 +8387,8 @@ impl Simulator {
                 match sid.edge {
                     EdgeKind::Posedge => fanout.posedge.push(block_idx),
                     EdgeKind::Negedge => fanout.negedge.push(block_idx),
-                    EdgeKind::AnyEdge | EdgeKind::LsbEdge => fanout.anyedge.push(block_idx),
+                    EdgeKind::AnyEdge => fanout.anyedge.push(block_idx),
+                    EdgeKind::LsbEdge => fanout.lsbedge.push(block_idx),
                 }
             }
         }
@@ -8491,7 +8503,7 @@ impl Simulator {
         for ib in pending_initial
             .into_iter()
             .map(|p| p.materialize())
-            .chain(initial_blocks.into_iter())
+            .chain(initial_blocks)
         {
             let scope = ib.scope;
             let span = ib.stmt.span;
@@ -8962,7 +8974,7 @@ impl Simulator {
                 continue;
             };
             let lp = self.edge_block_partition.get(bi).copied().unwrap_or(0);
-            if lp as u32 >= n_lp {
+            if lp >= n_lp {
                 continue;
             }
             for insn in &cb.instructions {
@@ -9751,7 +9763,7 @@ impl Simulator {
             if self
                 .compiled_edge_blocks
                 .get(bi)
-                .map_or(true, |c| c.is_none())
+                .is_none_or(|c| c.is_none())
             {
                 continue;
             }
@@ -9866,7 +9878,7 @@ impl Simulator {
 
         // Merge parallel writes (lp0 then lp1 to match seq ordering).
         let mut par_map: ahash::AHashMap<usize, Value> = ahash::AHashMap::default();
-        for (sid, val) in writes_a.into_iter().chain(writes_b.into_iter()) {
+        for (sid, val) in writes_a.into_iter().chain(writes_b) {
             par_map.insert(sid, val);
         }
 
@@ -9978,7 +9990,7 @@ impl Simulator {
                 a.dedup();
                 a
             };
-            ctx_comb.settle_subset(&mut seq_state, &in_all, &mut seed_all, limit);
+            ctx_comb.settle_subset(&mut seq_state, &in_all, &seed_all, limit);
         }
         let seq_ms = seq_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -10044,18 +10056,16 @@ impl Simulator {
                 let mut to_b: Vec<u32> = Vec::new();
                 for &sid in boundary {
                     match owner[sid] {
-                        0 => {
-                            if view_b[sid].raw_bits() != view_a[sid].raw_bits() {
+                        0
+                            if view_b[sid].raw_bits() != view_a[sid].raw_bits() => {
                                 view_b[sid] = view_a[sid].clone();
                                 to_b.push(sid as u32);
                             }
-                        }
-                        1 => {
-                            if view_a[sid].raw_bits() != view_b[sid].raw_bits() {
+                        1
+                            if view_a[sid].raw_bits() != view_b[sid].raw_bits() => {
                                 view_a[sid] = view_b[sid].clone();
                                 to_a.push(sid as u32);
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -10210,7 +10220,7 @@ impl Simulator {
         let mut edge_tasks: Vec<(usize, Vec<usize>)> = Vec::new();
         for lp in 0..2usize {
             let blocks = &edge_part.lp_blocks[lp];
-            let csize = ((blocks.len() + chunks_per_lp - 1) / chunks_per_lp).max(1);
+            let csize = blocks.len().div_ceil(chunks_per_lp).max(1);
             for chunk in blocks.chunks(csize) {
                 edge_tasks.push((lp, chunk.to_vec()));
             }
@@ -10233,7 +10243,7 @@ impl Simulator {
                 let (mut a, b) = dependents(&changed, &mut seen);
                 a.extend(b);
                 let in_all = vec![true; n_entries];
-                ctx_comb.settle_subset(&mut seq_state, &in_all, &mut a, limit);
+                ctx_comb.settle_subset(&mut seq_state, &in_all, &a, limit);
             }
             seq_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -10299,18 +10309,16 @@ impl Simulator {
                 let mut to_b: Vec<u32> = Vec::new();
                 for &sid in boundary {
                     match owner[sid] {
-                        0 => {
-                            if view_b[sid].raw_bits() != view_a[sid].raw_bits() {
+                        0
+                            if view_b[sid].raw_bits() != view_a[sid].raw_bits() => {
                                 view_b[sid] = view_a[sid].clone();
                                 to_b.push(sid as u32);
                             }
-                        }
-                        1 => {
-                            if view_a[sid].raw_bits() != view_b[sid].raw_bits() {
+                        1
+                            if view_a[sid].raw_bits() != view_b[sid].raw_bits() => {
                                 view_a[sid] = view_b[sid].clone();
                                 to_a.push(sid as u32);
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -10401,13 +10409,13 @@ impl Simulator {
                 && self
                     .compiled_edge_blocks
                     .get(bi)
-                    .map_or(false, |c| c.is_some())
+                    .is_some_and(|c| c.is_some())
             {
                 blocks.push(bi);
             }
         }
         let n = n_threads.max(1);
-        let chunk = (blocks.len() + n - 1) / n;
+        let chunk = blocks.len().div_ceil(n);
         let groups: Vec<Vec<usize>> = blocks.chunks(chunk.max(1)).map(|c| c.to_vec()).collect();
 
         let run_group =
@@ -11457,7 +11465,7 @@ impl Simulator {
                 // Should not happen in normal operation, but guard against it
                 cg.next_toggle_time += cg.half_period;
             }
-            if cg.next_toggle_time == self.time + 0 {
+            if cg.next_toggle_time == self.time {
                 // Toggle at current time (handled below)
             }
             next_time = next_time.min(cg.next_toggle_time);
@@ -11523,7 +11531,7 @@ impl Simulator {
         /// Does `e` read a variable whose base name is `target`?
         fn reads_name(e: &Expression, target: &str) -> bool {
             match &e.kind {
-                ExprKind::Ident(h) => h.path.last().map_or(false, |s| s.name.name == target),
+                ExprKind::Ident(h) => h.path.last().is_some_and(|s| s.name.name == target),
                 ExprKind::Paren(i) => reads_name(i, target),
                 ExprKind::Unary { operand, .. } => reads_name(operand, target),
                 ExprKind::Binary { left, right, .. } => {
@@ -11579,7 +11587,7 @@ impl Simulator {
                     then_stmt,
                     else_stmt,
                     ..
-                } => walk(then_stmt) || else_stmt.as_ref().map_or(false, |e| walk(e)),
+                } => walk(then_stmt) || else_stmt.as_ref().is_some_and(|e| walk(e)),
                 StatementKind::TimingControl { stmt, .. } => walk(stmt),
                 _ => false,
             }
@@ -11605,7 +11613,7 @@ impl Simulator {
                     let n = s.signal_name.as_str();
                     self.module.events.contains(n)
                         || n.strip_prefix(&top_prefix)
-                            .map_or(false, |b| self.module.events.contains(b))
+                            .is_some_and(|b| self.module.events.contains(b))
                 });
                 // A body that reads what it writes (`always @(s) cnt++;`) is
                 // not idempotent: the comb-settle path re-runs it on every
@@ -11964,7 +11972,7 @@ impl Simulator {
         // When feature=jit is off, `JitModule::new` returns None and
         // every `try_compile` also returns None — zero-cost fallback.
         let enable_jit = std::env::var("XEZIM_JIT")
-            .map(|v| v != "0" && v != "")
+            .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false);
         self.jit_fns = vec![None; self.compiled_edge_blocks.len()];
         // Pre-compute which compiled blocks touch any signal with width
@@ -12008,7 +12016,7 @@ impl Simulator {
                                 }
                                 if let Some(f) = jm.try_compile_with_xz(
                                     &cb.instructions,
-                                    cb.num_regs as u32,
+                                    cb.num_regs,
                                     xz_ptr,
                                     xz_len,
                                 ) {
@@ -12069,7 +12077,7 @@ impl Simulator {
                                 }
                                 if let Some(f) = jm.try_compile_with_xz(
                                     &cb.instructions,
-                                    cb.num_regs as u32,
+                                    cb.num_regs,
                                     xz_ptr,
                                     xz_len,
                                 ) {
@@ -12132,7 +12140,7 @@ impl Simulator {
         }
 
         for (idx, cb) in self.compiled_edge_blocks.iter().enumerate() {
-            let has_fallback = cb.as_ref().map_or(false, |cb| {
+            let has_fallback = cb.as_ref().is_some_and(|cb| {
                 cb.instructions
                     .iter()
                     .any(|insn| matches!(insn, super::bytecode::Insn::StmtFallback(..)))
@@ -12158,7 +12166,7 @@ impl Simulator {
             // path; array writes hit the cross-thread nba_fast_index issue
             // that stalls c910 cmark).
             use super::bytecode::Insn as BcInsn;
-            let is_pure = cb.as_ref().map_or(false, |cb| {
+            let is_pure = cb.as_ref().is_some_and(|cb| {
                 for insn in &cb.instructions {
                     match insn {
                         BcInsn::StmtFallback(..)
@@ -12171,11 +12179,10 @@ impl Simulator {
                         | BcInsn::NbaAssignArray(..)
                         | BcInsn::NbaAssignArrayRange(..)
                         | BcInsn::BlockingAssignArrayRange(..) => return false,
-                        BcInsn::NbaAssignRange(id, _, _, _) | BcInsn::NbaAssignBitDyn(id, _, _) => {
-                            if !unlock_range || nba_writer_count.get(id).copied().unwrap_or(0) > 1 {
+                        BcInsn::NbaAssignRange(id, _, _, _) | BcInsn::NbaAssignBitDyn(id, _, _)
+                            if (!unlock_range || nba_writer_count.get(id).copied().unwrap_or(0) > 1) => {
                                 return false;
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -15993,11 +16000,10 @@ impl Simulator {
 
     fn collect_leaf_idents(expr: &Expression, out: &mut HashSet<String>) {
         match &expr.kind {
-            ExprKind::Ident(hier) => {
-                if hier.path.len() == 1 {
+            ExprKind::Ident(hier)
+                if hier.path.len() == 1 => {
                     out.insert(hier.path[0].name.name.clone());
                 }
-            }
             ExprKind::Index { expr, index } => {
                 Self::collect_leaf_idents(expr, out);
                 Self::collect_leaf_idents(index, out);
@@ -17469,7 +17475,7 @@ impl Simulator {
     /// (function-call overhead × 8938 ticks + inner-call inlining
     /// disabled by the LLVM threshold drop).  See diff against the
     /// pre-Phase-3 inline body for context.
-    #[inline(always)]
+
     /// How deep `exec_forever_sched` may re-enter itself before it stops
     /// recursing and trampolines through the event queue instead. Small: real
     /// designs suspend on the first iteration, so any depth beyond a handful
@@ -18441,6 +18447,57 @@ impl Simulator {
         } else {
             std::time::Duration::MAX
         };
+        // ── Dead-clock watchdog ─────────────────────────────────────────────
+        // Signature of a dead-clock hang (undriven net / unresolved cell /
+        // ungenerated behavioral PLL VCO): a process is parked on a clock/reset
+        // that never changes value, while the rest of the design keeps churning
+        // edges (X-propagation) — the sim burns huge wall time making no
+        // functional progress. We track whether the OLDEST parked waiter's
+        // awaited signals stay frozen across a window of (sim ticks, edges,
+        // wall seconds); when all three thresholds are exceeded with the value
+        // unchanged, we emit a prominent actionable diagnostic (and optionally
+        // abort). Keyed on the signal VALUE, not the park cycle, so a waiter
+        // that repeatedly wakes-and-re-parks on a still-dead clock is caught.
+        //
+        //   XEZIM_STUCK_CLOCK = off | warn (default) | abort
+        //   XEZIM_STUCK_CLOCK_TICKS = <sim ticks>   (default 1000, a low floor)
+        //   XEZIM_STUCK_CLOCK_EDGES = <edges>       (default 1000000)
+        //   XEZIM_STUCK_CLOCK_WALL  = <seconds>     (default 20)
+        // All three must be exceeded together, so a healthy sim (its awaited
+        // signal toggles) or a quiet one (few edges) or a fast one (little
+        // wall) never trips. WALL + EDGES are the real gates — in a dead-clock
+        // churn the sim advances very LITTLE sim-time (each tick is expensive),
+        // so TICKS is only a low floor confirming time moved at all (not a
+        // same-timestamp delta storm, which the separate stall detector owns).
+        // Default is WARN — never changes results — with opt-in `abort` for a
+        // fast fail in CI/regressions.
+        let sc_mode = std::env::var("XEZIM_STUCK_CLOCK")
+            .ok()
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|| "warn".to_string());
+        let sc_enabled = sc_mode != "off" && sc_mode != "0";
+        let sc_abort = sc_mode == "abort";
+        let sc_ticks: u64 = std::env::var("XEZIM_STUCK_CLOCK_TICKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_000);
+        let sc_edges: u64 = std::env::var("XEZIM_STUCK_CLOCK_EDGES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_000_000);
+        let sc_wall = std::time::Duration::from_secs(
+            std::env::var("XEZIM_STUCK_CLOCK_WALL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(20),
+        );
+        // Reference snapshot of the monitored waiter's frozen signals.
+        let mut wd_sigs: Vec<usize> = Vec::new();
+        let mut wd_bits: Vec<(u64, u64)> = Vec::new();
+        let mut wd_ref_time: u64 = self.time;
+        let mut wd_ref_edges: u64 = self.prof_edges_fired;
+        let mut wd_ref_wall = sim_start.elapsed();
+        let mut wd_warned = false;
         // O1 flop-fire skip is default-ON (correct-by-construction snapshot
         // compare; ~1.1-1.6x on c910). Set XEZIM_EVENT_EDGE=0 to disable.
         let event_skip = std::env::var("XEZIM_EVENT_EDGE").ok().as_deref() != Some("0");
@@ -18472,6 +18529,61 @@ impl Simulator {
             if HANG_REPORT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("[xezim][hang-report] on-demand report (SIGUSR1) at sim time {}:", self.time);
                 self.report_parked_waiters(12);
+            }
+            // Dead-clock watchdog: cheap periodic check (every 1024 iters).
+            if sc_enabled && !wd_warned && (iters & 1023) == 0 && !self.event_waiters.is_empty() {
+                if let Some(w) = self.event_waiters.iter().min_by_key(|w| w.parked_time) {
+                    let cur_sigs: Vec<usize> =
+                        w.resolved_sensitivities.iter().map(|s| s.signal_id).collect();
+                    let cur_bits: Vec<(u64, u64)> = cur_sigs
+                        .iter()
+                        .map(|&id| self.signal_table[id].raw_bits())
+                        .collect();
+                    // Same monitored signals AND all still at their reference
+                    // value = the awaited clock/reset is frozen.
+                    if !cur_sigs.is_empty() && cur_sigs == wd_sigs && cur_bits == wd_bits {
+                        let d_ticks = self.time.saturating_sub(wd_ref_time);
+                        let d_edges = self.prof_edges_fired.saturating_sub(wd_ref_edges);
+                        let d_wall = sim_start.elapsed().saturating_sub(wd_ref_wall);
+                        if d_ticks >= sc_ticks && d_edges >= sc_edges && d_wall >= sc_wall {
+                            let sig = self.name_for_id(cur_sigs[0]).to_string();
+                            let pid = w.pid;
+                            eprintln!("\n=================== xezim: DEAD-CLOCK WATCHDOG ===================");
+                            eprintln!(
+                                "Process pid {} has been parked on '{}' for {} sim tick(s) with NO\n\
+                                 change to its awaited signal(s), while the design fired {} edges in\n\
+                                 {:.0}s of wall time. '{}' looks like a DEAD clock/reset.",
+                                pid, sig, d_ticks, d_edges, d_wall.as_secs_f64(), sig
+                            );
+                            eprintln!(
+                                "Likely cause: an undriven net, an unresolved/black-boxed cell, or an\n\
+                                 ungenerated behavioral clock (PLL VCO) upstream — search the log for\n\
+                                 '[IMPLICIT NET' and '-v resolution summary' / 'unresolved definition'.\n\
+                                 The simulation is making no functional progress (X-churn)."
+                            );
+                            self.report_parked_waiters(8);
+                            if sc_abort {
+                                eprintln!("Aborting (XEZIM_STUCK_CLOCK=abort). Fix the dead clock/reset, or\n\
+                                           set XEZIM_STUCK_CLOCK=warn to continue.");
+                                eprintln!("=================================================================\n");
+                                self.finished = true;
+                                self.stuck_clock_aborted = true;
+                            } else {
+                                eprintln!("Continuing (set XEZIM_STUCK_CLOCK=abort to stop here; =off to silence).");
+                                eprintln!("=================================================================\n");
+                            }
+                            wd_warned = true; // report once
+                        }
+                    } else {
+                        // Progress (signal changed or a different waiter is
+                        // oldest): reset the reference window.
+                        wd_sigs = cur_sigs;
+                        wd_bits = cur_bits;
+                        wd_ref_time = self.time;
+                        wd_ref_edges = self.prof_edges_fired;
+                        wd_ref_wall = sim_start.elapsed();
+                    }
+                }
             }
             if progress_interval > 0 && sim_start.elapsed() >= next_progress {
                 eprintln!("[PROGRESS] wall={:.1}s sim_time={} iters={} delta_cycles={} edges_fired={} nba_q={} waiters={}",
@@ -18556,7 +18668,7 @@ impl Simulator {
                 .into_iter()
                 .flatten()
                 .min()
-            .unwrap_or_else(|| {
+            .unwrap_or({
                 if has_waiters || has_reactive {
                     self.time
                 } else {
@@ -18710,6 +18822,56 @@ impl Simulator {
         eprintln!("[PROF] settle={:.1}ms edges={:.1}ms nba={:.1}ms process={:.1}ms snap={:.1}ms sched={:.1}ms",
             t_settle as f64/1e6, t_edges as f64/1e6, t_nba as f64/1e6,
             t_process as f64/1e6, t_snap as f64/1e6, t_sched as f64/1e6);
+        if std::env::var("XEZIM_CACHE_FIT").is_ok() {
+            let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+            let vs = std::mem::size_of::<Value>();
+            let ce = std::mem::size_of::<CombEntry>();
+            // Wide-storage heap: only signals wider than 64b carry a Vec<LogicBit>.
+            let mut wide_heap = 0usize;
+            let mut wide_cnt = 0usize;
+            for v in &self.signal_table {
+                if v.width > 64 { wide_cnt += 1; wide_heap += v.width as usize; }
+            }
+            // Per-entry heap (read/write id vecs, scope_hint strings).
+            let mut entry_heap = 0usize;
+            for e in &self.comb_entries {
+                entry_heap += e.read_signal_ids.capacity() * 8
+                    + e.write_signal_ids.capacity() * 8
+                    + e.scope_hint.as_ref().map_or(0, |s| s.capacity());
+            }
+            let st = self.signal_table.capacity() * vs;
+            let ceb = self.comb_entries.capacity() * ce;
+            let sw = self.signal_widths.capacity() * 4;
+            let sr = self.signal_real.capacity();
+            let s2 = self.signal_two_state.capacity();
+            let dof = self.comb_dep_offsets.capacity() * 4;
+            let den = self.comb_dep_entries.capacity() * 4;
+            let strig = self.settle_triggered.capacity();
+            let dsig = self.dirty_signals.capacity();
+            let tog = self.signal_toggle_counts.capacity() * 8;
+            eprintln!("[CACHE-FIT] L1d=32KiB/core L2=1MiB/core L3=16.5MiB shared line=64B");
+            eprintln!("[CACHE-FIT] signals={} entries={} sizeof(Value)={} sizeof(CombEntry)={}",
+                self.signal_table.len(), self.comb_entries.len(), vs, ce);
+            eprintln!("[CACHE-FIT] --- per-signal arrays (indexed by signal id) ---");
+            eprintln!("[CACHE-FIT]   signal_table       {:>9.2} MiB  ({} B/sig, {} sig/line)", mb(st), vs, 64/vs.max(1));
+            eprintln!("[CACHE-FIT]   signal_widths(u32) {:>9.2} MiB", mb(sw));
+            eprintln!("[CACHE-FIT]   signal_real(bool)  {:>9.2} MiB", mb(sr));
+            eprintln!("[CACHE-FIT]   signal_two_state   {:>9.2} MiB", mb(s2));
+            eprintln!("[CACHE-FIT]   dirty_signals      {:>9.2} MiB", mb(dsig));
+            eprintln!("[CACHE-FIT]   signal_toggle(u64) {:>9.2} MiB", mb(tog));
+            eprintln!("[CACHE-FIT]   dep_offsets(u32)   {:>9.2} MiB", mb(dof));
+            eprintln!("[CACHE-FIT]   Wide heap          {:>9.2} MiB  ({} wide signals)", mb(wide_heap), wide_cnt);
+            eprintln!("[CACHE-FIT] --- per-entry arrays (indexed by comb entry) ---");
+            eprintln!("[CACHE-FIT]   comb_entries       {:>9.2} MiB", mb(ceb));
+            eprintln!("[CACHE-FIT]   entry heap(r/w ids){:>9.2} MiB", mb(entry_heap));
+            eprintln!("[CACHE-FIT]   settle_triggered   {:>9.2} MiB", mb(strig));
+            eprintln!("[CACHE-FIT]   dep_entries(u32)   {:>9.2} MiB", mb(den));
+            let per_sig_hot = st + sw + sr + s2 + dsig;
+            eprintln!("[CACHE-FIT] hot per-signal working set (table+width+real+2st+dirty) = {:.2} MiB  => {:.0}x L3",
+                mb(per_sig_hot), per_sig_hot as f64 / (16.5*1024.0*1024.0));
+            eprintln!("[CACHE-FIT] one signal's hot bytes across arrays = {} B (spans {} lines if scattered)",
+                vs+4+1+1+1, ((vs+4+1+1+1)+63)/64);
+        }
         let unresolved = self
             .comb_entries
             .iter()
@@ -18950,10 +19112,10 @@ impl Simulator {
         let mut tot_samples = 0u64;
         for inst in self.cg_heap.iter().flatten() {
             tot_samples += inst.sample_count;
-            for (_n, set) in &inst.point_hits {
+            for set in inst.point_hits.values() {
                 n_cp_bins_hit += set.len();
             }
-            for (_n, set) in &inst.cross_hits {
+            for set in inst.cross_hits.values() {
                 n_cross_tuples_hit += set.len();
             }
         }
@@ -19356,8 +19518,8 @@ impl Simulator {
 
             eprintln!();
             eprintln!("  Top 10 most active blocks (comb triggers, excl. clocks):");
-            eprintln!("  {:>10}  {:>6}  {}", "triggers", "entries", "block");
-            eprintln!("  {:>10}  {:>6}  {}", "----------", "------", "-----");
+            eprintln!("  {:>10}  {:>6}  block", "triggers", "entries");
+            eprintln!("  {:>10}  {:>6}  -----", "----------", "------");
             for (block, count) in &sorted {
                 let entries = block_entry_count.get(block.as_str()).copied().unwrap_or(0);
                 eprintln!("  {:>10}  {:>6}  {}", count, entries, block);
@@ -19388,6 +19550,48 @@ impl Simulator {
                 }
             }
 
+            // Working-set summary: how many DISTINCT signals ever toggle
+            // (the true hot set that must live in cache) and how spread out
+            // their ids are (spatial-locality proxy). Compare vs L2 (1 MiB) /
+            // L3 (16.5 MiB) to judge cache fit.
+            {
+                let mut hot = 0usize;
+                let mut min_id = usize::MAX;
+                let mut max_id = 0usize;
+                for (id, &count) in self.signal_toggle_counts.iter().enumerate() {
+                    if count == 0 {
+                        continue;
+                    }
+                    hot += 1;
+                    min_id = min_id.min(id);
+                    max_id = max_id.max(id);
+                }
+                let vsz = std::mem::size_of::<Value>();
+                let hot_bytes = hot * vsz;
+                let span = if hot > 0 { max_id - min_id + 1 } else { 0 };
+                let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+                eprintln!();
+                eprintln!(
+                    "  [WORKING-SET] hot(toggling) signals = {} of {} ({:.1}%)",
+                    hot,
+                    self.signal_toggle_counts.len(),
+                    100.0 * hot as f64 / self.signal_toggle_counts.len().max(1) as f64
+                );
+                eprintln!(
+                    "  [WORKING-SET] hot Value bytes = {:.2} MiB  (=> {:.1}x L2 / {:.2}x L3)",
+                    mib(hot_bytes),
+                    hot_bytes as f64 / (1024.0 * 1024.0),
+                    hot_bytes as f64 / (16.5 * 1024.0 * 1024.0)
+                );
+                eprintln!(
+                    "  [WORKING-SET] id span = {} (ids {}..{}); density = {:.1}% of the span is hot",
+                    span,
+                    min_id,
+                    max_id,
+                    100.0 * hot as f64 / span.max(1) as f64
+                );
+            }
+
             let mut sorted: Vec<_> = block_toggles.into_iter().collect();
             sorted.sort_by(|a, b| b.1.cmp(&a.1));
             sorted.truncate(10);
@@ -19395,12 +19599,12 @@ impl Simulator {
             eprintln!();
             eprintln!("  Top 10 most toggling blocks (signal changes, excl. clocks):");
             eprintln!(
-                "  {:>10}  {:>5}  {:40}  {}",
-                "toggles", "sigs", "block", "hottest signal"
+                "  {:>10}  {:>5}  {:40}  hottest signal",
+                "toggles", "sigs", "block"
             );
             eprintln!(
-                "  {:>10}  {:>5}  {:40}  {}",
-                "----------", "-----", "-----", "--------------"
+                "  {:>10}  {:>5}  {:40}  --------------",
+                "----------", "-----", "-----"
             );
             for (block, count) in &sorted {
                 let sigs = block_sig_count.get(block.as_str()).copied().unwrap_or(0);
@@ -19974,8 +20178,8 @@ impl Simulator {
             // value (an IEEE-754 pattern read as a ~1e18 number) or a divide that
             // produced inf/NaN. Warn once per site so the offending delay names
             // itself in the log instead of silently freezing a clock.
-            if !f.is_finite() || f >= 1e15 {
-                if self.warned_delay_spikes.insert(d.span.start) {
+            if (!f.is_finite() || f >= 1e15)
+                && self.warned_delay_spikes.insert(d.span.start) {
                     let loc = self
                         .span_file_line_in(d.span, None)
                         .map(|l| format!(" at {}", l))
@@ -19988,7 +20192,6 @@ impl Simulator {
                         f, loc, self.time
                     );
                 }
-            }
             if f.is_finite() && f > 0.0 {
                 f
             } else {
@@ -20244,7 +20447,7 @@ impl Simulator {
                                     .and_then(|o| o.as_ref())
                                     .map(|inst| inst.class_name.clone())
                             })
-                            .map_or(false, |cls| self.class_has_method(&cls, &nm));
+                            .is_some_and(|cls| self.class_has_method(&cls, &nm));
                         if is_free_task || is_this_method {
                             Some(Expression::new(
                                 ExprKind::Call {
@@ -20267,7 +20470,7 @@ impl Simulator {
                                     .and_then(|o| o.as_ref())
                                     .map(|inst| inst.class_name.clone())
                             })
-                            .map_or(false, |cls| self.class_has_method(&cls, &member.name));
+                            .is_some_and(|cls| self.class_has_method(&cls, &member.name));
                         if recv_ok {
                             Some(Expression::new(
                                 ExprKind::Call {
@@ -20292,7 +20495,7 @@ impl Simulator {
                                     .and_then(|o| o.as_ref())
                                     .map(|inst| inst.class_name.clone())
                             })
-                            .map_or(false, |cls| self.class_has_method(&cls, &mn));
+                            .is_some_and(|cls| self.class_has_method(&cls, &mn));
                         if recv_ok {
                             Some(Expression::new(
                                 ExprKind::Call {
@@ -20346,7 +20549,7 @@ impl Simulator {
                                         .and_then(|o| o.as_ref())
                                         .map(|inst| inst.class_name.clone())
                                 })
-                                .map_or(false, |cls| {
+                                .is_some_and(|cls| {
                                     self.class_has_method(&cls, &h.path[0].name.name)
                                 });
                             if let Some(td) = (!is_this_method)
@@ -20589,7 +20792,7 @@ impl Simulator {
                                     let cont: Vec<Statement> = stmts[i + 1..].to_vec();
                                     self.mailbox_get_waiters
                                         .entry(handle)
-                                        .or_insert_with(std::collections::VecDeque::new)
+                                        .or_default()
                                         .push_back(MailboxGetWaiter {
                                             pid,
                                             lvalue,
@@ -20616,7 +20819,7 @@ impl Simulator {
                                     let cont: Vec<Statement> = stmts[i + 1..].to_vec();
                                     self.mailbox_put_waiters
                                         .entry(handle)
-                                        .or_insert_with(std::collections::VecDeque::new)
+                                        .or_default()
                                         .push_back(MailboxPutWaiter { pid, value, cont });
                                     return;
                                 }
@@ -20640,7 +20843,7 @@ impl Simulator {
                                     let cont: Vec<Statement> = stmts[i + 1..].to_vec();
                                     self.semaphore_get_waiters
                                         .entry(handle)
-                                        .or_insert_with(std::collections::VecDeque::new)
+                                        .or_default()
                                         .push_back(SemGetWaiter { pid, n, cont });
                                     return;
                                 }
@@ -21659,7 +21862,7 @@ impl Simulator {
                 self.stmt_is_blocking(then_stmt)
                     || else_stmt
                         .as_ref()
-                        .map_or(false, |e| self.stmt_is_blocking(e))
+                        .is_some_and(|e| self.stmt_is_blocking(e))
             }
             StatementKind::Forever { body } => self.stmt_is_blocking(body),
             StatementKind::For { body, .. }
@@ -21858,7 +22061,7 @@ impl Simulator {
         // Resolve the event: literal enum ident first, else evaluate the
         // (inlined-parameter) variable to its enum integer.
         let evt_int: Option<u64> = match &evt_expr.kind {
-            ExprKind::Ident(h) => match h.path.last().map(|s| s.name.name.as_str()).as_deref() {
+            ExprKind::Ident(h) => match h.path.last().map(|s| s.name.name.as_str()) {
                 Some("UVM_ALL_DROPPED") => Some(4),
                 Some("UVM_DROPPED") => Some(2),
                 Some("UVM_RAISED") => Some(1),
@@ -23133,7 +23336,10 @@ impl Simulator {
             };
             let fanout = match self.edge_blocks_by_sig.get(pos) {
                 Some(e)
-                    if !e.posedge.is_empty() || !e.negedge.is_empty() || !e.anyedge.is_empty() =>
+                    if !e.posedge.is_empty()
+                        || !e.negedge.is_empty()
+                        || !e.anyedge.is_empty()
+                        || !e.lsbedge.is_empty() =>
                 {
                     e
                 }
@@ -23249,6 +23455,12 @@ impl Simulator {
             }
             if fires_any {
                 for &block_idx in &fanout.anyedge {
+                    dispatch_block!(block_idx);
+                }
+            }
+            // §9.4.2 `@(edge x)`: an LSB posedge OR negedge (not any change).
+            if fires_pos || fires_neg {
+                for &block_idx in &fanout.lsbedge {
                     dispatch_block!(block_idx);
                 }
             }
@@ -23587,7 +23799,7 @@ impl Simulator {
                     let num_threads = std::thread::available_parallelism()
                         .map(|n| n.get().min(block_slices.len()).min(8))
                         .unwrap_or(2);
-                    let chunk_size = (block_slices.len() + num_threads - 1) / num_threads;
+                    let chunk_size = block_slices.len().div_ceil(num_threads);
                     chunks = block_slices
                         .chunks(chunk_size)
                         .map(|c| c.to_vec())
@@ -23646,7 +23858,7 @@ impl Simulator {
                         for c in sub_chunks.into_iter() {
                             let n = c.len();
                             let pieces = if (n as f64) > 1.3 * (target as f64) {
-                                (n + target - 1) / target
+                                n.div_ceil(target)
                             } else {
                                 1
                             };
@@ -23669,7 +23881,7 @@ impl Simulator {
                             }
                         }
                         sub_chunks = rebuilt;
-                    } else if subchunk_split >= 1 && sub_chunks.len() >= 1 {
+                    } else if subchunk_split >= 1 && !sub_chunks.is_empty() {
                         // Split-largest-only.
                         let sizes: Vec<usize> = sub_chunks.iter().map(|c| c.len()).collect();
                         let max_size = sizes.iter().copied().max().unwrap_or(0);
@@ -23717,7 +23929,7 @@ impl Simulator {
                         let recreate_pool = self
                             .pdes_worker_pool
                             .as_ref()
-                            .map_or(true, |pool| pool.worker_count() != worker_count);
+                            .is_none_or(|pool| pool.worker_count() != worker_count);
                         if recreate_pool {
                             self.pdes_worker_pool = Some(ParallelWorkerPool::new(worker_count));
                         }
@@ -23767,7 +23979,7 @@ impl Simulator {
                         std::thread::scope(|s| {
                             let mut handles = Vec::new();
                             for chunk in sub_chunks.iter() {
-                                let chunk: &[(usize, ParallelBlockSlice)] = *chunk;
+                                let chunk: &[(usize, ParallelBlockSlice)] = chunk;
                                 let handle = s.spawn(move || -> (Vec<NbaFast>, u128) {
                                     if let Ok(mut g) = exec_start_ref.lock() {
                                         if g.is_none() {
@@ -23932,7 +24144,7 @@ impl Simulator {
                                 for (ci, entry) in head.iter().enumerate() {
                                     if let Some(entry) = entry {
                                         let candidate = (entry.block_index, ci);
-                                        if best.map_or(true, |b| candidate < b) {
+                                        if best.is_none_or(|b| candidate < b) {
                                             best = Some(candidate);
                                         }
                                     }
@@ -24796,7 +25008,7 @@ impl Simulator {
                             .unwrap_or(2)
                             .min(par_scratch.len())
                             .max(1);
-                        let chunk = (par_scratch.len() + nthreads - 1) / nthreads;
+                        let chunk = par_scratch.len().div_ceil(nthreads);
                         let view_ptr = view.as_mut_ptr() as usize;
                         let view_len = view.len();
                         let widths: &[u32] = &self.signal_widths;
@@ -25543,8 +25755,13 @@ impl Simulator {
                 match &entries[eidx].item {
                     CombItem::Noop => {}
                     CombItem::FastDirectCopy { dst_id, src_id } => {
-                        // LRM §9.3.1: skip if the destination is forced
-                        if !self.forced_signals.contains_key(dst_id) {
+                        // LRM §9.3.1: skip if the destination is forced.
+                        // The is_empty() short-circuit avoids hashing dst_id on
+                        // every eval — this arm fires ~130M times on c910 and
+                        // forced_signals is empty in the common (no-force) case.
+                        if self.forced_signals.is_empty()
+                            || !self.forced_signals.contains_key(dst_id)
+                        {
                             let (mut sv, mut sx) = self.signal_table[*src_id].raw_bits();
                             // §6.11.1/§10.7: a 2-state destination drops X/Z
                             // (X/Z -> 0) on every write; the raw-bit copy would
@@ -25592,8 +25809,11 @@ impl Simulator {
                     }
                     CombItem::FastDirectFanout { src_id, dst_ids } => {
                         let (src_v, src_x) = self.signal_table[*src_id].raw_bits();
+                        // Hoist the empty-check: skip per-dst hashing entirely
+                        // when nothing is forced (the common case).
+                        let any_forced = !self.forced_signals.is_empty();
                         for &dst_id in dst_ids.iter() {
-                            if self.forced_signals.contains_key(&dst_id) {
+                            if any_forced && self.forced_signals.contains_key(&dst_id) {
                                 continue;
                             }
                             let (mut sv, mut sx) = (src_v, src_x);
@@ -26482,7 +26702,7 @@ impl Simulator {
                     }
                 };
                 resized.is_signed = self.signed_signals.contains(&name);
-                let changed = self.signals.get(&name).map_or(true, |p| *p != resized);
+                let changed = self.signals.get(&name).is_none_or(|p| *p != resized);
                 if changed {
                     self.mark_dirty(&name);
                 }
@@ -26538,7 +26758,7 @@ impl Simulator {
                 // cycle-break fails and `sprint()` on a circular object recurses
                 // to stack overflow.
                 if let Some((_, key)) = self.multidim_assoc_elem(expr, index) {
-                    let changed = self.signals.get(&key).map_or(true, |p| *p != *val);
+                    let changed = self.signals.get(&key).is_none_or(|p| *p != *val);
                     if changed {
                         self.signals.insert(key, val.clone());
                     }
@@ -26574,7 +26794,7 @@ impl Simulator {
                     let idx_val = self.eval_expr(index);
                     let idx_str = self.assoc_key_str(&an, &idx_val);
                     let elem_name = format!("{}[{}]", an, idx_str);
-                    let changed = self.signals.get(&elem_name).map_or(true, |p| p != val);
+                    let changed = self.signals.get(&elem_name) != Some(val);
                     self.signals.insert(elem_name, val.clone());
                     return changed;
                 }
@@ -26622,7 +26842,7 @@ impl Simulator {
                                     }
                                     return changed;
                                 }
-                                let changed = self.signals.get(&name).map_or(true, |p| *p != *val);
+                                let changed = self.signals.get(&name).is_none_or(|p| *p != *val);
                                 if changed {
                                     self.signals.insert(name.clone(), val.clone());
                                     self.mark_dirty(&name);
@@ -26666,7 +26886,7 @@ impl Simulator {
                                 }
                                 return changed;
                             }
-                            let changed = self.signals.get(&elem_name).map_or(true, |p| *p != *val);
+                            let changed = self.signals.get(&elem_name).is_none_or(|p| *p != *val);
                             if changed {
                                 self.signals.insert(elem_name.clone(), val.clone());
                                 self.mark_dirty(&elem_name);
@@ -26854,7 +27074,7 @@ impl Simulator {
                             return changed;
                         }
                         // Fallback: slow path / associative array
-                        let changed = self.signals.get(&elem_name).map_or(true, |p| *p != *val);
+                        let changed = self.signals.get(&elem_name).is_none_or(|p| *p != *val);
                         if changed {
                             sim_dbg_eprintln!("[DEBUG] signal {} changed to {:?}", elem_name, val);
                             self.signals.insert(elem_name.clone(), val.clone());
@@ -27775,7 +27995,7 @@ impl Simulator {
                             && !self
                                 .local_stack
                                 .last()
-                                .map_or(false, |m| m.contains_key(&cls))
+                                .is_some_and(|m| m.contains_key(&cls))
                             && !self.signal_name_to_id.contains_key(cls.as_str())
                             && !self.signals.contains_key(&cls)
                             && self.class_static_set(&cls, &member.name, val.clone())
@@ -27856,7 +28076,7 @@ impl Simulator {
                 // fields under their full dotted path.
                 {
                     let mut field_path: Vec<String> = vec![member.name.clone()];
-                    let mut cur_expr: &Expression = &*expr;
+                    let mut cur_expr: &Expression = expr;
                     // Walk inward through MemberAccess nodes; the LAST one
                     // reaches either Index (array form) or Ident (plain
                     // struct, handled by the Ident branch below).
@@ -27994,8 +28214,8 @@ impl Simulator {
                         }
                     }
                 }
-                if handle != 0 && handle < self.heap.len() {
-                    if self.heap[handle].is_some() {
+                if handle != 0 && handle < self.heap.len()
+                    && self.heap[handle].is_some() {
                         // §8.x: a class property assignment truncates/sign-
                         // extends the rvalue to the property's declared type
                         // (`byte a; a = 'hfff;` ⇒ 8-bit 0xff, read -1 when
@@ -28004,7 +28224,6 @@ impl Simulator {
                         let fitted = self.fit_class_prop(handle, &member.name, val);
                         return self.set_prop_if_changed(handle, &member.name, fitted);
                     }
-                }
                 false
             }
             _ => false,
@@ -28048,11 +28267,10 @@ impl Simulator {
                 let mut val = Value::zero(w.max(8));
                 for (i, byte) in s.bytes().rev().enumerate() {
                     for bit in 0..8 {
-                        if (byte >> bit) & 1 == 1 {
-                            if i * 8 + bit < val.width as usize {
+                        if (byte >> bit) & 1 == 1
+                            && i * 8 + bit < val.width as usize {
                                 val.set_bit(i * 8 + bit, LogicBit::One);
                             }
-                        }
                     }
                 }
                 val
@@ -28690,7 +28908,7 @@ impl Simulator {
                             return l.logic_and(&r);
                         }
                         BinaryOp::LogOr => {
-                            if l.to_u64().map_or(false, |v| v != 0) {
+                            if l.to_u64().is_some_and(|v| v != 0) {
                                 return Value::from_u64(1, 1);
                             }
                             let r = self.eval_expr_ctx(right, ctx_width);
@@ -29523,7 +29741,8 @@ impl Simulator {
                 let base = self.eval_expr(expr);
                 let l = self.eval_expr(left).to_u64().unwrap_or(0) as usize;
                 let r = self.eval_expr(right).to_u64().unwrap_or(0) as usize;
-                let result = match kind {
+
+                match kind {
                     RangeKind::Constant => base.range_select(l, r),
                     RangeKind::IndexedUp => base.range_select(l + r - 1, l),
                     RangeKind::IndexedDown => {
@@ -29538,14 +29757,13 @@ impl Simulator {
                             base.range_select_signed(l as i64, lo_signed)
                         }
                     }
-                };
-                result
+                }
             }
             // §12.6 `e matches p` used as a plain boolean.
             ExprKind::Matches { expr, pattern } => {
                 let mut binds: Vec<(String, Value)> = Vec::new();
                 let ok = self.match_pattern(expr, pattern, &mut binds);
-                return if ok { Value::ones(1) } else { Value::zero(1) };
+                if ok { Value::ones(1) } else { Value::zero(1) }
             }
             ExprKind::Inside { expr, ranges } => {
                 let val = self.eval_expr(expr);
@@ -29678,8 +29896,8 @@ impl Simulator {
                     let result = match name.as_str() {
                         "$rose" => cur_bit == 1 && prev_bit == 0,
                         "$fell" => cur_bit == 0 && prev_bit == 1,
-                        "$stable" => prev_opt.map_or(true, |p| p.to_u64() == cur.to_u64()),
-                        "$changed" => prev_opt.map_or(false, |p| p.to_u64() != cur.to_u64()),
+                        "$stable" => prev_opt.is_none_or(|p| p.to_u64() == cur.to_u64()),
+                        "$changed" => prev_opt.is_some_and(|p| p.to_u64() != cur.to_u64()),
                         _ => unreachable!(),
                     };
                     if result {
@@ -29724,7 +29942,7 @@ impl Simulator {
                         let v = self.eval_expr(a).resize(n.max(1));
                         return v;
                     }
-                    return Value::zero(n.max(1));
+                    Value::zero(n.max(1))
                 }
                 "$clog2" => {
                     let v = args
@@ -29825,17 +30043,17 @@ impl Simulator {
                     for i in 0..w as usize {
                         out.set_bit(i, Self::wire_resolve_bit(a.get_bit(i), b.get_bit(i)));
                     }
-                    return out;
+                    out
                 }
                 // §28.4 pull-strength marker. A lone pull driver just carries
                 // its value; multi-driver resolution unwraps it (see
                 // `resolve_multi_driver_nets`), so this identity path only runs
                 // when a pullup/pulldown is the net's sole driver.
                 "$__pull" => {
-                    return args
+                    args
                         .first()
                         .map(|a| self.eval_expr(a))
-                        .unwrap_or_else(|| Value::new(1));
+                        .unwrap_or_else(|| Value::new(1))
                 }
                 // Strong-over-weak resolution: `$__wres_pull(strong, weak)`.
                 // The STRONG chain (all non-pull drivers, already $__wres-folded)
@@ -29855,7 +30073,7 @@ impl Simulator {
                         let sb = st.get_bit(i);
                         out.set_bit(i, if sb == LogicBit::Z { wk.get_bit(i) } else { sb });
                     }
-                    return out;
+                    out
                 }
                 // `$__tranif(own_self, own_other, ctl, active)` — the value of
                 // THIS terminal of a bidirectional switch.
@@ -29898,7 +30116,7 @@ impl Simulator {
                         };
                         out.set_bit(i, bit);
                     }
-                    return out;
+                    out
                 }
                 "$signed" => {
                     let mut v = args
@@ -30071,7 +30289,7 @@ impl Simulator {
                         .first()
                         .map(|a| self.eval_file_handle_arg(a))
                         .unwrap_or(0);
-                    let buffered = self.ungetc_buf.get(&fd).map_or(false, |b| !b.is_empty());
+                    let buffered = self.ungetc_buf.get(&fd).is_some_and(|b| !b.is_empty());
                     if buffered {
                         Value::zero(32)
                     } else if let Some(f) = self.file_handles.get_mut(&fd) {
@@ -30222,11 +30440,11 @@ impl Simulator {
                     };
                     let mut seed = self.eval_expr(seed_arg).to_u64().unwrap_or(0) as u32;
                     // Advance the caller's seed exactly once per call.
-                    let mut next_u32 = |sd: &mut u32| -> u32 {
+                    let next_u32 = |sd: &mut u32| -> u32 {
                         *sd = Self::prng_next(*sd);
                         *sd
                     };
-                    let mut unit = |sd: &mut u32| -> f64 {
+                    let unit = |sd: &mut u32| -> f64 {
                         // (0,1) — never exactly 0, so ln() stays finite.
                         (next_u32(sd) as f64 + 1.0) / (u32::MAX as f64 + 2.0)
                     };
@@ -30411,8 +30629,7 @@ impl Simulator {
                     Value::from_f64(v.to_f64().sqrt())
                 }
                 "$pow" => {
-                    let a = args
-                        .get(0)
+                    let a = args.first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
                     let b = args
@@ -30605,7 +30822,7 @@ impl Simulator {
                         }
                     }
                     // Unknown cast target: pass the operand through unchanged.
-                    return inner_v;
+                    inner_v
                 }
                 "$shortrealtobits" => {
                     let v = args
@@ -30792,7 +31009,7 @@ impl Simulator {
                     // §18.13.4: the RNG state as an implementation-defined
                     // string (16 hex digits here), round-trippable via
                     // $set_randstate.
-                    return Value::from_string(&self.rng.to_state_string());
+                    Value::from_string(&self.rng.to_state_string())
                 }
                 "$typename" => {
                     if let Some(arg) = args.first() {
@@ -31257,7 +31474,7 @@ impl Simulator {
                         // matching the base_val width (handles queue elements
                         // where the element type isn't directly registered for
                         // the queue variable name).
-                        for (_td_name, td) in &self.module.typedef_types {
+                        for td in self.module.typedef_types.values() {
                             let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
                             if let Some(fields) = Self::struct_field_layout(&resolved) {
                                 let total_w: u32 = fields.iter().map(|(_, _, w, _)| w).sum();
@@ -31310,7 +31527,7 @@ impl Simulator {
                             && !self
                                 .local_stack
                                 .last()
-                                .map_or(false, |m| m.contains_key(cls))
+                                .is_some_and(|m| m.contains_key(cls))
                             && !self.signal_name_to_id.contains_key(cls.as_str())
                             && !self.signals.contains_key(cls)
                         {
@@ -31392,7 +31609,7 @@ impl Simulator {
                 // `packed_struct_fields[arr_name]`. Mirror of assign_value.
                 {
                     let mut field_path: Vec<String> = vec![member.name.clone()];
-                    let mut cur_expr: &Expression = &*expr;
+                    let mut cur_expr: &Expression = expr;
                     loop {
                         match &cur_expr.kind {
                             ExprKind::MemberAccess { expr: b, member: m } => {
@@ -32443,7 +32660,7 @@ impl Simulator {
                         if self
                             .local_stack
                             .last()
-                            .map_or(false, |f| f.contains_key(&lname))
+                            .is_some_and(|f| f.contains_key(&lname))
                         {
                             self.local_stack
                                 .last_mut()
@@ -32505,7 +32722,7 @@ impl Simulator {
                 // and RHS both supply fewer indices than dimensions:
                 //   B[i][j] = A[p][q];   // with A, B both 3D ⇒ copy inner dim
                 {
-                    fn unwrap_nd<'a>(e: &'a Expression) -> (&'a Expression, Vec<&'a Expression>) {
+                    fn unwrap_nd(e: &Expression) -> (&Expression, Vec<&Expression>) {
                         let mut cur = e;
                         let mut rev_idxs: Vec<&Expression> = Vec::new();
                         while let ExprKind::Index {
@@ -32540,8 +32757,8 @@ impl Simulator {
                                     r_prefix = format!("{}[{}]", r_prefix, rv);
                                 }
                                 let remaining: Vec<(i64, i64)> =
-                                    ls[given..].iter().copied().collect();
-                                let rem_r: Vec<(i64, i64)> = rs[given..].iter().copied().collect();
+                                    ls[given..].to_vec();
+                                let rem_r: Vec<(i64, i64)> = rs[given..].to_vec();
                                 if remaining == rem_r {
                                     fn enum_idx(
                                         dims: &[(i64, i64)],
@@ -32597,7 +32814,7 @@ impl Simulator {
                             // Evaluate stream raw (no pad) by using ctx 0.
                             let sv = self.eval_expr_ctx(rvalue, 0);
                             let total = sv.width as usize;
-                            let n_elems = (total + elem_w as usize - 1) / elem_w as usize;
+                            let n_elems = total.div_ceil(elem_w as usize);
                             self.set_queue_size(&lname, n_elems as u64);
                             for k in 0..n_elems {
                                 let hi =
@@ -32849,7 +33066,7 @@ impl Simulator {
                                     let struct_fields =
                                         self.module.packed_struct_fields.get(&arr_name).cloned();
                                     let has_idx_field =
-                                        struct_fields.as_ref().map_or(false, |fs| {
+                                        struct_fields.as_ref().is_some_and(|fs| {
                                             fs.iter().any(|(f, _, _)| f == "index")
                                         });
                                     let mut results = Vec::new();
@@ -33036,7 +33253,7 @@ impl Simulator {
                                 let is_frame_local = self
                                     .local_stack
                                     .last()
-                                    .map_or(false, |f| f.contains_key(&lhs_name));
+                                    .is_some_and(|f| f.contains_key(&lhs_name));
                                 let has_field_sigs = decl_order.iter().all(|(fn_, _, _, _)| {
                                     let dotted = format!("{}.{}", lhs_name, fn_);
                                     self.signals.contains_key(&dotted)
@@ -33064,7 +33281,7 @@ impl Simulator {
                                         if cur.width < total {
                                             cur = cur.resize(total);
                                         }
-                                        for ((fn_, off, w, fr), item) in
+                                        for ((_fn_, off, w, fr), item) in
                                             decl_order.iter().zip(items.iter())
                                         {
                                             let fr = *fr;
@@ -33606,7 +33823,7 @@ impl Simulator {
                                 }
                             }
                             let elem_is_scalar =
-                                self.foreach_dims(&lname).map_or(true, |d| d.len() == 1);
+                                self.foreach_dims(&lname).is_none_or(|d| d.len() == 1);
                             let items: Vec<&Expression> = if elem_is_scalar {
                                 let mut v = Vec::new();
                                 flatten_unpacked_concat(exprs, &mut v);
@@ -33841,7 +34058,7 @@ impl Simulator {
                         });
                     } else if matches!(&lvalue.kind, ExprKind::Ident(h)
                         if h.path.len() == 1
-                            && self.local_stack.last().map_or(false, |m| m.contains_key(&h.path[0].name.name)))
+                            && self.local_stack.last().is_some_and(|m| m.contains_key(&h.path[0].name.name)))
                     {
                         // NBA to a bare task-FRAME local: the deferred queue
                         // commits in `apply_nba`, OUTSIDE the (possibly
@@ -33970,7 +34187,7 @@ impl Simulator {
                     }
                 }
                 let mut matched = false;
-                for (_iidx, item) in items.iter().enumerate() {
+                for item in items.iter() {
                     if item.is_default {
                         continue;
                     }
@@ -34368,22 +34585,41 @@ impl Simulator {
                                 let sz = self.get_queue_size(&name) as i64;
                                 dims[0] = (0, sz - 1);
                             }
-                            // §12.7.3: a loop var BEYOND the unpacked dims maps
-                            // to the element's packed dimension — `foreach
-                            // (array[i,j,k])` on `reg [3:0] array[0:1][0:2]`
-                            // iterates k over the 4 bits.
-                            if dims.len() + 1 == vars.len() {
-                                let ew = self
-                                    .module
-                                    .arrays
-                                    .get(&name)
-                                    .map(|&(_, _, w)| w)
-                                    .or_else(|| {
-                                        self.module.arrays_2d.get(&name).map(|&(_, _, w)| w)
-                                    })
-                                    .or_else(|| self.module.arrays_nd.get(&name).map(|(_, w)| *w));
-                                if let Some(w) = ew.filter(|&w| w > 1) {
-                                    dims.push((0, w as i64 - 1));
+                            // §12.7.3: loop vars BEYOND the unpacked dimensions
+                            // iterate the element's PACKED dimensions — `foreach
+                            // (array[i,j])` on `logic [1:0][7:0] array[0:3]`
+                            // iterates j over the [1:0] packed dim. Use the
+                            // packed dimension STRUCTURE (`packed_full_dims`,
+                            // outermost first) rather than the flattened element
+                            // width, so multi-packed-dim elements and non-zero /
+                            // negative / descending packed ranges iterate the
+                            // correct index set (each dim normalized to
+                            // ascending for the odometer). Fall back to the
+                            // flat width only for a lone packed dim we did not
+                            // record (e.g. a bare `reg [W-1:0]` element).
+                            if dims.len() < vars.len() {
+                                if let Some(pdims) = self.module.packed_full_dims.get(&name) {
+                                    for &(l, r) in pdims.iter() {
+                                        if dims.len() >= vars.len() {
+                                            break;
+                                        }
+                                        dims.push((l.min(r), l.max(r)));
+                                    }
+                                } else if dims.len() + 1 == vars.len() {
+                                    let ew = self
+                                        .module
+                                        .arrays
+                                        .get(&name)
+                                        .map(|&(_, _, w)| w)
+                                        .or_else(|| {
+                                            self.module.arrays_2d.get(&name).map(|&(_, _, w)| w)
+                                        })
+                                        .or_else(|| {
+                                            self.module.arrays_nd.get(&name).map(|(_, w)| *w)
+                                        });
+                                    if let Some(w) = ew.filter(|&w| w > 1) {
+                                        dims.push((0, w as i64 - 1));
+                                    }
                                 }
                             }
                             if dims.len() >= vars.len() {
@@ -34487,7 +34723,7 @@ impl Simulator {
                                 self.set_loop_var_aliased(
                                     var_scope.as_deref(),
                                     &var.name,
-                                    Value::from_u64(v as u64, 32),
+                                    Self::signed_loop_val(v),
                                 );
                                 self.continue_flag = false;
                                 self.exec_statement(body);
@@ -34640,11 +34876,21 @@ impl Simulator {
                 // (§6.21): each entry — e.g. each loop iteration — is a fresh
                 // variable, so pop them on exit.
                 let seq_auto_len = self.auto_loop_vars.len();
+                // §21.2.1.7: a NAMED block adds its name to the `%m` hierarchy.
+                let m_pushed = if let Some(n) = name {
+                    self.m_scope_stack.push(n.name.clone());
+                    true
+                } else {
+                    false
+                };
                 for s in stmts {
                     if self.finished || self.break_flag || self.continue_flag {
                         break;
                     }
                     self.exec_statement(s);
+                }
+                if m_pushed {
+                    self.m_scope_stack.pop();
                 }
                 self.auto_loop_vars.truncate(seq_auto_len);
                 // A `disable` naming THIS block ends here; execution resumes
@@ -35736,7 +35982,7 @@ impl Simulator {
                                 } else {
                                     self.declare_local_dyn(&bare)
                                 };
-                                let is_string_key = key_dt.as_ref().map_or(false, |dt| {
+                                let is_string_key = key_dt.as_ref().is_some_and(|dt| {
                                     matches!(
                                         dt.as_ref(),
                                         crate::ast::types::DataType::Simple {
@@ -35876,7 +36122,7 @@ impl Simulator {
                                 let is_new = match &init_expr.kind {
                                     ExprKind::Call { func, args } => {
                                         if let ExprKind::Ident(h) = &func.kind {
-                                            if h.path.last().map_or(false, |s| s.name.name == "new")
+                                            if h.path.last().is_some_and(|s| s.name.name == "new")
                                             {
                                                 Some(args.clone())
                                             } else {
@@ -35887,7 +36133,7 @@ impl Simulator {
                                         }
                                     }
                                     ExprKind::Ident(h) => {
-                                        if h.path.last().map_or(false, |s| s.name.name == "new") {
+                                        if h.path.last().is_some_and(|s| s.name.name == "new") {
                                             Some(vec![])
                                         } else {
                                             None
@@ -37595,8 +37841,7 @@ impl Simulator {
     /// new queue. Status codes: 0 OK, 4 unsupported type, 5 length<=0,
     /// 6 duplicate q_id (Table 20-11).
     fn q_initialize_impl(&mut self, args: &[Expression]) -> i64 {
-        let qid = args
-            .get(0)
+        let qid = args.first()
             .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64)
             .unwrap_or(0);
         let qtype = args
@@ -37631,8 +37876,7 @@ impl Simulator {
     /// tagged with the current sim time (for wait statistics). Status codes:
     /// 0 OK, 1 queue full, 2 undefined q_id.
     fn q_add_impl(&mut self, args: &[Expression]) -> i64 {
-        let qid = args
-            .get(0)
+        let qid = args.first()
             .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64)
             .unwrap_or(0);
         let job = args
@@ -37671,8 +37915,7 @@ impl Simulator {
     /// inform_id to the output arguments, and accumulating wait statistics.
     /// Status codes: 0 OK, 2 undefined q_id, 3 queue empty.
     fn q_remove_impl(&mut self, args: &[Expression]) -> i64 {
-        let qid = args
-            .get(0)
+        let qid = args.first()
             .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64)
             .unwrap_or(0);
         let now = self.time_in_current_unit() as i64;
@@ -37690,7 +37933,7 @@ impl Simulator {
                 match popped {
                     None => (0, 0, 3), // queue empty
                     Some((job, inform, arrival)) => {
-                        let wait = now as i64 - arrival as i64;
+                        let wait = now - arrival;
                         // shortest wait over removed jobs (code 4)
                         q.shortest_wait_ever = Some(match q.shortest_wait_ever {
                             Some(w) => w.min(wait),
@@ -37702,7 +37945,7 @@ impl Simulator {
                         q.longest_wait_queued = q
                             .entries
                             .iter()
-                            .map(|(_, _, t)| now as i64 - *t as i64)
+                            .map(|(_, _, t)| now - *t)
                             .max();
                         (job, inform, 0)
                     }
@@ -37725,8 +37968,7 @@ impl Simulator {
     /// time-influenced codes (2/4/5/6) return -1 when insufficient samples
     /// exist; the LRM leaves their exact computation implementation-defined.
     fn q_exam_impl(&mut self, args: &[Expression]) -> i64 {
-        let qid = args
-            .get(0)
+        let qid = args.first()
             .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64)
             .unwrap_or(0);
         let code = args
@@ -37755,7 +37997,7 @@ impl Simulator {
                         // longest wait, jobs still queued
                         q.entries
                             .iter()
-                            .map(|(_, _, t)| now as i64 - *t as i64)
+                            .map(|(_, _, t)| now - *t)
                             .max()
                             .unwrap_or(-1)
                     }),
@@ -37782,8 +38024,7 @@ impl Simulator {
     /// queue is full, 0 otherwise; also writes the status code. Status codes:
     /// 0 OK, 2 undefined q_id.
     fn q_full_impl(&mut self, args: &[Expression]) -> (i64, i64) {
-        let qid = args
-            .get(0)
+        let qid = args.first()
             .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64)
             .unwrap_or(0);
         let Some(q) = self.queues.get(&qid) else {
@@ -37912,7 +38153,7 @@ impl Simulator {
                 self.string_signals.contains(&self.resolve_hier_name(h))
                     || self
                         .get_expr_type_name(expr)
-                        .map_or(false, |t| t == "string")
+                        .is_some_and(|t| t == "string")
             }
             ExprKind::Index { expr: base, .. } => {
                 (if let ExprKind::Ident(h) = &base.kind {
@@ -37921,7 +38162,7 @@ impl Simulator {
                     false
                 }) || self
                     .get_expr_type_name(base)
-                    .map_or(false, |t| t == "string")
+                    .is_some_and(|t| t == "string")
             }
             ExprKind::MemberAccess { .. } => {
                 // String methods (substr/getc-as-string-rare). Keep narrow.
@@ -38076,14 +38317,14 @@ impl Simulator {
                     }
                 }
                 let mut width_str = String::new();
-                while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+                while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
                     width_str.push(chars.next().unwrap());
                 }
                 let mut precision: Option<usize> = None;
                 if chars.peek() == Some(&'.') {
                     chars.next();
                     let mut p = String::new();
-                    while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+                    while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
                         p.push(chars.next().unwrap());
                     }
                     precision = Some(p.parse().unwrap_or(0));
@@ -38283,6 +38524,67 @@ impl Simulator {
                                     result.push_str(&format!("'{{{}}}", parts.join(", ")));
                                     continue;
                                 }
+                                // §21.2.1.7: a DIRECT queue/array slice
+                                // (`$display("%p", q[1:3])`) — render the
+                                // element range as a list, not the concatenated
+                                // packed value the raw fallback would print.
+                                if let ExprKind::RangeSelect { expr, left, right, kind } = &arg.kind {
+                                    if matches!(kind, RangeKind::Constant) {
+                                        if let ExprKind::Ident(h) = &expr.kind {
+                                            let nm = self.resolve_hier_name(h);
+                                            let is_coll = self.module.arrays.contains_key(&nm)
+                                                || self.module.dynamic_arrays.contains(&nm);
+                                            if is_coll {
+                                                let is_dyn =
+                                                    self.module.dynamic_arrays.contains(&nm);
+                                                let (arr_lo, arr_hi) = self
+                                                    .module
+                                                    .arrays
+                                                    .get(&nm)
+                                                    .map(|&(lo, hi, _)| (lo, hi))
+                                                    .unwrap_or((0, 0));
+                                                // `$` in the slice resolves to the
+                                                // last valid index (size-1 for a
+                                                // queue/dynamic array).
+                                                let upper = if is_dyn {
+                                                    self.get_queue_size(&nm) as i64 - 1
+                                                } else {
+                                                    arr_hi
+                                                };
+                                                self.dollar_bound.push(upper);
+                                                let mut l =
+                                                    self.eval_expr(left).to_i64().unwrap_or(0);
+                                                let mut r =
+                                                    self.eval_expr(right).to_i64().unwrap_or(0);
+                                                self.dollar_bound.pop();
+                                                if l > r {
+                                                    std::mem::swap(&mut l, &mut r);
+                                                }
+                                                // Clamp to the collection's live
+                                                // element range.
+                                                l = l.max(arr_lo);
+                                                r = r.min(upper);
+                                                let is_str = self.string_signals.contains(&nm);
+                                                let mut parts: Vec<String> = Vec::new();
+                                                for i in l..=r {
+                                                    let en = format!("{}[{}]", nm, i);
+                                                    if let Some(v) =
+                                                        self.get_signal_value_by_name(&en)
+                                                    {
+                                                        parts.push(Self::render_p_value(
+                                                            &v, is_str,
+                                                        ));
+                                                    }
+                                                }
+                                                result.push_str(&format!(
+                                                    "'{{{}}}",
+                                                    parts.join(", ")
+                                                ));
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
                                 let v = self.eval_expr(arg);
                                 result.push_str(&v.to_dec_string());
                             }
@@ -38296,10 +38598,34 @@ impl Simulator {
                             // so a multiply-instantiated module reports
                             // `TB.p1` rather than just `TB`.
                             if !self.current_scope.is_empty() {
-                                result.push_str(&format!(
-                                    "{}.{}",
-                                    self.module.name, self.current_scope
-                                ));
+                                // §21.2.1.7: instance path, then the lexical
+                                // scope chain (task / function / named block)
+                                // the `%m` sits in — e.g. `top.u_leaf.t_auto`.
+                                let mut out =
+                                    format!("{}.{}", self.module.name, self.current_scope);
+                                for sc in &self.m_scope_stack {
+                                    out.push('.');
+                                    out.push_str(sc);
+                                }
+                                result.push_str(&out);
+                            } else if !self.m_scope_stack.is_empty() {
+                                // No instance scope (top module itself): the
+                                // package/module function/task branch — base at
+                                // the first subroutine's declaring scope, then
+                                // the rest of the lexical chain.
+                                let first = &self.m_scope_stack[0];
+                                let base = self
+                                    .module
+                                    .func_decl_scope
+                                    .get(first)
+                                    .cloned()
+                                    .unwrap_or_else(|| self.module.name.clone());
+                                let mut out = format!("{}.{}", base, first);
+                                for sc in &self.m_scope_stack[1..] {
+                                    out.push('.');
+                                    out.push_str(sc);
+                                }
+                                result.push_str(&out);
                             } else if let Some(fname) = self.func_call_stack.last() {
                                 // Inside a package/module subroutine called with
                                 // no instance scope: `%m` must be the
@@ -38723,7 +39049,7 @@ impl Simulator {
             let ring = self.sva_sites[site_idx]
                 .past_snapshots
                 .entry(name)
-                .or_insert_with(std::collections::VecDeque::new);
+                .or_default();
             ring.push_front(v);
             while ring.len() > PAST_MAX_DEPTH {
                 ring.pop_back();
@@ -39456,7 +39782,7 @@ impl Simulator {
                 if p.is_empty() {
                     return this.module.name == d;
                 }
-                this.instance_by_path(p).map_or(false, |i| i.def_name == d)
+                this.instance_by_path(p).is_some_and(|i| i.def_name == d)
             };
             let hint_owned = self.name_resolve_hint.borrow().clone();
             // Walk from the stable executing scope first; the transient
@@ -39522,7 +39848,6 @@ impl Simulator {
     /// Fast signal read avoiding String allocation.
     /// Uses cached_signal_id to remember the signal name as &str key for HashMap lookup.
     #[inline]
-
     fn fast_signal_read(&self, hier: &HierarchicalIdentifier) -> Value {
         let is_ambiguous_leaf = hier.path.len() == 1 && !hier.path[0].name.name.contains('.');
         // Try cached signal ID first (O(1) Vec access)
@@ -39884,11 +40209,10 @@ impl Simulator {
                     | Insn::LoadSignalSigned(_, s)
                     | Insn::LoadSignalRange(_, s, _, _)
                     | Insn::LoadSignalBit(_, s, _)
-                    | Insn::BranchIfSignalFalse(s, _) => {
-                        if seen.insert(*s as u32) {
+                    | Insn::BranchIfSignalFalse(s, _)
+                        if seen.insert(*s as u32) => {
                             reads.push(*s as u32);
                         }
-                    }
                     // Partial (read-modify-write) assigns read the destination
                     // signal's current value as base, but NOT via a LoadSignal —
                     // so the preserved bits are an implicit input. Treat the dest
@@ -39899,11 +40223,10 @@ impl Simulator {
                     | Insn::NbaAssignBitDyn(s, ..)
                     | Insn::BlockingAssignRange(s, ..)
                     | Insn::BlockingAssignRangeDyn(s, ..)
-                    | Insn::BlockingAssignBitDyn(s, ..) => {
-                        if seen.insert(*s as u32) {
+                    | Insn::BlockingAssignBitDyn(s, ..)
+                        if seen.insert(*s as u32) => {
                             reads.push(*s as u32);
                         }
-                    }
                     Insn::LoadArrayElem(..) => dynamic = true,
                     // Array-element NBA/blocking writes (memory) use a dynamic
                     // index; conservatively make such blocks non-gateable.
@@ -40402,7 +40725,7 @@ impl Simulator {
                 .unwrap_or(val.width);
             let mut resized = val.resize(width);
             resized.is_signed = self.signed_signals.contains(name);
-            let changed = self.signals.get(name).map_or(true, |p| *p != resized);
+            let changed = self.signals.get(name).is_none_or(|p| *p != resized);
             if changed {
                 self.mark_dirty(name);
             }
@@ -41346,7 +41669,7 @@ impl Simulator {
             let (scope_parts, leaf) = if parts.len() > 1 {
                 (&parts[..parts.len() - 1], parts[parts.len() - 1])
             } else {
-                (&[][..], parts[0].as_ref())
+                (&[][..], parts[0])
             };
             // Navigate/create scope tree
             let mut node = &mut root;
@@ -42389,10 +42712,10 @@ impl Simulator {
             format!("0x{:x}", val.to_u64().unwrap_or(0))
         } else {
             // Wide all-known: emit as hex, MSB first.
-            let mut s = String::with_capacity((val.width as usize + 3) / 4 + 2);
+            let mut s = String::with_capacity((val.width as usize).div_ceil(4) + 2);
             s.push_str("0x");
             let mut started = false;
-            let nibble_count = (val.width as usize + 3) / 4;
+            let nibble_count = (val.width as usize).div_ceil(4);
             for n in (0..nibble_count).rev() {
                 let mut nib: u32 = 0;
                 for b in 0..4 {
@@ -43318,7 +43641,7 @@ impl Simulator {
     /// leak into the module table where the last-elaborated class wins), then
     /// the module-level table, then any class-local typedef table.
     fn lookup_typedef_target(&self, nm: &str) -> Option<crate::ast::types::DataType> {
-        use crate::ast::types::DataType;
+
         if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
             let mut cur = Some(ctx);
             while let Some(cname) = cur {
@@ -43576,8 +43899,8 @@ impl Simulator {
                     Some(frag)
                 })
                 .collect::<Option<_>>()?;
-            let result = Some((base.clone(), frags.join(",")));
-            result
+
+            Some((base.clone(), frags.join(",")))
         } else {
             None
         }
@@ -43841,19 +44164,56 @@ impl Simulator {
         };
         let dims = self.module.packed_full_dims.get(&base_name)?.clone();
         let k = idx_exprs.len();
-        if k > dims.len() {
+        idx_exprs.reverse(); // outermost dimension's index first
+
+        // §7.4: unpacked dimensions are indexed BEFORE packed ones. When
+        // `base_name` is an unpacked array whose element type is itself a
+        // packed multi-D vector (`logic [0:0][31:0] arr [0:0]`), the leading
+        // `num_unpacked` indices select the unpacked ELEMENT (a per-element
+        // signal `arr[i]…`) and only the trailing indices index the packed
+        // dims recorded in `packed_full_dims`. Without this split the unpacked
+        // index was consumed as a packed dimension, so `arr[0][0]` collapsed
+        // to a 1-bit select (bit 0) instead of the 32-bit packed slice.
+        // Pure packed vectors (num_unpacked == 0) keep the original behavior:
+        // the whole object is one flat signal named `base_name`.
+        let num_unpacked = if let Some((d, _)) = self.module.arrays_nd.get(&base_name) {
+            d.len()
+        } else if self.module.arrays_2d.contains_key(&base_name) {
+            2
+        } else if self.module.arrays.contains_key(&base_name) {
+            1
+        } else {
+            0
+        };
+        // Not enough indices to reach packed selection — let the generic
+        // unpacked-element path handle a bare element read/write.
+        if num_unpacked >= k {
             return None;
         }
-        idx_exprs.reverse(); // outermost dimension's index first
+        let mut elem_name = base_name.clone();
+        for ie in &idx_exprs[..num_unpacked] {
+            let iv = self.eval_expr(ie);
+            let idx_i = if iv.has_xz() { None } else { iv.to_i64() };
+            match idx_i {
+                // X / unresolved unpacked index: fall back to the generic path.
+                None => return None,
+                Some(i) => elem_name.push_str(&format!("[{}]", i)),
+            }
+        }
+        let packed_idx = &idx_exprs[num_unpacked..];
+        let pk = packed_idx.len();
+        if pk > dims.len() {
+            return None;
+        }
         let counts: Vec<u64> = dims
             .iter()
             .map(|(l, r)| (l - r).unsigned_abs() + 1)
             .collect();
-        let total: u64 = counts.iter().product();
-        let elem_w: u64 = counts[k..].iter().product::<u64>().max(1);
+        let total: u64 = counts.iter().product(); // packed element width in bits
+        let elem_w: u64 = counts[pk..].iter().product::<u64>().max(1);
         let mut msb_off: u64 = 0;
         let mut oob = false;
-        for (j, ie) in idx_exprs.iter().enumerate() {
+        for (j, ie) in packed_idx.iter().enumerate() {
             let iv = self.eval_expr(ie);
             if iv.has_xz() {
                 oob = true;
@@ -43881,10 +44241,10 @@ impl Simulator {
             msb_off += slot * w_j;
         }
         if oob {
-            return Some((base_name, None, elem_w as u32));
+            return Some((elem_name, None, elem_w as u32));
         }
         let lo = total - msb_off - elem_w;
-        Some((base_name, Some(lo as usize), elem_w as u32))
+        Some((elem_name, Some(lo as usize), elem_w as u32))
     }
 
     fn packed_leaf_of_hier(&self, full: &str) -> Option<(String, u32, u32)> {
@@ -44688,7 +45048,7 @@ impl Simulator {
         let inst = inst_expr
             .map(|a| self.eval_expr(a).to_sv_string())
             .unwrap_or_default();
-        let cntxt_expr = find_named("cntxt").or_else(|| args.get(0));
+        let cntxt_expr = find_named("cntxt").or_else(|| args.first());
         let scope = self.cfg_scope(cntxt_expr, &inst);
         let key = format!("__uvm_cfgdb__{}|{}", inst, field);
         match mname {
@@ -45196,8 +45556,8 @@ impl Simulator {
     fn subst_local_ident(&mut self, e: &mut Expression, name: &str) -> bool {
         let mut hit = false;
         match &mut e.kind {
-            ExprKind::Ident(h) => {
-                if h.path.len() == 1 && h.root.is_none() && h.path[0].name.name == name {
+            ExprKind::Ident(h)
+                if h.path.len() == 1 && h.root.is_none() && h.path[0].name.name == name => {
                     // Resolve on a cache-free copy: the AST node's memoized
                     // name must not be poisoned with the caller-scope
                     // resolution (the same node is re-solved under `this`).
@@ -45217,7 +45577,6 @@ impl Simulator {
                         hit = true;
                     }
                 }
-            }
             ExprKind::Binary { left, right, .. } => {
                 hit |= self.subst_local_ident(left, name);
                 hit |= self.subst_local_ident(right, name);
@@ -45279,6 +45638,18 @@ impl Simulator {
             .map(|&(lo, hi, _)| vec![(lo, hi)])
     }
 
+    /// A `foreach` index variable is implicitly `int` (signed, §12.7.3), so a
+    /// negative declared bound (`foreach (a[i])` on `a[-2:-4]`) must read back
+    /// as a negative number — not `from_u64`'s unsigned 4294967294. Masks to 32
+    /// bits and marks the value signed so `%0d`, arithmetic, and negative array
+    /// indexing (`a[i]`) all behave.
+    #[inline]
+    fn signed_loop_val(i: i64) -> Value {
+        let mut v = Value::from_u64(i as u64, 32);
+        v.is_signed = true;
+        v
+    }
+
     /// Run `body` once per index tuple, last dimension varying fastest.
     /// IEEE 1800-2017 §12.7.3: a dimension whose loop variable is OMITTED
     /// (`foreach (m[, j])`) is not traversed at all — only the named ones are.
@@ -45308,7 +45679,7 @@ impl Simulator {
                 return;
             }
             for (k, (_, id)) in iterated.iter().enumerate() {
-                self.set_loop_var_aliased(scope, &id.name, Value::from_u64(idx[k] as u64, 32));
+                self.set_loop_var_aliased(scope, &id.name, Self::signed_loop_val(idx[k]));
             }
             self.continue_flag = false;
             self.exec_statement(body);
@@ -45581,11 +45952,10 @@ impl Simulator {
                 condition,
                 constraint,
                 ..
-            } => {
-                if self.eval_expr(condition).is_true() {
+            }
+                if self.eval_expr(condition).is_true() => {
                     self.apply_inline_constraint(constraint, targets);
                 }
-            }
             CI::Block(items) => {
                 for it in items {
                     self.apply_inline_constraint(it, targets);
@@ -45774,8 +46144,8 @@ impl Simulator {
                     }
                 }
             }
-            CI::Inside { expr, range, .. } => {
-                if self.is_elem_of(expr, arr) {
+            CI::Inside { expr, range, .. }
+                if self.is_elem_of(expr, arr) => {
                     for r in range {
                         match r {
                             ConstraintRange::Range { lo, hi } => {
@@ -45790,7 +46160,6 @@ impl Simulator {
                         }
                     }
                 }
-            }
             CI::Foreach { item, .. } => self.collect_elem_ranges(item, arr, out),
             CI::Block(items) => {
                 for it in items {
@@ -46119,11 +46488,10 @@ impl Simulator {
                 condition,
                 constraint,
                 ..
-            } => {
-                if self.eval_expr(condition).is_true() {
+            }
+                if self.eval_expr(condition).is_true() => {
                     self.narrow_inline_foreach_bounds(constraint, arr, idx, lo, hi, any, excl);
                 }
-            }
             CI::Block(items) => {
                 for it in items {
                     self.narrow_inline_foreach_bounds(it, arr, idx, lo, hi, any, excl);
@@ -46232,13 +46600,10 @@ impl Simulator {
                 condition,
                 constraint,
                 ..
-            } => {
-                if self.eval_expr(condition).is_true() {
-                    self.apply_inline_foreach_pins(constraint, arr, idx, w)
-                } else {
-                    false
-                }
             }
+                if self.eval_expr(condition).is_true() => {
+                    self.apply_inline_foreach_pins(constraint, arr, idx, w)
+                }
             CI::Block(items) => {
                 let mut pinned = false;
                 for it in items {
@@ -46733,7 +47098,7 @@ impl Simulator {
             let mut ids = HashSet::default();
             me.collect_item_idents(it, &mut ids);
             ids.iter()
-                .any(|n| names.get(n).map_or(false, |i| owned.contains(i)))
+                .any(|n| names.get(n).is_some_and(|i| owned.contains(i)))
         };
         match item {
             CI::Expr(e) => {
@@ -47101,7 +47466,7 @@ impl Simulator {
         let stale = self
             .dist_decks
             .get(&key)
-            .map_or(true, |(s, deck, pos)| *s != sig || *pos >= deck.len());
+            .is_none_or(|(s, deck, pos)| *s != sig || *pos >= deck.len());
         if stale {
             let deck = self.build_dist_deck(masses, total);
             self.dist_decks.insert(key.clone(), (sig, deck, 0));
@@ -47470,7 +47835,7 @@ impl Simulator {
     /// `x`/`z` when all three bits are, `X`/`Z` when only some are.
     fn bin_to_oct_string(bin: &str) -> String {
         let b: Vec<char> = bin.chars().collect();
-        let mut digits: Vec<char> = Vec::with_capacity((b.len() + 2) / 3);
+        let mut digits: Vec<char> = Vec::with_capacity(b.len().div_ceil(3));
         let mut hi = b.len();
         while hi > 0 {
             let lo = hi.saturating_sub(3);
@@ -47602,7 +47967,7 @@ impl Simulator {
             .nth(1)
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let mut raw = if exp < -4 || exp >= p as i32 {
+        let raw = if exp < -4 || exp >= p as i32 {
             Self::c_style_exp(x, p.saturating_sub(1), upper)
         } else {
             let decimals = (p as i32 - 1 - exp).max(0) as usize;
@@ -47629,7 +47994,7 @@ impl Simulator {
     /// bytes, padded to whole 32-bit words.
     fn unformatted_2state(bin: &str) -> String {
         let bits: Vec<char> = bin.chars().rev().collect(); // LSB first
-        let words = (bits.len() + 31) / 32;
+        let words = bits.len().div_ceil(32);
         let mut out = String::with_capacity(words * 4);
         for byte_idx in 0..words * 4 {
             let mut byte = 0u8;
@@ -47648,10 +48013,10 @@ impl Simulator {
     /// 0=(a0,b0), 1=(a1,b0), z=(a0,b1), x=(a1,b1).
     fn unformatted_4state(bin: &str) -> String {
         let bits: Vec<char> = bin.chars().rev().collect(); // LSB first
-        let words = (bits.len() + 31) / 32;
+        let words = bits.len().div_ceil(32);
         let mut out = String::with_capacity(words * 8);
         for w in 0..words {
-            let mut word_bytes = |aval: bool, out: &mut String| {
+            let word_bytes = |aval: bool, out: &mut String| {
                 for byte_in_word in 0..4 {
                     let mut byte = 0u8;
                     for bit in 0..8 {
@@ -47997,7 +48362,7 @@ impl Simulator {
         if self
             .local_stack
             .last()
-            .map_or(false, |l| l.contains_key(nm))
+            .is_some_and(|l| l.contains_key(nm))
         {
             return None;
         }
@@ -49398,7 +49763,7 @@ impl Simulator {
         self.module
             .packed_struct_fields
             .get(vname)
-            .map_or(false, |f| !f.is_empty())
+            .is_some_and(|f| !f.is_empty())
     }
 
     fn expand_struct_target(&self, a: &Expression) -> Option<Vec<(String, Expression)>> {
@@ -50026,7 +50391,7 @@ impl Simulator {
         // packed_struct_fields layout to the queue's name so that
         // `driver[i].field` MemberAccess on queue elements works.
         let resolved_dt = Self::resolve_type_ref(queue_data_type, &self.module.typedef_types);
-        if matches!(resolved_dt, DataType::Struct(_)) {}
+        matches!(resolved_dt, DataType::Struct(_));
         if let crate::ast::types::DataType::Struct(su) = resolved_dt {
             if !su.packed {
                 // Record the element typedef name so MemberAccess reads can
@@ -50205,7 +50570,7 @@ impl Simulator {
             } = &arg.kind
             {
                 let is_new = match &func.kind {
-                    ExprKind::Ident(h) => h.path.last().map_or(false, |s| s.name.name == "new"),
+                    ExprKind::Ident(h) => h.path.last().is_some_and(|s| s.name.name == "new"),
                     _ => false,
                 };
                 if is_new {
@@ -50366,7 +50731,7 @@ impl Simulator {
         // passed by accident but `*`/`?` wildcards were never detected, so
         // `uvm_is_match("*.agent.*", path)` always failed (config_db scope globs).
         if mname == "getc" {
-            if let Some(idx_arg) = args.get(0) {
+            if let Some(idx_arg) = args.first() {
                 let idx = self.eval_expr(idx_arg).to_u64().unwrap_or(0) as usize;
                 // Byte indexing, not UTF-8: a char above 0x7F is one SV byte.
                 let b = self
@@ -50381,7 +50746,7 @@ impl Simulator {
             return Some(Value::zero(8));
         }
         if mname == "substr" {
-            if let Some(first) = args.get(0) {
+            if let Some(first) = args.first() {
                 if let Some(second) = args.get(1) {
                     let start = self.eval_expr(first).to_u64().unwrap_or(0) as usize;
                     let end = self.eval_expr(second).to_u64().unwrap_or(0) as usize;
@@ -50396,7 +50761,7 @@ impl Simulator {
                                 break;
                             }
                         }
-                        let actual_len = (highest_bit + 7) / 8;
+                        let actual_len = highest_bit.div_ceil(8);
                         if actual_len > 0 && start < actual_len && end < actual_len && start <= end
                         {
                             let l = (actual_len - 1 - start) * 8 + 7;
@@ -50520,7 +50885,7 @@ impl Simulator {
                         elements.push(v);
                     }
                 }
-                elements.sort_by(|a, b| a.to_u64().unwrap_or(0).cmp(&b.to_u64().unwrap_or(0)));
+                elements.sort_by_key(|a| a.to_u64().unwrap_or(0));
                 for (i, v) in elements.into_iter().enumerate() {
                     self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i), v);
                 }
@@ -50813,8 +51178,8 @@ impl Simulator {
                 return Some(Value::zero(32));
             }
         }
-        if mname == "first" || mname == "last" || mname == "next" || mname == "prev" {
-            if self.is_associative_array(obj_name) {
+        if (mname == "first" || mname == "last" || mname == "next" || mname == "prev")
+            && self.is_associative_array(obj_name) {
                 let prefix = format!("{}[", obj_name);
                 let mut keys: Vec<String> = self
                     .signals
@@ -50880,7 +51245,6 @@ impl Simulator {
                     return Some(Value::zero(32));
                 }
             }
-        }
         None
     }
 
@@ -51059,7 +51423,7 @@ impl Simulator {
             } else {
                 self.class_context_stack.push(Some(cname.clone()));
                 self.this_stack.push(None);
-                if prop == "m__initialized" {}
+
                 let v = self.eval_expr(&init);
                 self.this_stack.pop();
                 self.class_context_stack.pop();
@@ -51401,11 +51765,7 @@ impl Simulator {
                             .iter()
                             .find(|(name, _)| name == prop)
                             .and_then(|(_, e)| e.clone());
-                        if let Some(init_expr) = pd_expr {
-                            Some(self.eval_expr(&init_expr))
-                        } else {
-                            None
-                        }
+                        pd_expr.map(|init_expr| self.eval_expr(&init_expr))
                     }
                 } else {
                     None
@@ -51445,7 +51805,7 @@ impl Simulator {
                     .module
                     .var_decl_types
                     .get(name)
-                    .map_or(false, |dt| self.is_virtual_iface_type(dt));
+                    .is_some_and(|dt| self.is_virtual_iface_type(dt));
                 // A same-named class vif PROPERTY written bare inside a
                 // method takes the binding path below, not the var alias.
                 let shadows_class_prop = self
@@ -51456,7 +51816,7 @@ impl Simulator {
                     .and_then(|hd| self.heap.get(hd).and_then(|o| o.as_ref()))
                     .map(|i| i.class_name.clone())
                     .and_then(|cn| self.module.classes.get(&cn))
-                    .map_or(false, |cd| cd.virtual_iface_properties.contains_key(name));
+                    .is_some_and(|cd| cd.virtual_iface_properties.contains_key(name));
                 if is_viface_var && !shadows_class_prop {
                     // §25.10: whole-array binding (`vifs = interfaces`). Each
                     // virtual-interface element is an independent alias to the
@@ -51746,7 +52106,7 @@ impl Simulator {
         let is_vif_spec = self
             .current_spec
             .as_ref()
-            .map_or(false, |(_b, sig)| sig.trim_start().starts_with("virtual"));
+            .is_some_and(|(_b, sig)| sig.trim_start().starts_with("virtual"));
         if !is_vif_spec {
             return None;
         }
@@ -51992,7 +52352,7 @@ impl Simulator {
         // A type-param binding resolves first; otherwise the raw name may
         // itself be an array/queue typedef (`my_array_t data;` — the class
         // property elaboration is dim-blind for typedef'd types).
-        let raw_dbg = raw.clone();
+        let _raw_dbg = raw.clone();
         let concrete = self
             .heap
             .get(handle)
@@ -52006,7 +52366,7 @@ impl Simulator {
         // typedefs), then every class's local typedefs for a matching name
         // with an unsized/queue first dimension.
         let is_collection_dim = |dims: &Vec<crate::ast::types::UnpackedDimension>| {
-            dims.first().map_or(false, |d| {
+            dims.first().is_some_and(|d| {
                 matches!(
                     d,
                     crate::ast::types::UnpackedDimension::Unsized(_)
@@ -52820,7 +53180,7 @@ impl Simulator {
                         if !self
                             .local_stack
                             .last()
-                            .map_or(false, |m| m.contains_key(pkg.as_str()))
+                            .is_some_and(|m| m.contains_key(pkg.as_str()))
                             && !self.signal_name_to_id.contains_key(pkg.as_str())
                             && self.module.classes.contains_key(&cls)
                         {
@@ -52855,7 +53215,7 @@ impl Simulator {
                         let routed = mname == "new"
                             || self
                                 .super_call_parent()
-                                .map_or(false, |p| self.class_has_method(&p, mname));
+                                .is_some_and(|p| self.class_has_method(&p, mname));
                         if routed {
                             return self.exec_super_method_call(handle, mname, args);
                         }
@@ -52874,7 +53234,7 @@ impl Simulator {
                 let recv_is_factory = self
                     .eval_handle_expr(expr)
                     .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
-                    .map_or(false, |i| i.class_name.contains("factory"));
+                    .is_some_and(|i| i.class_name.contains("factory"));
                 if recv_is_factory {
                     let type_name = args
                         .first()
@@ -53002,7 +53362,7 @@ impl Simulator {
                         } else {
                             &self.constraint_mode_disabled
                         };
-                        let disabled = table.get(&h).map_or(false, |s| {
+                        let disabled = table.get(&h).is_some_and(|s| {
                             if let Some(ref n) = target_name {
                                 s.contains(n)
                             } else {
@@ -53287,7 +53647,7 @@ impl Simulator {
                 let is_class_with_name_method = type_hint
                     .as_deref()
                     .and_then(|tn| self.module.classes.get(tn))
-                    .map_or(false, |cd| cd.methods.contains_key("name"));
+                    .is_some_and(|cd| cd.methods.contains_key("name"));
                 if !is_class_with_name_method {
                     let val = self.eval_expr(expr).to_u64().unwrap_or(0);
                     if let Some(nm) = self.enum_value_name(val, type_hint.as_deref()) {
@@ -53490,12 +53850,12 @@ impl Simulator {
                     && !self
                         .local_stack
                         .last()
-                        .map_or(false, |m| m.contains_key(&name))
+                        .is_some_and(|m| m.contains_key(&name))
                     && !self.signal_name_to_id.contains_key(name.as_str())
                     && !self.signals.contains_key(&name)
                 {
                     // Type-parameter used as a class name: `Tregistry::get()`.
-                    if name == "Tregistry" {}
+
                     // Resolve the type param to a concrete class/specialization
                     // from the active spec before dispatching.
                     if let Some(resolved) = self.resolve_type_param_binding(&name) {
@@ -53644,7 +54004,7 @@ impl Simulator {
                     .heap
                     .get(handle)
                     .and_then(|o| o.as_ref())
-                    .map_or(false, |i| self.class_has_method(&i.class_name, "get"));
+                    .is_some_and(|i| self.class_has_method(&i.class_name, "get"));
                 if !is_user_get {
                     return Value::zero(32);
                 }
@@ -53990,7 +54350,7 @@ impl Simulator {
                     let routed = m == "new"
                         || self
                             .super_call_parent()
-                            .map_or(false, |p| self.class_has_method(&p, &m));
+                            .is_some_and(|p| self.class_has_method(&p, &m));
                     if routed {
                         return self.exec_super_method_call(handle, &m, args);
                     }
@@ -54205,7 +54565,7 @@ impl Simulator {
                     let is_class_name = hint
                         .as_deref()
                         .and_then(|tn| self.module.classes.get(tn))
-                        .map_or(false, |cd| cd.methods.contains_key("name"));
+                        .is_some_and(|cd| cd.methods.contains_key("name"));
                     if !is_class_name {
                         let val = self.eval_expr(&base_expr).to_u64().unwrap_or(0);
                         if let Some(nm) = self.enum_value_name(val, hint.as_deref()) {
@@ -54644,7 +55004,7 @@ impl Simulator {
                             } else {
                                 &self.constraint_mode_disabled
                             };
-                            let disabled = table.get(&h_val).map_or(false, |s| {
+                            let disabled = table.get(&h_val).is_some_and(|s| {
                                 if let Some(ref n) = target_name {
                                     s.contains(n) || s.contains("*")
                                 } else {
@@ -54685,7 +55045,7 @@ impl Simulator {
                     && !self
                         .local_stack
                         .last()
-                        .map_or(false, |m| m.contains_key(obj_name))
+                        .is_some_and(|m| m.contains_key(obj_name))
                     && !self.signal_name_to_id.contains_key(obj_name.as_str())
                     && !self.signals.contains_key(obj_name)
                 {
@@ -54803,7 +55163,7 @@ impl Simulator {
                     if !self
                         .local_stack
                         .last()
-                        .map_or(false, |m| m.contains_key(pkg))
+                        .is_some_and(|m| m.contains_key(pkg))
                         && !self.signal_name_to_id.contains_key(pkg)
                         && self.module.classes.contains_key(cls)
                     {
@@ -54902,7 +55262,7 @@ impl Simulator {
                     .map(|h| h as usize)
                     .filter(|&h| h != 0 && h < self.heap.len())
                     .and_then(|h| self.heap[h].as_ref())
-                    .map_or(false, |i| self.class_has_method(&i.class_name, method_name));
+                    .is_some_and(|i| self.class_has_method(&i.class_name, method_name));
                 if !prefer_user_method {
                     if let Some(res) = self.eval_builtin_method(obj_name, method_name, args) {
                         return res;
@@ -55658,6 +56018,8 @@ impl Simulator {
         // resolves to `<pkg>.<name>` (see the `%m` formatter). Popped after the
         // body; recursion keeps the stack ordered.
         self.func_call_stack.push(fd.name.name.name.clone());
+        let m_fn_leaf = fd.name.name.name.rsplit('.').next().unwrap_or(&fd.name.name.name).to_string();
+        let saved_m_scope_fn = std::mem::replace(&mut self.m_scope_stack, vec![m_fn_leaf]);
         // §6.21: open a static-local sync frame keyed by this subroutine name.
         self.static_local_syncs
             .push((fd.name.name.name.clone(), Vec::new()));
@@ -55670,6 +56032,7 @@ impl Simulator {
         }
         self.sync_static_locals();
         self.func_call_stack.pop();
+        self.m_scope_stack = saved_m_scope_fn;
         self.this_stack.pop();
         self.class_context_stack.pop();
         let mut result = if let Some(rv) = self.return_value.take() {
@@ -55787,6 +56150,8 @@ impl Simulator {
                 set.remove(&self.current_pid);
             }
         }
+        // §21.2.1.7 `%m`: restore the caller's lexical scope.
+        self.m_scope_stack = c.saved_m_scope;
         self.current_static_task = c.prev_static;
         if c.pushed_method_this {
             self.this_stack.pop();
@@ -56010,7 +56375,13 @@ impl Simulator {
             .entry(tname.clone())
             .or_default()
             .insert(self.current_pid);
+        // §21.2.1.7 `%m`: entering a task RESETS the lexical scope to just
+        // this task (leaf name — the decl name may be instance-qualified),
+        // saving the caller's scope for restoration on return.
+        let m_leaf = tname.rsplit('.').next().unwrap_or(&tname).to_string();
+        let saved_m_scope = std::mem::replace(&mut self.m_scope_stack, vec![m_leaf]);
         TaskCleanup {
+            saved_m_scope,
             task_name: Some(tname),
             array_writebacks,
             output_bindings,
@@ -56192,7 +56563,7 @@ impl Simulator {
                         .iter()
                         .any(|(k, &c)| c >= at_least && k.starts_with(&pre))
                 } else {
-                    inst.bin_hits.get(key).map_or(false, |&c| c >= at_least)
+                    inst.bin_hits.get(key).is_some_and(|&c| c >= at_least)
                 }
             })
         };
@@ -56349,7 +56720,7 @@ impl Simulator {
                                 let key = format!("{}.{}", cr_name, b.name.name);
                                 insts
                                     .iter()
-                                    .any(|i| i.cross_bin_hits.get(&key).map_or(false, |&c| c > 0))
+                                    .any(|i| i.cross_bin_hits.get(&key).is_some_and(|&c| c > 0))
                             })
                             .count();
                         hit as f64 / cr.bins.len() as f64
@@ -57245,7 +57616,7 @@ impl Simulator {
                     let spec_matches = self
                         .current_spec
                         .as_ref()
-                        .map_or(false, |(b, _)| *b == class_def.name);
+                        .is_some_and(|(b, _)| *b == class_def.name);
                     if spec_matches {
                         if let Some(v) = self.resolve_value_param_from_spec(pname) {
                             instance.properties.insert(pname.clone(), v);
@@ -58525,7 +58896,7 @@ impl Simulator {
         let used = self
             .randc_used
             .entry(key.clone())
-            .or_insert_with(HashSet::default);
+            .or_default();
         let mut avail: Vec<u64> = domain
             .iter()
             .copied()
@@ -58769,7 +59140,7 @@ impl Simulator {
                     then_item,
                     else_item,
                     ..
-                } => walk(then_item, prop) || else_item.as_ref().map_or(false, |e| walk(e, prop)),
+                } => walk(then_item, prop) || else_item.as_ref().is_some_and(|e| walk(e, prop)),
                 _ => false,
             }
         }
@@ -59053,12 +59424,11 @@ impl Simulator {
                 range,
                 is_dist,
                 ..
-            } => {
-                if !*is_dist && Self::is_size_call(expr, prop, row) {
+            }
+                if !*is_dist && Self::is_size_call(expr, prop, row) => {
                     let rs = range.clone();
                     out.push(SizeCon::In(self.eval_range_list(&rs)));
                 }
-            }
             ConstraintItem::Expr(e) => match &e.kind {
                 ExprKind::Binary { op, left, right } => {
                     let (sz_side, other, flip) = if Self::is_size_call(left, prop, row) {
@@ -59098,8 +59468,8 @@ impl Simulator {
                 ExprKind::Inside {
                     expr: inner,
                     ranges,
-                } => {
-                    if Self::is_size_call(inner, prop, row) {
+                }
+                    if Self::is_size_call(inner, prop, row) => {
                         let cr: Vec<ConstraintRange> = ranges
                             .iter()
                             .map(|r| match &r.kind {
@@ -59112,7 +59482,6 @@ impl Simulator {
                             .collect();
                         out.push(SizeCon::In(self.eval_range_list(&cr)));
                     }
-                }
                 _ => {}
             },
             _ => {}
@@ -59155,9 +59524,9 @@ impl Simulator {
             return false;
         }
         match (&recv.kind, row) {
-            (ExprKind::Ident(h), false) => h.path.last().map_or(false, |s| s.name.name == prop),
+            (ExprKind::Ident(h), false) => h.path.last().is_some_and(|s| s.name.name == prop),
             (ExprKind::Index { expr: b, .. }, true) => match &b.kind {
-                ExprKind::Ident(h) => h.path.last().map_or(false, |s| s.name.name == prop),
+                ExprKind::Ident(h) => h.path.last().is_some_and(|s| s.name.name == prop),
                 _ => false,
             },
             _ => false,
@@ -59218,7 +59587,7 @@ impl Simulator {
                     {
                         let is_elem = matches!(&inner.kind, ExprKind::Index { expr: b, .. }
                             if matches!(&b.kind, ExprKind::Ident(h)
-                                if h.path.last().map_or(false, |s| s.name.name == prop)));
+                                if h.path.last().is_some_and(|s| s.name.name == prop)));
                         if is_elem {
                             out.push(
                                 ranges
@@ -59243,7 +59612,7 @@ impl Simulator {
                 } => {
                     let is_elem = matches!(&expr.kind, ExprKind::Index { expr: b, .. }
                         if matches!(&b.kind, ExprKind::Ident(h)
-                            if h.path.last().map_or(false, |s| s.name.name == prop)));
+                            if h.path.last().is_some_and(|s| s.name.name == prop)));
                     if is_elem && !*is_dist {
                         out.push(range.clone());
                     }
@@ -59256,11 +59625,10 @@ impl Simulator {
                 ConstraintItem::Soft(i) => walk(i, prop, out),
                 ConstraintItem::Foreach {
                     array, item: body, ..
-                } => {
-                    if Simulator::foreach_base_name(array).as_deref() == Some(prop) {
+                }
+                    if Simulator::foreach_base_name(array).as_deref() == Some(prop) => {
                         walk(body, prop, out);
                     }
-                }
                 _ => {}
             }
         }
@@ -59505,13 +59873,10 @@ impl Simulator {
                 condition,
                 constraint,
                 ..
-            } => {
-                if self.eval_expr(condition).is_true() {
-                    self.force_elem_item(handle, constraint, elem_key, width)
-                } else {
-                    false
-                }
             }
+                if self.eval_expr(condition).is_true() => {
+                    self.force_elem_item(handle, constraint, elem_key, width)
+                }
             ConstraintItem::IfElse {
                 condition,
                 then_item,
@@ -59734,7 +60099,7 @@ impl Simulator {
                 None
             }
             ExprKind::Ident(h)
-                if h.path.len() >= 2 && h.path.last().map_or(false, |s| s.name.name == "sum") =>
+                if h.path.len() >= 2 && h.path.last().is_some_and(|s| s.name.name == "sum") =>
             {
                 Some(h.path[h.path.len() - 2].name.name.clone())
             }
@@ -60078,9 +60443,7 @@ impl Simulator {
         };
         let this = self.this_stack.last().copied().flatten()?;
         // `obj` must be a class-handle member of the enclosing object.
-        if self.prop_class_type(this, &obj).is_none() {
-            return None;
-        }
+        self.prop_class_type(this, &obj)?;
         let sub = self
             .heap
             .get(this)
@@ -60143,7 +60506,7 @@ impl Simulator {
                 continue;
             }
             let cur = self.read_coll_elem(k).and_then(|v| v.to_u64());
-            let in_domain = cur.map_or(false, |v| domain.iter().any(|(l, h)| v >= *l && v <= *h));
+            let in_domain = cur.is_some_and(|v| domain.iter().any(|(l, h)| v >= *l && v <= *h));
             if let Some(v) = cur {
                 if in_domain && used.insert(v) {
                     continue; // already distinct and legal
@@ -60382,7 +60745,7 @@ impl Simulator {
                 } => {
                     *has_cond = true;
                     scan(then_item, has_cond)
-                        && else_item.as_ref().map_or(true, |e| scan(e, has_cond))
+                        && else_item.as_ref().is_none_or(|e| scan(e, has_cond))
                 }
                 ConstraintItem::Block(items) => items.iter().all(|i| scan(i, has_cond)),
                 ConstraintItem::Foreach { .. } | ConstraintItem::Unique { .. } => false,
@@ -60538,7 +60901,7 @@ impl Simulator {
                         .properties
                         .get(prop)
                         .and_then(|s| s.type_name.clone())
-                        .map_or(false, |tn| self.module.classes.contains_key(&tn));
+                        .is_some_and(|tn| self.module.classes.contains_key(&tn));
                     if is_handle {
                         // §18.4/§18.5.9: randomize the referenced object, never
                         // the handle itself (a random handle would be a dangling
@@ -60946,7 +61309,7 @@ impl Simulator {
                             if !ranges.is_empty() {
                                 prop_allowed_ranges
                                     .entry(name)
-                                    .or_insert_with(Vec::new)
+                                    .or_default()
                                     .extend(ranges);
                             }
                         }
@@ -60999,7 +61362,7 @@ impl Simulator {
                         }
                         let is_prop = |ex: &Expression| {
                             matches!(&ex.kind,
-                            ExprKind::Ident(h) if h.path.last().map_or(false, |s| &s.name.name == name))
+                            ExprKind::Ident(h) if h.path.last().is_some_and(|s| &s.name.name == name))
                         };
                         let prop_left = is_prop(left);
                         let prop_right = is_prop(right);
@@ -61208,10 +61571,10 @@ impl Simulator {
                                         if let ExprKind::Binary { op, left, right } = &e.kind {
                                             let prop_on_left = matches!(&left.kind,
                                                 ExprKind::Ident(h) if h.path.last()
-                                                    .map_or(false, |s| &s.name.name == name));
+                                                    .is_some_and(|s| &s.name.name == name));
                                             let prop_on_right = matches!(&right.kind,
                                                 ExprKind::Ident(h) if h.path.last()
-                                                    .map_or(false, |s| &s.name.name == name));
+                                                    .is_some_and(|s| &s.name.name == name));
                                             if !prop_on_left && !prop_on_right {
                                                 continue;
                                             }
@@ -61229,16 +61592,14 @@ impl Simulator {
                                                 *op
                                             };
                                             match effective_op {
-                                                BinaryOp::Geq | BinaryOp::Gt => {
-                                                    if lit > lo {
+                                                BinaryOp::Geq | BinaryOp::Gt
+                                                    if lit > lo => {
                                                         lo = lit;
                                                     }
-                                                }
-                                                BinaryOp::Leq | BinaryOp::Lt => {
-                                                    if lit < hi {
+                                                BinaryOp::Leq | BinaryOp::Lt
+                                                    if lit < hi => {
                                                         hi = lit;
                                                     }
-                                                }
                                                 _ => {}
                                             }
                                         }
@@ -61536,7 +61897,7 @@ impl Simulator {
                                 }
                                 if soft_winner
                                     .get(&v)
-                                    .map_or(false, |&(wb, wi)| wb != bi || wi != ii)
+                                    .is_some_and(|&(wb, wi)| wb != bi || wi != ii)
                                 {
                                     continue;
                                 }
@@ -62098,7 +62459,7 @@ impl Simulator {
             val.is_signed = true;
         }
         if let Some(Some(inst)) = self.heap.get_mut(handle) {
-            if inst.properties.get(name).map_or(true, |cur| *cur != val) {
+            if inst.properties.get(name).is_none_or(|cur| *cur != val) {
                 inst.properties.insert(name.to_string(), val);
                 return true;
             }
@@ -62572,14 +62933,13 @@ impl Simulator {
     fn affine_candidates(&self, e: &Expression, rand_set: &HashSet<String>) -> Vec<String> {
         fn walk(e: &Expression, out: &mut Vec<String>) {
             match &e.kind {
-                ExprKind::Ident(h) => {
-                    if h.path.len() == 1 {
+                ExprKind::Ident(h)
+                    if h.path.len() == 1 => {
                         let n = &h.path[0].name.name;
                         if !out.contains(n) {
                             out.push(n.clone());
                         }
                     }
-                }
                 ExprKind::Unary { operand, .. } => walk(operand, out),
                 ExprKind::Binary { left, right, .. } => {
                     walk(left, out);
@@ -62719,7 +63079,7 @@ impl Simulator {
             let in_range = self
                 .rand_ranges
                 .get(&name)
-                .map_or(true, |rs| rs.iter().any(|(l, h)| t >= *l && t <= *h));
+                .is_none_or(|rs| rs.iter().any(|(l, h)| t >= *l && t <= *h));
             if in_range {
                 return self.set_prop_if_changed(handle, &name, val);
             }
@@ -62840,7 +63200,7 @@ impl Simulator {
                 // supposed to REPLACE).
                 ExprKind::Paren(inner) => {
                     let it = ConstraintItem::Expr((**inner).clone());
-                    return self.solve_forced(handle, &it, rand_set);
+                    self.solve_forced(handle, &it, rand_set)
                 }
                 // `antecedent -> consequent`: when the antecedent holds, the
                 // consequent becomes a forced sub-constraint.
@@ -62948,7 +63308,7 @@ impl Simulator {
                         let val = self.eval_expr(other).resize(w);
                         let changed = self
                             .read_coll_elem(&key)
-                            .map_or(true, |c| c.to_u64() != val.to_u64());
+                            .is_none_or(|c| c.to_u64() != val.to_u64());
                         self.write_coll_elem(&key, val);
                         return changed;
                     }
@@ -63168,13 +63528,10 @@ impl Simulator {
                 condition,
                 constraint,
                 ..
-            } => {
-                if self.eval_expr(condition).is_true() {
-                    self.solve_forced(handle, constraint, rand_set)
-                } else {
-                    false
-                }
             }
+                if self.eval_expr(condition).is_true() => {
+                    self.solve_forced(handle, constraint, rand_set)
+                }
             ConstraintItem::Block(items) => {
                 let mut changed = false;
                 for it in items {
@@ -63608,7 +63965,7 @@ impl Simulator {
     ///   `other != arr[i]` for every i in the slice, plus
     ///   `arr[i] != arr[j]` for every pair inside the slice (emitted once).
     fn expand_unique_slices(
-        constraints: &mut Vec<ClassConstraint>,
+        constraints: &mut [ClassConstraint],
         params: &HashMap<String, Value>,
     ) {
         fn idx_expr(i: i64, span: crate::ast::Span) -> Expression {
@@ -63752,7 +64109,7 @@ impl Simulator {
             ConstraintItem::IfElse { condition, then_item, else_item, .. } => {
                 Self::expr_unmodeled(condition)
                     || Self::constraint_unmodeled(then_item)
-                    || else_item.as_ref().map_or(false, |e| Self::constraint_unmodeled(e))
+                    || else_item.as_ref().is_some_and(|e| Self::constraint_unmodeled(e))
             }
             ConstraintItem::Block(items) => items.iter().any(Self::constraint_unmodeled),
             ConstraintItem::Soft(inner) => Self::constraint_unmodeled(inner),
@@ -63978,13 +64335,10 @@ impl Simulator {
                 condition,
                 constraint,
                 ..
-            } => {
-                if self.eval_expr(condition).is_true() {
-                    self.check_constraint_item_impl(constraint)
-                } else {
-                    true
-                }
             }
+                if self.eval_expr(condition).is_true() => {
+                    self.check_constraint_item_impl(constraint)
+                }
             ConstraintItem::IfElse {
                 condition,
                 then_item,
@@ -64416,7 +64770,7 @@ impl Simulator {
                             // and would fall back to the shared unspec'd cell →
                             // the get_type/get_type_handle mismatch).
                             let differs =
-                                self.current_spec.as_ref().map_or(true, |(b, _)| *b != cn);
+                                self.current_spec.as_ref().is_none_or(|(b, _)| *b != cn);
                             if differs {
                                 if inst.spec.is_some() {
                                     self.current_spec = inst.spec.clone();
@@ -64480,7 +64834,7 @@ impl Simulator {
                         // (this is uvm_default_report_server::compose_report_message,
                         // whose composed line was coming back blank).
                         if ret_is_string
-                            && lv.as_ref().map_or(true, |v| v.to_sv_string().is_empty())
+                            && lv.as_ref().is_none_or(|v| v.to_sv_string().is_empty())
                         {
                             self.get_signal_value_by_name(rn).or(lv)
                         } else {
@@ -64600,7 +64954,7 @@ impl Simulator {
     /// `"mailbox #(REQ)"`, `"mailbox#(T)"`, `"mailbox"` -> Some("mailbox").
     fn container_base(t: &str) -> Option<&'static str> {
         let base = t
-            .split(|c| c == '#' || c == ' ' || c == '(')
+            .split(['#', ' ', '('])
             .next()
             .unwrap_or("")
             .trim();
@@ -64714,7 +65068,7 @@ impl Simulator {
             for (n, v) in members {
                 if *v == value {
                     let sz = members.len();
-                    if best.as_ref().map_or(true, |(bsz, _)| sz > *bsz) {
+                    if best.as_ref().is_none_or(|(bsz, _)| sz > *bsz) {
                         best = Some((sz, n.clone()));
                     }
                 }
@@ -64765,7 +65119,7 @@ impl Simulator {
                     if !self
                         .local_stack
                         .last()
-                        .map_or(false, |m| m.contains_key(pn))
+                        .is_some_and(|m| m.contains_key(pn))
                     {
                         if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
                             if let Some(t) = self.class_prop_type_named(&ctx, pn) {
@@ -65483,7 +65837,7 @@ pub struct s_vpi_value {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct s_vpi_time {
+pub struct s_vpi_time {
     type_: libc::c_int,
     high: u32,
     low: u32,
@@ -65832,7 +66186,7 @@ thread_local! {
 
 /// Mirror of `s_vpi_systf_data` from `vpi_user.h` (IEEE 1800-2017 §38.36).
 #[repr(C)]
-struct s_vpi_systf_data {
+pub struct s_vpi_systf_data {
     type_: libc::c_int,
     sysfunctype: libc::c_int,
     tfname: *mut libc::c_char,
@@ -65851,7 +66205,7 @@ struct s_vpi_systf_data {
 /// offset by any C code compiled against a conforming `vpi_user.h` —
 /// `user_data` in particular.
 #[repr(C)]
-struct s_cb_data {
+pub struct s_cb_data {
     reason: libc::c_int,
     /// C function pointer (`PLI_INT32 (*cb_rtn)(p_cb_data)`).
     cb_rtn: *mut libc::c_void,
@@ -65867,7 +66221,7 @@ struct s_cb_data {
 /// Mirror of `s_vpi_vlog_info` from `vpi_user.h`. Returned by
 /// `vpi_get_vlog_info` so UVM can read the binary name / version.
 #[repr(C)]
-struct s_vpi_vlog_info {
+pub struct s_vpi_vlog_info {
     argc: libc::c_int,
     argv: *mut *mut libc::c_char,
     product: *mut libc::c_char,
@@ -66662,7 +67016,7 @@ pub fn vpi_systf_registered(name: &str) -> bool {
 /// Return width of a registered system function, without invoking it.
 pub fn vpi_sysfunc_ret_width(name: &str) -> u32 {
     VPI_SYSTFS
-        .with(|m| m.borrow().get(name).map(|e| vpi_sysfunc_width(&e)))
+        .with(|m| m.borrow().get(name).map(|e| vpi_sysfunc_width(e)))
         .unwrap_or(32)
 }
 
@@ -66677,7 +67031,7 @@ pub fn vpi_systf_is_func(name: &str) -> bool {
 
 /// Mirror of `s_vpi_error_info` (IEEE 1800-2017 §38.4).
 #[repr(C)]
-struct s_vpi_error_info {
+pub struct s_vpi_error_info {
     state: libc::c_int,
     level: libc::c_int,
     message: *mut libc::c_char,

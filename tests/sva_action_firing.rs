@@ -3,7 +3,7 @@
 //! never executed, so a failing `assert property (...) else $error(...)` was
 //! silent — a verification hole. Now the `else` runs on a fail, the pass action
 //! on a non-vacuous pass, a cover action on a match, and a VACUOUS pass runs
-//! nothing. Cross-checked against iverilog and a commercial simulator.
+//! nothing. Cross-checked against a reference simulator and a commercial simulator.
 
 use xezim::simulate;
 

@@ -230,7 +230,7 @@ pub fn rewrite_intra_assignment_delays(src: &str) -> String {
             let nba = p1 == b'=' && p2 == b'<' && p3 != b'<';
             if blocking || nba {
                 if let Some((delay_end, semi)) = extract_delay_and_rhs(b, i) {
-                    if define_end.map_or(true, |e| semi < e) {
+                    if define_end.is_none_or(|e| semi < e) {
                         out.push_str(INTRA_DELAY_MARKER);
                         out.push('(');
                         out.push_str(&src[i + 1..delay_end]);

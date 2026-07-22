@@ -176,7 +176,7 @@ fn no_timescale_module_keeps_one_ns_delays() {
 // §20.3 — `$time`/`$realtime` inside a subroutine reference the DEFINING
 // module's timescale, not the caller's. A task in a 1ns/1ps `sub` called from a
 // 1us/1ns `top` at t=5us must report 5000 (5us in sub's 1ns unit), not 5.
-// Confirmed against iverilog AND a commercial simulator.
+// Confirmed against a reference simulator AND a commercial simulator.
 #[test]
 fn cross_module_task_uses_callee_timescale() {
     let o = out(r#"
@@ -205,7 +205,7 @@ module sub; function real gett; gett = $realtime; endfunction endmodule
 // §20.3 — `%t` of `$time` must format `$time`'s UNIT-ROUNDED value, not the raw
 // sub-unit simulation time. At 1ns/1ps and t=1.234ns: `$time`=1 → %t prints
 // "1000" (1ns in the default ps timeformat), while `$realtime` keeps 1234.
-// Confirmed against iverilog and a commercial simulator.
+// Confirmed against a reference simulator and a commercial simulator.
 #[test]
 fn percent_t_of_time_uses_rounded_value() {
     let o = out(r#"
