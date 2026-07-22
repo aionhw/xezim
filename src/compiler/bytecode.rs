@@ -409,7 +409,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Self::stmt_has_break_or_continue(then_stmt)
                     || else_stmt
                         .as_ref()
-                        .map_or(false, |e| Self::stmt_has_break_or_continue(e))
+                        .is_some_and(|e| Self::stmt_has_break_or_continue(e))
             }
             StatementKind::Case { items, .. } => items
                 .iter()
@@ -436,7 +436,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Self::stmt_is_blocking(then_stmt)
                     || else_stmt
                         .as_ref()
-                        .map_or(false, |e| Self::stmt_is_blocking(e))
+                        .is_some_and(|e| Self::stmt_is_blocking(e))
             }
             StatementKind::For { body, .. } | StatementKind::While { body, .. } => {
                 Self::stmt_is_blocking(body)
@@ -697,11 +697,10 @@ impl<'a> BytecodeCompiler<'a> {
                 return true;
             }
         }
-        if hier.path.len() == 1 {
-            if set.contains(hier.path[0].name.name.as_str()) {
+        if hier.path.len() == 1
+            && set.contains(hier.path[0].name.name.as_str()) {
                 return true;
             }
-        }
         false
     }
 
@@ -2739,7 +2738,7 @@ impl<'a> BytecodeCompiler<'a> {
                         if let (Some(l), Some(r)) =
                             (self.eval_const_expr(left), self.eval_const_expr(right))
                         {
-                            ((l as i64 - r as i64).abs() as u32) + 1
+                            ((l as i64 - r as i64).unsigned_abs() as u32) + 1
                         } else {
                             // Fallback when bounds aren't const-evaluable:
                             // use the base signal's full width. Returning a
@@ -2750,13 +2749,12 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     RangeKind::IndexedUp | RangeKind::IndexedDown => self
                         .eval_const_expr(right)
-                        .unwrap_or_else(|| self.expr_max_width(base))
-                        as u32,
+                        .unwrap_or_else(|| self.expr_max_width(base)),
                 }
             }
             ExprKind::Index { .. } => 1,
             ExprKind::Replication { count, exprs } => {
-                let n = self.eval_const_expr(count).unwrap_or(0) as u32;
+                let n = self.eval_const_expr(count).unwrap_or(0);
                 let inner: u32 = exprs.iter().map(|e| self.expr_max_width(e)).sum();
                 n * inner
             }
@@ -2845,7 +2843,7 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::BitSelectConst(_, b, _) => *b == r,
             Insn::RangeSelect(_, b, l, rr) => *b == r || *l == r || *rr == r,
             Insn::RangeSelectConst(_, b, _, _) => *b == r,
-            Insn::Concat(_, parts) => parts.iter().any(|p| *p == r),
+            Insn::Concat(_, parts) => parts.contains(&r),
             Insn::BranchIfFalse(c, _) => *c == r,
             Insn::Select(_, c, t, e) => *c == r || *t == r || *e == r,
             Insn::NbaAssign(_, v, _) | Insn::BlockingAssign(_, v, _) => *v == r,
@@ -2901,11 +2899,10 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::BranchIfFalse(_, t)
                 | Insn::BranchUnlessZero(_, t)
                 | Insn::BranchIfSignalFalse(_, t)
-                | Insn::Jump(t) => {
-                    if (*t as usize) < is_target.len() {
+                | Insn::Jump(t)
+                    if (*t as usize) < is_target.len() => {
                         is_target[*t as usize] = true;
                     }
-                }
                 _ => {}
             }
         }
@@ -2958,11 +2955,11 @@ impl<'a> BytecodeCompiler<'a> {
             if is_target[i + 1] {
                 continue;
             }
-            let fused = match &insns[i + 1] {
-                &Insn::RangeSelectConst(d, b, l, r) if b == t && (mode & 1) != 0 => {
+            let fused = match insns[i + 1] {
+                Insn::RangeSelectConst(d, b, l, r) if b == t && (mode & 1) != 0 => {
                     Some((d, Insn::LoadSignalRange(d, sig, l, r)))
                 }
-                &Insn::BitSelectConst(d, b, idx) if b == t && (mode & 2) != 0 => {
+                Insn::BitSelectConst(d, b, idx) if b == t && (mode & 2) != 0 => {
                     Some((d, Insn::LoadSignalBit(d, sig, idx)))
                 }
                 _ => None,

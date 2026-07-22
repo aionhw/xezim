@@ -284,7 +284,7 @@ fn resolves_to_enum(dt: &DataType, elab: &ElaboratedModule) -> bool {
                 || elab
                     .typedef_types
                     .get(&name.name.name)
-                    .map_or(false, |inner| matches!(inner, DataType::Enum(_)))
+                    .is_some_and(|inner| matches!(inner, DataType::Enum(_)))
         }
         _ => false,
     }
@@ -1046,7 +1046,7 @@ fn check_enum_values(et: &EnumType, elab: &ElaboratedModule, errs: &mut Vec<Stri
                 && m.init
                     .as_ref()
                     .and_then(sized_literal_size)
-                    .map_or(false, |s| s <= width);
+                    .is_some_and(|s| s <= width);
             if !sized_fits && (val > max || val < min) {
                 if explicit {
                     if val < 0 {
@@ -1261,11 +1261,10 @@ fn dim_idents(dt: &DataType, out: &mut Vec<String>) {
 /// is never mistaken for an undeclared identifier.
 fn collect_idents(e: &Expression, out: &mut Vec<String>) {
     match &e.kind {
-        ExprKind::Ident(h) => {
-            if h.path.len() == 1 {
+        ExprKind::Ident(h)
+            if h.path.len() == 1 => {
                 out.push(h.path[0].name.name.clone());
             }
-        }
         ExprKind::Unary { operand, .. } => collect_idents(operand, out),
         ExprKind::Binary { left, right, .. } => {
             collect_idents(left, out);
@@ -1329,7 +1328,7 @@ fn wildcard_operand_illegal(e: &Expression, nonintegral: &std::collections::Hash
 
 /// §11.4.6: the wildcard-equality operators `==?` and `!=?` require INTEGRAL
 /// operands. A real- or string-typed operand is illegal.
-fn check_wildcard_cmp(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut Vec<String>) {
+fn check_wildcard_cmp(items: &[ModuleItem], _elab: &ElaboratedModule, errs: &mut Vec<String>) {
     // Names of real / string variables declared in this scope.
     let mut nonintegral: std::collections::HashSet<String> = std::collections::HashSet::new();
     for it in items {
@@ -1343,12 +1342,12 @@ fn check_wildcard_cmp(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut 
             _ => {}
         }
     }
-    let mut scan = |e: &Expression, errs: &mut Vec<String>| {
+    let scan = |e: &Expression, errs: &mut Vec<String>| {
         for_each_expr(e, &mut |x| {
             if let ExprKind::Binary { op, left, right } = &x.kind {
-                if matches!(op, BinaryOp::WildcardEq | BinaryOp::WildcardNeq) {
-                    if wildcard_operand_illegal(left, &nonintegral)
-                        || wildcard_operand_illegal(right, &nonintegral)
+                if matches!(op, BinaryOp::WildcardEq | BinaryOp::WildcardNeq)
+                    && (wildcard_operand_illegal(left, &nonintegral)
+                        || wildcard_operand_illegal(right, &nonintegral))
                     {
                         errs.push(
                             "wildcard-equality operator (==? / !=?) requires integral operands; \
@@ -1356,7 +1355,6 @@ fn check_wildcard_cmp(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut 
                                 .to_string(),
                         );
                     }
-                }
             }
         });
     };
@@ -1709,15 +1707,14 @@ fn check_implicit_ports(
                     name,
                     expr: None,
                     implicit: true,
-                } => {
-                    if !scope.contains(&name.name) {
+                }
+                    if !scope.contains(&name.name) => {
                         errs.push(format!(
                             "implicit port connection '.{}' has no matching signal in the \
                              enclosing scope (LRM 1800-2017 §23.3.2.2)",
                             name.name
                         ));
                     }
-                }
                 xezim_core::ast::decl::PortConnection::Wildcard => {
                     if let Some(tports) = port_map.get(&inst.module_name.name) {
                         let mut missing: Vec<&String> = tports

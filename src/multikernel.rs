@@ -169,7 +169,7 @@ pub fn pdes_sync_rounds_for_ticks(ticks: u64, k: u64) -> u64 {
         return 0;
     }
     let k = k.max(1);
-    (ticks + k - 1) / k
+    ticks.div_ceil(k)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,7 +510,7 @@ impl PdesKernel {
         let total_ticks = if self.spec.clock_period_ns == 0 {
             0
         } else {
-            (self.spec.max_sim_time + self.spec.clock_period_ns - 1) / self.spec.clock_period_ns
+            self.spec.max_sim_time.div_ceil(self.spec.clock_period_ns)
         };
 
         for batch in pdes_lookahead_batches(total_ticks, stats.lookahead_k) {
