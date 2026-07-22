@@ -11,10 +11,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Checkout xezim-core
-        uses: actions/checkout@v7
-        with:
-          repository: aionhw/xezim-core
-          path: ../xezim-core
+        run: git clone https://github.com/aionhw/xezim-core.git ../xezim-core
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
