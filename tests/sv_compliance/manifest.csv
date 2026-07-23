@@ -41,3 +41,4 @@ file,topic,description
 40_struct_nettype_resolution.sv,resolution tier 2,struct-typed nettype with real field and field-by-field resolver
 41_genfor_localparam_idx.sv,generate-for elaboration,genvar-dependent localparam init substituted per iteration
 42_typeparam_default_resolution.sv,type parameter defaults,non-overridden parameter type default resolved against overridden numeric params
+43_typedef_type_id_create.sv,typedef factory alias,typedef alias of parameterised class resolved via type_id::create factory path
