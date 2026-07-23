@@ -65470,28 +65470,52 @@ impl Simulator {
                 {
                     return Some(t);
                 }
-                // A class-typed procedural local declared in this scope.
-                if let Some(t) = self.var_class_types.get(&name) {
-                    return Some(t.clone());
-                }
-                // LRM §6.19.6: typedef-typed local — used by
-                // `local.next/.first/.last/.num/.prev` resolution.
-                if let Some(t) = self.var_typedef_types.get(&name) {
-                    return Some(t.clone());
+                // `var_class_types` / `var_typedef_types` are FLAT
+                // accumulators that are NOT cleared on scope/method exit,
+                // so a same-named local from an EARLIER method leaks in.
+                // E.g. UVM `process_all_report_catchers` declares a local
+                // `uvm_report_catcher catcher;`; that entry then shadows a
+                // user class PROPERTY `seqprtzmb_catcher catcher;` when the
+                // property's `catcher = new()` resolves its type, so the
+                // base class is constructed and the derived `catch()`
+                // override never runs (UVM 04sync/.../06test_end_cleanup).
+                //
+                // Only trust these maps when `name` is genuinely a local of
+                // the current scope. Two cases are genuine:
+                //  (a) `name` is in a `local_stack` frame (a method's
+                //      params/locals — class methods store locals there), or
+                //  (b) we are NOT inside a class method (initial/always
+                //      blocks): their locals live as signals, not frames, but
+                //      there is no class property they could shadow, so a
+                //      flat-map entry is always a real local.
+                // Inside a class method, a bare name that is NOT a frame
+                // local is a class property and must resolve through
+                // `class_prop_type_named`, ignoring any stale entry.
+                let in_any_frame = hier.path.len() == 1
+                    && self
+                        .local_stack
+                        .iter()
+                        .rev()
+                        .any(|m| m.contains_key(&name));
+                let in_class_method = self.class_context_stack.last().is_some();
+                let trust_flat_maps = in_any_frame || !in_class_method;
+                if trust_flat_maps {
+                    // A class-typed procedural local declared in this scope.
+                    if let Some(t) = self.var_class_types.get(&name) {
+                        return Some(t.clone());
+                    }
+                    // LRM §6.19.6: typedef-typed local — used by
+                    // `local.next/.first/.last/.num/.prev` resolution.
+                    if let Some(t) = self.var_typedef_types.get(&name) {
+                        return Some(t.clone());
+                    }
                 }
                 // A class property referenced bare inside a method —
                 // resolve its type through the current class context.
-                if hier.path.len() == 1 {
-                    let pn = &hier.path[0].name.name;
-                    if !self
-                        .local_stack
-                        .last()
-                        .is_some_and(|m| m.contains_key(pn))
-                    {
-                        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
-                            if let Some(t) = self.class_prop_type_named(&ctx, pn) {
-                                return Some(t);
-                            }
+                if hier.path.len() == 1 && !in_any_frame {
+                    if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                        if let Some(t) = self.class_prop_type_named(&ctx, &name) {
+                            return Some(t);
                         }
                     }
                 }
