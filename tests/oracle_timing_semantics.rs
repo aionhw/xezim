@@ -291,3 +291,31 @@ endmodule
         &["[    42][42    ][    42]"],
     );
 }
+
+#[test]
+fn observer_always_block_does_not_fire_at_time_zero() {
+    // §9.2.2.1 + §6.8: a write-free `always @(sig)` observer suspends at its
+    // event control and runs only on a real sensitivity change — declaration
+    // init / the X→z settling of an undriven net is NOT an event. So the
+    // display fires once (when y transitions z→0 at t=5000ns via the delayed
+    // cont-assign), never at t=0. Oracle-verified.
+    let out = lines(
+        r#"
+`timescale 1ns/1ps
+module top;
+  reg a; wire y;
+  assign #5 y = a;
+  always @(y) $display("FIRE T%0t y=%b", $realtime, y);
+  initial begin a = 0; #40 $finish; end
+endmodule
+"#,
+    );
+    let fires: Vec<&String> = out.iter().filter(|l| l.starts_with("FIRE ")).collect();
+    assert_eq!(
+        fires.len(),
+        1,
+        "observer must fire exactly once (no t0 pseudo-edge): {:?}",
+        fires
+    );
+    assert_eq!(fires[0], "FIRE T5000 y=0", "the single fire is the z->0 change");
+}

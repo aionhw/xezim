@@ -15070,13 +15070,27 @@ impl Simulator {
                         }
                     }
                 };
+                let is_pure_observer = wids.is_empty();
                 entries.push(CombEntry {
                     item,
                     scope_hint,
                     read_signal_ids: rids,
                     write_signal_ids: wids,
                     has_unresolved_reads,
-                    defer_at_time0: !is_always_comb && stmt_has_finish_or_stop(&ab.stmt),
+                    // §9.2.2.1: a level-only `always @(sensitivity)` block
+                    // suspends at its event control initially and runs only on
+                    // a sensitivity CHANGE — declaration init is not an event
+                    // (§6.8). xezim routes such blocks through the comb-settle
+                    // path, which would fire them once at t0 against their X
+                    // init. For a block that WRITES a signal this is
+                    // observationally harmless (X-in -> X-out, recomputed on
+                    // the first real change), so keep firing it (combinational
+                    // modeling relies on t0 settle). For a pure OBSERVER
+                    // (no signal write: `always @(y) $display(...)`) or one
+                    // that can $finish, the t0 fire is a spurious side effect a
+                    // reference simulator does not produce — defer it.
+                    defer_at_time0: !is_always_comb
+                        && (is_pure_observer || stmt_has_finish_or_stop(&ab.stmt)),
                     span: ab.stmt.span,
                 });
             }
@@ -25209,7 +25223,15 @@ impl Simulator {
                 }
             }
         }
-        cone.extend_from_slice(&self.comb_unresolved_idx);
+        if skip_deferred_at_t0 {
+            for &eidx in self.comb_unresolved_idx.iter() {
+                if !self.comb_entries[eidx].defer_at_time0 {
+                    cone.push(eidx);
+                }
+            }
+        } else {
+            cone.extend_from_slice(&self.comb_unresolved_idx);
+        }
         if self.time == 0 && !self.comb_time0_fired {
             cone.extend_from_slice(&self.comb_time0_idx);
         }
@@ -26209,9 +26231,15 @@ impl Simulator {
 
         // Unresolved entries always re-eval. Iterate the precomputed
         // index list instead of scanning `0..num_entries` (can be ~500K
-        // and is called on every BlockingAssign).
+        // and is called on every BlockingAssign). A t0-deferred entry (a
+        // write-free `always @(list)` observer, unresolved because it reads
+        // $time) is held back on the first t0 settle — same rule the
+        // dirty-seed loop above applies (§9.2.2.1).
         for &eidx in self.comb_unresolved_idx.iter() {
             if eidx < num_entries && !self.settle_triggered[eidx] {
+                if skip_deferred_at_t0 && entries[eidx].defer_at_time0 {
+                    continue;
+                }
                 self.settle_triggered[eidx] = true;
                 self.settle_triggered_list.push(eidx);
             }
