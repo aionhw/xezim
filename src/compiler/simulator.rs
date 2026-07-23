@@ -11178,10 +11178,69 @@ impl Simulator {
         (a_to_b, b_to_a, max_crossings, rounds, converged)
     }
 
+    /// Advise the kernel to back the largest per-signal / dependency arrays
+    /// with transparent huge pages (2 MiB), cutting TLB page-walk cost on the
+    /// scattered, GiB-scale working set. See the call site for the rationale.
+    fn advise_hugepages(&self) {
+        if std::env::var("XEZIM_HUGEPAGE").ok().as_deref() == Some("0") {
+            return;
+        }
+        // Only worth it for spans >= one huge page.
+        const HP: usize = 2 * 1024 * 1024;
+        #[cfg(target_os = "linux")]
+        fn advise<T>(s: &[T]) {
+            let bytes = std::mem::size_of_val(s);
+            if bytes < HP {
+                return;
+            }
+            let page = 4096usize;
+            let start = s.as_ptr() as usize;
+            let end = start + bytes;
+            // madvise needs a page-aligned start; round the span inward.
+            let astart = (start + page - 1) & !(page - 1);
+            let aend = end & !(page - 1);
+            if aend > astart {
+                let p = astart as *mut libc::c_void;
+                let len = aend - astart;
+                unsafe {
+                    // Hint future faults, then SYNCHRONOUSLY collapse the
+                    // already-faulted 4 KiB pages into 2 MiB pages. MADV_HUGEPAGE
+                    // alone only helps new faults / lazy khugepaged, but these
+                    // arrays are fully populated by `compile()` before we get
+                    // here, so nothing would change without the collapse.
+                    // MADV_COLLAPSE is Linux 6.1+; on older kernels it returns
+                    // EINVAL and we simply keep the (advisory) hint.
+                    libc::madvise(p, len, libc::MADV_HUGEPAGE);
+                    libc::madvise(p, len, libc::MADV_COLLAPSE);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        fn advise<T>(_s: &[T]) {}
+
+        advise(&self.signal_table);
+        advise(&self.signal_widths);
+        advise(&self.signal_signed);
+        advise(&self.signal_real);
+        advise(&self.signal_two_state);
+        advise(&self.dirty_signals);
+        advise(&self.comb_dep_offsets);
+        advise(&self.comb_dep_entries);
+        advise(&self.comb_entries);
+    }
+
     pub fn simulate(&mut self) {
         if !self.compiled {
             self.compile();
         }
+        // Back the big, stable, randomly-accessed arrays with 2 MiB transparent
+        // huge pages. On c910 the per-signal arrays span ~1.3 GiB / ~340k 4 KiB
+        // pages accessed with no spatial locality, so page-table walks burned
+        // ~15% of all cycles (dtlb_load_misses.walk_active) with 0 walks landing
+        // on huge pages. `madvise(MADV_HUGEPAGE)` collapses each 2 MiB span to a
+        // single TLB entry. Advisory + safe: a no-op where THP is off/unset, and
+        // it never changes results. `XEZIM_HUGEPAGE=0` opts out.
+        self.advise_hugepages();
         // `--dump-timescales`: report every module's timescale before the run.
         if dump_timescales_enabled() {
             self.dump_module_timescales();
