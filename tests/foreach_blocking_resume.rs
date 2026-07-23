@@ -11,8 +11,10 @@
 use std::process::Command;
 
 fn xezim() -> String {
-    let base = env!("CARGO_MANIFEST_DIR");
-    format!("{}/target/release/xezim", base)
+    // CARGO_BIN_EXE_<name> resolves to the binary built for the ACTIVE
+    // profile (debug under plain `cargo test`, release under `--release`),
+    // unlike a hardcoded target/release path which breaks CI (issue #51).
+    env!("CARGO_BIN_EXE_xezim").to_string()
 }
 
 fn run(src: &str, tag: &str) -> String {
