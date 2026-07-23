@@ -41650,6 +41650,7 @@ impl Simulator {
             }
         }
 
+        let vcd_param_as_wire = std::env::var("XEZIM_VCD_PARAM_AS_WIRE").ok().as_deref() == Some("1");
         let mut root = ScopeNode::new();
         for name in &sig_names {
             let tbl_id = match self.signal_name_to_id.get(name.as_str()) {
@@ -41657,7 +41658,15 @@ impl Simulator {
                 _ => continue,
             };
             let width = self.lookup_signal_width(name).unwrap_or(1);
-            let kind = self.dump_var_kind(name, tbl_id);
+            let mut kind = self.dump_var_kind(name, tbl_id);
+            // Parameters are dumped LRM-compliantly as `$var parameter` — but
+            // some viewers (Verdi/nWave) shelve those separately and never show
+            // them in the waveform pane. `XEZIM_VCD_PARAM_AS_WIRE=1` emits them
+            // as a constant-valued `wire` instead, so they trace like any other
+            // signal (matching what the FST/FSDB path already does).
+            if vcd_param_as_wire && matches!(kind, VcdVarKind::Parameter) {
+                kind = VcdVarKind::Wire;
+            }
             let range = match kind {
                 // A `real` is always declared 64 bits wide with no range, and an
                 // `event` is a 1-bit pulse.
