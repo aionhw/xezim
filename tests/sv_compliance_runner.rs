@@ -264,6 +264,10 @@ fn test_sv_41_genfor_localparam_idx() {
 fn test_sv_42_typeparam_default_resolution() {
     run_positive_compliance_test("tests_advanced", "42_typeparam_default_resolution.sv");
 }
+#[test]
+fn test_sv_43_vif_writes() {
+    run_positive_compliance_test("tests_advanced", "43_vif_writes.sv");
+}
 
 #[test]
 fn test_sv_neg01_duplicate_declaration() {
