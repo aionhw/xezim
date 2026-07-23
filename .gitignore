@@ -34,3 +34,11 @@ uvm-2017-1.0.so
 uvm-2020.3.1.so
 .claude/
 scratchpad/
+
+# editor cruft
+*.swp
+*.swo
+*~
+
+# one-off helper/scratch fragments
+*.new_helper
