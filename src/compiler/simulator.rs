@@ -20921,6 +20921,62 @@ impl Simulator {
                 }
             }
 
+            // IEEE 1800-2017 §9.4.5 intra-assignment EVENT control
+            // `lhs = [repeat(n)] @(edge sig) rhs` (canonicalized to
+            // `$__xz_intra_ev(n, edge, sig, rhs)`): evaluate the RHS NOW,
+            // then wait the event n times, then assign the saved value.
+            // Expand into n chained event controls + the saved assign so the
+            // existing top-level TimingControl::Event park machinery does
+            // the waiting.
+            if let StatementKind::BlockingAssign { lvalue, rvalue } = &stmt.kind {
+                if let ExprKind::SystemCall { name, args } = &rvalue.kind {
+                    if name == crate::intra_delay::INTRA_EVENT_MARKER && args.len() == 4 {
+                        let n_val = self.eval_expr(&args[0]).to_u64().unwrap_or(0) as i64;
+                        let edge_code = self.eval_expr(&args[1]).to_u64().unwrap_or(0);
+                        let val = self.eval_expr(&args[3]);
+                        let saved = self.make_intra_saved_expr(val, rvalue.span);
+                        let assign = Statement::new(
+                            StatementKind::BlockingAssign {
+                                lvalue: lvalue.clone(),
+                                rvalue: saved,
+                            },
+                            stmt.span,
+                        );
+                        let mut cont: Vec<Statement> = Vec::new();
+                        // §9.4.5: a zero/negative repeat count degenerates to
+                        // an immediate assignment (no event wait).
+                        let edge = match edge_code {
+                            1 => Some(Edge::Posedge),
+                            2 => Some(Edge::Negedge),
+                            _ => None,
+                        };
+                        for _ in 0..n_val.max(0) {
+                            cont.push(Statement::new(
+                                StatementKind::TimingControl {
+                                    control: TimingControl::Event(EventControl::EventExpr(vec![
+                                        EventExpr {
+                                            edge,
+                                            expr: args[2].clone(),
+                                            iff: None,
+                                            span: stmt.span,
+                                        },
+                                    ])),
+                                    stmt: Box::new(Statement::new(
+                                        StatementKind::Null,
+                                        stmt.span,
+                                    )),
+                                },
+                                stmt.span,
+                            ));
+                        }
+                        cont.push(assign);
+                        cont.extend_from_slice(&stmts[i + 1..]);
+                        self.run_process_stmts(pid, &cont);
+                        return;
+                    }
+                }
+            }
+
             // IEEE 1800-2017 §9.4.5 intra-assignment delay `lhs = #d rhs`:
             // the RHS is evaluated NOW, the process suspends d time units,
             // then the pre-computed value is assigned — i.e. behave like
@@ -22807,6 +22863,14 @@ impl Simulator {
         self.schedule_delayed_with_delay(id, val, delay);
     }
 
+    /// §10.3.3 inertial cancellation: a driver reverting to the signal's
+    /// CURRENT value while an opposite-value update is still pending means
+    /// the pulse was narrower than the delay — the pending update must be
+    /// dropped (no visible glitch), not left to fire.
+    fn cancel_delayed(&mut self, id: usize) {
+        self.delayed_updates.retain(|(_, sid, _)| *sid != id);
+    }
+
     /// Schedule a delayed signal update with an explicit delay (inertial delay model).
     fn schedule_delayed_with_delay(&mut self, id: usize, val: Value, delay: u64) {
         let target_time = self.time + delay;
@@ -24681,6 +24745,8 @@ impl Simulator {
                 if let Some(id) = lhs_id {
                     if self.signal_table[id] != val {
                         self.schedule_delayed_with_delay(id, val, delay);
+                    } else {
+                        self.cancel_delayed(id);
                     }
                 }
             } else if let Some(id) = lhs_id {
@@ -25588,6 +25654,8 @@ impl Simulator {
                     if let Some(id) = lhs_id {
                         if self.signal_table[id] != val {
                             self.schedule_delayed_with_delay(id, val, delay);
+                        } else {
+                            self.cancel_delayed(id);
                         }
                     }
                 } else if let Some(id) = lhs_id {

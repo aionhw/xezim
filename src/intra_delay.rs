@@ -21,6 +21,13 @@
 /// Marker system-function name the simulator recognizes (never user-visible).
 pub const INTRA_DELAY_MARKER: &str = "$__xz_intra_delay";
 
+/// Marker for §9.4.5 intra-assignment EVENT controls:
+/// `lhs = repeat(n) @(posedge clk) rhs;` / `lhs = @(ev) rhs;` become
+/// `$__xz_intra_ev(n, <edge>, <sig>, rhs)` where `<edge>` is 0 (any),
+/// 1 (posedge) or 2 (negedge). Multi-term event lists keep the parser's
+/// discard behavior.
+pub const INTRA_EVENT_MARKER: &str = "$__xz_intra_ev";
+
 /// Skip whitespace and comments starting at `i`; returns the next index of
 /// significant text.
 fn skip_ws_comments(b: &[u8], mut i: usize) -> usize {
@@ -149,6 +156,57 @@ fn extract_delay_and_rhs(b: &[u8], i: usize) -> Option<(usize, usize)> {
     Some((delay_end, semi))
 }
 
+/// Given `i` at the `@` of an intra-assignment event control, return
+/// `(edge, sig_text, rhs_start, semi)`. `None` -> leave unchanged (bare
+/// `@id`, multi-term lists, empty RHS).
+fn extract_event_and_rhs(b: &[u8], src: &str, i: usize) -> Option<(u8, String, usize, usize)> {
+    let j = skip_ws_comments(b, i + 1);
+    if j >= b.len() || b[j] != b'(' {
+        return None;
+    }
+    let mut k = j + 1;
+    let mut depth = 1i32;
+    while k < b.len() && depth > 0 {
+        match b[k] {
+            b'"' => {
+                k = skip_string(b, k);
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        k += 1;
+    }
+    if depth != 0 {
+        return None;
+    }
+    let ev = src[j + 1..k - 1].trim();
+    // Multi-term event lists: keep discard behavior.
+    if ev.contains(" or ") || ev.contains(',') {
+        return None;
+    }
+    let (edge, sig) = if let Some(r) = ev.strip_prefix("posedge ") {
+        (1u8, r.trim())
+    } else if let Some(r) = ev.strip_prefix("negedge ") {
+        (2u8, r.trim())
+    } else {
+        (0u8, ev)
+    };
+    if sig.is_empty()
+        || !sig
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$' | b'.' | b'[' | b']'))
+    {
+        return None;
+    }
+    let semi = find_stmt_semi(b, k)?;
+    if b[k..semi].iter().all(|c| c.is_ascii_whitespace()) {
+        return None;
+    }
+    Some((edge, sig.to_string(), k, semi))
+}
+
 /// Rewrite `= #d rhs;` / `<= #d rhs;` into the `$__xz_intra_delay(d, rhs)`
 /// marker form (see module docs). Returns the input unchanged when no
 /// intra-assignment delay is present.
@@ -205,6 +263,72 @@ pub fn rewrite_intra_assignment_delays(src: &str) -> String {
         }
         if c == b'`' && src[i..].starts_with("`define") {
             define_end = Some(define_line_end(b, i));
+        }
+        // `= @(ev) rhs;` / `= repeat(n) @(ev) rhs;` intra-assignment event
+        // controls (§9.4.5). Same assignment-operator gating as `#` below.
+        if c == b'@' || (c == b'r' && src[i..].starts_with("repeat")) {
+            let blocking = p1 == b'='
+                && !matches!(
+                    p2,
+                    b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|'
+                        | b'^' | b'~'
+                );
+            let nba = p1 == b'=' && p2 == b'<' && p3 != b'<';
+            if blocking || nba {
+                let mut count_txt = String::from("1");
+                let mut at_pos = i;
+                let mut ok = true;
+                if c == b'r' {
+                    // repeat ( count ) @
+                    let mut k = skip_ws_comments(b, i + 6);
+                    if k < n && b[k] == b'(' {
+                        let mut depth = 1i32;
+                        let start = k + 1;
+                        k += 1;
+                        while k < n && depth > 0 {
+                            match b[k] {
+                                b'(' => depth += 1,
+                                b')' => depth -= 1,
+                                _ => {}
+                            }
+                            k += 1;
+                        }
+                        if depth == 0 {
+                            count_txt = src[start..k - 1].trim().to_string();
+                            let a = skip_ws_comments(b, k);
+                            if a < n && b[a] == b'@' {
+                                at_pos = a;
+                            } else {
+                                ok = false;
+                            }
+                        } else {
+                            ok = false;
+                        }
+                    } else {
+                        ok = false;
+                    }
+                }
+                if ok {
+                    if let Some((edge, sig, rhs_start, semi)) =
+                        extract_event_and_rhs(b, src, at_pos)
+                    {
+                        if define_end.is_none_or(|e| semi < e) {
+                            out.push_str(INTRA_EVENT_MARKER);
+                            out.push('(');
+                            out.push_str(&count_txt);
+                            out.push(',');
+                            out.push_str(&edge.to_string());
+                            out.push(',');
+                            out.push_str(&sig);
+                            out.push(',');
+                            out.push_str(&src[rhs_start..semi]);
+                            out.push(')');
+                            i = semi; // main loop copies the `;`
+                            continue;
+                        }
+                    }
+                }
+            }
         }
         if c == b'#' && (i + 1 >= n || b[i + 1] != b'#') {
             // Trigger only directly after a plain `=` (blocking) or `<=`
