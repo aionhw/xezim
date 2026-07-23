@@ -19924,6 +19924,17 @@ impl Simulator {
         self.return_flag = saved_return;
     }
 
+    /// Reset `name_resolve_hint` to the CURRENT process's own instance
+    /// scope (None for a top-scope process). Loop-condition re-evaluation
+    /// must not run under sticky hint residue left by nested work (other
+    /// processes, settle entries) — a leaked sibling hint once made a
+    /// testbench loop var `c` shadow-resolve to the DUT instance's `c`,
+    /// and the per-node cache froze it: the loop never terminated.
+    fn reset_hint_to_process_scope(&self) {
+        let h = self.process_scope_hint.get(&self.current_pid).cloned();
+        *self.name_resolve_hint.borrow_mut() = h;
+    }
+
     fn run_scheduled_process(&mut self, pid: usize, stmts: &[Statement]) {
         // Flags from a prior process must not leak into this one.
         self.break_flag = false;
@@ -21499,6 +21510,7 @@ impl Simulator {
                         i += 1;
                         continue;
                     }
+                    self.reset_hint_to_process_scope();
                     let cond_val = self.eval_expr(condition).is_true();
                     if cond_val {
                         let body_stmts = match &body.kind {
@@ -34377,6 +34389,7 @@ impl Simulator {
                     }
                     iters += 1;
                     if let Some(c) = condition {
+                        self.reset_hint_to_process_scope();
                         if !self.eval_expr(c).is_true() {
                             break;
                         }
@@ -34841,6 +34854,7 @@ impl Simulator {
                         break;
                     }
                     i += 1;
+                    self.reset_hint_to_process_scope();
                     if !self.eval_expr(condition).is_true() {
                         break;
                     }
@@ -35003,6 +35017,17 @@ impl Simulator {
             StatementKind::TimingControl { control, stmt } => {
                 match control {
                     TimingControl::Delay(d) => {
+                        // The nested work below (run_events_until, settle,
+                        // edge cascades) executes OTHER processes and comb
+                        // entries whose dotted-name resolutions leave a sticky
+                        // `name_resolve_hint` behind. That residue must not
+                        // leak back into THIS process's bare-name resolution:
+                        // a leaked sibling-instance hint once made a
+                        // testbench's loop variable `c` shadow-resolve to the
+                        // DUT instance's `c` (then the per-node cache froze
+                        // it and the loop never terminated). Save/restore the
+                        // hint across the whole nested-delay window.
+                        let saved_hint_nested = self.name_resolve_hint.borrow().clone();
                         let delay = self.eval_delay_ticks(d);
                         self.apply_nba();
                         self.settle_combinatorial();
@@ -35041,6 +35066,7 @@ impl Simulator {
                         let _ = self.drain_edge_cascade(self.cascade_limit);
                         self.snapshot_edge_signals();
                         self.check_monitor();
+                        *self.name_resolve_hint.borrow_mut() = saved_hint_nested;
                     }
                     TimingControl::Event(e) => {
                         let sens = self.event_to_sens(e);
