@@ -1847,7 +1847,7 @@ struct ProcessContext {
     // statement stream — see `task_cleanup` and `StatementKind::ScopePop`).
     local_iface_aliases: Vec<HashMap<String, String>>,
     ref_binding_stack: Vec<HashMap<String, Expression>>,
-    queue_frame_saves: Vec<HashMap<String, Vec<(String, Value)>>>,
+    queue_frame_saves: Vec<HashMap<String, QueueLocalSave>>,
     task_cleanup: Vec<TaskCleanup>,
     // Per-call-frame map of a local dynamic-array/queue/assoc LOCAL's bare
     // name to a process-unique storage key (e.g. `edges` -> `@edges#7`).
@@ -2607,7 +2607,7 @@ pub struct Simulator {
     /// push a frame; whenever a queue param is bound or a queue local is
     /// (re)declared, we snapshot the caller's `name.*`/`name[*]` signals into
     /// the top frame; on exit we restore them.
-    queue_frame_saves: Vec<HashMap<String, Vec<(String, Value)>>>,
+    queue_frame_saves: Vec<HashMap<String, QueueLocalSave>>,
     /// Per-call-frame rename map for local dynamic arrays/queues/assoc
     /// locals (bare name -> process-unique storage key). See
     /// `ProcessContext::local_dyn`.
@@ -3640,6 +3640,28 @@ where
         args.first().map(|a| eval(a).to_f64()).unwrap_or(0.0),
         args.get(1).map(|a| eval(a).to_f64()).unwrap_or(0.0),
     )
+}
+
+/// Caller-frame state for a queue/dynamic-array LOCAL that a nested call may
+/// clobber. Bare-name locals share the global `signals` and `module.*`
+/// registration tables, so a nested method declaring a local of the same name
+/// (even a non-queue, e.g. its own `int p`) overwrites the caller's
+/// bookkeeping. We snapshot the caller's `name.size` / `name[i]` signals AND
+/// its `module.arrays`/`dynamic_arrays`/`descending_arrays`/`widths`/
+/// queue-limit registration, restoring both on return. Without the
+/// registration restore, the caller's queue stays unregistered after the
+/// nested call returns, so its later `delete()` and element reads become
+/// silent no-ops (seen in UVM `09callbacks/20inherit`'s `check_phase`, whose
+/// local `string p[$]` was unregistered by a nested helper's same-named
+/// local — IEEE 1800-2020 §6.21 automatic-variable per-invocation storage).
+#[derive(Clone, Default, Debug)]
+struct QueueLocalSave {
+    signals: Vec<(String, Value)>,
+    arrays_entry: Option<(i64, i64, u32)>,
+    was_dynamic: bool,
+    was_descending: bool,
+    queue_max: Option<u32>,
+    width: Option<u32>,
 }
 
 impl Simulator {
@@ -44885,10 +44907,24 @@ impl Simulator {
         self.string_signals.remove(key);
     }
 
+    /// Caller-frame state for a queue/dynamic-array LOCAL that a nested call
+    /// may clobber. Bare-name locals share the global `self.signals` and
+    /// `module.*` registration tables, so a nested method declaring a local
+    /// of the same name (even a non-queue, e.g. its own `int p`) overwrites
+    /// the caller's bookkeeping. We snapshot the caller's `name.size` /
+    /// `name[i]` signals AND its `module.arrays`/`dynamic_arrays`/`widths`/
+    /// queue-limit registration, restoring both on return. Without the
+    /// registration restore, the caller's queue stays unregistered after the
+    /// nested call returns, so its later `delete()` / element reads become
+    /// silent no-ops (seen in UVM `09callbacks/20inherit`'s `check_phase`,
+    /// whose local `string p[$]` was unregistered by a nested helper's
+    /// same-named local).
+
     /// Snapshot the caller's current queue storage for `name` (its `name.size`
-    /// and every `name[...]` element) into the top save frame, so it can be
-    /// restored when the current subroutine returns. No-op outside a frame, or
-    /// if this name was already snapshotted in this frame.
+    /// and every `name[...]` element, plus its `module.*` collection
+    /// registration) into the top save frame, so it can be restored when the
+    /// current subroutine returns. No-op outside a frame, or if this name was
+    /// already snapshotted in this frame.
     fn snapshot_queue_local(&mut self, name: &str) {
         if self.queue_frame_saves.is_empty() {
             return;
@@ -44903,28 +44939,42 @@ impl Simulator {
         }
         let size_key = format!("{}.size", name);
         let elem_prefix = format!("{}[", name);
-        let saved: Vec<(String, Value)> = self
+        let signals: Vec<(String, Value)> = self
             .signals
             .iter()
             .filter(|(k, _)| **k == size_key || k.starts_with(&elem_prefix))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let save = QueueLocalSave {
+            signals,
+            arrays_entry: self.module.arrays.get(name).copied(),
+            was_dynamic: self.module.dynamic_arrays.contains(name),
+            was_descending: self.module.descending_arrays.contains(name),
+            queue_max: self.module.queue_max_sizes.get(name).copied(),
+            width: self.widths.get(name).copied(),
+        };
         self.queue_frame_saves
             .last_mut()
             .unwrap()
-            .insert(name.to_string(), saved);
+            .insert(name.to_string(), save);
     }
 
     /// Pop the top queue-local save frame and restore every snapshotted name:
     /// drop the callee's current `name.size`/`name[...]` entries and re-insert
-    /// the caller's saved ones.
+    /// the caller's saved ones, AND restore the caller's `module.*` collection
+    /// registration (a nested call declaring a same-named local would have
+    /// removed the caller's queue from `module.arrays`/`dynamic_arrays`).
     fn pop_and_restore_queue_frame(&mut self) {
         let Some(frame) = self.queue_frame_saves.pop() else {
             // queue_frame_saves and local_dyn are pushed/popped in sync; if
             // there was no save frame there is no dyn frame either.
             return;
         };
-        for (name, saved) in frame {
+        // Drain into a Vec first so the borrows in the restore loop are the
+        // only outstanding `&mut self` access (no aliasing with the HashMap
+        // we are popping).
+        let entries: Vec<(String, QueueLocalSave)> = frame.into_iter().collect();
+        for (name, save) in entries {
             let size_key = format!("{}.size", name);
             let elem_prefix = format!("{}[", name);
             let stale: Vec<String> = self
@@ -44936,8 +44986,55 @@ impl Simulator {
             for k in stale {
                 self.signals.remove(&k);
             }
-            for (k, v) in saved {
+            // Restore the caller's collection registration AND signals. A
+            // nested method that declared a local of the same name (e.g. its
+            // own `int p`) removed the caller's queue from `module.*`; without
+            // restoring it, the caller's subsequent queue operations
+            // (`delete`, element reads, `.size` fallbacks) silently no-op.
+            let QueueLocalSave {
+                signals,
+                arrays_entry,
+                was_dynamic,
+                was_descending,
+                queue_max,
+                width,
+            } = save;
+            for (k, v) in signals {
                 self.signals.insert(k, v);
+            }
+            match arrays_entry {
+                Some(entry) => {
+                    self.module.arrays.insert(name.clone(), entry);
+                }
+                None => {
+                    self.module.arrays.remove(&name);
+                }
+            }
+            if was_dynamic {
+                self.module.dynamic_arrays.insert(name.clone());
+            } else {
+                self.module.dynamic_arrays.remove(&name);
+            }
+            if was_descending {
+                self.module.descending_arrays.insert(name.clone());
+            } else {
+                self.module.descending_arrays.remove(&name);
+            }
+            match queue_max {
+                Some(m) => {
+                    self.module.queue_max_sizes.insert(name.clone(), m);
+                }
+                None => {
+                    self.module.queue_max_sizes.remove(&name);
+                }
+            }
+            match width {
+                Some(w) => {
+                    self.widths.insert(name.clone(), w);
+                }
+                None => {
+                    self.widths.remove(&name);
+                }
             }
         }
         // Drop this invocation's process-unique local dyn-array storage so
