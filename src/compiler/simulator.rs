@@ -1789,6 +1789,11 @@ struct SvaClockedSite {
     /// actually reports (e.g. its `else $error(...)`), not just tallies.
     pass_action: Option<Statement>,
     fail_action: Option<Statement>,
+    /// LRM §16.5.1 — signal ids referenced anywhere in `body`. Their
+    /// slot-entry (Preponed) values are cached in `Simulator::sva_preponed`
+    /// and swapped in while this site's predicate is evaluated, so the
+    /// property samples pre-edge values (see `eval_sva_sampled`).
+    sampled_ids: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -2354,6 +2359,17 @@ pub struct Simulator {
     /// site's snapshot map. `None` when no SVA body is active —
     /// `$past` then returns 0.
     active_sva_site: Option<usize>,
+    /// LRM §16.5.1 Preponed-region sample cache for clocked concurrent
+    /// assertions. Keyed by signal id, holds each SVA-referenced signal's
+    /// value as of the START of the current time slot (captured at slot
+    /// entry, before the active/NBA regions run). When a clocked property
+    /// fires on its clock edge, its predicate is evaluated against these
+    /// sampled values rather than the live post-NBA values, so a signal
+    /// that changes on the SAME edge is seen with its old (preponed) value
+    /// — matching the §16.5.1/§16.9 sampled-value semantics instead of
+    /// being one clock cycle early. Only populated when `sva_sites` is
+    /// non-empty; the referenced ids are those collected per site.
+    sva_preponed: HashMap<usize, Value>,
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
     /// is `cb_name → (signal_name → pre-edge value)`. Updated in
     /// `tick_clocking_blocks` just before the clock signal's posedge
@@ -4786,6 +4802,7 @@ impl Simulator {
             pending_observed: Vec::new(),
             sva_sites: Vec::new(),
             active_sva_site: None,
+            sva_preponed: HashMap::default(),
             clocking_snapshots: HashMap::default(),
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
@@ -18238,6 +18255,11 @@ impl Simulator {
         if let Some(t) = _t {
             accum.t_snap += t.elapsed().as_nanos() as u64;
         }
+        // LRM §16.5.1: capture Preponed (slot-entry) samples of every
+        // SVA-referenced signal BEFORE the active/NBA regions run, so a
+        // clocked assertion firing later this slot (tick_sva_sites) samples
+        // pre-edge values rather than same-edge NBA updates.
+        self.refresh_sva_preponed();
 
         if self.apply_delayed_updates() {
             self.settle_combinatorial();
@@ -36136,6 +36158,14 @@ impl Simulator {
                                 ExprKind::Ident(h) => self.resolve_hier_name(h),
                                 _ => String::new(),
                             };
+                            // LRM §16.5.1: collect the ids of every signal
+                            // referenced in the property body so their
+                            // Preponed (slot-entry) values can be sampled
+                            // when the assertion fires (see eval_sva_sampled).
+                            let mut sampled_ids = Vec::new();
+                            self.collect_sva_signal_ids(body, &mut sampled_ids);
+                            sampled_ids.sort_unstable();
+                            sampled_ids.dedup();
                             self.sva_sites.push(SvaClockedSite {
                                 span_key,
                                 clock_signal,
@@ -36147,6 +36177,7 @@ impl Simulator {
                                 past_snapshots: HashMap::default(),
                                 pass_action: a.action.as_deref().cloned(),
                                 fail_action: a.else_action.as_deref().cloned(),
+                                sampled_ids,
                             });
                         }
                         return;
@@ -39801,6 +39832,155 @@ impl Simulator {
         }
     }
 
+    /// LRM §16.5.1 — walk an SVA property body and collect the ids of every
+    /// referenced signal (base ids of index/part-selects included). These are
+    /// the signals whose Preponed slot-entry values must be sampled when the
+    /// clocked assertion fires. Over-collection is harmless — an id that never
+    /// changes on the clock edge has an identical preponed and live value.
+    fn collect_sva_signal_ids(&self, expr: &Expression, out: &mut Vec<usize>) {
+        match &expr.kind {
+            ExprKind::Ident(_) => {
+                if let Some(id) = self.get_lhs_signal_id(expr) {
+                    out.push(id);
+                }
+            }
+            ExprKind::Unary { operand, .. } => self.collect_sva_signal_ids(operand, out),
+            ExprKind::Binary { left, right, .. } => {
+                self.collect_sva_signal_ids(left, out);
+                self.collect_sva_signal_ids(right, out);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.collect_sva_signal_ids(condition, out);
+                self.collect_sva_signal_ids(then_expr, out);
+                self.collect_sva_signal_ids(else_expr, out);
+            }
+            ExprKind::Paren(inner) => self.collect_sva_signal_ids(inner, out),
+            ExprKind::Index { expr: base, index } => {
+                // The base identifier is the sampled signal; also walk the
+                // index (it may itself reference a sampled signal).
+                if let Some(id) = self.get_lhs_signal_id(base) {
+                    out.push(id);
+                }
+                self.collect_sva_signal_ids(base, out);
+                self.collect_sva_signal_ids(index, out);
+            }
+            ExprKind::RangeSelect {
+                expr: base,
+                left,
+                right,
+                ..
+            } => {
+                if let Some(id) = self.get_lhs_signal_id(base) {
+                    out.push(id);
+                }
+                self.collect_sva_signal_ids(base, out);
+                self.collect_sva_signal_ids(left, out);
+                self.collect_sva_signal_ids(right, out);
+            }
+            ExprKind::Concatenation(exprs) => {
+                for e in exprs {
+                    self.collect_sva_signal_ids(e, out);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                self.collect_sva_signal_ids(count, out);
+                for e in exprs {
+                    self.collect_sva_signal_ids(e, out);
+                }
+            }
+            ExprKind::SystemCall { name, args } => {
+                // `$past/$rose/$fell/$stable/$changed` already read from the
+                // per-site ring buffers; their bare argument must NOT be
+                // preponed here (that would double-sample). Skip a leading
+                // bare-Ident argument to those calls; still walk the rest.
+                let skip_first = matches!(
+                    name.as_str(),
+                    "$past" | "$rose" | "$fell" | "$stable" | "$changed"
+                );
+                for (i, a) in args.iter().enumerate() {
+                    if skip_first && i == 0 && matches!(a.kind, ExprKind::Ident(_)) {
+                        continue;
+                    }
+                    self.collect_sva_signal_ids(a, out);
+                }
+            }
+            ExprKind::Call { args, .. } => {
+                for a in args {
+                    self.collect_sva_signal_ids(a, out);
+                }
+            }
+            ExprKind::Inside { expr, ranges } => {
+                self.collect_sva_signal_ids(expr, out);
+                for r in ranges {
+                    self.collect_sva_signal_ids(r, out);
+                }
+            }
+            ExprKind::SvaClocked { body, .. } => self.collect_sva_signal_ids(body, out),
+            _ => {}
+        }
+    }
+
+    /// LRM §16.5.1 — capture the Preponed (slot-entry) value of every
+    /// SVA-referenced signal. Called once at the top of each time slot,
+    /// before the active/NBA regions run, so `sva_preponed[id]` holds the
+    /// value as of the start of the slot. No-op when no clocked sites exist.
+    fn refresh_sva_preponed(&mut self) {
+        if self.sva_sites.is_empty() {
+            return;
+        }
+        self.sva_preponed.clear();
+        for i in 0..self.sva_sites.len() {
+            for j in 0..self.sva_sites[i].sampled_ids.len() {
+                let id = self.sva_sites[i].sampled_ids[j];
+                if id < self.signal_table.len() {
+                    self.sva_preponed
+                        .insert(id, self.signal_table[id].clone());
+                }
+            }
+        }
+    }
+
+    /// LRM §16.5.1/§16.9 — evaluate a clocked-assertion predicate against the
+    /// Preponed sampled values. Temporarily swaps each referenced signal's
+    /// live (post-NBA) value in `signal_table` for its slot-entry value from
+    /// `sva_preponed`, evaluates, then restores. A signal that has NOT changed
+    /// this slot has an identical preponed/live value, so this is a no-op for
+    /// the common case and only shifts sampling for signals that change on the
+    /// same edge as the clock (the off-by-one-cycle bug this fixes).
+    fn eval_sva_sampled(&mut self, sampled_ids: &[usize], expr: &Expression) -> bool {
+        let saved = self.install_preponed(sampled_ids);
+        let r = self.eval_expr(expr).is_true();
+        self.restore_preponed(saved);
+        r
+    }
+
+    /// Swap in the Preponed sample for each `id` that has one cached; returns
+    /// the saved live values for `restore_preponed`.
+    fn install_preponed(&mut self, ids: &[usize]) -> Vec<(usize, Value)> {
+        let mut saved: Vec<(usize, Value)> = Vec::new();
+        for &id in ids {
+            if id >= self.signal_table.len() {
+                continue;
+            }
+            if let Some(pre) = self.sva_preponed.get(&id) {
+                let pre = pre.clone();
+                saved.push((id, std::mem::replace(&mut self.signal_table[id], pre)));
+            }
+        }
+        saved
+    }
+
+    /// Restore the live values swapped out by `install_preponed`.
+    fn restore_preponed(&mut self, saved: Vec<(usize, Value)>) {
+        for (id, v) in saved.into_iter().rev() {
+            self.signal_table[id] = v;
+        }
+    }
+
     fn tick_sva_sites(&mut self) {
         if self.sva_sites.is_empty() {
             return;
@@ -39826,6 +40006,9 @@ impl Simulator {
             if !(prev == 0 && cur_clk_bit == 1) {
                 continue;
             }
+            // LRM §16.5.1: the referenced-signal ids whose Preponed samples
+            // this fire's predicates must read (see eval_sva_sampled).
+            let sampled_ids = self.sva_sites[i].sampled_ids.clone();
             // 1) Drain pending consequents whose counter is 1 (they're
             //    due this cycle), decrement the rest.
             let mut due: Vec<Expression> = Vec::new();
@@ -39849,7 +40032,7 @@ impl Simulator {
             let span_key_for_evt = self.sva_sites[i].span_key;
             let watchers: Vec<Expression> = std::mem::take(&mut self.sva_sites[i].s_eventually);
             for w in watchers {
-                let outcome = self.eval_expr(&w).is_true();
+                let outcome = self.eval_sva_sampled(&sampled_ids, &w);
                 if outcome {
                     let stat = self
                         .assertion_stats
@@ -39871,7 +40054,7 @@ impl Simulator {
             // a follow-up.)
             let always_watchers: Vec<Expression> = std::mem::take(&mut self.sva_sites[i].s_always);
             for w in always_watchers {
-                let outcome = self.eval_expr(&w).is_true();
+                let outcome = self.eval_sva_sampled(&sampled_ids, &w);
                 if outcome {
                     self.sva_sites[i].s_always.push(w);
                 } else {
@@ -39889,7 +40072,7 @@ impl Simulator {
             }
             let span_key = self.sva_sites[i].span_key;
             for e in due {
-                let v = self.eval_expr(&e).is_true();
+                let v = self.eval_sva_sampled(&sampled_ids, &e);
                 let stat = self
                     .assertion_stats
                     .entry(span_key)
@@ -39913,7 +40096,7 @@ impl Simulator {
             // once to collect the `$past`-referenced signal names.
             self.refresh_sva_past_snapshots(i, &body);
             let prev_active = self.active_sva_site.replace(i);
-            self.tick_sva_body(span_key, i, &body);
+            self.tick_sva_body(span_key, i, &body, &sampled_ids);
             self.active_sva_site = prev_active;
         }
     }
@@ -39998,7 +40181,16 @@ impl Simulator {
     }
 
     /// LRM §16.5: process one clock fire of an SVA property body.
-    fn tick_sva_body(&mut self, span_key: usize, site_idx: usize, body: &Expression) {
+    /// `sampled_ids` are the body's referenced signal ids whose Preponed
+    /// (slot-entry) values the antecedent/consequent predicates must sample
+    /// (see `eval_sva_sampled`).
+    fn tick_sva_body(
+        &mut self,
+        span_key: usize,
+        site_idx: usize,
+        body: &Expression,
+        sampled_ids: &[usize],
+    ) {
         // LRM §16.6 `disable iff (g)` wrapper. The parser encodes the
         // clause as `Binary{LogAnd, !g, inner_body}`. When `g` is true
         // (so `!g` is false), the property is suppressed for this
@@ -40017,7 +40209,7 @@ impl Simulator {
                         }
                         // Guard false: process the inner body as
                         // normal.
-                        return self.tick_sva_body(span_key, site_idx, right);
+                        return self.tick_sva_body(span_key, site_idx, right, sampled_ids);
                     }
                 }
             }
@@ -40032,7 +40224,7 @@ impl Simulator {
             ExprKind::Binary { op, left, right }
                 if matches!(op, crate::ast::expr::BinaryOp::OrFatArrow) =>
             {
-                let lhs_true = self.eval_expr(left).is_true();
+                let lhs_true = self.eval_sva_sampled(sampled_ids, left);
                 if lhs_true {
                     if let ExprKind::Unary { op: uop, operand } = &right.kind {
                         if matches!(uop, crate::ast::expr::UnaryOp::SEventually) {
@@ -40076,7 +40268,7 @@ impl Simulator {
             ExprKind::Binary { op, left, right }
                 if matches!(op, crate::ast::expr::BinaryOp::OrMinusArrow) =>
             {
-                let lhs = self.eval_expr(left).is_true();
+                let lhs = self.eval_sva_sampled(sampled_ids, left);
                 if !lhs {
                     let stat =
                         self.assertion_stats
@@ -40106,7 +40298,7 @@ impl Simulator {
                     }
                 }
                 // `lhs |-> rhs` (overlap): check rhs now.
-                let outcome = self.eval_expr(right).is_true();
+                let outcome = self.eval_sva_sampled(sampled_ids, right);
                 let stat = self
                     .assertion_stats
                     .entry(span_key)
@@ -40124,7 +40316,7 @@ impl Simulator {
             }
             // Plain boolean body: tally directly each clock.
             _ => {
-                let outcome = self.eval_expr(body).is_true();
+                let outcome = self.eval_sva_sampled(sampled_ids, body);
                 let stat = self
                     .assertion_stats
                     .entry(span_key)
