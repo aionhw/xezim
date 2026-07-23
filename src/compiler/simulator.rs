@@ -57521,6 +57521,23 @@ impl Simulator {
                             return Some(v.to_string());
                         }
                     }
+                    // §8.25.4 trailing-unbound fallback: the active
+                    // specialization omitted this type param (e.g.
+                    // `uvm_callbacks#(T)` elides the defaulted `CB`), so the
+                    // sig fragment is missing. Use the param's declared
+                    // default (e.g. `CB = uvm_callback`). Without this, an
+                    // in-body `uvm_typeid#(CB)::get()` resolves `CB` to the
+                    // bare literal instead of `uvm_callback`, flipping the
+                    // `get()` if/else and breaking the base-callback
+                    // `typeid_map` write (UVM callback grandchild edge).
+                    if let Some((_, default)) =
+                        cd.type_param_defaults.iter().find(|(n, _)| n == tn)
+                    {
+                        let d = default.trim();
+                        if !d.is_empty() {
+                            return Some(d.to_string());
+                        }
+                    }
                 }
                 // §8.25: `tn` is a type parameter declared in an ANCESTOR of
                 // the spec's base class (e.g. `Tregistry` in
@@ -64881,8 +64898,30 @@ impl Simulator {
                             // wouldn't match `uvm_resource` in static_prop_key
                             // and would fall back to the shared unspec'd cell →
                             // the get_type/get_type_handle mismatch).
-                            let differs =
-                                self.current_spec.as_ref().is_none_or(|(b, _)| *b != cn);
+                            let differs = match self.current_spec.as_ref() {
+                                None => true,
+                                // Switch when the base class differs OR the
+                                // instance's own specialization (same base,
+                                // different sig) differs. The latter is the
+                                // UVM callback typewide-recursion case:
+                                // `base_comp.m_add_tw_cbs` calls
+                                // `cb_pair.m_add_tw_cbs(cb)` where cb_pair is a
+                                // DIFFERENT specialization's instance (e.g.
+                                // uvm_callbacks#(b_comp)). Without restoring
+                                // the instance's spec, the recursed method's
+                                // `m_t_inst.m_tw_cb_q` static access keys off
+                                // the caller's (base_comp) cell, so typewide
+                                // callbacks never propagate to derived types.
+                                Some((b, s)) => {
+                                    *b != cn
+                                        || inst
+                                            .spec
+                                            .as_ref()
+                                            .is_some_and(|(ib, is)| {
+                                                ib != b || is != s
+                                            })
+                                }
+                            };
                             if differs {
                                 if inst.spec.is_some() {
                                     self.current_spec = inst.spec.clone();
