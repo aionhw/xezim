@@ -33216,9 +33216,7 @@ impl Simulator {
                             } else {
                                 None
                             };
-                            let ta_cloned = lname_opt
-                                .as_ref()
-                                .and_then(|n| self.module.class_type_args.get(n).cloned());
+                            let ta_cloned = self.resolve_ctor_type_args(lvalue, lname_opt.as_deref());
                             let handle = self.instantiate_class_with_type_args(
                                 &class_def,
                                 &[],
@@ -33493,13 +33491,8 @@ impl Simulator {
                                     } else {
                                         None
                                     };
-                                    let ta_cloned = lname_opt.as_ref().and_then(|n| {
-                                        self.module
-                                            .class_type_args
-                                            .get(n)
-                                            .cloned()
-                                            .or_else(|| self.var_type_args.get(n).cloned())
-                                    });
+                                    let ta_cloned =
+                                        self.resolve_ctor_type_args(lvalue, lname_opt.as_deref());
                                     self.instantiate_class_with_type_args(
                                         &class_def,
                                         args,
@@ -36900,13 +36893,8 @@ impl Simulator {
                                     } else {
                                         None
                                     };
-                                    let ta_cloned = lname_opt.as_ref().and_then(|n| {
-                                        self.module
-                                            .class_type_args
-                                            .get(n)
-                                            .cloned()
-                                            .or_else(|| self.var_type_args.get(n).cloned())
-                                    });
+                                    let ta_cloned =
+                                        self.resolve_ctor_type_args(left, lname_opt.as_deref());
                                     self.instantiate_class_with_type_args(
                                         &class_def,
                                         args,
@@ -53027,20 +53015,188 @@ impl Simulator {
                 // (SQRSNDREQCAST). Resolve it to the concrete class via the
                 // current instance's bindings; if it can't be resolved to a known
                 // class, don't enforce (stay permissive like the None case).
-                let resolved = if self.module.classes.contains_key(&dt) {
+                let raw = if self.module.classes.contains_key(&dt) {
                     dt
-                } else if let Some(c) = self
-                    .resolve_type_param_binding(&dt)
-                    .filter(|c| self.module.classes.contains_key(c))
-                {
-                    c
+                } else {
+                    match self.resolve_type_param_binding(&dt) {
+                        Some(c) => c,
+                        None => return true,
+                    }
+                };
+                // The resolved type may be a VALUE-PARAMETERIZED
+                // specialization like `special_comp#(2)` (a type param bound
+                // to a parameterized class). Strip the `#(args)` to get the
+                // base class for the hierarchy check, and retain the args
+                // text for the value-param comparison below. Without this,
+                // `special_comp#(2)` is not in `module.classes`, so the dest
+                // type is unknown and `$cast` falls back to permissive —
+                // leaking a `special_comp#(2)` typewide callback onto a
+                // `special_comp#(1)` instance (UVM 09callbacks/25params).
+                let (base, spec_args_from_name) = Self::strip_class_specialization(&raw);
+                let resolved = if self.module.classes.contains_key(&base) {
+                    base
                 } else {
                     return true;
                 };
-                self.class_is_a(&src_class, &resolved)
+                if !self.class_is_a(&src_class, &resolved) {
+                    return false;
+                }
+                // Value-parameter specialization check: if the dest class
+                // has value parameters, src and dest must agree on every
+                // one (e.g. $cast(me[special_comp#(2)], a1[#1]) must fail).
+                // Dest value bindings come from the resolved name's `#(...)`
+                // (type-param-dest case) or the dest var's declared
+                // `#(...)` type_args (direct-decl case).
+                self.cast_value_params_ok(&resolved, spec_args_from_name.as_deref(), dest, h)
             }
             None => true, // unknown dest type — stay permissive
         }
+    }
+
+    /// Parse a value-parameter spec fragment (decimal or based literal)
+    /// to a `u64`, for the `$cast` value-param comparison.
+    fn spec_fragment_to_u64(t: &str) -> Option<u64> {
+        let n = Self::parse_spec_number(t)?;
+        match n {
+            crate::ast::expr::NumberLiteral::Integer { base, value, .. } => {
+                let v = value.replace('_', "");
+                let negative = v.starts_with('-');
+                let digits = v.trim_start_matches('-').trim_start_matches('+');
+                let parsed = match base {
+                    crate::ast::expr::NumberBase::Decimal => u64::from_str_radix(digits, 10).ok()?,
+                    crate::ast::expr::NumberBase::Hex => u64::from_str_radix(digits, 16).ok()?,
+                    crate::ast::expr::NumberBase::Octal => u64::from_str_radix(digits, 8).ok()?,
+                    crate::ast::expr::NumberBase::Binary => u64::from_str_radix(digits, 2).ok()?,
+                };
+                Some(if negative { 0 } else { parsed })
+            }
+            _ => None,
+        }
+    }
+
+    /// Split a possibly-specialized type name `"Class#(args)"` into
+    /// `("Class", Some("args"))`. A bare `"Class"` yields
+    /// `("Class", None)`. Used by `cast_type_ok` to recognize a type param
+    /// bound to a value-parameterized specialization.
+    fn strip_class_specialization(s: &str) -> (String, Option<String>) {
+        if let Some(idx) = s.find("#(") {
+            let base = s[..idx].to_string();
+            let rest = &s[idx + 2..];
+            let args = rest.strip_suffix(')').unwrap_or(rest);
+            (base, Some(args.to_string()))
+        } else if let Some(idx) = s.find('#') {
+            (s[..idx].to_string(), None)
+        } else {
+            (s.to_string(), None)
+        }
+    }
+
+    /// Value-parameter specialization check for `$cast`. If `dest_class` has
+    /// value parameters, the src instance (heap handle `src_handle`) and the
+    /// dest's expected specialization must agree on every value param, else
+    /// the cast fails (e.g. `$cast(me[special_comp#(2)], a1[#1])`). Returns
+    /// `true` (permissive) when the comparison can't be determined — no
+    /// value params, missing instance data, or no dest specialization text.
+    fn cast_value_params_ok(
+        &self,
+        dest_class: &str,
+        spec_args_from_name: Option<&str>,
+        dest: &Expression,
+        src_handle: usize,
+    ) -> bool {
+        let cd = match self.module.classes.get(dest_class) {
+            Some(c) => c.clone(),
+            None => return true,
+        };
+        // Value-param names in declaration order (param_order minus type
+        // params). param_order is serde-defaulted; reconstruct the legacy
+        // value-first order for cached modules.
+        let legacy_order: Vec<String>;
+        let order: &[String] = if cd.param_order.is_empty()
+            && !(cd.param_defaults.is_empty() && cd.type_param_names.is_empty())
+        {
+            legacy_order = cd
+                .param_defaults
+                .iter()
+                .map(|(n, _)| n.clone())
+                .chain(cd.type_param_names.iter().cloned())
+                .collect();
+            &legacy_order
+        } else {
+            &cd.param_order
+        };
+        let is_type_param = |n: &str| cd.type_param_names.iter().any(|t| t == n);
+        let value_positions: Vec<(usize, String)> = order
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| !is_type_param(n))
+            .map(|(i, n)| (i, n.clone()))
+            .collect();
+        if value_positions.is_empty() {
+            return true;
+        }
+        // Dest specialization args: prefer the resolved name's `#(...)`
+        // (type-param-dest case), else the dest var's declared type_args
+        // (direct-decl case).
+        let dest_args_text = match spec_args_from_name {
+            Some(a) => Some(a.to_string()),
+            None => {
+                if let ExprKind::Ident(h) = &dest.kind {
+                    if h.path.len() == 1 {
+                        let dvar = &h.path[0].name.name;
+                        self.var_type_args.get(dvar).and_then(|ta| {
+                            let frags: Vec<String> =
+                                ta.iter().filter_map(|e| self.expr_to_spec_fragment(e)).collect();
+                            if frags.is_empty() { None } else { Some(frags.join(",")) }
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+        let dest_args: Vec<String> = match dest_args_text {
+            Some(t) => Self::split_spec_args(&t)
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .collect(),
+            None => return true, // can't determine dest specialization → permissive
+        };
+        let src_inst = match self.heap.get(src_handle).and_then(|o| o.as_ref()) {
+            Some(i) => i,
+            None => return true,
+        };
+        for (pos, vp) in &value_positions {
+            let dfrag = match dest_args.get(*pos) {
+                Some(s) => s.as_str(),
+                None => continue,
+            };
+            let sval = match src_inst.properties.get(vp) {
+                Some(v) => v,
+                None => continue,
+            };
+            // Compare the dest fragment (a literal) against the src value.
+            let dfrag_t = dfrag.trim();
+            if dfrag_t.is_empty() {
+                continue;
+            }
+            let matches = if let Some(s) = dfrag_t
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+            {
+                sval.to_string() == *s
+            } else if let Some(dn) = Self::spec_fragment_to_u64(dfrag_t) {
+                sval.to_u64() == Some(dn)
+            } else {
+                true // non-literal fragment (e.g. a param name) → can't compare
+            };
+            if !matches {
+                return false;
+            }
+        }
+        true
     }
 
     /// Find a class TASK method named `method` in `start_class` or an ancestor.
@@ -57621,8 +57777,10 @@ impl Simulator {
             .split(',')
             .map(|part| {
                 let p = part.trim();
-                self.resolve_type_param_with(p, enclosing)
-                    .unwrap_or_else(|| p.to_string())
+                if let Some(r) = self.resolve_type_param_with(p, enclosing) {
+                    return r;
+                }
+                p.to_string()
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -57666,6 +57824,64 @@ impl Simulator {
                             }
                         }
                     }
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a class PROPERTY's declared `#(...)` specialization args by
+    /// walking the current `this` instance's class hierarchy. Locals are in
+    /// `var_type_args` and module-level decls in `class_type_args`, but a
+    /// class property typed with a parameterized type
+    /// (`special_comp#(1) a1;`) had neither, so `this.a1 = new(...)` bound no
+    /// type-args and value parameters defaulted — collapsing `#(1)`/`#(2)`
+    /// to `#(0)` (UVM 09callbacks/25params). Elaboration now records these in
+    /// `ElaboratedClass::property_type_args`; this looks them up.
+    fn this_property_type_args(&self, prop_name: &str) -> Option<Vec<Expression>> {
+        let h = self.this_stack.last().copied().flatten()?;
+        let class_name = self
+            .heap
+            .get(h)
+            .and_then(|o| o.as_ref())?
+            .class_name
+            .clone();
+        let mut cur = self.module.classes.get(&class_name).cloned();
+        while let Some(c) = cur {
+            if let Some(ta) = c.property_type_args.get(prop_name) {
+                return Some(ta.clone());
+            }
+            cur = c
+                .extends
+                .as_ref()
+                .and_then(|e| self.module.classes.get(e).cloned());
+        }
+        None
+    }
+
+    /// Resolve the declared `#(...)` specialization args to use when
+    /// constructing `lvalue = new(...)`. Checks module-level decls, then
+    /// procedural locals, then class properties of the current `this`
+    /// instance. `resolved_name` is the lvalue's `resolve_hier_name` result
+    /// (used as the key for the first two); the property fallback keys off
+    /// the lvalue's leaf identifier so `this.prop` and bare `prop` both work.
+    fn resolve_ctor_type_args(
+        &self,
+        lvalue: &Expression,
+        resolved_name: Option<&str>,
+    ) -> Option<Vec<Expression>> {
+        if let Some(n) = resolved_name {
+            if let Some(ta) = self.module.class_type_args.get(n) {
+                return Some(ta.clone());
+            }
+            if let Some(ta) = self.var_type_args.get(n) {
+                return Some(ta.clone());
+            }
+        }
+        if let ExprKind::Ident(lh) = &lvalue.kind {
+            if let Some(leaf) = lh.path.last() {
+                if let Some(ta) = self.this_property_type_args(&leaf.name.name) {
+                    return Some(ta);
                 }
             }
         }
