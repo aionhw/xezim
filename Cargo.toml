@@ -24,11 +24,6 @@ cranelift = { version = "0.109", optional = true }
 cranelift-jit = { version = "0.109", optional = true }
 cranelift-module = { version = "0.109", optional = true }
 cranelift-native = { version = "0.109", optional = true }
-# LLVM JIT backend (alternative to cranelift). Enabled with
-# `--features jit-llvm`. Requires LLVM 18 dev libs on the host
-# (Ubuntu/Debian: `apt install llvm-18-dev`). Heavier compile-time
-# cost than cranelift but produces tighter machine code.
-inkwell = { version = "0.5", features = ["llvm18-0"], optional = true }
 fst-writer = "0.3"
 
 [dev-dependencies]
@@ -43,7 +38,6 @@ cc = "1"
 [features]
 default = []
 jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
-jit-llvm = ["dep:inkwell"]
 
 [[bin]]
 name = "xezim"
@@ -54,18 +48,16 @@ name = "xezim"
 path = "src/lib.rs"
 
 [profile.release]
-# LTO miscompiles the inkwell/llvm-sys JIT path (segfault before
-# JIT-compile loop). Disabled to keep both backends working. The
-# ~5-10% perf cost is acceptable; the interpreter hot path was
-# already memory-bound.
+# LTO miscompiled the (since-removed) LLVM JIT path; kept off until
+# it is validated against the cranelift JIT. The ~5-10% perf cost is
+# acceptable; the interpreter hot path was already memory-bound.
 lto = false
 codegen-units = 1
 opt-level = 3
 debug = "line-tables-only"
 panic = "abort"
 
-# Interpreter-only LTO build. Use when NOT building with `--features jit`
-# or `--features jit-llvm` (LTO miscompiles the LLVM JIT path).
+# Interpreter-only LTO build. Use when NOT building with `--features jit`.
 # Build with:
 #   cargo build --release --profile release-lto --bin xezim
 # (Binary lands in `target/release-lto/xezim`.)  Measured on c910 hello

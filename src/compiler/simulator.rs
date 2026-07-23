@@ -2801,11 +2801,6 @@ pub struct Simulator {
     /// all compiled function pointers. Kept on Simulator so the mmapped
     /// code pages stay mapped for the life of the simulation.
     jit_module: Option<super::jit::JitModule>,
-    /// Same role as `jit_module`, but for the LLVM backend. Owned
-    /// here to keep the JIT-compiled code's memory alive for the
-    /// simulator's lifetime. Always `None` when the `jit-llvm`
-    /// feature is disabled (the type is a stub).
-    jit_module_llvm: Option<super::jit_llvm::LlvmJitModule>,
     /// True for blocks eligible for parallel execution (no StmtFallback).
     edge_block_parallel: Vec<bool>,
     /// Per-edge-block partition / core assignment. Indexed by edge_block
@@ -4889,7 +4884,6 @@ impl Simulator {
             compiled_edge_blocks: Vec::new(),
             jit_fns: Vec::new(),
             jit_module: None,
-            jit_module_llvm: None,
             edge_block_parallel: Vec::new(),
             edge_block_partition: Vec::new(),
             edge_block_partition_count: 0,
@@ -12084,51 +12078,23 @@ impl Simulator {
             Vec::new()
         };
         if enable_jit {
-            // Pick backend via XEZIM_JIT_BACKEND={cranelift,llvm}.
-            // Default = cranelift (faster JIT-compile; matches prior
-            // behavior). LLVM produces tighter machine code but pays
-            // a heavy compile-time cost.
+            // Single backend: cranelift. (An LLVM backend once existed
+            // behind XEZIM_JIT_BACKEND=llvm; it was removed — warn if
+            // someone still asks for it.)
             let backend =
                 std::env::var("XEZIM_JIT_BACKEND").unwrap_or_else(|_| "cranelift".to_string());
             let xz_ptr = self.signal_has_xz.as_ptr() as u64;
             let xz_len = self.signal_has_xz.len() as u32;
             let jit_compile_start = std::time::Instant::now();
             let mut jit_count = 0usize;
-            match backend.as_str() {
-                "llvm" => {
-                    let mut llvm = super::jit_llvm::LlvmJitModule::new();
-                    if llvm.is_none() {
-                        eprintln!("[JIT] LLVM init failed; interpreter only");
-                    }
-                    if let Some(jm) = llvm.as_mut() {
-                        for (idx, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
-                            if let Some(cb) = cb_opt {
-                                if !block_jit_safe[idx] {
-                                    continue;
-                                }
-                                if let Some(f) = jm.try_compile_with_xz(
-                                    &cb.instructions,
-                                    cb.num_regs,
-                                    xz_ptr,
-                                    xz_len,
-                                ) {
-                                    self.jit_fns[idx] = Some(f);
-                                    jit_count += 1;
-                                }
-                            }
-                        }
-                    }
-                    // Hold the LLVM JIT module for the simulator's
-                    // lifetime so the JIT'd function pointers stay valid.
-                    self.jit_module_llvm = llvm;
-                    eprintln!(
-                        "[JIT] backend=llvm compiled {}/{} edge blocks in {:.1}s",
-                        jit_count,
-                        self.compiled_edge_blocks.len(),
-                        jit_compile_start.elapsed().as_secs_f64(),
-                    );
-                }
-                _ => {
+            if backend == "llvm" {
+                eprintln!(
+                    "[JIT] the LLVM backend was removed; using cranelift \
+                     (unset XEZIM_JIT_BACKEND)"
+                );
+            }
+            {
+                {
                     if self.jit_module.is_none() {
                         self.jit_module = super::jit::JitModule::new();
                     }
