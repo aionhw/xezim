@@ -41,3 +41,4 @@ file,topic,description
 40_struct_nettype_resolution.sv,resolution tier 2,struct-typed nettype with real field and field-by-field resolver
 41_genfor_localparam_idx.sv,generate-for elaboration,genvar-dependent localparam init substituted per iteration
 42_typeparam_default_resolution.sv,type parameter defaults,non-overridden parameter type default resolved against overridden numeric params
+43_packed_struct_assign.sv,packed struct assignment patterns,named/ordered patterns into packed struct packed by member offset; packed-2D element continuous assign emits full-width gate
