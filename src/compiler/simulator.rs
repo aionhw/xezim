@@ -54395,13 +54395,33 @@ impl Simulator {
                 if let Some(class_def) = self.module.classes.get(class_name).cloned() {
                     return self.instantiate_class(&class_def, args);
                 }
-            } else if len >= 2 && path[len - 1].name.name == "create" {
+                // Typedef alias of a parameterized class (same bridge as the
+                // MemberAccess path above and the PURE_SV_LRM branch below).
+                if let Some(DataType::TypeReference { name, type_args, .. }) =
+                    self.module.typedef_types.get(class_name).cloned()
+                {
+                    if let Some(class_def) =
+                        self.module.classes.get(&name.name.name).cloned()
+                    {
+                        let ta: Option<&[Expression]> = if type_args.is_empty() {
+                            None
+                        } else {
+                            Some(&type_args)
+                        };
+                        return self.instantiate_class_with_type_args(
+                            &class_def, args, ta,
+                        );
+                    }
+                }
             }
 
             // PURE-mode counterpart of the flattened `...,type_id,create` path
             // (the MemberAccess form is handled in eval_call_inner's call site
             // above). Resolve `C::type_id::create` from `C`'s own registry
-            // typedef and construct the registered target class.
+            // typedef and construct the registered target class.  When `C` is a
+            // typedef alias (e.g. `typedef base_seq#(T) my_sqr`) there is no
+            // class entry for `my_sqr`; fall through to `typedef_types` to
+            // resolve the alias and instantiate the parameterised target.
             if self.pure_sv_lrm
                 && len >= 3
                 && path[len - 1].name.name == "create"
@@ -54411,6 +54431,22 @@ impl Simulator {
                 if let Some(target) = self.resolve_type_id_target_class(&class_name) {
                     if let Some(class_def) = self.module.classes.get(&target).cloned() {
                         return self.instantiate_class(&class_def, args);
+                    }
+                }
+                if let Some(DataType::TypeReference { name, type_args, .. }) =
+                    self.module.typedef_types.get(&class_name).cloned()
+                {
+                    if let Some(class_def) =
+                        self.module.classes.get(&name.name.name).cloned()
+                    {
+                        let ta: Option<&[Expression]> = if type_args.is_empty() {
+                            None
+                        } else {
+                            Some(&type_args)
+                        };
+                        return self.instantiate_class_with_type_args(
+                            &class_def, args, ta,
+                        );
                     }
                 }
             }
