@@ -60,3 +60,77 @@ endmodule
     let out = out_of(&simulate(SRC, 100).expect("sim"));
     assert!(out.contains("O 1010"), "offset-range array drives absolute bits:\n{}", out);
 }
+
+/// §23.3.2 W-bit formal: an actual W*N wide is split into per-element W-bit
+/// slices. Here W=2, N=4, actual 8 bits: element k gets out[2k+1:2k].
+#[test]
+fn wbit_formal_per_slice() {
+    const SRC: &str = r#"
+module inv2(output logic [1:0] o, input logic [1:0] i); assign o = ~i; endmodule
+module top;
+  logic [7:0] out, din;
+  inv2 m[3:0] (.o(out), .i(din));
+  initial begin din = 8'hA5; #1 $display("W %b", out); end
+endmodule
+"#;
+    let out = out_of(&simulate(SRC, 100).expect("sim"));
+    // ~8'hA5 = ~10100101 = 01011010, distributed per 2-bit slice.
+    assert!(out.contains("W 01011010"), "2-bit formal splits 8-bit actual per slice:\n{}", out);
+}
+
+/// §23.3.2 replication: an actual whose width EQUALS the formal width is NOT
+/// split — the same actual connects to every element. A 1-bit scalar input
+/// broadcasts to all four inverters, so every output bit is ~in.
+#[test]
+fn scalar_actual_replicates() {
+    const SRC: &str = r#"
+module inv1(output logic o, input logic i); assign o = ~i; endmodule
+module top;
+  logic [3:0] out;
+  logic in;
+  inv1 m[3:0] (out[3:0], in);
+  initial begin in = 1'b1; #1 $display("C %b", out); end
+endmodule
+"#;
+    let out = out_of(&simulate(SRC, 100).expect("sim"));
+    assert!(out.contains("C 0000"), "1-bit actual broadcasts to every element:\n{}", out);
+}
+
+/// §23.3.2 by-name connections may be written in ANY order and must still bind
+/// each vector actual against its OWN formal port's width. With ports of
+/// DIFFERENT widths (o: 2-bit, i: 1-bit) listed in reverse, a position-based
+/// width lookup would slice each actual with the wrong stride.
+#[test]
+fn named_conn_reordered_binds_by_port() {
+    const SRC: &str = r#"
+module mix(output logic [1:0] o, input logic i); assign o = {i, ~i}; endmodule
+module top;
+  logic [7:0] o8;
+  logic [3:0] i4;
+  mix m[3:0] (.i(i4), .o(o8));   // reversed vs declaration order
+  initial begin i4 = 4'b1010; #1 $display("N %b", o8); end
+endmodule
+"#;
+    let out = out_of(&simulate(SRC, 100).expect("sim"));
+    // element k: {i4[k], ~i4[k]}; i4=1010 -> k0=01,k1=10,k2=01,k3=10 -> 10011001
+    assert!(out.contains("N 10011001"), "by-name conns slice by their own port width:\n{}", out);
+}
+
+/// §23.3.2 hierarchical read: an internal net of an array element is reachable
+/// as `m[k].<net>`.
+#[test]
+fn element_internal_hier_read() {
+    const SRC: &str = r#"
+module mycell(output logic o, input logic i);
+  logic internal; assign internal = ~i; assign o = internal;
+endmodule
+module top;
+  logic [3:0] out, din;
+  mycell m[3:0] (.o(out), .i(din));
+  initial begin din = 4'b1100; #1 $display("H %b", m[2].internal); end
+endmodule
+"#;
+    let out = out_of(&simulate(SRC, 100).expect("sim"));
+    // din[2]=1 -> internal of element 2 = ~1 = 0
+    assert!(out.contains("H 0"), "m[k].internal is readable:\n{}", out);
+}
