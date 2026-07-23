@@ -16,16 +16,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
       - name: cargo test (no features)
         run: cargo test
 
@@ -33,7 +23,10 @@ jobs:
         run: cargo test --features jit
 
       - name: Install LLVM 18
-        run: sudo apt-get install -y llvm-18-dev
+        run: sudo apt-get install -y llvm-18-dev libpolly-18-dev
+
+      - name: Remove previous build files
+        run: cargo clean
 
       - name: cargo test --features jit-llvm
         run: cargo test --features jit-llvm
