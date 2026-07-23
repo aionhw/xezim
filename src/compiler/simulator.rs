@@ -53724,6 +53724,33 @@ impl Simulator {
                                 {
                                     return self.instantiate_class(&class_def, args);
                                 }
+                                // `typedef uvm_sequencer#(item) sqr_t;
+                                // sqr_t::type_id::create(...)` — the name is a
+                                // typedef alias of a parameterized class (LRM
+                                // §6.18: a synonym, §8.25.1: same
+                                // specialization), not a class itself. Resolve
+                                // the alias to its base class + type args and
+                                // construct directly — same bridge as the
+                                // PURE_SV_LRM branch below; without it the
+                                // create falls through to the real factory,
+                                // which returns null, and the agent's
+                                // sequencer silently never exists.
+                                if let Some(DataType::TypeReference { name, type_args, .. }) =
+                                    self.module.typedef_types.get(class_name).cloned()
+                                {
+                                    if let Some(class_def) =
+                                        self.module.classes.get(&name.name.name).cloned()
+                                    {
+                                        let ta: Option<&[Expression]> = if type_args.is_empty() {
+                                            None
+                                        } else {
+                                            Some(&type_args)
+                                        };
+                                        return self.instantiate_class_with_type_args(
+                                            &class_def, args, ta,
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
