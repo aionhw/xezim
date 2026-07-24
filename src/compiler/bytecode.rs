@@ -251,6 +251,12 @@ pub struct BytecodeCompiler<'a> {
     /// bit `i` and silently drops the upper bits. Set via
     /// `set_packed_elem_widths`.
     packed_elem_widths: Option<&'a HashMap<String, u32>>,
+    /// Declared packed dimensions (outermost first) per signal, from the
+    /// elaborated model. Needed because a packed element's LSB offset is
+    /// `(idx - low_bound) * elem_w` for a DESCENDING range — the plain
+    /// `idx * elem_w` is only correct for a normalized `[N-1:0]` range and
+    /// mis-places (or drops) elements of e.g. `[2:1]` or an ascending `[0:1]`.
+    packed_full_dims: Option<&'a HashMap<String, Vec<(i64, i64)>>>,
     /// Stack of pending `break` jump-target patches, one entry per enclosing
     /// loop. When the loop's end address is known we rewrite each `Jump(0)`
     /// at these insn-indices to the loop-exit address. LRM §12.7.
@@ -302,6 +308,7 @@ impl<'a> BytecodeCompiler<'a> {
             params: None,
             top_module_name: None,
             packed_elem_widths: None,
+            packed_full_dims: None,
             loop_break_patches: Vec::new(),
             loop_continue_patches: Vec::new(),
             string_signals: None,
@@ -343,6 +350,67 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_packed_elem_widths(&mut self, w: &'a HashMap<String, u32>) {
         self.packed_elem_widths = Some(w);
+    }
+
+    pub fn set_packed_full_dims(&mut self, d: &'a HashMap<String, Vec<(i64, i64)>>) {
+        self.packed_full_dims = Some(d);
+    }
+
+    /// The declared OUTERMOST packed dimension `(left, right)` of the signal
+    /// named by `hier`, if recorded. Same raw / last-segment lookup the
+    /// `packed_elem_widths` sites use.
+    fn packed_outer_dim(&self, hier: &HierarchicalIdentifier) -> Option<(i64, i64)> {
+        let raw = Self::hier_raw_name(hier);
+        self.packed_full_dims.and_then(|m| {
+            m.get(raw.as_str())
+                .or_else(|| hier.path.last().and_then(|s| m.get(s.name.name.as_str())))
+                .and_then(|d| d.first())
+                .copied()
+        })
+    }
+
+    /// LSB bit offset of packed element `idx` given the declared outer
+    /// dimension. `[N-1:0]` reduces to the historical `idx * elem_w`.
+    fn packed_elem_lsb(dim: Option<(i64, i64)>, idx: i64, elem_w: u32) -> i64 {
+        let Some((l, r)) = dim else {
+            return idx * elem_w as i64;
+        };
+        let (lo_b, hi_b) = (l.min(r), l.max(r));
+        let count = hi_b - lo_b + 1;
+        let off = idx - lo_b;
+        // A descending range labels the LEFT bound as the most-significant
+        // element; an ascending one reverses the slot order (§7.4.1).
+        let slot = if l >= r { off } else { count - 1 - off };
+        slot * elem_w as i64
+    }
+
+    /// Emit the register holding the element's *slot* index (already
+    /// normalized to 0-based, LSB-first) for a DYNAMIC index. Returns the
+    /// original register unchanged for a normalized `[N-1:0]` range.
+    fn emit_packed_slot_index(&mut self, dim: Option<(i64, i64)>, idx_reg: RegId) -> RegId {
+        let Some((l, r)) = dim else { return idx_reg };
+        let (lo_b, hi_b) = (l.min(r), l.max(r));
+        if l >= r {
+            if lo_b == 0 {
+                return idx_reg; // normalized [N-1:0]
+            }
+            let lo_reg = self.alloc_reg();
+            self.emit(Insn::LoadConst(lo_reg, Box::new(Value::from_u64(lo_b as u64, 32))));
+            let out = self.alloc_reg();
+            self.emit(Insn::Sub(out, idx_reg, lo_reg));
+            out
+        } else {
+            // ascending: slot = (count-1) - (idx - lo_b) = (count-1+lo_b) - idx
+            let count = hi_b - lo_b + 1;
+            let k = self.alloc_reg();
+            self.emit(Insn::LoadConst(
+                k,
+                Box::new(Value::from_u64((count - 1 + lo_b) as u64, 32)),
+            ));
+            let out = self.alloc_reg();
+            self.emit(Insn::Sub(out, k, idx_reg));
+            out
+        }
     }
 
     pub fn set_ast_fallback(&mut self, allow: bool) {
@@ -1589,7 +1657,12 @@ impl<'a> BytecodeCompiler<'a> {
                         // never forwards" root cause: the arbiter's selected
                         // index came out X.)
                         if let Some(idx) = self.eval_const_expr(index) {
-                            let lo = idx * elem_w;
+                            let lo = Self::packed_elem_lsb(
+                                self.packed_outer_dim(hier),
+                                idx as i64,
+                                elem_w,
+                            )
+                            .max(0) as u32;
                             let hi = lo + elem_w - 1;
                             let dest = self.alloc_reg();
                             self.emit(Insn::RangeSelectConst(dest, base, hi, lo));
@@ -1815,6 +1888,10 @@ impl<'a> BytecodeCompiler<'a> {
                             .filter(|&w| w > 1);
                         if let Some(elem_w) = elem_w {
                             if let Some(idx_reg) = self.compile_expr(index, 0) {
+                                // Normalize the index to a 0-based, LSB-first
+                                // slot using the DECLARED outer range.
+                                let dim = self.packed_outer_dim(hier);
+                                let idx_reg = self.emit_packed_slot_index(dim, idx_reg);
                                 let elem_w_reg = self.alloc_reg();
                                 self.emit(Insn::LoadConst(
                                     elem_w_reg,
@@ -2085,7 +2162,10 @@ impl<'a> BytecodeCompiler<'a> {
                             .filter(|&w| w > 1);
                         if let Some(elem_w) = elem_w {
                             if let Some(idx_reg) = self.compile_expr(index, 0) {
-                                // lo = idx * elem_w
+                                // lo = slot * elem_w, where `slot` normalizes
+                                // the index against the DECLARED outer range.
+                                let dim = self.packed_outer_dim(hier);
+                                let idx_reg = self.emit_packed_slot_index(dim, idx_reg);
                                 let elem_w_reg = self.alloc_reg();
                                 self.emit(Insn::LoadConst(
                                     elem_w_reg,

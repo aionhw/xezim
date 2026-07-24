@@ -12225,6 +12225,7 @@ impl Simulator {
             compiler.set_tasks(&self.module.tasks);
             compiler.set_params(&self.module.parameters);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+            compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
@@ -12267,6 +12268,7 @@ impl Simulator {
                 compiler.set_tasks(&self.module.tasks);
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_array_first_id(&self.array_first_id);
                 compiler.set_string_signals(&self.module.string_signals);
@@ -12289,6 +12291,7 @@ impl Simulator {
                 delay_compiler.set_tasks(&self.module.tasks);
                 delay_compiler.set_params(&self.module.parameters);
                 delay_compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                delay_compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 delay_compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 delay_compiler.set_array_first_id(&self.array_first_id);
                 delay_compiler.set_string_signals(&self.module.string_signals);
@@ -15009,6 +15012,7 @@ impl Simulator {
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_array_first_id(&self.array_first_id);
                 compiler.top_module_name = Some(self.module.name.clone());
@@ -15062,6 +15066,7 @@ impl Simulator {
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_array_first_id(&self.array_first_id);
                 compiler.top_module_name = Some(self.module.name.clone());
@@ -15321,6 +15326,7 @@ impl Simulator {
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_params(&self.module.parameters);
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                    compiler.set_packed_full_dims(&self.module.packed_full_dims);
                     compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                     compiler.set_array_first_id(&self.array_first_id);
                     compiler.top_module_name = Some(self.module.name.clone());
@@ -42381,10 +42387,28 @@ impl Simulator {
                     }
                     // Multi-D PACKED vector (`logic [1:0][3:0][7:0] foo`):
                     // `foo[i]`/`foo[i][j]` select a SLICE — its width is the
-                    // product of the remaining dims, not 1 bit.
+                    // product of the remaining dims, not 1 bit. §7.4: UNPACKED
+                    // dimensions are indexed FIRST, so when the base is an
+                    // unpacked array of packed vectors (`logic [1:0][7:0] v
+                    // [0:1]`, `v[0][0]`) the leading indices consume the
+                    // unpacked dims and only the rest index the packed ones.
+                    // Without this subtraction the packed depth ran past the
+                    // dim list and the lvalue fell through to width 1 — a
+                    // continuous assign then resized its RHS to one bit and
+                    // wrote the LSB (0x12 -> 0).
+                    let num_unpacked = if let Some((d, _)) = self.module.arrays_nd.get(&n) {
+                        d.len()
+                    } else if self.module.arrays_2d.contains_key(&n) {
+                        2
+                    } else if self.module.arrays.contains_key(&n) {
+                        1
+                    } else {
+                        0
+                    };
                     if let Some(dims) = self.module.packed_full_dims.get(&n) {
-                        if depth < dims.len() {
-                            let w: u64 = dims[depth..]
+                        let pdepth = depth.saturating_sub(num_unpacked);
+                        if pdepth < dims.len() {
+                            let w: u64 = dims[pdepth..]
                                 .iter()
                                 .map(|(l, r)| (l - r).unsigned_abs() + 1)
                                 .product();
