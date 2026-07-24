@@ -18948,6 +18948,13 @@ impl Simulator {
         let mut wd_ref_time: u64 = self.time;
         let mut wd_ref_edges: u64 = self.prof_edges_fired;
         let mut wd_ref_wall = sim_start.elapsed();
+        // Event-phase high-water mark when the window opened. A clock returns to
+        // the same value each period, so equal *sampled* bits does NOT prove the
+        // awaited signal is frozen — it may have toggled 0→1→0→1 between checks.
+        // sig_last_change records the phase of each signal's last transition, so
+        // a value > this mark means the signal genuinely moved since the window
+        // opened (a live clock), suppressing the dead-clock false positive.
+        let mut wd_ref_phase: u64 = self.event_phase;
         let mut wd_warned = false;
         // O1 flop-fire skip is default-ON (correct-by-construction snapshot
         // compare; ~1.1-1.6x on c910). Set XEZIM_EVENT_EDGE=0 to disable.
@@ -18990,9 +18997,25 @@ impl Simulator {
                         .iter()
                         .map(|&id| self.signal_table[id].raw_bits())
                         .collect();
+                    // A live clock periodically returns to the same value, so
+                    // comparing sampled bits alone false-positives on a healthy
+                    // toggling clock whenever the 1024-iter sampling aligns with
+                    // its phase. Confirm with sig_last_change (precise per-signal
+                    // transition phase): if any awaited signal moved since the
+                    // window opened, it is a LIVE clock — treat as progress.
+                    let toggled_since_ref = self.event_measure
+                        && cur_sigs.iter().any(|&id| {
+                            id < self.sig_last_change.len()
+                                && self.sig_last_change[id] > wd_ref_phase
+                        });
                     // Same monitored signals AND all still at their reference
-                    // value = the awaited clock/reset is frozen.
-                    if !cur_sigs.is_empty() && cur_sigs == wd_sigs && cur_bits == wd_bits {
+                    // value AND no transition since the window opened = the
+                    // awaited clock/reset is genuinely frozen.
+                    if !cur_sigs.is_empty()
+                        && cur_sigs == wd_sigs
+                        && cur_bits == wd_bits
+                        && !toggled_since_ref
+                    {
                         let d_ticks = self.time.saturating_sub(wd_ref_time);
                         let d_edges = self.prof_edges_fired.saturating_sub(wd_ref_edges);
                         let d_wall = sim_start.elapsed().saturating_sub(wd_ref_wall);
@@ -19033,6 +19056,7 @@ impl Simulator {
                         wd_ref_time = self.time;
                         wd_ref_edges = self.prof_edges_fired;
                         wd_ref_wall = sim_start.elapsed();
+                        wd_ref_phase = self.event_phase;
                     }
                 }
             }
