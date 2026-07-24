@@ -8118,6 +8118,19 @@ impl Simulator {
             })
             .collect();
         for (cn, prop, init) in static_call_inits {
+            // A parameterized class's static initializers must NOT run here
+            // with no active specialization (`current_spec` is None at
+            // startup). Doing so collapses every value specialization
+            // (e.g. `special_comp#(1)` and `#(2)`) onto ONE bare-typedef
+            // typeid, because the class-local typedef
+            // `typedef special_comp#(N) special_comp_type;` cannot resolve
+            // its value parameter `N` without a spec. Instead, these run
+            // per-specialization via `ensure_spec_statics`, triggered when
+            // each specialization is first instantiated (see
+            // `instantiate_class_with_type_args`).
+            if self.class_is_parameterized(&cn) {
+                continue;
+            }
             // A STATIC mailbox/semaphore with `= new()` (e.g. UVM's phaser
             // `static mailbox m_phase_hopper = new();`) must be allocated as a
             // real container — eval_expr of bare new() doesn't create one, so
@@ -28625,7 +28638,12 @@ impl Simulator {
             // Set the active specialization (for per-spec static keying) while
             // resolving the stripped shape, e.g. `C#(params)::prop` reads the
             // per-spec static cell. Restore afterward.
-            let saved = self.current_spec.take();
+            //
+            // Keep `current_spec` set to the enclosing spec while resolving
+            // the call's specialization: `resolve_call_spec_params` resolves
+            // class-local typedef args (e.g. `special_comp_type`) through
+            // `resolve_typedef_spec`, which reads `self.current_spec`.
+            let saved = self.current_spec.clone();
             if self.pure_sv_lrm {
                 let extracted =
                     self.resolve_call_spec_params(Self::extract_call_spec(expr), &saved);
@@ -28633,6 +28651,8 @@ impl Simulator {
                     self.ensure_spec_statics(base, sig);
                 }
                 self.current_spec = extracted.or(saved.clone());
+            } else {
+                self.current_spec = None;
             }
             let v = self.eval_expr_ctx(&Self::strip_spec_shape(expr), ctx_width);
             self.current_spec = saved;
@@ -29883,10 +29903,17 @@ impl Simulator {
                         }
                     }
                     if self.module.arrays.contains_key(&name) || self.is_associative_array(&name) {
+                        // Per-spec storage key for STATIC collection properties
+                        // of parameterized classes: membership stays on the
+                        // bare `name` (registered globally), but element/size
+                        // STORAGE must use the spec-aware key so each
+                        // specialization gets its own cells (matching
+                        // `eval_builtin_method`'s push_back/size).
+                        let store_name = self.spec_static_coll_key(&name);
                         // Array element access: look up signal "name[idx]"
                         if self.module.dynamic_arrays.contains(&name) {
                             self.dollar_bound
-                                .push((self.get_queue_size(&name) as i64) - 1);
+                                .push((self.get_queue_size(&store_name) as i64) - 1);
                         }
                         let idx_val = self.eval_expr(index);
                         if self.module.dynamic_arrays.contains(&name) {
@@ -29924,7 +29951,7 @@ impl Simulator {
                         } else {
                             idx_val.to_u64().unwrap_or(0).to_string()
                         };
-                        let elem_name = format!("{}[{}]", name, idx_str);
+                        let elem_name = format!("{}[{}]", store_name, idx_str);
                         if let Some(&eid) = self.signal_name_to_id.get(elem_name.as_str()) {
                             let mut v = self.signal_table[eid].clone();
                             if self.signal_signed[eid] {
@@ -51090,6 +51117,13 @@ impl Simulator {
         mname: &str,
         args: &[Expression],
     ) -> Option<Value> {
+        // Per-specialization keying for STATIC collection properties of
+        // parameterized classes (e.g. `static T m_q[$]` in `uvmq#(T)`):
+        // rewrite the bare member name to the spec-aware storage key so each
+        // specialization gets its own element/size cells. No-op for instance
+        // methods and non-static/non-collection names.
+        let _resolved = self.spec_static_coll_key(obj_name);
+        let obj_name = _resolved.as_str();
         // §6.19.6 — Enum methods first/last/next/prev/num on an enum-typed
         // signal. Look up the signal's type_name → enum_members[type_name]
         // (Vec<(name, value)> in declaration order, which IS the LRM
@@ -52124,10 +52158,68 @@ impl Simulator {
         frags.join(",")
     }
 
+    /// For a STATIC queue/associative/dynamic-array property of a
+    /// parameterized class — accessed BARE inside a static method or a
+    /// static initializer — return the per-specialization storage key
+    /// (e.g. `uvmq#int::m_q`) so each specialization gets its own element
+    /// storage and size cell. Instance methods (a non-zero `this`) and
+    /// non-collection / non-static names are returned unchanged. Applied
+    /// centrally in `eval_builtin_method` so every builtin
+    /// (push_back/size/pop_front/...) keys off the same spec-aware name.
+    fn spec_static_coll_key(&self, name: &str) -> String {
+        let this_h = self
+            .this_stack
+            .last()
+            .copied()
+            .flatten()
+            .filter(|&h| h != 0);
+        // Instance method: collection storage is instance-scoped
+        // (`<handle>#name`), not static. A static method carries a ZERO
+        // `this` handle, so filter that out.
+        if this_h.is_some() {
+            return name.to_string();
+        }
+        let Some(Some(ctx)) = self.class_context_stack.last().cloned() else {
+            return name.to_string();
+        };
+        // Walk ctx's inheritance chain for a STATIC collection property.
+        // Static collections are registered in `static_collections`
+        // (name, is_assoc, width) — NOT queue_properties/assoc_properties,
+        // which are gated to non-static members during elaboration.
+        let mut cur = Some(ctx.clone());
+        while let Some(cn) = cur {
+            if let Some(cd) = self.module.classes.get(&cn) {
+                if cd.static_properties.contains(name)
+                    && cd.static_collections.iter().any(|(n, _, _)| n == name)
+                {
+                    if let Some(key) = self.static_prop_key(&ctx, name) {
+                        // ONLY rewrite for a parameterized class with an
+                        // active specialization (key carries `#spec`). For a
+                        // non-parameterized class the key is just
+                        // `Class::prop` — identical storage to the bare name
+                        // used by the many access paths we do NOT touch here,
+                        // so rewriting would split storage and break them.
+                        if key.contains('#') {
+                            return key;
+                        }
+                    }
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        name.to_string()
+    }
+
     /// Walk the class hierarchy from `start_class` and return the
     /// `"DeclClass::prop"` storage key for a static property, if one of
     /// `start_class` or its ancestors declares `prop` as `static`.
     fn static_prop_key(&self, start_class: &str, prop: &str) -> Option<String> {
+        self.static_prop_key_inner(start_class, prop)
+    }
+
+    fn static_prop_key_inner(&self, start_class: &str, prop: &str) -> Option<String> {
         let mut cur = Some(start_class.to_string());
         while let Some(cname) = cur {
             if let Some(cd) = self.module.classes.get(&cname) {
@@ -53796,7 +53888,11 @@ impl Simulator {
         if !self.pure_sv_lrm || !Self::expr_has_specialization(func) {
             return self.eval_call_inner(func, args);
         }
-        let saved = self.current_spec.take();
+        // Keep `current_spec` set while resolving the call's specialization so
+        // `resolve_call_spec_params` can resolve class-local typedef args
+        // (e.g. `special_comp_type`) through the enclosing spec —
+        // `resolve_typedef_spec` reads `self.current_spec`.
+        let saved = self.current_spec.clone();
         let extracted = self.resolve_call_spec_params(Self::extract_call_spec(func), &saved);
         if let Some((ref base, ref sig)) = extracted {
             self.ensure_spec_statics(base, sig);
@@ -58278,13 +58374,86 @@ impl Simulator {
             .map(|part| {
                 let p = part.trim();
                 if let Some(r) = self.resolve_type_param_with(p, enclosing) {
-                    return r;
+                    return Self::normalize_spec_ws(&r);
                 }
-                p.to_string()
+                // Resolve a class-local TYPEDEF name (e.g. `special_comp_type`,
+                // a `typedef special_comp#(N) special_comp_type;` inside
+                // `special_comp#(N)`) to its concrete specialization through
+                // the enclosing spec. Without this, a static initializer
+                // (`uvm_register_cb(special_comp_type, special_cb_type)` →
+                // `uvm_callbacks#(special_comp_type,...)::m_register_pair`)
+                // keys the typeid under the bare typedef name, while the
+                // matching `add`/query uses the explicit `special_comp#(1)`
+                // form — the two never meet and typewide callbacks
+                // cross-propagate across value specializations.
+                // `resolve_typedef_spec` reads `self.current_spec`, which the
+                // caller (`eval_expr_ctx`) leaves set to `enclosing` for
+                // this purpose.
+                if let Some((tb, ts)) = self.resolve_typedef_spec(p) {
+                    let ts = Self::normalize_spec_ws(&ts);
+                    return format!("{}#({})", tb, ts);
+                }
+                // Resolve a `Class#(args)` part whose args contain bare
+                // type/value-parameter names of the enclosing class — e.g.
+                // `special_comp#(N)` inside `special_comp#(N)`'s own
+                // `run_phase`, where the `uvm_do_callbacks` macro expands to
+                // `uvm_callbacks#(special_comp#(N),CB)::get_first`. The
+                // literal `N` (a value param) must resolve to the enclosing
+                // specialization's value (1 or 2), else every instance's
+                // do_callbacks keys the SAME `special_comp#(N)` cell —
+                // distinct from the `#(1)`/`#(2)` cells that `add` and
+                // `m_register_pair` populate.
+                if let Some((cb, cs)) = self.extract_spec_from_string(p) {
+                    let inner = Self::split_spec_args(&cs);
+                    let r_inner: Vec<String> = inner
+                        .iter()
+                        .map(|frag| {
+                            let f = frag.trim();
+                            if let Some(r) = self.resolve_type_param_with(f, enclosing) {
+                                return r;
+                            }
+                            // value param of the enclosing class?
+                            if let Some((eb, es)) = enclosing {
+                                if let Some(ecd) = self.module.classes.get(eb) {
+                                    if let Some(idx) = ecd.param_order.iter().position(|x| x == f) {
+                                        let frags = Self::split_spec_args(es);
+                                        if let Some(v) = frags.get(idx) {
+                                            return v.trim().to_string();
+                                        }
+                                    }
+                                }
+                            }
+                            f.to_string()
+                        })
+                        .collect();
+                    let r_sig = Self::normalize_spec_ws(&r_inner.join(","));
+                    return format!("{}#({})", cb, r_sig);
+                }
+                Self::normalize_spec_ws(p)
             })
             .collect::<Vec<_>>()
             .join(",");
         Some((base, resolved))
+    }
+
+    /// Remove whitespace outside of double-quoted string literals so that
+    /// sig fragments that differ only in spacing (the parser's spaced
+    /// reconstruction `special_comp # ( 1 )` vs a typedef-resolved
+    /// `special_comp#(1)`) key to the same per-spec static cell.
+    fn normalize_spec_ws(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut in_str = false;
+        for ch in s.chars() {
+            if ch == '"' {
+                in_str = !in_str;
+                out.push(ch);
+            } else if in_str {
+                out.push(ch);
+            } else if !ch.is_whitespace() {
+                out.push(ch);
+            }
+        }
+        out
     }
 
     fn instantiate_class(
@@ -58394,6 +58563,36 @@ impl Simulator {
         args: &[Expression],
         type_args: Option<&[Expression]>,
     ) -> Value {
+        // Per-specialization static initialization for a PARAMETERIZED
+        // class: run its static-call initializers (e.g. UVM's
+        // `uvm_register_cb` / `uvm_set_super_type` macro expansions, which
+        // are `static bit = uvm_callbacks#(T,CB)::m_register_pair(...)`)
+        // ONCE PER specialization, with `current_spec` set to this
+        // specialization. A value-parameterized class is modeled as a
+        // single elaborated class (value params are instance properties),
+        // so its statics cannot run once at startup — the class-local
+        // typedef `typedef C#(N) this_type;` needs an active spec to
+        // resolve `N`, otherwise every specialization collapses onto one
+        // bare-typedef typeid and typewide callbacks cross-propagate.
+        // Triggering at first instantiation matches the LRM semantics
+        // (a specialization's statics initialize before first use) and
+        // runs before any `add`/query that needs the registration.
+        let class_name_owned = class_def.name.clone();
+        if self.class_is_parameterized(&class_name_owned) {
+            if let Some(ta) = type_args {
+                if !ta.is_empty() {
+                    let frags: Vec<String> =
+                        ta.iter().filter_map(|e| self.expr_to_spec_fragment(e)).collect();
+                    if frags.len() == ta.len() {
+                        let sig = frags.join(",");
+                        let saved = self.current_spec.take();
+                        self.current_spec = Some((class_name_owned.clone(), sig.clone()));
+                        self.ensure_spec_statics(&class_name_owned, &sig);
+                        self.current_spec = saved;
+                    }
+                }
+            }
+        }
         let handle = self.heap.len();
         let mut instance = ClassInstance {
             class_name: class_def.name.clone(),
