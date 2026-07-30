@@ -61613,8 +61613,8 @@ impl Simulator {
     /// `uvm_object::compare(rhs)` is inherited by every UVM object, yet
     /// without this guard `obj.compare(other)` silently ran the lexicographic
     /// `string::compare` builtin (returning -1/0/1) instead of the user
-    /// method — so `d1.compare(d2)` looked "equal" and
-    /// `03data/10comparer/20nullobj` failed. Mirrors the per-name `name()`
+    /// method — so `d1.compare(d2)` looked "equal" even when the two objects
+    /// differ. Mirrors the per-name `name()`
     /// guard below, but walks the inheritance chain (`class_has_method`) so
     /// inherited methods like `uvm_object::compare` are detected.
     fn class_expr_has_method(&self, recv: &Expression, mname: &str) -> bool {

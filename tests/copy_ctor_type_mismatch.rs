@@ -12,8 +12,8 @@
 //! by the constructor stayed at its default — this broke the UVM
 //! factory's instance-override path
 //! (`uvm_*_registry::create` -> `create_component_by_type` ->
-//! `new(name, parent)`), surfacing as
-//! `15factory/40registry/{01object,02component}` failures.
+//! `new(name, parent)`): factory-created components kept their default field
+//! values instead of the constructor's settings.
 //!
 //! **Fix:** after evaluating the candidate source handle, verify its
 //! instance `class_name` is the same as (or derived from) the declared

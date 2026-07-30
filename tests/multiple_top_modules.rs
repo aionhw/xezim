@@ -5,9 +5,9 @@
 //!
 //! Before this fix, xezim's auto-detection picked exactly ONE uninstantiated
 //! module as the elaboration root and silently ignored the rest, so only that
-//! one module's `initial` blocks ran. This broke multi-top testbenches such as
-//! UVM's `35objections/03basic/04module` (two top modules: one drives UVM
-//! objections, the other calls `run_test()`).
+//! one module's `initial` blocks ran. This broke multi-top UVM testbenches
+//! that spawn two top modules (one driving UVM objections, the other calling
+//! `run_test()`).
 
 use xezim::simulate;
 

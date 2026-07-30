@@ -8,8 +8,8 @@
 //! and is *always* called with the trailing `comparer` left at its default —
 //! i.e. exactly one argument. That matched the `string::compare(s)` builtin,
 //! which stringified both handles and returned their lexicographic difference
-//! (-1/0/1) instead of invoking the comparison. `03data/10comparer/20nullobj`
-//! therefore saw two distinct objects "compare equal".
+//! (-1/0/1) instead of invoking the comparison, so two distinct objects
+//! "compared equal".
 //!
 //! The guard walks the receiver's declared type up the `extends` chain: if the
 //! class (or any ancestor) declares a method of that name, the string builtins
