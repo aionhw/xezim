@@ -56068,7 +56068,10 @@ impl Simulator {
                                             (1i128 << ww.saturating_sub(1)) - 1,
                                         )
                                     } else {
-                                        (0, (1i128 << ww) - 1)
+                                        // §18.4: unsigned domain [0, 2^ww - 1];
+                                        // for ww == 127 that bound is i128::MAX,
+                                        // and the shift form underflows in debug.
+                                        (0, if ww == 127 { i128::MAX } else { (1i128 << ww) - 1 })
                                     };
                                     cvar_names.push(name.clone());
                                     cvar_dom.push((lo, hi));
@@ -75821,7 +75824,12 @@ impl Simulator {
                         (1i128 << (w.saturating_sub(1))) - 1,
                     )
                 } else {
-                    (0, (1i128 << w) - 1)
+                    // §18.4: an unsigned domain of width w spans [0, 2^w - 1].
+                    // For w == 127 that bound is i128::MAX, but the
+                    // shift-then-subtract form underflows: `1i128 << 127` is
+                    // i128::MIN (bit 127 is the sign bit), so `- 1` overflows
+                    // in debug builds. Use the constant directly.
+                    (0, if w == 127 { i128::MAX } else { (1i128 << w) - 1 })
                 };
                 let (mut lo, mut hi) = (dlo, dhi);
                 let mut bounded = false;
@@ -76227,7 +76235,10 @@ impl Simulator {
                             (1i128 << ww.saturating_sub(1)) - 1,
                         )
                     } else {
-                        (0, (1i128 << ww) - 1)
+                        // §18.4: unsigned domain [0, 2^ww - 1]; for ww == 127
+                        // that bound is i128::MAX, and the shift form
+                        // underflows in debug builds.
+                        (0, if ww == 127 { i128::MAX } else { (1i128 << ww) - 1 })
                     };
                     cvar_names.push(name.clone());
                     cvar_dom.push((lo, hi));
