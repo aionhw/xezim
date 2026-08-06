@@ -238,7 +238,7 @@ and match the surrounding style.
 `--dump-files-list`/`--dump-merged-sv` to understand a multi-file build;
 `XEZIM_PROGRESS=5` to watch a long run; the stall report (names the parked
 processes and the signal that should have woken them) for hangs; `XEZIM_STUCK_CLOCK`
-for frozen-clock churn; `--max-time` to bound a runaway; `--threads` to toggle the
+for frozen-clock churn; `--max-time` to bound a runaway; (or use `scripts/dev/quick-repro.sh '…snippet…'` to iterate without writing a repo file) `--threads` to toggle the
 parallel edge path (also `XEZIM_NO_PARALLEL=1` / `XEZIM_FORCE_PARALLEL=1`).
 
 **Add a feature**: parse it in `xezim-parser` → elaborate/type it in `elaborate.rs`
@@ -261,6 +261,7 @@ document any new flag/env knob in the README tables.
 
 ## Resources
 
+- `docs/dev/README.md` — developer documentation: architecture, debugging, testing, gotchas
 - `README.md` — features, CLI reference, compliance, build/run, module-timescale extension
 - `docs/uvm-guide.md` — running UVM 1800.2-2017 / 2020.3.1 testbenches
 - `docs/dpi-guide.md` — compiling + loading DPI-C libraries
