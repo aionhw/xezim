@@ -9,7 +9,13 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  test:
+  # Build every test binary ONCE, then let the `test` matrix jobs below
+  # restore this `target/` AND `xezim-core/` and only *run* the group they
+  # own. Linking is the dominant cost (the suite itself runs in seconds once
+  # built), so compiling once instead of once-per-group keeps cold-cache CI
+  # from paying the link price eighteen times. The `xezim-core/` cache must
+  # preserve mtimes so cargo's fingerprint does not rebuild path dependencies.
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -33,24 +39,87 @@ jobs:
           key: ${{ runner.os }}-cargoreg-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargoreg-
 
-      # `target/` is NOT safe to share the same way. Cargo.lock is gitignored,
-      # so the old `hashFiles('**/Cargo.lock')` expanded to an EMPTY hash and
-      # every commit restored one shared `target/` — one built against whatever
-      # ../xezim-core happened to be at the time, since that repo is cloned from
-      # a moving main and no cache key ever covered it. Key on the manifests AND
-      # the core commit, with no restore-keys, so a tree built against a
-      # different core is never reused.
-      - name: Cache build artifacts
+      # `target/` AND `xezim-core/` are cached together. The `xezim-core/`
+      # path must be restored with its mtimes intact so cargo's fingerprint
+      # does not rebuild the path dependency. Key on the manifests AND the
+      # core commit, with no restore-keys, so a tree built against a different
+      # core is never reused.
+      - name: Cache build artifacts + xezim-core
         uses: actions/cache@v6
         with:
-          path: target
+          path: |
+            target
+            ../xezim-core
           key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}-${{ env.CORE_SHA }}
 
-      - name: cargo test (no features)
-        run: cargo test --no-fail-fast
+      - name: Build all test binaries (no features)
+        run: cargo test --no-run --no-fail-fast
 
-      # Run even when the previous step failed, so one job reports BOTH
-      # configurations instead of hiding the second behind the first.
-      - name: cargo test --features jit
-        if: always()
-        run: cargo test --features jit --no-fail-fast
+      - name: Build all test binaries (jit)
+        run: cargo test --no-run --features jit --no-fail-fast
+
+  # One job per (test-group, features) matrix cell. Each cell restores the
+  # `target/` AND `xezim-core/` produced by the `build` job and runs only its
+  # own binary with test-level parallelism — the *run* is sharded across
+  # workers, exactly the shape suggested for this suite. "lib" is a
+  # pseudo-group: it runs the lib unit tests + doctests that `cargo test
+  # --test <group>` alone would skip (the old sequential job ran `cargo test
+  # --no-fail-fast`, which covered lib + doc + all 8 integration binaries).
+  # Keeping it as a matrix cell preserves 100% coverage while still running
+  # every target in parallel.
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test-group: [classes, collections, gates, hierarchy, misc, scheduling, strings, types, lib]
+        features: ["", "jit"]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Checkout xezim-core
+        run: |
+          git clone https://github.com/aionhw/xezim-core.git ../xezim-core
+          echo "CORE_SHA=$(git -C ../xezim-core rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargoreg-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargoreg-
+
+      # Restore-only (no post-job save): same key as the build job's cache,
+      # so this cell reuses the shared build + xezim-core (with mtimes
+      # preserved) and never recompiles.
+      - name: Restore shared build + xezim-core
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            target
+            ../xezim-core
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}-${{ env.CORE_SHA }}
+
+      # `cargo` rejects --lib and --doc in one invocation, so run them as
+      # separate commands. Both must pass for the cell to be green.
+      - name: cargo test ${{ matrix.test-group }}
+        run: |
+          if [ "${{ matrix.test-group }}" = "lib" ]; then
+            if [ -n "${{ matrix.features }}" ]; then
+              cargo test --lib --features ${{ matrix.features }} --no-fail-fast && \
+              cargo test --doc --features ${{ matrix.features }} --no-fail-fast
+            else
+              cargo test --lib --no-fail-fast && \
+              cargo test --doc --no-fail-fast
+            fi
+          elif [ -n "${{ matrix.features }}" ]; then
+            cargo test --test ${{ matrix.test-group }} --features ${{ matrix.features }} -- --test-threads=8
+          else
+            cargo test --test ${{ matrix.test-group }} -- --test-threads=8
+          fi
