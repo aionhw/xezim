@@ -49023,11 +49023,11 @@ impl Simulator {
                 } else {
                     None
                 };
-                if let Some(cn) = cls_name {
+                if let Some(cn) = &cls_name {
                     let cls_has_vif = self
                         .module
                         .classes
-                        .get(&cn)
+                        .get(cn)
                         .map(|c| c.virtual_iface_properties.contains_key(segs[0]))
                         .unwrap_or(false);
                     if cls_has_vif {
@@ -65300,14 +65300,38 @@ impl Simulator {
         method_name: &str,
         args: &[Expression],
     ) -> Option<Value> {
-        // Intercept uvm_config_db static methods to ensure config_db works correctly
-        // This is needed because the regular method call interception doesn't catch
-        // static method calls like `uvm_config_db#(int)::set(...)`
-        if class_name == "uvm_config_db" {
+        // Intercept uvm_config_db / uvm_resource_db static methods so the
+        // config DB keeps working correctly — and, critically, so a
+        // virtual-interface reference written into a class property through
+        // `::set` + `::get`/`::read_by_name` records a virtual_iface_bindings
+        // entry. Per IEEE 1800-2017 §25.9 an interface reference is a binding
+        // to a structural interface instance, not a value copy; the inout-arg
+        // write-back of the genuine UVM `read()` path bypasses
+        // `try_bind_virtual_iface`, so a later `@(posedge vif.clk)` resolved
+        // to an EMPTY sensitivity and fired immediately (§9.4.2) — the
+        // zero-delay storm in passive-monitor forever loops. The scope-aware
+        // store keeps set/get round-trips distinct per UVM scope.
+        if class_name == "uvm_config_db" || class_name == "uvm_resource_db" {
+            // uvm_resource_db uses `(scope, name, val[, accessor])` while
+            // uvm_config_db uses `(cntxt, inst_name, field_name, value)`.
+            // Normalize resource_db's layout to the config_db one —
+            // `(scope, name, name, val)` — so `exec_config_db`'s field key
+            // (arg[2]) and value destination (arg[3]) line up.
+            let norm = |a: &[Expression]| -> Vec<Expression> {
+                if class_name != "uvm_resource_db" || a.len() < 3 {
+                    return a.to_vec();
+                }
+                let mut v = a.to_vec();
+                let val = v[2].clone();
+                v[2] = v[1].clone(); // field_name = name
+                v.push(val);         // value = val
+                v
+            };
             match method_name {
                 "set" => {
                     // Store in xezim's config DB (handles scope matching correctly)
-                    let result = self.exec_config_db("set", args);
+                    let ga = norm(args);
+                    let result = self.exec_config_db("set", &ga);
                     // Also call UVM's implementation to populate resource pool
                     // (bypass our interception to avoid infinite recursion)
                     let saved = self.pure_sv_lrm;
@@ -65318,7 +65342,24 @@ impl Simulator {
                 }
                 "get" | "exists" => {
                     // Try xezim's config DB first
-                    let xezim_result = self.exec_config_db(method_name, args);
+                    let ga = norm(args);
+                    let xezim_result = self.exec_config_db(method_name, &ga);
+                    if xezim_result.to_u64().unwrap_or(0) == 1 {
+                        return Some(xezim_result);
+                    }
+                    // Fall back to UVM's resource pool
+                    let saved = self.pure_sv_lrm;
+                    self.pure_sv_lrm = true;
+                    let result = self.exec_static_method_internal(class_name, method_name, args);
+                    self.pure_sv_lrm = saved;
+                    return result;
+                }
+                "read_by_name" => {
+                    // Same `(scope, name, val)` layout as set: route through
+                    // exec_config_db's get so the destination vif property gets
+                    // BOTH its value and its virtual-interface binding.
+                    let ga = norm(args);
+                    let xezim_result = self.exec_config_db("get", &ga);
                     if xezim_result.to_u64().unwrap_or(0) == 1 {
                         return Some(xezim_result);
                     }
