@@ -13,7 +13,8 @@ use crate::ast::decl::{
 };
 use crate::ast::expr::*;
 use crate::ast::stmt::*;
-use crate::ast::types::{DataType, IntegerAtomType, PortDirection};
+use crate::ast::types::{DataType, IntegerAtomType, PortDirection, TypeName};
+use crate::ast::{Identifier, Span};
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 use fst_writer::{
@@ -32189,23 +32190,44 @@ impl Simulator {
                         }
                     }
                 } else if let Some(id) = lhs_id {
-                    let width = self.signal_widths[id];
-                    let mut resized = if self.signal_real[id] {
-                        if val.is_real {
-                            val.clone()
-                        } else {
-                            Value::from_f64(val.to_f64())
+                    // IEEE 1800-2023 §6.6.7: struct-typed nettype with resolver.
+                    // The resolver returns a packed struct value (from the queue
+                    // argument). The LHS is an unpacked struct stored member-wise.
+                    // Spread the packed result into the unpacked leaf signals.
+                    let type_name = self.signal_type_names.get(&id).cloned();
+                    let mut spread_done = false;
+                    if let Some(ref tn) = type_name {
+                        if let Some(su) = self.unpacked_struct_of(&DataType::TypeReference {
+                            name: TypeName { scope: None, name: Identifier { name: tn.clone(), span: Span::dummy() }, span: Span::dummy() },
+                            dimensions: Vec::new(),
+                            type_args: Vec::new(),
+                            span: Span::dummy(),
+                        }) {
+                            let name_str: String = self.id_to_name.get(id).map(|s| s.as_ref().to_string()).unwrap_or_default();
+                            if self.spread_into_unpacked_struct(&name_str, &su, &val) {
+                                spread_done = true;
+                            }
                         }
-                    } else if val.is_real {
-                        Self::real_to_int(val.to_f64(), width)
-                    } else {
-                        val.resize(width)
-                    };
-                    resized.is_signed = self.signal_signed[id];
-                    if self.signal_table[id] != resized {
-                        self.mark_dirty_id(id);
-                        write_sig!(self, id, resized);
-                        self.table_modified = true;
+                    }
+                    if !spread_done {
+                        let width = self.signal_widths[id];
+                        let mut resized = if self.signal_real[id] {
+                            if val.is_real {
+                                val.clone()
+                            } else {
+                                Value::from_f64(val.to_f64())
+                            }
+                        } else if val.is_real {
+                            Self::real_to_int(val.to_f64(), width)
+                        } else {
+                            val.resize(width)
+                        };
+                        resized.is_signed = self.signal_signed[id];
+                        if self.signal_table[id] != resized {
+                            self.mark_dirty_id(id);
+                            write_sig!(self, id, resized);
+                            self.table_modified = true;
+                        }
                     }
                 } else {
                     self.assign_value(lhs, &val);
@@ -70999,8 +71021,12 @@ impl Simulator {
                 mv.set_bit(i as usize, v.get_bit((off + i) as usize));
             }
             if is_real {
-                let f = mv.to_u64().unwrap_or(0) as f64;
-                self.write_leaf_by_name(&leaf, Value::from_f64(f));
+                // mv holds the raw IEEE-754 BITS copied from the packed value.
+                // Rebuild the double from those bits — `to_u64() as f64` would
+                // reinterpret e.g. 0x4010000000000000 (4.0) as the integer
+                // 4613937818241073152.0, corrupting the leaf.
+                let bits = mv.to_u64().unwrap_or(0);
+                self.write_leaf_by_name(&leaf, Value::from_f64(f64::from_bits(bits)));
             } else {
                 self.write_leaf_by_name(&leaf, mv);
             }
