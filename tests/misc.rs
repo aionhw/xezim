@@ -173,6 +173,8 @@ mod unpacked_struct_in_instance;
 mod unsized_literal_keeps_its_digits;
 #[path = "misc/warm_cache_diag_replay.rs"]
 mod warm_cache_diag_replay;
+#[path = "misc/string_formal_name_leak.rs"]
+mod string_formal_name_leak;
 #[path = "misc/x_warn_switch.rs"]
 mod x_warn_switch;
 #[path = "misc/xselect_and_concat_flatten.rs"]

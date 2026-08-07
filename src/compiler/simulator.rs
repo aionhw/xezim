@@ -23896,27 +23896,27 @@ impl Simulator {
                     let mut ov: Vec<(&str, u64)> = by_op.into_iter().collect();
                     ov.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
                     #[cfg(feature = "jit")]
-            eprintln!(
-                "[PROF] comb_jit native={} xz_bail={}",
-                self.prof_comb_jit[0], self.prof_comb_jit[1]
-            );
-            if !self.cone_chain_member.is_empty() {
-                let mut chain_evals = 0u64;
-                let mut all_evals = 0u64;
-                for (i, &c) in self.prof_entry_counts.iter().enumerate() {
-                    all_evals += c;
-                    if self.cone_chain_member.get(i).copied().unwrap_or(false) {
-                        chain_evals += c;
+                    eprintln!(
+                        "[PROF] comb_jit native={} xz_bail={}",
+                        self.prof_comb_jit[0], self.prof_comb_jit[1]
+                    );
+                    if !self.cone_chain_member.is_empty() {
+                        let mut chain_evals = 0u64;
+                        let mut all_evals = 0u64;
+                        for (i, &c) in self.prof_entry_counts.iter().enumerate() {
+                            all_evals += c;
+                            if self.cone_chain_member.get(i).copied().unwrap_or(false) {
+                                chain_evals += c;
+                            }
+                        }
+                        eprintln!(
+                            "[CONE] eval-weighted: chain-member evals {}/{} ({:.1}%)",
+                            chain_evals,
+                            all_evals,
+                            chain_evals as f64 * 100.0 / all_evals.max(1) as f64
+                        );
                     }
-                }
-                eprintln!(
-                    "[CONE] eval-weighted: chain-member evals {}/{} ({:.1}%)",
-                    chain_evals,
-                    all_evals,
-                    chain_evals as f64 * 100.0 / all_evals.max(1) as f64
-                );
-            }
-            eprintln!("[PROF] opcode_exec total={} (static-estimate, straight-line)", total_insns);
+                    eprintln!("[PROF] opcode_exec total={} (static-estimate, straight-line)", total_insns);
                     let line: Vec<String> = ov.iter().take(14)
                         .map(|(k, c)| format!("{}={:.1}%", k, *c as f64 * 100.0 / total_insns.max(1) as f64))
                         .collect();
@@ -26972,6 +26972,7 @@ impl Simulator {
                     body,
                     keys,
                     is_str,
+                    key_type,
                     idx,
                     fe_auto_len,
                     live_size_name,
@@ -27021,8 +27022,15 @@ impl Simulator {
                         };
                         let kv = if *is_str {
                             Value::from_string(&key_str)
+                        } else if key_type.1 {
+                            let mut v = Value::from_u64(
+                                key_str.parse::<i64>().unwrap_or(0) as u64,
+                                key_type.0,
+                            );
+                            v.is_signed = true;
+                            v
                         } else {
-                            Value::from_u64(key_str.parse::<u64>().unwrap_or(0), 32)
+                            Value::from_u64(key_str.parse::<u64>().unwrap_or(0), key_type.0)
                         };
                         self.set_loop_var_aliased(var_scope.as_deref(), vn, kv);
                     }
@@ -27038,6 +27046,7 @@ impl Simulator {
                             body: body.clone(),
                             keys: keys.clone(),
                             is_str: *is_str,
+                            key_type: *key_type,
                             idx: idx + 1,
                             fe_auto_len: *fe_auto_len,
                             live_size_name: live_size_name.clone(),
@@ -27059,7 +27068,7 @@ impl Simulator {
                 // corrupting consuming handshakes and never actually blocking.
                 if let StatementKind::Foreach { array, vars, body } = &stmt.kind {
                     if self.stmt_is_blocking(body) {
-                        if let Some((keys, is_str, var_scope, live_size_name)) =
+                        if let Some((keys, is_str, var_scope, live_size_name, key_type)) =
                             self.foreach_materialize_keys_1d(array, vars)
                         {
                             let fe_names: Vec<String> = vars
@@ -27077,7 +27086,7 @@ impl Simulator {
                             let loop_var =
                                 vars.first().and_then(|v| v.as_ref().map(|id| id.name.clone()));
                             if let Some(vn) = &loop_var {
-                                self.widths.insert(vn.clone(), 32);
+                                self.widths.insert(vn.clone(), key_type.0);
                             }
                             if keys.is_empty() {
                                 self.auto_loop_vars.truncate(fe_auto_len);
@@ -27088,8 +27097,15 @@ impl Simulator {
                             if let Some(vn) = &loop_var {
                                 let kv = if is_str {
                                     Value::from_string(&keys[0])
+                                } else if key_type.1 {
+                                    let mut v = Value::from_u64(
+                                        keys[0].parse::<i64>().unwrap_or(0) as u64,
+                                        key_type.0,
+                                    );
+                                    v.is_signed = true;
+                                    v
                                 } else {
-                                    Value::from_u64(keys[0].parse::<u64>().unwrap_or(0), 32)
+                                    Value::from_u64(keys[0].parse::<u64>().unwrap_or(0), key_type.0)
                                 };
                                 self.set_loop_var_aliased(var_scope.as_deref(), vn, kv);
                             }
@@ -27106,6 +27122,7 @@ impl Simulator {
                                     body: body.clone(),
                                     keys,
                                     is_str,
+                                    key_type,
                                     idx: 1,
                                     fe_auto_len,
                                     live_size_name,
@@ -33520,9 +33537,32 @@ impl Simulator {
                             .join(".");
                         let last_idx = self.local_stack.len() - 1;
                         if self.local_stack[last_idx].contains_key(joined.as_str()) {
-                            let fitted = if !val.is_real {
+                            // §10.7: on assignment to a sized local, resize
+                            // the RHS to the local's DECLARED width so a
+                            // narrow signed literal sign-extends (e.g.
+                            // `logic [63:0] mask = -1` must yield all-ones).
+                            // The declared width is read from the `widths`
+                            // table (populated at VarDecl time), NOT from the
+                            // currently-stored value — the stored width drifts
+                            // as differently-sized RHS values flow through and
+                            // would corrupt string/handle locals. If no
+                            // declared width is recorded (method formals,
+                            // pattern bindings), leave the value untouched.
+                            //
+                            // WIDTH: a value WIDER than the declared width is
+                            // TRUNCATED to it (LRM assignment semantics, e.g.
+                            // `byte b; b = $urandom` keeps only the low 8
+                            // bits). STRING locals are exempt: xezim models a
+                            // `string` as a 1024-bit packed value and must not
+                            // truncate its text; the same `is_str` guard as
+                            // the signal-store path is used.
+                            let is_str = hier
+                                .path
+                                .last()
+                                .is_some_and(|s| self.string_signals.contains(&s.name.name));
+                            let fitted = if !val.is_real && !is_str {
                                 if let Some(&target_w) = self.widths.get(&joined) {
-                                    if val.width < target_w {
+                                    if val.width != target_w {
                                         val.resize_for_assign(target_w)
                                     } else {
                                         val.clone()
@@ -33556,17 +33596,15 @@ impl Simulator {
                             // declared width is recorded (method formals,
                             // pattern bindings), leave the value untouched.
                             //
-                            // NARROW-ONLY: a value already WIDER than the
-                            // declared width is left as-is rather than
-                            // truncated. xezim models a `string` local as
-                            // 1024 bits and reuses locals for different-width
-                            // reads (e.g. a register read into a sized local),
-                            // so truncation would silently drop data; only the
-                            // sign/w zero-extension case (the actual bug) is
-                            // applied.
-                            let fitted = if !val.is_real {
+                            // WIDTH truncation: a value WIDER than the
+                            // declared width is TRUNCATED (e.g. `byte b; b =
+                            // $urandom` keeps only the low 8 bits). STRING
+                            // locals are exempt (1024-bit internal packed
+                            // text).
+                            let is_str = self.string_signals.contains(name.as_str());
+                            let fitted = if !val.is_real && !is_str {
                                 if let Some(&target_w) = self.widths.get(name) {
-                                    if val.width < target_w {
+                                    if val.width != target_w {
                                         val.resize_for_assign(target_w)
                                     } else {
                                         val.clone()
@@ -34006,6 +34044,15 @@ impl Simulator {
                     self.dollar_bound.push(self.get_queue_size(&qn) as i64 - 1);
                     let k = self.eval_expr(index).to_i64().unwrap_or(0);
                     self.dollar_bound.pop();
+                    // §7.10.2.3 / §7.4: assigning `q[i]` with `i >= size`
+                    // APPENDS to a queue (auto-grows), size becomes `i+1`.
+                    // UVM's `uvm_unpack_queueN` fills an EMPTY queue exactly
+                    // this way (`for i in 0..sz VAR[i] = …`), so without the
+                    // growth the unpacked `.size()` stayed 0 and every
+                    // subsequent field read desynced.
+                    if k >= 0 && k as u64 >= self.get_queue_size(&qn) {
+                        self.set_queue_size(&qn, k as u64 + 1);
+                    }
                     let elem = format!("{}[{}]", qn, k);
                     let prev = self.get_signal_value_by_name(&elem);
                     let changed = prev.as_ref() != Some(val);
@@ -34180,6 +34227,19 @@ impl Simulator {
                     let idx_val = self.eval_expr(index);
                     let idx_str = self.assoc_key_str(&an, &idx_val);
                     let elem_name = format!("{}[{}]", an, idx_str);
+                    // §7.10.2.3 / §7.4: for a QUEUE / dynamic array (NOT a
+                    // true assoc array) `q[i] = v` with `i >= size` APPENDS —
+                    // the size becomes `i+1`. UVM's `uvm_unpack_queueN` fills
+                    // an EMPTY queue exactly this way
+                    // (`for i in 0..sz VAR[i] = …`); without this growth the
+                    // unpacked `.size()` stayed 0 and every later field read
+                    // desynced (PCKSZ errors / X compare).
+                    if !self.is_associative_array(&an) {
+                        let kval = idx_val.to_i64().unwrap_or(0);
+                        if kval >= 0 && kval as u64 >= self.get_queue_size(&an) {
+                            self.set_queue_size(&an, kval as u64 + 1);
+                        }
+                    }
                     // §10.7: fit to the DECLARED element width when one was
                     // recorded; class-member collections often have none, in
                     // which case the value is stored as-is (unchanged).
@@ -35789,20 +35849,17 @@ impl Simulator {
                 // marker `assoc[keystr]` so `exists(key)` sees the slot. Packed-
                 // struct arrays are handled by the dedicated walk below (this is
                 // gated on `is_associative_array`, which they are not).
-                if let ExprKind::Index {
-                    expr: idx_base,
-                    index,
-                } = &expr.kind
-                {
-                    if let ExprKind::Ident(hier) = &idx_base.kind {
-                        let mut an = self.resolve_hier_name(hier);
-                        if let Some(scoped) = self.instance_assoc_member(&an) {
-                            an = scoped;
-                        }
-                        if self.is_associative_array(&an) {
-                            let idx_val = self.eval_expr(index);
-                            let key_str = self.assoc_key_str(&an, &idx_val);
-                            let elem = format!("{}[{}]", an, key_str);
+                if let ExprKind::Index { .. } = &expr.kind {
+                    // A member of a struct ELEMENT of a class collection:
+                    // `assoc[key].field = v` (1-D) or `m[k1][k2][k3].field = v`
+                    // (multidim). Stored as the dotted cell `<elem>.<field>`
+                    // plus a presence marker `<elem>` so `exists(key)` sees the
+                    // slot. The generalised resolver handles any index arity via
+                    // the compound key `nested_index_name`.
+                    if let Some((elem, su)) =
+                        self.coll_assoc_struct_elem(expr)
+                    {
+                        if self.coll_field_width(&su, &member.name).is_some() {
                             let target = format!("{}.{}", elem, member.name);
                             let prev = self.get_signal_value_by_name(&target);
                             let w = prev.as_ref().map(|v| v.width).unwrap_or(val.width);
@@ -39056,6 +39113,38 @@ impl Simulator {
                                     return Value::from_u64(w as u64, 32);
                                 }
                             }
+                            // IEEE 1800-2017 §23.8 name resolution: inside a
+                            // class method, an unqualified identifier resolves
+                            // to a class member BEFORE module scope. The
+                            // module-scope `arrays`/`typedefs` tables below must
+                            // NOT shadow a same-named class property (a frequent
+                            // collision with common names like `i`). When `this`
+                            // is bound and `name` is a property of the current
+                            // class (walking inheritance), size the member from
+                            // its own value — exactly as `$bits(this.name)` does.
+                            if let Some(this_h) = self.this_stack.last().copied().flatten() {
+                                if let Some(inst) = self.heap.get(this_h).and_then(|o| o.as_ref()) {
+                                    let mut cur = Some(inst.class_name.clone());
+                                    let mut found_member = false;
+                                    while let Some(cn) = &cur {
+                                        if let Some(cd) = self.module.classes.get(cn) {
+                                            if cd.properties.contains_key(&name) {
+                                                found_member = true;
+                                                break;
+                                            }
+                                            cur = cd.extends.clone();
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    if found_member {
+                                        return Value::from_u64(
+                                            self.eval_expr(arg).width as u64,
+                                            32,
+                                        );
+                                    }
+                                }
+                            }
                             // Unpacked array: $bits = element_bits * product of
                             // dimension sizes (IEEE 1800-2017 §20.6.2). The
                             // signal's own Value holds only one element, so the
@@ -39171,6 +39260,19 @@ impl Simulator {
                                     )
                                     .max(1);
                                     return Value::from_u64(ew as u64 * idxs.len() as u64, 32);
+                                }
+                            }
+                        }
+                        // §7.8: `$bits(aa[i])` — the indexed ELEMENT of an
+                        // associative-array collection reports its DECLARED
+                        // element width, independent of the runtime value's
+                        // stored width. UVM's `uvm_pack_int/unpack_int` macros
+                        // size each element by `$bits`, so without this they
+                        // could pack an assoc-of-shortint as 32-bit (desync).
+                        if let ExprKind::Index { expr: idx_base, .. } = &arg.kind {
+                            if let Some(an) = self.expr_assoc_name(idx_base) {
+                                if let Some(w) = self.assoc_elem_width(&an) {
+                                    return Value::from_u64(w as u64, 32);
                                 }
                             }
                         }
@@ -40209,7 +40311,18 @@ impl Simulator {
                             } else {
                                 // Block-local vector: width lives in the
                                 // runtime maps, not the compact table.
-                                self.lookup_signal_width(&aname).unwrap_or(0)
+                                self.lookup_signal_width(&aname).unwrap_or_else(|| {
+                                    // A class-member packed vector (`$size(o.big)`
+                                    // on a `bit[88:0]` field) is not in the
+                                    // compact tables, so the lookup returns None
+                                    // and the query collapsed to 0 while `$bits`
+                                    // reported 89. Fall back to the evaluated
+                                    // value's width, which resolves class
+                                    // members to their full bit width.
+                                    args.first()
+                                        .map(|a| self.eval_expr(a).width as u32)
+                                        .unwrap_or(0)
+                                })
                             };
                             let sel = dims.as_ref().and_then(|d| d.get(dim.saturating_sub(1)));
                             let n_unpacked = dims.as_ref().map(|d| d.len()).unwrap_or(0);
@@ -40602,6 +40715,23 @@ impl Simulator {
                 // otherwise shadow the aliased view.
                 if let Some(r) = self.class_agg_member_parts(expr, &member.name) {
                     return self.read_class_agg(&r);
+                }
+                // §7.13: a member of a struct ELEMENT of a class collection
+                // (`m[k1][k2].state` — UNPACKED-struct assoc/dyn/queue array).
+                // The cells live as `<elemkey>.<member>` signals (the model
+                // `assoc[key].field` uses), so read the leader out. Previously
+                // this fell through to a phantom flat path that returned 0 —
+                // which made UVM's recurrence guard `m_rec[l][r][p].state` read
+                // NEVER→ the cycle never terminated and `compare` recursed to
+                // exhaustion.
+                if let Some((key, su)) = self.coll_assoc_struct_elem(expr) {
+                    let cell = format!("{}.{}", key, member.name);
+                    if let Some(v) = self.get_signal_value_by_name(&cell) {
+                        return v;
+                    }
+                    if let Some(w) = self.coll_field_width(&su, &member.name) {
+                        return Value::zero(w);
+                    }
                 }
                 // Whole unpacked-struct class-property read in MemberAccess
                 // shape (`rhs.first` inside a method): assemble the member
@@ -41730,19 +41860,21 @@ impl Simulator {
                 // what makes a DECLARATION initializer work — elaboration
                 // lowers `T v[int] = '{...}` to `v = '{...}` in an initial block.
                 if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
-                    let spread = if matches!(&lvalue.kind, ExprKind::Ident(_)) {
-                        self.pattern_aggregate_names(lvalue)
-                            .into_iter()
-                            .any(|n| self.assign_pattern_aggregate(&n, items))
-                    } else {
-                        // `assoc[key] = '{...}` resolves its key precisely;
-                        // everything else goes through the flattened path.
-                        self.assign_pattern_element(lvalue, rvalue)
-                            || match self.flat_member_name(lvalue) {
-                                Some(flat) => self.assign_pattern_flat(&flat, items),
-                                None => false,
-                            }
-                    };
+                    let spread = self.assign_class_collection_pattern(lvalue, items)
+                        || if matches!(&lvalue.kind, ExprKind::Ident(_)) {
+                            self.pattern_aggregate_names(lvalue).into_iter().any(|n| {
+                                self.assign_pattern_aggregate(&n, items)
+                            })
+                        } else {
+                            // `assoc[key] = '{...}` resolves its key precisely;
+                            // everything else goes through the flattened path.
+                            self.assign_coll_struct_pattern(lvalue, items)
+                                || self.assign_pattern_element(lvalue, rvalue)
+                                || match self.flat_member_name(lvalue) {
+                                    Some(flat) => self.assign_pattern_flat(&flat, items),
+                                    None => false,
+                                }
+                        };
                     if spread {
                         if !self.in_edge_block {
                             self.settle_combinatorial();
@@ -41818,9 +41950,20 @@ impl Simulator {
                             ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh)),
                             _ => self.flat_member_name(lvalue),
                         };
-                        if let Some(name) =
-                            target.filter(|n| self.module.dynamic_arrays.contains(n))
-                        {
+                        // A class-property dynamic array (`c.p = new[n]`)
+                        // lives under the instance-scoped `<handle>#p`, which
+                        // is never in the module-scope `dynamic_arrays` set —
+                        // fall back to the collection resolver so the size and
+                        // element cells are written. Restricted to
+                        // non-associative collections (dynamic arrays /
+                        // queues); `new[n]` is invalid for assoc arrays.
+                        let name = target
+                            .filter(|n| self.module.dynamic_arrays.contains(n))
+                            .or_else(|| {
+                                self.expr_assoc_name(lvalue)
+                                    .filter(|an| !self.is_associative_array(an))
+                            });
+                        if let Some(name) = name {
                             let n = self.eval_expr(n_expr).to_u64().unwrap_or(0);
                             // The source may be any array or queue. A self-copy
                             // (`d = new[n](d)`) is index-preserving, so no
@@ -42054,12 +42197,40 @@ impl Simulator {
                         while let ExprKind::Index { expr: inner, .. } = &root.kind {
                             root = inner.as_ref();
                         }
-                        if let ExprKind::Ident(bh) = &root.kind {
-                            let bname = bh
-                                .path
-                                .last()
-                                .map(|s| s.name.name.clone())
-                                .unwrap_or_default();
+                        // Normalize the collection base to (obj_name, member):
+                        //   - a flattened 2+ segment Ident `Ident([obj, member])`
+                        //     (parsed form for `c.p[i]`), or
+                        //   - a MemberAccess `obj.member` (lowered form, used
+                        //     inside foreach bodies where the index is a loop
+                        //     variable: `foreach(c.p[idx]) c.p[idx] = new()`).
+                        // Returns member=Some(obj_name, member) for these forms,
+                        // or member=None for a bare single-segment Ident `name`
+                        // (module-scope / local / static collection).
+                        let member_form: Option<(&str, String)> = match &root.kind {
+                            ExprKind::Ident(bh) if bh.path.len() >= 2 => Some((
+                                &bh.path[0].name.name,
+                                bh.path.last().unwrap().name.name.clone(),
+                            )),
+                            ExprKind::MemberAccess { expr: mbase, member } => {
+                                if let ExprKind::Ident(ob) = &mbase.kind {
+                                    Some((&ob.path[0].name.name, member.name.clone()))
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
+                        // Compute `bname` (the collection's base name) for
+                        // both root shapes: a bare/flattened `Ident`, or a
+                        // `MemberAccess(obj, member)` (foreach-body form).
+                        let bname_opt: Option<String> = match &root.kind {
+                            ExprKind::Ident(bh) => {
+                                Some(bh.path.last().map(|s| s.name.name.clone()).unwrap_or_default())
+                            }
+                            ExprKind::MemberAccess { member, .. } => Some(member.name.clone()),
+                            _ => None,
+                        };
+                        if let Some(bname) = bname_opt {
                             let elem_cls = self
                                 .module
                                 .array_elem_class
@@ -42087,6 +42258,49 @@ impl Simulator {
                                             cur = cd.extends.clone();
                                         } else {
                                             break;
+                                        }
+                                    }
+                                    None
+                                })
+                                .or_else(|| {
+                                    // `obj.p[i] = new(...)` from OUTSIDE a
+                                    // class method (e.g. an `initial` block,
+                                    // or inside a foreach body where the base
+                                    // is a `MemberAccess`). `member_form`
+                                    // normalized the root to (obj, member)
+                                    // for BOTH the flattened `Ident([obj,p])`
+                                    // and the `MemberAccess(obj,p)` shapes.
+                                    // Resolve `obj`'s handle, read its class,
+                                    // and look up the property's element type.
+                                    if let Some((obj_name, member)) = member_form {
+                                        let handle = if obj_name == "this" {
+                                            self.this_stack.last().copied().flatten().unwrap_or(0)
+                                        } else {
+                                            self.eval_ident_handle(obj_name).unwrap_or(0)
+                                        };
+                                        if handle != 0 {
+                                            let hcn = self
+                                                .heap
+                                                .get(handle)
+                                                .and_then(|x| x.as_ref())
+                                                .map(|i| i.class_name.clone());
+                                            if let Some(hcn) = hcn {
+                                                let mut cur = Some(hcn);
+                                                while let Some(cn) = cur {
+                                                    if let Some(cd) = self.module.classes.get(&cn) {
+                                                        if let Some(tn) = cd
+                                                            .properties
+                                                            .get(&member)
+                                                            .and_then(|s| s.type_name.clone())
+                                                        {
+                                                            return Some(tn);
+                                                        }
+                                                        cur = cd.extends.clone();
+                                                    } else {
+                                                        break;
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     None
@@ -42347,6 +42561,33 @@ impl Simulator {
                 if let (Some(dst), Some(src)) =
                     (self.expr_assoc_name(lvalue), self.expr_assoc_name(rvalue))
                 {
+                    // A QUEUE / DYNAMIC-ARRAY copy (`a.q = b.q`) must copy
+                    // elements + size, not re-key assoc entries. Distinguish
+                    // by whether the collection is a true assoc array.
+                    let dst_is_assoc = self.is_associative_array(&dst);
+                    if !dst_is_assoc
+                        && (self.module.dynamic_arrays.contains(&dst)
+                            || self.signals.contains_key(&format!("{}.size", dst)))
+                    {
+                        let sz = self.get_queue_size(&src);
+                        // Clear stale dst elements beyond the new size.
+                        let old_sz = self.get_queue_size(&dst);
+                        for i in sz..old_sz {
+                            self.signals.remove(&format!("{}[{}]", dst, i));
+                        }
+                        for i in 0..sz {
+                            if let Some(v) =
+                                self.get_signal_value_by_name(&format!("{}[{}]", src, i))
+                            {
+                                self.set_signal_value_by_name(&format!("{}[{}]", dst, i), v);
+                            }
+                        }
+                        self.set_queue_size(&dst, sz);
+                        if !self.in_edge_block {
+                            self.settle_combinatorial();
+                        }
+                        return;
+                    }
                     let dst_prefix = format!("{}[", dst);
                     let dst_keys: Vec<String> = self
                         .signals
@@ -43338,6 +43579,11 @@ impl Simulator {
                 };
                 let l_res = resolve_coll(self, lvalue);
                 let r_res = resolve_coll(self, rvalue);
+                // Extract the resolved names now — the both-collection `if let`
+                // below consumes `l_res`/`r_res`. Used by the mixed
+                // dynamic↔fixed path after it.
+                let l_dyn = l_res.as_ref().map(|(n, _)| n.clone());
+                let r_dyn = r_res.as_ref().map(|(n, _)| n.clone());
                 if xz_copy_debug_enabled() {
                     eprintln!("[CPDBG] l={:?} r={:?}", l_res, r_res);
                 }
@@ -43358,6 +43604,51 @@ impl Simulator {
                         }
                         return;
                     }
+                }
+                // Mixed dynamic↔fixed whole-array copy (`c.p = tmp`): one side is
+                // a dynamic array / collection property (resolved above via
+                // resolve_coll) and the other is a fixed array. The
+                // both-dynamic case above and the both-fixed case below
+                // already have dedicated paths; this only catches the
+                // cross-kind mix. Element copy uses descending-index handling
+                // on the fixed side (§7.2.1) and 0-based indices on the
+                // dynamic side. A dynamic-array destination is resized to the
+                // fixed source's length (§7.6).
+                let l_fix = self.fixed_array_operand(lvalue);
+                let r_fix = self.fixed_array_operand(rvalue);
+                // LHS dynamic array/prop  ←  RHS fixed array
+                if let (Some(dst), Some((src, lo, hi))) = (l_dyn.clone(), r_fix) {
+                    let desc = self.module.descending_arrays.contains(&src);
+                    let n = (hi - lo + 1) as u64;
+                    for i in 0..n {
+                        let ridx = if desc { hi - i as i64 } else { lo + i as i64 };
+                        let v = self
+                            .get_signal_value_by_name(&format!("{}[{}]", src, ridx))
+                            .unwrap_or_else(|| Value::zero(32));
+                        self.set_signal_value_by_name(&format!("{}[{}]", dst, i), v);
+                    }
+                    self.set_queue_size(&dst, n);
+                    if !self.in_edge_block {
+                        self.settle_combinatorial();
+                    }
+                    return;
+                }
+                // LHS fixed array  ←  RHS dynamic array/prop
+                if let (Some((dst, lo, hi)), Some(src)) = (l_fix, r_dyn.clone()) {
+                    let desc = self.module.descending_arrays.contains(&dst);
+                    let cap = (hi - lo + 1) as u64;
+                    let n = self.get_queue_size(&src).min(cap);
+                    for i in 0..n {
+                        let lidx = if desc { hi - i as i64 } else { lo + i as i64 };
+                        let v = self
+                            .get_signal_value_by_name(&format!("{}[{}]", src, i))
+                            .unwrap_or_else(|| Value::zero(32));
+                        self.set_signal_value_by_name(&format!("{}[{}]", dst, lidx), v);
+                    }
+                    if !self.in_edge_block {
+                        self.settle_combinatorial();
+                    }
+                    return;
                 }
                 // Assoc-to-assoc and fixed-array-to-fixed-array copies key on
                 // the PLAIN resolved names (they predate the collection
@@ -44484,22 +44775,37 @@ impl Simulator {
                                     .unwrap_or(false);
                                 // Integer-keyed members iterate in NUMERIC order;
                                 // lexicographic sort would visit "10" before "2".
+                                // Use i64 so negative (signed) keys keep order.
                                 if is_str {
                                     ks.sort();
                                 } else {
-                                    ks.sort_by_key(|k| k.parse::<u64>().unwrap_or(0));
+                                    ks.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
                                 }
                                 keys = ks;
                             }
                             self.widths.insert(var.name.clone(), 32);
+                            // §7.8.2: the loop variable takes the AA's index
+                            // type (width + signedness) so a signed/narrowed
+                            // key (e.g. shortint -3) keeps its value instead
+                            // of a failed u64 parse clobbering it to 0.
+                            let (kw, ks_sign) =
+                                self.assoc_index_width_for(&an).unwrap_or((32, false));
+                            self.widths.insert(var.name.clone(), kw);
                             for key in keys {
                                 if self.finished {
                                     break;
                                 }
                                 let kv = if is_str {
                                     Value::from_string(&key)
+                                } else if ks_sign {
+                                    let mut v = Value::from_u64(
+                                        key.parse::<i64>().unwrap_or(0) as u64,
+                                        kw,
+                                    );
+                                    v.is_signed = true;
+                                    v
                                 } else {
-                                    Value::from_u64(key.parse::<u64>().unwrap_or(0), 32)
+                                    Value::from_u64(key.parse::<u64>().unwrap_or(0), kw)
                                 };
                                 self.set_loop_var(&var.name, kv);
                                 self.continue_flag = false;
@@ -44730,7 +45036,41 @@ impl Simulator {
                     }
                     if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
                         self.widths.insert(var.name.clone(), 32);
-                        if self.is_associative_array(&name) {
+                        if self.string_signals.contains(&name) {
+                            // foreach over a STRING iterates its characters
+                            // [0..len) by CONTENT length, and must be checked
+                            // BEFORE any collection-array arm: a string name can
+                            // carry a stale collection-name registration (width
+                            // 2, e.g. module.arrays[value] == (0,-1,1)) that
+                            // would otherwise send it through the fixed-array
+                            // arm iterating 2 instead of the true character
+                            // count, truncating UVM's `pack_string` by 8 bytes.
+                            let len = self.eval_expr(array).to_sv_string().len() as u64;
+                            for i in 0..len {
+                                if self.finished {
+                                    break;
+                                }
+                                self.set_loop_var_aliased(
+                                    var_scope.as_deref(),
+                                    &var.name,
+                                    Value::from_u64(i, 32),
+                                );
+                                self.continue_flag = false;
+                                self.exec_statement(body);
+                                if self.break_flag {
+                                    break;
+                                }
+                                self.continue_flag = false;
+                            }
+                        } else if self.is_associative_array(&name) {
+                            // §7.8.2: the loop variable takes the AA's index
+                            // type (width + signedness). A signed shortint key
+                            // like -11823 must stay signed, not be re-parsed as
+                            // u64 (which fails and yields 0) or widened to 32.
+                            let (kw, ks) = self
+                                .assoc_index_width_for(&name)
+                                .unwrap_or((32, false));
+                            self.widths.insert(var.name.clone(), kw);
                             let prefix = format!("{}[", name);
                             // An assoc-of-collections (e.g. `bq_t all[int]`
                             // where `bq_t = Base[$]`) stores elements as
@@ -44759,7 +45099,7 @@ impl Simulator {
                             if is_str {
                                 keys.sort();
                             } else {
-                                keys.sort_by_key(|k| k.parse::<u64>().unwrap_or(0));
+                                keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
                             }
                             for key in keys {
                                 if self.finished {
@@ -44767,8 +45107,15 @@ impl Simulator {
                                 }
                                 let kv = if is_str {
                                     Value::from_string(&key)
+                                } else if ks {
+                                    let mut v = Value::from_u64(
+                                        key.parse::<i64>().unwrap_or(0) as u64,
+                                        kw,
+                                    );
+                                    v.is_signed = true;
+                                    v
                                 } else {
-                                    Value::from_u64(key.parse::<u64>().unwrap_or(0), 32)
+                                    Value::from_u64(key.parse::<u64>().unwrap_or(0), kw)
                                 };
                                 self.set_loop_var_aliased(var_scope.as_deref(), &var.name, kv);
                                 self.continue_flag = false;
@@ -44827,29 +45174,6 @@ impl Simulator {
                                 }
                                 self.continue_flag = false;
                                 idx += 1;
-                            }
-                        } else if self.string_signals.contains(&name) {
-                            // foreach over a string iterates its characters
-                            // [0..len). Use the CONTENT length: a string is held
-                            // in a fixed-width container (e.g. 1024 bits), so
-                            // `width/8` is the container size (128), not the
-                            // string length — the loop ran 128 times over "hi".
-                            let len = self.eval_expr(array).to_sv_string().len() as u64;
-                            for i in 0..len {
-                                if self.finished {
-                                    break;
-                                }
-                                self.set_loop_var_aliased(
-                                    var_scope.as_deref(),
-                                    &var.name,
-                                    Value::from_u64(i, 32),
-                                );
-                                self.continue_flag = false;
-                                self.exec_statement(body);
-                                if self.break_flag {
-                                    break;
-                                }
-                                self.continue_flag = false;
                             }
                         } else {
                             // Bit-by-bit foreach over a packed vector.
@@ -55572,7 +55896,21 @@ impl Simulator {
         if let Some(&w) = self.module.assoc_elem_widths.get(name) {
             return Some(w);
         }
-        if name.contains('#') {
+        // §7.8 / §7.13: a class collection element is stored under the scoped
+        // `<handle>#<member>` name. The declared element width for an
+        // associative array property isn't recorded in `assoc_elem_widths`
+        // (that holds élaboration-scoped names), but the per-instance class
+        // property's `Signal.width` IS the element type's width (array dims
+        // aren't folded into it), so — resize to DECLARED width rather than
+        // the runtime value's width.
+        if let Some((hstr, member)) = name.split_once('#') {
+            let handle: usize = match hstr.parse() {
+                Ok(h) => h,
+                Err(_) => return None,
+            };
+            if let Some(w) = self.class_prop_width_of(handle, member) {
+                return Some(w);
+            }
             return None;
         }
         let leaf = name.rsplit('.').next().unwrap_or(name);
@@ -55580,7 +55918,29 @@ impl Simulator {
     }
 
     fn is_associative_array(&self, name: &str) -> bool {
-        self.module.associative_arrays.contains_key(name)
+        if self.module.associative_arrays.contains_key(name) {
+            return true;
+        }
+        // Per-instance class member: `<handle>#<member>`.
+        if let Some(pos) = name.find('#') {
+            if let Ok(handle) = name[..pos].parse::<usize>() {
+                let member = &name[pos + 1..];
+                if let Some(Some(inst)) = self.heap.get(handle) {
+                    let mut cur = Some(inst.class_name.clone());
+                    while let Some(cn) = cur {
+                        if let Some(cd) = self.module.classes.get(&cn) {
+                            if cd.assoc_properties.contains_key(member) {
+                                return true;
+                            }
+                            cur = cd.extends.clone();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Resolve a `TypeName` (possibly a scoped/class-local typedef alias) to the
@@ -56139,6 +56499,40 @@ impl Simulator {
         }
     }
 
+    /// Resolve the declared INDEX (key) width + signedness for an
+    /// associative array, whether it lives at module scope (`name` in
+    /// `module.assoc_index_widths`) or as a per-instance class property
+    /// (`<handle>#<member>` — look up the object's class and its
+    /// `assoc_index_props`). Returns `None` for string-keyed / untracked
+    /// arrays (the caller falls back to the raw index value).
+    fn assoc_index_width_for(&self, name: &str) -> Option<(u32, bool)> {
+        if let Some(&iw) = self.module.assoc_index_widths.get(name) {
+            return Some(iw);
+        }
+        // Per-instance class member: `<handle>#<member>`.
+        if let Some(pos) = name.find('#') {
+            let handle: usize = name[..pos].parse().ok()?;
+            let member = &name[pos + 1..];
+            let cn = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.class_name.clone())?;
+            let mut cur = Some(cn);
+            while let Some(c) = cur {
+                if let Some(cd) = self.module.classes.get(&c) {
+                    if let Some(&iw) = cd.assoc_index_props.get(member) {
+                        return Some(iw);
+                    }
+                    cur = cd.extends.clone();
+                } else {
+                    break;
+                }
+            }
+        }
+        None
+    }
+
     fn assoc_key_str(&self, name: &str, idx_val: &Value) -> String {
         if self.is_string_keyed_array(name) {
             idx_val.to_sv_string()
@@ -56152,12 +56546,27 @@ impl Simulator {
             // Genuine wide numeric keys were already truncation-broken here, so
             // this only improves correctness.
             idx_val.to_sv_string()
-        } else if idx_val.is_signed {
-            // §7.8: a signed key keeps its sign — folding -5 to 4294967291
-            // both mis-stores the element and breaks first()/next() order.
-            idx_val.to_i64().unwrap_or(0).to_string()
         } else {
-            idx_val.to_u64().unwrap_or(0).to_string()
+            // §7.8.2: the index is narrowed to the declared key type before
+            // keying. `int k; shortint aa[shortint]; aa[k]` with a 32-bit k
+            // must store the 16-bit-truncated value so a later read with the
+            // correctly-narrowed key matches. Without this the packed key text
+            // diverged from the unpacked one and AA round-trips corrupted.
+            let (mut v, is_signed) =
+                if let Some((kw, ks)) = self.assoc_index_width_for(name) {
+                    let narrowed = idx_val.resize(kw);
+                    (narrowed, ks)
+                } else {
+                    (idx_val.clone(), idx_val.is_signed)
+                };
+            v.is_signed = is_signed;
+            if v.is_signed {
+                // §7.8: a signed key keeps its sign — folding -5 to 4294967291
+                // both mis-stores the element and breaks first()/next() order.
+                v.to_i64().unwrap_or(0).to_string()
+            } else {
+                v.to_u64().unwrap_or(0).to_string()
+            }
         }
     }
 
@@ -56704,7 +57113,12 @@ impl Simulator {
         } else if let Some((lo, hi, _)) = self.module.arrays.get(obj_name) {
             (hi - lo + 1) as u64
         } else {
-            0
+            // A class-property FIXED array (`<handle>#member`) has no
+            // runtime `.size` cell and no `module.arrays` entry (those are
+            // module-scope). Its element count comes from the class
+            // declaration's `array_properties`, so a whole-array copy
+            // (`c.p = c.q`) can size the destination.
+            self.class_prop_fixed_array_size(obj_name).unwrap_or(0)
         };
         // A queue/array element count above this is never legitimate — it
         // means `<name>.size` holds a garbage value (e.g. an X-coerced or
@@ -56742,6 +57156,33 @@ impl Simulator {
             self.mark_dirty_id(id);
             self.dirty_any = true;
         }
+    }
+
+    /// Element count of a class-property FIXED array named
+    /// `<handle>#member`. Returns `None` unless `member` is a constant-sized
+    /// unpacked-array property of the instance's class (walked up the
+    /// inheritance chain). Used by `get_queue_size` so whole-array copies
+    /// (`c.p = c.q`) can read a fixed-array property's length.
+    fn class_prop_fixed_array_size(&self, name: &str) -> Option<u64> {
+        let (hstr, member) = name.split_once('#')?;
+        let h = hstr.parse::<usize>().ok()?;
+        let cn = self
+            .heap
+            .get(h)
+            .and_then(|x| x.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let mut cur = Some(cn);
+        while let Some(c) = cur {
+            if let Some(cd) = self.module.classes.get(&c) {
+                if let Some(&(lo, hi, _)) = cd.array_properties.get(member) {
+                    return Some((hi - lo + 1) as u64);
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        None
     }
 
     /// Resolve a whole fixed-size (unpacked) array operand — used by unpacked-
@@ -57107,7 +57548,10 @@ impl Simulator {
         if is_str {
             ks.sort();
         } else {
-            ks.sort_by_key(|k| k.parse::<u64>().unwrap_or(0));
+            // Sort by signed value so negative keys (e.g. a signed shortint
+            // key -3) keep their true order instead of colliding at 0 via a
+            // failed u64 parse.
+            ks.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
         }
         (ks, is_str)
     }
@@ -57122,7 +57566,7 @@ impl Simulator {
         &mut self,
         array: &Expression,
         vars: &[Option<crate::ast::Identifier>],
-    ) -> Option<(Vec<String>, bool, Option<String>, Option<String>)> {
+    ) -> Option<(Vec<String>, bool, Option<String>, Option<String>, (u32, bool))> {
         if vars.len() != 1 {
             return None;
         }
@@ -57134,11 +57578,12 @@ impl Simulator {
             // A `.size`-shadowed collection (queue/dynamic) may shrink mid-
             // loop; use live-size bounds for it.
             let live = if self.signals.contains_key(&format!("{}.size", an)) {
-                Some(an)
+                Some(an.clone())
             } else {
                 None
             };
-            return Some((keys, is_str, None, live));
+            let kw = self.assoc_index_width_for(&an).unwrap_or((32, false));
+            return Some((keys, is_str, None, live, kw));
         }
         // Direct named array (fixed / dynamic / assoc array or queue).
         if let ExprKind::Ident(hier) = &array.kind {
@@ -57173,12 +57618,13 @@ impl Simulator {
             // (exec_statement's Ident arm).
             if self.is_associative_array(&name) {
                 let (keys, is_str) = self.array_iter_keys(&name);
-                return Some((keys, is_str, var_scope, None));
+                let kw = self.assoc_index_width_for(&name).unwrap_or((32, false));
+                return Some((keys, is_str, var_scope, None, kw));
             }
             if self.module.dynamic_arrays.contains(&name) {
                 let size = self.get_queue_size(&name);
                 let keys: Vec<String> = (0..size).map(|i| i.to_string()).collect();
-                return Some((keys, false, var_scope, Some(name)));
+                return Some((keys, false, var_scope, Some(name), (32, false)));
             }
             if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
                 let descending = self.module.descending_arrays.contains(&name);
@@ -57189,14 +57635,14 @@ impl Simulator {
                     keys.push(v.to_string());
                     idx += 1;
                 }
-                return Some((keys, false, var_scope, None));
+                return Some((keys, false, var_scope, None, (32, false)));
             }
             // Queue / dynamic array surfaced via `.size` shadow only.
             let (keys, is_str) = self.array_iter_keys(&name);
             if keys.is_empty() {
                 return None;
             }
-            return Some((keys, is_str, var_scope, Some(name)));
+            return Some((keys, is_str, var_scope, Some(name), (32, false)));
         }
         None
     }
@@ -58107,23 +58553,51 @@ impl Simulator {
     }
 
     fn nested_index_name(&mut self, expr: &Expression) -> Option<String> {
-        if let ExprKind::Index { expr: base, index } = &expr.kind {
-            if let ExprKind::Ident(bh) = &base.kind {
-                let mut bn = self.resolve_hier_name(bh);
-                if let Some(s) = self.instance_assoc_member(&bn) {
-                    bn = s;
-                }
-                if self.is_associative_array(&bn) {
-                    let key = if self.is_string_keyed_array(&bn) {
-                        self.eval_expr(index).to_sv_string()
-                    } else {
-                        self.eval_expr(index).to_u64().unwrap_or(0).to_string()
-                    };
-                    return Some(format!("{}[{}]", bn, key));
-                }
+        // Peel every Index level: `expr` is `Index(...Index(base, k1),...,kn)`.
+        // Collect indices leaf-first, then resolve the root `Ident` to its
+        // associative-array storage name and build the compound key
+        // `base[k1][k2]...[kn]` using `assoc_key_str` for every segment — the
+        // SAME format the write/read path (`multidim_assoc_elem`) uses, so a
+        // method call like `m[k1][k2].exists(k3)` resolves to the stored
+        // `m[K1][K2]` storage name. Without the recursion a depth-2 receiver
+        // (`Index(Index(..),..)`) has a non-`Ident` base and returned `None`,
+        // so `.exists()`/`.num()`/... never dispatched for 3D+ assoc arrays
+        // (IEEE 1800-2023 §7.8.1) — breaking UVM's cycle detector
+        // `m_recur_states[obj][obj][policy].exists(...)`.
+        let mut rev: Vec<&Expression> = Vec::new();
+        let mut cur = expr;
+        loop {
+            if let ExprKind::Index { expr: base, index } = &cur.kind {
+                rev.push(index.as_ref());
+                cur = base.as_ref();
+            } else {
+                break;
             }
         }
-        None
+        if rev.is_empty() {
+            return None; // not an Index expression
+        }
+        // The root must be a plain Ident naming an associative array.
+        let bh = if let ExprKind::Ident(bh) = &cur.kind {
+            bh
+        } else {
+            return None;
+        };
+        let mut bn = self.resolve_hier_name(bh);
+        if let Some(s) = self.instance_assoc_member(&bn) {
+            bn = s;
+        }
+        if !self.is_associative_array(&bn) {
+            return None;
+        }
+        let mut name = bn.clone();
+        // Build root→leaf so the string reads `base[K1][K2]...[Kn]`.
+        for idx in rev.iter().rev() {
+            let kv = self.eval_expr(idx);
+            let ks = self.assoc_key_str(&bn, &kv);
+            name = format!("{}[{}]", name, ks);
+        }
+        Some(name)
     }
 
     /// Resolve a base expression to its associative-array STORAGE name if it
@@ -62057,8 +62531,177 @@ impl Simulator {
         }
     }
 
+    /// A struct-typed element of a class collection. `elem` is a fully-indexed
+    /// element (`m[5]`, `m[k1][k2][k3]`) whose base is an associative-array
+    /// class member storing UNPACKED-struct elements. Resolves both the flat
+    /// compound storage key (`<handle>#<prop>[K1]...[Kn]`, the same key the
+    /// multidim/single-index element write uses) and the element struct type, so
+    /// member-cell reads/writes (<key>.<member> signals, the established model
+    /// for 1-D assoc-of-struct from the `assoc[key].field` path) can be used for
+    /// any index arity. Returns `None` when the base isn't an assoc array whose
+    /// element is an unpacked struct.
+    fn coll_assoc_struct_elem(
+        &mut self,
+        element: &Expression,
+    ) -> Option<(String, crate::ast::types::StructUnionType)> {
+        // compound key `base[K1][K2]...[Kn]` (assoc key-stringified).
+        let key = self.nested_index_name(element)?;
+        // Strip the trailing `[K...]` for the storage base `<handle>#<prop>`.
+        let scoped = key.split('[').next().unwrap_or("");
+        let (hstr, prop) = scoped.split_once('#')?;
+        let handle: usize = hstr.parse().ok()?;
+        let su = self.class_prop_struct(handle, prop)?;
+        if !Self::spreads_member_wise(&su) {
+            return None;
+        }
+        Some((key, su))
+    }
+
+    /// `element` : resolved as above for a struct element in a class collection,
+    /// return the unpacked struct's member width of `field`, if any.
+    fn coll_field_width(
+        &self,
+        su: &crate::ast::types::StructUnionType,
+        field: &str,
+    ) -> Option<u32> {
+        su.members
+            .iter()
+            .find(|m| m.declarators.iter().any(|d| d.name.name == field))
+            .map(|m| {
+                resolve_type_width(
+                    &m.data_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+                .max(1)
+            })
+    }
+
+    /// Spread an assignment pattern across the members of a struct-typed ELEMENT
+    /// of a class collection (`m[k1][k2] = '{a,b}`), plus write a presence
+    /// marker at the element key so `exists()/num()/...` see the slot. Returns
+    /// whether it took care of the write.
+    fn assign_coll_struct_pattern(
+        &mut self,
+        lvalue: &Expression,
+        items: &[AssignmentPatternItem],
+    ) -> bool {
+        let Some((key, su)) = self.coll_assoc_struct_elem(lvalue) else {
+            return false;
+        };
+        if items.is_empty() {
+            return false;
+        }
+        self.assign_pattern_into_struct(&key, &su, items);
+        if self.get_signal_value_by_name(&key).is_none() {
+            self.set_signal_value_by_name(&key, Value::zero(1));
+        }
+        true
+    }
+
+    /// Whole-assignment pattern to a CLASS COLLECTION property accessed by
+    /// handle — `obj.q = '{1,2,3}` (`queue`/dynamic array) or
+    /// `c.aa = '{k:v,...}` (associative array). This lvalue is a
+    /// `MemberAccess` (`obj.q`/`this.q`), so the bare-Ident aggregate path
+    /// misses it and it falls to a packed concat whose width is never
+    /// recorded — leaving `.size`/`.num` 0 and the elements absent (the
+    /// failure behind UVM's `uvm_pack_queue` writing size 0). Store the
+    /// elements under the instance-scoped `<h>#<name>[i]`/`[key]` names and
+    /// set the collection size, matching the in-method write.
+    fn assign_class_collection_pattern(
+        &mut self,
+        lvalue: &Expression,
+        items: &[AssignmentPatternItem],
+    ) -> bool {
+        // The lvalue is either `obj.q`/`this.q` (MemberAccess) or a two-
+        // segment `c.q` (flattened Ident). Resolve the object handle + member
+        // from both forms.
+        let (handle, member) = match &lvalue.kind {
+            ExprKind::MemberAccess { expr: base, member } => {
+                let h = match &base.kind {
+                    ExprKind::This => {
+                        self.this_stack.last().copied().flatten().unwrap_or(0)
+                    }
+                    ExprKind::Ident(b) if b.path.len() == 1 => {
+                        let nm = b.path[0].name.name.clone();
+                        self.eval_ident_handle(&nm).unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+                (h, member.name.clone())
+            }
+            ExprKind::Ident(hi) if hi.path.len() == 2 => {
+                let base_nm = hi.path[0].name.name.clone();
+                let h = self.eval_ident_handle(&base_nm).unwrap_or(0);
+                (h, hi.path[1].name.name.clone())
+            }
+            _ => (0, String::new()),
+        };
+        if handle == 0 {
+            return false;
+        }
+        let Some(cn) = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())
+        else {
+            return false;
+        };
+        let Some(cd) = self.module.classes.get(&cn) else {
+            return false;
+        };
+        let member = &member;
+        let scoped = format!("{}#{}", handle, member);
+        if items.is_empty() {
+            return false;
+        }
+        // Associative array: `'{k:v,...}` — keyed items.
+        if cd.assoc_properties.contains_key(member) {
+            let val_w = cd.properties.get(member).map(|s| s.width).unwrap_or(32);
+            for item in items {
+                if let AssignmentPatternItem::Keyed(k, v) = item {
+                    let kv = self.eval_expr(k);
+                    let key = self.assoc_key_str(&scoped, &kv);
+                    self.pattern_leaf_at_elem_width(&format!("{}[{}]", scoped, key), v, val_w);
+                }
+            }
+            return true;
+        }
+        // Queue / dynamic array: positional items are the elements; they set
+        // the size (so `.size`/`uvm_pack_queue` see the live count).
+        if let Some(&(ew, _)) = cd.queue_properties.get(member) {
+            let exprs = self.pattern_ordered(items);
+            if exprs.is_empty() {
+                return false;
+            }
+            for (i, e) in exprs.iter().enumerate() {
+                self.pattern_leaf_at_elem_width(&format!("{}[{}]", scoped, i), e, ew);
+            }
+            self.set_queue_size(&scoped, exprs.len() as u64);
+            return true;
+        }
+        false
+    }
+
+    /// Evaluate one collection-element pattern item at its ELEMENT width and
+    /// write it to the flat `target` name — the scalar analogue of
+    /// `assign_pattern_or_leaf` (whose width comes from a typed declaration,
+    /// which a by-handle class collection lacks).
+    fn pattern_leaf_at_elem_width(&mut self, target: &str, e: &Expression, ew: u32) {
+        let mut v = if ew > 0 {
+            self.eval_expr_ctx(e, ew)
+        } else {
+            self.eval_expr(e)
+        };
+        if ew > 0 && !v.is_real && v.width != ew {
+            v = v.resize_for_assign(ew);
+        }
+        self.set_signal_value_by_name(target, v);
+    }
+
     /// Whether an aggregate keeps each member in its OWN signal, so an
-    /// assignment pattern must be spread across them. A packed struct is one
+    /// assignment pattern must be spread across them. An unpacked struct is one
     /// signal; so is an untagged union — one storage shared by every member
     /// (§7.3) — and both take the packed-value path instead.
     fn spreads_member_wise(su: &crate::ast::types::StructUnionType) -> bool {
@@ -64627,7 +65270,8 @@ impl Simulator {
             // Fallback for strings (value may be a frame-local/parameter).
             // Counts the content bytes — including embedded/trailing NULs,
             // which §21.2.1.4 unformatted dumps legitimately contain.
-            let base_val = self.get_local_signal_or_static(obj_name);
+            let base_val = self.get_local_signal_or_static(obj_name)
+                .or_else(|| self.get_signal_value_by_name(obj_name));
 
             if let Some(base) = base_val {
                 return Some(Value::from_u64(base.sv_string_bytes().len() as u64, 32));
@@ -69299,11 +69943,21 @@ impl Simulator {
                     if matches!(m.as_str(), "len" | "size" | "getc" | "substr") {
                         if let ExprKind::Ident(bh) = &base_expr.kind {
                             let bn = self.resolve_hier_name(bh);
-                            if self.get_local_signal_or_static(&bn).is_some() {
+                            if self.get_local_signal_or_static(&bn).is_some()
+                                || self.get_signal_value_by_name(&bn).is_some()
+                            {
                                 if let Some(res) = self.eval_builtin_method(&bn, &m, args) {
                                     return res;
                                 }
                             }
+                        }
+                        // Fallback: the receiver was already evaluated as
+                        // `recv` (e.g. a class-property string `a.str` whose
+                        // member name `str` is not a standalone signal).
+                        // Compute len/size directly from the string value bytes.
+                        if matches!(m.as_str(), "len" | "size") {
+                            let bytes = recv.sv_string_bytes();
+                            return Value::from_u64(bytes.len() as u64, 32);
                         }
                     } else if let Some(v) = self.string_method(&base_expr, &m, args) {
                         return v;
@@ -71546,12 +72200,25 @@ impl Simulator {
             }
         }
         // Mark string-typed return var / params for character indexing.
+        // §23.8: a formal's name is local to THIS frame. Recording it in the
+        // shared `string_signals` set must not leak past the return — a string
+        // formal named `value` (e.g. uvm `pack_string`) would otherwise make a
+        // LATER function's integral `value` (e.g. `pack_field_int`) resolve
+        // as a string, so `value[i]` byte-selects instead of bit-selecting.
+        // Track only the names newly added here (HashSet::insert returns false
+        // when the name is already present from an active caller frame, so
+        // recursion/nesting is handled) and remove exactly those on exit.
+        let mut frame_string_signals: Vec<String> = Vec::new();
         if Self::is_string_data_type(&fd.return_type) {
-            self.string_signals.insert(ret_name.clone());
+            if self.string_signals.insert(ret_name.clone()) {
+                frame_string_signals.push(ret_name.clone());
+            }
         }
         for port in fd.ports.iter() {
             if Self::is_string_data_type(&port.data_type) {
-                self.string_signals.insert(port.name.name.clone());
+                if self.string_signals.insert(port.name.name.clone()) {
+                    frame_string_signals.push(port.name.name.clone());
+                }
             }
         }
         // §25.9: virtual-interface FORMALS of a free FUNCTION. Only the
@@ -71602,6 +72269,11 @@ impl Simulator {
             if self.return_value.is_some() || self.return_flag {
                 break;
             }
+        }
+        // §23.8: stop leaking this frame's string formal names into the
+        // global set now that the body is done (see frame_string_signals).
+        for n in &frame_string_signals {
+            self.string_signals.remove(n);
         }
         self.sync_static_locals();
         self.local_iface_aliases.pop();
@@ -74923,6 +75595,15 @@ impl Simulator {
                     continue;
                 }
                 let scoped = format!("{}#{}", handle, prop);
+                // The element type of a collection member: for `obj arr[]` this
+                // is the class name `obj`, so the elements are object handles
+                // (randomized recursively, never as scalars). For scalar/
+                // packed element types `type_name` is None or a non-class.
+                let is_object_elem = cd
+                    .properties
+                    .get(prop)
+                    .and_then(|s| s.type_name.clone())
+                    .is_some_and(|tn| self.module.classes.contains_key(&tn));
                 if let Some(&(lo, hi, w)) = cd.array_properties.get(prop) {
                     out.push(RandColl {
                         prop: prop.clone(),
@@ -74932,6 +75613,7 @@ impl Simulator {
                         lo,
                         hi,
                         nested: false,
+                        is_object_elem,
                     });
                 } else if cd.assoc_properties.contains_key(prop) {
                     let w = cd.properties.get(prop).map_or(32, |s| s.width).max(1);
@@ -74943,6 +75625,7 @@ impl Simulator {
                         lo: 0,
                         hi: 0,
                         nested: false,
+                        is_object_elem,
                     });
                 } else if let Some(&(w, _cap)) = cd.queue_properties.get(prop) {
                     let nested = Self::coll_is_nested(prop, constraints);
@@ -74954,6 +75637,7 @@ impl Simulator {
                         lo: 0,
                         hi: 0,
                         nested,
+                        is_object_elem,
                     });
                 }
             }
@@ -77172,6 +77856,73 @@ impl Simulator {
             // the only place a rand sub-object is drawn — a second, later redraw
             // would discard the cross-object solution just computed for it.
             for p in &rand_obj_props {
+                // A `rand obj arr[]` (array/queue/assoc of rand objects) is
+                // NOT a single handle — its element handles live at
+                // `<handle>#p[i]`. Recurse into each non-null element so the
+                // objects are randomized and aliasing (`arr[1]==arr[2]`) is
+                // preserved (a shared element is randomized once, and both
+                // slots read the same result). §18.5.9/§18.4.1.
+                let coll_name = format!("{}#{}", handle, p);
+                let is_coll = self.is_associative_array(&coll_name)
+                    || self
+                        .heap
+                        .get(handle)
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.class_name.clone())
+                        .and_then(|cn| self.module.classes.get(&cn).cloned())
+                        .map(|cd| {
+                            cd.queue_properties.contains_key(p)
+                                || cd.array_properties.contains_key(p)
+                        })
+                        .unwrap_or(false);
+                if is_coll {
+                    if self.is_associative_array(&coll_name) {
+                        // Associative array: iterate the stored keys.
+                        let prefix = format!("{}[", coll_name);
+                        let keys: Vec<String> = self
+                            .signals
+                            .keys()
+                            .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
+                            .map(|k| k[prefix.len()..k.len() - 1].to_string())
+                            .collect();
+                        for key in keys {
+                            if let Some(v) = self
+                                .get_signal_value_by_name(&format!("{}[{}]", coll_name, key))
+                            {
+                                let sub = v.to_u64().unwrap_or(0) as usize;
+                                if sub != 0
+                                    && sub != handle
+                                    && self.randomize_depth < 8
+                                    && self.heap.get(sub).and_then(|o| o.as_ref()).is_some()
+                                {
+                                    self.randomize_depth += 1;
+                                    self.exec_randomize(sub);
+                                    self.randomize_depth -= 1;
+                                }
+                            }
+                        }
+                    } else {
+                        // Dynamic array / queue / fixed array: 0-based indices.
+                        let n = self.get_queue_size(&coll_name);
+                        for i in 0..n {
+                            if let Some(v) = self
+                                .get_signal_value_by_name(&format!("{}[{}]", coll_name, i))
+                            {
+                                let sub = v.to_u64().unwrap_or(0) as usize;
+                                if sub != 0
+                                    && sub != handle
+                                    && self.randomize_depth < 8
+                                    && self.heap.get(sub).and_then(|o| o.as_ref()).is_some()
+                                {
+                                    self.randomize_depth += 1;
+                                    self.exec_randomize(sub);
+                                    self.randomize_depth -= 1;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let sub = self
                     .heap
                     .get(handle)
@@ -77308,8 +78059,11 @@ impl Simulator {
                         (1i128 << (w.saturating_sub(1))) - 1,
                     )
                 } else {
-                    // §18.4: see the ww == 127 note above — `1i128 << 127`
-                    // is i128::MIN, so the `- 1` overflows in debug builds.
+                    // §18.4: an unsigned domain of width w spans [0, 2^w - 1].
+                    // For w == 127 that bound is i128::MAX, but the
+                    // shift-then-subtract form underflows: `1i128 << 127` is
+                    // i128::MIN (bit 127 is the sign bit), so `- 1` overflows
+                    // in debug builds. Use the constant directly.
                     (0, if w == 127 { i128::MAX } else { (1i128 << w) - 1 })
                 };
                 let (mut lo, mut hi) = (dlo, dhi);
@@ -77716,7 +78470,9 @@ impl Simulator {
                             (1i128 << ww.saturating_sub(1)) - 1,
                         )
                     } else {
-                        // §18.4: see the ww == 127 note above.
+                        // §18.4: unsigned domain [0, 2^ww - 1]; for ww == 127
+                        // that bound is i128::MAX, and the shift form
+                        // underflows in debug builds.
                         (0, if ww == 127 { i128::MAX } else { (1i128 << ww) - 1 })
                     };
                     cvar_names.push(name.clone());
@@ -77762,8 +78518,11 @@ impl Simulator {
                 self.solve_array_sizes(&rand_colls, &constraints);
                 // Fresh random baseline for every element of a dynamic /
                 // associative member (fixed arrays keep the legacy pool pass).
+                // §18.4.1: a CLASS-element collection (`rand obj arr[]`) holds
+                // object handles that are randomized RECURSIVELY — never drawn
+                // as scalars, or the handle is overwritten with junk.
                 for c in &rand_colls {
-                    if c.kind == CollKind::Fixed {
+                    if c.kind == CollKind::Fixed || c.is_object_elem {
                         continue;
                     }
                     for key in self.coll_elem_keys(c) {
@@ -81302,15 +82061,47 @@ impl Simulator {
                 }
                 // Mark string-typed return variable and params so `s[i]`
                 // does byte (character) indexing instead of bit-select.
-                // `string_signals` is a global set; re-inserting is harmless.
+                // §23.8: a formal's name is local to THIS frame; recording it
+                // in the shared `string_signals` set must not leak past the
+                // return — uvm's `pack_string(string value)` would otherwise
+                // make `pack_field_int(uvm_integral_t value)` resolve `value`
+                // as a string, so `value[i]` byte-selects instead of
+                // bit-selecting. Track only newly-added names and remove them
+                // on exit; HashSet::insert returning false (name already
+                // present from an active caller) is left untouched.
+                let mut frame_string_signals: Vec<String> = Vec::new();
                 if let ClassMethodKind::Function(f) = &method.kind {
                     if Self::is_string_data_type(&f.return_type) {
-                        self.string_signals.insert(f.name.name.name.clone());
+                        if self.string_signals.insert(f.name.name.name.clone()) {
+                            frame_string_signals.push(f.name.name.name.clone());
+                        }
                     }
                 }
                 for port in ports.iter() {
                     if Self::is_string_data_type(&port.data_type) {
-                        self.string_signals.insert(port.name.name.clone());
+                        if self.string_signals.insert(port.name.name.clone()) {
+                            frame_string_signals.push(port.name.name.clone());
+                        }
+                    }
+                }
+                // §6.16: a class's STRING properties must be in `string_signals`
+                // so that `foreach(str[i])`, `str[i]` (char select), and
+                // `str.len()` dispatch to the string paths. Walk the inheritance
+                // chain from the callee's class and add each string property
+                // for the duration of this frame (removed on exit below).
+                {
+                    let mut cur = Some(cname.clone());
+                    while let Some(cn) = cur {
+                        if let Some(cd) = self.module.classes.get(&cn) {
+                            for sp in &cd.string_properties {
+                                if self.string_signals.insert(sp.clone()) {
+                                    frame_string_signals.push(sp.clone());
+                                }
+                            }
+                            cur = cd.extends.clone();
+                        } else {
+                            break;
+                        }
                     }
                 }
                 // Loop-control flags (`break`/`continue`) are frame-local:
@@ -81454,6 +82245,12 @@ impl Simulator {
                 // Write back any static locals declared in this body before
                 // the locals frame is dropped.
                 self.sync_static_locals();
+                // §23.8: stop leaking this frame's string formal names into
+                // the global set now that the body is done (see
+                // frame_string_signals).
+                for n in &frame_string_signals {
+                    self.string_signals.remove(n);
+                }
                 self.current_spec = saved_spec;
                 self.local_iface_aliases.pop();
                 if self.parked_from_exec {
@@ -85278,6 +86075,11 @@ struct RandColl {
     hi: i64,
     /// Dynamic array of dynamic arrays (`bit [7:0] m[][]`).
     nested: bool,
+    /// Element type is a CLASS (`rand obj arr[]`). Such elements are object
+    /// handles randomized RECURSIVELY (§18.4.1), never drawn as scalars —
+    /// a fresh random draw would overwrite the handle with junk, destroying
+    /// the object reference and any aliasing (`arr[1]==arr[2]`).
+    is_object_elem: bool,
 }
 
 /// A `.size()` constraint on a rand dynamic array (§18.4): the array must be
