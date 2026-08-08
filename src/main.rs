@@ -141,6 +141,11 @@ fn print_usage() {
     eprintln!("                     overrides a `timeunit`/`timeprecision` decl or an active `timescale.");
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
     eprintln!("                   n>=2 offloads stdout writes to a background thread.");
+    eprintln!("  --report-stats   Print a vendor-style statistics footer (printed by default as");
+    eprintln!("                   human text; this flag is accepted for script compatibility).");
+    eprintln!("  --report-stats=json  Emit the footer as a single JSON document (for CI diffing).");
+    eprintln!("  --report-stats-file <path>  Also write the footer (in the --report-stats format)");
+    eprintln!("                   to <path>. The +report=stats plusarg selects the same format.");
     eprintln!("  --cache          Enable the EXPERIMENTAL warm-start design cache (off by default;");
     eprintln!("                   also enabled by XEZIM_ENABLE_CACHE=1 or --cache-dir).");
     eprintln!("  --cache-dir <dir> Store/reuse content-addressed elaborated designs (implies --cache)");
@@ -846,37 +851,72 @@ fn print_design_summary(
     );
 }
 
-/// Peak/current memory and CPU usage, vendor-tool style, so long builds can
-/// be compared against other tools' footers.
-fn print_resource_usage(wall_start: std::time::Instant) {
-    let mut peak = String::new();
-    let mut cur = String::new();
-    if let Ok(st) = std::fs::read_to_string("/proc/self/status") {
-        for line in st.lines() {
-            if let Some(v) = line.strip_prefix("VmHWM:") {
-                peak = v.trim().to_string();
-            } else if let Some(v) = line.strip_prefix("VmRSS:") {
-                cur = v.trim().to_string();
+/// Build a `Report` from the run's phase timings + workload counters and
+/// emit it: the always-on default footer, plus the format requested via
+/// `--report-stats` / `+report=stats`. `--report-stats-file <path>` copies
+/// the same rendering into a file.
+fn emit_report(
+    phases: &xezim::report::Phases,
+    workload: &xezim::report::Workload,
+    report_mode: &xezim::report::ReportMode,
+    report_file: &Option<String>,
+    threads_requested: usize,
+    threads_used: usize,
+) {
+    let (user_s, sys_s) = xezim::report::collect_cpu();
+    let (cur_rss_kb, peak_rss_kb) = xezim::report::collect_memory();
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let report = xezim::report::Report::new(
+        env!("CARGO_PKG_VERSION").to_string(),
+        xezim::report::get_hostname(),
+        cores,
+        threads_requested,
+        threads_used,
+        phases.clone(),
+        xezim::report::Cpu {
+            user_s,
+            sys_s,
+            total_s: user_s + sys_s,
+        },
+        xezim::report::Mem {
+            peak_rss_kb,
+            cur_rss_kb,
+        },
+        workload.clone(),
+        None,
+    );
+    match report_mode {
+        // `Off` is truly silent: library callers pass it to opt out of any
+        // footer. The CLI's always-on footer is `Human` (the default in
+        // main), so `Off` reaching here means the caller asked for silence.
+        xezim::report::ReportMode::Off => {}
+        xezim::report::ReportMode::Human => {
+            let human = xezim::report::render_human(&report);
+            eprint!("{}", human);
+            if let Some(path) = report_file {
+                if let Err(e) = std::fs::write(path, &human) {
+                    eprintln!("Error writing report to {}: {}", path, e);
+                }
             }
         }
-    }
-    #[cfg(unix)]
-    {
-        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } == 0 {
-            let user = ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 / 1e6;
-            let sys = ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 / 1e6;
-            println!(
-                "xezim: CPU Usage - {:.1}s system + {:.1}s user = {:.1}s total (wall {:.1}s)",
-                sys,
-                user,
-                sys + user,
-                wall_start.elapsed().as_secs_f64()
-            );
+        xezim::report::ReportMode::Json => {
+            let json = xezim::report::render_json(&report);
+            eprint!("{}", json);
+            if let Some(path) = report_file {
+                if let Err(e) = std::fs::write(path, &json) {
+                    eprintln!("Error writing report to {}: {}", path, e);
+                }
+            }
         }
-    }
-    if !peak.is_empty() || !cur.is_empty() {
-        println!("xezim: Memory Usage - Current: {}, Peak: {}", cur, peak);
+        xezim::report::ReportMode::File(path) => {
+            let human = xezim::report::render_human(&report);
+            eprint!("{}", human);
+            if let Err(e) = std::fs::write(path, human) {
+                eprintln!("Error writing report to {}: {}", path.display(), e);
+            }
+        }
     }
 }
 
@@ -1187,6 +1227,12 @@ fn main() {
     let mut pdes_c910_stub: Option<String> = None;
     let mut pdes_c910_ticks: u64 = 100;
     let mut multikernel_scope: Option<String> = None;
+    // Always-on statistics footer by default. `Off` is reserved for library
+    // callers who explicitly opt out; the CLI never uses it.
+    let mut report_mode: xezim::report::ReportMode = xezim::report::ReportMode::Human;
+    let mut report_mode_cli_set = false;
+    let mut report_file: Option<String> = None;
+    let mut threads_requested: usize = 1;
 
     let mut include_dirs: Vec<String> = Vec::new();
     let mut defines: Vec<(String, Option<String>)> = Vec::new();
@@ -1434,6 +1480,31 @@ fn main() {
                 mode = Mode::Simulate;
                 mode_explicit = true;
             }
+            "--report-stats" => {
+                report_mode = xezim::report::ReportMode::Human;
+                report_mode_cli_set = true;
+            }
+            _ if arg.starts_with("--report-stats=") => {
+                let fmt = &arg["--report-stats=".len()..];
+                if fmt.eq_ignore_ascii_case("json") {
+                    report_mode = xezim::report::ReportMode::Json;
+                } else {
+                    report_mode = xezim::report::ReportMode::Human;
+                }
+                report_mode_cli_set = true;
+            }
+            "--report-stats-file" => {
+                i += 1;
+                if i < args.len() {
+                    report_file = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: --report-stats-file requires a file name");
+                    std::process::exit(1);
+                }
+            }
+            _ if arg.starts_with("--report-stats-file=") => {
+                report_file = Some(arg["--report-stats-file=".len()..].to_string());
+            }
             "--sv2023" => {
                 // No-op now (default), kept for back-compat with existing scripts.
                 sv_parser::set_sv2023(true);
@@ -1654,11 +1725,13 @@ fn main() {
             "--threads" => {
                 i += 1;
                 if i < args.len() {
-                    threads = args[i].parse().unwrap_or(1).max(1);
+                    threads_requested = args[i].parse().unwrap_or(1);
+                    threads = threads_requested.max(1);
                 }
             }
             _ if arg.starts_with("--threads=") => {
-                threads = arg["--threads=".len()..].parse().unwrap_or(1).max(1);
+                threads_requested = arg["--threads=".len()..].parse().unwrap_or(1);
+                threads = threads_requested.max(1);
             }
             "--cache-dir" => {
                 i += 1;
@@ -1852,6 +1925,23 @@ fn main() {
         i += 1;
     }
 
+    // `+report=stats` (optionally `:json`) selects the footer format without
+    // the CLI flag. Scanned after the loop so plusargs pulled in from `-f`
+    // files are honored too; the CLI flag wins if both appear. The footer is
+    // always on (default `Human`), so the plusarg only picks the format.
+    if !report_mode_cli_set {
+        for pa in &plusargs {
+            if let Some(rest) = pa.strip_prefix("+report=stats") {
+                if rest == ":json" {
+                    report_mode = xezim::report::ReportMode::Json;
+                } else {
+                    report_mode = xezim::report::ReportMode::Human;
+                }
+                break;
+            }
+        }
+    }
+
     if verbose {
         xezim::set_compile_verbose(true);
     }
@@ -2027,25 +2117,29 @@ suppressed but the explicit SDF annotation still applies."
                         sim.fst_scopes = fst_scopes.clone();
                         sim.set_plusargs(&plusargs);
                         sim.set_threads(threads);
+                        sim.set_report_mode(report_mode.clone(), report_file.clone());
                         // Pass the full CLI invocation (binary name +
                         // all args + plusargs) so vpi_get_vlog_info
                         // can hand the same argv back to UVM.
                         sim.set_args(&args);
                         let compilation_start = std::time::Instant::now();
                         sim.compile();
+                        let compile_ms = compilation_start.elapsed().as_secs_f64() * 1000.0;
                         eprintln!(
                             "[PHASE] compilation: {:.1}ms",
-                            compilation_start.elapsed().as_secs_f64() * 1000.0
+                            compile_ms
                         );
                         let simulation_start = std::time::Instant::now();
                         sim.simulate();
+                        let sim_ms = simulation_start.elapsed().as_secs_f64() * 1000.0;
                         eprintln!(
                             "[PHASE] simulation: {:.1}ms",
-                            simulation_start.elapsed().as_secs_f64() * 1000.0
+                            sim_ms
                         );
+                        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
                         eprintln!(
                             "[PHASE] total: {:.1}ms",
-                            total_start.elapsed().as_secs_f64() * 1000.0
+                            total_ms
                         );
                         println!("------------------------------");
                         println!("Simulation finished at time {}", sim.time);
@@ -2055,6 +2149,18 @@ suppressed but the explicit SDF annotation still applies."
                         if sim.stuck_clock_aborted {
                             std::process::exit(3);
                         }
+                        emit_report(
+                            &xezim::report::Phases {
+                                compile_ms,
+                                sim_ms,
+                                total_ms,
+                            },
+                            &sim.workload_summary(),
+                            &report_mode,
+                            &report_file,
+                            threads_requested,
+                            threads,
+                        );
                         return;
                     }
                     Ok(None) => {}
@@ -2367,7 +2473,26 @@ suppressed but the explicit SDF annotation still applies."
                     append_adopted_libs_to_merged(mo);
                 }
                 print_design_summary(&_defs, &elab);
-                print_resource_usage(compile_wall_start);
+                let total_ms = compile_wall_start.elapsed().as_secs_f64() * 1000.0;
+                emit_report(
+                    &xezim::report::Phases {
+                        compile_ms: total_ms,
+                        sim_ms: 0.0,
+                        total_ms,
+                    },
+                    &xezim::report::Workload {
+                        sim_time_ns: 0,
+                        insns: 0,
+                        delta_cycles: 0,
+                        nba_events: 0,
+                        edge_fires: 0,
+                        signal_count: 0,
+                    },
+                    &report_mode,
+                    &report_file,
+                    threads_requested,
+                    threads,
+                );
                 // §6.21: keep compiled artifacts consistent with the simulate
                 // path — re-issue static initializers that call simulation-time
                 // system functions as time-0 assignments (issue #26).
@@ -2431,28 +2556,32 @@ suppressed but the explicit SDF annotation still applies."
     match xezim::simulate_multi(
         &sources,
         max_time,
-        top_module.as_deref(),
-        &include_dirs,
-        &source_files,
-        settle_limit,
-        activity_mon,
-        sdf_file.as_deref(),
-        sdf_select,
-        &defines,
-        &plusargs,
-        threads,
-        xtrace_file.as_deref(),
-        &xtrace_scopes,
-        xtrace_from_ns,
-        xtrace_to_ns,
-        fst_file.as_deref(),
-        &fst_scopes,
-        emit_hypergraph.as_deref(),
-        load_partition.as_deref(),
-        write_profile.as_deref(),
-        profile_input.as_deref(),
-        collapse_islands,
-        multikernel_scope.as_deref(),
+        xezim::SimOptions {
+            top_module_name: top_module,
+            include_dirs,
+            source_paths: source_files,
+            settle_limit,
+            activity_mon,
+            sdf_file,
+            sdf_select,
+            defines,
+            plusargs,
+            threads,
+            xtrace_file,
+            xtrace_scopes,
+            xtrace_from_ns,
+            xtrace_to_ns,
+            fst_file,
+            fst_scopes,
+            emit_hypergraph,
+            load_partition,
+            write_profile,
+            profile_input,
+            collapse_islands,
+            multikernel_scope,
+            report_mode: report_mode.clone(),
+            report_file: report_file.clone(),
+        },
     ) {
         Ok(sim) => {
             println!("------------------------------");
@@ -2460,6 +2589,16 @@ suppressed but the explicit SDF annotation still applies."
                 append_adopted_libs_to_merged(mo);
             }
             println!("Simulation finished at time {}", sim.time);
+            if let Some(phases) = sim.phases_summary() {
+                emit_report(
+                    &phases,
+                    &sim.workload_summary(),
+                    &report_mode,
+                    &report_file,
+                    threads_requested,
+                    threads,
+                );
+            }
             if sim.finished {
                 println!("($finish called)");
             }

@@ -16,6 +16,7 @@ libloading = "0.8"
 libffi = "3"
 libc = "0.2"
 serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
 bincode = "1.3"
 once_cell = "1.18"
 # JIT: enabled with `--features jit`. Kept optional to avoid adding the
@@ -38,6 +39,9 @@ fst-writer = "0.3"
 libffi = { version = "3", features = ["system"] }
 
 [dev-dependencies]
+# `tests/perf_report_data.rs` parses the JSON stats report emitted by the
+# library's `render_json` for field-level assertions.
+serde_json = "1"
 # `tests/xtrace_conformance.rs` reads a zstd-compressed XTrace dump back to
 # check that its header declares the compression (XTrace §6.8). Same version
 # xezim-core writes the stream with.

@@ -65,28 +65,11 @@ fn dump_scoped(tag: &str, src: &str, scopes: &[String]) -> String {
     let sim = xezim::simulate_multi(
         &[src.to_string()],
         1_000_000,
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        None,
-        None,
-        &[],
-        &[],
-        1,
-        Some(path.to_str().unwrap()),
-        scopes,
-        0,
-        u64::MAX,
-        None,
-        &[],
-        None,
-        None,
-        None,
-        None,
-        false,
-        None,
+        xezim::SimOptions {
+            xtrace_file: Some(path.to_str().unwrap().to_string()),
+            xtrace_scopes: scopes.to_vec(),
+            ..Default::default()
+        },
     );
     sim.expect("simulate failed");
     let text = fs::read_to_string(&path)

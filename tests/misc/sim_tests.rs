@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xezim::compiler::Value;
-use xezim::{simulate, simulate_multi};
+use xezim::{simulate, simulate_multi, SimOptions};
 
 fn sim_ok(src: &str) -> xezim::compiler::Simulator {
     match simulate(src, 100_000) {
@@ -19,28 +19,10 @@ fn sim_ok_plusargs(src: &str, plusargs: &[&str]) -> xezim::compiler::Simulator {
     match simulate_multi(
         &[source],
         100_000,
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        None,
-        None,
-        &[],
-        &plusargs_vec,
-        1,
-        None,
-        &[],
-        0,
-        u64::MAX,
-        None,
-        &[],
-        None,
-        None,
-        None,
-        None,
-        false,
-        None,
+        SimOptions {
+            plusargs: plusargs_vec.to_vec(),
+            ..Default::default()
+        },
     ) {
         Ok(sim) => sim,
         Err(e) => panic!("Simulation failed: {}", e),

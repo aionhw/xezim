@@ -14,34 +14,16 @@
 //! never advances. xezim used to spin there forever, printing nothing; the user
 //! just sees "stuck at time 0". It now stops and names the offending processes.
 
-use xezim::simulate_multi;
+use xezim::{simulate_multi, SimOptions};
 
 fn run(src: &str, plusargs: &[String]) -> xezim::compiler::Simulator {
     simulate_multi(
         &[src.to_string()],
         100_000,
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        None,
-        None,
-        &[],
-        plusargs,
-        1,
-        None,
-        &[],
-        0,
-        u64::MAX,
-        None,
-        &[],
-        None,
-        None,
-        None,
-        None,
-        false,
-        None,
+        SimOptions {
+            plusargs: plusargs.to_vec(),
+            ..Default::default()
+        },
     )
     .expect("simulate failed")
 }

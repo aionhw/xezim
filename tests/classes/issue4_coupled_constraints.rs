@@ -32,28 +32,10 @@ fn run_seed(src: &str, seed: u64) -> xezim::compiler::Simulator {
     xezim::simulate_multi(
         &[src.to_string()],
         1000,
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        None,
-        None,
-        &[],
-        &plus,
-        1,
-        None,
-        &[],
-        0,
-        u64::MAX,
-        None,
-        &[],
-        None,
-        None,
-        None,
-        None,
-        false,
-        None,
+        xezim::SimOptions {
+            plusargs: plus.to_vec(),
+            ..Default::default()
+        },
     )
     .expect("simulate failed")
 }

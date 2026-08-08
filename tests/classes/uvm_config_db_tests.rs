@@ -6,7 +6,7 @@
 //! binary path, no reference simulator. Reference comparison belongs in the dev
 //! workflow, not in the committed suite.
 
-use xezim::simulate_multi;
+use xezim::{simulate_multi, SimOptions};
 
 /// Root of a 1800.2 UVM checkout (the directory holding `src/uvm_pkg.sv`), or
 /// None when this machine has no copy.
@@ -52,28 +52,11 @@ fn run_in_process(src: &str) -> Option<String> {
     let sim = simulate_multi(
         &[uvm_pkg, src.to_string()],
         50_000,
-        Some("top"),
-        &[inc],
-        &[],
-        None,
-        false,
-        None,
-        None,
-        &[],
-        &[],
-        1,
-        None,
-        &[],
-        0,
-        u64::MAX,
-        None,
-        &[],
-        None,
-        None,
-        None,
-        None,
-        false,
-        None,
+        SimOptions {
+            top_module_name: Some("top".to_string()),
+            include_dirs: vec![inc],
+            ..Default::default()
+        },
     )
     .expect("simulation failed");
 

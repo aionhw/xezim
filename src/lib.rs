@@ -9,6 +9,7 @@
 pub mod compiler;
 pub mod intra_delay;
 pub mod multikernel;
+pub mod report;
 pub mod should_fail_lint;
 
 use xezim_core::elaborate;
@@ -624,62 +625,114 @@ fn reinstall_ooc_constraint_bodies(
     }
 }
 
+/// Options for [`simulate_multi`]. `Default` provides the no-option baseline:
+/// no top module override, no include dirs, single-threaded, no tracing/FST,
+/// no report footer. Call sites that need a couple of fields can build
+/// `SimOptions { threads: 4, ..Default::default() }`.
+#[derive(Debug, Clone)]
+pub struct SimOptions {
+    pub top_module_name: Option<String>,
+    pub include_dirs: Vec<String>,
+    pub source_paths: Vec<String>,
+    pub settle_limit: Option<u32>,
+    pub activity_mon: bool,
+    pub sdf_file: Option<String>,
+    pub sdf_select: Option<xezim_core::sdf::DelaySelect>,
+    pub defines: Vec<(String, Option<String>)>,
+    pub plusargs: Vec<String>,
+    pub threads: usize,
+    pub xtrace_file: Option<String>,
+    pub xtrace_scopes: Vec<String>,
+    pub xtrace_from_ns: u64,
+    pub xtrace_to_ns: u64,
+    pub fst_file: Option<String>,
+    pub fst_scopes: Vec<String>,
+    pub emit_hypergraph: Option<String>,
+    pub load_partition: Option<String>,
+    pub write_profile: Option<String>,
+    pub profile_input: Option<String>,
+    pub collapse_islands: bool,
+    pub multikernel_scope: Option<String>,
+    pub report_mode: report::ReportMode,
+    pub report_file: Option<String>,
+}
+
+impl Default for SimOptions {
+    fn default() -> Self {
+        SimOptions {
+            top_module_name: None,
+            include_dirs: Vec::new(),
+            source_paths: Vec::new(),
+            settle_limit: None,
+            activity_mon: false,
+            sdf_file: None,
+            sdf_select: None,
+            defines: Vec::new(),
+            plusargs: Vec::new(),
+            threads: 1,
+            xtrace_file: None,
+            xtrace_scopes: Vec::new(),
+            xtrace_from_ns: 0,
+            xtrace_to_ns: u64::MAX,
+            fst_file: None,
+            fst_scopes: Vec::new(),
+            emit_hypergraph: None,
+            load_partition: None,
+            write_profile: None,
+            profile_input: None,
+            collapse_islands: false,
+            multikernel_scope: None,
+            report_mode: report::ReportMode::Off,
+            report_file: None,
+        }
+    }
+}
+
 /// Simulate a single source string.
 pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, String> {
-    simulate_multi(
-        &[source.to_string()],
-        max_time,
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        None,
-        None,
-        &[],
-        &[],
-        1,
-        None,
-        &[],
-        0,
-        u64::MAX,
-        None,
-        &[],
-        None,
-        None,
-        None,
-        None,
-        false,
-        None,
-    )
+    simulate_multi(&[source.to_string()], max_time, SimOptions::default())
 }
 
 pub fn simulate_multi(
     sources: &[String],
     max_time: u64,
-    top_module_name: Option<&str>,
-    include_dirs: &[String],
-    source_paths: &[String],
-    settle_limit: Option<u32>,
-    activity_mon: bool,
-    sdf_file: Option<&str>,
-    sdf_select: Option<xezim_core::sdf::DelaySelect>,
-    defines: &[(String, Option<String>)],
-    plusargs: &[String],
-    threads: usize,
-    xtrace_file: Option<&str>,
-    xtrace_scopes: &[String],
-    xtrace_from_ns: u64,
-    xtrace_to_ns: u64,
-    fst_file: Option<&str>,
-    fst_scopes: &[String],
-    emit_hypergraph: Option<&str>,
-    load_partition: Option<&str>,
-    write_profile: Option<&str>,
-    profile_input: Option<&str>,
-    collapse_islands: bool,
-    multikernel_scope: Option<&str>,
+    options: SimOptions,
 ) -> Result<compiler::Simulator, String> {
+    let SimOptions {
+        top_module_name,
+        include_dirs,
+        source_paths,
+        settle_limit,
+        activity_mon,
+        sdf_file,
+        sdf_select,
+        defines,
+        plusargs,
+        threads,
+        xtrace_file,
+        xtrace_scopes,
+        xtrace_from_ns,
+        xtrace_to_ns,
+        fst_file,
+        fst_scopes,
+        emit_hypergraph,
+        load_partition,
+        write_profile,
+        profile_input,
+        collapse_islands,
+        multikernel_scope,
+        report_mode,
+        report_file,
+    } = options;
+    let top_module_name = top_module_name.as_deref();
+    let sdf_file = sdf_file.as_deref();
+    let xtrace_file = xtrace_file.as_deref();
+    let fst_file = fst_file.as_deref();
+    let emit_hypergraph = emit_hypergraph.as_deref();
+    let load_partition = load_partition.as_deref();
+    let write_profile = write_profile.as_deref();
+    let profile_input = profile_input.as_deref();
+    let multikernel_scope = multikernel_scope.as_deref();
     let total_start = std::time::Instant::now();
     let compilation_start = std::time::Instant::now();
     // IEEE 1800-2017 §9.4.5: the parser discards intra-assignment delays
@@ -693,7 +746,7 @@ pub fn simulate_multi(
     let mut cache_pp_texts: Vec<String> = Vec::new();
     let cache_key = cache.as_ref().map(|config| {
         let (key, texts) =
-            design_cache_key(config, &sources, source_paths, top_module_name, include_dirs, defines);
+            design_cache_key(config, &sources, &source_paths, top_module_name, &include_dirs, &defines);
         cache_pp_texts = texts;
         key
     });
@@ -729,14 +782,14 @@ pub fn simulate_multi(
         let (definitions, mut elab) = parse_and_elaborate_multi(
             &sources,
             top_module_name,
-            include_dirs,
-            source_paths,
-            defines,
+            &include_dirs,
+            &source_paths,
+            &defines,
         )?;
 
         // §18.5.1: recover any out-of-class constraint body that the class-table
         // repopulation in `inline_instantiations` dropped.
-        reinstall_ooc_constraint_bodies(&sources, source_paths, include_dirs, defines, &mut elab);
+        reinstall_ooc_constraint_bodies(&sources, &source_paths, &include_dirs, &defines, &mut elab);
 
         // Second-pass `should_fail` lint (additive — reuses the elaboration above,
         // no extra cost; does not alter elaborate/simulate behavior). Rejecting
@@ -787,8 +840,9 @@ pub fn simulate_multi(
     sim.xtrace_to_ns = xtrace_to_ns;
     sim.fst_file = fst_file.map(|s| s.to_string());
     sim.fst_scopes = fst_scopes.to_vec();
-    sim.set_plusargs(plusargs);
+    sim.set_plusargs(&plusargs);
     sim.set_threads(threads);
+    sim.set_report_mode(report_mode, report_file);
     // Default argv for vpi_get_vlog_info — the real CLI passes the
     // full tokenized list via set_args() in main.rs. Here we hand
     // back just "xezim" + plusargs so UVM's tool banner works for
@@ -812,9 +866,10 @@ pub fn simulate_multi(
         sim.sdf_annotation = Some(annotation);
     }
     sim.compile();
+    let compile_ms = compilation_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
         "[PHASE] compilation: {:.1}ms",
-        compilation_start.elapsed().as_secs_f64() * 1000.0
+        compile_ms
     );
 
     if let Some(path) = emit_hypergraph {
@@ -920,9 +975,10 @@ pub fn simulate_multi(
 
     let simulation_start = std::time::Instant::now();
     sim.simulate();
+    let sim_ms = simulation_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
         "[PHASE] simulation: {:.1}ms",
-        simulation_start.elapsed().as_secs_f64() * 1000.0
+        sim_ms
     );
 
     if let Some(path) = write_profile {
@@ -946,6 +1002,11 @@ pub fn simulate_multi(
     // The result line itself is the CLI's to print, on stdout (main.rs). Printing
     // it here too put it on BOTH streams, so it appeared twice in any terminal
     // or merged log.
+    sim.report_phases = Some(report::Phases {
+        compile_ms,
+        sim_ms,
+        total_ms: total_elapsed.as_secs_f64() * 1000.0,
+    });
     Ok(sim)
 }
 

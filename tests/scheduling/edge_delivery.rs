@@ -15,34 +15,16 @@
 //! genuine zero-delay livelock, which must then hit the stall detector and
 //! terminate with an attributed report instead of hanging.
 
-use xezim::simulate_multi;
+use xezim::{simulate_multi, SimOptions};
 
 fn run(src: &str, plusargs: &[String]) -> xezim::compiler::Simulator {
     simulate_multi(
         &[src.to_string()],
         100_000,
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        None,
-        None,
-        &[],
-        plusargs,
-        1,
-        None,
-        &[],
-        0,
-        u64::MAX,
-        None,
-        &[],
-        None,
-        None,
-        None,
-        None,
-        false,
-        None,
+        SimOptions {
+            plusargs: plusargs.to_vec(),
+            ..Default::default()
+        },
     )
     .expect("simulate failed")
 }
