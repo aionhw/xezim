@@ -52,6 +52,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_proc_net_assign(&m.items, &mut errs);
                 check_enum_assign(&m.items, elab, &mut errs);
                 check_specparam_use(&m.items, &m.specparams, &mut errs);
+                check_param_class_scope(&m.items, elab, &mut errs);
                 check_dynarray_assign(&m.items, elab, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
@@ -63,6 +64,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     check_module_item(it, elab, &mut errs);
                 }
                 check_specparam_use(&m.items, &m.specparams, &mut errs);
+                check_param_class_scope(&m.items, elab, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_instantiations(&m.items, &port_map, &mut errs);
@@ -73,6 +75,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     check_module_item(it, elab, &mut errs);
                 }
                 check_specparam_use(&m.items, &m.specparams, &mut errs);
+                check_param_class_scope(&m.items, elab, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_program_items(&m.items, &mut errs);
@@ -1216,6 +1219,72 @@ fn check_enum_values(et: &EnumType, elab: &ElaboratedModule, errs: &mut Vec<Stri
 /// §8.20: a `pure virtual` method (or any method qualified `pure`) is legal
 /// only inside a *virtual* (abstract) class or an interface class. A concrete
 /// class declaring one is an error.
+/// §8.25: "For a parameterized class C, the default specialization is C#().
+/// Other than as the prefix of the scope resolution operator, use of the
+/// unadorned name of a parameterized class shall denote the default
+/// specialization of the class." So `par_cls::member` — the unadorned name of
+/// a parameterized class as the `::` prefix — does NOT denote the default
+/// specialization and is illegal; a legal form must specialize explicitly
+/// (`par_cls#()::member`, `par_cls#(15)::member`). The AST distinguishes the
+/// two: the legal form's MemberAccess base is a `Specialization`, the illegal
+/// form's base is a bare `Ident`.
+fn check_param_class_scope(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut Vec<String>) {
+    for it in items {
+        match it {
+            ModuleItem::AlwaysConstruct(a) => {
+                for_each_stmt_expr(&a.stmt, &mut |e| check_scope_expr(e, elab, errs))
+            }
+            ModuleItem::InitialConstruct(i) => {
+                for_each_stmt_expr(&i.stmt, &mut |e| check_scope_expr(e, elab, errs))
+            }
+            ModuleItem::FinalConstruct(fc) => {
+                for_each_stmt_expr(&fc.stmt, &mut |e| check_scope_expr(e, elab, errs))
+            }
+            ModuleItem::ContinuousAssign(ca) => {
+                for (l, r) in &ca.assignments {
+                    check_scope_expr(l, elab, errs);
+                    check_scope_expr(r, elab, errs);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_scope_expr(e: &Expression, elab: &ElaboratedModule, errs: &mut Vec<String>) {
+    for_each_expr(e, &mut |x| {
+        if let ExprKind::MemberAccess { expr, .. } = &x.kind {
+            // Bare `Class::member` base: a single-segment Ident (NOT a
+            // Specialization). Only fires when that name names a
+            // parameterized class and is not shadowed by a signal.
+            let base_name = match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    h.path[0].name.name.clone()
+                }
+                _ => return,
+            };
+            if elab.signals.contains_key(&base_name) {
+                return;
+            }
+            if let Some(cls) = elab.classes.get(&base_name) {
+                // Only the class HEADER `#(...)` list makes it parameterized.
+                // `param_defaults` also holds class-BODY localparams, and a
+                // class with only body localparams is NOT parameterized
+                // (mirrors simulator's `class_is_parameterized`).
+                let has_params = !cls.param_order.is_empty() || !cls.type_param_names.is_empty();
+                if has_params {
+                    errs.push(format!(
+                        "class '{}' is parameterized; scope resolution without a \
+                         specialization ('{}::') is illegal — use '{}#(...)::' \
+                         (LRM 1800-2017 §8.25)",
+                        base_name, base_name, base_name
+                    ));
+                }
+            }
+        }
+    });
+}
+
 /// §18.5.2: "A pure constraint represents an obligation on any non-abstract
 /// derived class (i.e., a derived class that is not virtual) to provide a
 /// constraint of the same name. It shall be an error if a non-abstract class

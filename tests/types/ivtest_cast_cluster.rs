@@ -2601,3 +2601,40 @@ endclass
 "#;
     assert!(!rejected(SRC), "implemented pure constraint must pass");
 }
+
+#[test]
+fn group_b_parametrized_class_bare_scope_rejected() {
+    // sv-tests chapter-8/8.25.1--parametrized_class_invalid_scope_resolution.sv
+    // — an unadorned parameterized class as a `::` prefix does NOT denote the
+    // default specialization (IEEE 1800-2017 §8.25).
+    const SRC: &str = r#"module class_tb ();
+	class par_cls #(int a = 25);
+		parameter int b = 23;
+	endclass
+	par_cls #(15) inst;
+	initial begin
+		inst = new;
+		$display(par_cls::b);
+	end
+endmodule
+"#;
+    assert!(rejected(SRC), "bare parameterized class scope resolution must be rejected");
+}
+
+#[test]
+fn group_b_parametrized_class_specialized_scope_passes() {
+    // sv-tests chapter-8/8.25.1--parametrized_class_scope_resolution.sv — an
+    // explicit empty specialization IS the default specialization, legal.
+    const SRC: &str = r#"module class_tb ();
+	class par_cls #(int a = 25);
+		parameter int b = 23;
+	endclass
+	par_cls #(15) inst;
+	initial begin
+		inst = new;
+		$display(par_cls#()::b);
+	end
+endmodule
+"#;
+    assert!(!rejected(SRC), "specialized parameterized class scope must pass");
+}
