@@ -102,28 +102,10 @@ endmodule
     let sim = xezim::simulate_multi(
         &[src],
         100,
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        None,
-        None,
-        &[],
-        &plusargs,
-        1,
-        None,
-        &[],
-        0,
-        u64::MAX,
-        None,
-        &[],
-        None,
-        None,
-        None,
-        None,
-        false,
-        None,
+        xezim::SimOptions {
+            plusargs: plusargs.to_vec(),
+            ..Default::default()
+        },
     )
     .expect("simulate failed");
     assert_eq!(

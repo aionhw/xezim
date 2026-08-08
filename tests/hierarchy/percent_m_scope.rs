@@ -9,8 +9,12 @@ use xezim::simulate;
 
 fn line(src: &str, top: &str) -> Vec<String> {
     xezim::simulate_multi(
-        &[src.to_string()], 1000, Some(top), &[], &[], None, false, None, None,
-        &[], &[], 1, None, &[], 0, u64::MAX, None, &[], None, None, None, None, false, None,
+        &[src.to_string()],
+        1000,
+        xezim::SimOptions {
+            top_module_name: Some(top.to_string()),
+            ..Default::default()
+        },
     )
     .expect("sim")
     .output

@@ -26,28 +26,10 @@ fn elab_err(files: &[(&str, &str)]) -> String {
     let res = xezim::simulate_multi(
         &sources,
         10,
-        None,
-        &[],
-        &paths,
-        None,
-        false,
-        None,
-        None,
-        &[],
-        &[],
-        1,
-        None,
-        &[],
-        0,
-        u64::MAX,
-        None,
-        &[],
-        None,
-        None,
-        None,
-        None,
-        false,
-        None,
+        xezim::SimOptions {
+            source_paths: paths.to_vec(),
+            ..Default::default()
+        },
     );
     match res {
         Ok(_) => panic!("expected a duplicate-declaration error, but it elaborated"),
@@ -129,8 +111,12 @@ fn local_declaration_beats_an_unimported_packages_enum_member() {
     ];
     let paths = ["pkg.sv".to_string(), "bfm.sv".to_string()];
     let sim = xezim::simulate_multi(
-        &sources, 10, None, &[], &paths, None, false, None, None, &[], &[], 1,
-        None, &[], 0, u64::MAX, None, &[], None, None, None, None, false, None,
+        &sources,
+        10,
+        xezim::SimOptions {
+            source_paths: paths.to_vec(),
+            ..Default::default()
+        },
     )
     .expect("a local declaration must not collide with an unimported package's enum member");
     let v = sim

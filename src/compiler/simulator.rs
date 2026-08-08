@@ -4261,6 +4261,18 @@ pub struct Simulator {
     /// entry is the binary name (xezim), the rest are CLI args + plusargs
     /// concatenated. Pointers stay stable across the simulator lifetime.
     vpi_argv: Vec<*mut libc::c_char>,
+    /// Statistics footer mode requested via CLI (`--report-stats`) or
+    /// plusarg (`+report=stats`). Stored here so the compiled-artifact
+    /// fast path and library callers share the same plumbing.
+    report_mode: crate::report::ReportMode,
+    /// Destination path for `--report-stats-file <path>`.
+    report_file: Option<String>,
+    /// Phase timings captured by `simulate_multi` at the same `Instant`s
+    /// the `[PHASE]` lines use; consumed by the statistics footer.
+    pub(crate) report_phases: Option<crate::report::Phases>,
+    /// Cumulative count of NBA updates applied over the whole run
+    /// (incremented in `apply_nba`; reported in the workload summary).
+    nba_events: u64,
     /// Cache of DPI scope handles keyed by hierarchical scope name.
     /// Each value is a `Box<DpiScope>` raw pointer handed out to C code
     /// via `svGetScopeFromName` and recovered in `svGetNameFromScope`.
@@ -6579,6 +6591,10 @@ impl Simulator {
             // (lib.rs / main.rs) overwrite this with the actual CLI.
             vpi_arg_cstrings: Vec::new(),
             vpi_argv: Vec::new(),
+            report_mode: crate::report::ReportMode::Off,
+            report_file: None,
+            report_phases: None,
+            nba_events: 0,
             dpi_scopes: HashMap::default(),
             dpi_value_change_cbs: HashMap::default(),
             dpi_next_time_cbs: Vec::new(),
@@ -6667,6 +6683,33 @@ impl Simulator {
     pub fn set_threads(&mut self, n: usize) {
         self.threads = n.max(1);
         self.pdes_worker_pool = None;
+    }
+
+    /// Set the statistics footer mode and optional destination file.
+    pub fn set_report_mode(&mut self, mode: crate::report::ReportMode, file: Option<String>) {
+        self.report_mode = mode;
+        self.report_file = file;
+    }
+
+    /// Report the phase timings captured by `simulate_multi` (same
+    /// `Instant`s as the `[PHASE]` lines). `None` when the run did not
+    /// reach the simulation stage.
+    pub fn phases_summary(&self) -> Option<crate::report::Phases> {
+        self.report_phases.clone()
+    }
+
+    /// Compile the workload counters that exist today into a report
+    /// payload: executed instructions, event-loop (delta) iterations,
+    /// NBA updates, edge fires, and the signal-table size.
+    pub fn workload_summary(&self) -> crate::report::Workload {
+        crate::report::Workload {
+            sim_time_ns: self.time,
+            insns: self.prof_insns_executed,
+            delta_cycles: self.loop_iters,
+            nba_events: self.nba_events,
+            edge_fires: self.prof_edges_fired,
+            signal_count: self.signal_table.len(),
+        }
     }
 
     /// Reuse the runtime-neutral combinational worklist associated with an
@@ -28239,6 +28282,7 @@ impl Simulator {
         // Reset the per-window partial-NBA index.
         self.nba_fast_index.clear();
         let mut nba = std::mem::take(&mut self.nba_fast);
+        self.nba_events = self.nba_events.saturating_add(nba.len() as u64);
 
         // PDES Phase 1.5/2: bucket NBAs by LP writer only when explicitly
         // requested. The serial bucket path is useful for classifier

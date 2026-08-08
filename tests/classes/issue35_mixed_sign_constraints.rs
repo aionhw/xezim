@@ -139,31 +139,13 @@ endmodule
         );
         let plus = vec![format!("seed={}", seed)];
         let sim = xezim::simulate_multi(
-            &[src],
-            1000,
-            None,
-            &[],
-            &[],
-            None,
-            false,
-            None,
-            None,
-            &[],
-            &plus,
-            1,
-            None,
-            &[],
-            0,
-            u64::MAX,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
-            false,
-            None,
-        )
+        &[src],
+        1000,
+        xezim::SimOptions {
+            plusargs: plus.to_vec(),
+            ..Default::default()
+        },
+    )
         .expect("simulate failed");
         assert_eq!(u(&sim, "ok_flag"), 1, "seed {}: solve must succeed", seed);
         let got = u(&sim, "got");

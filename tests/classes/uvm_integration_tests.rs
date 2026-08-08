@@ -20,28 +20,12 @@ fn test_uvm_complete() {
     let res = simulate_multi(
         &[uvm_pkg, test_src],
         2000,
-        Some("top"),
-        &include_dirs,
-        &[],
-        None,
-        false,
-        None,
-        None,
-        &defines,
-        &[],
-        1,
-        None,
-        &[],
-        0,
-        u64::MAX,
-        None,
-        &[],
-        None,
-        None,
-        None,
-        None,
-        false,
-        None,
+        SimOptions {
+            top_module_name: Some("top".to_string()),
+            include_dirs: include_dirs.to_vec(),
+            defines: defines.to_vec(),
+            ..Default::default()
+        },
     );
 
     assert!(res.is_ok(), "UVM Complete test failed: {:?}", res.err());
@@ -64,28 +48,12 @@ fn test_uvm_hello_world() {
     let res = simulate_multi(
         &[uvm_pkg, test_src],
         10000,
-        Some("hello_world"),
-        &include_dirs,
-        &[],
-        None,
-        false,
-        None,
-        None,
-        &defines,
-        &[],
-        1,
-        None,
-        &[],
-        0,
-        u64::MAX,
-        None,
-        &[],
-        None,
-        None,
-        None,
-        None,
-        false,
-        None,
+        SimOptions {
+            top_module_name: Some("hello_world".to_string()),
+            include_dirs: include_dirs.to_vec(),
+            defines: defines.to_vec(),
+            ..Default::default()
+        },
     );
 
     assert!(res.is_ok(), "UVM Hello World test failed: {:?}", res.err());
