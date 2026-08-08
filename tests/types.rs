@@ -95,6 +95,8 @@ mod module_type_param_behavioral;
 mod multi_dim_elem_read_and_param_dims;
 #[path = "types/ascending_indexed_part_select.rs"]
 mod ascending_indexed_part_select;
+#[path = "types/nettype_resolver_dispatch.rs"]
+mod nettype_resolver_dispatch;
 #[path = "types/nonzero_based_vector_writes.rs"]
 mod nonzero_based_vector_writes;
 #[path = "types/nonzero_based_vector_reads.rs"]
