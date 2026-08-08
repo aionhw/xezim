@@ -57,6 +57,7 @@ Current capabilities include:
   custom HDL-backdoor force/release layer, or your own UVM extensions). The
   repo ships minimal `svdpi.h` and `vpi_user.h` so DPI code compiles without a
   vendor install. See [docs/dpi-guide.md](docs/dpi-guide.md).
+* [`docs/dev/README.md`](docs/dev/README.md) — developer documentation (architecture, debugging, testing, gotchas)
 * **Event-control `iff` guards** (LRM §9.4.2.3) — `@(posedge clk iff rst_n)`
   is honored in both procedural `@` waits and edge-sensitive `always` blocks:
   the process resumes only on an edge where the guard holds.
