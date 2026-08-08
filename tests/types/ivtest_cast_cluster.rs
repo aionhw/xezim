@@ -2516,6 +2516,38 @@ endmodule
 }
 
 #[test]
+fn group_b_enum_block_local_int_assign_rejected() {
+    // sv-tests chapter-6/6.19.3--enum_type_checking_inv.sv — the enum var is
+    // declared INSIDE a procedural block, which must be tracked too.
+    const SRC: &str = r#"module top();
+typedef enum {a, b, c, d} e;
+initial begin
+  e val;
+  val = 1;
+end
+endmodule
+"#;
+    assert!(rejected(SRC), "block-local enum var assigned an int literal (no cast) must be rejected");
+}
+
+#[test]
+fn group_b_enum_compound_assign_rejected() {
+    // sv-tests chapter-6/6.19.4--enum_numerical_expr_no_cast.sv — `e += 1`
+    // expands to `e = e + 1`: the enum is used in an arithmetic expression
+    // without a cast to its base type.
+    const SRC: &str = r#"module top();
+typedef enum {a, b, c, d} e;
+e val;
+initial begin
+  val = a;
+  val += 1;
+end
+endmodule
+"#;
+    assert!(rejected(SRC), "enum compound assignment (e += 1, no cast) must be rejected");
+}
+
+#[test]
 fn group_b_specparam_in_parameter_expr_rejected() {
     // sv-tests chapter-6/6.20.5--specparam_inv.sv — a specparam "can appear
     // in any expression that is not assigned to a parameter" (§6.20.5), so

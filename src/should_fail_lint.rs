@@ -337,11 +337,32 @@ fn is_nonenum_integral_var(e: &Expression, elab: &ElaboratedModule) -> bool {
     }
 }
 
-/// §6.19.3: reject `enum_var = <integer literal>` (no explicit cast). Covers
-/// both procedural (`e = 1;`) and continuous (`assign e = 1;`) assignments.
-/// Deliberately narrow — only a bare integer-literal RHS to a WHOLE enum
-/// variable fires, so legal enum-member / same-type / cast assignments are
-/// untouched.
+/// §6.19.4: a compound assignment (`e += x`, `e -= x`, …) is the enum var
+/// used in an arithmetic expression without a cast to its base type, which is
+/// illegal. The parser expands `e += x` to `e = e + x`, so the RHS is a
+/// `Binary` whose LEFT operand is the same enum var — that shape is the
+/// unambiguous compound-assignment case (a cast would parse as a `SystemCall`,
+/// and a plain `e = a + b` where neither side is `e` doesn't match `b`).
+fn is_enum_arith_rhs(e: &Expression, enum_var: &str) -> bool {
+    match &e.kind {
+        ExprKind::Binary { left, .. } => {
+            if let ExprKind::Ident(h) = &left.kind {
+                h.path.len() == 1 && h.path[0].name.name == enum_var && h.path[0].selects.is_empty()
+            } else {
+                false
+            }
+        }
+        ExprKind::Paren(inner) => is_enum_arith_rhs(inner, enum_var),
+        _ => false,
+    }
+}
+
+/// §6.19.3/§6.19.4: reject assigning a non-enum value to an enum variable
+/// without an explicit cast. Covers both procedural (`e = 1;`, `e += 1;`) and
+/// continuous (`assign e = 1;`) assignments. Deliberately narrow — only a
+/// bare integer-literal RHS, a definitely-integral non-enum var RHS, or the
+/// compound-assignment desugar fires, so legal enum-member / same-type / cast
+/// assignments are untouched.
 fn check_enum_assign(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut Vec<String>) {
     use std::collections::HashSet;
     let mut enum_vars: HashSet<String> = HashSet::new();
@@ -359,6 +380,28 @@ fn check_enum_assign(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut V
             }
             _ => {}
         }
+        // §6.19.3: an enum var declared INSIDE a procedural block (`initial` /
+        // `always`, incl. nested blocks) is enum-typed too — `e v; v = 1;`
+        // inside an `initial` is just as illegal as at module scope.
+        let stmt = match it {
+            ModuleItem::AlwaysConstruct(a) => &a.stmt,
+            ModuleItem::InitialConstruct(i) => &i.stmt,
+            _ => continue,
+        };
+        for_each_stmt(stmt, &mut |s| {
+            if let StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } = &s.kind
+            {
+                if resolves_to_enum(data_type, elab) {
+                    for d in declarators {
+                        enum_vars.insert(d.name.name.clone());
+                    }
+                }
+            }
+        });
     }
     if enum_vars.is_empty() {
         return;
@@ -374,7 +417,9 @@ fn check_enum_assign(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut V
         if matches!(lv.kind, ExprKind::Ident(_)) {
             if let Some(b) = base_ident(lv) {
                 if enum_vars.contains(&b)
-                    && (is_bare_integer_rhs(rv) || is_nonenum_integral_var(rv, elab))
+                    && (is_bare_integer_rhs(rv)
+                        || is_nonenum_integral_var(rv, elab)
+                        || is_enum_arith_rhs(rv, &b))
                 {
                     errs.push(format!(
                         "assignment to enum variable '{}' requires an explicit cast \
