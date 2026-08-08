@@ -31,6 +31,9 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     // §23.3.2: map every module/interface/program to its declared port names,
     // so a named port connection to a non-existent port can be rejected.
     let port_map = build_port_map(defs);
+    // §18.5.2: scans ALL classes at once (needs the full hierarchy to walk
+    // extends chains), so it runs once rather than per-definition.
+    check_pure_constraints(elab, &mut errs);
     for def in defs {
         match def {
             SourceDefinition::Class(c) => check_class(c, &mut errs),
@@ -1213,6 +1216,75 @@ fn check_enum_values(et: &EnumType, elab: &ElaboratedModule, errs: &mut Vec<Stri
 /// §8.20: a `pure virtual` method (or any method qualified `pure`) is legal
 /// only inside a *virtual* (abstract) class or an interface class. A concrete
 /// class declaring one is an error.
+/// §18.5.2: "A pure constraint represents an obligation on any non-abstract
+/// derived class (i.e., a derived class that is not virtual) to provide a
+/// constraint of the same name. It shall be an error if a non-abstract class
+/// does not have an implementation of every pure constraint that it inherits.
+/// It shall be an error to declare a pure constraint in a non-abstract class."
+///
+/// Walks every elaborated class. For each non-virtual (non-interface) class:
+///  - a pure constraint DECLARED on the class itself is an error;
+///  - every pure constraint inherited from a virtual ancestor must be
+///    implemented (a non-pure constraint of the same name) somewhere in the
+///    class's own extends chain.
+fn check_pure_constraints(elab: &ElaboratedModule, errs: &mut Vec<String>) {
+    for (name, cls) in &elab.classes {
+        if cls.is_virtual || cls.is_interface {
+            continue;
+        }
+        // Pure constraint declared directly on a non-abstract class.
+        let own_pure: Vec<String> = cls
+            .constraints
+            .values()
+            .filter(|c| c.is_pure)
+            .map(|c| c.name.name.clone())
+            .collect();
+        for p in &own_pure {
+            errs.push(format!(
+                "class '{}': a pure constraint '{}' is illegal in a non-virtual class \
+                 (LRM 1800-2017 §18.5.2)",
+                name, p
+            ));
+        }
+        // Walk the extends chain, collecting every pure constraint declared
+        // by a virtual ancestor and every non-pure implementation.
+        let mut cur = cls.extends.clone();
+        let mut inherited_pure: Vec<String> = Vec::new();
+        let mut implemented: Vec<String> = cls
+            .constraints
+            .values()
+            .filter(|c| !c.is_pure)
+            .map(|c| c.name.name.clone())
+            .collect();
+        while let Some(anc_name) = cur {
+            match elab.classes.get(&anc_name) {
+                Some(anc) => {
+                    for c in anc.constraints.values() {
+                        if c.is_pure {
+                            if !inherited_pure.contains(&c.name.name) {
+                                inherited_pure.push(c.name.name.clone());
+                            }
+                        } else if !implemented.contains(&c.name.name) {
+                            implemented.push(c.name.name.clone());
+                        }
+                    }
+                    cur = anc.extends.clone();
+                }
+                None => break,
+            }
+        }
+        for p in &inherited_pure {
+            if !implemented.contains(p) {
+                errs.push(format!(
+                    "class '{}': inherited pure constraint '{}' must be implemented \
+                     (LRM 1800-2017 §18.5.2)",
+                    name, p
+                ));
+            }
+        }
+    }
+}
+
 fn check_class(c: &ClassDeclaration, errs: &mut Vec<String>) {
     if !c.virtual_kw && !c.is_interface {
         for item in &c.items {

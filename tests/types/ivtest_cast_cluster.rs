@@ -2573,3 +2573,31 @@ endmodule
     // exercised by the full suite; keep a trivial passes-style run here.
     assert!(!rejected(SRC), "standalone specparam must NOT be rejected");
 }
+
+#[test]
+fn group_b_pure_constraint_inherited_not_implemented_rejected() {
+    // sv-tests chapter-18/18.5.2--pure-constraint_2.sv — a non-abstract
+    // derived class must implement every pure constraint it inherits.
+    const SRC: &str = r#"virtual class a;
+    pure constraint c;
+endclass
+class a2 extends a;
+endclass
+"#;
+    assert!(rejected(SRC), "inherited pure constraint must be implemented");
+}
+
+#[test]
+fn group_b_pure_constraint_implemented_passes() {
+    // sv-tests chapter-18/18.5.2--pure-constraint_0.sv — implementing the
+    // pure constraint in the derived class is legal.
+    const SRC: &str = r#"virtual class a;
+    pure constraint c;
+endclass
+class a2 extends a;
+    rand int b2;
+    constraint c { b2 == 5; }
+endclass
+"#;
+    assert!(!rejected(SRC), "implemented pure constraint must pass");
+}
