@@ -247,6 +247,19 @@ parallel edge path (also `XEZIM_NO_PARALLEL=1` / `XEZIM_FORCE_PARALLEL=1`).
 → execute it in `simulator.rs` (bytecode only if it must be fast) → add tests →
 document any new flag/env knob in the README tables.
 
+## Git identity
+
+Every commit must be **authored and committed as the same single identity**:
+`opensource-elearning <159253500+opensource-elearning@users.noreply.github.com>`
+(the only verified email for the GitHub account). Never commit under the legacy
+`opensource-elearning@users.noreply.github.com`, the typo variant
+`opensource.elearning@users.noreply.github.com`, or any new username/email. A commit
+whose author and committer emails differ makes GitHub render two identities and
+notify the wrong account, so before committing run
+`git config user.name opensource-elearning` and
+`git config user.email 159253500+opensource-elearning@users.noreply.github.com`
+and keep author == committer on every commit.
+
 ## Before you open a PR
 
 - Regression test added **with an LRM § citation** in its doc comment, wired into
