@@ -260,6 +260,15 @@ notify the wrong account, so before committing run
 `git config user.email 159253500+opensource-elearning@users.noreply.github.com`
 and keep author == committer on every commit.
 
+## No machine-specific or confidential content
+
+PRs are public and permanent. Never include absolute filesystem paths
+(`/home/...`, `/root/...`, `C:\Users\...`), local usernames, hostnames, IP
+addresses, environment-variable values, tokens, or other machine-specific
+details in docs, code, commit messages, or PR descriptions. Use repo-relative
+paths only and keep everything reproducible from the repository itself. Before
+submitting, scan your added files for local paths and secrets.
+
 ## Before you open a PR
 
 - Regression test added **with an LRM § citation** in its doc comment, wired into
