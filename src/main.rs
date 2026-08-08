@@ -97,9 +97,12 @@ fn spawn_memory_watchdog() {
 }
 
 /// Clamp a requested thread count to the available parallelism, warning if
-/// clamped. Unavailable/0 degrade to 1.
+/// clamped. Unavailable/0 degrade to 1. Uses the same availability source as
+/// the internal `safe_worker_cap` so the CLI and dispatch paths agree on the
+/// machine bound (the CLI additionally allows up to the full machine, while
+/// `safe_worker_cap` applies its measured 8-worker sweet-spot cap).
 fn clamp_threads(requested: usize) -> usize {
-    let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let avail = xezim::compiler::simulator::available_parallelism_floor_1();
     if requested == 0 {
         eprintln!("[xezim][warning] --threads 0 invalid; using 1");
         return 1;

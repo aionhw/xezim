@@ -46,14 +46,20 @@ static DPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 /// process handle can never be mistaken for a class-object handle.
 const PROCESS_HANDLE_BASE: u64 = 0x7000_0000;
 
-/// Safe worker cap: available parallelism minus one core (for OS/main thread),
-/// floored at 1. Centralizes the policy so CLI `--threads` and internal
-/// parallel dispatch paths agree on the bound.
+/// Available parallelism on this machine, floored at 1 so callers never
+/// divide by zero. Single source of truth for both the CLI `--threads` clamp
+/// (`clamp_threads` in main.rs) and the internal dispatch cap below.
+pub fn available_parallelism_floor_1() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// Internal parallel-dispatch worker cap. Bounded by the measured sweet spot:
+/// the persistent-worker path measured *slower* than the scoped path on c910,
+/// so more than 8 workers is not free throughput. Centralizes the policy so
+/// every internal dispatch site agrees; the user-facing `--threads` clamp
+/// (`clamp_threads` in main.rs) is the separate CLI-side bound.
 pub fn safe_worker_cap() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(1))
-        .unwrap_or(1)
-        .max(1)
+    available_parallelism_floor_1().min(8).max(1)
 }
 
 /// A random stream (IEEE 1800-2023 §18.14 "Random stability").

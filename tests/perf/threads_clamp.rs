@@ -1,7 +1,9 @@
-//! Test for --threads clamp with warning
+//! CLI `--threads` clamp behaviour.
 //!
-//! Verifies that passing --threads with a value exceeding available parallelism
-//! prints a warning and clamps to the available count.
+//! Verifies that passing `--threads` with a value exceeding available
+//! parallelism prints a warning and clamps to the available count, and that
+//! `--threads 0` is rejected. These assert on deterministic stderr text, so
+//! they are safe to run on any machine size.
 
 use std::process::Command;
 
