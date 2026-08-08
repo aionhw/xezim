@@ -96,6 +96,28 @@ fn spawn_memory_watchdog() {
     });
 }
 
+/// Clamp a requested thread count to the available parallelism, warning if
+/// clamped. Unavailable/0 degrade to 1. Uses the same availability source as
+/// the internal `safe_worker_cap` so the CLI and dispatch paths agree on the
+/// machine bound (the CLI additionally allows up to the full machine, while
+/// `safe_worker_cap` applies its measured 8-worker sweet-spot cap).
+fn clamp_threads(requested: usize) -> usize {
+    let avail = xezim::compiler::simulator::available_parallelism_floor_1();
+    if requested == 0 {
+        eprintln!("[xezim][warning] --threads 0 invalid; using 1");
+        return 1;
+    }
+    if requested > avail {
+        eprintln!(
+            "[xezim][warning] --threads {} exceeds available parallelism ({}); clamping to {}",
+            requested, avail, avail
+        );
+        avail
+    } else {
+        requested
+    }
+}
+
 fn print_usage() {
     eprintln!("Usage: xezim [mode] [options] <source_files> [plusargs]");
     eprintln!("Modes (pick one; default is 'simulate'):");
@@ -1654,11 +1676,11 @@ fn main() {
             "--threads" => {
                 i += 1;
                 if i < args.len() {
-                    threads = args[i].parse().unwrap_or(1).max(1);
+                    threads = clamp_threads(args[i].parse().unwrap_or(1));
                 }
             }
             _ if arg.starts_with("--threads=") => {
-                threads = arg["--threads=".len()..].parse().unwrap_or(1).max(1);
+                threads = clamp_threads(arg["--threads=".len()..].parse().unwrap_or(1));
             }
             "--cache-dir" => {
                 i += 1;
