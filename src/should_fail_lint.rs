@@ -49,7 +49,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 for it in &m.items {
                     check_module_item(it, elab, &mut errs);
                 }
-                check_proc_net_assign(&m.items, &mut errs);
+                check_proc_net_assign(&m.items, &m.ports, &mut errs);
                 check_enum_assign(&m.items, elab, &mut errs);
                 check_specparam_use(&m.items, &m.specparams, &mut errs);
                 check_param_class_scope(&m.items, elab, &mut errs);
@@ -246,13 +246,48 @@ fn check_array_flat_init(d: &VarDeclarator, elab: &ElaboratedModule, errs: &mut 
 /// Conservative: only explicit NetDeclarations are treated as nets (output
 /// ports, where net-vs-var is ambiguous, are NOT flagged), and only `=`/`<=`
 /// targets are checked (force/release/assign are separate statement kinds).
-fn check_proc_net_assign(items: &[ModuleItem], errs: &mut Vec<String>) {
+fn check_proc_net_assign(
+    items: &[ModuleItem],
+    ports: &xezim_core::ast::module::PortList,
+    errs: &mut Vec<String>,
+) {
     use std::collections::HashSet;
+    // Body variable declarations complete an untyped ANSI port as a VARIABLE
+    // (e.g. `output b; ... logic b;` — §23.2.2.1), so they must not be treated
+    // as nets even though the header alone was untyped.
+    let mut vars: HashSet<String> = HashSet::new();
+    for it in items {
+        if let ModuleItem::DataDeclaration(dd) = it {
+            for d in &dd.declarators {
+                vars.insert(d.name.name.clone());
+            }
+        }
+    }
     let mut nets: HashSet<String> = HashSet::new();
     for it in items {
         if let ModuleItem::NetDeclaration(nd) = it {
             for d in &nd.declarators {
                 nets.insert(d.name.name.clone());
+            }
+        }
+    }
+    // §23.2.2.3: an ANSI port whose data type is omitted (or only implicit)
+    // defaults to a NET of the default net type for input/inout AND for output
+    // when the type is omitted/implicit. Only when the type is declared with
+    // the explicit `data_type` syntax (e.g. `output logic b`) is the port a
+    // variable. A body `logic`/`reg` declaration completes the untyped port as
+    // a variable instead (excluded above).
+    if let PortList::Ansi(ps) = ports {
+        for p in ps {
+            let untyped = p.data_type.is_none() || matches!(p.data_type, Some(DataType::Implicit { .. }));
+            if !untyped || p.var_kw || vars.contains(&p.name.name) {
+                continue;
+            }
+            if matches!(
+                p.direction,
+                Some(PortDirection::Output | PortDirection::Inout)
+            ) {
+                nets.insert(p.name.name.clone());
             }
         }
     }
@@ -1816,6 +1851,7 @@ fn check_new_array_target(dt: &DataType, decl: &VarDeclarator, errs: &mut Vec<St
 
 use std::collections::{HashMap, HashSet};
 use xezim_core::ast::module::PortList;
+use xezim_core::ast::types::PortDirection;
 
 /// Set of declared port names for a module/interface/program, or None when the
 /// port list is empty/unknown (so no connection is ever flagged against it).
