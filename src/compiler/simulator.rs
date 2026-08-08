@@ -77126,6 +77126,7 @@ impl Simulator {
             constraints.push(ClassConstraint {
                 is_static: false,
                 is_extern: false,
+                is_pure: false,
                 has_body: true,
                 name: crate::ast::Identifier {
                     name: "__inline__".to_string(),
