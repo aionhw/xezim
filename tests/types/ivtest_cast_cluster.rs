@@ -2514,3 +2514,30 @@ endmodule
 "#;
     assert!(rejected(SRC), "br_gh386c is an illegal cast and must be rejected");
 }
+
+#[test]
+fn group_b_specparam_in_parameter_expr_rejected() {
+    // sv-tests chapter-6/6.20.5--specparam_inv.sv — a specparam "can appear
+    // in any expression that is not assigned to a parameter" (§6.20.5), so
+    // `parameter p = specparam_name + ...` is illegal.
+    const SRC: &str = r#"module top();
+specparam delay = 50;
+parameter p = delay + 2;
+endmodule
+"#;
+    assert!(rejected(SRC), "specparam referenced in a parameter value expression must be rejected");
+}
+
+#[test]
+fn group_b_specparam_legal_when_not_in_parameter_passes() {
+    // sv-tests chapter-6/6.20.5--specparam.sv — a standalone specparam
+    // declaration is fine; the rule only fires on parameter value exprs.
+    const SRC: &str = r#"module top();
+specparam delay = 50;
+endmodule
+"#;
+    let _ = SRC;
+    // no assertion body needed: the point is that `rejected` must be FALSE,
+    // exercised by the full suite; keep a trivial passes-style run here.
+    assert!(!rejected(SRC), "standalone specparam must NOT be rejected");
+}

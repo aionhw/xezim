@@ -48,6 +48,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 }
                 check_proc_net_assign(&m.items, &mut errs);
                 check_enum_assign(&m.items, elab, &mut errs);
+                check_specparam_use(&m.items, &m.specparams, &mut errs);
                 check_dynarray_assign(&m.items, elab, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
@@ -58,6 +59,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 for it in &m.items {
                     check_module_item(it, elab, &mut errs);
                 }
+                check_specparam_use(&m.items, &m.specparams, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_instantiations(&m.items, &port_map, &mut errs);
@@ -67,6 +69,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 for it in &m.items {
                     check_module_item(it, elab, &mut errs);
                 }
+                check_specparam_use(&m.items, &m.specparams, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_program_items(&m.items, &mut errs);
@@ -394,6 +397,53 @@ fn check_enum_assign(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut V
         if let ModuleItem::ContinuousAssign(ca) = it {
             for (l, r) in &ca.assignments {
                 flag(l, r, &enum_vars, elab, errs);
+            }
+        }
+    }
+}
+
+/// §6.20.5: a specparam "can appear in any expression that is not assigned to
+/// a parameter and is not part of the range specification of a declaration".
+/// So a parameter / localparam whose VALUE expression references a specparam
+/// (`specparam delay = 50; parameter p = delay + 2;`) is illegal — a specparam
+/// is only for timing / delay values. The parser captures specparam NAMES (the
+/// declarations themselves are parse-accept, since xezim doesn't model specify
+/// timing); here every value parameter / localparam expression is walked and
+/// any bare reference to one of those names fires. Type params (`localparam
+/// type T = ...`) can't reference a specparam by construction.
+fn check_specparam_use(
+    items: &[ModuleItem],
+    specparams: &[String],
+    errs: &mut Vec<String>,
+) {
+    if specparams.is_empty() {
+        return;
+    }
+    use std::collections::HashSet;
+    let names: HashSet<&str> = specparams.iter().map(|s| s.as_str()).collect();
+    fn walk_expr(e: &Expression, names: &HashSet<&str>, errs: &mut Vec<String>) {
+        for_each_expr(e, &mut |x| {
+            if let ExprKind::Ident(h) = &x.kind {
+                if h.path.len() == 1 && names.contains(h.path[0].name.name.as_str()) {
+                    errs.push(format!(
+                        "specparam '{}' cannot be used in a parameter value expression \
+                         (LRM 1800-2017 §6.20.5)",
+                        h.path[0].name.name
+                    ));
+                }
+            }
+        });
+    }
+    for it in items {
+        let pd = match it {
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => pd,
+            _ => continue,
+        };
+        if let crate::ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
+            for a in assignments {
+                if let Some(init) = &a.init {
+                    walk_expr(init, &names, errs);
+                }
             }
         }
     }
