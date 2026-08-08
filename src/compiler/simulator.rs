@@ -2743,6 +2743,14 @@ pub struct Simulator {
     /// dropped end took a `{base, "TAIL"}` suffix with it). These ids skip the
     /// width fit and keep whatever length they are given.
     signal_is_string: Vec<bool>,
+    /// Signal ids whose declared type resolves to an unpacked struct stored
+    /// member-wise (§7.2), i.e. the continuous-assign fallback must SPREAD a
+    /// packed RHS across the member leaves instead of storing it whole in the
+    /// container signal. Fixed at elaboration time, so it is precomputed once
+    /// in `Simulator::new`; the per-evaluation gate is a single indexed read
+    /// (`spread_into_unpacked_struct` + the typedef chain behind it only run
+    /// for signals actually in this set).
+    signal_spread_struct: Vec<bool>,
     /// `--warn-x` state. `warn_x` is a plain field (not the atomic) so the
     /// write hot path costs one bool load; everything else is touched only
     /// when a report actually fires.
@@ -6132,6 +6140,7 @@ impl Simulator {
             signal_two_state,
             signal_gate_driven,
             signal_is_string,
+            signal_spread_struct: vec![false; num_signals],
             warn_x: warn_x_enabled(),
             warn_x_seen: std::cell::RefCell::new(HashSet::default()),
             warn_x_pending: std::cell::RefCell::new(Vec::new()),
@@ -6618,6 +6627,28 @@ impl Simulator {
                 named_count
             );
         }
+        // §6.6.7/§7.2: which signal ids need the member-wise struct SPREAD in
+        // the continuous-assign fallback? The declared type chain is fixed at
+        // elaboration, so resolve it once here — the per-evaluation gate in
+        // `eval_ast_comb_entry` is then a single indexed read instead of a
+        // `tn.clone()` + fresh `DataType::TypeReference` + `resolve_dt` chain.
+        let mut signal_spread_struct = vec![false; num_signals];
+        for (&id, tn) in &sim.signal_type_names {
+            let dt = DataType::TypeReference {
+                name: TypeName {
+                    scope: None,
+                    name: Identifier { name: tn.clone(), span: Span::dummy() },
+                    span: Span::dummy(),
+                },
+                dimensions: Vec::new(),
+                type_args: Vec::new(),
+                span: Span::dummy(),
+            };
+            if sim.unpacked_struct_of(&dt).is_some() {
+                signal_spread_struct[id] = true;
+            }
+        }
+        sim.signal_spread_struct = signal_spread_struct;
         sim.load_dpi_libraries();
         sim.bind_all_dpi_imports();
         // VPI modules register their $systf's before simulation starts. The
@@ -32194,18 +32225,22 @@ impl Simulator {
                     // The resolver returns a packed struct value (from the queue
                     // argument). The LHS is an unpacked struct stored member-wise.
                     // Spread the packed result into the unpacked leaf signals.
-                    let type_name = self.signal_type_names.get(&id).cloned();
+                    // `signal_spread_struct` is precomputed at construction, so the
+                    // common (non-struct) case is one indexed read, not a
+                    // `tn.clone()` + fresh `DataType::TypeReference` + `resolve_dt`.
                     let mut spread_done = false;
-                    if let Some(ref tn) = type_name {
-                        if let Some(su) = self.unpacked_struct_of(&DataType::TypeReference {
-                            name: TypeName { scope: None, name: Identifier { name: tn.clone(), span: Span::dummy() }, span: Span::dummy() },
-                            dimensions: Vec::new(),
-                            type_args: Vec::new(),
-                            span: Span::dummy(),
-                        }) {
-                            let name_str: String = self.id_to_name.get(id).map(|s| s.as_ref().to_string()).unwrap_or_default();
-                            if self.spread_into_unpacked_struct(&name_str, &su, &val) {
-                                spread_done = true;
+                    if self.signal_spread_struct[id] {
+                        if let Some(tn) = self.signal_type_names.get(&id) {
+                            if let Some(su) = self.unpacked_struct_of(&DataType::TypeReference {
+                                name: TypeName { scope: None, name: Identifier { name: tn.clone(), span: Span::dummy() }, span: Span::dummy() },
+                                dimensions: Vec::new(),
+                                type_args: Vec::new(),
+                                span: Span::dummy(),
+                            }) {
+                                let name_str: String = self.id_to_name.get(id).map(|s| s.as_ref().to_string()).unwrap_or_default();
+                                if self.spread_into_unpacked_struct(&name_str, &su, &val) {
+                                    spread_done = true;
+                                }
                             }
                         }
                     }
