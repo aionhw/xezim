@@ -51,7 +51,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 }
                 check_proc_net_assign(&m.items, &m.ports, &mut errs);
                 check_enum_assign(&m.items, elab, &mut errs);
-                check_specparam_use(&m.items, &m.specparams, &mut errs);
+                check_specparam_use(&m.items, def.specparams(), &mut errs);
                 check_param_class_scope(&m.items, elab, &mut errs);
                 check_dynarray_assign(&m.items, elab, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
@@ -63,7 +63,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 for it in &m.items {
                     check_module_item(it, elab, &mut errs);
                 }
-                check_specparam_use(&m.items, &m.specparams, &mut errs);
+                check_specparam_use(&m.items, def.specparams(), &mut errs);
                 check_param_class_scope(&m.items, elab, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
@@ -74,7 +74,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 for it in &m.items {
                     check_module_item(it, elab, &mut errs);
                 }
-                check_specparam_use(&m.items, &m.specparams, &mut errs);
+                check_specparam_use(&m.items, def.specparams(), &mut errs);
                 check_param_class_scope(&m.items, elab, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
