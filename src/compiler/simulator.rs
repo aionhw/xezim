@@ -46,6 +46,22 @@ static DPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 /// process handle can never be mistaken for a class-object handle.
 const PROCESS_HANDLE_BASE: u64 = 0x7000_0000;
 
+/// Available parallelism on this machine, floored at 1 so callers never
+/// divide by zero. Single source of truth for both the CLI `--threads` clamp
+/// (`clamp_threads` in main.rs) and the internal dispatch cap below.
+pub fn available_parallelism_floor_1() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// Internal parallel-dispatch worker cap. Bounded by the measured sweet spot:
+/// the persistent-worker path measured *slower* than the scoped path on c910,
+/// so more than 8 workers is not free throughput. Centralizes the policy so
+/// every internal dispatch site agrees; the user-facing `--threads` clamp
+/// (`clamp_threads` in main.rs) is the separate CLI-side bound.
+pub fn safe_worker_cap() -> usize {
+    available_parallelism_floor_1().min(8).max(1)
+}
+
 /// A random stream (IEEE 1800-2023 §18.14 "Random stability").
 ///
 /// §18.14 requires every *object* and every *process* to own an independent,
@@ -30861,9 +30877,9 @@ impl Simulator {
                     chunks.retain(|c| !c.is_empty());
                 } else {
                     self.prof_par_dispatch_legacy += 1;
-                    let num_threads = std::thread::available_parallelism()
-                        .map(|n| n.get().min(block_slices.len()).min(8))
-                        .unwrap_or(2);
+                    let num_threads = safe_worker_cap()
+                        .min(block_slices.len())
+                        .max(1);
                     let chunk_size = block_slices.len().div_ceil(num_threads);
                     chunks = block_slices
                         .chunks(chunk_size)
@@ -30987,9 +31003,8 @@ impl Simulator {
                         // Experimental: persistent workers avoid OS-thread
                         // spawn, but current c910 measurements are slower
                         // than the scoped path. Keep opt-in for comparison.
-                        let worker_count = std::thread::available_parallelism()
-                            .map(|n| n.get().min(sub_chunks.len()).min(8))
-                            .unwrap_or(2)
+                        let worker_count = safe_worker_cap()
+                            .min(sub_chunks.len())
                             .max(1);
                         let recreate_pool = self
                             .pdes_worker_pool
@@ -32087,9 +32102,7 @@ impl Simulator {
                     if par_scratch.len() >= self.bsp_par_threshold {
                         self.entry_evals += par_scratch.len() as u64;
                         dirtied.clear();
-                        let nthreads = std::thread::available_parallelism()
-                            .map(|x| x.get().min(8))
-                            .unwrap_or(2)
+                        let nthreads = safe_worker_cap()
                             .min(par_scratch.len())
                             .max(1);
                         let chunk = par_scratch.len().div_ceil(nthreads);
