@@ -1091,6 +1091,28 @@ fn append_adopted_libs_to_merged(merged_out: &str) {
 }
 
 fn main() {
+    // FIRST thing, before any large allocation: a parent can disable transparent
+    // huge pages for its whole descendant tree with prctl(PR_SET_THP_DISABLE, 1),
+    // and the flag is inherited across fork+exec. While set, madvise(MADV_HUGEPAGE)
+    // still returns 0 and sets VM_HUGEPAGE but the fault handler never attempts a
+    // huge page, and MADV_COLLAPSE fails EINVAL — the simulator's whole
+    // `advise_hugepages()` path becomes a silent no-op. Some launchers (CI
+    // runners, agent harnesses, container supervisors) set it.
+    //
+    // This MUST happen here rather than in `advise_hugepages()`: by the time the
+    // simulator runs, `compile()` has already faulted the ~1.3 GB of per-signal
+    // arrays in as 4 KiB pages, leaving only a partial MADV_COLLAPSE to recover.
+    // Measured on c906 memcpy x50 — cleared at process start:
+    // dTLB-load-misses 161.1M -> 65.2M, cycles -3.7%, wall -3.8%. Cleared late
+    // instead: only 93.7M and no cycle win. Clearing it needs no privilege and
+    // affects only this process. XEZIM_HUGEPAGE=0 opts out.
+    #[cfg(target_os = "linux")]
+    if std::env::var("XEZIM_HUGEPAGE").ok().as_deref() != Some("0") {
+        const PR_SET_THP_DISABLE: libc::c_int = 41;
+        unsafe {
+            libc::prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
+        }
+    }
     let compile_wall_start = std::time::Instant::now();
     spawn_memory_watchdog();
     // Install the SIGUSR1 hang-report handler before compile: a user poking a

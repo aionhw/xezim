@@ -79,9 +79,11 @@ module tb;
 endmodule
 "#;
     let out = line(src);
-    // i over [0:1], j over packed [3:0] => 8 tuples, j from 0..3.
+    // i over [0:1] ascending; j over packed [3:0] LEFT-to-RIGHT, i.e.
+    // 3,2,1,0 (§12.7.3, reference-validated — the old 0..3 expectation
+    // encoded the pre-fix ascending bug).
     assert!(
-        out.iter().any(|m| m.starts_with("R=0.0 0.1 0.2 0.3 1.0 1.1 1.2 1.3")),
+        out.iter().any(|m| m.starts_with("R=0.3 0.2 0.1 0.0 1.3 1.2 1.1 1.0")),
         "positive foreach regressed; got {:?}",
         out
     );

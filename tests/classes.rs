@@ -153,3 +153,9 @@ mod foreach_dynarray_property_elem;
 mod randomize_obj_array_property;
 #[path = "classes/struct_output_formal.rs"]
 mod struct_output_formal;
+
+#[path = "classes/class_init_cast_copy.rs"]
+mod class_init_cast_copy;
+
+#[path = "classes/nested_and_extends_spec.rs"]
+mod nested_and_extends_spec;

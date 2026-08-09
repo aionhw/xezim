@@ -274,7 +274,7 @@ mod enabled {
         xezim_jit_schedule_nba_4s, xezim_jit_schedule_nba_range_dyn, xezim_jit_store_signal,
         xezim_jit_store_signal_4s, JitFn,
     };
-    use cranelift::codegen::ir::{FuncRef, StackSlot};
+    use cranelift::codegen::ir::{BlockArg, FuncRef, MemFlagsData, StackSlot};
 
     /// The two leaner NBA emission paths below move only the VALUE plane, so
     /// they cannot be used now that registers are 4-state. Left in place (and
@@ -736,10 +736,10 @@ mod enabled {
                 || std::env::var("XEZIM_JIT_SKIP_XZ").is_ok()
             {
                 let _ = (xz_check_ref, fallback_block, &input_ids);
-                builder.ins().jump(entry_block, &[prelude_sim_ptr]);
+                builder.ins().jump(entry_block, &[BlockArg::Value(prelude_sim_ptr)]);
             } else if input_ids.is_empty() {
                 // No reads — no X/Z risk. Fall straight through.
-                builder.ins().jump(entry_block, &[prelude_sim_ptr]);
+                builder.ins().jump(entry_block, &[BlockArg::Value(prelude_sim_ptr)]);
             } else if xz_ptr != 0 {
                 // Inline prelude: load `signal_has_xz[id]` (a u8) for
                 // each input id and OR them. Branches to fallback if
@@ -756,13 +756,13 @@ mod enabled {
                     }
                     let byte = builder.ins().load(
                         types::I8,
-                        MemFlags::trusted(),
+                        MemFlagsData::trusted(),
                         xz_base,
                         id as i32,
                     );
                     acc = builder.ins().bor(acc, byte);
                 }
-                builder.ins().brif(acc, fallback_block, &[], entry_block, &[prelude_sim_ptr]);
+                builder.ins().brif(acc, fallback_block, &[], entry_block, &[BlockArg::Value(prelude_sim_ptr)]);
             } else {
                 // Materialise input_ids as a fixed stack-slot u32 array,
                 // then call xezim_jit_inputs_have_xz(sim, ptr, n).
@@ -774,7 +774,7 @@ mod enabled {
                 ));
                 for (i, &id) in input_ids.iter().enumerate() {
                     let id_val = builder.ins().iconst(types::I32, id as i64);
-                    builder.ins().stack_store(id_val, id_slot, (i * 4) as i32);
+                    builder.ins().stack_store(pointer_type, id_val, id_slot, (i * 4) as i32);
                 }
                 let ids_ptr = builder.ins().stack_addr(pointer_type, id_slot, 0);
                 let n_val = builder.ins().iconst(types::I32, input_ids.len() as i64);
@@ -786,7 +786,7 @@ mod enabled {
                 // jump to entry_block with sim_ptr.
                 builder
                     .ins()
-                    .brif(xz_rc, fallback_block, &[], entry_block, &[prelude_sim_ptr]);
+                    .brif(xz_rc, fallback_block, &[], entry_block, &[BlockArg::Value(prelude_sim_ptr)]);
             }
             builder.seal_block(prelude_block);
 
@@ -876,7 +876,7 @@ mod enabled {
                     Insn::BranchIfFalse(cond, target) => {
                         let cv = builder
                             .ins()
-                            .stack_load(types::I64, reg_slots[*cond as usize], 0);
+                            .stack_load(pointer_type, types::I64, reg_slots[*cond as usize], 0);
                         let target_b = resolve_target(*target as usize, &pc_to_block);
                         let fall_b = if i + 1 < n {
                             pc_to_block[i + 1].unwrap_or(exit_block)
@@ -912,12 +912,12 @@ mod enabled {
                         let (base_ptr, len_ptr, _cap) = nba_side_queue.unwrap();
                         let v = builder
                             .ins()
-                            .stack_load(types::I64, reg_slots[*val_reg as usize], 0);
+                            .stack_load(pointer_type, types::I64, reg_slots[*val_reg as usize], 0);
                         // Load current length (u32) from *len_ptr.
                         let len_addr = builder.ins().iconst(pointer_type, len_ptr as i64);
                         let len = builder.ins().load(
                             types::I32,
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             len_addr,
                             0,
                         );
@@ -931,18 +931,18 @@ mod enabled {
                         let sid = builder.ins().iconst(types::I32, *sig_id as i64);
                         builder
                             .ins()
-                            .store(MemFlags::trusted(), sid, slot, 0);
+                            .store(MemFlagsData::trusted(), sid, slot, 0);
                         // Write val_bits (u64) at offset 8 (skip the 4-byte
                         // pad after signal_id).
                         builder
                             .ins()
-                            .store(MemFlags::trusted(), v, slot, 8);
+                            .store(MemFlagsData::trusted(), v, slot, 8);
                         // Increment len.
                         let one = builder.ins().iconst(types::I32, 1);
                         let new_len = builder.ins().iadd(len, one);
                         builder
                             .ins()
-                            .store(MemFlags::trusted(), new_len, len_addr, 0);
+                            .store(MemFlagsData::trusted(), new_len, len_addr, 0);
                     }
                     // JIT Stage 4 Tier A: when the Insn::NbaAssign's
                     // width matches the signal's declared width, emit
@@ -959,7 +959,7 @@ mod enabled {
                     {
                         let v = builder
                             .ins()
-                            .stack_load(types::I64, reg_slots[*val_reg as usize], 0);
+                            .stack_load(pointer_type, types::I64, reg_slots[*val_reg as usize], 0);
                         let id = builder.ins().iconst(types::I32, *sig_id as i64);
                         builder.ins().call(nba_fast_ref, &[sim_ptr, id, v]);
                     }
@@ -989,12 +989,12 @@ mod enabled {
                         let val =
                             builder
                                 .ins()
-                                .load(types::I64, MemFlags::trusted(), base, offset);
+                                .load(types::I64, MemFlagsData::trusted(), base, offset);
                         let xzv =
                             builder
                                 .ins()
-                                .load(types::I64, MemFlags::trusted(), base, offset + 8);
-                        st2(&mut builder, &reg_slots, &xz_slots, *dest, val, xzv);
+                                .load(types::I64, MemFlagsData::trusted(), base, offset + 8);
+                        st2(&mut builder, pointer_type, &reg_slots, &xz_slots, *dest, val, xzv);
                     }
                     other => {
                         emit_insn(
@@ -1016,6 +1016,7 @@ mod enabled {
                             nba_bit_ref,
                             blk_range_ref,
                             load_array_ref,
+                            pointer_type,
                         )?;
                         // Width mask: keep the result within the width the
                         // interpreter's `Value` would have had (see
@@ -1027,13 +1028,13 @@ mod enabled {
                             let mask = (1u64 << w) - 1;
                             let mc = builder.ins().iconst(types::I64, mask as i64);
                             let v =
-                                builder.ins().stack_load(types::I64, reg_slots[d as usize], 0);
+                                builder.ins().stack_load(pointer_type, types::I64, reg_slots[d as usize], 0);
                             let mv = builder.ins().band(v, mc);
-                            builder.ins().stack_store(mv, reg_slots[d as usize], 0);
+                            builder.ins().stack_store(pointer_type, mv, reg_slots[d as usize], 0);
                             let x =
-                                builder.ins().stack_load(types::I64, xz_slots[d as usize], 0);
+                                builder.ins().stack_load(pointer_type, types::I64, xz_slots[d as usize], 0);
                             let mx = builder.ins().band(x, mc);
-                            builder.ins().stack_store(mx, xz_slots[d as usize], 0);
+                            builder.ins().stack_store(pointer_type, mx, xz_slots[d as usize], 0);
                         }
                         update_reg_meta(
                             other,
@@ -1054,7 +1055,7 @@ mod enabled {
             let zero = builder.ins().iconst(types::I32, 0);
             builder.ins().return_(&[zero]);
             builder.seal_all_blocks();
-            builder.finalize();
+            builder.finalize(self.module.target_config());
             if std::env::var("XEZIM_JIT_CLIF").is_ok() {
                 eprintln!("[CLIF]\n{}", ctx.func.display());
             }
@@ -1098,6 +1099,9 @@ mod enabled {
         nba_bit_ref: FuncRef,
         blk_range_ref: FuncRef,
         _load_array_ref: FuncRef,
+        // cranelift 0.134 made `stack_load`/`stack_store` take the target
+        // pointer type as their first argument.
+        pointer_type: Type,
     ) -> Result<(), ()> {
         use Insn::*;
         match insn {
@@ -1108,7 +1112,7 @@ mod enabled {
                 let (vb, xb) = v.raw_bits();
                 let c = builder.ins().iconst(types::I64, vb as i64);
                 let cx = builder.ins().iconst(types::I64, xb as i64);
-                st2(builder, regs, xz, *dest, c, cx);
+                st2(builder, pointer_type, regs, xz, *dest, c, cx);
             }
             LoadSignal(dest, sig_id) | LoadSignalSigned(dest, sig_id) => {
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
@@ -1117,28 +1121,28 @@ mod enabled {
                 let idx = builder.ins().iconst(types::I32, *sig_id as i64);
                 let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, idx]);
                 let xv = builder.inst_results(xcall)[0];
-                st2(builder, regs, xz, *dest, val, xv);
+                st2(builder, pointer_type, regs, xz, *dest, val, xv);
             }
             Move(d, s) => {
-                let (v, x) = ld2(builder, regs, xz, *s);
-                st2(builder, regs, xz, *d, v, x);
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *s);
+                st2(builder, pointer_type, regs, xz, *d, v, x);
             }
             Add(d, l, r) => {
-                emit_binop_arith(builder, regs, xz, *d, *l, *r, |b, x, y| b.ins().iadd(x, y))
+                emit_binop_arith(builder, pointer_type, regs, xz, *d, *l, *r, |b, x, y| b.ins().iadd(x, y))
             }
             Sub(d, l, r) => {
-                emit_binop_arith(builder, regs, xz, *d, *l, *r, |b, x, y| b.ins().isub(x, y))
+                emit_binop_arith(builder, pointer_type, regs, xz, *d, *l, *r, |b, x, y| b.ins().isub(x, y))
             }
             Mul(d, l, r) => {
-                emit_binop_arith(builder, regs, xz, *d, *l, *r, |b, x, y| b.ins().imul(x, y))
+                emit_binop_arith(builder, pointer_type, regs, xz, *d, *l, *r, |b, x, y| b.ins().imul(x, y))
             }
             // §11.4.8: bitwise operators propagate X PER BIT — `1'b0 & 1'bx`
             // is 0, not x — so these cannot use the whole-result-X rule the
             // arithmetic ops use. Known-1 / known-0 planes make each table a
             // handful of word ops.
             BitAnd(d, l, r) => {
-                let (av, ax) = ld2(builder, regs, xz, *l);
-                let (bv, bx) = ld2(builder, regs, xz, *r);
+                let (av, ax) = ld2(builder, pointer_type, regs, xz, *l);
+                let (bv, bx) = ld2(builder, pointer_type, regs, xz, *r);
                 let na = builder.ins().bnot(ax);
                 let nb = builder.ins().bnot(bx);
                 let a1 = builder.ins().band(av, na);
@@ -1152,11 +1156,11 @@ mod enabled {
                 let n_one = builder.ins().bnot(one);
                 let n_zero = builder.ins().bnot(zero);
                 let rx = builder.ins().band(n_one, n_zero);
-                st2(builder, regs, xz, *d, one, rx);
+                st2(builder, pointer_type, regs, xz, *d, one, rx);
             }
             BitOr(d, l, r) => {
-                let (av, ax) = ld2(builder, regs, xz, *l);
-                let (bv, bx) = ld2(builder, regs, xz, *r);
+                let (av, ax) = ld2(builder, pointer_type, regs, xz, *l);
+                let (bv, bx) = ld2(builder, pointer_type, regs, xz, *r);
                 let na = builder.ins().bnot(ax);
                 let nb = builder.ins().bnot(bx);
                 let a1 = builder.ins().band(av, na);
@@ -1170,36 +1174,36 @@ mod enabled {
                 let n_one = builder.ins().bnot(one);
                 let n_zero = builder.ins().bnot(zero);
                 let rx = builder.ins().band(n_one, n_zero);
-                st2(builder, regs, xz, *d, one, rx);
+                st2(builder, pointer_type, regs, xz, *d, one, rx);
             }
             BitXor(d, l, r) => {
-                let (av, ax) = ld2(builder, regs, xz, *l);
-                let (bv, bx) = ld2(builder, regs, xz, *r);
+                let (av, ax) = ld2(builder, pointer_type, regs, xz, *l);
+                let (bv, bx) = ld2(builder, pointer_type, regs, xz, *r);
                 let unk = builder.ins().bor(ax, bx);
                 let x0 = builder.ins().bxor(av, bv);
                 let nunk = builder.ins().bnot(unk);
                 let rv = builder.ins().band(x0, nunk);
-                st2(builder, regs, xz, *d, rv, unk);
+                st2(builder, pointer_type, regs, xz, *d, rv, unk);
             }
             BitNot(d, s) => {
                 // ~: known bits invert, X/Z stay unknown.
-                let (v, x) = ld2(builder, regs, xz, *s);
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *s);
                 let nv = builder.ins().bnot(v);
                 let nx = builder.ins().bnot(x);
                 let rv = builder.ins().band(nv, nx);
-                st2(builder, regs, xz, *d, rv, x);
+                st2(builder, pointer_type, regs, xz, *d, rv, x);
             }
-            Eq(d, l, r) => emit_cmp(builder, regs, xz, reg_w, reg_s, *d, *l, *r, IntCC::Equal),
-            Neq(d, l, r) => emit_cmp(builder, regs, xz, reg_w, reg_s, *d, *l, *r, IntCC::NotEqual),
-            Lt(d, l, r) => emit_cmp(builder, regs, xz, reg_w, reg_s, *d, *l, *r, IntCC::UnsignedLessThan),
-            Leq(d, l, r) => emit_cmp(builder, regs, xz, reg_w, reg_s, *d, *l, *r, IntCC::UnsignedLessThanOrEqual),
-            Gt(d, l, r) => emit_cmp(builder, regs, xz, reg_w, reg_s, *d, *l, *r, IntCC::UnsignedGreaterThan),
-            Geq(d, l, r) => emit_cmp(builder, regs, xz, reg_w, reg_s, *d, *l, *r, IntCC::UnsignedGreaterThanOrEqual),
+            Eq(d, l, r) => emit_cmp(builder, pointer_type, regs, xz, reg_w, reg_s, *d, *l, *r, IntCC::Equal),
+            Neq(d, l, r) => emit_cmp(builder, pointer_type, regs, xz, reg_w, reg_s, *d, *l, *r, IntCC::NotEqual),
+            Lt(d, l, r) => emit_cmp(builder, pointer_type, regs, xz, reg_w, reg_s, *d, *l, *r, IntCC::UnsignedLessThan),
+            Leq(d, l, r) => emit_cmp(builder, pointer_type, regs, xz, reg_w, reg_s, *d, *l, *r, IntCC::UnsignedLessThanOrEqual),
+            Gt(d, l, r) => emit_cmp(builder, pointer_type, regs, xz, reg_w, reg_s, *d, *l, *r, IntCC::UnsignedGreaterThan),
+            Geq(d, l, r) => emit_cmp(builder, pointer_type, regs, xz, reg_w, reg_s, *d, *l, *r, IntCC::UnsignedGreaterThanOrEqual),
             Shl(d, l, r) => {
-                emit_shift(builder, regs, xz, *d, *l, *r, |b, x, y| b.ins().ishl(x, y))
+                emit_shift(builder, pointer_type, regs, xz, *d, *l, *r, |b, x, y| b.ins().ishl(x, y))
             }
             Shr(d, l, r) => {
-                emit_shift(builder, regs, xz, *d, *l, *r, |b, x, y| b.ins().ushr(x, y))
+                emit_shift(builder, pointer_type, regs, xz, *d, *l, *r, |b, x, y| b.ins().ushr(x, y))
             }
             AShr(d, l, r) => {
                 // §11.4.10.1: `>>>` shifts in copies of the SIGN BIT — which
@@ -1209,27 +1213,27 @@ mod enabled {
                 let lw = reg_w.get(*l as usize).copied().unwrap_or(0);
                 let signed = reg_s.get(*l as usize).copied().unwrap_or(false);
                 if signed && lw > 0 && lw < 64 {
-                    let (lv, lx) = ld2(builder, regs, xz, *l);
+                    let (lv, lx) = ld2(builder, pointer_type, regs, xz, *l);
                     let (ve, xe) = sext_planes(builder, lv, lx, lw);
-                    st2(builder, regs, xz, *l, ve, xe);
+                    st2(builder, pointer_type, regs, xz, *l, ve, xe);
                 }
-                emit_shift(builder, regs, xz, *d, *l, *r, |b, x, y| b.ins().sshr(x, y))
+                emit_shift(builder, pointer_type, regs, xz, *d, *l, *r, |b, x, y| b.ins().sshr(x, y))
             }
             BitXnor(d, l, r) => {
-                let (av, ax) = ld2(builder, regs, xz, *l);
-                let (bv, bx) = ld2(builder, regs, xz, *r);
+                let (av, ax) = ld2(builder, pointer_type, regs, xz, *l);
+                let (bv, bx) = ld2(builder, pointer_type, regs, xz, *r);
                 let unk = builder.ins().bor(ax, bx);
                 let x0 = builder.ins().bxor(av, bv);
                 let inv = builder.ins().bnot(x0);
                 let nunk = builder.ins().bnot(unk);
                 let rv = builder.ins().band(inv, nunk);
-                st2(builder, regs, xz, *d, rv, unk);
+                st2(builder, pointer_type, regs, xz, *d, rv, unk);
             }
             LogAnd(d, l, r) => {
                 // §11.4.7: `0 && x` is 0, not x — an operand that is DEFINITELY
                 // false decides the result even when the other is unknown.
-                let (lv, lx) = ld2(builder, regs, xz, *l);
-                let (rv, rx) = ld2(builder, regs, xz, *r);
+                let (lv, lx) = ld2(builder, pointer_type, regs, xz, *l);
+                let (rv, rx) = ld2(builder, pointer_type, regs, xz, *r);
                 let zero = builder.ins().iconst(types::I64, 0);
                 let one = builder.ins().iconst(types::I64, 1);
                 let (lt, lf) = truthiness(builder, lv, lx);
@@ -1239,12 +1243,12 @@ mod enabled {
                 let tv = builder.ins().uextend(types::I64, is_true);
                 let known = builder.ins().bor(is_true, is_false);
                 let out_x = builder.ins().select(known, zero, one);
-                st2(builder, regs, xz, *d, tv, out_x);
+                st2(builder, pointer_type, regs, xz, *d, tv, out_x);
             }
             LogOr(d, l, r) => {
                 // §11.4.7: `1 || x` is 1.
-                let (lv, lx) = ld2(builder, regs, xz, *l);
-                let (rv, rx) = ld2(builder, regs, xz, *r);
+                let (lv, lx) = ld2(builder, pointer_type, regs, xz, *l);
+                let (rv, rx) = ld2(builder, pointer_type, regs, xz, *r);
                 let zero = builder.ins().iconst(types::I64, 0);
                 let one = builder.ins().iconst(types::I64, 1);
                 let (lt, lf) = truthiness(builder, lv, lx);
@@ -1254,28 +1258,28 @@ mod enabled {
                 let tv = builder.ins().uextend(types::I64, is_true);
                 let known = builder.ins().bor(is_true, is_false);
                 let out_x = builder.ins().select(known, zero, one);
-                st2(builder, regs, xz, *d, tv, out_x);
+                st2(builder, pointer_type, regs, xz, *d, tv, out_x);
             }
             LogNot(d, s) => {
-                let (v, x) = ld2(builder, regs, xz, *s);
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *s);
                 let zero = builder.ins().iconst(types::I64, 0);
                 let one = builder.ins().iconst(types::I64, 1);
                 let (t, f) = truthiness(builder, v, x);
                 let ext = builder.ins().uextend(types::I64, f);
                 let known = builder.ins().bor(t, f);
                 let out_x = builder.ins().select(known, zero, one);
-                st2(builder, regs, xz, *d, ext, out_x);
+                st2(builder, pointer_type, regs, xz, *d, ext, out_x);
             }
             Negate(d, s) => {
                 // §11.4.3: unary minus of an unknown operand is unknown.
-                let (v, x) = ld2(builder, regs, xz, *s);
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *s);
                 let neg = builder.ins().ineg(v);
                 let zero = builder.ins().iconst(types::I64, 0);
                 let ones = builder.ins().iconst(types::I64, -1);
                 let unk = builder.ins().icmp(IntCC::NotEqual, x, zero);
                 let out_v = builder.ins().select(unk, zero, neg);
                 let out_x = builder.ins().select(unk, ones, zero);
-                st2(builder, regs, xz, *d, out_v, out_x);
+                st2(builder, pointer_type, regs, xz, *d, out_v, out_x);
             }
             // ReduceAnd intentionally NOT JIT'd: requires width info to
             // compare val against the width-specific all-ones mask, and
@@ -1285,18 +1289,18 @@ mod enabled {
             ReduceOr(d, s) => {
                 // §11.4.9: a known 1 anywhere decides the result even with
                 // unknown bits present; otherwise any unknown bit makes it x.
-                let (v, x) = ld2(builder, regs, xz, *s);
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *s);
                 let zero = builder.ins().iconst(types::I64, 0);
                 let one = builder.ins().iconst(types::I64, 1);
                 let (t, f) = truthiness(builder, v, x);
                 let ext = builder.ins().uextend(types::I64, t);
                 let known = builder.ins().bor(t, f);
                 let out_x = builder.ins().select(known, zero, one);
-                st2(builder, regs, xz, *d, ext, out_x);
+                st2(builder, pointer_type, regs, xz, *d, ext, out_x);
             }
             ReduceXor(d, s) => {
                 // §11.4.9: parity is unknown if ANY bit is unknown.
-                let (v, x) = ld2(builder, regs, xz, *s);
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *s);
                 let pc = builder.ins().popcnt(v);
                 let one = builder.ins().iconst(types::I64, 1);
                 let parity = builder.ins().band(pc, one);
@@ -1304,7 +1308,7 @@ mod enabled {
                 let unk = builder.ins().icmp(IntCC::NotEqual, x, zero);
                 let out_v = builder.ins().select(unk, zero, parity);
                 let out_x = builder.ins().select(unk, one, zero);
-                st2(builder, regs, xz, *d, out_v, out_x);
+                st2(builder, pointer_type, regs, xz, *d, out_v, out_x);
             }
             // NOTE: an earlier 2-state Select arm lived here and was
             // intentionally left out of is_supported (it mismatched the
@@ -1323,14 +1327,14 @@ mod enabled {
                 // val-plane-only compare was correct solely because the X/Z
                 // pre-check kept unknowns out; with 4-state registers it
                 // would have called `4'bxxxx === 4'b0000` equal.
-                let (lv, lx) = ld2(builder, regs, xz, *l);
-                let (rv, rx) = ld2(builder, regs, xz, *r);
+                let (lv, lx) = ld2(builder, pointer_type, regs, xz, *l);
+                let (rv, rx) = ld2(builder, pointer_type, regs, xz, *r);
                 let veq = builder.ins().icmp(IntCC::Equal, lv, rv);
                 let xeq = builder.ins().icmp(IntCC::Equal, lx, rx);
                 let both = builder.ins().band(veq, xeq);
                 let ext = builder.ins().uextend(types::I64, both);
                 let zero = builder.ins().iconst(types::I64, 0);
-                st2(builder, regs, xz, *d, ext, zero);
+                st2(builder, pointer_type, regs, xz, *d, ext, zero);
             }
             SetSigned(_) => {
                 // No-op in 2-state JIT: signedness is a per-Value flag the
@@ -1339,20 +1343,20 @@ mod enabled {
                 // when materialising results into signal_table.
             }
             BlockingAssign(sig_id, val_reg, width) => {
-                let (v, x) = ld2(builder, regs, xz, *val_reg);
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let w = builder.ins().iconst(types::I32, *width as i64);
                 builder.ins().call(store_4s_ref, &[sim_ptr, id, v, x, w]);
             }
             BlockingAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
-                let (v, x) = ld2(builder, regs, xz, *val_reg);
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let hi = builder
                     .ins()
-                    .stack_load(types::I64, regs[*hi_reg as usize], 0);
+                    .stack_load(pointer_type, types::I64, regs[*hi_reg as usize], 0);
                 let lo = builder
                     .ins()
-                    .stack_load(types::I64, regs[*lo_reg as usize], 0);
+                    .stack_load(pointer_type, types::I64, regs[*lo_reg as usize], 0);
                 builder
                     .ins()
                     .call(blk_range_ref, &[sim_ptr, id, hi, lo, v, x]);
@@ -1360,7 +1364,7 @@ mod enabled {
             // Constant-bounds forms of the same stores: materialize the
             // bounds and share the dynamic bridges.
             BlockingAssignRange(sig_id, hi, lo, val_reg) => {
-                let (v, x) = ld2(builder, regs, xz, *val_reg);
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let hi_v = builder.ins().iconst(types::I64, *hi as i64);
                 let lo_v = builder.ins().iconst(types::I64, *lo as i64);
@@ -1369,18 +1373,18 @@ mod enabled {
                     .call(blk_range_ref, &[sim_ptr, id, hi_v, lo_v, v, x]);
             }
             BlockingAssignBitDyn(sig_id, idx_reg, val_reg) => {
-                let (v, x) = ld2(builder, regs, xz, *val_reg);
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let idx = builder
                     .ins()
-                    .stack_load(types::I64, regs[*idx_reg as usize], 0);
+                    .stack_load(pointer_type, types::I64, regs[*idx_reg as usize], 0);
                 // A 1-bit write at [idx:idx] — same semantics, same bridge.
                 builder
                     .ins()
                     .call(blk_range_ref, &[sim_ptr, id, idx, idx, v, x]);
             }
             NbaAssign(sig_id, val_reg, width) => {
-                let (nv, nx) = ld2(builder, regs, xz, *val_reg);
+                let (nv, nx) = ld2(builder, pointer_type, regs, xz, *val_reg);
                 let nid = builder.ins().iconst(types::I32, *sig_id as i64);
                 let nw = builder.ins().iconst(types::I32, *width as i64);
                 builder.ins().call(nba_4s_ref, &[sim_ptr, nid, nv, nx, nw]);
@@ -1388,13 +1392,13 @@ mod enabled {
                 #[allow(unreachable_code)]
                 let v = builder
                     .ins()
-                    .stack_load(types::I64, regs[*val_reg as usize], 0);
+                    .stack_load(pointer_type, types::I64, regs[*val_reg as usize], 0);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let w = builder.ins().iconst(types::I32, *width as i64);
                 builder.ins().call(nba_ref, &[sim_ptr, id, v, w]);
             }
             NbaAssignRange(sig_id, hi, lo, val_reg) => {
-                let (v, x) = ld2(builder, regs, xz, *val_reg);
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let hi_v = builder.ins().iconst(types::I64, *hi as i64);
                 let lo_v = builder.ins().iconst(types::I64, *lo as i64);
@@ -1403,24 +1407,24 @@ mod enabled {
                     .call(nba_range_ref, &[sim_ptr, id, hi_v, lo_v, v, x]);
             }
             NbaAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
-                let (v, x) = ld2(builder, regs, xz, *val_reg);
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let hi = builder
                     .ins()
-                    .stack_load(types::I64, regs[*hi_reg as usize], 0);
+                    .stack_load(pointer_type, types::I64, regs[*hi_reg as usize], 0);
                 let lo = builder
                     .ins()
-                    .stack_load(types::I64, regs[*lo_reg as usize], 0);
+                    .stack_load(pointer_type, types::I64, regs[*lo_reg as usize], 0);
                 builder
                     .ins()
                     .call(nba_range_ref, &[sim_ptr, id, hi, lo, v, x]);
             }
             NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
-                let (v, x) = ld2(builder, regs, xz, *val_reg);
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let idx = builder
                     .ins()
-                    .stack_load(types::I64, regs[*idx_reg as usize], 0);
+                    .stack_load(pointer_type, types::I64, regs[*idx_reg as usize], 0);
                 builder.ins().call(nba_bit_ref, &[sim_ptr, id, idx, v, x]);
             }
             // NbaAssignRangeDyn / NbaAssignBitDyn still left out — they
@@ -1436,7 +1440,7 @@ mod enabled {
                 if sw > 0 && *bit >= sw {
                     let zero = builder.ins().iconst(types::I64, 0);
                     let one = builder.ins().iconst(types::I64, 1);
-                    st2(builder, regs, xz, *dest, zero, one);
+                    st2(builder, pointer_type, regs, xz, *dest, zero, one);
                 } else {
                     let id = builder.ins().iconst(types::I32, *sig_id as i64);
                     let call = builder.ins().call(load_ref, &[sim_ptr, id]);
@@ -1450,7 +1454,7 @@ mod enabled {
                     let vb = builder.ins().band(vs, one);
                     let xs = builder.ins().ushr(x, sh);
                     let xb = builder.ins().band(xs, one);
-                    st2(builder, regs, xz, *dest, vb, xb);
+                    st2(builder, pointer_type, regs, xz, *dest, vb, xb);
                 }
             }
             LoadSignalRange(dest, sig_id, left, right) => {
@@ -1484,16 +1488,16 @@ mod enabled {
                 let xm0 = builder.ins().band(xs, keepc);
                 let oc = builder.ins().iconst(types::I64, oor as i64);
                 let xm = builder.ins().bor(xm0, oc);
-                st2(builder, regs, xz, *dest, vm, xm);
+                st2(builder, pointer_type, regs, xz, *dest, vm, xm);
             }
             // §11.4.11: `c ? t : e` — a definitely-true condition takes t, a
             // definitely-false one takes e, and an UNKNOWN condition merges:
             // bits where both branches are known and agree keep their value,
             // every other bit reads x.
             Select(dest, c, t, e) => {
-                let (cv, cx) = ld2(builder, regs, xz, *c);
-                let (tv, tx) = ld2(builder, regs, xz, *t);
-                let (ev, ex) = ld2(builder, regs, xz, *e);
+                let (cv, cx) = ld2(builder, pointer_type, regs, xz, *c);
+                let (tv, tx) = ld2(builder, pointer_type, regs, xz, *t);
+                let (ev, ex) = ld2(builder, pointer_type, regs, xz, *e);
                 let (ct, cf) = truthiness(builder, cv, cx);
                 let ntx = builder.ins().bnot(tx);
                 let nex = builder.ins().bnot(ex);
@@ -1507,7 +1511,7 @@ mod enabled {
                 let sel_xe = builder.ins().select(cf, ex, mx);
                 let out_v = builder.ins().select(ct, tv, sel_ve);
                 let out_x = builder.ins().select(ct, tx, sel_xe);
-                st2(builder, regs, xz, *dest, out_v, out_x);
+                st2(builder, pointer_type, regs, xz, *dest, out_v, out_x);
             }
             Resize(reg, width) => {
                 // Emulates Value::resize: narrowing masks; widening a SIGNED
@@ -1515,7 +1519,7 @@ mod enabled {
                 // `-1` at 32 bits resized to a 64-bit context must become
                 // 64-bit -1, which is what makes `(-1)*(-1)` equal 1). The
                 // xz plane extends identically so an X sign bit fills as X.
-                let (mut v, mut x) = ld2(builder, regs, xz, *reg);
+                let (mut v, mut x) = ld2(builder, pointer_type, regs, xz, *reg);
                 let cur_w = reg_w.get(*reg as usize).copied().unwrap_or(0);
                 if reg_s.get(*reg as usize).copied().unwrap_or(false)
                     && cur_w > 0
@@ -1533,7 +1537,7 @@ mod enabled {
                 let mc = builder.ins().iconst(types::I64, mask as i64);
                 let mv = builder.ins().band(v, mc);
                 let mx = builder.ins().band(x, mc);
-                st2(builder, regs, xz, *reg, mv, mx);
+                st2(builder, pointer_type, regs, xz, *reg, mv, mx);
             }
             // §11.5.1 — all four select forms below are 4-STATE and
             // OUT-OF-RANGE AWARE: a position outside the base's declared
@@ -1546,8 +1550,8 @@ mod enabled {
                 if w == 0 {
                     return Err(());
                 }
-                let (bv, bx) = ld2(builder, regs, xz, *base);
-                let i = builder.ins().stack_load(types::I64, regs[*idx as usize], 0);
+                let (bv, bx) = ld2(builder, pointer_type, regs, xz, *base);
+                let i = builder.ins().stack_load(pointer_type, types::I64, regs[*idx as usize], 0);
                 // One UNSIGNED compare covers both ends: a negative index
                 // wraps to a huge u64 and fails `idx < w`.
                 let wv = builder.ins().iconst(types::I64, w as i64);
@@ -1560,7 +1564,7 @@ mod enabled {
                 let xb = builder.ins().band(xs, one);
                 let out_v = builder.ins().select(inr, vb, zero);
                 let out_x = builder.ins().select(inr, xb, one);
-                st2(builder, regs, xz, *dest, out_v, out_x);
+                st2(builder, pointer_type, regs, xz, *dest, out_v, out_x);
             }
             BitSelectConst(dest, base, idx) => {
                 let w = reg_w.get(*base as usize).copied().unwrap_or(0);
@@ -1571,15 +1575,15 @@ mod enabled {
                     // Compile-time out of range: constant x.
                     let zero = builder.ins().iconst(types::I64, 0);
                     let one = builder.ins().iconst(types::I64, 1);
-                    st2(builder, regs, xz, *dest, zero, one);
+                    st2(builder, pointer_type, regs, xz, *dest, zero, one);
                 } else {
-                    let (bv, bx) = ld2(builder, regs, xz, *base);
+                    let (bv, bx) = ld2(builder, pointer_type, regs, xz, *base);
                     let one = builder.ins().iconst(types::I64, 1);
                     let vs = builder.ins().ushr_imm(bv, *idx as i64);
                     let vb = builder.ins().band(vs, one);
                     let xs = builder.ins().ushr_imm(bx, *idx as i64);
                     let xb = builder.ins().band(xs, one);
-                    st2(builder, regs, xz, *dest, vb, xb);
+                    st2(builder, pointer_type, regs, xz, *dest, vb, xb);
                 }
             }
             RangeSelect(dest, base, left_r, right_r) => {
@@ -1587,13 +1591,13 @@ mod enabled {
                 if w == 0 {
                     return Err(());
                 }
-                let (bv, bx) = ld2(builder, regs, xz, *base);
+                let (bv, bx) = ld2(builder, pointer_type, regs, xz, *base);
                 let mut l = builder
                     .ins()
-                    .stack_load(types::I64, regs[*left_r as usize], 0);
+                    .stack_load(pointer_type, types::I64, regs[*left_r as usize], 0);
                 let mut r = builder
                     .ins()
-                    .stack_load(types::I64, regs[*right_r as usize], 0);
+                    .stack_load(pointer_type, types::I64, regs[*right_r as usize], 0);
                 // Match the interpreter exactly: bounds are 32-bit index
                 // arithmetic, truncated to u32 and REINTERPRETED as i32
                 // unconditionally (`[1 -: 4]`'s low bound arrives as
@@ -1659,7 +1663,7 @@ mod enabled {
                 let out_v = builder.ins().band(vkeep, resm);
                 let xall = builder.ins().bor(x2, oor);
                 let out_x = builder.ins().band(xall, resm);
-                st2(builder, regs, xz, *dest, out_v, out_x);
+                st2(builder, pointer_type, regs, xz, *dest, out_v, out_x);
             }
             RangeSelectConst(dest, base, l_imm, r_imm) => {
                 let w = reg_w.get(*base as usize).copied().unwrap_or(0);
@@ -1682,7 +1686,7 @@ mod enabled {
                 } else {
                     0
                 };
-                let (bv, bx) = ld2(builder, regs, xz, *base);
+                let (bv, bx) = ld2(builder, pointer_type, regs, xz, *base);
                 let vs = builder.ins().ushr_imm(bv, lsb as i64);
                 let xs = builder.ins().ushr_imm(bx, lsb as i64);
                 let keep = builder.ins().iconst(types::I64, (resm & !oor) as i64);
@@ -1690,7 +1694,7 @@ mod enabled {
                 let xm = builder.ins().band(xs, keep);
                 let oc = builder.ins().iconst(types::I64, oor as i64);
                 let out_x = builder.ins().bor(xm, oc);
-                st2(builder, regs, xz, *dest, out_v, out_x);
+                st2(builder, pointer_type, regs, xz, *dest, out_v, out_x);
             }
             // ArrayOperand is no longer a raw C string. Passing its String
             // buffer to xezim_jit_load_array_elem (which expects a CStr) is
@@ -1707,6 +1711,7 @@ mod enabled {
     /// in either operand yields 1'bx, not a 0/1 answer.
     fn emit_cmp(
         builder: &mut FunctionBuilder,
+        pointer_type: Type,
         regs: &[StackSlot],
         xz: &[StackSlot],
         reg_w: &[u32],
@@ -1731,24 +1736,24 @@ mod enabled {
         } else {
             cc
         };
-        let mut lv = builder.ins().stack_load(types::I64, regs[l as usize], 0);
-        let mut rv = builder.ins().stack_load(types::I64, regs[r as usize], 0);
+        let mut lv = builder.ins().stack_load(pointer_type, types::I64, regs[l as usize], 0);
+        let mut rv = builder.ins().stack_load(pointer_type, types::I64, regs[r as usize], 0);
         if both_signed {
             let lw = reg_w.get(l as usize).copied().unwrap_or(0);
             let rw = reg_w.get(r as usize).copied().unwrap_or(0);
             if lw > 0 && lw < 64 {
-                let lx0 = builder.ins().stack_load(types::I64, xz[l as usize], 0);
+                let lx0 = builder.ins().stack_load(pointer_type, types::I64, xz[l as usize], 0);
                 let (ve, _) = sext_planes(builder, lv, lx0, lw);
                 lv = ve;
             }
             if rw > 0 && rw < 64 {
-                let rx0 = builder.ins().stack_load(types::I64, xz[r as usize], 0);
+                let rx0 = builder.ins().stack_load(pointer_type, types::I64, xz[r as usize], 0);
                 let (ve, _) = sext_planes(builder, rv, rx0, rw);
                 rv = ve;
             }
         }
-        let lx = builder.ins().stack_load(types::I64, xz[l as usize], 0);
-        let rx = builder.ins().stack_load(types::I64, xz[r as usize], 0);
+        let lx = builder.ins().stack_load(pointer_type, types::I64, xz[l as usize], 0);
+        let rx = builder.ins().stack_load(pointer_type, types::I64, xz[r as usize], 0);
         let cmp = builder.ins().icmp(cc, lv, rv);
         // Cranelift icmp returns an I8 (boolean). Extend to I64 for
         // storage; Verilog relational ops produce a 1-bit value where
@@ -1760,8 +1765,8 @@ mod enabled {
         let unknown = builder.ins().icmp(IntCC::NotEqual, anyx, zero);
         let out_v = builder.ins().select(unknown, zero, ext);
         let out_x = builder.ins().select(unknown, one, zero);
-        builder.ins().stack_store(out_v, regs[d as usize], 0);
-        builder.ins().stack_store(out_x, xz[d as usize], 0);
+        builder.ins().stack_store(pointer_type, out_v, regs[d as usize], 0);
+        builder.ins().stack_store(pointer_type, out_x, xz[d as usize], 0);
     }
 
     /// Static width propagation for the masking pass in `codegen_block`.
@@ -1932,27 +1937,29 @@ mod enabled {
     /// Load both planes of a VM register.
     fn ld2(
         builder: &mut FunctionBuilder,
+        pointer_type: Type,
         regs: &[StackSlot],
         xz: &[StackSlot],
         r: u16,
     ) -> (Value, Value) {
         (
-            builder.ins().stack_load(types::I64, regs[r as usize], 0),
-            builder.ins().stack_load(types::I64, xz[r as usize], 0),
+            builder.ins().stack_load(pointer_type, types::I64, regs[r as usize], 0),
+            builder.ins().stack_load(pointer_type, types::I64, xz[r as usize], 0),
         )
     }
 
     /// Store both planes of a VM register.
     fn st2(
         builder: &mut FunctionBuilder,
+        pointer_type: Type,
         regs: &[StackSlot],
         xz: &[StackSlot],
         d: u16,
         v: Value,
         x: Value,
     ) {
-        builder.ins().stack_store(v, regs[d as usize], 0);
-        builder.ins().stack_store(x, xz[d as usize], 0);
+        builder.ins().stack_store(pointer_type, v, regs[d as usize], 0);
+        builder.ins().stack_store(pointer_type, x, xz[d as usize], 0);
     }
 
     /// §11.4.10: a shift by a KNOWN amount shifts both planes — `4'bxxxx << 1`
@@ -1960,6 +1967,7 @@ mod enabled {
     /// an unknown shift AMOUNT makes the whole result unknown.
     fn emit_shift(
         builder: &mut FunctionBuilder,
+        pointer_type: Type,
         regs: &[StackSlot],
         xz: &[StackSlot],
         d: u16,
@@ -1967,8 +1975,8 @@ mod enabled {
         r: u16,
         op: impl Fn(&mut FunctionBuilder, Value, Value) -> Value,
     ) {
-        let (lv, lx) = ld2(builder, regs, xz, l);
-        let (rv, rx) = ld2(builder, regs, xz, r);
+        let (lv, lx) = ld2(builder, pointer_type, regs, xz, l);
+        let (rv, rx) = ld2(builder, pointer_type, regs, xz, r);
         let sv = op(builder, lv, rv);
         let sx = op(builder, lx, rv);
         let zero = builder.ins().iconst(types::I64, 0);
@@ -1976,7 +1984,7 @@ mod enabled {
         let amt_unknown = builder.ins().icmp(IntCC::NotEqual, rx, zero);
         let out_v = builder.ins().select(amt_unknown, zero, sv);
         let out_x = builder.ins().select(amt_unknown, ones, sx);
-        st2(builder, regs, xz, d, out_v, out_x);
+        st2(builder, pointer_type, regs, xz, d, out_v, out_x);
     }
 
     /// §11.4.3 arithmetic / §11.4.10 shifts: any unknown bit in an operand
@@ -1985,6 +1993,7 @@ mod enabled {
     /// following `Resize` or by the store bridge.
     fn emit_binop_arith(
         builder: &mut FunctionBuilder,
+        pointer_type: Type,
         regs: &[StackSlot],
         xz: &[StackSlot],
         d: u16,
@@ -1992,8 +2001,8 @@ mod enabled {
         r: u16,
         op: impl FnOnce(&mut FunctionBuilder, Value, Value) -> Value,
     ) {
-        let (lv, lx) = ld2(builder, regs, xz, l);
-        let (rv, rx) = ld2(builder, regs, xz, r);
+        let (lv, lx) = ld2(builder, pointer_type, regs, xz, l);
+        let (rv, rx) = ld2(builder, pointer_type, regs, xz, r);
         let result = op(builder, lv, rv);
         let anyx = builder.ins().bor(lx, rx);
         let zero = builder.ins().iconst(types::I64, 0);
@@ -2001,21 +2010,22 @@ mod enabled {
         let unknown = builder.ins().icmp(IntCC::NotEqual, anyx, zero);
         let out_v = builder.ins().select(unknown, zero, result);
         let out_x = builder.ins().select(unknown, ones, zero);
-        st2(builder, regs, xz, d, out_v, out_x);
+        st2(builder, pointer_type, regs, xz, d, out_v, out_x);
     }
 
     fn emit_binop(
         builder: &mut FunctionBuilder,
+        pointer_type: Type,
         regs: &[StackSlot],
         d: u16,
         l: u16,
         r: u16,
         op: impl FnOnce(&mut FunctionBuilder, Value, Value) -> Value,
     ) {
-        let lv = builder.ins().stack_load(types::I64, regs[l as usize], 0);
-        let rv = builder.ins().stack_load(types::I64, regs[r as usize], 0);
+        let lv = builder.ins().stack_load(pointer_type, types::I64, regs[l as usize], 0);
+        let rv = builder.ins().stack_load(pointer_type, types::I64, regs[r as usize], 0);
         let result = op(builder, lv, rv);
-        builder.ins().stack_store(result, regs[d as usize], 0);
+        builder.ins().stack_store(pointer_type, result, regs[d as usize], 0);
     }
 
     /// Allowlist: MVP coverage. Keep in sync with `emit_insn` +
