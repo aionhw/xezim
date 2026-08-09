@@ -45,6 +45,57 @@ pub(crate) fn as_sig_id(id: usize) -> SigId {
     id as SigId
 }
 
+/// Number of `LoadSignal ; LoadArrayElem ; NbaAssign` triples collapsed into
+/// `Insn::NbaAssignArrayRead` across every block compiled in this process.
+/// Reported once by the simulator's `[PROF]` summary so the static fusion
+/// count can be compared against the dynamic opcode census.
+static FUSED_ARRAY_READ_NBA: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Static count of array-read→flop fusions performed. See
+/// [`Insn::NbaAssignArrayRead`].
+pub fn array_read_nba_fusions() -> u64 {
+    FUSED_ARRAY_READ_NBA.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Per-kind count of `LoadConst ; <binop>` pairs collapsed into
+/// `Insn::BinOpConst`, indexed by `BinOpConstKind as usize`. See
+/// [`BytecodeCompiler::fuse_binop_const`].
+static FUSED_BINOP_CONST: [std::sync::atomic::AtomicU64; BinOpConstKind::COUNT] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Static count of constant-operand ALU fusions performed, per
+/// [`BinOpConstKind`] (same index order as the enum).
+pub fn binop_const_fusions() -> [u64; BinOpConstKind::COUNT] {
+    std::array::from_fn(|i| FUSED_BINOP_CONST[i].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Which binary operator an [`Insn::BinOpConst`] applies to its register
+/// operand and its embedded constant.
+///
+/// Deliberately tiny and closed: one fused variant covering the three
+/// constant-fed ALU ops the census actually shows (`Add`, `Eq`, `CaseEq`)
+/// keeps the `Insn` enum — and the ~25 analysis sites that match on it — with
+/// a single new case to reason about instead of three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum BinOpConstKind {
+    /// `dst = src + K` — same `Value` semantics as [`Insn::Add`].
+    Add = 0,
+    /// `dst = (src == K)` — same `Value` semantics as [`Insn::Eq`].
+    Eq = 1,
+    /// `dst = (src === K)` — same `Value` semantics as [`Insn::CaseEq`].
+    CaseEq = 2,
+}
+
+impl BinOpConstKind {
+    /// Number of kinds; sizes the static fusion-count array.
+    pub const COUNT: usize = 3;
+}
+
 /// Bytecode instruction set. Stack-free, register-based design.
 /// Each instruction specifies source and destination registers explicitly,
 /// enabling the VM to iterate a flat Vec<Insn> with predictable memory access.
@@ -212,6 +263,52 @@ pub enum Insn {
     /// `LoadSignal`+`BitSelectConst` fusion below runs, which is why it needs
     /// its own pass.
     BranchIfSignalFalse(SigId, u32, u32), // (signal_id, jump_target, bit | u32::MAX)
+
+    /// Fused `LoadSignal` + `LoadArrayElem` + `NbaAssign` — an RTL memory
+    /// read feeding a flop:
+    ///
+    ///   LoadSignal(r1, idx_sig)          ; r1 = the array index, from a signal
+    ///   LoadArrayElem(r2, array, r1)     ; r2 = array[r1]
+    ///   NbaAssign(dst_sig, r2, width)    ; dst_sig <= r2
+    ///       → NbaAssignArrayRead(dst_sig, array, idx_sig, width)
+    ///
+    /// The dominant shape in a CPU's register file and caches. On the C906
+    /// memcpy census the two constituent adjacent pairs each fire 16.5 M times
+    /// with IDENTICAL counts (3.7% of the stream apiece) — one idiom, not two.
+    /// Collapsing it removes two dispatches and two 32-byte VM register
+    /// writes per execution.
+    ///
+    /// NOTE the field order: the DESTINATION signal comes first (so the
+    /// `NbaAssign*` write-extraction alternations bind it in their usual first
+    /// position) and the INDEX signal — which this instruction READS — is
+    /// third. The array element read is dynamically addressed, so like
+    /// `LoadArrayElem` this variant makes an edge block non-gateable in
+    /// `build_event_measure_state`.
+    NbaAssignArrayRead(SigId, Box<ArrayOperand>, SigId, u32), // (dst_sig, array, idx_sig, width)
+
+    /// Fused `LoadConst` + a binary ALU op that consumes it as its RIGHT
+    /// operand:
+    ///
+    ///   LoadConst(c, K)                    ; c = K
+    ///   Add|Eq|CaseEq(d, l, c)             ; d = l <op> c
+    ///       → BinOpConst(d, l, K, kind)
+    ///
+    /// `LoadConst` is the #2 opcode on the C906 memcpy census (49.7 M, 12.0%)
+    /// and 32.5 M of those feed exactly these three operators — 7.9% of the
+    /// whole executed stream. Each fusion removes one dispatch and one 32-byte
+    /// VM register write.
+    ///
+    /// ONE variant, not three: the enum's known silent-failure mode is the
+    /// ~25 analysis sites that match `Insn` with a catch-all `_ =>` to pull
+    /// out SIGNAL IDs. This variant carries no signal id — only two register
+    /// ids and a constant — so `_ =>` is the correct answer at every one of
+    /// them, and there is one thing to audit rather than three.
+    ///
+    /// Field order is (dest, src, K, kind). The exec arms substitute `&**K`
+    /// for what would have been `&vm_regs[c]` and are otherwise character-for-
+    /// character the unfused arms, so the 4-state, signedness and §5.7.1
+    /// `is_fill` rules cannot drift.
+    BinOpConst(RegId, RegId, Box<Value>, BinOpConstKind), // (dest, src, const, kind)
 }
 
 /// Pre-resolved unpacked-array addressing embedded in bytecode. The name is
@@ -332,6 +429,10 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::NbaAssignBitDyn(..) => "NbaBitDyn",
         Insn::NbaAssignArray(..) => "NbaArr",
         Insn::NbaAssignArrayRange(..) => "NbaArrRng",
+        Insn::NbaAssignArrayRead(..) => "NbaArrRd",
+        Insn::BinOpConst(_, _, _, BinOpConstKind::Add) => "AddC",
+        Insn::BinOpConst(_, _, _, BinOpConstKind::Eq) => "EqC",
+        Insn::BinOpConst(_, _, _, BinOpConstKind::CaseEq) => "CaseEqC",
         Insn::StmtFallback(..) => "Fallback",
     }
 }
@@ -344,6 +445,10 @@ pub struct BytecodeCompiler<'a> {
     signal_name_to_id: &'a HashMap<Arc<str>, usize>,
     signal_signed: &'a [bool],
     signal_widths: &'a [u32],
+    /// Per-signal `is_real`. Optional because only the simulator has it;
+    /// absent means "assume possibly-real", which only costs missed
+    /// `Resize` elisions, never correctness.
+    signal_real: Option<&'a [bool]>,
     arrays: &'a HashMap<String, (i64, i64, u32)>,
     array_first_id: Option<&'a HashMap<Arc<str>, (usize, i64, i64)>>,
     widths: &'a HashMap<String, u32>,
@@ -463,6 +568,7 @@ impl<'a> BytecodeCompiler<'a> {
             signal_name_to_id,
             signal_signed,
             signal_widths,
+            signal_real: None,
             arrays,
             array_first_id: None,
             widths,
@@ -534,6 +640,15 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_string_signals(&mut self, s: &'a HashSet<String>) {
         self.string_signals = Some(s);
+    }
+
+    /// Supply per-signal `is_real` so `elide_redundant_resizes` can prove a
+    /// loaded signal is not real. `Value::add` and friends special-case a real
+    /// operand (returning a 64-bit `from_f64`), so without this every
+    /// arithmetic result on a signal is "possibly real" and its `Resize`
+    /// survives — measured at ~337K of the ~553K resizes still executing.
+    pub fn set_signal_real(&mut self, r: &'a [bool]) {
+        self.signal_real = Some(r);
     }
 
     pub fn set_multi_dim_arrays(&mut self, s: &'a HashSet<String>) {
@@ -1687,9 +1802,35 @@ impl<'a> BytecodeCompiler<'a> {
         let l = self.eval_const_expr(left)?;
         let r = self.eval_const_expr(right)?;
         let (lo, hi) = if l >= r { (r, l) } else { (l, r) };
-        let elem_w = hi - lo + 1;
-        let flat_lo = outer.checked_mul(elem_w)?.checked_add(lo)?;
-        let flat_hi = outer.checked_mul(elem_w)?.checked_add(hi)?;
+        // §7.4.1: the element stride is the DECLARED element width, not the
+        // slice width — `d[1][31:0]` on `logic [4:0][63:0] d` targets bits
+        // [95:64], not [63:32]. The slice-width fallback stays for signals
+        // with no packed metadata (the generated-loop flattening case this
+        // helper was built for, where slice == element by construction).
+        let (stride, base_bit) = match self.packed_elem_width_of(hier) {
+            Some(decl_ew) => {
+                if hi >= decl_ew {
+                    return None; // slice exceeds the element: not this shape
+                }
+                let dim = self.packed_outer_dim(hier);
+                let lsb = Self::packed_elem_lsb(dim, outer as i64, decl_ew);
+                if lsb < 0 {
+                    return None;
+                }
+                (0, lsb as u32)
+            }
+            None => (hi - lo + 1, 0),
+        };
+        let flat_lo = if stride == 0 {
+            base_bit.checked_add(lo)?
+        } else {
+            outer.checked_mul(stride)?.checked_add(lo)?
+        };
+        let flat_hi = if stride == 0 {
+            base_bit.checked_add(hi)?
+        } else {
+            outer.checked_mul(stride)?.checked_add(hi)?
+        };
         if flat_hi < self.signal_widths[id] {
             Some((id, flat_hi, flat_lo))
         } else {
@@ -4382,7 +4523,16 @@ impl<'a> BytecodeCompiler<'a> {
         // this pass leaves behind).
         let signal_widths = self.signal_widths;
         let num_regs = (self.next_reg as usize).min(u16::MAX as usize + 1);
-        Self::elide_redundant_resizes(&mut self.insns, signal_widths, num_regs);
+        Self::elide_redundant_resizes(&mut self.insns, signal_widths, self.signal_real, num_regs);
+        // AFTER resize elision: an about-to-be-deleted `Resize` sitting between
+        // the array read and the NBA would otherwise hide the triple. Still
+        // before `compact_nops`, which removes the `Nop`s it leaves behind.
+        Self::fuse_array_read_nba(&mut self.insns);
+        // Also after `elide_redundant_resizes`: a `Resize` that pass deletes
+        // is what most often separates a `LoadConst` from its consumer. Its
+        // pattern is disjoint from `fuse_array_read_nba`'s, so the order
+        // between the two does not matter.
+        Self::fuse_binop_const(&mut self.insns);
         Self::compact_nops(&mut self.insns);
         // Trim unused capacity. `Vec::push` doubles the backing buffer
         // when it overflows, so a freshly compiled block can sit on
@@ -4403,6 +4553,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::NbaAssignConst(id, _, _)
                 | Insn::NbaAssignRange(id, _, _, _)
                 | Insn::NbaAssignRangeDyn(id, _, _, _)
+                | Insn::NbaAssignArrayRead(id, _, _, _)
                 | Insn::NbaAssignBitDyn(id, _, _) => Some(*id as u32),
                 _ => None,
             };
@@ -4433,6 +4584,8 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::LoadSignalBit(..)
             | Insn::NbaAssignConst(..)
             | Insn::BranchIfSignalFalse(..)
+            // Reads its index straight out of the signal table; no registers.
+            | Insn::NbaAssignArrayRead(..)
             | Insn::Jump(..)
             | Insn::Nop => false,
             Insn::BranchUnlessZero(c, _) => *c == r,
@@ -4470,6 +4623,8 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::ReduceXor(_, s)
             | Insn::Move(_, s)
             | Insn::Replicate(_, s, _) => *s == r,
+            // Its other operand is the embedded constant, not a register.
+            Insn::BinOpConst(_, s, _, _) => *s == r,
             Insn::BitSelect(_, b, i) => *b == r || *i == r,
             Insn::BitSelectConst(_, b, _) => *b == r,
             Insn::RangeSelect(_, b, l, rr) => *b == r || *l == r || *rr == r,
@@ -4672,6 +4827,222 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Peephole: collapse the RTL "memory read feeding a flop" idiom
+    ///
+    ///   LoadSignal(r1, idx_sig)         ; r1 = the array index, from a signal
+    ///   LoadArrayElem(r2, array, r1)    ; r2 = array[r1]
+    ///   NbaAssign(dst, r2, w)           ; dst <= r2
+    ///       → NbaAssignArrayRead(dst, array, idx_sig, w)
+    ///
+    /// into one instruction, removing two dispatches and two 32-byte VM
+    /// register writes per execution.
+    ///
+    /// The opcode census only proves ADJACENCY; the operand chain is verified
+    /// HERE. `LoadArrayElem`'s index register must be exactly the
+    /// `LoadSignal`'s destination, `NbaAssign`'s value register exactly the
+    /// `LoadArrayElem`'s destination, and — since the fused form writes no
+    /// register at all — neither intermediate may be read anywhere else in the
+    /// block. Registers are allocated fresh per value (`alloc_reg` never
+    /// reuses an id within a block), so any read of `r1`/`r2` outside the
+    /// triple consumes THIS chain; the scan covers the whole block, not just
+    /// the suffix, so a backward jump cannot smuggle one past it.
+    ///
+    /// Runs after `elide_redundant_resizes` (a `Resize` that pass is about to
+    /// delete would otherwise hide the triple) and before `compact_nops`,
+    /// skipping the `Nop` placeholders earlier fusions left behind — those are
+    /// removed before execution, so the three really are consecutive in the
+    /// stream that runs. `XEZIM_FUSE_ARRNBA=0` disables the pass (A/B escape
+    /// hatch).
+    fn fuse_array_read_nba(insns: &mut [Insn]) {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| {
+            !matches!(std::env::var("XEZIM_FUSE_ARRNBA").as_deref(), Ok("0"))
+        }) || insns.len() < 3
+        {
+            return;
+        }
+        // Branch targets: fusing must not change what a jump lands on.
+        let mut is_target = vec![false; insns.len() + 1];
+        for insn in insns.iter() {
+            match insn {
+                Insn::BranchIfFalse(_, t)
+                | Insn::BranchUnlessZero(_, t)
+                | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::Jump(t)
+                    if (*t as usize) < is_target.len() => {
+                        is_target[*t as usize] = true;
+                    }
+                _ => {}
+            }
+        }
+        // Index of the next instruction that survives `compact_nops`.
+        fn next_real(insns: &[Insn], from: usize) -> Option<usize> {
+            let mut j = from;
+            while j < insns.len() && matches!(insns[j], Insn::Nop) {
+                j += 1;
+            }
+            (j < insns.len()).then_some(j)
+        }
+        for i in 0..insns.len() - 2 {
+            let &Insn::LoadSignal(r1, idx_sig) = &insns[i] else {
+                continue;
+            };
+            let Some(k) = next_real(insns, i + 1) else {
+                continue;
+            };
+            let Insn::LoadArrayElem(r2, _, elem_idx_reg) = &insns[k] else {
+                continue;
+            };
+            let (r2, elem_idx_reg) = (*r2, *elem_idx_reg);
+            if elem_idx_reg != r1 {
+                continue;
+            }
+            let Some(j) = next_real(insns, k + 1) else {
+                continue;
+            };
+            let &Insn::NbaAssign(dst, val_reg, width) = &insns[j] else {
+                continue;
+            };
+            if val_reg != r2 {
+                continue;
+            }
+            // Control must fall through i → k → j: no branch may land on
+            // anything from i+1 through j, or the fused form would swallow an
+            // entry point.
+            if (i + 1..=j).any(|x| is_target[x]) {
+                continue;
+            }
+            let consumed = insns.iter().enumerate().any(|(x, ins)| {
+                x != i
+                    && x != k
+                    && x != j
+                    && (Self::insn_reads_reg(ins, r1) || Self::insn_reads_reg(ins, r2))
+            });
+            if consumed {
+                continue;
+            }
+            // Take the boxed operand out of the `LoadArrayElem` rather than
+            // cloning its name `String`.
+            let Insn::LoadArrayElem(_, array, _) =
+                std::mem::replace(&mut insns[k], Insn::Nop)
+            else {
+                unreachable!("just matched LoadArrayElem")
+            };
+            insns[i] = Insn::NbaAssignArrayRead(dst, array, idx_sig, width);
+            insns[j] = Insn::Nop;
+            FUSED_ARRAY_READ_NBA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Peephole: absorb a constant load into the ALU op that consumes it.
+    ///
+    ///   LoadConst(c, K)          ; c = K
+    ///   Add|Eq|CaseEq(d, l, c)   ; d = l <op> c
+    ///       → BinOpConst(d, l, K, kind)
+    ///
+    /// `LoadConst` is the #2 opcode on the C906 memcpy census (49.7 M, 12.0%
+    /// of executed bytecode) and 32.5 M of those — 7.9% of the whole stream —
+    /// feed exactly these three operators. Each fusion removes one dispatch
+    /// and one 32-byte VM register write. It also dissolves the `Add;LoadConst`
+    /// pairs of an address-increment chain, whose `LoadConst` half is the same
+    /// instruction seen from the other side.
+    ///
+    /// Only the RIGHT operand is fused, and that costs nothing: the compiler
+    /// emits the left operand's code, then the right's, then the operator, so
+    /// an IMMEDIATELY PRECEDING `LoadConst` is by construction the right
+    /// operand. (A left-hand constant has the right operand's code in between
+    /// and so is not an adjacent pair at all.) `l == c` — both operands the
+    /// same constant register — is rejected, since the fused form no longer
+    /// loads `c` for the left side to read.
+    ///
+    /// The census only proves ADJACENCY; the operand chain is verified HERE:
+    /// the operator's right register must be exactly the `LoadConst`'s
+    /// destination, and — since the fused form does not write `c` — `c` must
+    /// not be read anywhere else in the block. Registers are allocated fresh
+    /// per value (`alloc_reg` never reuses an id within a block), so any read
+    /// of `c` outside the pair consumes THIS constant; the scan covers the
+    /// whole block, not just the suffix, so a backward jump cannot smuggle one
+    /// past it.
+    ///
+    /// Runs after `elide_redundant_resizes` — a `Resize` that pass is about to
+    /// delete would otherwise hide the pair, and a `Resize` it KEEPS must
+    /// still block the fusion (only `Nop`s are skipped) because the constant
+    /// would then need resizing before use. Before `compact_nops`, which
+    /// removes the `Nop`s left behind. `XEZIM_FUSE_CONST=0` disables the pass
+    /// (A/B escape hatch).
+    fn fuse_binop_const(insns: &mut [Insn]) {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| {
+            !matches!(std::env::var("XEZIM_FUSE_CONST").as_deref(), Ok("0"))
+        }) || insns.len() < 2
+        {
+            return;
+        }
+        // Branch targets: fusing must not change what a jump lands on.
+        let mut is_target = vec![false; insns.len() + 1];
+        for insn in insns.iter() {
+            match insn {
+                Insn::BranchIfFalse(_, t)
+                | Insn::BranchUnlessZero(_, t)
+                | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::Jump(t)
+                    if (*t as usize) < is_target.len() =>
+                {
+                    is_target[*t as usize] = true;
+                }
+                _ => {}
+            }
+        }
+        for i in 0..insns.len() - 1 {
+            let Insn::LoadConst(c, _) = &insns[i] else {
+                continue;
+            };
+            let c = *c;
+            // Index of the next instruction that survives `compact_nops`.
+            let mut j = i + 1;
+            while j < insns.len() && matches!(insns[j], Insn::Nop) {
+                j += 1;
+            }
+            if j >= insns.len() {
+                continue;
+            }
+            let (d, l, kind) = match insns[j] {
+                Insn::Add(d, l, r) if r == c => (d, l, BinOpConstKind::Add),
+                Insn::Eq(d, l, r) if r == c => (d, l, BinOpConstKind::Eq),
+                Insn::CaseEq(d, l, r) if r == c => (d, l, BinOpConstKind::CaseEq),
+                _ => continue,
+            };
+            // `op(d, c, c)`: the left operand is the constant register too,
+            // and the fused form no longer materialises it.
+            if l == c {
+                continue;
+            }
+            // Control must fall through i → j: nothing from i+1 through j may
+            // be a branch target, or the fused form would swallow an entry
+            // point.
+            if (i + 1..=j).any(|x| is_target[x]) {
+                continue;
+            }
+            let consumed = insns
+                .iter()
+                .enumerate()
+                .any(|(x, ins)| x != i && x != j && Self::insn_reads_reg(ins, c));
+            if consumed {
+                continue;
+            }
+            // Take the boxed constant out of the `LoadConst` rather than
+            // cloning a possibly-`Wide` `Value`.
+            let Insn::LoadConst(_, k) = std::mem::replace(&mut insns[i], Insn::Nop) else {
+                unreachable!("just matched LoadConst")
+            };
+            insns[i] = Insn::BinOpConst(d, l, k, kind);
+            insns[j] = Insn::Nop;
+            FUSED_BINOP_CONST[kind as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Static width inference over the emitted stream: delete every
     /// `Resize(r, w)` whose register is already provably `w` bits wide.
     ///
@@ -4705,7 +5076,12 @@ impl<'a> BytecodeCompiler<'a> {
     /// cleared there. That covers backward jumps too (a loop head is a target),
     /// at the cost of giving up the first iteration's worth of knowledge inside
     /// loops. `XEZIM_RESIZE_ELIDE=0` disables the pass (A/B escape hatch).
-    fn elide_redundant_resizes(insns: &mut [Insn], signal_widths: &[u32], num_regs: usize) {
+    fn elide_redundant_resizes(
+        insns: &mut [Insn],
+        signal_widths: &[u32],
+        signal_real: Option<&[bool]>,
+        num_regs: usize,
+    ) {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         if !*ENABLED.get_or_init(|| {
@@ -4783,14 +5159,21 @@ impl<'a> BytecodeCompiler<'a> {
                     store(&mut rw, *d, f);
                 }
                 // `signal_table[id].clone()`. `is_real` is a property of the
-                // signal's declared type, which is not in scope here, so a
-                // loaded signal is never `plain`.
+                // signal's DECLARED type, so it is plain exactly when
+                // `signal_real[id]` is false. Without that table (no
+                // `set_signal_real`) assume possibly-real, which only forgoes
+                // elisions. `is_fill` never reaches a stored signal value:
+                // `resize`/`resize_for_assign` clear it on the way in.
                 Insn::LoadSignal(d, s) | Insn::LoadSignalSigned(d, s) => {
+                    let plain = signal_real
+                        .and_then(|sr| sr.get(*s as usize).copied())
+                        .map(|is_real| !is_real)
+                        .unwrap_or(false);
                     let f = signal_widths
                         .get(*s as usize)
                         .copied()
                         .and_then(ok)
-                        .map(|w| (w, false));
+                        .map(|w| (w, plain));
                     store(&mut rw, *d, f);
                 }
                 // `Value::bit_select` is 1 bit on every path, including the
@@ -4885,6 +5268,33 @@ impl<'a> BytecodeCompiler<'a> {
                     store(&mut rw, *d, f);
                 }
 
+                // Same rules as the unfused pair, with the constant's fact
+                // read straight off the boxed `Value` instead of looked up —
+                // which is strictly MORE inferable than the register form,
+                // since `K` can never be unknown. The `Add` kind reuses the
+                // arithmetic rule above verbatim (`max` of the operand widths,
+                // both operands required non-real because `Value::add`
+                // special-cases a real operand into a 64-bit `from_f64`, and
+                // non-fill because §5.7.1 widening renormalises them);
+                // `Eq`/`CaseEq` land in the 1-bit comparison rule, since
+                // `is_equal`/`case_eq` return `from_u64(_, 1)` on every path.
+                Insn::BinOpConst(d, s, k, kind) => {
+                    let f = match kind {
+                        BinOpConstKind::Eq | BinOpConstKind::CaseEq => Some((1, true)),
+                        BinOpConstKind::Add => {
+                            // Identical to the `Insn::LoadConst` arm's fact.
+                            let kf = ok(k.width).map(|w| (w, !k.is_real && !k.is_fill));
+                            match (fact(&rw, *s), kf) {
+                                (Some((a, true)), Some((b, true))) => {
+                                    ok(a.max(b)).map(|w| (w, true))
+                                }
+                                _ => None,
+                            }
+                        }
+                    };
+                    store(&mut rw, *d, f);
+                }
+
                 // `Select` is the one arm that writes registers it does not
                 // name as its destination: it widens a §5.7.1 fill branch to
                 // the other branch's width IN PLACE before choosing. Only when
@@ -4965,6 +5375,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::NbaAssignBitDyn(..)
                 | Insn::NbaAssignArray(..)
                 | Insn::NbaAssignArrayRange(..)
+                | Insn::NbaAssignArrayRead(..)
                 | Insn::BlockingAssign(..)
                 | Insn::BlockingAssignRange(..)
                 | Insn::BlockingAssignRangeDyn(..)
@@ -5196,7 +5607,7 @@ mod tests {
             Insn::Resize(0, 4),
             Insn::Resize(0, 4),
         ];
-        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], 1);
+        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], None, 1);
         assert!(matches!(
             insns.as_slice(),
             [Insn::LoadSignal(0, 0), Insn::Nop, Insn::Resize(0, 4), Insn::Nop]
@@ -5213,7 +5624,7 @@ mod tests {
             Insn::Resize(0, 8),
             Insn::Resize(0, 8),
         ];
-        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], 1);
+        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], None, 1);
         assert!(matches!(insns[2], Insn::Nop));
         assert!(matches!(insns[3], Insn::Resize(0, 8)));
     }
@@ -5232,7 +5643,7 @@ mod tests {
             Insn::BitOr(3, 0, 1),
             Insn::Resize(3, 8),
         ];
-        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], 4);
+        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], None, 4);
         assert!(matches!(insns[3], Insn::Resize(2, 8)));
         assert!(matches!(insns[5], Insn::Nop));
     }

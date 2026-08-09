@@ -781,6 +781,7 @@ pub fn classify_lp_io(sim: &crate::compiler::Simulator, lp_a_prefix: &str) -> Lp
                 Insn::NbaAssignRange(id, _, _, _) => Some(*id),
                 Insn::NbaAssignBitDyn(id, _, _) => Some(*id),
                 Insn::NbaAssignRangeDyn(id, _, _, _) => Some(*id),
+                Insn::NbaAssignArrayRead(id, _, _, _) => Some(*id),
                 Insn::BlockingAssign(id, _, _) => Some(*id),
                 Insn::BlockingAssignRange(id, _, _, _) => Some(*id),
                 Insn::BlockingAssignBitDyn(id, _, _) => Some(*id),
@@ -800,6 +801,8 @@ pub fn classify_lp_io(sim: &crate::compiler::Simulator, lp_a_prefix: &str) -> Lp
             let read_all = match insn {
                 Insn::LoadSignal(_, id) => Some(*id),
                 Insn::LoadSignalSigned(_, id) => Some(*id),
+                // Fused array-read NBA READS its index signal (3rd field).
+                Insn::NbaAssignArrayRead(_, _, id, _) => Some(*id),
                 _ => None,
             };
             if let Some(id) = read_all {
@@ -835,6 +838,7 @@ pub fn classify_lp_io(sim: &crate::compiler::Simulator, lp_a_prefix: &str) -> Lp
                 Insn::NbaAssignRange(id, _, _, _) => Some(*id),
                 Insn::NbaAssignBitDyn(id, _, _) => Some(*id),
                 Insn::NbaAssignRangeDyn(id, _, _, _) => Some(*id),
+                Insn::NbaAssignArrayRead(id, _, _, _) => Some(*id),
                 _ => None,
             };
             if let Some(id) = written {
@@ -851,6 +855,8 @@ pub fn classify_lp_io(sim: &crate::compiler::Simulator, lp_a_prefix: &str) -> Lp
             let read = match insn {
                 Insn::LoadSignal(_, id) => Some(*id),
                 Insn::LoadSignalSigned(_, id) => Some(*id),
+                // Fused array-read NBA READS its index signal (3rd field).
+                Insn::NbaAssignArrayRead(_, _, id, _) => Some(*id),
                 _ => None,
             };
             if let Some(id) = read {
@@ -1185,6 +1191,11 @@ pub fn compute_ddg(sim: &crate::compiler::Simulator) -> DdgStats {
             match insn {
                 Insn::LoadSignal(_, sig) | Insn::LoadSignalSigned(_, sig) => {
                     block_reads[bi].push(*sig as usize);
+                }
+                // Fused array-read NBA: reads the index, writes the dest.
+                Insn::NbaAssignArrayRead(dst, _, idx, _) => {
+                    block_reads[bi].push(*idx as usize);
+                    block_writes[bi].push(*dst as usize);
                 }
                 Insn::NbaAssign(sig, _, _)
                 | Insn::NbaAssignRange(sig, _, _, _)

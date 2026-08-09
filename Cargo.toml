@@ -20,10 +20,10 @@ bincode = "1.3"
 once_cell = "1.18"
 # JIT: enabled with `--features jit`. Kept optional to avoid adding the
 # cranelift build dependency to users who only want the interpreter.
-cranelift = { version = "0.109", optional = true }
-cranelift-jit = { version = "0.109", optional = true }
-cranelift-module = { version = "0.109", optional = true }
-cranelift-native = { version = "0.109", optional = true }
+cranelift = { version = "0.134", optional = true }
+cranelift-jit = { version = "0.134", optional = true }
+cranelift-module = { version = "0.134", optional = true }
+cranelift-native = { version = "0.134", optional = true }
 fst-writer = "0.3"
 
 # macOS: link the SDK's libffi instead of building libffi-sys's vendored copy.

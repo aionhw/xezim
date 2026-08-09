@@ -239,3 +239,36 @@ mod procedural_storage_semantics;
 
 #[path = "types/expression_event_controls.rs"]
 mod expression_event_controls;
+
+#[path = "types/packed_multilevel_and_collision.rs"]
+mod packed_multilevel_and_collision;
+
+#[path = "types/star_vs_always_comb.rs"]
+mod star_vs_always_comb;
+
+#[path = "types/force_expression_tracks.rs"]
+mod force_expression_tracks;
+
+#[path = "types/procedural_loop_and_static_fn.rs"]
+mod procedural_loop_and_static_fn;
+
+#[path = "types/inside_defaults_and_foreach_dir.rs"]
+mod inside_defaults_and_foreach_dir;
+
+#[path = "types/param_const_eval_contexts.rs"]
+mod param_const_eval_contexts;
+
+#[path = "types/struct_port_pattern_ca.rs"]
+mod struct_port_pattern_ca;
+
+#[path = "types/packed2d_slice_ca_offset.rs"]
+mod packed2d_slice_ca_offset;
+
+#[path = "types/typedef_bits_of_signal_dims.rs"]
+mod typedef_bits_of_signal_dims;
+
+#[path = "types/nested_dynamic_members.rs"]
+mod nested_dynamic_members;
+
+#[path = "types/assoc_keys_and_handles.rs"]
+mod assoc_keys_and_handles;
