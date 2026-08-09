@@ -42836,6 +42836,20 @@ impl Simulator {
                     }
                     return;
                 }
+                // IEEE 1800-2023 §7.2: a whole unpacked-struct CLASS
+                // PROPERTY read into a MEMBER target (`local.s = obj.s`).
+                // The packed-Value route drops reference/string members,
+                // so decompose member-wise. (Mirrors the class-prop TARGET
+                // path above but keys off the SOURCE being a class property.)
+                if self
+                    .try_decompose_class_prop_member_copy(lvalue, rvalue)
+                    .is_some()
+                {
+                    if !self.in_edge_block {
+                        self.settle_combinatorial();
+                    }
+                    return;
+                }
                 // IEEE 1800-2017 §7.2: assigning one unpacked struct to another
                 // copies every member. Their leaves live in separate signals, so
                 // evaluating the RHS to a packed value and storing it writes a
@@ -62962,6 +62976,85 @@ impl Simulator {
         // Member-wise assign. Nested struct/array members recurse naturally:
         // `lhs.m = eval(rhs.m)` re-enters this path (for a nested struct
         // class-property target) or the existing signal paths.
+        for m in &su.members {
+            for md in &m.declarators {
+                let mname = md.name.name.as_str();
+                let lhs_f = Self::append_member_expr(lvalue, mname);
+                let rhs_f = Self::append_member_expr(rvalue, mname);
+                let v = self.eval_expr(&rhs_f);
+                self.assign_value(&lhs_f, &v);
+            }
+        }
+        Some(())
+    }
+
+    /// §7.4.5: a whole unpacked-struct CLASS PROPERTY read into a MEMBER
+    /// target (`local.s = obj.s` — the shape UVM's factory match helpers use:
+    /// `match_type_pair = override.orig`). The packed-Value route can never
+    /// carry a reference/pointer member, so any struct with a class-handle or
+    /// `string` field that is read as a whole loses those fields (either the
+    /// zero-width handle is dropped, or the whole pack reports `None`).
+    /// Decompose member-wise instead (`local.x.a = eval(obj.x.a)`) — the same
+    /// unconditional member-wise copy the class-prop TARGET path above uses,
+    /// so the source never has to materialize as a single Value.
+    ///
+    /// A ternary source (`local.s = cond ? a.s : b.s`) is peeled first: the
+    /// condition is evaluated once and the SELECTED arm rides the member-wise
+    /// copy. (IEEE 1800-2023 §7.2, §11.4.11)
+    fn try_decompose_class_prop_member_copy(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> Option<()> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        // Ternary source (`local.s = cond ? a.s : b.s`): peel to the selected
+        // arm — but ONLY when BOTH arms resolve to a whole spread class-prop
+        // struct (`class_prop_receiver` + `class_prop_struct` +
+        // `spreads_member_wise`; a pure structural check, no evaluation). Any
+        // other ternary (`r = f() ? x : y`) falls through untouched and is
+        // evaluated exactly once by the normal assignment path below, so a
+        // side-effecting `f()` is never double-evaluated here.
+        if let ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } = &rvalue.kind
+        {
+            // Only peel when BOTH arms resolve to a whole spread (unpacked)
+            // struct class property — a pure structural check with no side
+            // effects. Any other ternary (`r = f() ? x : y`) falls through
+            // untouched and is evaluated exactly once by the normal path.
+            let mut arm_ok = |e: &Expression| -> bool {
+                let (h, p) = match self.class_prop_receiver(e) {
+                    Some(x) => x,
+                    None => return false,
+                };
+                match self.class_prop_struct(h, p.as_str()) {
+                    Some(su) => Self::spreads_member_wise(&su),
+                    None => false,
+                }
+            };
+            if !arm_ok(then_expr) || !arm_ok(else_expr) {
+                return None;
+            }
+            let c = self.eval_expr(condition);
+            if c.has_unknown() {
+                return None;
+            }
+            let arm = if c.is_true() {
+                (**then_expr).clone()
+            } else {
+                (**else_expr).clone()
+            };
+            return self.try_decompose_class_prop_member_copy(lvalue, &arm);
+        }
+        let (handle, prop) = self.class_prop_receiver(rvalue)?;
+        let su = self.class_prop_struct(handle, &prop)?;
+        if !Self::spreads_member_wise(&su) {
+            return None;
+        }
         for m in &su.members {
             for md in &m.declarators {
                 let mname = md.name.name.as_str();
