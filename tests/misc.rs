@@ -109,6 +109,8 @@ mod parser_gaps2;
 mod parser_stmt_gaps;
 #[path = "misc/obj_assocd_event_disable_fork.rs"]
 mod obj_assocd_event_disable_fork;
+#[path = "misc/indexed_event_roundtrip.rs"]
+mod indexed_event_roundtrip;
 #[path = "misc/param_class_cast_type_args.rs"]
 mod param_class_cast_type_args;
 #[path = "misc/pattern_replication_and_extends_args.rs"]
