@@ -69331,7 +69331,8 @@ impl Simulator {
                 // (type-param-dest case) or the dest var's declared
                 // `#(...)` type_args (direct-decl case).
                 let vp_ok = self.cast_value_params_ok(&resolved, spec_args_from_name.as_deref(), dest, h);
-                vp_ok
+                let tp_ok = self.cast_type_params_ok(&resolved, spec_args_from_name.as_deref(), dest, h);
+                vp_ok && tp_ok
             }
             None => true, // unknown dest type — stay permissive
         }
@@ -69476,6 +69477,133 @@ impl Simulator {
                 true // non-literal fragment (e.g. a param name) → can't compare
             };
             if !matches {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Type-parameter specialization check for `$cast` (LRM 1800-2023 §8.25.1).
+    /// Two distinct instantiations of a parameterized class are the SAME type
+    /// iff their parameters are the same; distinct type arguments make the two
+    /// instantiations DIFFERENT, unrelated types, so a `$cast` between them
+    /// must FAIL even when the type arguments are subclasses/siblings of a
+    /// common base or are unrelated builtin types.
+    ///
+    /// `uvm_config_wrapper::set` stores a `uvm_resource#(uvm_object_wrapper)`
+    /// default sequence; the sequencer's `start_phase_sequence` does
+    /// `$cast(sbr, rsrc)` with `sbr : uvm_resource#(uvm_sequence_base)`. Those
+    /// are distinct instantiations (type params `uvm_object_wrapper` vs
+    /// `uvm_sequence_base`), so the cast must FAIL and fall through to the
+    /// `uvm_object_wrapper` branch that creates + starts the sequence. Before
+    /// this check the cast only compared the base-class hierarchy (both are
+    /// `uvm_resource`) and the value params (none), so it wrongly returned
+    /// success, the sequence was never started, and its body messages never
+    /// ran (50phase_controls/01simple ended with message count 0).
+    ///
+    /// Mirrors `cast_value_params_ok`: for each TYPE param position the dest
+    /// declares, the src instance's `type_bindings` must carry the same
+    /// concrete type, else the cast fails. Permissive (`true`) when the
+    /// comparison can't be determined (no type params, no dest args, or no src
+    /// binding) — preserving the behaviour for non-specialized declarations.
+    fn cast_type_params_ok(
+        &self,
+        dest_class: &str,
+        spec_args_from_name: Option<&str>,
+        dest: &Expression,
+        src_handle: usize,
+    ) -> bool {
+        let cd = match self.module.classes.get(dest_class) {
+            Some(c) => c.clone(),
+            None => return true,
+        };
+        if cd.type_param_names.is_empty() {
+            return true; // no type params to compare
+        }
+        // parameter order: type and value params interleave. Reuse the legacy
+        // order reconstruction exactly as the value-param checker does.
+        let legacy_order: Vec<String>;
+        let order: &[String] = if cd.param_order.is_empty()
+            && !(cd.param_defaults.is_empty() && cd.type_param_names.is_empty())
+        {
+            legacy_order = cd
+                .param_defaults
+                .iter()
+                .map(|(n, _)| n.clone())
+                .chain(cd.type_param_names.iter().cloned())
+                .collect();
+            &legacy_order
+        } else {
+            &cd.param_order
+        };
+        let is_type_param = |n: &str| cd.type_param_names.iter().any(|t| t == n);
+        let type_positions: Vec<(usize, String)> = order
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| is_type_param(n))
+            .map(|(i, n)| (i, n.clone()))
+            .collect();
+
+        // Dest type-argument text: prefer the resolved name's `#(...)`
+        // (type-param-dest case), else the dest var's declared type_args.
+        let dest_args_text = match spec_args_from_name {
+            Some(a) => Some(a.to_string()),
+            None => {
+                if let ExprKind::Ident(h) = &dest.kind {
+                    if h.path.len() == 1 {
+                        let dvar = &h.path[0].name.name;
+                        self.var_type_args.get(dvar).and_then(|ta| {
+                            let frags: Vec<String> =
+                                ta.iter().filter_map(|e| self.expr_to_spec_fragment(e)).collect();
+                            if frags.is_empty() {
+                                None
+                            } else {
+                                Some(frags.join(","))
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+        let dest_args: Vec<String> = match dest_args_text {
+            Some(t) => Self::split_spec_args(&t)
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .collect(),
+            None => return true, // can't determine dest type args → permissive
+        };
+        let src_inst = match self.heap.get(src_handle).and_then(|o| o.as_ref()) {
+            Some(i) => i,
+            None => return true,
+        };
+        // Strip a `#(…)`/value-spec suffix and scope prefix for a canonical
+        // type-argument comparison. Keep the argument's own type args intact
+        // (they are part of the type's identity).
+        fn canon(s: &str) -> String {
+            s.trim()
+                .split("::")
+                .last()
+                .unwrap_or_else(|| s.trim())
+                .trim_matches('`')
+                .to_string()
+        }
+        for (pos, tp) in &type_positions {
+            let dfrag = match dest_args.get(*pos) {
+                Some(s) => s.trim(),
+                None => continue,
+            };
+            if dfrag.is_empty() {
+                continue;
+            }
+            let sval = match src_inst.type_bindings.get(tp) {
+                Some(v) => v,
+                None => continue,
+            };
+            if canon(dfrag) != canon(sval) {
                 return false;
             }
         }
