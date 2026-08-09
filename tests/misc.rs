@@ -107,6 +107,8 @@ mod operators_11_select_reduce;
 mod parser_gaps2;
 #[path = "misc/parser_stmt_gaps.rs"]
 mod parser_stmt_gaps;
+#[path = "misc/obj_assocd_event_disable_fork.rs"]
+mod obj_assocd_event_disable_fork;
 #[path = "misc/pattern_replication_and_extends_args.rs"]
 mod pattern_replication_and_extends_args;
 #[path = "misc/program_block_reactive.rs"]

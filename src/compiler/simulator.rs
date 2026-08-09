@@ -23732,8 +23732,7 @@ impl Simulator {
                     eprintln!(
                         "[xezim][hang-report] simulation reached --max-time ({} ticks) without $finish",
                         self.max_time
-                    );
-                    self.report_parked_waiters(8);
+                    );                    self.report_parked_waiters(8);
                 }
                 break;
             }
@@ -25697,14 +25696,6 @@ impl Simulator {
             }
         }
         let _dg = DepthGuard;
-        // Only count TOP-LEVEL (depth == 0) activations toward the per-pid
-        // zero-delay livelock limit. A re-entrant call (depth > 0) is a
-        // synchronous sub-invocation fired from within this same activation —
-        // e.g. a function/task the process called, or a trampolined
-        // while/for/repeat body that re-entered run_process_stmts. Such
-        // recursion is bounded (it returns) and is NOT the process re-arming
-        // itself via a #0 / event wait, so inflating `stall_pid_hits` with it
-        // would conflate ordinary recursion with genuine zero-delay livelock
         // (a process that keeps re-scheduling at one time and never lets the
         // clock advance). The livelock pattern only manifests at the outermost
         // dispatch, so the guard stays accurate while re-entrant work is free
@@ -26556,7 +26547,18 @@ impl Simulator {
                         // handle from OUTSIDE the class. `resolve_this_event_field`
                         // above only covers a bare field on `this`.
                         if let Some(expr) = Self::event_control_single_expr(event) {
-                            if let Some(key) = self.expr_handle_event_field(&expr) {
+                            let mut key = self.expr_handle_event_field(&expr);
+                            // Fallback: an event member reached through an
+                            // arbitrary receiver-expression that evaluates to a
+                            // class handle (e.g. an associative-array element:
+                            // `@(m_events[k].all_dropped)`). `expr_handle_event_field`
+                            // only accepts a plain `h.ce` / `this.ce` receiver;
+                            // the array-index base yields no sensitivity and the
+                            // `@` did not suspend (uvm_phase phasing livelock).
+                            if key.is_none() {
+                                key = self.expr_receiver_event_field(&expr);
+                            }
+                            if let Some(key) = key {
                                 let cont = vec![*body.clone()];
                                 // Chain the caller's tail rather than copying it.
                                 let cont = pc.pushed(cont, pc.start + i + 1);
@@ -46469,6 +46471,14 @@ impl Simulator {
                     self.killed_pids.insert(pid);
                     self.process_parents.remove(&pid);
                     self.process_contexts.remove(&pid);
+                    // §9.6.2: also purge every FUTURE-time `#delay` the killed
+                    // process had parked in the timing wheel, or the wheel's
+                    // `next_time`/`is_empty` would keep reporting activity and
+                    // a quiet simulation would never exit the event loop.
+                    // (UVM kills its run-phase timeout watchdog via `disable
+                    // fork`; leaving its 9200 s timer behind spins the run to
+                    // --max-time instead of finishing.)
+                    self.event_queue.remove_pid(pid);
                 }
                 self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
                 self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
@@ -47925,11 +47935,23 @@ impl Simulator {
                 // `-> h.ce` / `-> this.ce`: a class-property event reached
                 // through a handle (the `->` parser flattens it to a dotted
                 // name).
-                if name.name.contains('.') {
-                    if let Some(key) = self.resolve_handle_event_field(&name.name) {
-                        self.fire_instance_event(key);
-                        return;
-                    }
+                let key = if name.name.contains('.') {
+                    self.resolve_handle_event_field(&name.name)
+                } else {
+                    None
+                };
+                let key = if key.is_none() {
+                    // `-> m_events[obj].all_dropped`: a class-property event
+                    // reached through an ASSOCIATIVE-ARRAY element (UvM
+                    // objection). `resolve_handle_event_field` only accepts a
+                    // plain receiver name, so resolve the indexed receiver.
+                    self.resolve_indexed_handle_event_field(&name.name)
+                } else {
+                    key
+                };
+                if let Some(key) = key {
+                    self.fire_instance_event(key);
+                    return;
                 }
                 // An event bound to a `ref` formal fires the CALLER's event.
                 if !self.module.events.contains(name.name.as_str()) {
@@ -48240,6 +48262,112 @@ impl Simulator {
             _ => return None,
         };
         self.resolve_handle_event_field(&dotted)
+    }
+
+    /// Evaluate an arbitrary receiver EXPRESSION to a heap instance handle.
+    /// `@(m_events[k].ce)` / `-> m_events[k].ce` reach a class-property event
+    /// through an ASSOCIATIVE-ARRAY element: the base `m_events[k]` yields the
+    /// `rec` handle, and `.ce` is the event member. `resolve_handle_event_field`
+    /// only accepts a plain receiver name (`h.ce`, `this.ce`), so these
+    /// base-an-array-index shapes fell through to a bogus sensitivity and the
+    /// `@` did not suspend. Evaluate the receiver to the live handle.
+    fn eval_receiver_handle_expr(&mut self, recv: &Expression) -> Option<usize> {
+        let v = self.eval_expr(recv);
+        let h = v.to_u64()? as usize;
+        // sanity: it must name a live object, not (e.g.) a 1-bit flag
+        if self.heap.get(h).and_then(|o| o.as_ref()).is_some() {
+            Some(h)
+        } else {
+            None
+        }
+    }
+
+    /// §15.5 instance event reached through an arbitrary receiver expression
+    /// that evaluates (at suspension time) to a class handle and a member
+    /// event: `@(m_events[k].all_dropped)`. Returns the `(handle, field)`
+    /// event identity, or `None` when the receiver is not such a shape.
+    fn expr_receiver_event_field(&mut self, e: &Expression) -> Option<(usize, String)> {
+        let (recv, member) = match &e.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                (expr.as_ref(), member.name.clone())
+            }
+            _ => return None,
+        };
+        let h = self.eval_receiver_handle_expr(recv)?;
+        let inst = self.heap.get(h).and_then(|o| o.as_ref())?;
+        if inst.properties.contains_key(&member) {
+            Some((h, member))
+        } else {
+            None
+        }
+    }
+
+    /// Build the AST expression `this.<base>[<idx>]` for a receiver that the
+    /// `->` parser flattened to a dotted name like `m_events[obj].all_dropped`
+    /// (UvM objection `->m_events[obj].all_dropped`). Reconstructs the
+    /// array-element receiver so it hits the SAME `eval_expr` path the
+    /// wait-side `@(m_events[obj].all_dropped)` uses, then returns the
+    /// resulting class handle.
+    fn eval_this_member_index_handle(&mut self, base: &str, idx: &str) -> Option<usize> {
+        let span = crate::ast::Span::dummy();
+        let ident_expr = |n: &str| crate::ast::expr::Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: n.to_string(),
+                        span,
+                    },
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            span,
+        );
+        // `this.base[idx]`: a member array (of class handles) indexed by `idx`.
+        let member = crate::ast::expr::Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(crate::ast::expr::Expression::new(ExprKind::This, span)),
+                member: crate::ast::Identifier { name: base.to_string(), span },
+            },
+            span,
+        );
+        let receiver = crate::ast::expr::Expression::new(
+            ExprKind::Index {
+                expr: Box::new(member),
+                index: Box::new(ident_expr(idx)),
+            },
+            span,
+        );
+        let v = self.eval_expr(&receiver);
+        let h = v.to_u64()? as usize;
+        if self.heap.get(h).and_then(|o| o.as_ref()).is_some() {
+            Some(h)
+        } else {
+            None
+        }
+    }
+
+    /// §15.5 instance event reached through an ASSOCIATIVE-ARRAY element from
+    /// a flattened trigger name `m_events[obj].all_dropped`. Returns the
+    /// `(handle, field)` identity once the receiver handle holds an event
+    /// property named `field`.
+    fn resolve_indexed_handle_event_field(&mut self, dotted: &str) -> Option<(usize, String)> {
+        let (recv, field) = dotted.rsplit_once('.')?;
+        if !recv.contains('[') {
+            return None;
+        }
+        let (base, idx) = recv.trim_end_matches(']').split_once('[')?;
+        let idx = idx.split('.').next().unwrap_or(idx);
+        let h = self.eval_this_member_index_handle(base, idx)?;
+        let inst = self.heap.get(h).and_then(|o| o.as_ref())?;
+        if inst.properties.contains_key(field) {
+            Some((h, field.to_string()))
+        } else {
+            None
+        }
     }
 
     /// §15.5 / §13.5.2: an event passed as a `ref` formal. `-> x` and `@x`
@@ -55617,7 +55745,9 @@ impl Simulator {
             self.process_contexts.remove(&p);
         }
         // Purge from every scheduling structure.
-        self.event_queue.remove_pid(pid);
+        for &p in &to_kill {
+            self.event_queue.remove_pid(p);
+        }
         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
         self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
         self.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
