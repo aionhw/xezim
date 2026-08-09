@@ -123,10 +123,6 @@ mod struct_output_inout_ref_formal;
 mod type_param_struct_formal;
 #[path = "classes/typename_param_class.rs"]
 mod typename_param_class;
-#[path = "classes/unpacked_struct_class_property_whole_value.rs"]
-mod unpacked_struct_class_property_whole_value;
-#[path = "classes/uvm_config_db_tests.rs"]
-mod uvm_config_db_tests;
 #[path = "classes/uvm_factory_linkage.rs"]
 mod uvm_factory_linkage;
 #[path = "classes/uvm_genuine_2017.rs"]
@@ -141,7 +137,19 @@ mod uvm_objection_bridge;
 mod uvm_printer_fixes;
 #[path = "classes/virtual_iface_this_binding.rs"]
 mod virtual_iface_this_binding;
+#[path = "classes/class_dynarray_property_elem_new.rs"]
+mod class_dynarray_property_elem_new;
+#[path = "classes/class_dynarray_property_fixed_copy.rs"]
+mod class_dynarray_property_fixed_copy;
+#[path = "classes/class_dynarray_property_size.rs"]
+mod class_dynarray_property_size;
 #[path = "classes/class_unpacked_struct_property.rs"]
 mod class_unpacked_struct_property;
+#[path = "classes/dollar_bits_class_member_shadow.rs"]
+mod dollar_bits_class_member_shadow;
+#[path = "classes/foreach_dynarray_property_elem.rs"]
+mod foreach_dynarray_property_elem;
+#[path = "classes/randomize_obj_array_property.rs"]
+mod randomize_obj_array_property;
 #[path = "classes/struct_output_formal.rs"]
 mod struct_output_formal;

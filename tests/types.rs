@@ -141,6 +141,12 @@ mod shift_context_width;
 mod shift_width_and_scope_hint;
 #[path = "types/size_cast_context_and_fn_return_default.rs"]
 mod size_cast_context_and_fn_return_default;
+#[path = "types/size_on_class_member_vector.rs"]
+mod size_on_class_member_vector;
+#[path = "types/byte_local_narrow.rs"]
+mod byte_local_narrow;
+#[path = "types/bits_builtin_type_width.rs"]
+mod bits_builtin_type_width;
 #[path = "types/static_typedef_singleton.rs"]
 mod static_typedef_singleton;
 #[path = "types/streaming_and_typedef_array_width.rs"]
@@ -193,8 +199,6 @@ mod value_param_specialization;
 mod vcd_param_as_wire;
 #[path = "types/wide_signed_arith_and_power.rs"]
 mod wide_signed_arith_and_power;
-#[path = "types/byte_local_narrow.rs"]
-mod byte_local_narrow;
 #[path = "types/packed_struct_array_elem_write.rs"]
 mod packed_struct_array_elem_write;
 #[path = "types/bits_of_type_operands.rs"]

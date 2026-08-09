@@ -69,6 +69,19 @@ mod struct_collections_across_calls;
 mod stream_justify_assoc_default_partsel;
 #[path = "collections/whole_array_continuous_assign.rs"]
 mod whole_array_continuous_assign;
+
+#[path = "collections/multidim_assoc_nested_exists.rs"]
+mod multidim_assoc_nested_exists;
+#[path = "collections/aa_index_type_narrowing.rs"]
+mod aa_index_type_narrowing;
+#[path = "collections/whole_queue_copy.rs"]
+mod whole_queue_copy;
+#[path = "collections/struct_coll_element.rs"]
+mod struct_coll_element;
+#[path = "collections/class_coll_bits_and_pattern.rs"]
+mod class_coll_bits_and_pattern;
+#[path = "collections/queue_indexed_grow.rs"]
+mod queue_indexed_grow;
 #[path = "collections/string_foreach_content.rs"]
 mod string_foreach_content;
 #[path = "collections/void_cast_queue_ops.rs"]
