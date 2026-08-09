@@ -47633,6 +47633,35 @@ impl Simulator {
                             // container's x instead of the packed members, so
                             // `return s;` from a struct-returning function
                             // yielded x even though every member was set.
+                            // §3.12/§7.5: an unpacked-struct LOCAL initialized
+                            // from a WHOLE class-property struct (`m_uvm_factory_type_pair_t
+                            // match_type_pair = override.orig;`) can't ride the
+                            // discarded container above (a zero-width handle/string
+                            // member can't pack into a Value), so its initializer was
+                            // silently dropped. Decompose the source member-wise into
+                            // the freshly-seeded `<name>.<member>` leaves instead.
+                            if let Some(init) = &d.init {
+                                let base = d.name.name.clone();
+                                let lv = crate::ast::expr::Expression::new(
+                                    crate::ast::expr::ExprKind::Ident(
+                                        crate::ast::expr::HierarchicalIdentifier {
+                                            root: None,
+                                            path: vec![crate::ast::expr::HierPathSegment {
+                                                name: crate::ast::Identifier {
+                                                    name: base.clone(),
+                                                    span: d.name.span,
+                                                },
+                                                selects: Vec::new(),
+                                            }],
+                                            span: d.name.span,
+                                            cached_signal_id: std::cell::Cell::new(None),
+                                            cached_resolved_name: std::cell::OnceCell::new(),
+                                        },
+                                    ),
+                                    d.name.span,
+                                );
+                                self.try_decompose_class_prop_member_copy(&lv, init);
+                            }
                             self.local_stack
                                 .last_mut()
                                 .map(|frame| frame.remove(&d.name.name));
