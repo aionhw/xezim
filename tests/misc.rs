@@ -199,6 +199,8 @@ mod string_formal_name_leak;
 mod x_warn_switch;
 #[path = "misc/xselect_and_concat_flatten.rs"]
 mod xselect_and_concat_flatten;
+#[path = "misc/static_method_via_handle.rs"]
+mod static_method_via_handle;
 
 #[path = "misc/preprocessor_directives.rs"]
 mod preprocessor_directives;

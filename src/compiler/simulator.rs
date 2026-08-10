@@ -71660,6 +71660,76 @@ impl Simulator {
         false
     }
 
+    /// Resolve the DECLARED (static) class of a receiver expression used for
+    /// a static method call. Handles a plain variable (`req), a bare `this`,
+    /// and a member chain rooted at a known object (`this.req`) — where the
+    /// member's declared type comes from the owning class, not any runtime
+    /// value (which may be null). This lets `uvm_create`'s `req.get_type()`
+    /// resolve the `trans` wrapper even when the handle is null.
+    fn receiver_static_class(
+        &self,
+        expr: &Expression,
+        runtime_handle: usize,
+    ) -> Option<String> {
+        use crate::ast::expr::ExprKind;
+        // A live receiver: prefer its runtime class (covers derived objects).
+        if runtime_handle != 0 {
+            if let Some(cn) = self
+                .heap
+                .get(runtime_handle)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.class_name.clone())
+            {
+                return Some(cn);
+            }
+        }
+        match &expr.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let name = &h.path[0].name.name;
+                if name == "this" || name == "super" {
+                    return None; // handled via builtin-dispatch elsewhere
+                }
+                let c = self.class_of_var(name);
+                let th = self.this_stack.last().copied().flatten();
+                let pt = th.and_then(|hh| self.prop_class_type(hh, name));
+                c.or_else(|| pt)
+            }
+            // `this.req.get_type()` (receiver = `this.req`) — resolve the
+            // declared member type through the current `this` class.
+            ExprKind::MemberAccess { expr: base, member } => match &base.kind {
+                ExprKind::Ident(b) if b.path.len() == 1 && b.path[0].selects.is_empty() => {
+                    let bname = &b.path[0].name.name;
+                    if bname == "this" || bname == "super" {
+                        self.this_stack.last().copied().flatten().and_then(|th| {
+                            self.prop_class_type(th, &member.name)
+                        })
+                    } else {
+                        // `s.req.getv()`: receiver `expr` = `s.req`. Resolve
+                        // the base object `s` to its runtime handle and read
+                        // the member's declared type off its class (with
+                        // type-param binding), exactly like `this.req`.
+                        let lv = self.local_stack.last().and_then(|m| m.get(bname));
+                        let sh = lv
+                            .and_then(|v| v.to_u64())
+                            .map(|h| h as usize)
+                            .or_else(|| self.eval_ident_handle(bname))
+                            .filter(|&h| h != 0 && h < self.heap.len())
+                            .unwrap_or(0);
+                        if sh != 0 {
+                            self.prop_class_type(sh, &member.name)
+                        } else {
+                            self.class_of_var(bname).and_then(|bc| {
+                                self.prop_class_type_from_class(&bc, &member.name, None)
+                            })
+                        }
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Execute `ClassName::method(args)` — a static method call with no
     /// instance handle. Returns None if the method is not found.
     fn exec_static_method(
@@ -73087,6 +73157,23 @@ impl Simulator {
 
             let base = self.eval_expr(expr);
             let handle = base.to_u64().unwrap_or(0) as usize;
+            // LRM §8.7/§8.23: a STATIC method always dispatches to the
+            // receiver's DECLARED class, with NO instance dereference — even
+            // when the receiver handle is null/`this.req` member. Static
+            // methods are stored separately from instance methods, so the
+            // instance dispatch path would miss them and return null.
+            // (e.g. `uvm_create`'s `req.get_type()`.)
+            if let Some(base_cls) = self
+                .receiver_static_class(expr, handle)
+                .map(|c| c.split('#').next().unwrap_or(&c).to_string())
+            {
+                let m = member.name.clone();
+                if self.is_static_method(&base_cls, &m) {
+                    if let Some(res) = self.exec_static_method(&base_cls, &m, args) {
+                        return res;
+                    }
+                }
+            }
             if handle != 0 {
                 if let Some(Some(_)) = self.cg_heap.get(handle) {
                     return self.exec_cg_method_call(handle, &member.name, args);
@@ -74085,6 +74172,39 @@ impl Simulator {
                 }
                 if let Some(v) = obj_val {
                     let handle = v.to_u64().unwrap_or(0) as usize;
+                    // LRM §8.7/§8.23: a STATIC method always dispatches to the
+                    // receiver's class with NO instance dereference — even when
+                    // the receiver handle is null (how `uvm_create` obtains the
+                    // type wrapper: `tr.get_type()` before `tr` is allocated).
+                    // Static methods are not in `cd.methods`, so the instance
+                    // dispatch below would miss them and return null. Prefer the
+                    // RUNTIME class of a live receiver, else the DECLARED type.
+                    let decl_cls_opt = self.class_of_var(obj_name).or_else(|| {
+                        self.this_stack
+                            .last()
+                            .copied()
+                            .flatten()
+                            .and_then(|th| self.prop_class_type(th, obj_name))
+                    });
+                    let base_cls = if handle != 0 {
+                        self.heap
+                            .get(handle)
+                            .and_then(|o| o.as_ref())
+                            .map(|i| i.class_name.clone())
+                            .or_else(|| decl_cls_opt.clone())
+                    } else {
+                        decl_cls_opt
+                    };
+                    if let Some(base_cls) = base_cls
+                        .map(|c| c.split('#').next().unwrap_or(&c).to_string())
+                    {
+                        let m = method_name.clone();
+                        if self.is_static_method(&base_cls, &m) {
+                            if let Some(res) = self.exec_static_method(&base_cls, &m, args) {
+                                return res;
+                            }
+                        }
+                    }
                     if handle != 0 {
                         // IEEE 1800-2023 §9.7 + §18.14: `process::self()` yields an
                         // opaque token, NOT a heap object, so the heap gate below
@@ -78793,6 +78913,18 @@ impl Simulator {
         } else {
             return Value::zero(32);
         };
+        // LRM §8.7/§8.23: a STATIC method is resolved/stored separately from
+        // instance methods and never dereferences `this`; a call through an
+        // object handle (e.g. `req.get_type()`) must dispatch statically, even
+        // when the object is live. Dispatch here (the common funnel) so every
+        // instance-path route resolves static methods correctly.
+        if self.is_static_method(&class_name, method_name) {
+            if let Some(res) =
+                self.exec_static_method(&class_name, method_name, args)
+            {
+                return res;
+            }
+        }
         self.exec_method_in_class_hierarchy(handle, &class_name, method_name, args)
     }
 
@@ -79030,14 +79162,115 @@ impl Simulator {
         while let Some(cn) = cur {
             let cd = self.module.classes.get(&cn)?;
             if let Some(sig) = cd.properties.get(prop) {
-                return sig
-                    .type_name
-                    .clone()
-                    .filter(|tn| self.module.classes.contains_key(tn));
+                let owner = self.heap.get(handle).and_then(|o| o.as_ref());
+                let mut tn = sig.type_name.clone();
+                // A member whose declared type is a class TYPE PARAMETER
+                // (e.g. `REQ req` in `uvm_sequence #(trans)`) is not itself a
+                // registered class — `classes.contains_key` below would drop
+                // it. Resolve the type param to its concrete binding on the
+                // owning instance where possible.
+                if let Some(raw) = &tn {
+                    let owner = self.heap.get(handle).and_then(|o| o.as_ref());
+                    let resolved = owner
+                        .and_then(|i| i.type_bindings.get(raw).cloned())
+                        .or_else(|| self.resolve_type_param_binding(raw))
+                        .or_else(|| self.ancestor_type_param_binding(handle, &cn, raw));
+                    if let Some(r) = resolved {
+                        tn = Some(r);
+                    }
+                }
+                return tn.filter(|t| self.module.classes.contains_key(t));
             }
             cur = cd.extends.clone();
         }
         None
+    }
+
+    /// Class-chain member-type lookup without a live instance handle (used
+    /// when the receiver's base object is null but its DECLARED class is
+    /// known). Mirrors `prop_class_type`; type params resolve via current_spec
+    /// or the owner handle when supplied.
+    fn prop_class_type_from_class(
+        &self,
+        cls: &str,
+        prop: &str,
+        owner: Option<usize>,
+    ) -> Option<String> {
+        let mut cur = Some(cls.to_string());
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(sig) = cd.properties.get(prop) {
+                let mut tn = sig.type_name.clone();
+                if let Some(raw) = &tn {
+                    let resolved = owner
+                        .and_then(|h| self.ancestor_type_param_binding(h, &cn, raw))
+                        .or_else(|| self.resolve_type_param_binding(raw));
+                    if let Some(r) = resolved {
+                        tn = Some(r);
+                    }
+                }
+                return tn.filter(|t| self.module.classes.contains_key(t));
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// Bind a class TYPE PARAMETER (`raw`) declared by an ANCESTOR class
+    /// (`declaring_class`) for an instance whose concrete specialization comes
+    /// from its OWN `extends` clause. `uvm_sequence #(REQ)` declares `REQ req`;
+    /// a derived `my_seq extends seq_base #(trans)` must bind `REQ -> trans`
+    /// even when no `current_spec` is active (e.g. inside an inlined body).
+    /// Walks the instance's class up to `declaring_class`, substituting each
+    /// `extends #(...)` argument positionally onto the parent's params.
+    fn ancestor_type_param_binding(
+        &self,
+        handle: usize,
+        declaring_class: &str,
+        raw: &str,
+    ) -> Option<String> {
+        let owner = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let mut binds: HashMap<String, String> = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.type_bindings.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        self.ancestor_type_param_walk(&owner, declaring_class, raw, &mut binds)
+    }
+
+    fn ancestor_type_param_walk(
+        &self,
+        cur: &str,
+        target: &str,
+        raw: &str,
+        binds: &mut HashMap<String, String>,
+    ) -> Option<String> {
+        let cd = self.module.classes.get(cur)?;
+        let parent = cd.extends.clone()?;
+        let pcd = self.module.classes.get(&parent)?;
+        let mut nb = binds.clone();
+        for (i, pname) in pcd.param_order.iter().enumerate() {
+            if let Some(arg) = cd.extends_type_args.get(i) {
+                let arg = arg.trim();
+                if arg.is_empty() {
+                    continue;
+                }
+                let sub = nb.get(arg).cloned().unwrap_or_else(|| arg.to_string());
+                nb.insert(pname.clone(), sub);
+            }
+        }
+        if parent == target {
+            nb.get(raw).cloned().filter(|s| !s.is_empty())
+        } else {
+            self.ancestor_type_param_walk(&parent, target, raw, &mut nb)
+        }
     }
 
     /// Every rand collection member of `handle`'s class chain (skipping any
