@@ -38333,7 +38333,7 @@ impl Simulator {
                                 .and_then(|o| o.as_ref())
                                 .map(|i| i.class_name.clone());
                             if let Some(cn) = cls {
-                                if self.class_parameterless_function(&cn, &member) {
+                                if self.class_bare_method(&cn, &member) {
                                     let r = self.exec_method_call(handle, &member, &[]);
                                     self.return_flag = false;
                                     return r;
@@ -43429,7 +43429,7 @@ impl Simulator {
                     // function if the class declares one (e.g. `if (port.size < 1)`).
                     let cls = self.heap[handle].as_ref().map(|i| i.class_name.clone());
                     match cls {
-                        Some(cn) if self.class_parameterless_function(&cn, &member.name) => {
+                        Some(cn) if self.class_bare_method(&cn, &member.name) => {
                             let res = self.exec_method_call(handle, &member.name, &[]);
                             self.return_flag = false;
                             return res;
@@ -71110,6 +71110,21 @@ impl Simulator {
             }
         }
         false
+    }
+
+    /// Does `obj.name` (a parenthesless member reference) denote a CLASS-
+    /// method invocation per LRM §13.4.1/§18.11? This is true when the class
+    /// declares a parameterless function `name`, OR when `name` is a built-in
+    /// no-arg method of every class OBJECT.
+    ///
+    /// UVM relies on the latter for `assert(t1.randomize & t2.randomize)`.
+    /// `randomize` is NOT a declared class method (the source never lists the
+    /// implicit built-in from `class_object`), so `class_parameterless_function`
+    /// correctly returns false for it — but a bare `obj.randomize` must still
+    /// dispatch to `exec_method_call(.., "randomize", [])`, which routes to
+    /// the §18.11 solver, so both operands of the `&` actually randomize.
+    fn class_bare_method(&self, class_name: &str, name: &str) -> bool {
+        self.class_parameterless_function(class_name, name) || matches!(name, "randomize")
     }
 
     fn class_has_method(&self, class_name: &str, name: &str) -> bool {

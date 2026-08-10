@@ -119,6 +119,8 @@ mod param_pair_this_type_cast;
 mod assoc_class_new_stores_instance;
 #[path = "misc/bare_method_call_returns.rs"]
 mod bare_method_call_returns;
+#[path = "misc/bare_randomize_solver.rs"]
+mod bare_randomize_solver;
 #[path = "misc/pattern_replication_and_extends_args.rs"]
 mod pattern_replication_and_extends_args;
 #[path = "misc/program_block_reactive.rs"]
