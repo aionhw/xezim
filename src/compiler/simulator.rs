@@ -23063,10 +23063,41 @@ impl Simulator {
     ///
     /// Returns (t_snap, t_nba, t_settle, t_edges) deltas in ns for profiling;
     /// callers that don't need them can ignore the return value.
+
+    /// §4.5: drain `#0` continuations (Inactive region) INLINE until empty,
+    /// BEFORE the caller commits the NBA region. A `#0` parked by an
+    /// edge-waiter-resumed process previously promoted only at end-of-tick —
+    /// after the cascade's apply_nba — so `@(posedge clk); #0 x = r;` read
+    /// POST-NBA r (one cycle "early" vs the reference simulator; the exact
+    /// checker/BFM divergence shape of the rptr race-through report).
+    fn drain_inactive_pre_nba(&mut self) {
+        let mut fuel = 1000u32;
+        while !self.inactive_queue.is_empty() && fuel > 0 {
+            fuel -= 1;
+            let moved = std::mem::take(&mut self.inactive_queue);
+            for (pid, cont) in moved {
+                if self.finished {
+                    return;
+                }
+                self.run_scheduled_process(pid, &cont);
+                if !self.is_pid_suspended(pid) {
+                    self.child_finished(pid);
+                }
+            }
+            if self.dirty_any {
+                self.settle_combinatorial();
+            }
+        }
+    }
+
     fn drain_edge_cascade(&mut self, cascade_limit: u32) -> (u64, u64, u64, u64) {
         let (mut t_snap, mut t_nba, mut t_settle, mut t_edges) = (0u64, 0u64, 0u64, 0u64);
         let mut cascade_iter = 0u32;
         while cascade_iter < cascade_limit {
+            // Inactive region precedes the NBA region (§4.5): `#0`
+            // continuations parked by this round's active-region work run
+            // before its NBAs commit.
+            self.drain_inactive_pre_nba();
             if self.nba_fast.is_empty() && self.nba_queue.is_empty() {
                 break;
             }
@@ -23944,6 +23975,8 @@ impl Simulator {
         }
 
         let _t = profile_timing.then(std::time::Instant::now);
+        // §4.5: inactive (`#0`) continuations run before this slot's NBAs.
+        self.drain_inactive_pre_nba();
         if !self.nba_fast.is_empty()
             || !self.nba_queue.is_empty()
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
@@ -32372,6 +32405,39 @@ impl Simulator {
             } else {
                 // Legacy: schedule for next event_loop iter
                 self.event_queue.schedule(self.time, pid, stmts);
+            }
+        }
+        if waiters_first {
+            // The pre-block drain above cannot see waiters whose trigger was
+            // produced BY the blocks just executed (`-> ev` inside an
+            // always_ff toggles the event signal during exec). §15.5.1: such
+            // waiters resume in the SAME active region — before this slot's
+            // NBA region — but the next check_edges that would notice them
+            // sits in the cascade AFTER apply_nba, so they read post-NBA
+            // state (reference-divergent). Drain-and-run inline, re-draining
+            // because a resumed continuation may fire further events.
+            let mut settle_guard = 0u32;
+            loop {
+                let conts = self.drain_triggered_event_waiters();
+                if conts.is_empty() {
+                    break;
+                }
+                for (pid, stmts) in conts {
+                    if self.finished {
+                        break;
+                    }
+                    self.run_scheduled_process(pid, &stmts);
+                    if !self.is_pid_suspended(pid) {
+                        self.child_finished(pid);
+                    }
+                    self.break_flag = false;
+                    self.continue_flag = false;
+                    self.return_flag = false;
+                }
+                settle_guard += 1;
+                if self.finished || settle_guard > 10_000 {
+                    break;
+                }
             }
         }
     }

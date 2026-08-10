@@ -131,6 +131,8 @@ mod pure_inline_loop_body;
 mod ranged_port_connections_and_nba_freeze;
 #[path = "scheduling/parallel_dispatch_expr_fallback.rs"]
 mod parallel_dispatch_expr_fallback;
+#[path = "scheduling/zero_delay_inactive_region.rs"]
+mod zero_delay_inactive_region;
 #[path = "scheduling/sampled_value_inferred_clock.rs"]
 mod sampled_value_inferred_clock;
 #[path = "scheduling/sequential_event_waits.rs"]

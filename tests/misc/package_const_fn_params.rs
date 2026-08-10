@@ -235,3 +235,66 @@ endmodule
     let sim = simulate(src, 10).expect("simulate failed");
     assert!(msgs(&sim).iter().any(|m| m == "T|4 6"), "got {:?}", msgs(&sim));
 }
+
+#[test]
+fn scoped_param_as_fn_argument_cross_package() {
+    // `LOG2(q::DEPTH)` — the scoped arg parses as MemberAccess and the
+    // const-fn arg support check rejected it, silently zeroing W (this is
+    // also the shape of a fn call in an instance param override).
+    let src = r#"
+package q;
+  parameter integer DEPTH = 128;
+endpackage
+package p;
+  function automatic integer LOG2(input integer v);
+    integer r; begin r=0; while (v>1) begin v=v/2; r=r+1; end LOG2=r; end
+  endfunction
+  parameter integer W = LOG2(q::DEPTH);  // 7
+endpackage
+module ch #(parameter integer CW = 1)(output logic [CW-1:0] o);
+  assign o = '1;
+endmodule
+module tb;
+  logic [p::W-1:0] a;
+  logic [15:0] ov;
+  ch #(.CW(p::LOG2(q::DEPTH))) u(.o(ov[6:0]));
+  initial #1 $display("T|%0d %0d %h", $bits(a), p::W, ov[6:0]);
+endmodule
+"#;
+    let sim = simulate(src, 10).expect("simulate failed");
+    assert!(
+        msgs(&sim).iter().any(|m| m == "T|7 7 7f"),
+        "got {:?}",
+        msgs(&sim)
+    );
+}
+
+#[test]
+fn unpacked_array_of_scoped_structs_member_write() {
+    // The array-of-structs decl site resolved the element typedef by bare
+    // name only and computed member layouts without the owning package's
+    // params — arr[2].f wrote into a 1-bit slice.
+    let src = r#"
+package p;
+  function automatic integer LOG2(input integer v);
+    integer r; begin r=0; while (v>1) begin v=v/2; r=r+1; end LOG2=r; end
+  endfunction
+  parameter integer W = LOG2(64);  // 6
+  typedef struct packed { logic [W-1:0] f; logic v; } r_t;  // 7
+endpackage
+module tb;
+  p::r_t arr [4];
+  initial begin
+    for (int i = 0; i < 4; i++) arr[i] = '0;
+    arr[2].f = 6'h2b; arr[2].v = 1'b1;
+    #1 $display("T|%0d %h %h %h", $bits(arr[2]), arr[2], arr[2].f, arr[3]);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 10).expect("simulate failed");
+    assert!(
+        msgs(&sim).iter().any(|m| m == "T|7 57 2b 00"),
+        "got {:?}",
+        msgs(&sim)
+    );
+}
