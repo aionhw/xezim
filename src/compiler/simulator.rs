@@ -70907,6 +70907,21 @@ impl Simulator {
                         None
                     }
                 }
+                // A function-call base (`get_h().member`,
+                // `factory.get().queue`): evaluate the call to the object
+                // handle it returns and resolve the instance-scoped
+                // collection on it. Without this, both the WRITE
+                // (`f().member[k] = v`) and the READ (`f().member.exists(k)`)
+                // resolved `member` to nothing, so writes were silently
+                // dropped and reads came back empty.
+                ExprKind::Call { .. } => {
+                    let h = self.eval_expr(base).to_u64().unwrap_or(0) as usize;
+                    if h != 0 {
+                        self.handle_collection_name(h, &member.name)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             },
             ExprKind::Ident(h) if h.path.len() == 1 => {

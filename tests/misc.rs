@@ -127,6 +127,8 @@ mod uvm_agent_active_config;
 mod new_ctor_vs_shallow_copy;
 #[path = "misc/assoc_dotted_key.rs"]
 mod assoc_dotted_key;
+#[path = "misc/call_returned_handle_assoc.rs"]
+mod call_returned_handle_assoc;
 #[path = "misc/pattern_replication_and_extends_args.rs"]
 mod pattern_replication_and_extends_args;
 #[path = "misc/program_block_reactive.rs"]
