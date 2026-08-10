@@ -9096,6 +9096,44 @@ impl Simulator {
         cur
     }
 
+    /// Returns `Some((width, signed))` when `dt` — either directly or through a
+    /// typedef/type-parameter chain — denotes a SCALAR INTEGRAL type whose
+    /// width differs from the caller's actual (e.g. `input int` into a formal
+    /// declared as the 64-bit typedef `uvm_integral_t`). Returns `None` for
+    /// real / string / chandle / struct / class / assoc-array / void so those
+    /// formals keep the caller value untouched (mirrors the direct integral
+    /// formal handling that a raw `TypeReference` port bypassed).
+    fn scalar_formal_integral(&self, dt: &DataType) -> Option<(u32, bool)> {
+        use crate::ast::types::DataType as DT;
+        // Enum and real stay out: enum formals were never width-adapted and a
+        // real typedef must round (not resize) — keep the prior behavior.
+        let resolved = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+        let is_resolved_int = matches!(
+            &resolved,
+            DT::IntegerVector { .. }
+                | DT::IntegerAtom { .. }
+        ) || matches!(
+            &resolved,
+            DT::Implicit { dimensions, .. } if !dimensions.is_empty()
+        );
+        if !is_resolved_int {
+            return None;
+        }
+        let pw = super::elaborate::resolve_type_width(
+            &resolved,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        if pw == 0 {
+            return None;
+        }
+        let signed = super::elaborate::is_type_signed_resolved(
+            &resolved,
+            &self.module.typedef_types,
+        );
+        Some((pw, signed))
+    }
+
     /// Given a resolved struct DataType, return a list of (field_name, bit_offset, width)
     /// for each member. Walks members in reverse (last member at LSB, matching SV packing).
     /// Returns `(field_name, bit_offset, width, is_real)` per member.
@@ -84922,7 +84960,33 @@ impl Simulator {
                     } else {
                         Value::zero(32)
                     };
-                    if super::elaborate::is_type_signed(&port.data_type) {
+                    // §13.5.1/§6.18/§10.7: a scalar INTEGRAL formal adopts its
+                    // declared (possibly typedef-derived) width and signedness.
+                    // Without this a class-method formal declared as a wider
+                    // typedef (e.g. `uvm_integral_t` = 64-bit) bound a 32-bit
+                    // actual as-is, so the high bits read x and uvm_pack_*
+                    // emitted garbage for `$realtobits(shortreal)` and negative
+                    // ints passed to a 64-bit packer formal. This is scoped to
+                    // TYPEREFERENCE formals only: a direct `bit[W-1:0]`/`int`
+                    // ports stays on the old (signedness-only) path so a width
+                    // derived from a CLASS type-param (not in module.parameters)
+                    // isn't mis-resolved to `1` and truncates the caller's
+                    // value.
+                    if matches!(
+                        &port.data_type,
+                        DataType::TypeReference { .. }
+                    ) {
+                        if let Some((pw, signed)) = self.scalar_formal_integral(&port.data_type) {
+                            val = if val.is_real {
+                                Self::real_to_int(val.to_f64(), pw.max(1))
+                            } else if pw != val.width {
+                                val.resize_for_assign(pw)
+                            } else {
+                                val
+                            };
+                            val.is_signed = signed;
+                        }
+                    } else if super::elaborate::is_type_signed(&port.data_type) {
                         val.is_signed = true;
                     }
                     if let DataType::TypeReference { name: tn, .. } = &port.data_type {

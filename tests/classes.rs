@@ -13,6 +13,8 @@
 
 #[path = "classes/array_equality_class.rs"]
 mod array_equality_class;
+#[path = "classes/class_formal_typedef_widen.rs"]
+mod class_formal_typedef_widen;
 #[path = "classes/assoc_typedef_element_class.rs"]
 mod assoc_typedef_element_class;
 #[path = "classes/bit_class_property_signedness.rs"]
