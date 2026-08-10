@@ -123,6 +123,8 @@ mod bare_method_call_returns;
 mod bare_randomize_solver;
 #[path = "misc/uvm_agent_active_config.rs"]
 mod uvm_agent_active_config;
+#[path = "misc/new_ctor_vs_shallow_copy.rs"]
+mod new_ctor_vs_shallow_copy;
 #[path = "misc/pattern_replication_and_extends_args.rs"]
 mod pattern_replication_and_extends_args;
 #[path = "misc/program_block_reactive.rs"]

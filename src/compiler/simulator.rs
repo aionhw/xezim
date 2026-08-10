@@ -40842,6 +40842,19 @@ impl Simulator {
                 l.concat_with(&h) // Dummy representation
             }
             ExprKind::Paren(inner) => self.eval_expr_ctx(inner, ctx_width),
+            // §8.10 (Syntax 8-2, footnote 23): the parentheseless `new
+            // src` shallow-copy constructor. `<expr>` evaluates to an object
+            // handle; a fresh object copies the source's fields (deep
+            // cloning of instance-scoped collections per §8.13).
+            ExprKind::ShallowCopy { source } => {
+                let src_v = self.eval_expr(source);
+                let src_h = src_v.to_u64().unwrap_or(0) as usize;
+                if src_h != 0 && matches!(self.heap.get(src_h), Some(Some(_))) {
+                    self.copy_construct(src_h)
+                } else {
+                    Value::zero(32)
+                }
+            }
             ExprKind::AssignExpr { lvalue, rvalue } => {
                 let v = self.eval_expr(rvalue);
                 self.assign_value(lvalue, &v);
@@ -45217,9 +45230,10 @@ impl Simulator {
                 // through instantiation so the constructor dispatches correctly
                 // (the heartbeat fix: `new(name, cntxt, objection)` with a class
                 // handle arg).  The `sized_new` handler above catches dynamic
-                // array allocation; the shallow-copy case (`h = new src`) has
-                // a single arg that is a class handle — skip instantiation and
-                // let the existing copy-construction path handle it.
+                // array allocation. The parentheseless shallow-copy form
+                // `new src` is a distinct `ShallowCopy` node (LRM 8.8 fn 23) and
+                // never reaches here — so a parenthesized `new(args)` is ALWAYS
+                // a constructor call, even a single class-handle argument.
                 let (is_new_call, ctor_args): (bool, &[Expression]) = match &rvalue.kind {
                     ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new" => (true, &[]),
                     ExprKind::Call { func, args } if matches!(
@@ -45256,9 +45270,6 @@ impl Simulator {
                             })
                             .unwrap_or(false);
                         if !is_class {
-                            false
-                        } else if args.len() == 1 && self.expr_is_class_handle(&args[0]) {
-                            // Single class-handle arg = shallow copy, not construction
                             false
                         } else {
                             true
