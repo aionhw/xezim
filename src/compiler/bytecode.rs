@@ -473,6 +473,12 @@ pub struct BytecodeCompiler<'a> {
     /// all (§12.7.1 makes it automatic and local to the loop). Without this the
     /// whole loop fell back to the AST interpreter.
     pub local_var_regs: std::collections::HashMap<String, (RegId, u32)>,
+    /// Depth of enclosing loops whose counter lives in a VM REGISTER
+    /// (`for (int i = ...)`). While > 0, StmtFallback emission is FORBIDDEN:
+    /// the AST interpreter cannot see VM registers, so a fallback statement
+    /// inside such a loop silently reads the loop var as X. Any unsupported
+    /// construct must instead fail the whole loop back to the AST path.
+    reg_var_loop_depth: u32,
     /// User-task table for inlining zero-arg, non-blocking task bodies.
     /// Task-enable (`task_name;`) statements that resolve here get their
     /// bodies compiled in place instead of emitting a single StmtFallback
@@ -577,6 +583,7 @@ impl<'a> BytecodeCompiler<'a> {
             scope_hint: None,
             for_loop_var_ids: std::collections::HashMap::default(),
             local_var_regs: std::collections::HashMap::default(),
+            reg_var_loop_depth: 0,
             tasks: None,
             functions: None,
             inlining_stack: Vec::new(),
@@ -1098,7 +1105,129 @@ impl<'a> BytecodeCompiler<'a> {
         ok
     }
 
+    /// Conservative structural test for loop bodies that the NEW for-loop
+    /// compilation capabilities (register-backed `for (int i...)` vars and
+    /// signal-backed `i++` steps) are allowed to handle. Nested indexing,
+    /// member access, and non-assign statements go through addressing paths
+    /// whose register/loop-var handling is not yet audited — those loops
+    /// keep the old whole-loop AST fallback. Never regresses: these bodies
+    /// always fell back before the new capabilities existed.
+    fn for_body_is_simple(stmt: &Statement) -> bool {
+        fn expr_simple(e: &Expression) -> bool {
+            // no member access anywhere; everything else is fine (reads
+            // resolve through compile_expr's normal paths).
+            match &e.kind {
+                ExprKind::MemberAccess { .. } => false,
+                ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                    expr_simple(operand)
+                }
+                ExprKind::Binary { left, right, .. } => {
+                    expr_simple(left) && expr_simple(right)
+                }
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => expr_simple(condition) && expr_simple(then_expr) && expr_simple(else_expr),
+                ExprKind::Index { expr, index } => expr_simple(expr) && expr_simple(index),
+                ExprKind::RangeSelect { expr, left, right, .. } => {
+                    expr_simple(expr) && expr_simple(left) && expr_simple(right)
+                }
+                ExprKind::SystemCall { args, .. } | ExprKind::Concatenation(args) => {
+                    args.iter().all(expr_simple)
+                }
+                _ => !matches!(&e.kind, ExprKind::Call { .. }),
+            }
+        }
+        fn lv_simple(e: &Expression) -> bool {
+            match &e.kind {
+                ExprKind::Ident(h) => h.path.iter().all(|s| s.selects.is_empty()),
+                ExprKind::Index { expr, index } => {
+                    matches!(&expr.kind, ExprKind::Ident(h)
+                        if h.path.iter().all(|s| s.selects.is_empty()))
+                        && expr_simple(index)
+                }
+                _ => false,
+            }
+        }
+        fn lv_base_name(e: &Expression) -> Option<&str> {
+            match &e.kind {
+                ExprKind::Index { expr, .. } => match &expr.kind {
+                    ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        fn expr_reads_name(e: &Expression, name: &str) -> bool {
+            match &e.kind {
+                ExprKind::Ident(h) => {
+                    h.path.last().is_some_and(|s| s.name.name == name)
+                }
+                ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                    expr_reads_name(operand, name)
+                }
+                ExprKind::Binary { left, right, .. } => {
+                    expr_reads_name(left, name) || expr_reads_name(right, name)
+                }
+                ExprKind::Conditional { condition, then_expr, else_expr } => {
+                    expr_reads_name(condition, name)
+                        || expr_reads_name(then_expr, name)
+                        || expr_reads_name(else_expr, name)
+                }
+                ExprKind::Index { expr, index } => {
+                    expr_reads_name(expr, name) || expr_reads_name(index, name)
+                }
+                ExprKind::RangeSelect { expr, left, right, .. } => {
+                    expr_reads_name(expr, name)
+                        || expr_reads_name(left, name)
+                        || expr_reads_name(right, name)
+                }
+                ExprKind::SystemCall { args, .. } | ExprKind::Concatenation(args) => {
+                    args.iter().any(|a| expr_reads_name(a, name))
+                }
+                _ => false,
+            }
+        }
+        match &stmt.kind {
+            StatementKind::Null => true,
+            StatementKind::NonblockingAssign { lvalue, rvalue, .. }
+            | StatementKind::BlockingAssign { lvalue, rvalue } => {
+                // A SELF-READING array update (`ptr[i] <= ptr[i] + 1`) is
+                // excluded: in an inlined instance the compiled read and
+                // write paths can resolve the array through different
+                // aliases (port copy vs local), skewing the pre-edge read.
+                // Keep such loops on the audited AST path.
+                let self_read = lv_base_name(lvalue)
+                    .is_some_and(|n| expr_reads_name(rvalue, n));
+                lv_simple(lvalue) && expr_simple(rvalue) && !self_read
+            }
+            StatementKind::SeqBlock { stmts, .. } => {
+                stmts.iter().all(Self::for_body_is_simple)
+            }
+            StatementKind::If {
+                condition,
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                expr_simple(condition)
+                    && Self::for_body_is_simple(then_stmt)
+                    && else_stmt
+                        .as_ref()
+                        .map(|e| Self::for_body_is_simple(e))
+                        .unwrap_or(true)
+            }
+            _ => false,
+        }
+    }
+
     fn emit_fallback(&mut self, stmt: &Statement) -> bool {
+        if self.reg_var_loop_depth > 0 {
+            // See reg_var_loop_depth — a fallback here would mis-read the
+            // register-backed loop var; force the whole loop to bail.
+            return false;
+        }
         if self.allow_ast_fallback {
             let reason = self
                 .bail_reason
@@ -2241,6 +2370,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // Save outer for-loop overrides so nested loops don't leak.
                 let saved_for_vars = std::mem::take(&mut self.for_loop_var_ids);
                 let saved_locals = self.local_var_regs.clone();
+                let mut reg_vars_registered: u32 = 0;
                 // Inherit the outer overrides too — a nested loop's body
                 // can still reference the outer counter.
                 self.for_loop_var_ids = saved_for_vars.clone();
@@ -2310,16 +2440,62 @@ impl<'a> BytecodeCompiler<'a> {
                                 }
                             }
                         }
+                        ForInit::VarDecl { data_type, name, init }
+                            if Self::for_body_is_simple(body) =>
+                        {
+                            // §12.7.1: `for (int i = ...)` — the loop var
+                            // lives in a VM REGISTER (it has no signal).
+                            // Body/step reads resolve through local_var_regs,
+                            // which compile_expr consults BEFORE the signal
+                            // tables, so a same-named outer signal can never
+                            // capture. Array indexing through the register is
+                            // safe: the register path (Nba/BlockingAssignArray)
+                            // takes a RegId, and the SigId-fusion peepholes
+                            // pattern-match LoadSignal, which a register-backed
+                            // index never emits. This bail was 83% of a
+                            // customer run's wall time (For_init_vardecl,
+                            // 204µs per AST execution of a lane-copy loop).
+                            let w = self.decl_width(data_type);
+                            let slot = self.alloc_reg();
+                            let Some(v) = self.compile_expr(init, w) else {
+                                self.for_loop_var_ids = saved_for_vars;
+                                self.local_var_regs = saved_locals;
+                                self.bail("For_init_vardecl_rvalue");
+                                return false;
+                            };
+                            self.emit(Insn::Move(slot, v));
+                            if w > 0 {
+                                self.emit(Insn::Resize(slot, w));
+                            }
+                            // §6.11: int/byte/shortint/longint/integer are
+                            // SIGNED by default — the init literal may not be
+                            // (`for (int i = 4'hF; ...)`), and an unsigned
+                            // slot makes `i >= 0` never terminate / negative
+                            // comparisons go unsigned.
+                            use crate::ast::types::{
+                                DataType as FDt, IntegerAtomType as FIat, Signing as FSg,
+                            };
+                            let decl_signed = match data_type {
+                                FDt::IntegerAtom { kind, signing, .. } => {
+                                    !matches!(signing, Some(FSg::Unsigned))
+                                        && !matches!(kind, FIat::Time)
+                                }
+                                FDt::IntegerVector { signing, .. } => {
+                                    matches!(signing, Some(FSg::Signed))
+                                }
+                                _ => false,
+                            };
+                            if decl_signed {
+                                self.emit(Insn::SetSigned(slot));
+                            } else {
+                                self.emit(Insn::ClearSigned(slot));
+                            }
+                            self.local_var_regs.insert(name.name.clone(), (slot, w));
+                            self.reg_var_loop_depth += 1;
+                            reg_vars_registered += 1;
+                        }
+                        #[allow(unreachable_patterns)]
                         ForInit::VarDecl { .. } => {
-                            // A `for (int i = ...)` variable has no signal, so
-                            // it would have to live in a register. That works
-                            // for straight-line bodies, but several ARRAY
-                            // ADDRESSING paths resolve an index through the
-                            // signal tables and silently mis-compile a
-                            // register-backed index (`unp[1][j] <= unp[0][j]`),
-                            // so the whole loop still defers to the AST path.
-                            // Lifting this needs those paths to bail (or learn
-                            // register indices) first.
                             self.for_loop_var_ids = saved_for_vars;
                             self.local_var_regs = saved_locals;
                             self.bail("For_init_vardecl");
@@ -2335,6 +2511,8 @@ impl<'a> BytecodeCompiler<'a> {
                             self.bail("For_condition");
                             self.for_loop_var_ids = saved_for_vars;
                             self.local_var_regs = saved_locals;
+                            self.reg_var_loop_depth -=
+                                reg_vars_registered.min(self.reg_var_loop_depth);
                             return false;
                         }
                     };
@@ -2350,6 +2528,8 @@ impl<'a> BytecodeCompiler<'a> {
                     self.loop_continue_patches.pop();
                     self.for_loop_var_ids = saved_for_vars;
                     self.local_var_regs = saved_locals;
+                    self.reg_var_loop_depth -=
+                        reg_vars_registered.min(self.reg_var_loop_depth);
                     return false;
                 }
                 let step_start = self.insns.len() as u32;
@@ -2385,10 +2565,15 @@ impl<'a> BytecodeCompiler<'a> {
                                 if let Some((slot, dw)) = self.local_var_reg_of(h) {
                                     let one = self.alloc_reg();
                                     let w = if dw > 0 { dw } else { 32 };
-                                    self.emit(Insn::LoadConst(
-                                        one,
-                                        Box::new(Value::from_u64(1, w)),
-                                    ));
+                                    // SIGNED one: signed+signed stays signed
+                                    // (an unsigned 1 silently stripped the
+                                    // loop var's sign on the first step, so
+                                    // `i >= -2` compared unsigned);
+                                    // signed+unsigned still yields unsigned,
+                                    // so unsigned loop vars are unaffected.
+                                    let mut one_v = Value::from_u64(1, w);
+                                    one_v.is_signed = true;
+                                    self.emit(Insn::LoadConst(one, Box::new(one_v)));
                                     let dst = self.alloc_reg();
                                     self.emit(Insn::Move(dst, slot));
                                     if delta > 0 {
@@ -2400,6 +2585,35 @@ impl<'a> BytecodeCompiler<'a> {
                                         self.emit(Insn::Resize(dst, w));
                                     }
                                     self.emit(Insn::Move(slot, dst));
+                                    continue;
+                                }
+                                // SIGNAL-backed loop counter (`int i;` at
+                                // module/block scope): load, ±1, store.
+                                // Previously bailed the whole loop to the AST
+                                // path ("For_step_other") — ~30µs per edge.
+                                if let Some(id) = self
+                                    .lookup_signal_id(h)
+                                    .filter(|_| Self::for_body_is_simple(body))
+                                {
+                                    let w = self
+                                        .signal_widths
+                                        .get(id)
+                                        .copied()
+                                        .unwrap_or(32)
+                                        .max(1);
+                                    let cur = self.alloc_reg();
+                                    self.emit(Insn::LoadSignal(cur, id as u32));
+                                    let one = self.alloc_reg();
+                                    let mut one_v = Value::from_u64(1, w);
+                                    one_v.is_signed = true; // see register arm
+                                    self.emit(Insn::LoadConst(one, Box::new(one_v)));
+                                    if delta > 0 {
+                                        self.emit(Insn::Add(cur, cur, one));
+                                    } else {
+                                        self.emit(Insn::Sub(cur, cur, one));
+                                    }
+                                    self.emit(Insn::Resize(cur, w));
+                                    self.emit(Insn::BlockingAssign(id as u32, cur, w));
                                     continue;
                                 }
                             }
@@ -2449,6 +2663,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // Restore outer for-loop's override map and block locals.
                 self.for_loop_var_ids = saved_for_vars;
                 self.local_var_regs = saved_locals;
+                self.reg_var_loop_depth -= reg_vars_registered.min(self.reg_var_loop_depth);
                 true
             }
             StatementKind::Break => {
@@ -3239,6 +3454,23 @@ impl<'a> BytecodeCompiler<'a> {
                         // (the $display path was already correct).
                         let r = self.compile_expr(args.first()?, 0)?;
                         self.emit(Insn::ClearSigned(r));
+                        Some(r)
+                    }
+                    "$__xz_size_cast" => {
+                        // §6.24.1 `N'(x)`: evaluate x in context width N,
+                        // then resize. N is a literal (parser lowering).
+                        let n = match args.first().map(|a| &a.kind) {
+                            Some(ExprKind::Number(NumberLiteral::Integer {
+                                value, ..
+                            })) => value.parse::<u32>().ok(),
+                            _ => None,
+                        };
+                        let Some(n) = n.filter(|&n| n > 0) else {
+                            self.bail("SystemCall_size_cast_width");
+                            return None;
+                        };
+                        let r = self.compile_expr(args.get(1)?, n)?;
+                        self.emit(Insn::Resize(r, n));
                         Some(r)
                     }
                     other => {

@@ -153,3 +153,6 @@ mod wait_in_foreach_blocks;
 mod waiter_edge_ordering;
 #[path = "scheduling/xtrace_conformance.rs"]
 mod xtrace_conformance;
+
+#[path = "scheduling/compiled_for_loops.rs"]
+mod compiled_for_loops;

@@ -5,3 +5,6 @@
 
 #[path = "perf/work_counters.rs"]
 mod work_counters;
+
+#[path = "perf/bench_host_workloads.rs"]
+mod bench_host_workloads;

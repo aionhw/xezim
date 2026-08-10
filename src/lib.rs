@@ -6,6 +6,7 @@
 //!
 //! For ahead-of-time native compilation, use the `xezim-b` crate.
 
+pub mod benchw;
 pub mod compiler;
 pub mod intra_delay;
 pub mod multikernel;

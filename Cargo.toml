@@ -57,6 +57,10 @@ jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranel
 name = "xezim"
 path = "src/main.rs"
 
+[[bin]]
+name = "xezim-bench"
+path = "src/bin/bench.rs"
+
 [lib]
 name = "xezim"
 path = "src/lib.rs"

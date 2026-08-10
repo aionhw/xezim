@@ -3153,6 +3153,11 @@ pub struct Simulator {
     /// __deferred_init()`) must run once per specialization — not just once
     /// for the generic class with default params.
     initialized_spec_statics: std::collections::HashSet<(String, String)>,
+    /// (handle, class) whose constructor body is currently executing —
+    /// unqualified calls on `this` bind within that class's chain (§8.7).
+    ctor_class_stack: Vec<(usize, String)>,
+    /// (var.prop) null-deref reads already reported (in-method soft errors).
+    reported_null_derefs: std::collections::HashSet<String>,
     /// Queue of specializations pending static-init, processed iteratively
     /// by `ensure_spec_statics` to avoid deep Rust stack recursion.
     pending_spec_inits: Vec<(String, String)>,
@@ -4167,6 +4172,24 @@ pub struct Simulator {
     /// An unarmed block can skip without reading its operand snapshots.
     armed_edge: bool,
     armed_edge_shadow: bool,
+    /// XEZIM_EDGE_FIRE_TRACE=<substr>: log every edge-block fire whose
+    /// instance scope or sensitivity-signal name contains <substr> — with
+    /// the SCHEDULER WINDOW it fired from (active / cascade / clocking-mirror
+    /// / rescan) and its gateable data-input values at fire time. Built to
+    /// attribute one-cycle-early flop captures (a fire in any window other
+    /// than `active` samples post-NBA state).
+    edge_fire_trace: Option<String>,
+    /// Lazily-built per-block match bitmap for `edge_fire_trace` — the
+    /// string scan runs ONCE per block, not once per fire (the naive scan
+    /// measurably slowed a customer run with thousands of fires per tick).
+    edge_fire_match: Option<Vec<bool>>,
+    /// XEZIM_EDGE_FIRE_WATCH=<name1,name2>: signals whose CURRENT values
+    /// are appended to every traced fire line. Resolved lazily by substring
+    /// match against the signal table (first match per pattern).
+    edge_fire_watch: Vec<(String, usize)>,
+    edge_fire_watch_init: bool,
+    /// Label of the dispatch window the current check_edges belongs to.
+    edge_dispatch_phase: &'static str,
     armed_input_bitmap: Vec<bool>,
     armed_input_ranges: Vec<(u32, u32)>,
     armed_input_blocks: Vec<u32>,
@@ -6391,6 +6414,8 @@ impl Simulator {
             spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
             type_id_create_in_progress: HashSet::default(),
             initialized_spec_statics: std::collections::HashSet::default(),
+            ctor_class_stack: Vec::new(),
+            reported_null_derefs: std::collections::HashSet::default(),
             pending_spec_inits: Vec::new(),
             spec_init_depth: 0,
             var_class_types: HashMap::default(),
@@ -6667,6 +6692,11 @@ impl Simulator {
             armed_edge: std::env::var("XEZIM_ARMED_EDGE").ok().as_deref() != Some("0")
                 || std::env::var_os("XEZIM_ARMED_EDGE_SHADOW").is_some(),
             armed_edge_shadow: std::env::var_os("XEZIM_ARMED_EDGE_SHADOW").is_some(),
+            edge_fire_trace: std::env::var("XEZIM_EDGE_FIRE_TRACE").ok().filter(|s| !s.is_empty()),
+            edge_fire_match: None,
+            edge_fire_watch: Vec::new(),
+            edge_fire_watch_init: false,
+            edge_dispatch_phase: "active",
             armed_input_bitmap: Vec::new(),
             armed_input_ranges: Vec::new(),
             armed_input_blocks: Vec::new(),
@@ -14220,6 +14250,7 @@ impl Simulator {
     /// `event_loop` uses that to restrict the next check_edges scan to just
     /// those positions when no other state changed this iter.
     fn fire_clock_generators(&mut self) {
+
         self.toggled_clock_positions.clear();
         for cg in &mut self.clock_generators {
             if cg.next_toggle_time == self.time {
@@ -14567,6 +14598,7 @@ impl Simulator {
                         scope: ab.scope,
                     });
                 }
+                let mut dropped_terms: Vec<String> = Vec::new();
                 let resolved: Vec<SensitivityId> = sens
                     .iter()
                     .filter_map(|s| {
@@ -14588,9 +14620,49 @@ impl Simulator {
                                 });
                             }
                         }
+                        // The term may still be spelled relative to the
+                        // block's INSTANCE scope (an inlined child whose
+                        // rewrite left the leaf bare).
+                        if !ab.scope.is_empty() {
+                            let scoped = format!("{}.{}", ab.scope, s.signal_name);
+                            if let Some(&id) = self.signal_name_to_id.get(scoped.as_str()) {
+                                return Some(SensitivityId {
+                                    signal_id: id,
+                                    edge: s.edge,
+                                    iff: s.iff.clone(),
+                                    value_of: None,
+                                });
+                            }
+                        }
+                        // NOT resolvable. Silently dropping the term changes
+                        // semantics invisibly: a lost CLOCK term makes a dead
+                        // flop; a lost async-RESET term removes the reset.
+                        // Record it for the warning below.
+                        dropped_terms.push(format!(
+                            "{}{}",
+                            s.edge.print_str(),
+                            s.signal_name
+                        ));
                         None
                     })
                     .collect();
+                if !dropped_terms.is_empty() {
+                    eprintln!(
+                        "[xezim][warning] edge-sensitive always block{} DROPPED {}                          unresolvable sensitivity term(s): {} — {}",
+                        if ab.scope.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" in '{}'", ab.scope)
+                        },
+                        dropped_terms.len(),
+                        dropped_terms.join(", "),
+                        if resolved.is_empty() {
+                            "NO terms remain; this block will NEVER fire (dead flop)"
+                        } else {
+                            "the block will not respond to the dropped term(s)"
+                        }
+                    );
+                }
                 let block_idx = self.edge_blocks.len();
                 // §9.4.2: record constant bit-select event terms (`@(v[3])`).
                 // `event_to_sens` walks past the select and yields the BASE
@@ -22984,7 +23056,9 @@ impl Simulator {
             }
             let t0 = self.profile_timing.then(std::time::Instant::now);
             let edges_before = self.prof_edges_fired;
+            self.edge_dispatch_phase = "cascade";
             self.check_edges();
+            self.edge_dispatch_phase = "active";
             if let Some(t) = t0 {
                 t_edges += t.elapsed().as_nanos() as u64;
             }
@@ -23890,7 +23964,9 @@ impl Simulator {
         // publish happens after this slot's edge pass, so run one more.
         if self.clocking_mirror_dirty {
             self.clocking_mirror_dirty = false;
+            self.edge_dispatch_phase = "clocking-mirror";
             self.check_edges();
+            self.edge_dispatch_phase = "active";
             let _ = self.drain_edge_cascade(cascade_limit);
         }
         // §14.13: now that this edge's NBA updates have committed and the
@@ -26009,6 +26085,7 @@ impl Simulator {
     /// keeps a triggered `always @(*)` from running in the middle of another
     /// process's statement sequence.
     fn run_scheduled_process(&mut self, pid: usize, stmts: &ProcCont) {
+
         self.proc_depth += 1;
         self.run_scheduled_process_inner(pid, stmts);
         self.proc_depth -= 1;
@@ -29278,6 +29355,7 @@ impl Simulator {
     }
 
     fn apply_nba(&mut self) {
+
         // §4.9.4: commit matured future-time NBAs first — they were scheduled
         // in an earlier slot, so they precede this slot's freshly queued NBAs.
         if !self.delayed_nba.is_empty() {
@@ -29823,6 +29901,8 @@ impl Simulator {
         let mut passes: u64 = 0;
         self.edge_rescan_block_hits.clear();
         self.in_edge_rescan = true;
+        let prev_phase = self.edge_dispatch_phase;
+        self.edge_dispatch_phase = "rescan";
         let mut subset: Vec<usize> = Vec::new();
         while !self.edge_exec_wrote.is_empty() && !self.finished {
             subset.clear();
@@ -29841,6 +29921,7 @@ impl Simulator {
             self.check_edges_inner(Some(&subset), false);
         }
         self.in_edge_rescan = false;
+        self.edge_dispatch_phase = prev_phase;
     }
 
     /// A zero-delay livelock sustained entirely by edge-triggered always
@@ -29930,6 +30011,7 @@ impl Simulator {
     /// `check_edges`, which additionally drains the §9.2 re-triggers
     /// produced by blocking writes during edge-block execution.
     fn check_edges_pass(&mut self) {
+
         // Time-0 init detect is special (initial values set via non-hot paths
         // vs uninitialized prev → everything "fires"). Run it as a full scan
         // and reset the dirty accumulator so steady-state (time>0) starts clean.
@@ -31442,6 +31524,97 @@ impl Simulator {
         }
 
         if !triggered.is_empty() {
+            if let Some(pat) = self.edge_fire_trace.clone() {
+                // One-time: precompute which blocks match, and resolve the
+                // watch list. Per-dispatch cost is then a bitmap index per
+                // fired block.
+                if self.edge_fire_match.is_none() {
+                    let m: Vec<bool> = self
+                        .edge_blocks
+                        .iter()
+                        .map(|b| {
+                            b.scope.contains(pat.as_str())
+                                || b.resolved_sensitivities.iter().any(|si| {
+                                    self.name_for_id(si.signal_id).contains(pat.as_str())
+                                })
+                        })
+                        .collect();
+                    self.edge_fire_match = Some(m);
+                }
+                if !self.edge_fire_watch_init {
+                    self.edge_fire_watch_init = true;
+                    if let Ok(w) = std::env::var("XEZIM_EDGE_FIRE_WATCH") {
+                        for patt in w.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                            let hit = self
+                                .signal_name_to_id
+                                .iter()
+                                .filter(|(n, _)| n.contains(patt))
+                                .min_by_key(|(n, _)| n.len())
+                                .map(|(n, &id)| (n.to_string(), id));
+                            match hit {
+                                Some((n, id)) => self.edge_fire_watch.push((n, id)),
+                                None => eprintln!(
+                                    "[EDGE-FIRE] watch pattern '{}' matched no signal",
+                                    patt
+                                ),
+                            }
+                        }
+                    }
+                }
+                let matched = self.edge_fire_match.as_ref().unwrap();
+                for &bi in &triggered {
+                    if !matched.get(bi).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    let Some(b) = self.edge_blocks.get(bi) else { continue };
+                    let sens: Vec<String> = b
+                        .resolved_sensitivities
+                        .iter()
+                        .map(|si| {
+                            format!("{}{}", si.edge.print_str(), self.name_for_id(si.signal_id))
+                        })
+                        .collect();
+                    let reads: Vec<String> = self
+                        .edge_block_data_reads
+                        .get(bi)
+                        .map(|rs| {
+                            rs.iter()
+                                .map(|&sid| {
+                                    let sid = sid as usize;
+                                    let v = self
+                                        .signal_table
+                                        .get(sid)
+                                        .map(|v| v.to_hex_string())
+                                        .unwrap_or_else(|| "?".into());
+                                    format!("{}='h{}", self.name_for_id(sid), v)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let watch: Vec<String> = self
+                        .edge_fire_watch
+                        .iter()
+                        .map(|(n, id)| {
+                            let v = self
+                                .signal_table
+                                .get(*id)
+                                .map(|v| v.to_hex_string())
+                                .unwrap_or_else(|| "?".into());
+                            format!("{}='h{}", n, v)
+                        })
+                        .collect();
+                    eprintln!(
+                        "[EDGE-FIRE] t={} window={} bi={} scope={} @({}) reads=[{}] watch=[{}]",
+                        self.time,
+                        self.edge_dispatch_phase,
+                        bi,
+                        if b.scope.is_empty() { "<top>" } else { &b.scope },
+                        sens.join(","),
+                        reads.join(", "),
+                        watch.join(", ")
+                    );
+                }
+            }
             let t1 = self.profile_timing.then(std::time::Instant::now);
             if self.edge_block_stats_enabled {
                 for &bi in &triggered {
@@ -33427,6 +33600,7 @@ impl Simulator {
     }
 
     fn settle_combinatorial_inner(&mut self) {
+
         if self.settling {
             return;
         }
@@ -38534,6 +38708,15 @@ impl Simulator {
                             }
                             if let Some(v) = handle_value {
                                 let h = v.to_u64().unwrap_or(0) as usize;
+                                // §8.4: reading an instance property through a
+                                // NULL declared class handle is a runtime
+                                // fatal, not a silent x.
+                                if h == 0 && split == segs.len() - 1 {
+                                    let prefix = segs[..split].join(".");
+                                    if self.null_deref_fatal(&prefix, segs[split]) {
+                                        return Value::new(32);
+                                    }
+                                }
                                 if h != 0 && h < self.heap.len() {
                                     if let Some(inst) = self.heap.get(h).and_then(|x| x.as_ref()) {
                                         let mut cur_props = &inst.properties;
@@ -43183,6 +43366,15 @@ impl Simulator {
                     }
                 }
                 if handle == 0 || handle >= self.heap.len() {
+                    // §8.4: reading an instance property through a null handle
+                    // is a runtime FATAL (the reference simulator aborts) —
+                    // silently yielding 0/x lets a dead testbench keep "passing".
+                    if let ExprKind::Ident(h) = &expr.kind {
+                        let n = self.resolve_hier_name(h);
+                        if self.null_deref_fatal(&n, &member.name) {
+                            return Value::new(32);
+                        }
+                    }
                     Value::zero(32)
                 } else {
                     let prop = self.heap[handle]
@@ -43576,6 +43768,7 @@ impl Simulator {
     }
 
     pub fn exec_statement(&mut self, stmt: &Statement) {
+
         if self.finished
             || self.time > self.max_time
             || self.break_flag
@@ -51793,6 +51986,71 @@ impl Simulator {
                                                 ));
                                                 continue;
                                             }
+                                        }
+                                    }
+                                }
+                                // §21.2.1.7: a class FIXED-ARRAY property
+                                // (`c.arr`) renders as an element list — the
+                                // scalar fallback below printed 0.
+                                let obj_prop: Option<(usize, String)> = match &arg.kind {
+                                    ExprKind::MemberAccess { expr: b, member } => {
+                                        let hh =
+                                            self.eval_expr(b).to_u64().unwrap_or(0) as usize;
+                                        Some((hh, member.name.clone()))
+                                    }
+                                    ExprKind::Ident(ih)
+                                        if ih.path.len() == 2
+                                            && ih.path.iter().all(|s| s.selects.is_empty()) =>
+                                    {
+                                        let obj = ih.path[0].name.name.clone();
+                                        self.eval_ident_handle(&obj)
+                                            .map(|hv| (hv, ih.path[1].name.name.clone()))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((h, prop)) = obj_prop {
+                                    if h != 0 && h < self.heap.len() {
+                                        let mut cur = self
+                                            .heap
+                                            .get(h)
+                                            .and_then(|o| o.as_ref())
+                                            .map(|i| i.class_name.clone());
+                                        let mut range: Option<(i64, i64)> = None;
+                                        let mut guard = 0;
+                                        while let Some(c) = cur {
+                                            guard += 1;
+                                            if guard > 64 {
+                                                break;
+                                            }
+                                            let Some(cd) = self.module.classes.get(&c) else {
+                                                break;
+                                            };
+                                            if let Some(&(lo, hi, _w)) =
+                                                cd.array_properties.get(&prop)
+                                            {
+                                                range = Some((lo, hi));
+                                                break;
+                                            }
+                                            cur = cd.extends.clone();
+                                        }
+                                        if let Some((lo, hi)) = range {
+                                            let nm = format!("{}#{}", h, prop);
+                                            let is_str = self.string_signals.contains(&nm);
+                                            let mut parts: Vec<String> = Vec::new();
+                                            for i in lo..=hi {
+                                                let v = self
+                                                    .get_signal_value_by_name(&format!(
+                                                        "{}[{}]",
+                                                        nm, i
+                                                    ))
+                                                    .unwrap_or_else(|| Value::zero(32));
+                                                parts.push(Self::render_p_value(&v, is_str));
+                                            }
+                                            result.push_str(&format!(
+                                                "'{{{}}}",
+                                                parts.join(", ")
+                                            ));
+                                            continue;
                                         }
                                     }
                                 }
@@ -63735,6 +63993,74 @@ impl Simulator {
             }
             _ => val.clone(),
         }
+    }
+
+    /// §8.4: `var.prop` where `var` is a DECLARED class handle currently
+    /// null and `prop` is an instance property of that class — a runtime
+    /// fatal. Emits the error and terminates; returns true when it fired.
+    /// A STATIC property (readable through null) never reaches here — the
+    /// static route runs first at every call site.
+    fn null_deref_fatal(&mut self, vname: &str, prop: &str) -> bool {
+        let Some(cn) = self.class_of_var(vname) else {
+            return false;
+        };
+        let base = cn.split('#').next().unwrap_or(&cn).to_string();
+        let mut cur = Some(base);
+        let mut declares = false;
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&c) else {
+                break;
+            };
+            if cd.properties.contains_key(prop) && !cd.static_properties.contains(prop) {
+                declares = true;
+                break;
+            }
+            cur = cd.extends.clone();
+        }
+        if !declares {
+            return false;
+        }
+        // Inside a class method (deep library code), report ONCE and keep
+        // going — an emulation gap can leave a handle null where the
+        // reference had one, and terminating there kills whole UVM runs.
+        // In module/TB context the deref is the user's bug: fatal.
+        let in_method = self.this_stack.last().copied().flatten().is_some()
+            || self
+                .class_context_stack
+                .last()
+                .cloned()
+                .flatten()
+                .is_some()
+            // any subroutine frame (package/module function or task) — the
+            // fatal is reserved for a deref directly in a process body
+            || !self.local_stack.is_empty();
+        let key = format!("{}.{}", vname, prop);
+        if in_method {
+            if self.reported_null_derefs.insert(key.clone()) {
+                let m = format!(
+                    "[xezim][error] null object dereference: '{}' read through \
+                     a null handle (t={})",
+                    key, self.time
+                );
+                self.record_output(m.clone());
+                self.stdout_writeln(&m);
+            }
+            return false;
+        }
+        let m = format!(
+            "[xezim][fatal] null object dereference: '{}' read through a \
+             null handle (t={})",
+            key, self.time
+        );
+        self.record_output(m.clone());
+        self.stdout_writeln(&m);
+        self.finished = true;
+        true
     }
 
     fn class_of_var(&self, vname: &str) -> Option<String> {
@@ -78072,6 +78398,15 @@ impl Simulator {
     }
 
     fn exec_method_call(&mut self, handle: usize, method_name: &str, args: &[Expression]) -> Value {
+        // Ctor-time binding: a call on the object UNDER CONSTRUCTION starts
+        // its search at the constructing class, not the runtime leaf.
+        if method_name != "new" {
+            if let Some((ch, cc)) = self.ctor_class_stack.last().cloned() {
+                if ch == handle && self.class_has_method(&cc, method_name) {
+                    return self.exec_method_in_class_hierarchy(handle, &cc, method_name, args);
+                }
+            }
+        }
         // IEEE 1800-2023 §9.7 process class: kill/await/suspend/resume on a
         // process handle (>= PROCESS_HANDLE_BASE). These are intercepted here,
         // before any user-class dispatch.
@@ -85246,6 +85581,13 @@ impl Simulator {
                 // local that leaked into the flat `var_class_types` map.
                 self.method_local_base.push(self.local_stack.len() - 1);
                 self.class_context_stack.push(Some(cname.clone()));
+                // §8.7 ctor-time binding (reference behavior): while class
+                // C's `new` body runs, an unqualified method call on `this`
+                // binds within C's own chain — a derived override must not
+                // run against a partially-constructed object.
+                if method_name == "new" {
+                    self.ctor_class_stack.push((handle, cname.clone()));
+                }
                 self.local_iface_aliases.push(iface_alias_frame);
                 // §6.21: open a static-local sync frame so a `static`
                 // local declared in the method body persists across calls.
@@ -85281,6 +85623,9 @@ impl Simulator {
                     self.break_flag = saved_break;
                     self.continue_flag = saved_continue;
                     self.return_flag = saved_return;
+                }
+                if method_name == "new" {
+                    self.ctor_class_stack.pop();
                 }
                 self.class_context_stack.pop();
                 self.method_local_base.pop();

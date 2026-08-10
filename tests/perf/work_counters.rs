@@ -92,8 +92,13 @@ fn comb_datapath_work_stays_bounded() {
     // refactors pass and a genuine work regression (a dead-instruction
     // reintroduction was ~15-20% on real RTL) trips the guard.
     // Baseline 2026-08-06: entry_evals=3710 insns=12916 (see `baseline` below).
+    // Re-baselined 2026-08-09: `for (int i...)` loops now COMPILE to bytecode
+    // instead of AST-fallback (the customer For_init_vardecl perf fix), so
+    // this design's comb for-loop moved its work INTO the counted insn
+    // stream: insns=44060 (each far cheaper than the AST statement execs
+    // they replaced — wall time drops). Evals unchanged.
     const MAX_EVALS: u64 = 4_650;
-    const MAX_INSNS: u64 = 16_200;
+    const MAX_INSNS: u64 = 55_000;
     assert!(
         evals <= MAX_EVALS,
         "comb entry evaluations regressed: {} > {} (same answer, more work — \
