@@ -3153,6 +3153,15 @@ pub struct Simulator {
     /// __deferred_init()`) must run once per specialization — not just once
     /// for the generic class with default params.
     initialized_spec_statics: std::collections::HashSet<(String, String)>,
+    /// Object handles currently mid-`register()` in a factory. Guards
+    /// against RE-ENTRANT registration: a factory `register(obj)` whose
+    /// first statement `obj.get_type_name()` triggers a parameterized
+    /// class specialization's lazy static init, which itself calls
+    /// `factory.register(obj)` for the SAME object. The re-entrant call is
+    /// skipped so the OUTER call performs the single registration — without
+    /// it, the outer call resumes and finds the type already stored, emitting
+    /// a spurious UVM `TPRGED` warning.
+    factory_reg_in_progress: std::collections::HashSet<usize>,
     /// (handle, class) whose constructor body is currently executing —
     /// unqualified calls on `this` bind within that class's chain (§8.7).
     ctor_class_stack: Vec<(usize, String)>,
@@ -6414,6 +6423,7 @@ impl Simulator {
             spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
             type_id_create_in_progress: HashSet::default(),
             initialized_spec_statics: std::collections::HashSet::default(),
+            factory_reg_in_progress: std::collections::HashSet::default(),
             ctor_class_stack: Vec::new(),
             reported_null_derefs: std::collections::HashSet::default(),
             pending_spec_inits: Vec::new(),
@@ -85533,6 +85543,27 @@ impl Simulator {
         args: &[Expression],
     ) -> Value {
         use crate::ast::decl::{ClassMethod, ClassMethodKind};
+        // Re-entrant registration guard: a factory `register(obj)` whose
+        // body calls `obj.get_type_name()` can trigger a parameterized class
+        // specialization's lazy static init, which re-enters
+        // `factory.register(obj)` for the SAME object. Skip the re-entrant
+        // call so the outer one performs the single registration (else the
+        // outer call resumes to find the type already stored -> UVM TPRGED).
+        // `register`'s argument is a handle; `insert` returns false when the
+        // handle is already mid-registration.
+        let reg_guard_obj: Option<usize> = if method_name == "register" {
+            args.first()
+                .and_then(|a| self.eval_expr(a).to_u64())
+                .map(|h| h as usize)
+                .filter(|&h| h != 0)
+        } else {
+            None
+        };
+        if let Some(h) = reg_guard_obj {
+            if !self.factory_reg_in_progress.insert(h) {
+                return Value::zero(32);
+            }
+        }
         let mut cur_class = Some(start_class.to_string());
         while let Some(cname) = cur_class {
             // Resolve the matched method + parent-class pointer in a scoped
@@ -86218,8 +86249,14 @@ impl Simulator {
                     }
                     self.purge_assoc_param(&param);
                 }
+                if let Some(h) = reg_guard_obj {
+                    self.factory_reg_in_progress.remove(&h);
+                }
                 return ret;
             }
+        }
+        if let Some(h) = reg_guard_obj {
+            self.factory_reg_in_progress.remove(&h);
         }
         Value::zero(32)
     }
