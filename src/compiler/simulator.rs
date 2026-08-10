@@ -38308,6 +38308,40 @@ impl Simulator {
                         return self.eval_expr_ctx(&e2, ctx_width);
                     }
                 }
+                // §13.4.1: `obj.method` with NO parens invokes a parameterless
+                // function. The MemberAccess shape (`obj.method`) already
+                // dispatches it; the FLATTENED 2-segment `Ident([obj, method])`
+                // (how `t1.randomize & t2.randomize` parses) fell through to a
+                // property read and returned 0 WITHOUT running the function —
+                // so UVM's `assert(t1.randomize & t2.randomize)` never
+                // randomized `t1`/`t2` (fields stayed 0). Mirror the
+                // MemberAccess dispatch: if the base is a live class handle
+                // whose type declares a parameterless function `method`, call
+                // it and use its return. Guarded to the 2-segment flat form so
+                // struct-member / enum / signal-path reads keep their own arms.
+                if hier.path.len() == 2
+                    && hier.path[1].selects.is_empty()
+                    && hier.path[0].selects.is_empty()
+                {
+                    let base_name = hier.path[0].name.name.as_str();
+                    let member = hier.path[1].name.name.clone();
+                    if let Some(handle) = self.eval_ident_handle(base_name) {
+                        if handle != 0 {
+                            let cls = self
+                                .heap
+                                .get(handle)
+                                .and_then(|o| o.as_ref())
+                                .map(|i| i.class_name.clone());
+                            if let Some(cn) = cls {
+                                if self.class_parameterless_function(&cn, &member) {
+                                    let r = self.exec_method_call(handle, &member, &[]);
+                                    self.return_flag = false;
+                                    return r;
+                                }
+                            }
+                        }
+                    }
+                }
                 // §18.4: `<obj>.<agg_prop>.<member>` / `<agg_prop>.<member>`
                 // that parsed as a FLAT hier ident — same aggregate-class-
                 // property storage as the `MemberAccess` shape (see there).
@@ -44318,6 +44352,7 @@ impl Simulator {
                                 .get(&bname)
                                 .cloned()
                                 .or_else(|| self.var_class_types.get(&bname).cloned())
+                                .or_else(|| self.declared_collection_elem_class(&bname))
                                 .or_else(|| {
                                     // Class-MEMBER collection (static or instance):
                                     // resolve the element class from the current
@@ -86043,6 +86078,51 @@ impl Simulator {
         }
         self.get_expr_type_name(expr)
             .is_some_and(|t| says_mailbox(&t))
+    }
+
+    /// Element class of a bare module-scoped / package-scoped unpacked
+    /// collection of a class type, resolved from the variable's DECLARED
+    /// DataType. `var_decl_types` is keyed by the BASE name and stores the
+    /// ELEMENT type (for `K m [string]` it holds the `TypeReference` "K"), so
+    /// a `= new` assigning into an element slot can construct the right class.
+    ///
+    /// Without this the ARRAY-element type maps
+    /// `array_elem_class` / `var_class_types` are keyed only for ranged / local
+    /// arrays and class-member collections; a MODULE/PACKAGE-scope assoc
+    /// array of a class (e.g. UVM's `uvm_seed_map uvm_random_seed_table_lookup
+    /// [string]`) has no entry, `elem_cls` resolved the element type as unknown,
+    /// and `uvm_random_seed_table_lookup[inst_id] = new;` fell through to an
+    /// OPAQUE "unknown-LHS" instance, so the stored handle deref'd null the
+    /// moment a seed was read back (`seed_map.seed_table` null deref at t=0).
+    fn declared_collection_elem_class(&self, name: &str) -> Option<String> {
+        // Package-scoped collections (e.g. UVM's
+        // `uvm_seed_map uvm_random_seed_table_lookup [string]` inside
+        // `package uvm_pkg`) may be keyed under a QUALIFIED name
+        // (`uvm_pkg::uvm_random_seed_table_lookup`). Try the bare name
+        // first, then a leaf-name match so a bare in-scope reference finds
+        // its declared type either way.
+        let dt = self.module.var_decl_types.get(name).cloned();
+        let dt = dt.or_else(|| {
+            let leaf = name.rsplit(':').next().unwrap_or(name);
+            self.module.var_decl_types.iter().find_map(|(k, v)| {
+                if k.rsplit(':').next().unwrap_or(k) == leaf {
+                    Some(v.clone())
+                } else {
+                    None
+                }
+            })
+        })?;
+        let cn = match &dt {
+            crate::ast::types::DataType::TypeReference { name, .. } => name.name.name.clone(),
+            _ => return None,
+        };
+        if self.module.classes.contains_key(&cn)
+            || self.module.covergroups.contains_key(&cn)
+        {
+            Some(cn)
+        } else {
+            None
+        }
     }
 
     fn get_expr_type_name(&self, expr: &Expression) -> Option<String> {
