@@ -125,6 +125,8 @@ mod bare_randomize_solver;
 mod uvm_agent_active_config;
 #[path = "misc/new_ctor_vs_shallow_copy.rs"]
 mod new_ctor_vs_shallow_copy;
+#[path = "misc/assoc_dotted_key.rs"]
+mod assoc_dotted_key;
 #[path = "misc/pattern_replication_and_extends_args.rs"]
 mod pattern_replication_and_extends_args;
 #[path = "misc/program_block_reactive.rs"]

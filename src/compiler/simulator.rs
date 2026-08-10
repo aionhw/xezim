@@ -59279,7 +59279,6 @@ impl Simulator {
                 let rest = &k[prefix.len()..];
                 rest.find(']').map(|pos| rest[..pos].to_string())
             })
-            .filter(|key| !key.contains('.'))
             .collect();
         keys.sort();
         keys.dedup();
