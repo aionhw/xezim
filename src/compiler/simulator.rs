@@ -71501,7 +71501,23 @@ impl Simulator {
                 Some(v) => v,
                 None => continue,
             };
-            if canon(dfrag) != canon(sval) {
+            // A dest arg that is a bare TYPE-PARAM NAME of `dest_class` (e.g.
+            // `this_type = pair#(T1,T2)` inside `pair` — the typedef was
+            // recorded textually with the parameter names, not the concrete
+            // specialization) is a PLACEHOLDER, not the actual type. Resolve
+            // it to the concrete type bound in the current context (a method
+            // of `pair#(txn,txn)` binds `T1`->`txn`); comparing the bare
+            // name `T1` against the src instance's concrete `txn` would
+            // wrongly fail every `$cast` to one's own `this_type`
+            // (§8.25 two specializations === same iff their params are same).
+            let dfrag_resolved = if cd.type_param_names.iter().any(|n| n == dfrag) {
+                self.resolve_type_param_binding(dfrag)
+                    .unwrap_or_else(|| dfrag.to_string())
+            } else {
+                dfrag.to_string()
+            };
+            let dfrag_resolved = dfrag_resolved.trim().to_string();
+            if canon(&dfrag_resolved) != canon(sval) {
                 return false;
             }
         }
