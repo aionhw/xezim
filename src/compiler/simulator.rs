@@ -7480,6 +7480,7 @@ impl Simulator {
             for insn in &cb.instructions {
                 match insn {
                     Insn::StmtFallback(..)
+                    | Insn::EvalExprFallback(..)
                     | Insn::BlockingAssign(..)
                     | Insn::BlockingAssignRange(..)
                     | Insn::BlockingAssignRangeDyn(..)
@@ -11153,6 +11154,7 @@ impl Simulator {
                             // catch-all in exec_comb_block_isolated): array /
                             // dynamic-range blocking writes and AST fallback.
                             Insn::StmtFallback(..)
+                            | Insn::EvalExprFallback(..)
                             | Insn::BlockingAssignArray(..)
                             | Insn::BlockingAssignArrayRange(..)
                             | Insn::BlockingAssignRangeDyn(..) => unsupported = true,
@@ -13039,7 +13041,7 @@ impl Simulator {
                     if compiled
                         .instructions
                         .iter()
-                        .any(|i| matches!(i, Insn::StmtFallback(..)))
+                        .any(|i| matches!(i, Insn::StmtFallback(..) | Insn::EvalExprFallback(..)))
                     {
                         SendCombItem::AstFallback
                     } else {
@@ -14932,6 +14934,10 @@ impl Simulator {
                 &self.widths,
             );
             compiler.set_ast_fallback(true);
+            // Edge blocks only: sensitivity is the explicit clock list, so a
+            // read hidden inside an interpreted expression can't break wake-up
+            // analysis here (unlike comb entries / cont-assigns).
+            compiler.set_expr_fallback(true);
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
                 compiler.set_functions(&self.module.functions);
@@ -15277,7 +15283,11 @@ impl Simulator {
             let has_fallback = cb.as_ref().is_some_and(|cb| {
                 cb.instructions
                     .iter()
-                    .any(|insn| matches!(insn, super::bytecode::Insn::StmtFallback(..)))
+                    .any(|insn| matches!(
+                        insn,
+                        super::bytecode::Insn::StmtFallback(..)
+                            | super::bytecode::Insn::EvalExprFallback(..)
+                    ))
             });
             // NbaAssignBitDyn and NbaAssignRange read signal_table.clone() in
             // the parallel path and produce a full-register NbaFast entry with
@@ -15304,6 +15314,7 @@ impl Simulator {
                 for insn in &cb.instructions {
                     match insn {
                         BcInsn::StmtFallback(..)
+                        | BcInsn::EvalExprFallback(..)
                         | BcInsn::BlockingAssign(..)
                         | BcInsn::BlockingAssignRange(..)
                         | BcInsn::BlockingAssignRangeDyn(..)
@@ -15404,6 +15415,7 @@ impl Simulator {
                 for insn in &cb.instructions {
                     let c = match insn {
                         Insn::StmtFallback(..) => 0,
+                        Insn::EvalExprFallback(..) => 0,
                         Insn::BlockingAssign(..) => 1,
                         Insn::BlockingAssignRange(..)
                         | Insn::BlockingAssignRangeDyn(..)
@@ -15490,6 +15502,7 @@ impl Simulator {
                     matches!(
                         i,
                         Insn::StmtFallback(..)
+                        | Insn::EvalExprFallback(..)
                             | Insn::BlockingAssign(..)
                             | Insn::BlockingAssignRange(..)
                             | Insn::BlockingAssignRangeDyn(..)
@@ -16002,6 +16015,7 @@ impl Simulator {
                 }
                 // These should never appear in parallel-eligible blocks
                 Insn::StmtFallback(..)
+                | Insn::EvalExprFallback(..)
                 | Insn::BlockingAssign(..)
                 | Insn::BlockingAssignRange(..)
                 | Insn::BlockingAssignRangeDyn(..)
@@ -16627,11 +16641,13 @@ impl Simulator {
                 insn @ (Insn::NbaAssignRangeDyn(..)
                 | Insn::NbaAssignArrayRange(..)
                 | Insn::BlockingAssignArrayRange(..)
-                | Insn::StmtFallback(..)) => {
+                | Insn::StmtFallback(..)
+                | Insn::EvalExprFallback(..)) => {
                     unsupported = true;
                     if std::env::var("XEZIM_PDES_CHK_KINDS").ok().as_deref() == Some("1") {
                         let kind = match insn {
                             Insn::StmtFallback(..) => "StmtFallback",
+                            Insn::EvalExprFallback(..) => "EvalExprFallback",
                             Insn::BlockingAssignArrayRange(..) => "BlockingAssignArrayRange",
                             Insn::NbaAssignRangeDyn(..) => "NbaAssignRangeDyn",
                             Insn::NbaAssignArrayRange(..) => "NbaAssignArrayRange",
@@ -17636,6 +17652,23 @@ impl Simulator {
                             });
                         }
                     }
+                }
+                Insn::EvalExprFallback(payload, r, ctxw) => {
+                    // Expression-level AST escape hatch: interpret one
+                    // sub-expression; the rest of the statement stays
+                    // compiled. Counted in the fallback_reason table so the
+                    // remaining interpreter surface stays visible.
+                    let e = payload.0.clone();
+                    let reason = payload.1.clone();
+                    self.prof_fallback_insns += 1;
+                    let (r, ctxw) = (*r as usize, *ctxw);
+                    let v = self.eval_expr_ctx(&e, ctxw);
+                    self.vm_regs[r] = v;
+                    let ent = self
+                        .prof_fallback_by_reason
+                        .entry(reason)
+                        .or_insert((0u64, 0u64));
+                    ent.0 += 1;
                 }
                 Insn::StmtFallback(payload) => {
                     let s = payload.0.clone();
@@ -25424,6 +25457,7 @@ impl Simulator {
             Insn::BlockingAssignArrayRange(..) => "BlockingAssignArrayRange",
             Insn::Move(..) => "Move",
             Insn::StmtFallback(..) => "StmtFallback",
+            Insn::EvalExprFallback(..) => "EvalExprFallback",
             Insn::ClearSigned(..) => "ClearSigned",
             Insn::Pow(..) => "Pow",
             Insn::SetSigned(..) => "SetSigned",
@@ -54691,7 +54725,7 @@ impl Simulator {
             let mut opaque = false;
             for insn in &cb.instructions {
                 match insn {
-                    Insn::StmtFallback(..) => opaque = true,
+                    Insn::StmtFallback(..) | Insn::EvalExprFallback(..) => opaque = true,
                     Insn::LoadSignal(_, s)
                     | Insn::LoadSignalSigned(_, s)
                     | Insn::LoadSignalRange(_, s, _, _)

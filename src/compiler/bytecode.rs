@@ -220,6 +220,13 @@ pub enum Insn {
     /// 24 B (Arc + fat-ptr str). StmtFallback is the AST-interpreter
     /// escape hatch — its dispatch cost dwarfs an extra deref.
     StmtFallback(Box<(Arc<Statement>, Arc<str>)>),
+    /// Expression-level AST escape hatch: interpret ONE sub-expression the
+    /// compiler can't handle (unresolvable ident, member access, impure
+    /// call, ...) into a register, keeping the REST of the statement
+    /// compiled. (RegId dest, ctx width for §11.8.1 sizing.) Forbidden
+    /// while any register-backed locals are live — the interpreter cannot
+    /// see VM registers.
+    EvalExprFallback(Box<(Arc<Expression>, Arc<str>)>, RegId, u32),
 
     SetSigned(RegId),
     /// §11.8.1: the enclosing expression is UNSIGNED (some operand is
@@ -434,6 +441,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::BinOpConst(_, _, _, BinOpConstKind::Eq) => "EqC",
         Insn::BinOpConst(_, _, _, BinOpConstKind::CaseEq) => "CaseEqC",
         Insn::StmtFallback(..) => "Fallback",
+        Insn::EvalExprFallback(..) => "EvalExpr",
     }
 }
 
@@ -479,6 +487,13 @@ pub struct BytecodeCompiler<'a> {
     /// inside such a loop silently reads the loop var as X. Any unsupported
     /// construct must instead fail the whole loop back to the AST path.
     reg_var_loop_depth: u32,
+    /// Expression-level fallback is only sound where surrounding analysis
+    /// doesn't need to SEE the expression's reads: edge blocks, whose
+    /// sensitivity is the explicit clock list. Comb entries build their
+    /// wake-up graph from LoadSignal scans, so a read hidden inside an
+    /// interpreted fragment would stop the entry re-firing. Off by default;
+    /// enabled only at the edge-block compile site.
+    allow_expr_fallback: bool,
     /// User-task table for inlining zero-arg, non-blocking task bodies.
     /// Task-enable (`task_name;`) statements that resolve here get their
     /// bodies compiled in place instead of emitting a single StmtFallback
@@ -584,6 +599,7 @@ impl<'a> BytecodeCompiler<'a> {
             for_loop_var_ids: std::collections::HashMap::default(),
             local_var_regs: std::collections::HashMap::default(),
             reg_var_loop_depth: 0,
+            allow_expr_fallback: false,
             tasks: None,
             functions: None,
             inlining_stack: Vec::new(),
@@ -781,6 +797,10 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_ast_fallback(&mut self, allow: bool) {
         self.allow_ast_fallback = allow;
+    }
+
+    pub fn set_expr_fallback(&mut self, allow: bool) {
+        self.allow_expr_fallback = allow;
     }
 
     pub fn set_scope_hint(&mut self, scope: Option<String>) {
@@ -1220,6 +1240,61 @@ impl<'a> BytecodeCompiler<'a> {
             }
             _ => false,
         }
+    }
+
+    fn expr_has_sampled_value_call(e: &Expression) -> bool {
+        let sub = |x: &Expression| Self::expr_has_sampled_value_call(x);
+        match &e.kind {
+            ExprKind::SystemCall { name, args } => {
+                matches!(
+                    name.as_str(),
+                    "$past" | "$rose" | "$fell" | "$stable" | "$changed" | "$sampled"
+                ) || args.iter().any(sub)
+            }
+            ExprKind::Unary { operand, .. } => sub(operand),
+            ExprKind::Binary { left, right, .. } => sub(left) || sub(right),
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                sub(condition) || sub(then_expr) || sub(else_expr)
+            }
+            ExprKind::Paren(i) => sub(i),
+            ExprKind::Concatenation(items) => items.iter().any(sub),
+            ExprKind::Replication { count, exprs } => {
+                sub(count) || exprs.iter().any(sub)
+            }
+            ExprKind::Call { args, .. } => args.iter().any(sub),
+            _ => false,
+        }
+    }
+
+    /// Expression-level escape hatch (see Insn::EvalExprFallback). Returns
+    /// None when forbidden (no ast-fallback, or register-backed locals are
+    /// live and the interpreter couldn't see them).
+    fn emit_expr_fallback(
+        &mut self,
+        e: &Expression,
+        ctx_width: u32,
+        reason: &'static str,
+    ) -> Option<RegId> {
+        if !self.allow_ast_fallback
+            || !self.allow_expr_fallback
+            || self.reg_var_loop_depth > 0
+            || !self.local_var_regs.is_empty()
+        {
+            return None;
+        }
+        // Sampled-value functions ($past/$rose/...) take their clock from the
+        // ENCLOSING block's inferred clocking — an isolated expression eval
+        // has no block context, so the whole statement must fall back.
+        if Self::expr_has_sampled_value_call(e) {
+            return None;
+        }
+        let r = self.alloc_reg();
+        self.emit(Insn::EvalExprFallback(
+            Box::new((Arc::new(e.clone()), Arc::from(reason))),
+            r,
+            ctx_width,
+        ));
+        Some(r)
     }
 
     fn emit_fallback(&mut self, stmt: &Statement) -> bool {
@@ -2764,6 +2839,9 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit(Insn::LoadConst(r, Box::new(v)));
                     return Some(r);
                 }
+                if let Some(r) = self.emit_expr_fallback(expr, ctx_width, "ident_lookup") {
+                    return Some(r);
+                }
                 self.bail("ident_lookup");
                 None
             }
@@ -3474,8 +3552,13 @@ impl<'a> BytecodeCompiler<'a> {
                         Some(r)
                     }
                     other => {
-                        self.bail("SystemCall_other");
                         let _ = other;
+                        if let Some(r) =
+                            self.emit_expr_fallback(expr, ctx_width, "SystemCall_other")
+                        {
+                            return Some(r);
+                        }
+                        self.bail("SystemCall_other");
                         None
                     }
             },
@@ -3484,7 +3567,9 @@ impl<'a> BytecodeCompiler<'a> {
             // formals. That is the overwhelmingly common combinational-helper
             // shape in RTL (`lfsr32(s)`, `mix(a,b)`), and leaving it to the AST
             // interpreter dragged the whole enclosing block out of bytecode.
-            ExprKind::Call { func, args } => self.compile_pure_call(func, args, ctx_width),
+            ExprKind::Call { func, args } => self
+                .compile_pure_call(func, args, ctx_width)
+                .or_else(|| self.emit_expr_fallback(expr, ctx_width, "Expr_Call_impure")),
             other => {
                 let n: &'static str = match other {
                     ExprKind::StringLiteral(_) => "Expr_StringLiteral",
@@ -3501,6 +3586,19 @@ impl<'a> BytecodeCompiler<'a> {
                     ExprKind::NamedArg { .. } => "Expr_NamedArg",
                     _ => "Expr_other",
                 };
+                // Assignment patterns (and named args inside them) spread
+                // member-wise at the STATEMENT level on the AST path;
+                // evaluating one here to a packed value changes NBA
+                // semantics on unpacked structs. Let the statement bail.
+                let pattern_like = matches!(
+                    other,
+                    ExprKind::AssignmentPattern(_) | ExprKind::NamedArg { .. }
+                );
+                if !pattern_like {
+                    if let Some(r) = self.emit_expr_fallback(expr, ctx_width, n) {
+                        return Some(r);
+                    }
+                }
                 self.bail(n);
                 None
             }
@@ -4882,6 +4980,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // AST fallback can read anything through the interpreter.
             Insn::StmtFallback(..) => true,
+            Insn::EvalExprFallback(..) => true,
         }
     }
 
@@ -5617,6 +5716,7 @@ impl<'a> BytecodeCompiler<'a> {
 
                 // The AST interpreter runs with the whole machine in reach.
                 Insn::StmtFallback(..) => rw.iter_mut().for_each(|f| *f = None),
+                Insn::EvalExprFallback(..) => rw.iter_mut().for_each(|f| *f = None),
             }
         }
     }

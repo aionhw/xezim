@@ -96,6 +96,29 @@ Projected effect on the customer run: 921 s → roughly 2.5–4 minutes
   share of the customer's traced run), plus `XEZIM_EDGE_FIRE_WATCH=<sigs>`
   appending watched signal values to each fire line.
 
+## Expression-level fallback (EvalExprFallback, 2026-08-09)
+
+Statement-level fallback made ONE unsupported sub-expression drag the whole
+statement (often the whole block) into the AST interpreter. The new
+`Insn::EvalExprFallback` interprets just that sub-expression into a VM
+register; the rest of the statement stays compiled. Wired into the
+ident_lookup, Expr_Call_impure, SystemCall_other and generic-expression bail
+sites.
+
+Scoping (all three restrictions are load-bearing; enabling the fallback
+everywhere failed 11 gate tests):
+- **Edge blocks only** (`allow_expr_fallback`, set at the edge-block compile
+  site). Comb entries build their wake-up graph from LoadSignal scans, so a
+  read hidden inside an interpreted fragment stops readers waking.
+- **No assignment patterns / named args** — they spread member-wise at the
+  statement level on the AST path; packing one to a value here changes NBA
+  semantics on unpacked structs.
+- **No sampled-value calls** (`$past`/`$rose`/`$fell`/`$stable`/...) — they
+  take their clock from the ENCLOSING block's inferred clocking, which an
+  isolated expression eval doesn't carry.
+- A block containing EvalExprFallback is never gateable (hidden reads would
+  break the no-data-change skip).
+
 ## Remaining fallback work, ranked by the customer run's table
 
 | reason               | count | total   | avg     | note |

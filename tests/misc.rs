@@ -198,3 +198,5 @@ mod xselect_and_concat_flatten;
 
 #[path = "misc/preprocessor_directives.rs"]
 mod preprocessor_directives;
+#[path = "misc/package_const_fn_params.rs"]
+mod package_const_fn_params;

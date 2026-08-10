@@ -129,6 +129,8 @@ mod procedural_loop_stall;
 mod pure_inline_loop_body;
 #[path = "scheduling/ranged_port_connections_and_nba_freeze.rs"]
 mod ranged_port_connections_and_nba_freeze;
+#[path = "scheduling/parallel_dispatch_expr_fallback.rs"]
+mod parallel_dispatch_expr_fallback;
 #[path = "scheduling/sampled_value_inferred_clock.rs"]
 mod sampled_value_inferred_clock;
 #[path = "scheduling/sequential_event_waits.rs"]
