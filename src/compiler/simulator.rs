@@ -77435,6 +77435,39 @@ impl Simulator {
     /// type_param_names picks the matching comma element of `sig`). E.g.
     /// `resource#(T)` where `T` is `config_db#(int)`'s own param → `int`.
     fn resolve_type_param_with(&self, tn: &str, spec: &Option<(String, String)>) -> Option<String> {
+        // When the ACTIVE specialization DIRECTLY declares `tn`, its sig
+        // argument is authoritative over an instance's cached binding. The
+        // cached `this.type_bindings` can be stale for a parameterized type
+        // built recursively: constructing `uvm_resource#(T)` inside
+        // `uvm_config_db_default_implementation_t#(T=uvm_bitstream_t)` came up
+        // with the OUTER instance bound as `T ->
+        // uvm_config_db_default_implementation_t#(uvm_bitstream_t)` (the
+        // full specialization) instead of `T -> uvm_bitstream_t`, so the
+        // child `uvm_resource` recorded the impl type and a `$cast` to
+        // `uvm_resource#(uvm_bitstream_t)` failed (any UVM_agent's `is_active`
+        // config read). Prefer the exact type argument of the active spec.
+        if let Some((base, sig)) = spec {
+            if let Some(cd) = self.get_class_def(base) {
+                // The sig fragment index for an INTERLEAVED type/value param
+                // list (`Mix #(int A, type T, int B)`) comes from the full
+                // `param_order`, not `type_param_names` (which would wrong-
+                // index `T` onto the `A` slot).
+                let order = if cd.param_order.is_empty() {
+                    cd.type_param_names.clone()
+                } else {
+                    cd.param_order.clone()
+                };
+                if let Some(idx) = order.iter().position(|p| p == tn) {
+                    let frags = Self::split_spec_args(sig);
+                    if let Some(v) = frags.get(idx) {
+                        let v = v.trim();
+                        if !v.is_empty() {
+                            return Some(v.to_string());
+                        }
+                    }
+                }
+            }
+        }
         if let Some(h) = self.this_stack.last().copied().flatten() {
             if let Some(c) = self
                 .heap

@@ -121,6 +121,8 @@ mod assoc_class_new_stores_instance;
 mod bare_method_call_returns;
 #[path = "misc/bare_randomize_solver.rs"]
 mod bare_randomize_solver;
+#[path = "misc/uvm_agent_active_config.rs"]
+mod uvm_agent_active_config;
 #[path = "misc/pattern_replication_and_extends_args.rs"]
 mod pattern_replication_and_extends_args;
 #[path = "misc/program_block_reactive.rs"]
