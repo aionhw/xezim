@@ -97,3 +97,6 @@ mod submodule_net_array_shapes;
 mod submodule_two_dim_array_element;
 #[path = "hierarchy/wildcard_import_shadow.rs"]
 mod wildcard_import_shadow;
+
+#[path = "hierarchy/nested_modules_and_zpad.rs"]
+mod nested_modules_and_zpad;

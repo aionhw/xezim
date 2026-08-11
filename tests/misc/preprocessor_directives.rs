@@ -172,3 +172,34 @@ endmodule
         lines(&sim)
     );
 }
+
+/// K-A: an EMPTY (or omitted) actual with no default substitutes NOTHING
+/// (§22.5.1) — the formal name must not survive into the body. Previously
+/// `F(1,)` of body `a b` expanded to `1 b` (a parse error) and `` `"b`" ``
+/// stringified the formal's own name. Reference-validated: b=[] and x1=1.
+/// An empty actual WITH a default still takes the default (emptydef=115a,
+/// also reference-validated).
+#[test]
+fn empty_macro_argument_substitutes_nothing() {
+    let src = r#"
+`define EMPTYARG(a, b) $display("T|a=[%0d] b=[%s]", a, `"b`")
+`define H(a, b) int x``a = 1 b;
+`define D(a, b = 8'h5A) {a, b}
+module tb;
+  `H(1, )
+  `H(2, +41)
+  logic [15:0] r;
+  initial begin
+    `EMPTYARG(1, );
+    $display("T|x1=%0d x2=%0d", x1, x2);
+    r = `D(8'h11, );
+    $display("T|emptydef=%h", r);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    let l = lines(&sim);
+    assert!(l.iter().any(|m| m == "T|a=[1] b=[]"), "empty arg stringifies empty: {:?}", l);
+    assert!(l.iter().any(|m| m == "T|x1=1 x2=42"), "empty arg substitutes nothing: {:?}", l);
+    assert!(l.iter().any(|m| m == "T|emptydef=115a"), "empty arg with default takes it: {:?}", l);
+}
