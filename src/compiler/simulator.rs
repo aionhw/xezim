@@ -508,7 +508,7 @@ macro_rules! write_sig {
                     && $self.warn_x_seen.borrow_mut().insert(__wsig_id)
                 {
                     let __xt = $self.time;
-                    let __xp = $self.current_pid;
+                    let __xp = $self.proc.current_pid;
                     $self
                         .warn_x_pending
                         .borrow_mut()
@@ -2717,6 +2717,50 @@ struct OopState {
     method_local_base: Vec<usize>,
 }
 
+/// Process control & scheduling state — PID allocation, per-process execution
+/// contexts, join/await/condition waiters, suspended processes, and named-block
+/// disable bookkeeping. Grouped here (Step 11 of the codebase rework) so the
+/// process scheduler can be extracted to its own module (`simulator/process.rs`).
+struct ProcessState {
+    /// Monotonic PID allocator.
+    next_pid: usize,
+    /// PID of the scheduled process currently running (0 = none).
+    current_pid: usize,
+    /// Processes waiting for join
+    join_waiters: Vec<JoinWaiter>,
+    /// Map from child PID -> parent PID
+    process_parents: HashMap<usize, usize>,
+    /// Per-process execution context for scheduled class/task processes.
+    process_contexts: HashMap<usize, ProcessContext>,
+    /// Instance scope (e.g. `"TB.p1"`) for a scheduled process.
+    process_scope_hint: HashMap<usize, String>,
+    /// Set when `exec_statement`'s Wait handler parks the process via
+    /// `exec_park_cont`. Must propagate through method-frame save/restore.
+    parked_from_exec: bool,
+    /// When `exec_statement` encounters a blocking `wait(cond)` with a
+    /// FALSE condition it cannot park directly; the scheduler seeds this.
+    exec_park_cont: Option<ProcCont>,
+    /// SV-2023: target named block for `disable <name>` propagation.
+    disable_target: Option<String>,
+    /// Label of a process-level named block -> its pid, for `disable <name>`.
+    disable_labels: HashMap<String, usize>,
+    /// A named `fork : blk ... join*` maps to the processes it spawned.
+    fork_block_children: HashMap<String, HashSet<usize>>,
+    /// PIDs killed by `disable fork` — skip dispatch on these.
+    killed_pids: HashSet<usize>,
+    /// §9.7 `process`: PIDs suspended via `suspend()`.
+    suspended_pids: HashSet<usize>,
+    /// §9.7: detailed resumption info for each suspended pid.
+    suspended_proc_info: HashMap<usize, SuspendedProc>,
+    /// §9.7 `process::await()`: processes waiting for another's termination.
+    await_waiters: Vec<AwaitWaiter>,
+    /// `wait(expr)` whose condition references no signals — parks here and is
+    /// re-checked in a same-time fixpoint until the condition flips.
+    condition_waiters: Vec<(usize, ProcCont)>,
+    /// §4.4.2.3 Inactive region: `#0` delay continuations park here.
+    inactive_queue: Vec<(usize, ProcCont)>,
+}
+
 pub struct Simulator {
     pub signals: HashMap<String, Value>,
     /// Signals currently under force/release control (LRM §9.3.1).
@@ -3107,6 +3151,8 @@ pub struct Simulator {
     dpi_unresolved: HashSet<String>,
     /// Grouped OOP/class-heap runtime state (Step 12).
     oop: OopState,
+    /// Grouped process control & scheduling state (Step 11).
+    proc: ProcessState,
     /// Memo for transitive blocking-task detection (pure-LRM mode only): maps a
     /// subroutine name to whether its body — following calls — eventually hits a
     /// blocking construct (`#`/`@`/`wait`/`fork…join[_any]`). Lets a task that
@@ -3278,17 +3324,6 @@ pub struct Simulator {
     local_stack: Vec<HashMap<String, Value>>,
     /// Current covergroup instance if in sampling context.
     cg_this: Option<usize>,
-    /// Processes waiting for join
-    join_waiters: Vec<JoinWaiter>,
-    /// Map from child PID -> parent PID
-    process_parents: HashMap<usize, usize>,
-    /// Per-process execution context for scheduled class/task processes.
-    process_contexts: HashMap<usize, ProcessContext>,
-    /// Instance scope (e.g. `"TB.p1"`) for a scheduled process, set from the
-    /// originating initial block. `run_scheduled_process` installs it as the
-    /// name-resolution hint so AST-evaluated bare names in a multiply-
-    /// instantiated module resolve to THIS instance's signals.
-    process_scope_hint: HashMap<usize, String>,
     /// §21.2.1.7 `%m`: label of a named `initial begin : lbl` / `always
     /// begin : lbl`, per pid. The scheduler FLATTENS a process's outermost
     /// `begin`/`end` into its statement stream (see `run_process_stmts`), so
@@ -3603,8 +3638,6 @@ pub struct Simulator {
     /// Dynamic-delay simple assignments, keyed by their scheduled process id.
     fast_delay_always: HashMap<usize, FastDelayAlways>,
     event_queue: TimingWheel,
-    next_pid: usize,
-    current_pid: usize,
     /// Value that `$` resolves to in the current evaluation scope
     /// (e.g. queue upper bound during `q[a:$]`). Stack of overrides.
     dollar_bound: Vec<i64>,
@@ -3618,25 +3651,6 @@ pub struct Simulator {
     /// continuation.
     return_flag: bool,
     rs_return_flag: bool,
-    /// Set when `exec_statement`'s Wait handler parks the process via
-    /// `exec_park_cont`. Must propagate through method-frame save/restore.
-    parked_from_exec: bool,
-    /// When `exec_statement` encounters a blocking `wait(cond)` with a
-    /// FALSE condition inside a loop body (foreach/while/for), it cannot park
-    /// (it has no continuation). `run_process_stmts` sets this to the full
-    /// continuation `[stmt, stmts[i+1..]]` before calling `exec_statement`, and
-    /// `exec_statement`'s Wait handler reads it to park the process.
-    exec_park_cont: Option<ProcCont>,
-    /// SV-2023: target named block for `disable <name>` propagation.
-    disable_target: Option<String>,
-    /// Label of a process-level named block (`initial begin : worker`) -> its
-    /// pid, so `disable worker` from another process can terminate it.
-    disable_labels: HashMap<String, usize>,
-    /// A named `fork : blk ... join*` maps to the processes it spawned, so
-    /// `disable blk` can terminate them (§9.6.2). Without this, disabling a
-    /// join_none fork block — which has already returned — unwound the
-    /// DISABLING process instead, dropping its continuation.
-    fork_block_children: HashMap<String, HashSet<usize>>,
     /// Associative arrays already warned about an x/z index.
     warned_assoc_index: HashSet<String>,
     /// `#delay` sites already warned about a pathological (non-finite / absurdly
@@ -3649,15 +3663,6 @@ pub struct Simulator {
     /// clock's phase is fixed). Guards the one-shot re-park against a genuine
     /// zero-period loop re-parking forever at t=0.
     t0_delay_deferred: HashSet<usize>,
-    /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
-    killed_pids: HashSet<usize>,
-    /// §9.7 `process` class: PIDs explicitly suspended via `suspend()`. The
-    /// continuation + original delay info is in `suspended_proc_info`.
-    suspended_pids: HashSet<usize>,
-    /// §9.7: detailed resumption info for each suspended pid.
-    suspended_proc_info: HashMap<usize, SuspendedProc>,
-    /// §9.7 `process::await()`: processes waiting for another's termination.
-    await_waiters: Vec<AwaitWaiter>,
     /// Names of init-declared (automatic) `for`-loop variables that — because
     /// the enclosing process had no local frame — currently live in the signal
     /// table. A `fork` child must capture these BY VALUE at fork time so the
@@ -3681,24 +3686,6 @@ pub struct Simulator {
     /// `ScopePop` sentinel pops and replays the top entry. Per-process (carried
     /// in ProcessContext across suspension).
     task_cleanup: Vec<TaskCleanup>,
-    /// `wait(expr)` whose condition references no signals — it depends on class
-    /// members / locals another same-time process mutates.
-    /// Such a process parks here
-    /// (pid + continuation whose first stmt is the Wait) and is re-checked in a
-    /// fixpoint after the same-time batch drains, suspending until the
-    /// condition genuinely flips instead of falsely proceeding.
-    condition_waiters: Vec<(usize, ProcCont)>,
-    /// IEEE 1800-2017 §4.4.2.3 Inactive region: continuations of `#0`
-    /// delays park here instead of in the event_queue. The event_queue's
-    /// batch drain in `run_one_tick` re-fetches same-time entries into the
-    /// SAME active pass (before `apply_nba`), so scheduling a `#0`
-    /// continuation there made it resume BEFORE the NBA region committed —
-    /// an NBA posted before the `#0` was invisible after it. Commercial
-    /// simulators (VCS / Riviera) all make an NBA posted before a
-    /// `#0` visible after it, so entries parked here are promoted back into
-    /// the event queue only at the END of the current tick, after
-    /// `apply_nba` has run (see `promote_inactive_to_active`).
-    inactive_queue: Vec<(usize, ProcCont)>,
     /// Bumped whenever a `wait(expr)` condition evaluates true (a parked waiter
     /// proceeds). The condition-waiter fixpoint uses it to detect "no progress
     /// this round" and stop (genuine stall).
@@ -6481,10 +6468,25 @@ impl Simulator {
             assertion_stats: HashMap::default(),
             local_stack: vec![],
             cg_this: None,
-            join_waiters: Vec::new(),
-            process_parents: HashMap::default(),
-            process_contexts: HashMap::default(),
-            process_scope_hint: HashMap::default(),
+            proc: ProcessState {
+                next_pid: 0,
+                current_pid: 0,
+                join_waiters: Vec::new(),
+                process_parents: HashMap::default(),
+                process_contexts: HashMap::default(),
+                process_scope_hint: HashMap::default(),
+                parked_from_exec: false,
+                exec_park_cont: None,
+                disable_target: None,
+                disable_labels: HashMap::default(),
+                fork_block_children: HashMap::default(),
+                killed_pids: HashSet::default(),
+                suspended_pids: HashSet::default(),
+                suspended_proc_info: HashMap::default(),
+                await_waiters: Vec::new(),
+                condition_waiters: Vec::new(),
+                inactive_queue: Vec::new(),
+            },
             process_m_label: HashMap::default(),
             process_origin: HashMap::default(),
             timescale_scope_override: None,
@@ -6559,31 +6561,18 @@ impl Simulator {
             clock_generators: Vec::new(),
             fast_delay_always: HashMap::default(),
             event_queue: TimingWheel::new(),
-            next_pid: 0,
-            current_pid: 0,
             dollar_bound: Vec::new(),
             break_flag: false,
             continue_flag: false,
             return_flag: false,
             rs_return_flag: false,
-            parked_from_exec: false,
-            exec_park_cont: None,
-            disable_target: None,
-            disable_labels: HashMap::default(),
-            fork_block_children: HashMap::default(),
             warned_assoc_index: HashSet::default(),
             warned_delay_spikes: HashSet::default(),
             t0_delay_deferred: HashSet::default(),
-            killed_pids: HashSet::default(),
-            suspended_pids: HashSet::default(),
-            suspended_proc_info: HashMap::default(),
-            await_waiters: Vec::new(),
             auto_loop_vars: Vec::new(),
             ref_binding_stack: Vec::new(),
             ref_alias_stack: Vec::new(),
             task_cleanup: Vec::new(),
-            condition_waiters: Vec::new(),
-            inactive_queue: Vec::new(),
             cond_progress: 0,
             real_time: 0.0,
             mailbox_get_waiters: HashMap::default(),
@@ -10938,14 +10927,14 @@ impl Simulator {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
                 other => vec![Statement::new(other, span)],
             };
-            let pid = self.next_pid;
-            self.next_pid += 1;
+            let pid = self.proc.next_pid;
+            self.proc.next_pid += 1;
             // §6.21: an instance-scoped static initializer (deferred by
             // `defer_static_syscall_inits`) needs the same name-resolution
             // hint initial blocks get, so bare names, module-level function
             // calls and `%m` resolve in the DECLARING instance's scope.
             if !ib.scope.is_empty() {
-                self.process_scope_hint.insert(pid, ib.scope);
+                self.proc.process_scope_hint.insert(pid, ib.scope);
             }
             self.process_origin
                 .insert(pid, (span, "static initializer"));
@@ -10994,17 +10983,17 @@ impl Simulator {
                 self.clock_generators.push(cg);
                 continue;
             }
-            let pid = self.next_pid;
-            self.next_pid += 1;
+            let pid = self.proc.next_pid;
+            self.proc.next_pid += 1;
             if !scope.is_empty() {
-                self.process_scope_hint.insert(pid, scope);
+                self.proc.process_scope_hint.insert(pid, scope);
             }
             self.process_origin.insert(pid, (span, "initial block"));
             if let Some(l) = block_label {
                 // The outermost `begin/end` is flattened away below, so keep
                 // the label for `%m` here — see `process_m_label`.
                 self.process_m_label.insert(pid, l.clone());
-                self.disable_labels.insert(l, pid);
+                self.proc.disable_labels.insert(l, pid);
             }
             self.event_queue.schedule(0, pid, stmts.into());
         }
@@ -14032,12 +14021,12 @@ impl Simulator {
                     StatementKind::SeqBlock { stmts, .. } => stmts,
                     other => vec![Statement::new(other, fb.stmt.span)],
                 };
-                let pid = self.next_pid;
-                self.next_pid += 1;
+                let pid = self.proc.next_pid;
+                self.proc.next_pid += 1;
                 // A submodule's final must resolve names, %m, and $time/%t
                 // under ITS instance scope, like initial blocks do.
                 if !fb.scope.is_empty() {
-                    self.process_scope_hint.insert(pid, fb.scope.clone());
+                    self.proc.process_scope_hint.insert(pid, fb.scope.clone());
                     self.current_scope = fb.scope.clone();
                 } else {
                     self.current_scope.clear();
@@ -14786,10 +14775,10 @@ impl Simulator {
                     _ => false,
                 };
                 if simple_retained_assign {
-                    let pid = self.next_pid;
-                    self.next_pid += 1;
+                    let pid = self.proc.next_pid;
+                    self.proc.next_pid += 1;
                     if !ab.scope.is_empty() {
-                        self.process_scope_hint.insert(pid, ab.scope.clone());
+                        self.proc.process_scope_hint.insert(pid, ab.scope.clone());
                     }
                     self.process_origin
                         .insert(pid, (ab.stmt.span, "always block"));
@@ -14813,10 +14802,10 @@ impl Simulator {
                     },
                     ab.stmt.span,
                 );
-                let pid = self.next_pid;
-                self.next_pid += 1;
+                let pid = self.proc.next_pid;
+                self.proc.next_pid += 1;
                 if !ab.scope.is_empty() {
-                    self.process_scope_hint.insert(pid, ab.scope.clone());
+                    self.proc.process_scope_hint.insert(pid, ab.scope.clone());
                 }
                 self.process_origin
                     .insert(pid, (ab.stmt.span, "always block"));
@@ -14830,10 +14819,10 @@ impl Simulator {
                     },
                     ab.stmt.span,
                 );
-                let pid = self.next_pid;
-                self.next_pid += 1;
+                let pid = self.proc.next_pid;
+                self.proc.next_pid += 1;
                 if !ab.scope.is_empty() {
-                    self.process_scope_hint.insert(pid, ab.scope.clone());
+                    self.proc.process_scope_hint.insert(pid, ab.scope.clone());
                 }
                 self.process_origin
                     .insert(pid, (ab.stmt.span, "always block"));
@@ -15030,7 +15019,7 @@ impl Simulator {
                 let Some(fast) = self.fast_delay_always.get(&pid) else {
                     continue;
                 };
-                let scope_hint = self.process_scope_hint.get(&pid).cloned();
+                let scope_hint = self.proc.process_scope_hint.get(&pid).cloned();
                 let mut compiler = BytecodeCompiler::new(
                     &self.signal_name_to_id,
                     &self.signal_signed,
@@ -15066,7 +15055,7 @@ impl Simulator {
                     &self.widths,
                 );
                 delay_compiler.set_ast_fallback(false);
-                delay_compiler.set_scope_hint(self.process_scope_hint.get(&pid).cloned());
+                delay_compiler.set_scope_hint(self.proc.process_scope_hint.get(&pid).cloned());
                 delay_compiler.set_tasks(&self.module.tasks);
                 delay_compiler.set_functions(&self.module.functions);
                 delay_compiler.set_params(&self.module.parameters);
@@ -22828,7 +22817,7 @@ impl Simulator {
     /// ends by --max-time without $finish, and (abbreviated) with
     /// XEZIM_PROGRESS ticks.
     fn report_parked_waiters(&mut self, max_n: usize) {
-        if self.event_waiters.is_empty() && self.condition_waiters.is_empty() {
+        if self.event_waiters.is_empty() && self.proc.condition_waiters.is_empty() {
             return;
         }
         let mut order: Vec<usize> = (0..self.event_waiters.len()).collect();
@@ -22836,7 +22825,7 @@ impl Simulator {
         eprintln!(
             "[xezim][hang-report] {} event waiter(s), {} condition waiter(s) parked at sim time {}; oldest first:",
             self.event_waiters.len(),
-            self.condition_waiters.len(),
+            self.proc.condition_waiters.len(),
             self.time
         );
         for &i in order.iter().take(max_n) {
@@ -22898,7 +22887,7 @@ impl Simulator {
                 self.describe_driver_chain(d, 5, 4, &mut visited);
             }
         }
-        for (pid, cont) in self.condition_waiters.iter().take(max_n) {
+        for (pid, cont) in self.proc.condition_waiters.iter().take(max_n) {
             let loc = cont
                 .first()
                 .and_then(|st| self.span_file_line_in(st.span, None))
@@ -23121,10 +23110,10 @@ impl Simulator {
     /// commercial consensus (VCS / Riviera): an NBA posted before
     /// a `#0` is visible after it in the same time slot.
     fn promote_inactive_to_active(&mut self) -> bool {
-        if self.inactive_queue.is_empty() {
+        if self.proc.inactive_queue.is_empty() {
             return false;
         }
-        let moved = std::mem::take(&mut self.inactive_queue);
+        let moved = std::mem::take(&mut self.proc.inactive_queue);
         for (pid, cont) in moved {
             self.event_queue.schedule(self.time, pid, cont);
         }
@@ -23158,9 +23147,9 @@ impl Simulator {
     /// checker/BFM divergence shape of the rptr race-through report).
     fn drain_inactive_pre_nba(&mut self) {
         let mut fuel = 1000u32;
-        while !self.inactive_queue.is_empty() && fuel > 0 {
+        while !self.proc.inactive_queue.is_empty() && fuel > 0 {
             fuel -= 1;
-            let moved = std::mem::take(&mut self.inactive_queue);
+            let moved = std::mem::take(&mut self.proc.inactive_queue);
             for (pid, cont) in moved {
                 if self.finished {
                     return;
@@ -23335,7 +23324,7 @@ impl Simulator {
                 line.push_str(&loc);
             }
         }
-        match self.process_scope_hint.get(&pid) {
+        match self.proc.process_scope_hint.get(&pid) {
             Some(s) if !s.is_empty() => {
                 let s = s.clone();
                 let def_mod = self
@@ -23389,7 +23378,7 @@ impl Simulator {
         for (p, c) in stuck {
             self.event_queue.schedule(ft, p, c);
         }
-        let inact = std::mem::take(&mut self.inactive_queue);
+        let inact = std::mem::take(&mut self.proc.inactive_queue);
         for (p, c) in inact {
             self.event_queue.schedule(ft, p, c);
         }
@@ -23547,7 +23536,7 @@ impl Simulator {
                 .event_waiters
                 .iter()
                 .map(|w| w.pid)
-                .chain(self.condition_waiters.iter().map(|(p, _)| *p))
+                .chain(self.proc.condition_waiters.iter().map(|(p, _)| *p))
                 .collect();
             for pid in waiter_pids {
                 if spinner.contains(&pid) || !seen.insert(pid) {
@@ -23600,7 +23589,7 @@ impl Simulator {
     /// The module whose definition `pid`'s originating block was written in,
     /// via the same scope→instance lookup as `stall_pid_src_file`.
     fn stall_pid_def_module(&self, pid: usize) -> Option<String> {
-        self.scope_def_module(self.process_scope_hint.get(&pid).map(String::as_str))
+        self.scope_def_module(self.proc.process_scope_hint.get(&pid).map(String::as_str))
     }
 
     /// The module DEFINING the instance at `scope` (empty/None = the top
@@ -23774,7 +23763,7 @@ impl Simulator {
         // re-arms it (a `forever`/`always` body), so classify that first to
         // recover the actual delay expression (`#(p/2) — currently 0`);
         // degrade to the plain form when the continuation says nothing.
-        if let Some((_, cont)) = self.inactive_queue.iter().find(|(p, _)| *p == pid) {
+        if let Some((_, cont)) = self.proc.inactive_queue.iter().find(|(p, _)| *p == pid) {
             let cont = cont.clone();
             if let Some(r) = self.classify_stall_stmts(&cont.to_vec(), 0, src_file) {
                 // Being parked here PROVES the re-arm was a zero delay; take
@@ -23805,7 +23794,7 @@ impl Simulator {
             ));
         }
         // Blocked on a signal-less `wait (cond)` (condition-waiter fixpoint).
-        if let Some((_, cont)) = self.condition_waiters.iter().find(|(p, _)| *p == pid) {
+        if let Some((_, cont)) = self.proc.condition_waiters.iter().find(|(p, _)| *p == pid) {
             let cont = cont.clone();
             return self.classify_stall_stmts(&cont.to_vec(), 0, src_file);
         }
@@ -24146,14 +24135,14 @@ impl Simulator {
         // when a full round advances no waiter (the rest are waiting on a
         // future-time change).
         let mut guard = 0u32;
-        while !self.condition_waiters.is_empty() && !self.finished && !self.zero_delay_defer_pending
+        while !self.proc.condition_waiters.is_empty() && !self.finished && !self.zero_delay_defer_pending
         {
             guard += 1;
             if guard > 10000 {
                 break;
             }
             let prog_before = self.cond_progress;
-            let parked = std::mem::take(&mut self.condition_waiters);
+            let parked = std::mem::take(&mut self.proc.condition_waiters);
             for (cpid, cont) in parked {
                 self.event_queue.schedule(self.time, cpid, cont);
             }
@@ -25972,9 +25961,9 @@ impl Simulator {
             && !ctx.return_flag
             && ctx.local_dyn.is_empty()
         {
-            self.process_contexts.remove(&pid);
+            self.proc.process_contexts.remove(&pid);
         } else {
-            self.process_contexts.insert(pid, ctx);
+            self.proc.process_contexts.insert(pid, ctx);
         }
     }
 
@@ -26025,7 +26014,7 @@ impl Simulator {
             && !ctx.return_flag
             && ctx.local_dyn.is_empty();
         if trivial {
-            self.process_contexts.remove(&pid);
+            self.proc.process_contexts.remove(&pid);
         } else {
             // §9.3.2 baseline: snapshot the child's local frames as forked so
             // `propagate_fork_locals_to_parent` can merge only the keys the
@@ -26034,7 +26023,7 @@ impl Simulator {
             // mailbox-get delivery into `phase` while this child runs).
             self.fork_baselines.insert(pid, ctx.local_stack.clone());
             self.fork_signal_captures.insert(pid, signal_caps);
-            self.process_contexts.insert(pid, ctx);
+            self.proc.process_contexts.insert(pid, ctx);
         }
     }
 
@@ -26042,7 +26031,7 @@ impl Simulator {
     /// Used when a task-internal `#delay` needs to yield the simulator so
     /// concurrent processes can advance while this task sleeps.
     fn run_events_until(&mut self, target: u64) {
-        let saved_pid = self.current_pid;
+        let saved_pid = self.proc.current_pid;
         let saved_break = self.break_flag;
         let saved_return = self.return_flag;
         // §4.4.2.3: `#0` continuations parked by earlier same-batch
@@ -26135,7 +26124,7 @@ impl Simulator {
             // values, same ordering as the run_one_tick path.
             self.promote_inactive_to_active();
         }
-        self.current_pid = saved_pid;
+        self.proc.current_pid = saved_pid;
         self.break_flag = saved_break;
         self.return_flag = saved_return;
     }
@@ -26147,7 +26136,7 @@ impl Simulator {
     /// testbench loop var `c` shadow-resolve to the DUT instance's `c`,
     /// and the per-node cache froze it: the loop never terminated.
     fn reset_hint_to_process_scope(&self) {
-        let h = self.process_scope_hint.get(&self.current_pid);
+        let h = self.proc.process_scope_hint.get(&self.proc.current_pid);
         let mut cur = self.name_resolve_hint.borrow_mut();
         if cur.as_deref() != h.map(|s| s.as_str()) {
             *cur = h.cloned();
@@ -26258,13 +26247,13 @@ impl Simulator {
         self.break_flag = false;
         self.return_flag = false;
         self.continue_flag = false;
-        self.parked_from_exec = false;
+        self.proc.parked_from_exec = false;
         // A process terminated by `disable fork` (LRM §9.6.2) must not run any
         // remaining queued continuation (e.g. the resume of a `#delay` it was
         // parked on when killed). Pids are monotonic and never reused, so it is
         // safe to leave the entry in `killed_pids` permanently. This is the one
         // chokepoint every dispatch site funnels through.
-        if self.killed_pids.contains(&pid) {
+        if self.proc.killed_pids.contains(&pid) {
             return;
         }
         // A freshly-activated scheduled process must resolve unqualified names
@@ -26290,7 +26279,7 @@ impl Simulator {
         // resolution hint so AST-evaluated bare names — e.g. a
         // `std::randomize(sig)` target — resolve to THIS instance's signals in
         // a multiply-instantiated module, not the first instance's.
-        if let Some(scope) = self.process_scope_hint.get(&pid).cloned() {
+        if let Some(scope) = self.proc.process_scope_hint.get(&pid).cloned() {
             *self.name_resolve_hint.borrow_mut() = Some(scope.clone());
             self.current_scope = scope;
         } else {
@@ -26320,7 +26309,7 @@ impl Simulator {
         let saved_ctx_needed = !self.oop.this_stack.is_empty()
             || !self.local_stack.is_empty()
             || !self.oop.class_context_stack.is_empty();
-        let has_pid_ctx = self.process_contexts.contains_key(&pid);
+        let has_pid_ctx = self.proc.process_contexts.contains_key(&pid);
         if !saved_ctx_needed && !has_pid_ctx {
             self.run_process_payload(pid, stmts);
             let susp = self.is_pid_suspended(pid);
@@ -26330,7 +26319,7 @@ impl Simulator {
                     || !self.local_stack.is_empty()
                     || !self.oop.class_context_stack.is_empty()
                 {
-                    self.process_contexts
+                    self.proc.process_contexts
                         .insert(pid, self.snapshot_process_context());
                 }
             }
@@ -26339,14 +26328,14 @@ impl Simulator {
             return;
         }
         let mut saved = self.snapshot_process_context();
-        let ctx = self.process_contexts.remove(&pid).unwrap_or_default();
+        let ctx = self.proc.process_contexts.remove(&pid).unwrap_or_default();
         self.restore_process_context(ctx);
         self.run_process_payload(pid, stmts);
         if self.is_pid_suspended(pid) {
-            self.process_contexts
+            self.proc.process_contexts
                 .insert(pid, self.snapshot_process_context());
         } else {
-            self.process_contexts.remove(&pid);
+            self.proc.process_contexts.remove(&pid);
         }
         // IEEE 1800-2023 §6.21/§9.3.2: automatic variables declared in the
         // parent scope are SHARED with fork children — a child's write must be
@@ -26368,9 +26357,9 @@ impl Simulator {
         let baseline = self.fork_baselines.get(&pid).cloned();
         let signal_caps = self.fork_signal_captures.get(&pid).cloned();
         if !child_frames.is_empty() {
-            if let Some(parent_pid) = self.process_parents.get(&pid).copied() {
+            if let Some(parent_pid) = self.proc.process_parents.get(&pid).copied() {
                 // (a) subroutine-frame merge
-                if let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) {
+                if let Some(parent_ctx) = self.proc.process_contexts.get_mut(&parent_pid) {
                     Self::merge_fork_writes(
                         &mut parent_ctx.local_stack,
                         &child_frames,
@@ -26426,7 +26415,7 @@ impl Simulator {
     }
 
     fn run_fast_delay_always(&mut self, pid: usize) {
-        self.current_pid = pid;
+        self.proc.current_pid = pid;
 
         // Match run_process_stmts' per-process zero-delay protection. The
         // marker was removed from the timing wheel before dispatch, so park it
@@ -26495,11 +26484,11 @@ impl Simulator {
             // The delay may depend on a real continuous assignment that has
             // not settled yet. Re-evaluate once after the time-zero inactive
             // boundary before fixing the first clock phase.
-            self.inactive_queue.push((pid, ProcCont::empty()));
+            self.proc.inactive_queue.push((pid, ProcCont::empty()));
         } else {
             fast.execute_body = true;
             if delay == 0 {
-                self.inactive_queue.push((pid, ProcCont::empty()));
+                self.proc.inactive_queue.push((pid, ProcCont::empty()));
             } else {
                 self.event_queue
                     .schedule(self.time.saturating_add(delay), pid, Vec::new().into());
@@ -26721,7 +26710,7 @@ impl Simulator {
     /// in front of the caller's tail without copying that tail.
     fn run_process_stmts(&mut self, pid: usize, pc: &ProcCont) {
         let stmts: &[Statement] = pc.frame();
-        self.current_pid = pid;
+        self.proc.current_pid = pid;
         // Install THIS process's own instance scope as the resolution hint.
         // The hint is transient sibling-scope state: the previous process (or
         // a $display argument it evaluated) may have left its scope behind,
@@ -27548,7 +27537,7 @@ impl Simulator {
                             )];
                             // Chain the caller's tail rather than copying it (ProcCont::pushed).
                             let whole = pc.pushed(whole, pc.start + i + 1);
-                            self.inactive_queue.push((pid, whole));
+                            self.proc.inactive_queue.push((pid, whole));
                             return;
                         }
                         let mut cont = vec![*body.clone()];
@@ -27564,7 +27553,7 @@ impl Simulator {
                             // Commercial consensus (VCS/Riviera): it IS
                             // visible. Park here; run_one_tick promotes after
                             // the NBA region of this tick has been applied.
-                            self.inactive_queue.push((pid, cont));
+                            self.proc.inactive_queue.push((pid, cont));
                         } else {
                             self.event_queue.schedule(self.time + delay, pid, cont);
                         }
@@ -27741,7 +27730,7 @@ impl Simulator {
                     let mut cont = vec![stmt.clone()];
                     // Chain the caller's tail rather than copying it (ProcCont::pushed).
                     let cont = pc.pushed(cont, pc.start + i + 1);
-                    self.condition_waiters.push((pid, cont));
+                    self.proc.condition_waiters.push((pid, cont));
                     return;
                 }
             }
@@ -28171,14 +28160,14 @@ impl Simulator {
                 let (spawnable, saved_auto_len) = self.exec_fork_block_decls(sub_stmts);
                 let mut child_pids = HashSet::default();
                 for s in spawnable {
-                    let pid_child = self.next_pid;
-                    self.next_pid += 1;
-                    self.process_parents.insert(pid_child, pid);
+                    let pid_child = self.proc.next_pid;
+                    self.proc.next_pid += 1;
+                    self.proc.process_parents.insert(pid_child, pid);
                     // §9.3.2: a fork child executes in the forking process's
                     // scope, so it inherits the parent's instance-scope hint
                     // (additive — a child previously had none at all).
-                    if let Some(h) = self.process_scope_hint.get(&pid).cloned() {
-                        self.process_scope_hint.insert(pid_child, h);
+                    if let Some(h) = self.proc.process_scope_hint.get(&pid).cloned() {
+                        self.proc.process_scope_hint.insert(pid_child, h);
                     }
                     self.process_origin
                         .insert(pid_child, (s.span, "fork child"));
@@ -28190,7 +28179,7 @@ impl Simulator {
                     // the self-unwind path, and the child kept running — a
                     // later `wait fork` then blocked on it forever.
                     if let StatementKind::SeqBlock { name: Some(n), .. } = &s.kind {
-                        self.disable_labels.insert(n.name.clone(), pid_child);
+                        self.proc.disable_labels.insert(n.name.clone(), pid_child);
                     }
                     self.inherit_fork_child_context(pid_child);
                     // §9.4.5: a child that IS an intra-assignment delay
@@ -28225,7 +28214,7 @@ impl Simulator {
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
                 if let Some(nm) = block_name {
-                    self.fork_block_children
+                    self.proc.fork_block_children
                         .insert(nm.name.clone(), child_pids.clone());
                 }
 
@@ -28242,7 +28231,7 @@ impl Simulator {
                 } else {
                     // Suspend current process and wait for children
                     let cont = pc.resume_at(pc.start + i + 1);
-                    self.join_waiters.push(JoinWaiter {
+                    self.proc.join_waiters.push(JoinWaiter {
                         parent_pid: pid,
                         child_pids,
                         join_type: *join_type,
@@ -28454,7 +28443,7 @@ impl Simulator {
                 // remains for multi-variable / unhandled shapes that
                 // `foreach_materialize_keys_1d` declined.
                 if matches!(&stmt.kind, StatementKind::Foreach { .. }) {
-                    self.exec_park_cont = Some({
+                    self.proc.exec_park_cont = Some({
                         let mut c = vec![stmt.clone()];
                         // Chain the caller's tail rather than copying it (ProcCont::pushed).
                         let c = pc.pushed(c, pc.start + i + 1);
@@ -28462,8 +28451,8 @@ impl Simulator {
                     });
                 }
                 self.exec_statement(stmt);
-                self.exec_park_cont = None;
-                self.parked_from_exec = false;
+                self.proc.exec_park_cont = None;
+                self.proc.parked_from_exec = false;
             }
 
             // Check for WaitFork
@@ -28477,7 +28466,7 @@ impl Simulator {
                 // spawned by a child, which is exactly the shape UVM drivers
                 // use.
                 let children: HashSet<usize> = self
-                    .process_parents
+                    .proc.process_parents
                     .iter()
                     .filter(|&(_, &parent)| parent == pid)
                     .map(|(&child, _)| child)
@@ -28488,7 +28477,7 @@ impl Simulator {
                     continue;
                 } else {
                     let cont = pc.resume_at(pc.start + i + 1);
-                    self.join_waiters.push(JoinWaiter {
+                    self.proc.join_waiters.push(JoinWaiter {
                         parent_pid: pid,
                         child_pids: children,
                         join_type: JoinType::Join,
@@ -28934,7 +28923,7 @@ impl Simulator {
                                 },
                                 body.span,
                             )];
-                            self.inactive_queue.push((pid, pc.pushed(restart, resume_at)));
+                            self.proc.inactive_queue.push((pid, pc.pushed(restart, resume_at)));
                             return;
                         }
                         let mut cont = vec![*tbody.clone()];
@@ -28950,7 +28939,7 @@ impl Simulator {
                             // Inactive-region parking as the run_process_stmts
                             // Delay handler above: resume only after this
                             // tick's NBA region (commercial consensus).
-                            self.inactive_queue.push((pid, pc.pushed(cont, resume_at)));
+                            self.proc.inactive_queue.push((pid, pc.pushed(cont, resume_at)));
                         } else {
                             self.event_queue
                                 .schedule(self.time + delay, pid, pc.pushed(cont, resume_at));
@@ -46484,8 +46473,8 @@ impl Simulator {
                             },
                             stmt.span,
                         ));
-                        let child = self.next_pid;
-                        self.next_pid += 1;
+                        let child = self.proc.next_pid;
+                        self.proc.next_pid += 1;
                         self.process_origin
                             .insert(child, (stmt.span, "intra-assignment event NBA"));
                         self.event_queue.schedule(self.time, child, cont.into());
@@ -46976,7 +46965,7 @@ impl Simulator {
                     if self.break_flag {
                         // Keep the flag set while a `disable` unwinds to an
                         // enclosing named block.
-                        if self.disable_target.is_none() {
+                        if self.proc.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         break;
@@ -47705,7 +47694,7 @@ impl Simulator {
                     if self.break_flag {
                         // Keep the flag set while a `disable` unwinds to an
                         // enclosing named block.
-                        if self.disable_target.is_none() {
+                        if self.proc.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         break;
@@ -47729,7 +47718,7 @@ impl Simulator {
                     if self.break_flag {
                         // Keep the flag set while a `disable` unwinds to an
                         // enclosing named block.
-                        if self.disable_target.is_none() {
+                        if self.proc.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         break;
@@ -47754,7 +47743,7 @@ impl Simulator {
                     if self.break_flag {
                         // Keep the flag set while a `disable` unwinds to an
                         // enclosing named block.
-                        if self.disable_target.is_none() {
+                        if self.proc.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         break;
@@ -47783,7 +47772,7 @@ impl Simulator {
                     if self.break_flag {
                         // Keep the flag set while a `disable` unwinds to an
                         // enclosing named block.
-                        if self.disable_target.is_none() {
+                        if self.proc.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         break;
@@ -47836,9 +47825,9 @@ impl Simulator {
                 self.auto_loop_vars.truncate(seq_auto_len);
                 // A `disable` naming THIS block ends here; execution resumes
                 // after it (§9.6.2).
-                if let (Some(target), Some(n)) = (self.disable_target.as_deref(), name.as_ref()) {
+                if let (Some(target), Some(n)) = (self.proc.disable_target.as_deref(), name.as_ref()) {
                     if target == n.name {
-                        self.disable_target = None;
+                        self.proc.disable_target = None;
                         self.break_flag = false;
                         self.continue_flag = false;
                     }
@@ -47862,13 +47851,13 @@ impl Simulator {
                 let (spawnable, saved_auto_len) = self.exec_fork_block_decls(stmts);
                 let mut child_set = HashSet::default();
                 for s in spawnable {
-                    let pid = self.next_pid;
-                    self.next_pid += 1;
-                    self.process_parents.insert(pid, self.current_pid);
+                    let pid = self.proc.next_pid;
+                    self.proc.next_pid += 1;
+                    self.proc.process_parents.insert(pid, self.proc.current_pid);
                     // Same scope-hint inheritance as the run_process_stmts
                     // ParBlock arm — §9.3.2, additive.
-                    if let Some(h) = self.process_scope_hint.get(&self.current_pid).cloned() {
-                        self.process_scope_hint.insert(pid, h);
+                    if let Some(h) = self.proc.process_scope_hint.get(&self.proc.current_pid).cloned() {
+                        self.proc.process_scope_hint.insert(pid, h);
                     }
                     self.process_origin.insert(pid, (s.span, "fork child"));
                     self.inherit_fork_child_context(pid);
@@ -47877,7 +47866,7 @@ impl Simulator {
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
                 if let Some(nm) = block_name {
-                    self.fork_block_children
+                    self.proc.fork_block_children
                         .insert(nm.name.clone(), child_set.clone());
                 }
                 match join_type {
@@ -47886,8 +47875,8 @@ impl Simulator {
                     // An empty fork has no children to wait for, so it must NOT
                     // suspend — a childless waiter is never re-checked.
                     JoinType::Join | JoinType::JoinAny if !child_set.is_empty() => {
-                        self.join_waiters.push(JoinWaiter {
-                            parent_pid: self.current_pid,
+                        self.proc.join_waiters.push(JoinWaiter {
+                            parent_pid: self.proc.current_pid,
                             child_pids: child_set,
                             join_type: *join_type,
                             continuation: Vec::new().into(),
@@ -47986,7 +47975,7 @@ impl Simulator {
                         if let Some(fname) = self.event_control_field_name(e) {
                             if let Some(key) = self.resolve_this_event_field(&fname) {
                                 let cont = vec![*stmt.clone()];
-                                let pid = self.current_pid;
+                                let pid = self.proc.current_pid;
                                 self.instance_event_waiters.push(InstanceEventWaiter {
                                     key,
                                     pid,
@@ -48007,7 +47996,7 @@ impl Simulator {
                                 .or_else(|| self.expr_instance_event_field_general(&expr))
                             {
                                 let cont = vec![*stmt.clone()];
-                                let pid = self.current_pid;
+                                let pid = self.proc.current_pid;
                                 self.instance_event_waiters.push(InstanceEventWaiter {
                                     key,
                                     pid,
@@ -48021,7 +48010,7 @@ impl Simulator {
                         let is_clk_ev = self.is_clocking_event(e);
                         sim_dbg_eprintln!(
                             "[DEBUG] process {} waiting for event {:?} at time {}",
-                            self.current_pid,
+                            self.proc.current_pid,
                             sens,
                             self.time
                         );
@@ -48101,7 +48090,7 @@ impl Simulator {
                 // fork block has already returned, so trying to unwind to it
                 // below would run off the end of the disabling process and drop
                 // its continuation — which is exactly what used to happen.
-                if let Some(children) = self.fork_block_children.get(&name.name).cloned() {
+                if let Some(children) = self.proc.fork_block_children.get(&name.name).cloned() {
                     let mut to_kill: HashSet<usize> = HashSet::default();
                     for &c in &children {
                         to_kill.insert(c);
@@ -48110,11 +48099,11 @@ impl Simulator {
                     // If the disabling process is itself one of them (disabling
                     // the block it is currently inside), fall through to the
                     // unwind path rather than killing itself here.
-                    if !to_kill.contains(&self.current_pid) {
+                    if !to_kill.contains(&self.proc.current_pid) {
                         for &pid in &to_kill {
-                            self.killed_pids.insert(pid);
-                            self.process_parents.remove(&pid);
-                            self.process_contexts.remove(&pid);
+                            self.proc.killed_pids.insert(pid);
+                            self.proc.process_parents.remove(&pid);
+                            self.proc.process_contexts.remove(&pid);
                         }
                         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
                         self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
@@ -48130,11 +48119,11 @@ impl Simulator {
                 }
                 // A label naming ANOTHER process's top-level block terminates
                 // that process; the disabling process carries on.
-                if let Some(&pid) = self.disable_labels.get(&name.name) {
-                    if pid != self.current_pid {
-                        self.killed_pids.insert(pid);
-                        self.process_parents.remove(&pid);
-                        self.process_contexts.remove(&pid);
+                if let Some(&pid) = self.proc.disable_labels.get(&name.name) {
+                    if pid != self.proc.current_pid {
+                        self.proc.killed_pids.insert(pid);
+                        self.proc.process_parents.remove(&pid);
+                        self.proc.process_contexts.remove(&pid);
                         self.event_waiters.retain(|w| w.pid != pid);
                         self.instance_event_waiters.retain(|w| w.pid != pid);
                         for q in self.mailbox_get_waiters.values_mut() {
@@ -48157,13 +48146,13 @@ impl Simulator {
                 if let Some(pids) = self.active_task_pids.get(&name.name).cloned() {
                     let to_kill: HashSet<usize> = pids
                         .into_iter()
-                        .filter(|&p| p != self.current_pid && !self.killed_pids.contains(&p))
+                        .filter(|&p| p != self.proc.current_pid && !self.proc.killed_pids.contains(&p))
                         .collect();
                     if !to_kill.is_empty() {
                         for &pid in &to_kill {
-                            self.killed_pids.insert(pid);
-                            self.process_parents.remove(&pid);
-                            self.process_contexts.remove(&pid);
+                            self.proc.killed_pids.insert(pid);
+                            self.proc.process_parents.remove(&pid);
+                            self.proc.process_contexts.remove(&pid);
                         }
                         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
                         self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
@@ -48187,21 +48176,21 @@ impl Simulator {
                 // flags when it sees its own name, so execution resumes after
                 // it. For a loop-body block that is `continue`; for a block
                 // enclosing the loop it is `break`.
-                self.disable_target = Some(name.name.clone());
+                self.proc.disable_target = Some(name.name.clone());
                 self.break_flag = true;
             }
             StatementKind::DisableFork => {
                 // LRM §9.6.2: terminate all active descendant processes of the
                 // calling process (children AND their descendants), then return.
-                let cur = self.current_pid;
+                let cur = self.proc.current_pid;
                 let to_kill = self.collect_fork_descendants(cur);
                 for &pid in &to_kill {
                     // Mark killed so any already-queued continuation is dropped
                     // at dispatch, and purge every place the process can be
                     // parked so it never resumes and never satisfies a join.
-                    self.killed_pids.insert(pid);
-                    self.process_parents.remove(&pid);
-                    self.process_contexts.remove(&pid);
+                    self.proc.killed_pids.insert(pid);
+                    self.proc.process_parents.remove(&pid);
+                    self.proc.process_contexts.remove(&pid);
                     // §9.6.2: also purge every FUTURE-time `#delay` the killed
                     // process had parked in the timing wheel, or the wheel's
                     // `next_time`/`is_empty` would keep reporting activity and
@@ -48251,9 +48240,9 @@ impl Simulator {
                     // But `run_process_stmts` may have set `exec_park_cont` to
                     // the full continuation. If so, park the process and set
                     // return_flag to unwind all the way back to run_process_stmts.
-                    if let Some(cont) = self.exec_park_cont.take() {
-                        self.condition_waiters.push((self.current_pid, cont));
-                        self.parked_from_exec = true;
+                    if let Some(cont) = self.proc.exec_park_cont.take() {
+                        self.proc.condition_waiters.push((self.proc.current_pid, cont));
+                        self.proc.parked_from_exec = true;
                         self.return_flag = true;
                         self.break_flag = true;
                     }
@@ -50702,7 +50691,7 @@ impl Simulator {
             return; // repeat use: skip span resolution entirely
         }
         let loc = args.first().and_then(|a| {
-            let sf = self.stall_pid_src_file(self.current_pid);
+            let sf = self.stall_pid_src_file(self.proc.current_pid);
             self.span_file_line_in(a.span, sf)
         });
         let msg = match loc {
@@ -50763,8 +50752,8 @@ impl Simulator {
                     // Prefix the caller's own instance scope for a relative
                     // path ($printtimescale(m1) inside tb_top.sub).
                     let hint = self
-                        .process_scope_hint
-                        .get(&self.current_pid)
+                        .proc.process_scope_hint
+                        .get(&self.proc.current_pid)
                         .cloned()
                         .unwrap_or_default();
                     let candidates = if hint.is_empty() {
@@ -50797,7 +50786,7 @@ impl Simulator {
                 } else {
                     let def = self.current_module_def().to_string();
                     let (u, p) = self.reported_timescale_exp(&def);
-                    let scope = match self.process_scope_hint.get(&self.current_pid) {
+                    let scope = match self.proc.process_scope_hint.get(&self.proc.current_pid) {
                         Some(s) if !s.is_empty() => {
                             format!("{}.{}", self.module.name, s)
                         }
@@ -51444,7 +51433,7 @@ impl Simulator {
     /// context line of §20.10 severity messages and §20.17.2 `$stacktrace`.
     /// Mirrors the resolution used by `$printtimescale`.
     fn severity_scope(&self) -> String {
-        match self.process_scope_hint.get(&self.current_pid) {
+        match self.proc.process_scope_hint.get(&self.proc.current_pid) {
             Some(s) if !s.is_empty() => format!("{}.{}", self.module.name, s),
             _ => self.module.name.clone(),
         }
@@ -52493,7 +52482,7 @@ impl Simulator {
                                 // named from its DECLARING scope, not the
                                 // caller's block.
                                 if self.func_call_stack.is_empty() {
-                                    if let Some(l) = self.process_m_label.get(&self.current_pid) {
+                                    if let Some(l) = self.process_m_label.get(&self.proc.current_pid) {
                                         out.push('.');
                                         out.push_str(l);
                                     }
@@ -52805,8 +52794,8 @@ impl Simulator {
         // module-top and program-top behavior identical. Allocate a fresh pid
         // so process-scoped bookkeeping (disable labels, scope hints) has
         // somewhere to attach.
-        let pid = self.next_pid;
-        self.next_pid += 1;
+        let pid = self.proc.next_pid;
+        self.proc.next_pid += 1;
         if let Some(first) = stmts.first() {
             self.process_origin
                 .insert(pid, (first.span, "program initial block"));
@@ -54637,7 +54626,7 @@ impl Simulator {
         let _ = v.set_inline_bits(nv, nx);
         self.warn_x_pending
             .borrow_mut()
-            .push((id, self.time, v, self.current_pid, None));
+            .push((id, self.time, v, self.proc.current_pid, None));
     }
 
     /// Record a fresh x on a value stored by NAME rather than by signal id —
@@ -54666,7 +54655,7 @@ impl Simulator {
             usize::MAX,
             self.time,
             new.clone(),
-            self.current_pid,
+            self.proc.current_pid,
             Some(name.to_string()),
         ));
     }
@@ -57553,12 +57542,12 @@ impl Simulator {
         v: Value,
         cont: ProcCont,
     ) {
-        if let Some(ctx) = self.process_contexts.get(&pid).cloned() {
+        if let Some(ctx) = self.proc.process_contexts.get(&pid).cloned() {
             let saved = self.snapshot_process_context();
             self.restore_process_context(ctx);
             let width = self.infer_lhs_width(lvalue);
             self.assign_value(lvalue, &v.resize(width));
-            self.process_contexts
+            self.proc.process_contexts
                 .insert(pid, self.snapshot_process_context());
             self.restore_process_context(saved);
         } else {
@@ -57575,7 +57564,7 @@ impl Simulator {
     fn is_pid_suspended(&self, pid: usize) -> bool {
         // §9.7: a process explicitly suspended via `process::suspend()` is
         // suspended (and has been removed from all scheduling queues).
-        if self.suspended_pids.contains(&pid) {
+        if self.proc.suspended_pids.contains(&pid) {
             return true;
         }
         if self.event_queue.has_pid(pid) {
@@ -57584,13 +57573,13 @@ impl Simulator {
         if self.event_waiters.iter().any(|w| w.pid == pid) {
             return true;
         }
-        if self.condition_waiters.iter().any(|(p, _)| *p == pid) {
+        if self.proc.condition_waiters.iter().any(|(p, _)| *p == pid) {
             return true;
         }
         // A process parked by `#0` in the Inactive-region queue (§4.4.2.3)
         // is suspended, not finished — its continuation resumes after the
         // NBA region of the current tick.
-        if self.inactive_queue.iter().any(|(p, _)| *p == pid) {
+        if self.proc.inactive_queue.iter().any(|(p, _)| *p == pid) {
             return true;
         }
         // A process blocked on `fork...join`/`join_any` is the PARENT of a
@@ -57598,7 +57587,7 @@ impl Simulator {
         // so its process context (this_stack, locals) was dropped and the
         // join-resume restored an empty context (this=None) — forked tasks lost
         // the enclosing instance `this`.
-        if self.join_waiters.iter().any(|w| w.parent_pid == pid) {
+        if self.proc.join_waiters.iter().any(|w| w.parent_pid == pid) {
             return true;
         }
         // A process blocked on a mailbox get/peek (`m_req_fifo.peek` in `get_next_item`)
@@ -57693,13 +57682,13 @@ impl Simulator {
     /// §9.7 `status()`: return the process state enum.
     ///   FINISHED=0, RUNNING=1, WAITING=2, SUSPENDED=3, KILLED=4
     fn proc_status(&self, pid: usize) -> u32 {
-        if self.killed_pids.contains(&pid) {
+        if self.proc.killed_pids.contains(&pid) {
             return 4; // KILLED
         }
-        if self.suspended_pids.contains(&pid) {
+        if self.proc.suspended_pids.contains(&pid) {
             return 3; // SUSPENDED
         }
-        if pid == self.current_pid {
+        if pid == self.proc.current_pid {
             return 1; // RUNNING
         }
         if self.is_pid_suspended(pid) {
@@ -57717,11 +57706,11 @@ impl Simulator {
         to_kill.insert(pid);
         to_kill.extend(self.collect_fork_descendants(pid));
         for &p in &to_kill {
-            self.killed_pids.insert(p);
-            self.suspended_pids.remove(&p);
-            self.suspended_proc_info.remove(&p);
-            self.process_parents.remove(&p);
-            self.process_contexts.remove(&p);
+            self.proc.killed_pids.insert(p);
+            self.proc.suspended_pids.remove(&p);
+            self.proc.suspended_proc_info.remove(&p);
+            self.proc.process_parents.remove(&p);
+            self.proc.process_contexts.remove(&p);
         }
         // Purge from every scheduling structure.
         for &p in &to_kill {
@@ -57729,8 +57718,8 @@ impl Simulator {
         }
         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
         self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
-        self.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
-        self.inactive_queue.retain(|(p, _)| !to_kill.contains(p));
+        self.proc.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
+        self.proc.inactive_queue.retain(|(p, _)| !to_kill.contains(p));
         for q in self.mailbox_get_waiters.values_mut() {
             q.retain(|w| !to_kill.contains(&w.pid));
         }
@@ -57753,12 +57742,12 @@ impl Simulator {
         caller_pid: usize,
         continuation: ProcCont,
     ) -> bool {
-        let terminated = self.killed_pids.contains(&target_pid)
-            || !self.is_pid_suspended(target_pid) && target_pid != self.current_pid;
+        let terminated = self.proc.killed_pids.contains(&target_pid)
+            || !self.is_pid_suspended(target_pid) && target_pid != self.proc.current_pid;
         if terminated {
             return false; // already done — caller continues
         }
-        self.await_waiters.push(AwaitWaiter {
+        self.proc.await_waiters.push(AwaitWaiter {
             target_pid,
             waiter_pid: caller_pid,
             continuation,
@@ -57769,14 +57758,14 @@ impl Simulator {
     /// §9.7 `suspend()`: suspend the process, desensitizing it from whatever
     /// it is blocked on. The process will not run until `resume()`.
     fn proc_suspend(&mut self, pid: usize) {
-        if self.suspended_pids.contains(&pid) || self.killed_pids.contains(&pid) {
+        if self.proc.suspended_pids.contains(&pid) || self.proc.killed_pids.contains(&pid) {
             return; // already suspended or killed — no effect
         }
         // Try to extract the process from wherever it's parked.
         // 1) Delay (event_queue)
         if let Some((expiry, stmts)) = self.event_queue.remove_pid(pid) {
-            self.suspended_pids.insert(pid);
-            self.suspended_proc_info.insert(
+            self.proc.suspended_pids.insert(pid);
+            self.proc.suspended_proc_info.insert(
                 pid,
                 SuspendedProc {
                 continuation: stmts,
@@ -57788,8 +57777,8 @@ impl Simulator {
         // 2) Event control (event_waiters)
         if let Some(idx) = self.event_waiters.iter().position(|w| w.pid == pid) {
             let waiter = self.event_waiters.remove(idx);
-            self.suspended_pids.insert(pid);
-            self.suspended_proc_info.insert(
+            self.proc.suspended_pids.insert(pid);
+            self.proc.suspended_proc_info.insert(
                 pid,
                 SuspendedProc {
                 continuation: waiter.continuation,
@@ -57799,10 +57788,10 @@ impl Simulator {
             return;
         }
         // 3) Condition wait (wait(expr))
-        if let Some(idx) = self.condition_waiters.iter().position(|(p, _)| *p == pid) {
-            let (_, stmts) = self.condition_waiters.remove(idx);
-            self.suspended_pids.insert(pid);
-            self.suspended_proc_info.insert(
+        if let Some(idx) = self.proc.condition_waiters.iter().position(|(p, _)| *p == pid) {
+            let (_, stmts) = self.proc.condition_waiters.remove(idx);
+            self.proc.suspended_pids.insert(pid);
+            self.proc.suspended_proc_info.insert(
                 pid,
                 SuspendedProc {
                 continuation: stmts,
@@ -57812,10 +57801,10 @@ impl Simulator {
             return;
         }
         // 4) Inactive queue (#0)
-        if let Some(idx) = self.inactive_queue.iter().position(|(p, _)| *p == pid) {
-            let (_, stmts) = self.inactive_queue.remove(idx);
-            self.suspended_pids.insert(pid);
-            self.suspended_proc_info.insert(
+        if let Some(idx) = self.proc.inactive_queue.iter().position(|(p, _)| *p == pid) {
+            let (_, stmts) = self.proc.inactive_queue.remove(idx);
+            self.proc.suspended_pids.insert(pid);
+            self.proc.suspended_proc_info.insert(
                 pid,
                 SuspendedProc {
                 continuation: stmts,
@@ -57828,8 +57817,8 @@ impl Simulator {
         for q in self.mailbox_get_waiters.values_mut() {
             if let Some(idx) = q.iter().position(|w| w.pid == pid) {
                 if let Some(waiter) = q.remove(idx) {
-                    self.suspended_pids.insert(pid);
-                    self.suspended_proc_info.insert(
+                    self.proc.suspended_pids.insert(pid);
+                    self.proc.suspended_proc_info.insert(
                         pid,
                         SuspendedProc {
                         continuation: waiter.cont,
@@ -57843,8 +57832,8 @@ impl Simulator {
         for q in self.semaphore_get_waiters.values_mut() {
             if let Some(idx) = q.iter().position(|w| w.pid == pid) {
                 if let Some(waiter) = q.remove(idx) {
-                    self.suspended_pids.insert(pid);
-                    self.suspended_proc_info.insert(
+                    self.proc.suspended_pids.insert(pid);
+                    self.proc.suspended_proc_info.insert(
                         pid,
                         SuspendedProc {
                         continuation: waiter.cont,
@@ -57862,8 +57851,8 @@ impl Simulator {
 
     /// §9.7 `resume()`: restart a previously suspended process.
     fn proc_resume(&mut self, pid: usize) {
-        if let Some(info) = self.suspended_proc_info.remove(&pid) {
-            self.suspended_pids.remove(&pid);
+        if let Some(info) = self.proc.suspended_proc_info.remove(&pid) {
+            self.proc.suspended_pids.remove(&pid);
             // LRM §9.7: if suspended while WAITING on a delay, resensitize.
             // If the original delay has transpired, continue immediately.
             let schedule_time = match info.original_delay_expiry {
@@ -57879,7 +57868,7 @@ impl Simulator {
     /// Wake all `await()` waiters whose target process has terminated.
     fn wake_await_waiters(&mut self, terminated_pids: &HashSet<usize>) {
         let to_wake: Vec<usize> = self
-            .await_waiters
+            .proc.await_waiters
             .iter()
             .enumerate()
             .filter(|(_, w)| terminated_pids.contains(&w.target_pid))
@@ -57887,7 +57876,7 @@ impl Simulator {
             .collect();
         // Remove in reverse order to keep indices valid.
         for i in to_wake.into_iter().rev() {
-            let waiter = self.await_waiters.remove(i);
+            let waiter = self.proc.await_waiters.remove(i);
             self.event_queue
                 .schedule(self.time, waiter.waiter_pid, waiter.continuation);
         }
@@ -57901,7 +57890,7 @@ impl Simulator {
         let mut out: HashSet<usize> = HashSet::default();
         let mut stack = vec![root];
         while let Some(p) = stack.pop() {
-            for (&child, &parent) in self.process_parents.iter() {
+            for (&child, &parent) in self.proc.process_parents.iter() {
                 if parent == p && out.insert(child) {
                     stack.push(child);
                 }
@@ -57916,7 +57905,7 @@ impl Simulator {
     /// parent blocked in `join` would hang forever on a terminated child.
     fn release_killed_from_join_waiters(&mut self, killed: &HashSet<usize>) {
         let mut to_wake: Vec<usize> = Vec::new();
-        for (i, w) in self.join_waiters.iter_mut().enumerate() {
+        for (i, w) in self.proc.join_waiters.iter_mut().enumerate() {
             let before = w.child_pids.len();
             w.child_pids.retain(|p| !killed.contains(p));
             w.finished_children.retain(|p| !killed.contains(p));
@@ -57934,7 +57923,7 @@ impl Simulator {
         }
         to_wake.sort_by(|a, b| b.cmp(a));
         for i in to_wake {
-            let waiter = self.join_waiters.remove(i);
+            let waiter = self.proc.join_waiters.remove(i);
             self.event_queue
                 .schedule(self.time, waiter.parent_pid, waiter.continuation);
         }
@@ -57950,31 +57939,31 @@ impl Simulator {
         // own parent, so the fork descendant tree stays connected (a `wait fork`
         // higher up must still see grandchildren whose intermediate parent has
         // finished). Without this, completing `X` would orphan its child `G`.
-        if let Some(&grandparent) = self.process_parents.get(&child_pid) {
+        if let Some(&grandparent) = self.proc.process_parents.get(&child_pid) {
             let regrandkids: Vec<usize> = self
-                .process_parents
+                .proc.process_parents
                 .iter()
                 .filter(|&(_, &p)| p == child_pid)
                 .map(|(&c, _)| c)
                 .collect();
             for c in regrandkids {
-                self.process_parents.insert(c, grandparent);
+                self.proc.process_parents.insert(c, grandparent);
             }
         }
-        self.process_parents.remove(&child_pid);
+        self.proc.process_parents.remove(&child_pid);
 
         // Record the completion against every matching plain waiter first
         // (mutable pass), deferring the wake decision so the `wait fork`
         // re-check below can borrow `self` immutably.
-        for waiter in self.join_waiters.iter_mut() {
+        for waiter in self.proc.join_waiters.iter_mut() {
             if waiter.child_pids.contains(&child_pid) {
                 waiter.finished_children.insert(child_pid);
             }
         }
 
         let mut finished_parents = Vec::new();
-        for i in 0..self.join_waiters.len() {
-            let w = &self.join_waiters[i];
+        for i in 0..self.proc.join_waiters.len() {
+            let w = &self.proc.join_waiters[i];
             let should_wake = if w.wait_fork {
                 // §9.6.1: `wait fork` waits on the IMMEDIATE children captured
                 // when it ran — never on grandchildren. Recomputing the
@@ -57998,7 +57987,7 @@ impl Simulator {
             if should_wake {
                 sim_dbg_eprintln!(
                     "[DEBUG] join waiter for parent process {} triggered at time {}",
-                    self.join_waiters[i].parent_pid,
+                    self.proc.join_waiters[i].parent_pid,
                     self.time
                 );
                 finished_parents.push(i);
@@ -58007,7 +57996,7 @@ impl Simulator {
 
         finished_parents.sort_by(|a, b| b.cmp(a));
         for i in finished_parents {
-            let waiter = self.join_waiters.remove(i);
+            let waiter = self.proc.join_waiters.remove(i);
             self.event_queue
                 .schedule(self.time, waiter.parent_pid, waiter.continuation);
         }
@@ -60299,7 +60288,7 @@ impl Simulator {
             }
             return &mut self.rng;
         }
-        let pid = self.current_pid;
+        let pid = self.proc.current_pid;
         if self.proc_rng.contains_key(&pid) {
             return self.proc_rng.get_mut(&pid).unwrap();
         }
@@ -63716,7 +63705,7 @@ impl Simulator {
         match self
             .timescale_scope_override
             .as_ref()
-            .or_else(|| self.process_scope_hint.get(&self.current_pid))
+            .or_else(|| self.proc.process_scope_hint.get(&self.proc.current_pid))
         {
             Some(s) if !s.is_empty() => {
                 let rel = s
@@ -73085,7 +73074,7 @@ impl Simulator {
                 // real heap index; the `.status` workaround in the MemberAccess
                 // handler then yields RUNNING for it).
                 if name == "process" && mname == "self" {
-                    let h = PROCESS_HANDLE_BASE.wrapping_add(self.current_pid as u64);
+                    let h = PROCESS_HANDLE_BASE.wrapping_add(self.proc.current_pid as u64);
                     return Value::from_u64(h, 64);
                 }
                 // Static method call: `ClassName::method(args)`. The LHS
@@ -73650,7 +73639,7 @@ impl Simulator {
             // handler for the full rationale. Returns a non-null opaque
             // process handle.
             if len == 2 && path[0].name.name == "process" && path[1].name.name == "self" {
-                let h = PROCESS_HANDLE_BASE.wrapping_add(self.current_pid as u64);
+                let h = PROCESS_HANDLE_BASE.wrapping_add(self.proc.current_pid as u64);
                 return Value::from_u64(h, 64);
             }
 
@@ -76318,8 +76307,8 @@ impl Simulator {
         // §9.6.2: `disable <task>` terminates this invocation and no more —
         // the caller resumes. Clear the unwind signal here, or it would leak
         // out and keep later loops from clearing `break_flag`.
-        if self.disable_target.as_deref() == Some(td.name.name.name.as_str()) {
-            self.disable_target = None;
+        if self.proc.disable_target.as_deref() == Some(td.name.name.name.as_str()) {
+            self.proc.disable_target = None;
             self.break_flag = false;
         }
         self.unwind_task_frame(cleanup);
@@ -76331,7 +76320,7 @@ impl Simulator {
     fn unwind_task_frame(&mut self, c: TaskCleanup) {
         if let Some(tn) = &c.task_name {
             if let Some(set) = self.active_task_pids.get_mut(tn) {
-                set.remove(&self.current_pid);
+                set.remove(&self.proc.current_pid);
             }
         }
         // §21.2.1.7 `%m`: restore the caller's lexical scope.
@@ -76738,7 +76727,7 @@ impl Simulator {
         self.active_task_pids
             .entry(tname.clone())
             .or_default()
-            .insert(self.current_pid);
+            .insert(self.proc.current_pid);
         // §21.2.1.7 `%m`: entering a task RESETS the lexical scope to just
         // this task (leaf name — the decl name may be instance-qualified),
         // saving the caller's scope for restoration on return.
@@ -79378,12 +79367,12 @@ impl Simulator {
                             };
                             locals.insert(port.name.name.clone(), val);
                         }
-                        let pid = self.next_pid;
-                        self.next_pid += 1;
+                        let pid = self.proc.next_pid;
+                        self.proc.next_pid += 1;
                         if let Some(first) = t.items.first() {
                             self.process_origin.insert(pid, (first.span, "class task"));
                         }
-                        self.process_contexts.insert(
+                        self.proc.process_contexts.insert(
                             pid,
                             ProcessContext {
                                 this_stack: vec![Some(handle)],
@@ -86437,7 +86426,7 @@ impl Simulator {
                 }
                 self.current_spec = saved_spec;
                 self.local_iface_aliases.pop();
-                if self.parked_from_exec {
+                if self.proc.parked_from_exec {
                     // The process was parked by exec_statement's Wait handler.
                     // Keep break/return flags set so they propagate up to
                     // run_process_stmts. Don't restore the saved values.
