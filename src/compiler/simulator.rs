@@ -5366,6 +5366,23 @@ impl Simulator {
                 signal_real_vec.push(false);
             }
         }
+        // §10.4 alias unification: repoint each aliased name at the
+        // canonical net's slot — ONE storage, N names. Width agreement was
+        // checked at elaboration.
+        for (canon, other) in module.alias_pairs.iter() {
+            let (Some(&cid), Some(&oid)) = (
+                signal_name_to_id.get(canon.as_str()),
+                signal_name_to_id.get(other.as_str()),
+            ) else {
+                continue;
+            };
+            if cid != oid {
+                if let Some(slot) = signal_name_to_id.get_mut(other.as_str()) {
+                    *slot = cid;
+                }
+                let _ = oid; // the orphan slot keeps its default value, unreferenced
+            }
+        }
         let static_ms = phase_static.elapsed().as_secs_f64() * 1000.0;
         // Phase 2: synthesize per-element entries for unpacked arrays.
         // Elaborate skips the per-element Signal inserts (memory-as-array
