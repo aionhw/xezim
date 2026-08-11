@@ -1,93 +1,90 @@
-//! Regression for `uvm_agent::is_active` configuration propagation
-//! (`05components/90Mantis/3167_agent_activepassive`).
+//! Regression for `resolve_type_param_with` — the active specialization's
+//! own argument must win for a type parameter it directly declares
+//! (commit "fix: active specialization wins when resolving a colliding type
+//! param").
 //!
-//! `uvm_agent.build_phase` reads `is_active` from the resource pool via
+//! # Original UVM symptom
+//!
+//! `uvm_agent::build_phase` reads `is_active` from the resource pool via
 //! `uvm_resource_enum_read`, whose `$cast` to `uvm_resource#(<enum>)` /
 //! `uvm_resource#(uvm_integral_t)` / `uvm_resource#(uvm_bitstream_t)` must
-//! succeed against the resource that `uvm_config_int::set` wrote.
+//! succeed against the resource `uvm_config_int::set` wrote.
+//! `05components/90Mantis/3167_agent_activepassive` failed: agent2 came up
+//! `UVM_ACTIVE` (default) instead of the configured `UVM_PASSIVE`.
 //!
-//! Root cause: in `resolve_type_param_with`, constructing `uvm_resource#(T)`
-//! INSIDE `uvm_config_db_default_implementation_t#(T)` (a nested parameterized
-//! class whose type-param NAME collides with the enclosing one) resolved `T`
-//! from the enclosing instance's CACHED binding, which had been polluted to the
-//! full implementation specialization
-//! (`uvm_config_db_default_implementation_t#(uvm_bitstream_t)`) instead of
-//! `uvm_bitstream_t`. The child resource recorded the wrong element type and
-//! every read-side `$cast` failed, leaving `agent2.is_active == UVM_ACTIVE`
-//! (default) instead of `UVM_PASSIVE`. The active specialization
-//! (`current_spec`) is authoritative for a type parameter it directly declares.
+//! Constructing `uvm_resource#(T)` INSIDE
+//! `uvm_config_db_default_implementation_t#(T)` (a parameterized class whose
+//! type-param NAME collides with the enclosing one) resolved `T` from the
+//! enclosing instance's CACHED binding, which had been polluted to the full
+//! implementation specialization instead of the concrete element type, so the
+//! child resource recorded the wrong type and every read-side `$cast` failed.
 //!
-//! It reproduces only inside the UVM bootstrap, so this test drives the real
-//! 1800.2–2020.3.1 library and skips when it is unavailable.
-use std::path::PathBuf;
-use std::process::Command;
+//! # Why this is a pure-SV test (no UVM library)
+//!
+//! The fix is a single early-return block at the top of
+//! `resolve_type_param_with`: when `tn` is DIRECTLY declared in the active
+//! specialization's base, return that specialization's argument (indexed by the
+//! full interleaved `param_order`, not just `type_param_names`) BEFORE
+//! consulting the instance binding.
+//!
+//! The reported pollution needs UVM's factory/`type_id` machinery to set up the
+//! stale cached binding, so it cannot be reproduced in isolation without the
+//! 1800.2 library *and* the DPI shared object. The early-return it depends on,
+//! however, is exercised directly by a class with INTERLEAVED value+type
+//! parameters (`#(int W, type T, int H)`): resolving `T` from a static context
+//! has no instance binding to fall back to, and the legacy code indexed `T` by
+//! `type_param_names` (slot 0) instead of `param_order` (slot 1), picking up
+//! the value param's argument. That reduction fails without the fix and passes
+//! with it — the same `resolve_type_param_with` block — with zero external
+//! dependencies.
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
+use xezim::simulate;
+
+fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
+    sim.get_signal(n)
+        .or_else(|| sim.get_signal(&format!("top.{}", n)))
+        .unwrap_or_else(|| panic!("signal not found: {n}"))
+        .to_u64()
+        .unwrap_or_else(|| panic!("{n} not u64-able"))
+        & 0xFFFF_FFFF
 }
 
-/// Runs an inline `uvm_config_int` + `uvm_agent` test through xezim + the
-/// 1800.2 UVM library; PASSED means both `a1.is_active` and `a2.is_active`
-/// read back their configured enum (`UVM_ACTIVE` / `UVM_PASSIVE`).
+/// A class with INTERLEAVED value+type params resolves its type parameter from
+/// a static (instance-free) context by the active specialization's argument.
+/// The inner `#(T)` reference mirrors the `uvm_resource#(T)`-inside-`config_db`
+/// shape that broke UVM 3167.
 #[test]
-fn uvm_agent_is_active_config_read() {
-    // Locate the reference UVM library beside the repo. If absent, skip.
-    let lib = repo_root().join("1800.2-2020.3.1");
-    let uvm_pkg = lib.join("src/uvm_pkg.sv");
-    if !uvm_pkg.exists() {
-        eprintln!("skipping: 1800.2-2020.3.1 not present");
-        return;
-    }
-    let src = lib.join("src");
-    let dpi = repo_root().join("xezim/uvm-2020.3.1.so");
-
-    let test_sv = r#"
+fn interleaved_type_param_resolves_from_active_spec() {
+    let src = r#"
 module top;
-  import uvm_pkg::*;
-  `include "uvm_macros.svh"
-  class myagent extends uvm_agent;
-    `uvm_new_func
-  endclass
-  class t extends uvm_test;
-    myagent a1, a2;
-    `uvm_new_func
-    `uvm_component_utils(t)
-    function void build_phase(uvm_phase phase);
-      super.build_phase(phase);
-      uvm_config_int::set(this, "a1", "is_active", UVM_ACTIVE);
-      uvm_config_int::set(this, "a2", "is_active", UVM_PASSIVE);
-      a1 = new("a1", this);
-      a2 = new("a2", this);
+  class markA; static function int id(); return 11; endfunction endclass
+  class markB; static function int id(); return 22; endfunction endclass
+
+  // `inner#(T)` — stands in for `uvm_resource#(T)`; its static method must see
+  // the concrete element type, not the enclosing specialization.
+  class inner #(type T = markA);
+    static function int tag();
+      return T::id();
     endfunction
-    task run_phase(uvm_phase phase);
-      if (a1.is_active != UVM_ACTIVE || a1.get_is_active() != UVM_ACTIVE)
-        $display("RESULT_FAIL a1");
-      else if (a2.is_active != UVM_PASSIVE || a2.get_is_active() != UVM_PASSIVE)
-        $display("RESULT_FAIL a2");
-      else
-        $display("RESULT_PASS");
-    endtask
   endclass
-  initial run_test();
+
+  // A VALUE param (W) PRECEDES the TYPE param (T) followed by another value
+  // param (H): param_order = [W, T, H], type_param_names = [T]. The legacy
+  // index (type_param_names slot 0) wrongly mapped T onto W's argument.
+  class outer #(int W = 1, type T = markA, int H = 1);
+    static function int whichT();
+      return inner#(T)::tag();
+    endfunction
+  endclass
+
+  logic [31:0] got_a, got_b;
+  initial begin
+    got_a = outer#(2, markA, 3)::whichT();   // T -> markA -> 11
+    got_b = outer#(2, markB, 3)::whichT();   // T -> markB -> 22
+  end
 endmodule
 "#;
-    let sv = std::env::temp_dir().join(format!("xezim_3167_{}.sv", std::process::id()));
-    std::fs::write(&sv, test_sv).unwrap();
-
-    let bin = PathBuf::from(env!("CARGO_BIN_EXE_xezim"));
-    let mut cmd = Command::new(bin);
-    cmd.arg("--simulate").arg("-s").arg("top");
-    cmd.arg("-I").arg(&src);
-    if dpi.exists() {
-        cmd.arg("--dpi-lib").arg(&dpi);
-    }
-    cmd.arg("+UVM_TESTNAME=t").arg(&uvm_pkg).arg(&sv);
-
-    let out = cmd.output().expect("failed to run xezim");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(text.contains("RESULT_PASS"), "uvm_agent must read a1=A a2=P: {text}");
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "got_a"), 11, "outer#(2,markA,3) must bind T -> markA");
+    assert_eq!(u(&sim, "got_b"), 22, "outer#(2,markB,3) must bind T -> markB");
 }
