@@ -9,7 +9,16 @@ Closed items are not repeated here — see the git log and `debug_notes.md`
 
 ---
 
-## 1. Continuous-assignment propagation order after a procedural blocking write
+## 1. Continuous-assignment propagation order — CLOSED (#35)
+
+Per-evaluator split landed: a process's post-write settle defers the
+cont-assign family until the process yields (§5.5/§10.3); UDP/gate/always
+entries stay eager per input change. Both reference traces match at once
+(c1b `2 1 2 7`, dep `wb=1 rdy=1 rfi=1`). Escapes: XEZIM_EAGER_PROC_SETTLE=1
+(old default), XEZIM_LAZY_PROC_SETTLE=1 (all-lazy).
+Pinned: tests/scheduling/zero_delay_inactive_region.rs.
+
+## 1-old. (superseded analysis, kept for the measurement table)
 
 **What differs.** xezim settles continuous assignments immediately after a
 procedural blocking write, so the *writing process* observes the propagated

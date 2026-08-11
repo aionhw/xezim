@@ -22240,6 +22240,27 @@ impl Simulator {
                                 continue;
                             }
                         }
+                        // §9.4.2/§7.2.1: `@(s.a)` on a PACKED STRUCT field —
+                        // no standalone signal backs the field (it is a slice
+                        // of the base vector), so a name-keyed sensitivity
+                        // armed nothing and the waiter fell into the
+                        // delta-yield (spurious t=0 wake). Arm the BASE and
+                        // let the wake path compare the FIELD's value against
+                        // the armed snapshot (the non-trivial-expression
+                        // machinery).
+                        if !self.signal_name_to_id.contains_key(sig.as_str())
+                            && !self.signals.contains_key(&sig)
+                        {
+                            if let Some((base, _off, _w)) = self.packed_leaf_of_hier(&sig) {
+                                out.push(Sensitivity {
+                                    signal_name: base,
+                                    edge,
+                                    iff: ee.iff.clone(),
+                                    value_of: Some(ee.expr.clone()),
+                                });
+                                continue;
+                            }
+                        }
                         out.push(Sensitivity {
                             signal_name: sig,
                             edge,
@@ -41326,6 +41347,23 @@ impl Simulator {
                 //   Call{ MemberAccess{q, method}, [] }     (with parens)
                 //   Call{ Ident(hier=[q, method]), [] }     (flat)
                 //   Ident(hier=[q, method])                 (no parens — `q.sort` form)
+                // §7.12: the call may DECLARE an iterator name —
+                // `q.sort(x) with (x)` — which the filter references instead
+                // of the default `item`. Silently ignoring it left the filter
+                // unresolved (0 for every element): sort became a stable
+                // no-op and reductions summed zeros.
+                let iter_name: Option<String> = if let ExprKind::Call { args, .. } = &expr.kind {
+                    args.first().and_then(|a| match &a.kind {
+                        ExprKind::Ident(h)
+                            if h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                        {
+                            Some(h.path[0].name.name.clone())
+                        }
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
                 let parsed: Option<(String, String)> =
                     if let ExprKind::Call { func, .. } = &expr.kind {
                     match &func.kind {
@@ -41380,15 +41418,15 @@ impl Simulator {
                                 method.as_str(),
                                 "sum" | "product" | "min" | "max" | "and" | "or" | "xor"
                             ) {
-                                return self.reduce_with(&arr, &method, filter);
+                                return self.reduce_with(&arr, &method, filter, iter_name.as_deref());
                             }
                             // LRM §7.12.2: `q.sort/.rsort/.unique with
                             // (expr)` — in-place mutators with a per-
-                            // element filter expression (binds `item`).
-                            // sort/rsort use the filter's value as the
-                            // sort key; unique dedups by filter value.
+                            // element filter expression (binds `item` or the
+                            // declared iterator). sort/rsort use the filter's
+                            // value as the sort key; unique dedups by it.
                             if matches!(method.as_str(), "sort" | "rsort" | "unique") {
-                                self.sort_with(&arr, &method, filter);
+                                self.sort_with(&arr, &method, filter, iter_name.as_deref());
                                 return Value::zero(32);
                             }
                         }
@@ -65733,7 +65771,7 @@ impl Simulator {
     /// around, so the old "collect values, reorder, write back" shape reordered
     /// nothing. `item` binds to the element's value for scalars and to its flat
     /// name for structs (see `item_alias`).
-    fn sort_with(&mut self, arr: &str, method: &str, filter: &Expression) {
+    fn sort_with(&mut self, arr: &str, method: &str, filter: &Expression, iter: Option<&str>) {
         let size = self.get_queue_size(arr) as usize;
         if size == 0 {
             return;
@@ -65758,6 +65796,9 @@ impl Simulator {
                 .get_signal_value_by_name(&elem)
                 .unwrap_or_else(|| Value::zero(32));
             if let Some(f) = self.local_stack.last_mut() {
+                if let Some(nm) = iter {
+                    f.insert(nm.to_string(), v.clone());
+                }
                 f.insert("item".to_string(), v);
             }
             keys.push(self.eval_expr(filter).to_i64().unwrap_or(0));
@@ -65765,6 +65806,9 @@ impl Simulator {
 
         self.item_alias = saved_alias;
         if let Some(f) = self.local_stack.last_mut() {
+            if let Some(nm) = iter {
+                f.remove(nm);
+            }
             match saved_item {
                 Some(v) => {
                     f.insert("item".to_string(), v);
@@ -65800,7 +65844,7 @@ impl Simulator {
         }
     }
 
-    fn reduce_with(&mut self, arr: &str, method: &str, filter: &Expression) -> Value {
+    fn reduce_with(&mut self, arr: &str, method: &str, filter: &Expression, iter: Option<&str>) -> Value {
         let (keys, _is_str) = self.array_iter_keys(arr);
         // Ensure a local frame exists so `item` has somewhere to live.
         // Initial-block-scope calls (no enclosing function) reach here
@@ -65825,6 +65869,9 @@ impl Simulator {
                 .get_signal_value_by_name(&format!("{}[{}]", arr, key))
                 .unwrap_or_else(|| Value::zero(32));
             if let Some(f) = self.local_stack.last_mut() {
+                if let Some(nm) = iter {
+                    f.insert(nm.to_string(), elem.clone());
+                }
                 f.insert("item".to_string(), elem);
             }
             let fv = self.eval_expr(filter);
@@ -65844,8 +65891,11 @@ impl Simulator {
                 (Some(a), _) => a,
             });
         }
-        // Restore the prior `item` binding (if any).
+        // Restore the prior `item` binding (if any); drop the iterator's.
         if let Some(f) = self.local_stack.last_mut() {
+            if let Some(nm) = iter {
+                f.remove(nm);
+            }
             match saved_item {
                 Some(v) => {
                     f.insert("item".to_string(), v);
