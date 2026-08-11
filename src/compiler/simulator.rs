@@ -43695,6 +43695,18 @@ impl Simulator {
                     if let Some(s) = self.instance_assoc_member(&lname) {
                         lname = s;
                     }
+                    if !(self.module.arrays.contains_key(&lname)
+                        || self.module.dynamic_arrays.contains(&lname))
+                    {
+                        // A CLASS-MEMBER queue/dynamic-array lvalue (`obj.q =
+                        // {...}`) is instance-scoped to `<handle>#q`; without
+                        // this the unpacked-array-concatenation distribution
+                        // below wrote to the bare member name and the queue
+                        // came back empty (§10.10, §7.2).
+                        if let Some(scoped) = self.expr_assoc_name(lvalue) {
+                            lname = scoped;
+                        }
+                    }
                     if self.module.arrays.contains_key(&lname) {
                         // Queue/array slice assignment: lq = rq[a:b]
                         if let ExprKind::RangeSelect {
