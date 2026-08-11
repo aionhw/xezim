@@ -178,3 +178,6 @@ mod ctor_dispatch_and_p_format;
 
 #[path = "classes/struct_queue_foreach_assoc.rs"]
 mod struct_queue_foreach_assoc;
+
+#[path = "classes/struct_prop_whole_copy.rs"]
+mod struct_prop_whole_copy;

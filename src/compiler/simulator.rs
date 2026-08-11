@@ -42108,6 +42108,18 @@ impl Simulator {
                     }
                     return;
                 }
+                // §10.6 mirror case: the SOURCE is an unpacked-struct class
+                // property (`p = o.orig`, incl. through a ternary — UVM's
+                // factory pair copy). The whole-struct read of a class prop
+                // through a frame-held handle has no flat signals to
+                // assemble, so decompose member-wise from the RHS side too.
+                if self
+                    .try_decompose_class_prop_member_copy(lvalue, rvalue)
+                    .is_some()
+                {
+                    self.settle_after_proc_write();
+                    return;
+                }
                 // IEEE 1800-2017 §7.2: assigning one unpacked struct to another
                 // copies every member. Their leaves live in separate signals, so
                 // evaluating the RHS to a packed value and storing it writes a
@@ -62946,6 +62958,11 @@ impl Simulator {
     ) -> Option<()> {
         if self.oop.heap.is_empty() {
             return None;
+        }
+        // §10.6: peel a parenthesized source (`local.s = (o.orig)` so the
+        // member-wise copy below still resolves the class-prop receiver).
+        if let ExprKind::Paren(inner) = &rvalue.kind {
+            return self.try_decompose_class_prop_member_copy(lvalue, inner);
         }
         // Ternary source (`local.s = cond ? a.s : b.s`): peel to the selected
         // arm — but ONLY when BOTH arms resolve to a whole spread class-prop
