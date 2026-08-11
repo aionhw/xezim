@@ -65,6 +65,8 @@ mod queue_ops_and_dist;
 mod sort_with_clause;
 #[path = "collections/s7_11_s7_12_arrays.rs"]
 mod s7_11_s7_12_arrays;
+#[path = "collections/nonexistent_class_elem_null.rs"]
+mod nonexistent_class_elem_null;
 #[path = "collections/struct_collections_across_calls.rs"]
 mod struct_collections_across_calls;
 #[path = "collections/stream_justify_assoc_default_partsel.rs"]

@@ -38045,7 +38045,20 @@ impl Simulator {
                                 self.array_first_id.get(name.as_str())
                             {
                                 let idx = idx_val.to_u64().unwrap_or(0) as i64;
-                                if idx >= lo && idx <= hi {
+                                // For a DYNAMIC array the reservation is a max
+                                // block (`hi` up to 63) but only indices below
+                                // the logical queue size are populated; phantom
+                                // slots beyond size read an undefined 0/x. Clamp
+                                // to size so a class element OOB returns the
+                                // element default (null) rather than a stray
+                                // filled slot (Table 7.1 / §7.4.5, §7.8.6).
+                                let eff_hi = if self.module.dynamic_arrays.contains(&name) {
+                                    let sz = self.get_queue_size(&store_name) as i64 - 1;
+                                    sz.max(lo - 1)
+                                } else {
+                                    hi
+                                };
+                                if idx >= lo && idx <= eff_hi {
                                     let eid = first_id + (idx - lo) as usize;
                                     let mut v = self.signal_table[eid].clone();
                                     if self.signal_signed[eid] {
@@ -38067,42 +38080,43 @@ impl Simulator {
                             idx_val.to_u64().unwrap_or(0).to_string()
                         };
                         let elem_name = format!("{}[{}]", store_name, idx_str);
-                        if let Some(&eid) = self.signal_name_to_id.get(elem_name.as_str()) {
-                            let mut v = self.signal_table[eid].clone();
-                            if self.signal_signed[eid] {
-                                v.is_signed = true;
+                        let elem_name = format!("{}[{}]", store_name, idx_str);
+                        // For a DYNAMIC array, an index at/above the logical
+                        // queue size is OUT-OF-RANGE (Table 7.1): the reserved
+                        // cell exists (all-x) but must read as the element
+                        // default, so bypass the signal-cell fast paths below.
+                        let dyn_oob = self.module.dynamic_arrays.contains(&name)
+                            && idx_val
+                                .to_u64()
+                                .map_or(true, |i| i as i64 >= self.get_queue_size(&store_name) as i64);
+                        if !dyn_oob {
+                            if let Some(&eid) = self.signal_name_to_id.get(elem_name.as_str()) {
+                                let mut v = self.signal_table[eid].clone();
+                                if self.signal_signed[eid] {
+                                    v.is_signed = true;
+                                }
+                                return v;
                             }
-                            return v;
-                        }
-                        let mut v = if let Some(sv) = self.signals.get(&elem_name) {
-                            sv.clone()
-                        } else if let Some(def_expr) =
-                            self.module.assoc_defaults.get(&name).cloned()
-                        {
-                            self.eval_expr(&def_expr)
-                        } else {
-                            // §7.8.6: reading a NONEXISTENT element yields the
-                            // element type's default initial value — 0 for a
-                            // 2-state type, x for a 4-state one — at the
-                            // ELEMENT's width. A flat 1-bit x was wrong twice
-                            // over: `int aa[int]; aa[7]` read x instead of 0,
-                            // and even where x was right the 1-bit width made
-                            // `%h` print a single `x` for what should be `xx`.
-                            // (The read still must not CREATE the element —
-                            // `num()` is unchanged, which is why this is a
-                            // value-only fallback.)
-                            let ew = self.assoc_elem_width(&name).unwrap_or(1).max(1);
-                            if self.module.two_state_signals.contains(&name)
-                                || name
-                                    .rsplit('.')
-                                    .next()
-                                    .is_some_and(|l| self.module.two_state_signals.contains(l))
+                            if let Some(sv) = self.signals.get(&elem_name) {
+                                if self.signed_signals.contains(&elem_name) {
+                                    let mut v = sv.clone();
+                                    v.is_signed = true;
+                                    return v;
+                                }
+                                return sv.clone();
+                            }
+                            if let Some(def_expr) =
+                                self.module.assoc_defaults.get(&name).cloned()
                             {
-                                Value::zero(ew)
-                            } else {
-                                Value::new(ew)
+                                return self.eval_expr(&def_expr);
                             }
-                        };
+                        }
+                        // §7.8.6 / Table 7-1: a nonexistent (or OOB) element
+                        // read yields the element type's default — 0 for a
+                        // 2-state, x for a 4-state, null for a class handle — at
+                        // the element's width. The read must NOT create the
+                        // element, so `size()`/`num()` are unchanged.
+                        let mut v = self.coll_elem_default_value(&name);
                         if self.signed_signals.contains(&elem_name) {
                             v.is_signed = true;
                         }
@@ -83558,6 +83572,36 @@ impl Simulator {
     /// and `uvm_random_seed_table_lookup[inst_id] = new;` fell through to an
     /// OPAQUE "unknown-LHS" instance, so the stored handle deref'd null the
     /// moment a seed was read back (`seed_map.seed_table` null deref at t=0).
+    /// Is `name` a collection whose element type is a class handle? Used to
+    /// pick the §7.4.5 / Table 7-1 missing-element default (`null`) instead of
+    /// an X or 0 for a nonexistent entry read.
+    fn coll_elem_is_class(&self, name: &str) -> bool {
+        self.module.array_elem_class.contains_key(name)
+            || self.oop_var_class_type_of(name).is_some()
+            || self.declared_collection_elem_class(name).is_some()
+    }
+
+    /// §7.4.5 / Table 7-1: the default value read from a NONEXISTENT
+    /// collection element — `null` for a class-handle element, `0` for a
+    /// 2-state, `x` for a 4-state integral, at the element's declared width.
+    fn coll_elem_default_value(&self, name: &str) -> Value {
+        let w = self.assoc_elem_width(name).unwrap_or(64).max(1);
+        if self.coll_elem_is_class(name) {
+            // A class-handle element reads as `null` — a zeroed handle — never
+            // as an X-stained handle. Class handles are 64-bit.
+            Value::zero(64)
+        } else if self.module.two_state_signals.contains(name)
+            || name
+                .rsplit('.')
+                .next()
+                .is_some_and(|l| self.module.two_state_signals.contains(l))
+        {
+            Value::zero(w)
+        } else {
+            Value::new(w)
+        }
+    }
+
     fn declared_collection_elem_class(&self, name: &str) -> Option<String> {
         // Package-scoped collections (e.g. UVM's
         // `uvm_seed_map uvm_random_seed_table_lookup [string]` inside
