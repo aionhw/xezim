@@ -2761,6 +2761,36 @@ struct ProcessState {
     inactive_queue: Vec<(usize, ProcCont)>,
 }
 
+/// IPC & synchronization state — mailboxes, semaphores, and named events.
+/// Grouped here (Step 13 of the codebase rework) so the IPC subsystem can be
+/// extracted to its own module (`simulator/ipc.rs`).
+struct IpcState {
+    /// Built-in mailboxes (handle -> queue of values)
+    mailboxes: HashMap<usize, std::collections::VecDeque<Value>>,
+    /// §15.4.1 bounded-mailbox capacity (handle -> bound). Absent or 0 = unbounded.
+    mailbox_bound: HashMap<usize, usize>,
+    /// Producers parked on `put` to a full bounded mailbox (handle -> queue).
+    mailbox_put_waiters: HashMap<usize, std::collections::VecDeque<MailboxPutWaiter>>,
+    /// Blocked mailbox `get`/`peek` proxies keyed by mailbox handle.
+    mailbox_get_waiters: HashMap<usize, std::collections::VecDeque<MailboxGetWaiter>>,
+    /// Built-in semaphores (handle -> current count)
+    semaphores: HashMap<usize, i64>,
+    /// Processes blocked in `semaphore.get()` on an under-full semaphore.
+    semaphore_get_waiters: HashMap<usize, std::collections::VecDeque<SemGetWaiter>>,
+    /// Named-event handle key (or `arr[i]`) -> the canonical event key it aliases.
+    event_aliases: HashMap<String, String>,
+    /// LRM §15.5.3: per-named-event last-trigger time.
+    event_triggered_time: HashMap<String, u64>,
+    /// Processes waiting for signal edge events (@(posedge clk), etc.)
+    event_waiters: Vec<EventWaiter>,
+    /// Processes parked on a class-field named event (`@m_event`).
+    instance_event_waiters: Vec<InstanceEventWaiter>,
+    /// Covergroups waiting for sampling events
+    cg_event_waiters: Vec<(usize, Vec<SensitivityId>)>,
+    /// Swap buffer for event_waiters filtering (avoids allocation per cycle)
+    event_waiters_swap: Vec<EventWaiter>,
+}
+
 pub struct Simulator {
     pub signals: HashMap<String, Value>,
     /// Signals currently under force/release control (LRM §9.3.1).
@@ -3153,6 +3183,8 @@ pub struct Simulator {
     oop: OopState,
     /// Grouped process control & scheduling state (Step 11).
     proc: ProcessState,
+    /// Grouped IPC & synchronization state (Step 13).
+    ipc: IpcState,
     /// Memo for transitive blocking-task detection (pure-LRM mode only): maps a
     /// subroutine name to whether its body — following calls — eventually hits a
     /// blocking construct (`#`/`@`/`wait`/`fork…join[_any]`). Lets a task that
@@ -3281,14 +3313,6 @@ pub struct Simulator {
     local_dyn: Vec<HashMap<String, String>>,
     /// Monotonic counter backing the process-unique keys in `local_dyn`.
     next_dyn_id: u64,
-    /// Built-in mailboxes (handle -> queue of values)
-    mailboxes: HashMap<usize, std::collections::VecDeque<Value>>,
-    /// §15.4.1 bounded-mailbox capacity (handle -> bound). Absent or 0 means
-    /// UNBOUNDED — `try_put` never fails and `put` never blocks. `new(N)` with
-    /// N>0 records N here; a full box rejects `try_put` and parks `put`.
-    mailbox_bound: HashMap<usize, usize>,
-    /// Producers parked on `put` to a full bounded mailbox (handle -> queue).
-    mailbox_put_waiters: HashMap<usize, std::collections::VecDeque<MailboxPutWaiter>>,
     /// §18.5.9/§18.6 recursion guard: depth of nested `randomize()` calls made
     /// for `rand` class-handle members (a cyclic object graph would otherwise
     /// recurse forever).
@@ -3311,8 +3335,6 @@ pub struct Simulator {
     /// §18.5.4/§18.10 dist schedules, keyed by (instance handle, variable):
     /// (weight signature, item schedule, next slot). See `pick_dist_value`.
     dist_decks: HashMap<(usize, String), (u64, Vec<usize>, usize)>,
-    /// Built-in semaphores (handle -> current count)
-    semaphores: HashMap<usize, i64>,
     /// Covergroup instance heap (index 0 is null).
     cg_heap: Vec<Option<CovergroupInstance>>,
     /// Running tallies for every distinct `assert`/`assume`/`cover` source
@@ -3509,12 +3531,6 @@ pub struct Simulator {
     /// (SVA actions, $monitor/$strobe) have run — reference simulators still
     /// fire a final-cycle assertion action or display racing the finish.
     finish_deferred: bool,
-    /// §15.5.5 event variables are HANDLES to synchronization objects:
-    /// `ev_alias = ev_b` makes both names one object. Maps an event variable
-    /// (or element key `arr[i]`) to the event it currently aliases;
-    /// `EVENT_NULL_KEY` marks a null handle. Trigger/`.triggered`/wait_order
-    /// all chase this map to the canonical key first.
-    event_aliases: HashMap<String, String>,
     /// Fast-path NBA buffer: pre-resolved (signal_id, value) pairs.
     nba_fast: Vec<NbaFast>,
     /// Reverse index: signal_id → most recent index in `nba_fast` for that
@@ -3692,12 +3708,6 @@ pub struct Simulator {
     cond_progress: u64,
     /// SV-2023: real-precision time tracker (parallel to integer `time`).
     real_time: f64,
-    /// SV-2023: blocked mailbox `get`/`peek` proxies keyed by mailbox handle.
-    /// Each waiter records the suspended process pid, the destination lvalue
-    /// expression to receive the value, and the post-get continuation
-    /// statements. `put` drains a waiter, assigns the value into its lvalue,
-    /// and re-schedules the continuation at the current time.
-    mailbox_get_waiters: HashMap<usize, std::collections::VecDeque<MailboxGetWaiter>>,
     /// IEEE 1800-2023 §9.3.2: a fork child's WRITES to the parent's automatic
     /// variables must be visible to the parent after the child finishes. xezim
     /// gives each child a COPY of the parent's locals (see
@@ -3719,29 +3729,12 @@ pub struct Simulator {
     /// child's changed values back INTO `self.signals` (true shared storage,
     /// per §6.21's enclosing-scope rule).
     fork_signal_captures: HashMap<usize, Vec<String>>,
-    /// Processes blocked in `semaphore.get()` on an under-full semaphore.
-    semaphore_get_waiters: HashMap<usize, std::collections::VecDeque<SemGetWaiter>>,
     /// IEEE 1800-2017 §9.4.5 intra-assignment delay (`lhs = #d rhs`): RHS
     /// values captured at statement execution, keyed by the slot index baked
     /// into the synthesized `$__xz_intra_saved(idx)` continuation. Taken
     /// (removed) when the delayed assignment fires.
     intra_saved: HashMap<u64, Value>,
     intra_saved_next: u64,
-    /// LRM §15.5.3: per-named-event last-trigger time. `e.triggered`
-    /// returns 1 iff this map's `time` matches the current simulation time
-    /// (i.e. the event has been triggered in the same time slot as the
-    /// query). EventTrigger handler stamps this.
-    event_triggered_time: HashMap<String, u64>,
-    /// Processes waiting for signal edge events (@(posedge clk), etc.)
-    event_waiters: Vec<EventWaiter>,
-    /// Processes parked on a class-field named event (`@m_event` inside a
-    /// method on `this`). Woken directly by `fire_instance_event` when the
-    /// matching `->m_event` runs; see `InstanceEventWaiter`.
-    instance_event_waiters: Vec<InstanceEventWaiter>,
-    /// Covergroups waiting for sampling events
-    cg_event_waiters: Vec<(usize, Vec<SensitivityId>)>,
-    /// Swap buffer for event_waiters filtering (avoids allocation per cycle)
-    event_waiters_swap: Vec<EventWaiter>,
     /// VCD dump state
     vcd_file: Option<String>,
     vcd_writer: Option<super::vcd_sink::VcdSink>,
@@ -6456,14 +6449,24 @@ impl Simulator {
             next_dyn_id: 0,
             string_signals: HashSet::default(),
             queue_frame_saves: Vec::new(),
-            mailboxes: HashMap::default(),
-            mailbox_bound: HashMap::default(),
-            mailbox_put_waiters: HashMap::default(),
+            ipc: IpcState {
+                mailboxes: HashMap::default(),
+                mailbox_bound: HashMap::default(),
+                mailbox_put_waiters: HashMap::default(),
+                mailbox_get_waiters: HashMap::default(),
+                semaphores: HashMap::default(),
+                semaphore_get_waiters: HashMap::default(),
+                event_aliases: HashMap::default(),
+                event_triggered_time: HashMap::default(),
+                event_waiters: Vec::new(),
+                instance_event_waiters: Vec::new(),
+                cg_event_waiters: Vec::new(),
+                event_waiters_swap: Vec::new(),
+            },
             randomize_depth: 0,
             randc_used: HashMap::default(),
             randc_pending: HashMap::default(),
             dist_decks: HashMap::default(),
-            semaphores: HashMap::default(),
             cg_heap: vec![None],
             assertion_stats: HashMap::default(),
             local_stack: vec![],
@@ -6526,7 +6529,6 @@ impl Simulator {
             pending_nba_instance_triggers: Vec::new(),
             active_task_pids: HashMap::default(),
             finish_deferred: false,
-            event_aliases: HashMap::default(),
             nba_fast: Vec::new(),
             // Named signals stay on the dense hot path. Unnamed large-array
             // elements use NbaFastIndex's sparse tail.
@@ -6575,17 +6577,10 @@ impl Simulator {
             task_cleanup: Vec::new(),
             cond_progress: 0,
             real_time: 0.0,
-            mailbox_get_waiters: HashMap::default(),
             fork_baselines: HashMap::default(),
             fork_signal_captures: HashMap::default(),
-            semaphore_get_waiters: HashMap::default(),
             intra_saved: HashMap::default(),
             intra_saved_next: 0,
-            event_triggered_time: HashMap::default(),
-            event_waiters: Vec::new(),
-            instance_event_waiters: Vec::new(),
-            cg_event_waiters: Vec::new(),
-            event_waiters_swap: Vec::new(),
             vcd_file: None,
             vcd_writer: None,
             vcd_trace: Vec::new(),
@@ -10403,9 +10398,9 @@ impl Simulator {
                 spec: None,
                 }));
                 if kind == "semaphore" {
-                    self.semaphores.insert(ch, 0);
+                    self.ipc.semaphores.insert(ch, 0);
                 } else {
-                    self.mailboxes.insert(ch, std::collections::VecDeque::new());
+                    self.ipc.mailboxes.insert(ch, std::collections::VecDeque::new());
                 }
                 Value::from_u64(ch as u64, 32)
             } else if is_new {
@@ -19700,7 +19695,7 @@ impl Simulator {
             sim_dbg_eprintln!(
                 "[OPT] edge blocks: {}, event_waiters: {}",
                 self.edge_blocks.len(),
-                self.event_waiters.len()
+                self.ipc.event_waiters.len()
             );
         }
         self.comb_unresolved_idx = entries
@@ -22817,19 +22812,19 @@ impl Simulator {
     /// ends by --max-time without $finish, and (abbreviated) with
     /// XEZIM_PROGRESS ticks.
     fn report_parked_waiters(&mut self, max_n: usize) {
-        if self.event_waiters.is_empty() && self.proc.condition_waiters.is_empty() {
+        if self.ipc.event_waiters.is_empty() && self.proc.condition_waiters.is_empty() {
             return;
         }
-        let mut order: Vec<usize> = (0..self.event_waiters.len()).collect();
-        order.sort_by_key(|&i| self.event_waiters[i].parked_time);
+        let mut order: Vec<usize> = (0..self.ipc.event_waiters.len()).collect();
+        order.sort_by_key(|&i| self.ipc.event_waiters[i].parked_time);
         eprintln!(
             "[xezim][hang-report] {} event waiter(s), {} condition waiter(s) parked at sim time {}; oldest first:",
-            self.event_waiters.len(),
+            self.ipc.event_waiters.len(),
             self.proc.condition_waiters.len(),
             self.time
         );
         for &i in order.iter().take(max_n) {
-            let w = &self.event_waiters[i];
+            let w = &self.ipc.event_waiters[i];
             let age = self.time.saturating_sub(w.parked_time);
             let mut sens_desc: Vec<String> = Vec::new();
             for (k, sid) in w.resolved_sensitivities.iter().enumerate() {
@@ -23533,7 +23528,7 @@ impl Simulator {
                 }
             }
             let waiter_pids: Vec<usize> = self
-                .event_waiters
+                .ipc.event_waiters
                 .iter()
                 .map(|w| w.pid)
                 .chain(self.proc.condition_waiters.iter().map(|(p, _)| *p))
@@ -23778,7 +23773,7 @@ impl Simulator {
         }
         // Blocked on @(...) — if it is also a top spinner, something keeps
         // re-triggering it at this timestamp.
-        if let Some(w) = self.event_waiters.iter().find(|w| w.pid == pid) {
+        if let Some(w) = self.ipc.event_waiters.iter().find(|w| w.pid == pid) {
             let sens = w
                 .resolved_sensitivities
                 .iter()
@@ -24404,7 +24399,7 @@ impl Simulator {
                 "[xezim] event_loop start: finished={} eq.empty={} waiters={} clocks={}",
                 self.finished,
                 self.event_queue.is_empty(),
-                self.event_waiters.len(),
+                self.ipc.event_waiters.len(),
                 self.clock_generators.len()
             );
         }
@@ -24415,8 +24410,8 @@ impl Simulator {
                 self.report_parked_waiters(12);
             }
             // Dead-clock watchdog: cheap periodic check (every 1024 iters).
-            if sc_enabled && !wd_warned && (iters & 1023) == 0 && !self.event_waiters.is_empty() {
-                if let Some(w) = self.event_waiters.iter().min_by_key(|w| w.parked_time) {
+            if sc_enabled && !wd_warned && (iters & 1023) == 0 && !self.ipc.event_waiters.is_empty() {
+                if let Some(w) = self.ipc.event_waiters.iter().min_by_key(|w| w.parked_time) {
                     let cur_sigs: Vec<usize> =
                         w.resolved_sensitivities.iter().map(|s| s.signal_id).collect();
                     let cur_bits: Vec<(u64, u64)> = cur_sigs
@@ -24491,10 +24486,10 @@ impl Simulator {
                     sim_start.elapsed().as_secs_f64(), self.time, iters,
                     self.stall_iters,
                     self.prof_edges_fired, self.nba_fast.len() + self.nba_queue.len(),
-                    self.event_waiters.len());
+                    self.ipc.event_waiters.len());
                 // Oldest parked waiter one-liner: an ancient waiter whose
                 // signals never moved is the signature of a dead-clock hang.
-                if let Some(w) = self.event_waiters.iter().min_by_key(|w| w.parked_time) {
+                if let Some(w) = self.ipc.event_waiters.iter().min_by_key(|w| w.parked_time) {
                     let age = self.time.saturating_sub(w.parked_time);
                     let all_dead = w
                         .resolved_sensitivities
@@ -24556,7 +24551,7 @@ impl Simulator {
             }
 
             let has_timed = !self.event_queue.is_empty();
-            let has_waiters = !self.event_waiters.is_empty();
+            let has_waiters = !self.ipc.event_waiters.is_empty();
             let has_clocks = !self.clock_generators.is_empty();
             let has_reactive = !self.pending_reactive.is_empty();
 
@@ -27210,7 +27205,7 @@ impl Simulator {
                                 return;
                             }
                             let mbx_empty = self
-                                .mailboxes
+                                .ipc.mailboxes
                                 .get(&handle)
                                 .map(|q| q.is_empty())
                                 .unwrap_or(false);
@@ -27223,7 +27218,7 @@ impl Simulator {
                                 // pair deadlocked after filling the bound once.
                                 self.admit_mailbox_put_waiter(handle);
                             }
-                            if let Some(q) = self.mailboxes.get(&handle) {
+                            if let Some(q) = self.ipc.mailboxes.get(&handle) {
                                 if q.is_empty() {
                                     // Blocking get/peek on an empty mailbox: park
                                     // until a put hands over a value. peek leaves
@@ -27232,7 +27227,7 @@ impl Simulator {
                                     // try_gets it).
                                     let lvalue = args[0].clone();
                                     let cont = pc.resume_at(pc.start + i + 1);
-                                    self.mailbox_get_waiters
+                                    self.ipc.mailbox_get_waiters
                                         .entry(handle)
                                         .or_default()
                                         .push_back(MailboxGetWaiter {
@@ -27253,13 +27248,13 @@ impl Simulator {
                         if let Some(recv) = recv_expr_opt.clone() {
                             let recv_val = self.eval_expr(&recv);
                             let handle = recv_val.to_u64().unwrap_or(0) as usize;
-                            let bound = self.mailbox_bound.get(&handle).copied().unwrap_or(0);
+                            let bound = self.ipc.mailbox_bound.get(&handle).copied().unwrap_or(0);
                             if bound > 0 {
-                                let len = self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
+                                let len = self.ipc.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
                                 if len >= bound {
                                     let value = self.eval_expr(&args[0]);
                                     let cont = pc.resume_at(pc.start + i + 1);
-                                    self.mailbox_put_waiters
+                                    self.ipc.mailbox_put_waiters
                                         .entry(handle)
                                         .or_default()
                                         .push_back(MailboxPutWaiter { pid, value, cont });
@@ -27276,14 +27271,14 @@ impl Simulator {
                         if let Some(recv) = recv_expr_opt {
                             let recv_val = self.eval_expr(&recv);
                             let handle = recv_val.to_u64().unwrap_or(0) as usize;
-                            if let Some(&count) = self.semaphores.get(&handle) {
+                            if let Some(&count) = self.ipc.semaphores.get(&handle) {
                                 let n = args
                                     .first()
                                     .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
                                     .unwrap_or(1) as i64;
                                 if count < n {
                                     let cont = pc.resume_at(pc.start + i + 1);
-                                    self.semaphore_get_waiters
+                                    self.ipc.semaphore_get_waiters
                                         .entry(handle)
                                         .or_default()
                                         .push_back(SemGetWaiter { pid, n, cont });
@@ -27397,11 +27392,11 @@ impl Simulator {
                 let stamp_now = |sim: &Self, nm: &str| -> bool {
                     let now = sim.time;
                     let canon = sim.resolve_event_key(nm);
-                    if sim.event_triggered_time.get(canon.as_str()) == Some(&now) {
+                    if sim.ipc.event_triggered_time.get(canon.as_str()) == Some(&now) {
                         return true;
                     }
                     let pref = format!("{}.{}", sim.module.name, canon);
-                    sim.event_triggered_time.get(pref.as_str()) == Some(&now)
+                    sim.ipc.event_triggered_time.get(pref.as_str()) == Some(&now)
                 };
                 let mut next_k = k;
                 let mut outcome: Option<bool> = None; // Some(true)=pass, Some(false)=fail
@@ -27487,7 +27482,7 @@ impl Simulator {
                                 self.signal_name_to_id.contains_key(s.signal_name.as_str())
                             })
                         {
-                            { let w = self.make_event_waiter(pid, sens, cont); self.event_waiters.push(w); }
+                            { let w = self.make_event_waiter(pid, sens, cont); self.ipc.event_waiters.push(w); }
                         } else {
                             eprintln!(
                                 "[xezim][warning] wait_order at time {}: none of the named events resolve to declared events; process will not resume (IEEE 1800-2017 §15.5.3)",
@@ -27599,7 +27594,7 @@ impl Simulator {
                                 let mut cont = vec![*body.clone()];
                                 // Chain the caller's tail rather than copying it (ProcCont::pushed).
                                 let cont = pc.pushed(cont, pc.start + i + 1);
-                                self.instance_event_waiters.push(InstanceEventWaiter {
+                                self.ipc.instance_event_waiters.push(InstanceEventWaiter {
                                     key,
                                     pid,
                                     continuation: cont,
@@ -27621,7 +27616,7 @@ impl Simulator {
                                 let cont = vec![*body.clone()];
                                 // Chain the caller's tail rather than copying it.
                                 let cont = pc.pushed(cont, pc.start + i + 1);
-                                self.instance_event_waiters.push(InstanceEventWaiter {
+                                self.ipc.instance_event_waiters.push(InstanceEventWaiter {
                                     key,
                                     pid,
                                     continuation: cont,
@@ -27652,7 +27647,7 @@ impl Simulator {
                                     iff: None,
                                     value_of: None,
                                 }];
-                                { let w = self.make_event_waiter_kind(pid, sens, cont, false); self.event_waiters.push(w); }
+                                { let w = self.make_event_waiter_kind(pid, sens, cont, false); self.ipc.event_waiters.push(w); }
                                 return;
                             }
                         }
@@ -27679,7 +27674,7 @@ impl Simulator {
                                 self.signal_name_to_id.contains_key(s.signal_name.as_str())
                             });
                             if has_real {
-                                { let w = self.make_event_waiter_kind(pid, sens, cont, is_clk_ev); self.event_waiters.push(w); }
+                                { let w = self.make_event_waiter_kind(pid, sens, cont, is_clk_ev); self.ipc.event_waiters.push(w); }
                             } else {
                                 // `@(x)` where x is not a real signal — a
                                 // procedural local that was NBA-assigned then
@@ -27836,7 +27831,7 @@ impl Simulator {
                                     pc.resume_at(pc.start + i + 1),
                                 );
                                 waiter.remaining_events = n;
-                                self.event_waiters.push(waiter);
+                                self.ipc.event_waiters.push(waiter);
                                 return;
                             }
                         }
@@ -28963,7 +28958,7 @@ impl Simulator {
                                     sens,
                                     pc.pushed(cont, resume_at),
                                     is_clk_ev,
-                                ); self.event_waiters.push(w); }
+                                ); self.ipc.event_waiters.push(w); }
                             return;
                         }
                     }
@@ -29965,9 +29960,9 @@ impl Simulator {
                 }
             }
         }
-        for i in 0..self.event_waiters.len() {
-            for j in 0..self.event_waiters[i].resolved_sensitivities.len() {
-                let sid = self.event_waiters[i].resolved_sensitivities[j].signal_id;
+        for i in 0..self.ipc.event_waiters.len() {
+            for j in 0..self.ipc.event_waiters[i].resolved_sensitivities.len() {
+                let sid = self.ipc.event_waiters[i].resolved_sensitivities[j].signal_id;
                 snap_one(
                     sid,
                     &self.signal_table,
@@ -29978,9 +29973,9 @@ impl Simulator {
                 );
             }
         }
-        for i in 0..self.cg_event_waiters.len() {
-            for j in 0..self.cg_event_waiters[i].1.len() {
-                let sid = self.cg_event_waiters[i].1[j].signal_id;
+        for i in 0..self.ipc.cg_event_waiters.len() {
+            for j in 0..self.ipc.cg_event_waiters[i].1.len() {
+                let sid = self.ipc.cg_event_waiters[i].1[j].signal_id;
                 snap_one(
                     sid,
                     &self.signal_table,
@@ -30430,11 +30425,11 @@ impl Simulator {
     /// before process continuations (and classic mode after edge blocks).
     fn sample_edge_covergroups(&mut self) {
         let _t_cg = self.profile_timing.then(std::time::Instant::now);
-        for i in 0..self.cg_event_waiters.len() {
-            let handle = self.cg_event_waiters[i].0;
+        for i in 0..self.ipc.cg_event_waiters.len() {
+            let handle = self.ipc.cg_event_waiters[i].0;
             let mut triggered = false;
-            for j in 0..self.cg_event_waiters[i].1.len() {
-                let sid = &self.cg_event_waiters[i].1[j];
+            for j in 0..self.ipc.cg_event_waiters[i].1.len() {
+                let sid = &self.ipc.cg_event_waiters[i].1[j];
                 if self.check_edge_id(sid.signal_id, sid.edge) {
                     triggered = true;
                     break;
@@ -30456,9 +30451,9 @@ impl Simulator {
     /// drain and the commercial-order pre-edge-block drain (see
     /// XEZIM_WAITERS_FIRST in check_edges_inner).
     fn drain_triggered_event_waiters(&mut self) -> Vec<(usize, ProcCont)> {
-        let waiters = std::mem::take(&mut self.event_waiters);
+        let waiters = std::mem::take(&mut self.ipc.event_waiters);
         self.prof_waiter_iters += waiters.len() as u64;
-        self.event_waiters_swap.clear();
+        self.ipc.event_waiters_swap.clear();
         let mut triggered_conts: Vec<(usize, ProcCont)> = Vec::new();
         for mut waiter in waiters {
             let mut triggered = false;
@@ -30541,10 +30536,10 @@ impl Simulator {
                             Some(self.signal_table[sid.signal_id].clone());
                     }
                 }
-                self.event_waiters_swap.push(waiter);
+                self.ipc.event_waiters_swap.push(waiter);
             }
         }
-        std::mem::swap(&mut self.event_waiters, &mut self.event_waiters_swap);
+        std::mem::swap(&mut self.ipc.event_waiters, &mut self.ipc.event_waiters_swap);
         // Within-region process resumption order is LRM-indeterminate
         // (§4.7), but the reference simulator wakes the LAST-armed waiter
         // first — and this campaign matches the reference's observable
@@ -30955,7 +30950,7 @@ impl Simulator {
             // (which may immediately drive the next stimulus value).
             self.sample_edge_covergroups();
         }
-        if waiters_first && !self.event_waiters.is_empty() {
+        if waiters_first && !self.ipc.event_waiters.is_empty() {
             let _t_w = self.profile_timing.then(std::time::Instant::now);
             // Drain and run triggered waiters, then RE-DRAIN: a resumed
             // continuation may `-> ev` or write a signal that triggers ANOTHER
@@ -45735,9 +45730,9 @@ impl Simulator {
                                         .first()
                                         .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64)
                                         .unwrap_or(0);
-                                    self.semaphores.insert(handle, n);
+                                    self.ipc.semaphores.insert(handle, n);
                                 } else {
-                                    self.mailboxes
+                                    self.ipc.mailboxes
                                         .insert(handle, std::collections::VecDeque::new());
                                     self.record_mailbox_bound(handle, args);
                                 }
@@ -45802,7 +45797,7 @@ impl Simulator {
                                         .first()
                                         .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64)
                                         .unwrap_or(0);
-                                    self.semaphores.insert(handle, initial_count);
+                                    self.ipc.semaphores.insert(handle, initial_count);
                                     Value::from_u64(handle as u64, 32)
                                 } else if tname == "mailbox" {
                                     let handle = self.oop.heap.len();
@@ -45812,7 +45807,7 @@ impl Simulator {
                                         type_bindings: HashMap::default(),
                                     spec: None,
                                     }));
-                                    self.mailboxes
+                                    self.ipc.mailboxes
                                         .insert(handle, std::collections::VecDeque::new());
                                     self.record_mailbox_bound(handle, args);
                                     Value::from_u64(handle as u64, 32)
@@ -47976,7 +47971,7 @@ impl Simulator {
                             if let Some(key) = self.resolve_this_event_field(&fname) {
                                 let cont = vec![*stmt.clone()];
                                 let pid = self.proc.current_pid;
-                                self.instance_event_waiters.push(InstanceEventWaiter {
+                                self.ipc.instance_event_waiters.push(InstanceEventWaiter {
                                     key,
                                     pid,
                                     continuation: cont.into(),
@@ -47997,7 +47992,7 @@ impl Simulator {
                             {
                                 let cont = vec![*stmt.clone()];
                                 let pid = self.proc.current_pid;
-                                self.instance_event_waiters.push(InstanceEventWaiter {
+                                self.ipc.instance_event_waiters.push(InstanceEventWaiter {
                                     key,
                                     pid,
                                     continuation: cont.into(),
@@ -48018,7 +48013,7 @@ impl Simulator {
                         // If we are here, it's a nested timing control which we don't fully support yet.
                         let cont = vec![*stmt.clone()];
                         let pid = self.cg_this.unwrap_or(0); // placeholder
-                        { let w = self.make_event_waiter_kind(pid, sens, cont.into(), is_clk_ev); self.event_waiters.push(w); }
+                        { let w = self.make_event_waiter_kind(pid, sens, cont.into(), is_clk_ev); self.ipc.event_waiters.push(w); }
                         self.break_flag = true;
                         return;
                     }
@@ -48105,12 +48100,12 @@ impl Simulator {
                             self.proc.process_parents.remove(&pid);
                             self.proc.process_contexts.remove(&pid);
                         }
-                        self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
-                        self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
-                        for q in self.mailbox_get_waiters.values_mut() {
+                        self.ipc.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                        self.ipc.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                        for q in self.ipc.mailbox_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
                         }
-                        for q in self.semaphore_get_waiters.values_mut() {
+                        for q in self.ipc.semaphore_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
                         }
                         self.release_killed_from_join_waiters(&to_kill);
@@ -48124,12 +48119,12 @@ impl Simulator {
                         self.proc.killed_pids.insert(pid);
                         self.proc.process_parents.remove(&pid);
                         self.proc.process_contexts.remove(&pid);
-                        self.event_waiters.retain(|w| w.pid != pid);
-                        self.instance_event_waiters.retain(|w| w.pid != pid);
-                        for q in self.mailbox_get_waiters.values_mut() {
+                        self.ipc.event_waiters.retain(|w| w.pid != pid);
+                        self.ipc.instance_event_waiters.retain(|w| w.pid != pid);
+                        for q in self.ipc.mailbox_get_waiters.values_mut() {
                             q.retain(|w| w.pid != pid);
                         }
-                        for q in self.semaphore_get_waiters.values_mut() {
+                        for q in self.ipc.semaphore_get_waiters.values_mut() {
                             q.retain(|w| w.pid != pid);
                         }
                         let mut killed: HashSet<usize> = HashSet::default();
@@ -48154,12 +48149,12 @@ impl Simulator {
                             self.proc.process_parents.remove(&pid);
                             self.proc.process_contexts.remove(&pid);
                         }
-                        self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
-                        self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
-                        for q in self.mailbox_get_waiters.values_mut() {
+                        self.ipc.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                        self.ipc.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                        for q in self.ipc.mailbox_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
                         }
-                        for q in self.semaphore_get_waiters.values_mut() {
+                        for q in self.ipc.semaphore_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
                         }
                         self.release_killed_from_join_waiters(&to_kill);
@@ -48200,12 +48195,12 @@ impl Simulator {
                     // --max-time instead of finishing.)
                     self.event_queue.remove_pid(pid);
                 }
-                self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
-                self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
-                for q in self.mailbox_get_waiters.values_mut() {
+                self.ipc.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                self.ipc.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                for q in self.ipc.mailbox_get_waiters.values_mut() {
                     q.retain(|w| !to_kill.contains(&w.pid));
                 }
-                for q in self.semaphore_get_waiters.values_mut() {
+                for q in self.ipc.semaphore_get_waiters.values_mut() {
                     q.retain(|w| !to_kill.contains(&w.pid));
                 }
                 // A killed process must no longer hold back a join waiter: drop
@@ -49745,7 +49740,7 @@ impl Simulator {
     fn resolve_event_key(&self, name: &str) -> String {
         let mut cur = name;
         for _ in 0..16 {
-            match self.event_aliases.get(cur) {
+            match self.ipc.event_aliases.get(cur) {
                 Some(next) => cur = next,
                 None => break,
             }
@@ -49808,16 +49803,16 @@ impl Simulator {
             return false;
         };
         if matches!(rvalue.kind, ExprKind::Null) {
-            self.event_aliases
+            self.ipc.event_aliases
                 .insert(lkey, Self::EVENT_NULL_KEY.to_string());
             return true;
         }
         if let Some(rkey) = self.event_ref_key(rvalue) {
             let target = self.resolve_event_key(&rkey);
             if target == lkey {
-                self.event_aliases.remove(&lkey);
+                self.ipc.event_aliases.remove(&lkey);
             } else {
-                self.event_aliases.insert(lkey, target);
+                self.ipc.event_aliases.insert(lkey, target);
             }
             return true;
         }
@@ -49827,11 +49822,11 @@ impl Simulator {
         let sv = v.to_sv_string();
         if !sv.is_empty()
             && (self.module.events.contains(sv.as_str())
-                || self.event_aliases.contains_key(sv.as_str())
-                || self.event_triggered_time.contains_key(sv.as_str()))
+                || self.ipc.event_aliases.contains_key(sv.as_str())
+                || self.ipc.event_triggered_time.contains_key(sv.as_str()))
         {
             let target = self.resolve_event_key(&sv);
-            self.event_aliases.insert(lkey, target);
+            self.ipc.event_aliases.insert(lkey, target);
             return true;
         }
         false
@@ -49861,8 +49856,8 @@ impl Simulator {
                 let sv = v.to_sv_string();
                 if !sv.is_empty()
                     && (self.module.events.contains(sv.as_str())
-                        || self.event_aliases.contains_key(sv.as_str())
-                        || self.event_triggered_time.contains_key(sv.as_str()))
+                        || self.ipc.event_aliases.contains_key(sv.as_str())
+                        || self.ipc.event_triggered_time.contains_key(sv.as_str()))
                 {
                     keys.push(sv);
                 }
@@ -49871,7 +49866,7 @@ impl Simulator {
         // `h.ce.triggered` / `this.ce.triggered` — a per-instance class event.
         if let Some(k) = self.expr_handle_event_field(e) {
             let stamp = Self::instance_event_stamp_key(&k);
-            if self.event_triggered_time.get(stamp.as_str()) == Some(&now) {
+            if self.ipc.event_triggered_time.get(stamp.as_str()) == Some(&now) {
                 return Some(true);
             }
             keys.push(stamp);
@@ -49886,11 +49881,11 @@ impl Simulator {
                 known_event = true;
                 continue;
             }
-            if self.event_triggered_time.get(canon.as_str()) == Some(&now) {
+            if self.ipc.event_triggered_time.get(canon.as_str()) == Some(&now) {
                 return Some(true);
             }
             if self.module.events.contains(canon.as_str())
-                || self.event_triggered_time.contains_key(canon.as_str())
+                || self.ipc.event_triggered_time.contains_key(canon.as_str())
             {
                 known_event = true;
             }
@@ -50227,9 +50222,9 @@ impl Simulator {
         // Instance events have no backing signal, so stamp the same table the
         // name-keyed path uses, under a synthetic per-instance key.
         let stamp = Self::instance_event_stamp_key(&key);
-        self.event_triggered_time.insert(stamp, now);
+        self.ipc.event_triggered_time.insert(stamp, now);
         let mut woken = Vec::new();
-        self.instance_event_waiters.retain(|w| {
+        self.ipc.instance_event_waiters.retain(|w| {
             if w.key == key {
                 woken.push((w.pid, w.continuation.clone()));
                 false
@@ -50294,14 +50289,14 @@ impl Simulator {
                         self.fast_signal_write(&sig_name, new_val);
                         // LRM §15.5.3: stamp last-trigger time so
                         // `e.triggered` returns 1 in the same time slot.
-                        self.event_triggered_time
+                        self.ipc.event_triggered_time
                             .insert(sig_name.clone(), self.time);
                     }
                 }
                 // Also stamp the bare name (covers cases where the signal
                 // lookup failed because the event was never registered as a
                 // signal — `.triggered` still reads correctly).
-                self.event_triggered_time
+                self.ipc.event_triggered_time
                     .insert(raw_name.to_string(), self.time);
                 // Settle combinatorial logic but defer edge-triggered blocks
                 // (always @(e)) to the main event loop so the triggering
@@ -57257,7 +57252,7 @@ impl Simulator {
                     let fired = self
                         .id_to_name
                         .get(id)
-                        .and_then(|n| self.event_triggered_time.get(n.as_ref()))
+                        .and_then(|n| self.ipc.event_triggered_time.get(n.as_ref()))
                         .copied()
                         == Some(now);
                     if fired && self.vcd_event_last[idx] != now {
@@ -57471,21 +57466,21 @@ impl Simulator {
     /// later, smaller request — that would starve a large getter.
     fn wake_semaphore_waiters(&mut self, handle: usize) {
         loop {
-            let count = self.semaphores.get(&handle).copied().unwrap_or(0);
+            let count = self.ipc.semaphores.get(&handle).copied().unwrap_or(0);
             let next_n = self
-                .semaphore_get_waiters
+                .ipc.semaphore_get_waiters
                 .get(&handle)
                 .and_then(|q| q.front())
                 .map(|w| w.n);
             match next_n {
                 Some(n) if count >= n => {
                     let w = self
-                        .semaphore_get_waiters
+                        .ipc.semaphore_get_waiters
                         .get_mut(&handle)
                         .unwrap()
                         .pop_front()
                         .unwrap();
-                    *self.semaphores.get_mut(&handle).unwrap() = count - n;
+                    *self.ipc.semaphores.get_mut(&handle).unwrap() = count - n;
                     if w.cont.is_empty() {
                         self.child_finished(w.pid);
                     } else {
@@ -57505,7 +57500,7 @@ impl Simulator {
             .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as usize)
             .unwrap_or(0);
         if bound > 0 {
-            self.mailbox_bound.insert(handle, bound);
+            self.ipc.mailbox_bound.insert(handle, bound);
         }
     }
 
@@ -57513,20 +57508,20 @@ impl Simulator {
     /// (store its value, resume the producer). No-op for an unbounded mailbox or
     /// when no producer is waiting.
     fn admit_mailbox_put_waiter(&mut self, handle: usize) {
-        let bound = self.mailbox_bound.get(&handle).copied().unwrap_or(0);
+        let bound = self.ipc.mailbox_bound.get(&handle).copied().unwrap_or(0);
         if bound == 0 {
             return;
         }
-        let len = self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
+        let len = self.ipc.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
         if len >= bound {
             return;
         }
         if let Some(w) = self
-            .mailbox_put_waiters
+            .ipc.mailbox_put_waiters
             .get_mut(&handle)
             .and_then(|q| q.pop_front())
         {
-            self.mailboxes.get_mut(&handle).unwrap().push_back(w.value);
+            self.ipc.mailboxes.get_mut(&handle).unwrap().push_back(w.value);
             if w.cont.is_empty() {
                 self.child_finished(w.pid);
             } else {
@@ -57570,7 +57565,7 @@ impl Simulator {
         if self.event_queue.has_pid(pid) {
             return true;
         }
-        if self.event_waiters.iter().any(|w| w.pid == pid) {
+        if self.ipc.event_waiters.iter().any(|w| w.pid == pid) {
             return true;
         }
         if self.proc.condition_waiters.iter().any(|(p, _)| *p == pid) {
@@ -57596,7 +57591,7 @@ impl Simulator {
         // so the put-wake's writeback chain back to the caller's `req` read empty and
         // delivered a null handle (item data=0). Count it as suspended.
         if self
-            .mailbox_get_waiters
+            .ipc.mailbox_get_waiters
             .values()
             .any(|q| q.iter().any(|w| w.pid == pid))
         {
@@ -57607,7 +57602,7 @@ impl Simulator {
         // `InstanceEventWaiter`. Without this a `fork...join_any` whose child
         // is the `@m_event` waiter (e.g. event abort branch) fired
         // the join prematurely, killing the loop branch.
-        if self.instance_event_waiters.iter().any(|w| w.pid == pid) {
+        if self.ipc.instance_event_waiters.iter().any(|w| w.pid == pid) {
             return true;
         }
         // §15.4.1: a producer parked on a FULL bounded mailbox, and §15.3.3 a
@@ -57616,14 +57611,14 @@ impl Simulator {
         // ProcessContext was discarded (losing its loop state) and an
         // enclosing `fork ... join` completed while it was still mid-loop.
         if self
-            .mailbox_put_waiters
+            .ipc.mailbox_put_waiters
             .values()
             .any(|q| q.iter().any(|w| w.pid == pid))
         {
             return true;
         }
         if self
-            .semaphore_get_waiters
+            .ipc.semaphore_get_waiters
             .values()
             .any(|q| q.iter().any(|w| w.pid == pid))
         {
@@ -57716,14 +57711,14 @@ impl Simulator {
         for &p in &to_kill {
             self.event_queue.remove_pid(p);
         }
-        self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
-        self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
+        self.ipc.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+        self.ipc.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
         self.proc.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
         self.proc.inactive_queue.retain(|(p, _)| !to_kill.contains(p));
-        for q in self.mailbox_get_waiters.values_mut() {
+        for q in self.ipc.mailbox_get_waiters.values_mut() {
             q.retain(|w| !to_kill.contains(&w.pid));
         }
-        for q in self.semaphore_get_waiters.values_mut() {
+        for q in self.ipc.semaphore_get_waiters.values_mut() {
             q.retain(|w| !to_kill.contains(&w.pid));
         }
         self.release_killed_from_join_waiters(&to_kill);
@@ -57775,8 +57770,8 @@ impl Simulator {
             return;
         }
         // 2) Event control (event_waiters)
-        if let Some(idx) = self.event_waiters.iter().position(|w| w.pid == pid) {
-            let waiter = self.event_waiters.remove(idx);
+        if let Some(idx) = self.ipc.event_waiters.iter().position(|w| w.pid == pid) {
+            let waiter = self.ipc.event_waiters.remove(idx);
             self.proc.suspended_pids.insert(pid);
             self.proc.suspended_proc_info.insert(
                 pid,
@@ -57814,7 +57809,7 @@ impl Simulator {
             return;
         }
         // 5) Mailbox get / semaphore get
-        for q in self.mailbox_get_waiters.values_mut() {
+        for q in self.ipc.mailbox_get_waiters.values_mut() {
             if let Some(idx) = q.iter().position(|w| w.pid == pid) {
                 if let Some(waiter) = q.remove(idx) {
                     self.proc.suspended_pids.insert(pid);
@@ -57829,7 +57824,7 @@ impl Simulator {
                 }
             }
         }
-        for q in self.semaphore_get_waiters.values_mut() {
+        for q in self.ipc.semaphore_get_waiters.values_mut() {
             if let Some(idx) = q.iter().position(|w| w.pid == pid) {
                 if let Some(waiter) = q.remove(idx) {
                     self.proc.suspended_pids.insert(pid);
@@ -58578,7 +58573,7 @@ impl Simulator {
             let triggered = self
                 .id_to_name
                 .get(id)
-                .and_then(|n| self.event_triggered_time.get(n.as_ref()))
+                .and_then(|n| self.ipc.event_triggered_time.get(n.as_ref()))
                 .copied()
                 == Some(now);
             if triggered && self.xtrace_event_last[idx] != now {
@@ -68697,7 +68692,7 @@ impl Simulator {
             "num" | "put" | "get" | "peek" | "try_put" | "try_get" | "try_peek"
         ) {
             if let Some(handle) = self.resolve_container_handle(obj_name) {
-                if self.mailboxes.contains_key(&handle) || self.semaphores.contains_key(&handle) {
+                if self.ipc.mailboxes.contains_key(&handle) || self.ipc.semaphores.contains_key(&handle) {
                     return None;
                 }
             }
@@ -68974,12 +68969,12 @@ impl Simulator {
         }
         if mname == "num" {
             // §15.4.2: a mailbox's `num()` counts queued messages, which live in
-            // `self.mailboxes` (keyed by handle), not in `obj[i]` signal slots.
+            // `self.ipc.mailboxes` (keyed by handle), not in `obj[i]` signal slots.
             // This expression path (e.g. `m.num()` inside `$display(...)`) must
             // resolve the handle before falling back to the queue/assoc count.
             if let Some(handle_val) = self.get_signal_value_by_name(obj_name) {
                 let handle = handle_val.to_u64().unwrap_or(0) as usize;
-                if let Some(q) = self.mailboxes.get(&handle) {
+                if let Some(q) = self.ipc.mailboxes.get(&handle) {
                     return Some(Value::from_u64(q.len() as u64, 32));
                 }
             }
@@ -69443,9 +69438,9 @@ impl Simulator {
                     spec: None,
                 }));
                 if kind == "semaphore" {
-                    self.semaphores.insert(ch, 0);
+                    self.ipc.semaphores.insert(ch, 0);
                 } else {
-                    self.mailboxes.insert(ch, std::collections::VecDeque::new());
+                    self.ipc.mailboxes.insert(ch, std::collections::VecDeque::new());
                 }
                 Value::from_u64(ch as u64, 32)
             } else {
@@ -73170,9 +73165,9 @@ impl Simulator {
                     // in EXPRESSION context (e.g. a forked producer); without
                     // the delivery the parked consumer never resumed and the
                     // schedule deadlocked.
-                    if self.mailboxes.contains_key(&handle) {
+                    if self.ipc.mailboxes.contains_key(&handle) {
                         let waiter = self
-                            .mailbox_get_waiters
+                            .ipc.mailbox_get_waiters
                             .get_mut(&handle)
                             .and_then(|q| q.pop_front());
                         if let Some(MailboxGetWaiter {
@@ -73185,16 +73180,16 @@ impl Simulator {
                             if is_peek {
                                 // peek does not consume — leave the item for the
                                 // subsequent get/try_get.
-                                self.mailboxes
+                                self.ipc.mailboxes
                                     .get_mut(&handle)
                                     .unwrap()
                                     .push_back(v.clone());
                             }
                             self.deliver_to_mailbox_waiter(pid, &lvalue, v, cont);
-                        } else if let Some(q) = self.mailboxes.get_mut(&handle) {
+                        } else if let Some(q) = self.ipc.mailboxes.get_mut(&handle) {
                             q.push_back(v);
                         }
-                    } else if let Some(count) = self.semaphores.get_mut(&handle) {
+                    } else if let Some(count) = self.ipc.semaphores.get_mut(&handle) {
                         *count += v.to_u64().unwrap_or(1) as i64;
                         self.wake_semaphore_waiters(handle);
                     }
@@ -73206,11 +73201,11 @@ impl Simulator {
                 let handle = base.to_u64().unwrap_or(0) as usize;
                 let arg_val = args.first().map(|a| self.eval_expr(a));
 
-                if self.mailboxes.contains_key(&handle) {
-                    let has_item = !self.mailboxes[&handle].is_empty();
+                if self.ipc.mailboxes.contains_key(&handle) {
+                    let has_item = !self.ipc.mailboxes[&handle].is_empty();
                     if has_item {
                         let val = self
-                            .mailboxes
+                            .ipc.mailboxes
                             .get_mut(&handle)
                             .unwrap()
                             .pop_front()
@@ -73225,7 +73220,7 @@ impl Simulator {
                         // BLOCKING: simplified, just retry later or return for now
                         return Value::zero(32);
                     }
-                } else if let Some(count) = self.semaphores.get_mut(&handle) {
+                } else if let Some(count) = self.ipc.semaphores.get_mut(&handle) {
                     let n = arg_val.map(|v| v.to_u64().unwrap_or(1)).unwrap_or(1) as i64;
                     if *count >= n {
                         *count -= n;
@@ -73256,8 +73251,8 @@ impl Simulator {
                 // Only intercept a direct mailbox try_get. A non-mailbox receiver
                 // (whose user-defined `try_get` method delegates internally)
                 // must fall through to normal method dispatch.
-                if self.mailboxes.contains_key(&handle) {
-                    let val = self.mailboxes.get_mut(&handle).and_then(|q| q.pop_front());
+                if self.ipc.mailboxes.contains_key(&handle) {
+                    let val = self.ipc.mailboxes.get_mut(&handle).and_then(|q| q.pop_front());
                     if let (Some(v), Some(arg)) = (val, args.first()) {
                         let w = self.infer_lhs_width(arg);
                         self.assign_value(arg, &v.resize(w));
@@ -73269,12 +73264,12 @@ impl Simulator {
                 // §15.4.3: `semaphore.try_get(int key = 1)` — non-blocking
                 // attempt to procure `key` keys. Returns 1 on success (count
                 // decremented), 0 if not enough keys.
-                if self.semaphores.contains_key(&handle) {
+                if self.ipc.semaphores.contains_key(&handle) {
                     let n = args
                         .first()
                         .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
                         .unwrap_or(1) as i64;
-                    let count = self.semaphores.get_mut(&handle).unwrap();
+                    let count = self.ipc.semaphores.get_mut(&handle).unwrap();
                     if *count >= n && n >= 0 {
                         *count -= n;
                         return Value::from_u64(1, 32);
@@ -73903,7 +73898,7 @@ impl Simulator {
                 // returns garbage (the test saw `num()` == 0).
                 if m == "num" {
                     let h = self.eval_expr(&base_expr).to_u64().unwrap_or(0) as usize;
-                    if let Some(q) = self.mailboxes.get(&h) {
+                    if let Some(q) = self.ipc.mailboxes.get(&h) {
                         return Value::from_u64(q.len() as u64, 32);
                     }
                 }
@@ -74397,8 +74392,8 @@ impl Simulator {
                     let recv = Expression::new(ExprKind::Ident(head), func.span);
                     let handle = self.eval_expr(&recv).to_u64().unwrap_or(0) as usize;
                     if handle != 0
-                        && (self.mailboxes.contains_key(&handle)
-                            || self.semaphores.contains_key(&handle))
+                        && (self.ipc.mailboxes.contains_key(&handle)
+                            || self.ipc.semaphores.contains_key(&handle))
                     {
                         return self.exec_method_call(handle, method_name, args);
                     }
@@ -76833,7 +76828,7 @@ impl Simulator {
                         })
                 })
                 .collect();
-            self.cg_event_waiters.push((handle, resolved));
+            self.ipc.cg_event_waiters.push((handle, resolved));
         }
 
         Value::from_u64(handle as u64, 32)
@@ -78912,9 +78907,9 @@ impl Simulator {
                     spec: None,
                     }));
                     if kind == "semaphore" {
-                        self.semaphores.insert(ch, 0);
+                        self.ipc.semaphores.insert(ch, 0);
                     } else {
-                        self.mailboxes.insert(ch, std::collections::VecDeque::new());
+                        self.ipc.mailboxes.insert(ch, std::collections::VecDeque::new());
                     }
                     if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                         inst.properties
@@ -79175,7 +79170,7 @@ impl Simulator {
         }
 
         // Built-in mailbox / semaphore methods
-        if self.mailboxes.contains_key(&handle) {
+        if self.ipc.mailboxes.contains_key(&handle) {
             match method_name {
                 "put" => {
                     if let Some(arg) = args.first() {
@@ -79185,7 +79180,7 @@ impl Simulator {
                         // (skipping the queue) and reschedule its
                         // continuation at the current time.
                         let waiter = self
-                            .mailbox_get_waiters
+                            .ipc.mailbox_get_waiters
                             .get_mut(&handle)
                             .and_then(|q| q.pop_front());
                         if let Some(w) = waiter {
@@ -79198,23 +79193,23 @@ impl Simulator {
                             if is_peek {
                                 // peek doesn't consume — leave the item for the
                                 // subsequent get/try_get (sequencer item_done).
-                                self.mailboxes
+                                self.ipc.mailboxes
                                     .get_mut(&handle)
                                     .unwrap()
                                     .push_back(v.clone());
                             }
                             self.deliver_to_mailbox_waiter(pid, &lvalue, v, cont);
                         } else {
-                            self.mailboxes.get_mut(&handle).unwrap().push_back(v);
+                            self.ipc.mailboxes.get_mut(&handle).unwrap().push_back(v);
                         }
                     }
                     return Value::zero(32);
                 }
                 "get" | "peek" => {
                     let val = if method_name == "get" {
-                        self.mailboxes.get_mut(&handle).and_then(|q| q.pop_front())
+                        self.ipc.mailboxes.get_mut(&handle).and_then(|q| q.pop_front())
                     } else {
-                        self.mailboxes.get(&handle).and_then(|q| q.front().cloned())
+                        self.ipc.mailboxes.get(&handle).and_then(|q| q.front().cloned())
                     };
                     if let (Some(v), Some(arg)) = (val, args.first()) {
                         let w = self.infer_lhs_width(arg);
@@ -79231,16 +79226,16 @@ impl Simulator {
                         // §15.4.1: a bounded mailbox that is full rejects try_put
                         // (returns 0). A full box has no parked get-waiter (those
                         // park only on empty), so len>=bound is the whole test.
-                        let bound = self.mailbox_bound.get(&handle).copied().unwrap_or(0);
+                        let bound = self.ipc.mailbox_bound.get(&handle).copied().unwrap_or(0);
                         if bound > 0 {
-                            let len = self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
+                            let len = self.ipc.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
                             if len >= bound {
                                 return Value::zero(32);
                             }
                         }
                         let v = self.eval_expr(arg);
                         let waiter = self
-                            .mailbox_get_waiters
+                            .ipc.mailbox_get_waiters
                             .get_mut(&handle)
                             .and_then(|q| q.pop_front());
                         if let Some(w) = waiter {
@@ -79251,23 +79246,23 @@ impl Simulator {
                                 is_peek,
                             } = w;
                             if is_peek {
-                                self.mailboxes
+                                self.ipc.mailboxes
                                     .get_mut(&handle)
                                     .unwrap()
                                     .push_back(v.clone());
                             }
                             self.deliver_to_mailbox_waiter(pid, &lvalue, v, cont);
                         } else {
-                            self.mailboxes.get_mut(&handle).unwrap().push_back(v);
+                            self.ipc.mailboxes.get_mut(&handle).unwrap().push_back(v);
                         }
                     }
                     return Value::from_u64(1, 32);
                 }
                 "try_get" | "try_peek" => {
                     let val = if method_name == "try_get" {
-                        self.mailboxes.get_mut(&handle).and_then(|q| q.pop_front())
+                        self.ipc.mailboxes.get_mut(&handle).and_then(|q| q.pop_front())
                     } else {
-                        self.mailboxes.get(&handle).and_then(|q| q.front().cloned())
+                        self.ipc.mailboxes.get(&handle).and_then(|q| q.front().cloned())
                     };
                     if let (Some(v), Some(arg)) = (val, args.first()) {
                         let w = self.infer_lhs_width(arg);
@@ -79280,20 +79275,20 @@ impl Simulator {
                     return Value::zero(32);
                 }
                 "num" => {
-                    let n = self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
+                    let n = self.ipc.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
                     return Value::from_u64(n as u64, 32);
                 }
                 _ => {}
             }
         }
-        if self.semaphores.contains_key(&handle) {
+        if self.ipc.semaphores.contains_key(&handle) {
             match method_name {
                 "put" => {
                     let n = args
                         .first()
                         .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
                         .unwrap_or(1) as i64;
-                    *self.semaphores.get_mut(&handle).unwrap() += n;
+                    *self.ipc.semaphores.get_mut(&handle).unwrap() += n;
                     self.wake_semaphore_waiters(handle);
                     return Value::zero(32);
                 }
@@ -79302,7 +79297,7 @@ impl Simulator {
                         .first()
                         .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
                         .unwrap_or(1) as i64;
-                    let count = self.semaphores.get_mut(&handle).unwrap();
+                    let count = self.ipc.semaphores.get_mut(&handle).unwrap();
                     if *count >= n {
                         *count -= n;
                     }
@@ -79313,7 +79308,7 @@ impl Simulator {
                         .first()
                         .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
                         .unwrap_or(1) as i64;
-                    let count = self.semaphores.get_mut(&handle).unwrap();
+                    let count = self.ipc.semaphores.get_mut(&handle).unwrap();
                     if *count >= n {
                         *count -= n;
                         return Value::from_u64(1, 32);
