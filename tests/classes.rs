@@ -27,6 +27,8 @@ mod class_field_named_event;
 mod class_handle_return_preservation;
 #[path = "classes/var_class_types_name_collision.rs"]
 mod var_class_types_name_collision;
+#[path = "classes/typedef_extends_cast.rs"]
+mod typedef_extends_cast;
 #[path = "classes/class_local_typedef_aa.rs"]
 mod class_local_typedef_aa;
 #[path = "classes/class_local_typedef_resolution.rs"]

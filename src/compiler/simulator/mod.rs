@@ -68899,13 +68899,45 @@ impl Simulator {
 
     /// Is class `derived` the same as, or a subclass of, `base`? Walks the
     /// `extends` chain; compares parameter-stripped names (IEEE 1800-2023 §8.25).
+    fn typedef_unroll(&self, name: &str) -> String {
+        // Follow an `extends` target / derived class name through any typedef
+        // indirection to a real class base (specialization-stripped). e.g.
+        // `class seqA extends simple_seq;` where
+        // `typedef uvm_sequence #(simple_item) simple_seq;` — the heritage
+        // walk must continue from `uvm_sequence` (whose `extends` is
+        // `uvm_sequence_base`). Without this, a sequence declared through a
+        // typedef base was never recognized as a uvm_sequence_base and every
+        // sequence-library add failed `$cast` ([BAD_SEQ_TYPE]).
+        use crate::ast::types::DataType;
+        let mut cur = name;
+        let mut guard = 0;
+        while guard < 16 {
+            guard += 1;
+            let stripped = cur.split('#').next().unwrap_or(cur);
+            if self.module.classes.contains_key(stripped) {
+                return stripped.to_string();
+            }
+            match self.module.typedef_types.get(cur) {
+                Some(DataType::TypeReference { name, .. }) => {
+                    let base = name.name.name.split('#').next().unwrap_or(&name.name.name);
+                    if self.module.classes.contains_key(base) {
+                        return base.to_string();
+                    }
+                    cur = base;
+                }
+                _ => return stripped.to_string(),
+            }
+        }
+        cur.to_string()
+    }
+
     fn class_is_a(&self, derived: &str, base: &str) -> bool {
         // Class names are keyed bare (the parser keeps only the leaf segment
         // of a scoped name), so the comparison strips just the `#(params)`
         // specialization suffix, not a package prefix.
         let strip = |s: &str| s.split('#').next().unwrap_or(s).to_string();
         let base = strip(base);
-        let mut cur = Some(derived.to_string());
+        let mut cur = Some(self.typedef_unroll(derived));
         let mut guard = 0;
         while let Some(c) = cur {
             guard += 1;
@@ -68915,12 +68947,14 @@ impl Simulator {
             if strip(&c) == base {
                 return true;
             }
-            cur = self
+            let nxt = self
                 .module
                 .classes
                 .get(&c)
                 .or_else(|| self.module.classes.get(&strip(&c)))
-                .and_then(|cd| cd.extends.clone());
+                .and_then(|cd| cd.extends.clone())
+                .map(|e| self.typedef_unroll(&e));
+            cur = nxt;
         }
         false
     }
