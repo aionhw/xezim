@@ -175,3 +175,6 @@ mod null_deref_fatal;
 
 #[path = "classes/ctor_dispatch_and_p_format.rs"]
 mod ctor_dispatch_and_p_format;
+
+#[path = "classes/struct_queue_foreach_assoc.rs"]
+mod struct_queue_foreach_assoc;

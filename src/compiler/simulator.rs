@@ -3086,7 +3086,16 @@ pub struct Simulator {
     /// Collection name a `return <collection>` recorded (§13.4: functions may
     /// return arrays/queues). The caller's assign-from-call consumes it with
     /// a whole-collection copy; a plain value return leaves it None.
+    /// Collection name a `return <collection>` recorded (§13.4: functions may
+    /// return arrays/queues). The caller's assign-from-call consumes it with
+    /// a whole-collection copy; a plain value return leaves it None.
     pending_ret_collection: Option<String>,
+    /// Unpacked-struct ELEMENT a `return q.pop()` of a struct-element queue
+    /// recorded (`<q>[<idx>]` + member type). A packed Value cannot carry
+    /// struct members, so the caller's assign (or enclosing function's
+    /// return) must reconstruct member-wise via `copy_unpacked_struct`.
+    /// Mirrors `pending_ret_collection`.
+    pending_ret_struct: Option<(String, crate::ast::types::StructUnionType)>,
     /// Stable instance scope of the process currently running (for `%m`).
     /// Unlike `name_resolve_hint`, this is not mutated by name resolution.
     current_scope: String,
@@ -6214,6 +6223,7 @@ impl Simulator {
             process_origin: HashMap::default(),
             timescale_scope_override: None,
             pending_ret_collection: None,
+            pending_ret_struct: None,
             current_scope: String::new(),
             m_block_scope: String::new(),
             edge_block_scope_id: Vec::new(),
@@ -44729,6 +44739,14 @@ impl Simulator {
                                 is_str = false;
                             } else {
                                 let prefix = format!("{}[", an);
+                                // A string-keyed AA can have `]` inside a key
+                                // value — extract up to the LAST `]` then.
+                                let is_str_key = self
+                                    .module
+                                    .associative_arrays
+                                    .get(&an)
+                                    .copied()
+                                    .unwrap_or(false);
                                 // An assoc-of-collections member (e.g.
                                 // `bq_t all[int]`) stores elements as
                                 // `all[5][0]` etc. — extract the key up to
@@ -44739,18 +44757,16 @@ impl Simulator {
                                     .keys()
                                     .filter_map(|k| {
                                         let rest = k.strip_prefix(&prefix)?;
-                                        let end = rest.find(']')?;
-                                        Some(rest[..end].to_string())
+                                        if is_str_key {
+                                            rest.rsplit_once(']').map(|(key, _)| key.to_string())
+                                        } else {
+                                            rest.find(']').map(|end| rest[..end].to_string())
+                                        }
                                     })
                                     .collect();
                                 ks.sort();
                                 ks.dedup();
-                                is_str = self
-                                    .module
-                                    .associative_arrays
-                                    .get(&an)
-                                    .copied()
-                                    .unwrap_or(false);
+                                is_str = is_str_key;
                                 // Integer-keyed members iterate in NUMERIC order;
                                 // lexicographic sort would visit "10" before "2".
                                 // Use i64 so negative (signed) keys keep order.
@@ -45051,7 +45067,10 @@ impl Simulator {
                     }
                     if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
                         self.widths.insert(var.name.clone(), 32);
-                        if self.string_signals.contains(&name) {
+                        if self.string_signals.contains(&name)
+                            && !self.module.dynamic_arrays.contains(&name)
+                            && self.signals.get(&format!("{}.size", name)).is_none()
+                        {
                             // foreach over a STRING iterates its characters
                             // [0..len) by CONTENT length, and must be checked
                             // BEFORE any collection-array arm: a string name can
@@ -45087,6 +45106,14 @@ impl Simulator {
                                 .unwrap_or((32, false));
                             self.widths.insert(var.name.clone(), kw);
                             let prefix = format!("{}[", name);
+                            // A string-keyed AA can have `]` inside a key
+                            // value — extract up to the LAST `]` then.
+                            let is_str_key = self
+                                .module
+                                .associative_arrays
+                                .get(&name)
+                                .copied()
+                                .unwrap_or(false);
                             // An assoc-of-collections (e.g. `bq_t all[int]`
                             // where `bq_t = Base[$]`) stores elements as
                             // `all[5][0]` etc. — extract the key up to the
@@ -45097,18 +45124,16 @@ impl Simulator {
                                 .keys()
                                 .filter_map(|k| {
                                     let rest = k.strip_prefix(&prefix)?;
-                                    let end = rest.find(']')?;
-                                    Some(rest[..end].to_string())
+                                    if is_str_key {
+                                        rest.rsplit_once(']').map(|(key, _)| key.to_string())
+                                    } else {
+                                        rest.find(']').map(|end| rest[..end].to_string())
+                                    }
                                 })
                                 .collect();
                             keys.sort();
                             keys.dedup();
-                            let is_str = self
-                                .module
-                                .associative_arrays
-                                .get(&name)
-                                .copied()
-                                .unwrap_or(false);
+                            let is_str = is_str_key;
                             // Numeric key order for integer-keyed arrays (see
                             // note above); lexicographic would scramble order.
                             if is_str {
@@ -45592,7 +45617,62 @@ impl Simulator {
                     // §13.4: `return <collection>` — record the collection's
                     // storage name so the caller's assign can copy elements
                     // (a packed Value cannot carry them).
+                    // §13.4/§15.5.5 (see also `queue_pop_call`): `return
+                    // q.pop_front()`/`pop_back()` of a struct-element queue
+                    // returns a packed zero that carries no members. Record
+                    // the popped element so the caller's assign spreads it
+                    // member-wise. Extract receiver + method by EXPRESSION
+                    // SHAPE: `queue_pop_call` gates on `dynamic_arrays` for
+                    // the BARE name, which a class-member queue isn't, so it
+                    // misses these; also resolve SCOPED storage (`q` -> `1hq`).
                     self.pending_ret_collection = None;
+                    self.pending_ret_struct = None;
+                    let (qobj, qmc) = match &e.kind {
+                        ExprKind::Call { func, .. } => match &func.kind {
+                            ExprKind::MemberAccess { expr: en, member } => {
+                                (self.flat_member_name(en), Some(member.name.clone()))
+                            }
+                            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                                let o = h.path[..h.path.len() - 1]
+                                    .iter()
+                                    .map(|s| s.name.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(".");
+                                (Some(o), h.path.last().map(|s| s.name.name.clone()))
+                            }
+                            _ => (None, None),
+                        },
+                        ExprKind::MemberAccess { expr: en, member } => {
+                            (self.flat_member_name(en), Some(member.name.clone()))
+                        }
+                        ExprKind::Ident(h) if h.path.len() >= 2 => {
+                            let o = h.path[..h.path.len() - 1]
+                                .iter()
+                                .map(|s| s.name.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(".");
+                            (Some(o), h.path.last().map(|s| s.name.name.clone()))
+                        }
+                        _ => (None, None),
+                    };
+                    if let (Some(qobj), Some(qm)) = (qobj, qmc) {
+                        if (qm == "pop_front" || qm == "pop_back")
+                            && let Some(su) = self.queue_elem_struct(
+                                &self.instance_assoc_member(&qobj)
+                                    .unwrap_or_else(|| qobj.clone()),
+                            )
+                        {
+                            let scoped =
+                                self.instance_assoc_member(&qobj)
+                                    .unwrap_or_else(|| qobj.clone());
+                            let sz = self.get_queue_size(&scoped);
+                            if sz > 0 {
+                                let idx = if qm == "pop_front" { 0 } else { sz - 1 };
+                                self.pending_ret_struct =
+                                    Some((format!("{}[{}]", scoped, idx), su));
+                            }
+                        }
+                    }
                     if let ExprKind::Ident(h) = &e.kind {
                         let bare = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                         // A queue / dynamic-array member lives at `<handle>#member`,
@@ -45614,7 +45694,23 @@ impl Simulator {
                             }
                         }
                     }
-                    self.return_value = Some(self.eval_expr(e));
+                    // §13.4/§15.5.5: `return q.pop_front()`/`pop_back()` of a
+                    // struct-element queue. `eval_expr` executes the pop (side
+                    // effect: queue shrinks/shifts) and returns a packed ZERO —
+                    // a queue element's aggregate carries no member leaves.
+                    // Pack the element's leaves BEFORE the pop shifts the
+                    // queue, then run eval only for its side effect. The
+                    // caller's struct-return scatter (the same path `return
+                    // member` uses) reconstructs every field, including strings.
+                    let struct_pop = self.pending_ret_struct.take();
+                    if let Some((src, su)) = &struct_pop {
+                        if let Some(packed) = self.pack_unpacked_struct(src, su) {
+                            self.return_value = Some(packed);
+                        }
+                        let _ = self.eval_expr(e);
+                    } else {
+                        self.return_value = Some(self.eval_expr(e));
+                    }
                     // §25.9: a returned VIRTUAL INTERFACE carries only a
                     // sentinel value; record the instance it is bound to so
                     // the caller's `vd = getter();` can re-establish the
@@ -56946,6 +57042,16 @@ impl Simulator {
     /// `num()`'s count of distinct keys.
     fn assoc_top_level_keys(&self, obj_name: &str) -> Vec<String> {
         let prefix = format!("{}[", obj_name);
+        // A string-keyed AA can have `]` INSIDE a key value (e.g.
+        // `rtab["sa_num[0]"]` → signal `rtab[sa_num[0]]`). The first `]`
+        // would truncate the key to `sa_num[0`; take everything up to
+        // the LAST `]` instead.
+        let is_str_key = self
+            .module
+            .associative_arrays
+            .get(obj_name)
+            .copied()
+            .unwrap_or(false);
         // A STRUCT element stores member-wise leaves (`sa[k].id`), which do
         // not end in `]` — accept any entry whose key bracket closes, else
         // struct-element assoc arrays enumerate as empty (num()/foreach).
@@ -56957,7 +57063,11 @@ impl Simulator {
             .filter(|k| k.starts_with(&prefix))
             .filter_map(|k| {
                 let rest = &k[prefix.len()..];
-                rest.find(']').map(|pos| rest[..pos].to_string())
+                if is_str_key {
+                    rest.rsplit_once(']').map(|(key, _)| key.to_string())
+                } else {
+                    rest.find(']').map(|pos| rest[..pos].to_string())
+                }
             })
             .collect();
         keys.sort();
@@ -63921,7 +64031,7 @@ impl Simulator {
     /// each member in its own signal, so writing one packed value (what
     /// `push_back` used to do) loses every member.
     fn queue_store_elem(&mut self, obj_name: &str, elem: &str, arg: &Expression) {
-        // §15.5.5: pushing an event variable stores its synchronization-object
+        // §6.4: pushing an event variable stores its synchronization-object
         // KEY (a string), so a handle later pulled out of the container
         // (`e = q[0]`, `q[0].triggered`) still names the same object.
         if let Some(k) = self.event_ref_key(arg) {
@@ -64573,6 +64683,19 @@ impl Simulator {
             .get(name)
             .cloned()
             .or_else(|| self.flat_path_type(name).map(|(d, _)| d))
+            .or_else(|| {
+                // Instance-scoped class QUEUE/array member `<handle>#member`
+                // (§7.5/§13.5): its element type lives on the class, not in
+                // `var_decl_types` (keyed by the bare name). Without this,
+                // `q.push_back(struct)` on a class queue resolved no struct
+                // element type and fell back to a packed scalar copy that
+                // dropped every string member. Resolve the property's concrete
+                // element type from the instance's class.
+                let (hstr, member) = name.split_once('#')?;
+                let h: usize = hstr.parse().ok()?;
+                let tn = self.class_prop_type_name(h, member)?;
+                self.module.typedef_types.get(tn.as_str()).cloned()
+            })
             .or_else(|| {
                 // An ELEMENT (`arr[2]`) carries no type of its own, but
                 // `var_decl_types` holds the container's ELEMENT type — so the
@@ -72899,6 +73022,58 @@ impl Simulator {
             return None;
         }
         let mut entries = Vec::new();
+        // An AssignmentPattern (`push_back('{ "s", "" })`) has no
+        // member-accessable storage of its own — evaluating `arg.name` would
+        // read an unrelated zero. Bind its items to the struct members the
+        // same way an explicit struct assignment pattern does (named, then
+        // ordered-by-position, then `default:`), and eval the ITEM expression
+        // directly so string members keep their value.
+        let pattern_items: Option<Vec<Option<&Expression>>> = if let ExprKind::AssignmentPattern(items) =
+            &arg.kind
+        {
+            let members: Vec<(String, DataType)> = su
+                .members
+                .iter()
+                .flat_map(|m| {
+                    m.declarators.iter().map(move |md| {
+                        (md.name.name.clone(), m.data_type.clone())
+                    })
+                })
+                .collect();
+            let mut by_name: Vec<Option<&Expression>> = vec![None; members.len()];
+            let mut ordered: Vec<&Expression> = Vec::new();
+            let mut default: Option<&Expression> = None;
+            for it in items {
+                match it {
+                    AssignmentPatternItem::Named(id, e) => {
+                        if let Some(i) = members.iter().position(|(n, _)| *n == id.name) {
+                            by_name[i] = Some(e);
+                        }
+                    }
+                    AssignmentPatternItem::Default(e) => default = Some(e),
+                    AssignmentPatternItem::Ordered(e) => ordered.push(e),
+                    AssignmentPatternItem::Typed(key_dt, e) => {
+                        for (i, (_, mdt)) in members.iter().enumerate() {
+                            if by_name[i].is_none() && self.pattern_type_matches(mdt, key_dt) {
+                                by_name[i] = Some(e);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some(
+                (0..members.len())
+                    .map(|i| {
+                        by_name[i]
+                            .or_else(|| ordered.get(i).copied())
+                            .or(default)
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
         for m in &su.members {
             for md in &m.declarators {
                 let fname = &md.name.name;
@@ -72912,7 +73087,19 @@ impl Simulator {
                     },
                     arg.span,
                 );
-                let v = self.eval_expr(&member_expr);
+                let v = if let Some(pat) = &pattern_items {
+                    if let Some(pos) = Self::struct_member_pos(&su, fname) {
+                        if let Some(pe) = pat.get(pos).copied().flatten() {
+                            self.eval_expr_ctx(pe, 0)
+                        } else {
+                            self.eval_expr(&member_expr)
+                        }
+                    } else {
+                        self.eval_expr(&member_expr)
+                    }
+                } else {
+                    self.eval_expr(&member_expr)
+                };
                 let local_key = format!("{}.{}", port_name, fname);
                 locals.insert(local_key.clone(), v);
                 // Write-back lvalue: for a plain-identifier actual emit the
@@ -72926,6 +73113,25 @@ impl Simulator {
             }
         }
         Some(entries)
+    }
+
+    /// Flat position of a struct member declarator `fname` within `su`
+    /// (matching the order used when an AssignmentPattern actual is bound to
+    /// a struct formal member-wise). `None` if not a member.
+    fn struct_member_pos(
+        su: &crate::ast::types::StructUnionType,
+        fname: &str,
+    ) -> Option<usize> {
+        let mut idx = 0;
+        for m in &su.members {
+            for md in &m.declarators {
+                if md.name.name == fname {
+                    return Some(idx);
+                }
+                idx += 1;
+            }
+        }
+        None
     }
 
     /// Build a member-access lvalue for the write-back of a struct formal.
