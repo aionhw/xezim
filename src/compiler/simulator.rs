@@ -41359,7 +41359,8 @@ impl Simulator {
                             arr = s;
                         }
                         let is_arr = self.module.arrays.contains_key(&arr)
-                            || self.module.dynamic_arrays.contains(&arr);
+                            || self.module.dynamic_arrays.contains(&arr)
+                            || self.is_associative_array(&arr);
                         if is_arr {
                             if matches!(
                                 method.as_str(),
@@ -58008,17 +58009,16 @@ impl Simulator {
     /// (`<name>.size` dense fallback, else raw key-scan of `<name>[…]`).
     /// Returns `(keys, is_str)`. Integer keys are sorted numerically.
     fn array_iter_keys(&self, name: &str) -> (Vec<String>, bool) {
-        // A queue / dynamic array carries an authoritative `<name>.size`
-        // shadow and is DENSE: iterate the logical range [0, size). Scanning
-        // the raw signal keys instead would visit stale elements left behind
-        // when the queue shrank. Only TRUE associative arrays (sparse) fall
-        // through to the key-scan.
-        if let Some(sz) = self
-            .signals
-            .get(&format!("{}.size", name))
-            .and_then(|v| v.to_u64())
-        {
-            return ((0..sz).map(|i| i.to_string()).collect(), false);
+        // A queue / dynamic / fixed array is DENSE: iterate the logical
+        // range [0, size). get_queue_size is authoritative even when the
+        // runtime `.size` signal cell is absent (e.g. a queue initialised at
+        // declaration, or a class-property fixed array), so it — not the
+        // raw `.size` signal — is the source of the count. Only a TRUE
+        // associative array (sparse, unordered) falls through to the
+        // key-scan below.
+        if !self.is_associative_array(name) {
+            let n = self.get_queue_size(name) as usize;
+            return ((0..n).map(|i| i.to_string()).collect(), false);
         }
         let prefix = format!("{}[", name);
         // For an associative array whose VALUES are themselves collections
@@ -65538,7 +65538,10 @@ impl Simulator {
         if !Self::is_locator_method(&mname) {
             return None;
         }
-        if self.module.arrays.contains_key(&arr) || self.module.dynamic_arrays.contains(&arr) {
+        if self.module.arrays.contains_key(&arr)
+            || self.module.dynamic_arrays.contains(&arr)
+            || self.is_associative_array(&arr)
+        {
             Some((arr, mname, filter, iter_name))
         } else {
             None
@@ -65565,7 +65568,11 @@ impl Simulator {
         filter: Option<&Expression>,
         iter_name: Option<&str>,
     ) -> Vec<usize> {
-        let size = self.get_queue_size(arr) as usize;
+        // Dense arrays have index space [0,size); an ASSOCIATIVE array's
+        // index space IS its key set (find_index/unique_index report the
+        // keys, and a selected element re-reads as `arr[key]`).
+        let (elem_keys, is_assoc) = self.array_iter_keys(arr);
+        let size = elem_keys.len();
         if size == 0 {
             return Vec::new();
         }
@@ -65579,10 +65586,11 @@ impl Simulator {
         let saved_item = self.local_stack.last().and_then(|f| f.get("item").cloned());
         let saved_alias = self.item_alias.take();
 
+        let indices: Vec<usize> = (0..size).collect();
         let mut keys: Vec<i64> = Vec::with_capacity(size);
         let mut truth: Vec<bool> = Vec::with_capacity(size);
-        for i in 0..size {
-            let elem = format!("{}[{}]", arr, i);
+        for key in &elem_keys {
+            let elem = format!("{}[{}]", arr, key);
             if elem_su.is_some() {
                 self.item_alias = Some(elem.clone());
             }
@@ -65625,19 +65633,50 @@ impl Simulator {
             self.local_stack.pop();
         }
 
+        // Map a selected element position back to its storage index: the
+        // position itself for a dense array, the parsed assoc KEY otherwise.
+        let to_index = |i: usize| -> usize {
+            if is_assoc {
+                elem_keys[i].parse::<usize>().unwrap_or(i)
+            } else {
+                i
+            }
+        };
+
         match method {
-            "find" | "find_index" => (0..size).filter(|&i| truth[i]).collect(),
-            "find_first" | "find_first_index" => {
-                (0..size).find(|&i| truth[i]).into_iter().collect()
-            }
-            "find_last" | "find_last_index" => {
-                (0..size).rev().find(|&i| truth[i]).into_iter().collect()
-            }
-            "min" => (0..size).min_by_key(|&i| keys[i]).into_iter().collect(),
-            "max" => (0..size).max_by_key(|&i| keys[i]).into_iter().collect(),
+            "find" | "find_index" => indices
+                .into_iter()
+                .filter(|&i| truth[i])
+                .map(to_index)
+                .collect(),
+            "find_first" | "find_first_index" => indices
+                .into_iter()
+                .find(|&i| truth[i])
+                .map(to_index)
+                .into_iter()
+                .collect(),
+            "find_last" | "find_last_index" => indices
+                .iter()
+                .rev()
+                .copied()
+                .find(|&i| truth[i])
+                .map(to_index)
+                .into_iter()
+                .collect(),
+            "min" => indices
+                .into_iter()
+                .min_by_key(|&i| keys[i])
+                .map(to_index)
+                .into_iter()
+                .collect(),
+            "max" => indices.into_iter().max_by_key(|&i| keys[i]).map(to_index).into_iter().collect(),
             "unique" | "unique_index" => {
                 let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
-                (0..size).filter(|&i| seen.insert(keys[i])).collect()
+                indices
+                    .into_iter()
+                    .filter(|&i| seen.insert(keys[i]))
+                    .map(to_index)
+                    .collect()
             }
             _ => Vec::new(),
         }
@@ -65736,7 +65775,7 @@ impl Simulator {
     }
 
     fn reduce_with(&mut self, arr: &str, method: &str, filter: &Expression) -> Value {
-        let size = self.get_queue_size(arr);
+        let (keys, _is_str) = self.array_iter_keys(arr);
         // Ensure a local frame exists so `item` has somewhere to live.
         // Initial-block-scope calls (no enclosing function) reach here
         // with an empty local_stack, which previously silenced every
@@ -65755,9 +65794,9 @@ impl Simulator {
         // accumulating in a full i64 and returning 32 bits gave the raw match
         // count (3) where the LRM requires 1.
         let mut expr_w: u32 = 0;
-        for i in 0..size {
+        for key in &keys {
             let elem = self
-                .get_signal_value_by_name(&format!("{}[{}]", arr, i))
+                .get_signal_value_by_name(&format!("{}[{}]", arr, key))
                 .unwrap_or_else(|| Value::zero(32));
             if let Some(f) = self.local_stack.last_mut() {
                 f.insert("item".to_string(), elem);
@@ -66550,11 +66589,11 @@ impl Simulator {
             return Some(Value::from_u64(self.assoc_top_level_keys(obj_name).len() as u64, 32));
         }
         if matches!(mname, "sum" | "product") {
-            let cur_size = self.get_queue_size(obj_name) as usize;
+            let (keys, _is_str) = self.array_iter_keys(obj_name);
             let (w, signed) = self.array_elem_sign_width(obj_name);
             let mut total: u64 = if mname == "sum" { 0 } else { 1 };
-            for i in 0..cur_size {
-                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
+            for key in &keys {
+                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, key)) {
                     let x = if signed {
                         v.to_i64().unwrap_or(0) as u64
                     } else {
@@ -66576,10 +66615,10 @@ impl Simulator {
             return Some(out);
         }
         if matches!(mname, "and" | "or" | "xor") {
-            let cur_size = self.get_queue_size(obj_name) as usize;
+            let (keys, _is_str) = self.array_iter_keys(obj_name);
             let mut acc: Option<u64> = None;
-            for i in 0..cur_size {
-                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
+            for key in &keys {
+                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, key)) {
                     let x = v.to_u64().unwrap_or(0);
                     acc = Some(match (acc, mname) {
                         (None, _) => x,
@@ -66593,10 +66632,10 @@ impl Simulator {
             return Some(Value::from_u64(acc.unwrap_or(0), 32));
         }
         if mname == "min" {
-            let cur_size = self.get_queue_size(obj_name) as usize;
+            let (keys, _is_str) = self.array_iter_keys(obj_name);
             let mut min_val: Option<Value> = None;
-            for i in 0..cur_size {
-                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
+            for key in &keys {
+                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, key)) {
                     let signed = self.array_elem_sign_width(obj_name).1;
                     let lt = if signed {
                         v.to_i64().unwrap_or(i64::MAX)
@@ -66613,10 +66652,10 @@ impl Simulator {
             return Some(min_val.unwrap_or(Value::zero(32)));
         }
         if mname == "max" {
-            let cur_size = self.get_queue_size(obj_name) as usize;
+            let (keys, _is_str) = self.array_iter_keys(obj_name);
             let mut max_val: Option<Value> = None;
-            for i in 0..cur_size {
-                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
+            for key in &keys {
+                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, key)) {
                     let signed = self.array_elem_sign_width(obj_name).1;
                     let gt = if signed {
                         v.to_i64().unwrap_or(i64::MIN)
@@ -66639,21 +66678,20 @@ impl Simulator {
             return Some(Value::zero(32));
         }
         if mname == "unique_index" {
-            let cur_size = self.get_queue_size(obj_name) as usize;
+            let (keys, _is_str) = self.array_iter_keys(obj_name);
             let mut seen = std::collections::HashSet::new();
             let mut indices = Vec::new();
-            for i in 0..cur_size {
-                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
-                    let key = v.to_u64().unwrap_or(0);
-                    if seen.insert(key) {
+            for (i, key) in keys.iter().enumerate() {
+                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, key)) {
+                    if seen.insert(v.to_u64().unwrap_or(0)) {
                         indices.push(i as u64);
                     }
                 }
             }
-            for (i, idx) in indices.iter().enumerate() {
+            for (i, slot) in indices.iter().enumerate() {
                 self.set_signal_value_by_name(
                     &format!("{}[{}]", obj_name, i),
-                    Value::from_u64(*idx, 32),
+                    Value::from_u64(*slot, 32),
                 );
             }
             self.set_queue_size(obj_name, indices.len() as u64);
@@ -66672,8 +66710,9 @@ impl Simulator {
             let cur_size = self.get_queue_size(obj_name) as usize;
             let mut results = Vec::new();
             if let Some(callback) = args.first() {
-                for i in 0..cur_size {
-                    if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i))
+                let (keys, _is_str) = self.array_iter_keys(obj_name);
+                for (i, key) in keys.iter().enumerate() {
+                    if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, key))
                     {
                         let idx_match = if mname.contains("index") {
                             Value::from_u64(i as u64, 32)

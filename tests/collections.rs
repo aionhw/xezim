@@ -63,6 +63,8 @@ mod queue_member_init;
 mod queue_ops_and_dist;
 #[path = "collections/sort_with_clause.rs"]
 mod sort_with_clause;
+#[path = "collections/s7_11_s7_12_arrays.rs"]
+mod s7_11_s7_12_arrays;
 #[path = "collections/struct_collections_across_calls.rs"]
 mod struct_collections_across_calls;
 #[path = "collections/stream_justify_assoc_default_partsel.rs"]
