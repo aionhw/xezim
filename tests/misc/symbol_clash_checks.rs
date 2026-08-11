@@ -116,3 +116,34 @@ endmodule
         .unwrap_or(0);
     assert_eq!(ok, 0x4F, "design with an extern prototype runs normally");
 }
+
+/// §10.11 `alias` is NET UNIFICATION — one storage, N names — not a pair of
+/// continuous assigns. Reference-validated: the aliased pair carries the
+/// driven value (b=5c, chain 9/9/9) while a hand-written assign CYCLE of the
+/// same nets reads x in both simulators.
+#[test]
+fn alias_unifies_nets() {
+    let src = r#"
+module tb;
+  wire [7:0] a;
+  wire [7:0] b;
+  alias a = b;
+  assign a = 8'h5C;
+  wire [3:0] p, q, r;
+  alias p = q = r;
+  assign r = 4'h9;
+  wire c1, c2;
+  assign c1 = c2;
+  assign c2 = c1;
+  initial begin
+    #1 $display("T|b=%h chain=%h%h%h cyc=%b%b", b, p, q, r, c1, c2);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 10).expect("alias must elaborate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        out.contains(&"T|b=5c chain=999 cyc=xx".to_string()),
+        "alias carries the driven value; an assign cycle stays x: {out:?}"
+    );
+}

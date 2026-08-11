@@ -100,3 +100,6 @@ mod wildcard_import_shadow;
 
 #[path = "hierarchy/nested_modules_and_zpad.rs"]
 mod nested_modules_and_zpad;
+
+#[path = "hierarchy/iface_port_params.rs"]
+mod iface_port_params;

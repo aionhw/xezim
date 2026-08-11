@@ -5366,6 +5366,23 @@ impl Simulator {
                 signal_real_vec.push(false);
             }
         }
+        // §10.4 alias unification: repoint each aliased name at the
+        // canonical net's slot — ONE storage, N names. Width agreement was
+        // checked at elaboration.
+        for (canon, other) in module.alias_pairs.iter() {
+            let (Some(&cid), Some(&oid)) = (
+                signal_name_to_id.get(canon.as_str()),
+                signal_name_to_id.get(other.as_str()),
+            ) else {
+                continue;
+            };
+            if cid != oid {
+                if let Some(slot) = signal_name_to_id.get_mut(other.as_str()) {
+                    *slot = cid;
+                }
+                let _ = oid; // the orphan slot keeps its default value, unreferenced
+            }
+        }
         let static_ms = phase_static.elapsed().as_secs_f64() * 1000.0;
         // Phase 2: synthesize per-element entries for unpacked arrays.
         // Elaborate skips the per-element Signal inserts (memory-as-array
@@ -42091,6 +42108,18 @@ impl Simulator {
                     }
                     return;
                 }
+                // §10.6 mirror case: the SOURCE is an unpacked-struct class
+                // property (`p = o.orig`, incl. through a ternary — UVM's
+                // factory pair copy). The whole-struct read of a class prop
+                // through a frame-held handle has no flat signals to
+                // assemble, so decompose member-wise from the RHS side too.
+                if self
+                    .try_decompose_class_prop_member_copy(lvalue, rvalue)
+                    .is_some()
+                {
+                    self.settle_after_proc_write();
+                    return;
+                }
                 // IEEE 1800-2017 §7.2: assigning one unpacked struct to another
                 // copies every member. Their leaves live in separate signals, so
                 // evaluating the RHS to a packed value and storing it writes a
@@ -62929,6 +62958,11 @@ impl Simulator {
     ) -> Option<()> {
         if self.oop.heap.is_empty() {
             return None;
+        }
+        // §10.6: peel a parenthesized source (`local.s = (o.orig)` so the
+        // member-wise copy below still resolves the class-prop receiver).
+        if let ExprKind::Paren(inner) = &rvalue.kind {
+            return self.try_decompose_class_prop_member_copy(lvalue, inner);
         }
         // Ternary source (`local.s = cond ? a.s : b.s`): peel to the selected
         // arm — but ONLY when BOTH arms resolve to a whole spread class-prop
