@@ -2680,6 +2680,43 @@ impl VcdVarKind {
     }
 }
 
+/// OOP runtime state — the class instance heap, static storage, virtual-
+/// interface bindings, and the per-call method-context stacks. Grouped here
+/// (Step 12 of the codebase rework) so the class runtime can be extracted to
+/// its own module (`simulator/oop.rs`).
+struct OopState {
+    /// Class instance heap (index 0 is null).
+    heap: Vec<Option<ClassInstance>>,
+    /// Static class properties — one shared cell per `Class::prop`,
+    /// keyed `"ClassName::propname"` where ClassName is the class that
+    /// declared the static property.
+    class_statics: HashMap<String, Value>,
+    /// LRM §25.8 virtual-interface bindings.
+    /// Key: `(class_instance_handle, property_name)`.
+    /// Value: `(bound_iface_inst_name, modport_opt)`.
+    virtual_iface_bindings: HashMap<(usize, String), (String, Option<String>)>,
+    /// (handle, class) whose constructor body is currently executing —
+    /// unqualified calls on `this` bind within that class's chain (§8.7).
+    ctor_class_stack: Vec<(usize, String)>,
+    /// Class-typed procedural locals — variable name -> class type name.
+    var_class_types: HashMap<String, String>,
+    /// Parameterized-class procedural locals — variable name -> the declared
+    /// `#(...)` type-parameter args (as expressions).
+    var_type_args: HashMap<String, Vec<Expression>>,
+    /// §18.13 rand_mode: per-instance set of rand properties disabled.
+    rand_mode_disabled: HashMap<usize, HashSet<String>>,
+    /// §18.13 constraint_mode: per-instance set of disabled constraint names.
+    constraint_mode_disabled: HashMap<usize, HashSet<String>>,
+    /// Constraints statically disabled (constraint_mode(0) in an initial).
+    static_constraint_disabled: HashSet<(String, String)>,
+    /// `this` handle stack (per-call), bottom to top.
+    this_stack: Vec<Option<usize>>,
+    /// Class-context stack (per method-call frame), mirroring `this_stack`.
+    class_context_stack: Vec<Option<String>>,
+    /// Base index (into the call frame) where this method's locals begin.
+    method_local_base: Vec<usize>,
+}
+
 pub struct Simulator {
     pub signals: HashMap<String, Value>,
     /// Signals currently under force/release control (LRM §9.3.1).
@@ -3068,15 +3105,8 @@ pub struct Simulator {
     dpi_bindings: HashMap<String, DpiBinding>,
     dpi_unsupported: HashSet<String>,
     dpi_unresolved: HashSet<String>,
-    /// Class instance heap (index 0 is null).
-    heap: Vec<Option<ClassInstance>>,
-    /// LRM §25.8 virtual-interface bindings.
-    /// Key: `(class_instance_handle, property_name)`.
-    /// Value: `(bound_iface_inst_name, modport_opt)`. The modport is
-    /// carried from the class property's declared type (e.g. `virtual
-    /// bus_if.master vif`) so the rewrite path can also emit a direction
-    /// warning when writing to a modport-input member.
-    virtual_iface_bindings: HashMap<(usize, String), (String, Option<String>)>,
+    /// Grouped OOP/class-heap runtime state (Step 12).
+    oop: OopState,
     /// Memo for transitive blocking-task detection (pure-LRM mode only): maps a
     /// subroutine name to whether its body — following calls — eventually hits a
     /// blocking construct (`#`/`@`/`wait`/`fork…join[_any]`). Lets a task that
@@ -3128,10 +3158,6 @@ pub struct Simulator {
     /// item in hand (an `unique {a, arr[0]}` re-pick used to blow `a inside
     /// {[1:10]}` wide open). Rebuilt at the top of every solver trial.
     rand_ranges: HashMap<String, Vec<(i128, i128)>>,
-    /// Static class properties — one shared cell per `Class::prop`,
-    /// keyed `"ClassName::propname"` where ClassName is the class that
-    /// declared the static property.
-    class_statics: HashMap<String, Value>,
     /// Active parameterized-class specialization for per-spec static storage:
     /// `(base_class, sig)` where `sig` is the canonical `#(...)` param text. Set
     /// while a `C#(params)::...` static method runs or a `C#(params)::prop` is
@@ -3172,9 +3198,6 @@ pub struct Simulator {
     /// it, the outer call resumes and finds the type already stored, emitting
     /// a spurious UVM `TPRGED` warning.
     factory_reg_in_progress: std::collections::HashSet<usize>,
-    /// (handle, class) whose constructor body is currently executing —
-    /// unqualified calls on `this` bind within that class's chain (§8.7).
-    ctor_class_stack: Vec<(usize, String)>,
     /// (var.prop) null-deref reads already reported (in-method soft errors).
     reported_null_derefs: std::collections::HashSet<String>,
     /// Queue of specializations pending static-init, processed iteratively
@@ -3182,16 +3205,6 @@ pub struct Simulator {
     pending_spec_inits: Vec<(String, String)>,
     /// Recursion guard for `ensure_spec_statics`.
     spec_init_depth: u32,
-    /// Class-typed procedural locals — variable name -> class type name.
-    /// Lets a later `name = new();` know which class to construct.
-    var_class_types: HashMap<String, String>,
-    /// Parameterized-class procedural locals — variable name -> the declared
-    /// `#(...)` type-parameter args (as expressions). Lets a SEPARATE-statement
-    /// `name = new(...)` (which can't see the decl's data_type) construct the
-    /// right specialization, so the instance records its type bindings. This is
-    /// right specialization, so the instance records its type bindings (IEEE 1800-2023 §8.25).
-    /// Needed for per-spec static resolution (get_type vs get_type_handle → GET).
-    var_type_args: HashMap<String, Vec<Expression>>,
     /// §15.3/§15.4: built-in container local variable → "mailbox"/"semaphore".
     /// Populated at VarDecl exec time when the declared base type is a
     /// (possibly parameterized) mailbox/semaphore, so a later separate
@@ -3230,22 +3243,10 @@ pub struct Simulator {
     mailbox_bound: HashMap<usize, usize>,
     /// Producers parked on `put` to a full bounded mailbox (handle -> queue).
     mailbox_put_waiters: HashMap<usize, std::collections::VecDeque<MailboxPutWaiter>>,
-    /// §18.13 rand_mode: per-instance set of rand properties whose
-    /// randomization is currently disabled. `obj.x.rand_mode(0)` adds "x".
-    /// `obj.rand_mode(0)` disables ALL rand props.
-    rand_mode_disabled: HashMap<usize, HashSet<String>>,
-    /// §18.13 constraint_mode: per-instance set of constraint names that
-    /// are currently disabled. `obj.cb.constraint_mode(0)` adds "cb".
-    constraint_mode_disabled: HashMap<usize, HashSet<String>>,
     /// §18.5.9/§18.6 recursion guard: depth of nested `randomize()` calls made
     /// for `rand` class-handle members (a cyclic object graph would otherwise
     /// recurse forever).
     randomize_depth: usize,
-    /// IEEE 1800-2017 §18.5.11 — a `static constraint` block is SHARED by every
-    /// instance of the class: `constraint_mode()` on it through ANY instance
-    /// (or through the class scope) sets one class-wide flag. Keyed by
-    /// (declaring class, constraint name); membership == disabled.
-    static_constraint_disabled: HashSet<(String, String)>,
     /// §18.4.3 randc cycles: per-(instance, prop) set of values already
     /// drawn in the current cycle. Each randomize call must pick a value
     /// not in this set; once every value in the prop's range has been
@@ -3274,20 +3275,7 @@ pub struct Simulator {
     /// Emitted at end-of-sim under `[COV] assertion summary` + (when
     /// `XEZIM_COV_DB` is set) the JSON coverage database file.
     assertion_stats: HashMap<usize, AssertionStat>,
-    /// Call stack for tracking 'this' and local variables.
-    this_stack: Vec<Option<usize>>,
     local_stack: Vec<HashMap<String, Value>>,
-    /// Context for 'super' resolution: stack of (current_class_name).
-    class_context_stack: Vec<Option<String>>,
-    /// For each class-method call entered via `exec_method_in_class_hierarchy`,
-    /// the `local_stack` depth at entry (before the method's own frame is
-    /// pushed). Used by `get_expr_type_name` to decide whether a bare name is
-    /// a local of the CURRENT method vs a stale flat-map entry leaked from a
-    /// caller's scope — without this, `var_class_types` (never cleared on
-    /// method exit) lets a caller's same-named local shadow a class property's
-    /// declared type, so `prop = new(...)` constructs the wrong class (and can
-    /// recurse infinitely when the wrong class is the enclosing class itself).
-    method_local_base: Vec<usize>,
     /// Current covergroup instance if in sampling context.
     cg_this: Option<usize>,
     /// Processes waiting for join
@@ -4603,13 +4591,13 @@ impl Simulator {
     /// `None`), and stale/out-of-range handles yield `None`.
     #[inline]
     fn heap_obj(&self, handle: usize) -> Option<&ClassInstance> {
-        if handle > 0 { self.heap.get(handle)?.as_ref() } else { None }
+        if handle > 0 { self.oop.heap.get(handle)?.as_ref() } else { None }
     }
 
     /// Mutable access to a class instance on the heap by handle.
     #[inline]
     fn heap_obj_mut(&mut self, handle: usize) -> Option<&mut ClassInstance> {
-        if handle > 0 { self.heap.get_mut(handle)?.as_mut() } else { None }
+        if handle > 0 { self.oop.heap.get_mut(handle)?.as_mut() } else { None }
     }
 
     /// IEEE 1800-2017 §18.3 / §18.4 — hoist CLASS-LOCAL typedefs into the
@@ -6444,8 +6432,20 @@ impl Simulator {
             dpi_bindings: HashMap::default(),
             dpi_unsupported: HashSet::default(),
             dpi_unresolved: HashSet::default(),
-            heap: vec![None], // index 0 is null
-            virtual_iface_bindings: HashMap::default(),
+            oop: OopState {
+                heap: vec![None], // index 0 is null
+                class_statics: HashMap::default(),
+                virtual_iface_bindings: HashMap::default(),
+                ctor_class_stack: Vec::new(),
+                var_class_types: HashMap::default(),
+                var_type_args: HashMap::default(),
+                rand_mode_disabled: HashMap::default(),
+                constraint_mode_disabled: HashMap::default(),
+                static_constraint_disabled: HashSet::default(),
+                this_stack: vec![],
+                class_context_stack: vec![],
+                method_local_base: vec![],
+            },
             tb_cache: std::cell::RefCell::new(HashMap::default()),
             local_iface_aliases: Vec::new(),
             viface_var_aliases: HashMap::default(),
@@ -6453,7 +6453,6 @@ impl Simulator {
             item_alias: None,
             dist_picked_once: HashSet::default(),
             rand_ranges: HashMap::default(),
-            class_statics: HashMap::default(),
             current_spec: None,
             gate_fall_delay_by_id: HashMap::default(),
             spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
@@ -6461,12 +6460,9 @@ impl Simulator {
             type_id_create_in_progress: HashSet::default(),
             initialized_spec_statics: std::collections::HashSet::default(),
             factory_reg_in_progress: std::collections::HashSet::default(),
-            ctor_class_stack: Vec::new(),
             reported_null_derefs: std::collections::HashSet::default(),
             pending_spec_inits: Vec::new(),
             spec_init_depth: 0,
-            var_class_types: HashMap::default(),
-            var_type_args: HashMap::default(),
             var_container_types: HashMap::default(),
             var_typedef_types: HashMap::default(),
             local_dyn: Vec::new(),
@@ -6476,9 +6472,6 @@ impl Simulator {
             mailboxes: HashMap::default(),
             mailbox_bound: HashMap::default(),
             mailbox_put_waiters: HashMap::default(),
-            rand_mode_disabled: HashMap::default(),
-            constraint_mode_disabled: HashMap::default(),
-            static_constraint_disabled: HashSet::default(),
             randomize_depth: 0,
             randc_used: HashMap::default(),
             randc_pending: HashMap::default(),
@@ -6486,10 +6479,7 @@ impl Simulator {
             semaphores: HashMap::default(),
             cg_heap: vec![None],
             assertion_stats: HashMap::default(),
-            this_stack: vec![],
             local_stack: vec![],
-            class_context_stack: vec![],
-            method_local_base: vec![],
             cg_this: None,
             join_waiters: Vec::new(),
             process_parents: HashMap::default(),
@@ -10416,8 +10406,8 @@ impl Simulator {
                 _ => (false, Vec::new()),
             };
             let v = if let (Some(kind), true) = (cont_kind, is_new) {
-                let ch = self.heap.len();
-                self.heap.push(Some(ClassInstance {
+                let ch = self.oop.heap.len();
+                self.oop.heap.push(Some(ClassInstance {
                     class_name: kind.to_string(),
                     properties: HashMap::default(),
                     type_bindings: HashMap::default(),
@@ -10446,24 +10436,24 @@ impl Simulator {
                         _ => tn,
                     });
                 if let Some(cd2) = prop_cn.and_then(|tn| self.module.classes.get(&tn).cloned()) {
-                    self.class_context_stack.push(Some(cn.clone()));
-                    self.this_stack.push(None);
+                    self.oop.class_context_stack.push(Some(cn.clone()));
+                    self.oop.this_stack.push(None);
                     let v = self.instantiate_class(&cd2, &ctor_args);
-                    self.this_stack.pop();
-                    self.class_context_stack.pop();
+                    self.oop.this_stack.pop();
+                    self.oop.class_context_stack.pop();
                     v
                 } else {
                     Value::zero(32)
                 }
             } else {
-                self.class_context_stack.push(Some(cn.clone()));
-                self.this_stack.push(None);
+                self.oop.class_context_stack.push(Some(cn.clone()));
+                self.oop.this_stack.push(None);
                 let v = self.eval_expr(&init);
-                self.this_stack.pop();
-                self.class_context_stack.pop();
+                self.oop.this_stack.pop();
+                self.oop.class_context_stack.pop();
                 v
             };
-            self.class_statics.insert(format!("{}::{}", cn, prop), v);
+            self.oop.class_statics.insert(format!("{}::{}", cn, prop), v);
         }
 
         // Evaluate parameter expressions whose initializers contained function
@@ -22624,8 +22614,8 @@ impl Simulator {
                                 if bh.path.len() == 1 {
                                     let vifname = bh.path[0].name.name.clone();
                                     let bound =
-                                        self.this_stack.last().copied().flatten().and_then(|h| {
-                                            self.virtual_iface_bindings
+                                        self.oop.this_stack.last().copied().flatten().and_then(|h| {
+                                            self.oop.virtual_iface_bindings
                                                 .get(&(h, vifname.clone()))
                                                 .map(|(b, _)| b.clone())
                                         });
@@ -25912,9 +25902,9 @@ impl Simulator {
 
     fn snapshot_process_context(&self) -> ProcessContext {
         ProcessContext {
-            this_stack: self.this_stack.clone(),
+            this_stack: self.oop.this_stack.clone(),
             local_stack: self.local_stack.clone(),
-            class_context_stack: self.class_context_stack.clone(),
+            class_context_stack: self.oop.class_context_stack.clone(),
             cg_this: self.cg_this,
             return_value: self.return_value.clone(),
             break_flag: self.break_flag,
@@ -25936,9 +25926,9 @@ impl Simulator {
     /// cloning its local arrays on every clock edge.
     fn take_process_context(&mut self) -> ProcessContext {
         ProcessContext {
-            this_stack: std::mem::take(&mut self.this_stack),
+            this_stack: std::mem::take(&mut self.oop.this_stack),
             local_stack: std::mem::take(&mut self.local_stack),
-            class_context_stack: std::mem::take(&mut self.class_context_stack),
+            class_context_stack: std::mem::take(&mut self.oop.class_context_stack),
             cg_this: self.cg_this.take(),
             return_value: self.return_value.take(),
             break_flag: std::mem::replace(&mut self.break_flag, false),
@@ -25954,9 +25944,9 @@ impl Simulator {
     }
 
     fn restore_process_context(&mut self, ctx: ProcessContext) {
-        self.this_stack = ctx.this_stack;
+        self.oop.this_stack = ctx.this_stack;
         self.local_stack = ctx.local_stack;
-        self.class_context_stack = ctx.class_context_stack;
+        self.oop.class_context_stack = ctx.class_context_stack;
         self.cg_this = ctx.cg_this;
         self.return_value = ctx.return_value;
         self.break_flag = ctx.break_flag;
@@ -26327,18 +26317,18 @@ impl Simulator {
         // restore dance. Forever-loop bodies like `jclk = ~jclk` that run
         // with no locals don't need context bookkeeping; each call paid
         // several `Vec<HashMap<String, Value>>`-level clones for nothing.
-        let saved_ctx_needed = !self.this_stack.is_empty()
+        let saved_ctx_needed = !self.oop.this_stack.is_empty()
             || !self.local_stack.is_empty()
-            || !self.class_context_stack.is_empty();
+            || !self.oop.class_context_stack.is_empty();
         let has_pid_ctx = self.process_contexts.contains_key(&pid);
         if !saved_ctx_needed && !has_pid_ctx {
             self.run_process_payload(pid, stmts);
             let susp = self.is_pid_suspended(pid);
             if susp {
                 // Only snapshot if actually suspended and has state worth saving.
-                if !self.this_stack.is_empty()
+                if !self.oop.this_stack.is_empty()
                     || !self.local_stack.is_empty()
-                    || !self.class_context_stack.is_empty()
+                    || !self.oop.class_context_stack.is_empty()
                 {
                     self.process_contexts
                         .insert(pid, self.snapshot_process_context());
@@ -26891,12 +26881,12 @@ impl Simulator {
                         let nm = h.path[0].name.name.clone();
                         let is_free_task = self.module.tasks.contains_key(&nm);
                         let is_this_method = self
-                            .this_stack
+                            .oop.this_stack
                             .last()
                             .copied()
                             .flatten()
                             .and_then(|hh| {
-                                self.heap
+                                self.oop.heap
                                     .get(hh)
                                     .and_then(|o| o.as_ref())
                                     .map(|inst| inst.class_name.clone())
@@ -26919,7 +26909,7 @@ impl Simulator {
                         let recv_ok = self
                             .eval_handle_expr(recv)
                             .and_then(|hh| {
-                                self.heap
+                                self.oop.heap
                                     .get(hh)
                                     .and_then(|o| o.as_ref())
                                     .map(|inst| inst.class_name.clone())
@@ -26944,7 +26934,7 @@ impl Simulator {
                         let recv_ok = self
                             .eval_ident_handle(&vn)
                             .and_then(|hh| {
-                                self.heap
+                                self.oop.heap
                                     .get(hh)
                                     .and_then(|o| o.as_ref())
                                     .map(|inst| inst.class_name.clone())
@@ -26990,12 +26980,12 @@ impl Simulator {
                             // otherwise free task resolution without `this` causes
                             // member accesses to fail to resolve.
                             let is_this_method = self
-                                .this_stack
+                                .oop.this_stack
                                 .last()
                                 .copied()
                                 .flatten()
                                 .and_then(|hh| {
-                                    self.heap
+                                    self.oop.heap
                                         .get(hh)
                                         .and_then(|o| o.as_ref())
                                         .map(|inst| inst.class_name.clone())
@@ -27038,7 +27028,7 @@ impl Simulator {
                     let resolved: Option<(usize, String, bool)> = match &func.kind {
                         // (receiver_handle, method_name, this_changes)
                         ExprKind::Ident(h) if h.path.len() == 1 => self
-                            .this_stack
+                            .oop.this_stack
                             .last()
                             .copied()
                             .flatten()
@@ -27059,14 +27049,14 @@ impl Simulator {
                                 this_changes = false;
                             }
                             let cls = if is_super {
-                                self.class_context_stack
+                                self.oop.class_context_stack
                                     .last()
                                     .cloned()
                                     .flatten()
                                     .and_then(|c| self.module.classes.get(&c))
                                     .and_then(|cd| cd.extends.clone())
                             } else {
-                                self.heap
+                                self.oop.heap
                                     .get(rh)
                                     .and_then(|o| o.as_ref())
                                     .map(|inst| inst.class_name.clone())
@@ -27076,8 +27066,8 @@ impl Simulator {
                                     if self.stmts_have_blocking(&td.items) {
                                         let mut cleanup = self.bind_task_frame(&td, args);
                                         if this_changes {
-                                            self.this_stack.push(Some(rh));
-                                            self.class_context_stack.push(Some(mclass));
+                                            self.oop.this_stack.push(Some(rh));
+                                            self.oop.class_context_stack.push(Some(mclass));
                                             cleanup.pushed_method_this = true;
                                         }
                                         self.task_cleanup.push(cleanup);
@@ -27140,8 +27130,8 @@ impl Simulator {
                                 let mut cleanup = self.bind_task_frame(&td, args);
                                 // Static context: push the declaring class for
                                 // member/static resolution, with a null `this`.
-                                self.this_stack.push(None);
-                                self.class_context_stack.push(Some(mclass));
+                                self.oop.this_stack.push(None);
+                                self.oop.class_context_stack.push(Some(mclass));
                                 cleanup.pushed_method_this = true;
                                 self.task_cleanup.push(cleanup);
                                 let mut cont: Vec<Statement> = td.items.clone();
@@ -29480,9 +29470,9 @@ impl Simulator {
                             }
                         }
                         // Check `virtual_iface_bindings` via `this_stack`.
-                        if let Some(Some(this_h)) = self.this_stack.last().copied() {
+                        if let Some(Some(this_h)) = self.oop.this_stack.last().copied() {
                             let cls_name = self
-                                .heap
+                                .oop.heap
                                 .get(this_h)
                                 .and_then(|o| o.as_ref())
                                 .map(|i| i.class_name.clone());
@@ -29493,7 +29483,7 @@ impl Simulator {
                                 .unwrap_or(false);
                             if is_vif {
                                 let bound = self
-                                    .virtual_iface_bindings
+                                    .oop.virtual_iface_bindings
                                     .get(&(this_h, prop.to_string()))
                                     .map(|(n, _)| n.clone());
                                 if let Some(bound_name) = bound {
@@ -35240,15 +35230,15 @@ impl Simulator {
         if let ExprKind::MemberAccess { expr: recv, member } = &lhs.kind {
             if matches!(recv.kind, ExprKind::Index { .. }) {
                 let h = self.eval_expr(recv).to_u64().unwrap_or(0) as usize;
-                if h != 0 && h < self.heap.len() {
+                if h != 0 && h < self.oop.heap.len() {
                     let holds = self
-                        .heap
+                        .oop.heap
                         .get(h)
                         .and_then(|o| o.as_ref())
                         .is_some_and(|inst| inst.properties.contains_key(&member.name));
                     if holds {
                         let fitted = self.fit_class_prop(h, &member.name, val);
-                        if let Some(Some(inst)) = self.heap.get_mut(h) {
+                        if let Some(Some(inst)) = self.oop.heap.get_mut(h) {
                             inst.properties.insert(member.name.clone(), fitted);
                             return true;
                         }
@@ -35297,11 +35287,11 @@ impl Simulator {
             };
             if let Some((obj, prop)) = obj_prop {
                 let cn = if obj == "this" {
-                    self.this_stack
+                    self.oop.this_stack
                         .last()
                         .copied()
                         .flatten()
-                        .and_then(|h| self.heap.get(h))
+                        .and_then(|h| self.oop.heap.get(h))
                         .and_then(|o| o.as_ref())
                         .map(|i| i.class_name.clone())
                 } else {
@@ -35504,7 +35494,7 @@ impl Simulator {
                         }
                     }
                     // Check 'this' properties
-                    if let Some(Some(handle)) = self.this_stack.last() {
+                    if let Some(Some(handle)) = self.oop.this_stack.last() {
                         let handle = *handle;
                         // §8.10: a base method's write to a shadowed name must
                         // land in the base's own copy, or it silently leaks
@@ -35513,20 +35503,20 @@ impl Simulator {
                             .shadowed_prop_key(name, false)
                             .unwrap_or_else(|| name.clone());
                         let holds = self
-                            .heap
+                            .oop.heap
                             .get(handle)
                             .and_then(|o| o.as_ref())
                             .is_some_and(|i| i.properties.contains_key(&key));
                         if holds {
                             let fitted = self.fit_class_prop(handle, &key, val);
-                            if let Some(Some(instance)) = self.heap.get_mut(handle) {
+                            if let Some(Some(instance)) = self.oop.heap.get_mut(handle) {
                                 instance.properties.insert(key, fitted);
                                 return true;
                             }
                         }
                     }
                     // Static class property assigned bare inside a method.
-                    if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                    if let Some(Some(ctx)) = self.oop.class_context_stack.last().cloned() {
                         let nm = name.clone();
                         if self.class_static_set(&ctx, &nm, val.clone()) {
                             return true;
@@ -35542,7 +35532,7 @@ impl Simulator {
                         let head_expr = Expression::new(ExprKind::Ident(head_hier), lhs.span);
                         let base_val = self.eval_expr(&head_expr);
                         let handle = base_val.to_u64().unwrap_or(0) as usize;
-                        if handle != 0 && handle < self.heap.len() && self.heap[handle].is_some() {
+                        if handle != 0 && handle < self.oop.heap.len() && self.oop.heap[handle].is_some() {
                             let fitted = self.fit_class_prop(handle, prop_name, val);
                             return self.set_prop_if_changed(handle, prop_name, fitted);
                         }
@@ -35577,15 +35567,15 @@ impl Simulator {
                         {
                             let cur0 = self
                                 .static_prop_key(cls, sprop)
-                                .and_then(|k| self.class_statics.get(&k))
+                                .and_then(|k| self.oop.class_statics.get(&k))
                                 .and_then(|v| v.to_u64())
                                 .map(|h| h as usize)
                                 .unwrap_or(0);
-                            if cur0 != 0 && cur0 < self.heap.len() {
+                            if cur0 != 0 && cur0 < self.oop.heap.len() {
                                 let mut cur = cur0;
                                 let mut done = false;
                                 for i in 2..hier.path.len() {
-                                    if cur == 0 || cur >= self.heap.len() {
+                                    if cur == 0 || cur >= self.oop.heap.len() {
                                         break;
                                     }
                                     let mname = hier.path[i].name.name.clone();
@@ -35596,7 +35586,7 @@ impl Simulator {
                                         // (the read path resolves it there).
                                         // Otherwise write the instance property.
                                         let cn = self
-                                            .heap
+                                            .oop.heap
                                             .get(cur)
                                             .and_then(|o| o.as_ref())
                                             .map(|inst| inst.class_name.clone());
@@ -35614,7 +35604,7 @@ impl Simulator {
                                         if !done {
                                             let fitted =
                                                 self.fit_class_prop(cur, &mname, val);
-                                            if let Some(Some(inst)) = self.heap.get_mut(cur) {
+                                            if let Some(Some(inst)) = self.oop.heap.get_mut(cur) {
                                                 inst.properties.insert(mname, fitted);
                                                 done = true;
                                             }
@@ -35704,26 +35694,26 @@ impl Simulator {
                     if let Some(v) = obj_val {
                         let mut cur_handle = v.to_u64().unwrap_or(0) as usize;
                         for i in 1..hier.path.len() {
-                            if cur_handle == 0 || cur_handle >= self.heap.len() {
+                            if cur_handle == 0 || cur_handle >= self.oop.heap.len() {
                                 break;
                             }
                             let member_name = &hier.path[i].name.name;
                             if i == hier.path.len() - 1 {
                                 let holds = self
-                                    .heap
+                                    .oop.heap
                                     .get(cur_handle)
                                     .and_then(|o| o.as_ref())
                                     .is_some_and(|inst| inst.properties.contains_key(member_name));
                                 if holds {
                                     let fitted = self.fit_class_prop(cur_handle, member_name, val);
-                                    if let Some(Some(inst)) = self.heap.get_mut(cur_handle) {
+                                    if let Some(Some(inst)) = self.oop.heap.get_mut(cur_handle) {
                                         inst.properties.insert(member_name.clone(), fitted);
                                         return true;
                                     }
                                 }
                                 break;
                             }
-                            if let Some(Some(inst)) = self.heap.get(cur_handle) {
+                            if let Some(Some(inst)) = self.oop.heap.get(cur_handle) {
                                 if let Some(mval) = inst.properties.get(member_name) {
                                     cur_handle = mval.to_u64().unwrap_or(0) as usize;
                                 } else {
@@ -36591,13 +36581,13 @@ impl Simulator {
                             let sig_member = ma_member.name.as_str();
                             // Resolve virtual-interface binding (same lookup as
                             // the scalar MemberAccess arm below ~line 20401).
-                            let binding = self.this_stack.last().copied().flatten().and_then(|this_h| {
-                                let cls_name = self.heap.get(this_h)
+                            let binding = self.oop.this_stack.last().copied().flatten().and_then(|this_h| {
+                                let cls_name = self.oop.heap.get(this_h)
                                     .and_then(|o| o.as_ref())
                                     .map(|i| i.class_name.clone())?;
                                 self.module.classes.get(&cls_name)
                                     .and_then(|cd| cd.virtual_iface_properties.get(vif_prop).map(|_| ()))
-                                    .and(self.virtual_iface_bindings.get(&(this_h, vif_prop.to_string())).cloned())
+                                    .and(self.oop.virtual_iface_bindings.get(&(this_h, vif_prop.to_string())).cloned())
                             });
                             if let Some((bound_name, _modport)) = binding {
                                 let target = format!("{}.{}", bound_name, sig_member);
@@ -36909,11 +36899,11 @@ impl Simulator {
                     }
                     // Bit-select on a `this.<prop>` instance field.
                     if let (Some(Some(handle)), Some(hier)) =
-                        (self.this_stack.last().copied(), hier_opt)
+                        (self.oop.this_stack.last().copied(), hier_opt)
                     {
                         if hier.path.len() == 1 {
                             let pname = hier.path[0].name.name.clone();
-                            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                            if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                                 if let Some(cur) = inst.properties.get(&pname).cloned() {
                                     if idx < cur.width as usize {
                                         let nb = val.bits_first();
@@ -37313,11 +37303,11 @@ impl Simulator {
                                 .map(|h| h as usize)
                                 .filter(|&h| h != 0);
                             let from_this = self
-                                .this_stack
+                                .oop.this_stack
                                 .last()
                                 .copied()
                                 .flatten()
-                                .and_then(|h| self.heap.get(h))
+                                .and_then(|h| self.oop.heap.get(h))
                                 .and_then(|o| o.as_ref())
                                 .and_then(|i| i.properties.get(&root))
                                 .and_then(|v| v.to_u64())
@@ -37354,7 +37344,7 @@ impl Simulator {
                                 }
                                 _ => (msb, lsb),
                             };
-                            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                            if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                                 if let Some(cur) = inst.properties.get(&fname).cloned() {
                                     let width = cur.width as usize;
                                     let mut nv = cur.clone();
@@ -37397,8 +37387,8 @@ impl Simulator {
                             }
                         }
                         // this.<prop>
-                        if let Some(Some(handle)) = self.this_stack.last().copied() {
-                            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                        if let Some(Some(handle)) = self.oop.this_stack.last().copied() {
+                            if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                                 if let Some(cur) = inst.properties.get(&bare).cloned() {
                                     let width = cur.width as usize;
                                     let mut nv = cur.clone();
@@ -37450,7 +37440,7 @@ impl Simulator {
                 if let ExprKind::MemberAccess { expr: base, member } = &expr.kind {
                     // (a) class instance property.
                     let handle_opt: Option<usize> = match &base.kind {
-                        ExprKind::This => self.this_stack.last().copied().flatten(),
+                        ExprKind::This => self.oop.this_stack.last().copied().flatten(),
                         _ => {
                             let v = self.eval_expr(base);
                             v.to_u64().map(|h| h as usize).filter(|&h| h != 0)
@@ -37458,7 +37448,7 @@ impl Simulator {
                     };
                     if let Some(handle) = handle_opt {
                         let pname = member.name.clone();
-                        if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                        if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                             if let Some(cur) = inst.properties.get(&pname).cloned() {
                                 let width = cur.width as usize;
                                 let mut nv = cur.clone();
@@ -37870,10 +37860,10 @@ impl Simulator {
                     if let ExprKind::Ident(hier) = &base.kind {
                         if hier.path.len() == 1 {
                             let prop_base = hier.path[0].name.name.to_string();
-                            let this_h_opt = self.this_stack.last().and_then(|t| *t);
+                            let this_h_opt = self.oop.this_stack.last().and_then(|t| *t);
                             if let Some(this_h) = this_h_opt {
                                 let cls_name = self
-                                    .heap
+                                    .oop.heap
                                     .get(this_h)
                                     .and_then(|o| o.as_ref().map(|i| i.class_name.clone()));
                                 let is_vif = cls_name
@@ -37885,7 +37875,7 @@ impl Simulator {
                                     let idx = self.eval_expr(index).to_u64().unwrap_or(0);
                                     let key_prop = format!("{}[{}]", prop_base, idx);
                                     if let Some((bound_name, _modport)) = self
-                                        .virtual_iface_bindings
+                                        .oop.virtual_iface_bindings
                                         .get(&(this_h, key_prop))
                                         .cloned()
                                     {
@@ -37957,8 +37947,8 @@ impl Simulator {
                 };
                 if let Some(prop) = vif_prop_name {
                     {
-                        if let Some(Some(this_h)) = self.this_stack.last() {
-                            let cls_name = if let Some(Some(inst)) = self.heap.get(*this_h) {
+                        if let Some(Some(this_h)) = self.oop.this_stack.last() {
+                            let cls_name = if let Some(Some(inst)) = self.oop.heap.get(*this_h) {
                                 Some(inst.class_name.clone())
                             } else {
                                 None
@@ -37968,7 +37958,7 @@ impl Simulator {
                                 .and_then(|cn| self.module.classes.get(cn))
                                 .and_then(|cd| cd.virtual_iface_properties.get(prop).map(|_| ()))
                                 .and(
-                                    self.virtual_iface_bindings
+                                    self.oop.virtual_iface_bindings
                                         .get(&(*this_h, prop.to_string()))
                                         .cloned(),
                                 );
@@ -38282,8 +38272,8 @@ impl Simulator {
                         }
                     }
                 }
-                if handle != 0 && handle < self.heap.len()
-                    && self.heap[handle].is_some() {
+                if handle != 0 && handle < self.oop.heap.len()
+                    && self.oop.heap[handle].is_some() {
                         // §8.x: a class property assignment truncates/sign-
                         // extends the rvalue to the property's declared type
                         // (`byte a; a = 'hfff;` ⇒ 8-bit 0xff, read -1 when
@@ -38496,7 +38486,7 @@ impl Simulator {
             expr.kind,
             ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
         ) && !self.no_class_objects()
-            && Self::chain_maybe_class_agg(expr, self.this_stack.last().copied().flatten().is_some())
+            && Self::chain_maybe_class_agg(expr, self.oop.this_stack.last().copied().flatten().is_some())
         {
             if let Some(r) = self.class_agg_member(expr) {
                 return self.read_class_agg(&r);
@@ -38508,7 +38498,7 @@ impl Simulator {
         // property's unused scalar cell (zero) instead of the members.
         if !self.no_class_objects() {
             if let ExprKind::Ident(h) = &expr.kind {
-                if (h.path.len() >= 2 || self.this_stack.last().copied().flatten().is_some())
+                if (h.path.len() >= 2 || self.oop.this_stack.last().copied().flatten().is_some())
                     && h.path.iter().all(|p| p.selects.is_empty())
                 {
                     if let Some((handle, prop)) = self.class_prop_receiver(expr) {
@@ -38636,7 +38626,7 @@ impl Simulator {
                     if let Some(handle) = self.eval_ident_handle(base_name) {
                         if handle != 0 {
                             let cls = self
-                                .heap
+                                .oop.heap
                                 .get(handle)
                                 .and_then(|o| o.as_ref())
                                 .map(|i| i.class_name.clone());
@@ -38824,9 +38814,9 @@ impl Simulator {
                     // bound → non-zero (the bound instance's hashed
                     // sentinel handle), unbound → 0 (null). Drives the
                     // `vif == null` / `vif != null` idiom.
-                    if let Some(Some(handle)) = self.this_stack.last() {
+                    if let Some(Some(handle)) = self.oop.this_stack.last() {
                         let cls = self
-                            .heap
+                            .oop.heap
                             .get(*handle)
                             .and_then(|o| o.as_ref().map(|i| i.class_name.clone()));
                         if let Some(cn) = cls {
@@ -38838,7 +38828,7 @@ impl Simulator {
                                 .unwrap_or(false);
                             if is_vif {
                                 let bound = self
-                                    .virtual_iface_bindings
+                                    .oop.virtual_iface_bindings
                                     .contains_key(&(*handle, name.clone()));
                                 return if bound {
                                     Value::from_u64(1, 32)
@@ -38856,7 +38846,7 @@ impl Simulator {
                     // a static property has ONE cell shared across all
                     // instances.
                     let is_static_prop = self
-                        .class_context_stack
+                        .oop.class_context_stack
                         .last()
                         .cloned()
                         .flatten()
@@ -38878,7 +38868,7 @@ impl Simulator {
                         })
                         .unwrap_or(false);
                     if !is_static_prop {
-                        if let Some(Some(handle)) = self.this_stack.last().copied() {
+                        if let Some(Some(handle)) = self.oop.this_stack.last().copied() {
                             // §8.10: a shadowed property resolves to the copy
                             // the EXECUTING method's class declares, not the
                             // leaf's.
@@ -38893,7 +38883,7 @@ impl Simulator {
                             {
                                 return v;
                             }
-                            if let Some(Some(instance)) = self.heap.get(handle) {
+                            if let Some(Some(instance)) = self.oop.heap.get(handle) {
                                 if let Some(val) = instance.properties.get(&key) {
                                     return val.clone();
                                 }
@@ -38916,13 +38906,13 @@ impl Simulator {
                     // registered under their bare name in one flat namespace,
                     // so without this a same-named member of an unrelated
                     // class — whichever elaborated last — silently won.
-                    if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                    if let Some(Some(ctx)) = self.oop.class_context_stack.last().cloned() {
                         if let Some(v) = self.class_enum_member(&ctx, name) {
                             return v;
                         }
                     }
                     // Static class property referenced bare inside a method.
-                    if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                    if let Some(Some(ctx)) = self.oop.class_context_stack.last().cloned() {
                         if let Some(v) = self.class_static_get(&ctx, name) {
                             return v;
                         }
@@ -38943,9 +38933,9 @@ impl Simulator {
                             .or_else(|| self.get_signal_value_by_name(obj));
                         if let Some(v) = obj_handle {
                             let handle = v.to_u64().unwrap_or(0) as usize;
-                            if handle != 0 && handle < self.heap.len() {
+                            if handle != 0 && handle < self.oop.heap.len() {
                                 let cls = self
-                                    .heap
+                                    .oop.heap
                                     .get(handle)
                                     .and_then(|o| o.as_ref().map(|i| i.class_name.clone()));
                                 if let Some(cn) = cls {
@@ -38957,7 +38947,7 @@ impl Simulator {
                                         .unwrap_or(false);
                                     if is_vif {
                                         let bound = self
-                                            .virtual_iface_bindings
+                                            .oop.virtual_iface_bindings
                                             .contains_key(&(handle, prop.clone()));
                                         return if bound {
                                             Value::from_u64(1, 32)
@@ -39078,8 +39068,8 @@ impl Simulator {
                                         return Value::new(32);
                                     }
                                 }
-                                if h != 0 && h < self.heap.len() {
-                                    if let Some(inst) = self.heap.get(h).and_then(|x| x.as_ref()) {
+                                if h != 0 && h < self.oop.heap.len() {
+                                    if let Some(inst) = self.oop.heap.get(h).and_then(|x| x.as_ref()) {
                                         let mut cur_props = &inst.properties;
                                         let mut cur_handle = h;
                                         let mut found: Option<Value> = None;
@@ -39110,11 +39100,11 @@ impl Simulator {
                                                 break;
                                             }
                                             if let Some(sh) = sub_handle.take() {
-                                                if sh == 0 || sh >= self.heap.len() {
+                                                if sh == 0 || sh >= self.oop.heap.len() {
                                                     break;
                                                 }
                                                 if let Some(next_inst) =
-                                                    self.heap.get(sh).and_then(|x| x.as_ref())
+                                                    self.oop.heap.get(sh).and_then(|x| x.as_ref())
                                                 {
                                                     cur_props = &next_inst.properties;
                                                     cur_handle = sh;
@@ -39308,24 +39298,24 @@ impl Simulator {
                     // need an explicit fallback.
                     let mut cur_handle = self
                         .eval_ident_handle(obj_name)
-                        .filter(|&h| h != 0 && h < self.heap.len())
+                        .filter(|&h| h != 0 && h < self.oop.heap.len())
                         .or_else(|| {
                             self.local_stack
                                 .last()
                                 .and_then(|m| m.get(obj_name))
                                 .and_then(|v| v.to_u64())
                                 .map(|h| h as usize)
-                                .filter(|&h| h != 0 && h < self.heap.len())
+                                .filter(|&h| h != 0 && h < self.oop.heap.len())
                         })
                         .or_else(|| {
                             self.get_signal_value_by_name(obj_name)
                                 .and_then(|v| v.to_u64())
                                 .map(|h| h as usize)
-                                .filter(|&h| h != 0 && h < self.heap.len())
+                                .filter(|&h| h != 0 && h < self.oop.heap.len())
                         });
                     while let Some(h) = cur_handle {
                         for i in 1..hier.path.len() {
-                            if h == 0 || h >= self.heap.len() {
+                            if h == 0 || h >= self.oop.heap.len() {
                                 cur_handle = None;
                                 break;
                             }
@@ -41142,7 +41132,7 @@ impl Simulator {
             ExprKind::ShallowCopy { source } => {
                 let src_v = self.eval_expr(source);
                 let src_h = src_v.to_u64().unwrap_or(0) as usize;
-                if src_h != 0 && matches!(self.heap.get(src_h), Some(Some(_))) {
+                if src_h != 0 && matches!(self.oop.heap.get(src_h), Some(Some(_))) {
                     self.copy_construct(src_h)
                 } else {
                     Value::zero(32)
@@ -41411,7 +41401,7 @@ impl Simulator {
                             // is bound and `name` is a property of the current
                             // class (walking inheritance), size the member from
                             // its own value — exactly as `$bits(this.name)` does.
-                            if let Some(this_h) = self.this_stack.last().copied().flatten() {
+                            if let Some(this_h) = self.oop.this_stack.last().copied().flatten() {
                                 if let Some(inst) = self.heap_obj(this_h) {
                                     let mut cur = Some(inst.class_name.clone());
                                     let mut found_member = false;
@@ -41464,7 +41454,7 @@ impl Simulator {
                                 // dims have to be folded in here.
                                 let mult: u64 = Self::typedef_dims_via_tables(
                                     &self.module,
-                                    self.class_context_stack
+                                    self.oop.class_context_stack
                                         .last()
                                         .cloned()
                                         .flatten()
@@ -42915,7 +42905,7 @@ impl Simulator {
                 }
             },
             ExprKind::This => {
-                if let Some(Some(handle)) = self.this_stack.last() {
+                if let Some(Some(handle)) = self.oop.this_stack.last() {
                     Value::from_u64(*handle as u64, 32)
                 } else {
                     Value::zero(32)
@@ -43333,7 +43323,7 @@ impl Simulator {
                         // where the element type isn't directly registered for
                         // the queue variable name).
                         let base_h = base_val.to_u64().unwrap_or(0) as usize;
-                        let is_heap_obj = base_h != 0 && base_h < self.heap.len() && self.heap[base_h].is_some();
+                        let is_heap_obj = base_h != 0 && base_h < self.oop.heap.len() && self.oop.heap[base_h].is_some();
                         if !is_heap_obj {
                             for td in self.module.typedef_types.values() {
                                 let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
@@ -43674,9 +43664,9 @@ impl Simulator {
                             }
                         }
                         // (b) `this.vif` class property binding.
-                        if let Some(Some(this_h)) = self.this_stack.last().copied() {
+                        if let Some(Some(this_h)) = self.oop.this_stack.last().copied() {
                             let is_vif = self
-                                .heap
+                                .oop.heap
                                 .get(this_h)
                                 .and_then(|o| o.as_ref().map(|i| i.class_name.clone()))
                                 .and_then(|cn| self.module.classes.get(&cn))
@@ -43684,7 +43674,7 @@ impl Simulator {
                                 .unwrap_or(false);
                             if is_vif {
                                 if let Some((bound, _mp)) = self
-                                    .virtual_iface_bindings
+                                    .oop.virtual_iface_bindings
                                     .get(&(this_h, seg0.clone()))
                                     .cloned()
                                 {
@@ -43726,8 +43716,8 @@ impl Simulator {
                 // `obj = new`). Route to the shared cell. class_static_get
                 // returns None for a non-static member, so ordinary reads fall
                 // through unchanged.
-                let static_class: Option<String> = if handle != 0 && handle < self.heap.len() {
-                    self.heap[handle].as_ref().map(|i| i.class_name.clone())
+                let static_class: Option<String> = if handle != 0 && handle < self.oop.heap.len() {
+                    self.oop.heap[handle].as_ref().map(|i| i.class_name.clone())
                 } else if let ExprKind::Ident(h) = &expr.kind {
                     let n = self.resolve_hier_name(h);
                     self.class_of_var(&n)
@@ -43739,7 +43729,7 @@ impl Simulator {
                         return v;
                     }
                 }
-                if handle == 0 || handle >= self.heap.len() {
+                if handle == 0 || handle >= self.oop.heap.len() {
                     // §8.4: reading an instance property through a null handle
                     // is a runtime FATAL (the reference simulator aborts) —
                     // silently yielding 0/x lets a dead testbench keep "passing".
@@ -43751,12 +43741,12 @@ impl Simulator {
                     }
                     Value::zero(32)
                 } else {
-                    let prop = self.heap[handle]
+                    let prop = self.oop.heap[handle]
                         .as_ref()
                         .and_then(|i| i.properties.get(&member.name).cloned())
                         .or_else(|| {
                             let prefix = format!("{}.", member.name);
-                            self.heap[handle]
+                            self.oop.heap[handle]
                                 .as_ref()
                                 .and_then(|i| i.properties.get(&format!("{}m_type", prefix)).cloned())
                         });
@@ -43767,7 +43757,7 @@ impl Simulator {
                     // no-argument function `f`. The member matched no
                     // property, so dispatch to a same-named parameterless
                     // function if the class declares one (e.g. `if (port.size < 1)`).
-                    let cls = self.heap[handle].as_ref().map(|i| i.class_name.clone());
+                    let cls = self.oop.heap[handle].as_ref().map(|i| i.class_name.clone());
                     match cls {
                         Some(cn) if self.class_bare_method(&cn, &member.name) => {
                             let res = self.exec_method_call(handle, &member.name, &[]);
@@ -44671,7 +44661,7 @@ impl Simulator {
                                 .array_elem_class
                                 .get(&bname)
                                 .cloned()
-                                .or_else(|| self.var_class_types.get(&bname).cloned())
+                                .or_else(|| self.oop.var_class_types.get(&bname).cloned())
                                 .or_else(|| self.declared_collection_elem_class(&bname))
                                 .or_else(|| {
                                     // Class-MEMBER collection (static or instance):
@@ -44681,7 +44671,7 @@ impl Simulator {
                                     // (a pool per context) — the local/array
                                     // maps above don't cover class members.
                                     let mut cur =
-                                        self.class_context_stack.last().cloned().flatten();
+                                        self.oop.class_context_stack.last().cloned().flatten();
                                     while let Some(cn) = cur {
                                         if let Some(cd) = self.module.classes.get(&cn) {
                                             if let Some(tn) = cd
@@ -44710,13 +44700,13 @@ impl Simulator {
                                     // and look up the property's element type.
                                     if let Some((obj_name, member)) = member_form {
                                         let handle = if obj_name == "this" {
-                                            self.this_stack.last().copied().flatten().unwrap_or(0)
+                                            self.oop.this_stack.last().copied().flatten().unwrap_or(0)
                                         } else {
                                             self.eval_ident_handle(obj_name).unwrap_or(0)
                                         };
                                         if handle != 0 {
                                             let hcn = self
-                                                .heap
+                                                .oop.heap
                                                 .get(handle)
                                                 .and_then(|x| x.as_ref())
                                                 .map(|i| i.class_name.clone());
@@ -44805,7 +44795,7 @@ impl Simulator {
                                 if ctor_args.len() == 1 && arg_could_be_handle {
                                     let src_h = self.eval_expr(&ctor_args[0]).to_u64().unwrap_or(0)
                                         as usize;
-                                    if src_h != 0 && matches!(self.heap.get(src_h), Some(Some(_))) {
+                                    if src_h != 0 && matches!(self.oop.heap.get(src_h), Some(Some(_))) {
                                         let h = self.copy_construct(src_h);
                                         self.assign_value(lvalue, &h);
                                         return;
@@ -45744,8 +45734,8 @@ impl Simulator {
                             // misreports (it returns the enclosing class name for
                             // a property, or None for an untracked local).
                             if let Some(kind) = self.lvalue_container_kind(lvalue) {
-                                let handle = self.heap.len();
-                                self.heap.push(Some(ClassInstance {
+                                let handle = self.oop.heap.len();
+                                self.oop.heap.push(Some(ClassInstance {
                                     class_name: kind.to_string(),
                                     properties: HashMap::default(),
                                     type_bindings: HashMap::default(),
@@ -45794,7 +45784,7 @@ impl Simulator {
                             if args.len() == 1 && arg_could_be_handle {
                                 let src_h = self.eval_expr(&args[0]).to_u64().unwrap_or(0) as usize;
                                 if src_h != 0 {
-                                    if let Some(Some(_)) = self.heap.get(src_h) {
+                                    if let Some(Some(_)) = self.oop.heap.get(src_h) {
                                         let h = self.copy_construct(src_h);
                                         self.assign_value(lvalue, &h.resize(w));
                                         self.settle_after_proc_write();
@@ -45812,8 +45802,8 @@ impl Simulator {
                                 .map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn));
                             if let Some(tname) = type_name {
                                 if tname == "semaphore" {
-                                    let handle = self.heap.len();
-                                    self.heap.push(Some(ClassInstance {
+                                    let handle = self.oop.heap.len();
+                                    self.oop.heap.push(Some(ClassInstance {
                                         class_name: tname.clone(),
                                         properties: HashMap::default(),
                                         type_bindings: HashMap::default(),
@@ -45826,8 +45816,8 @@ impl Simulator {
                                     self.semaphores.insert(handle, initial_count);
                                     Value::from_u64(handle as u64, 32)
                                 } else if tname == "mailbox" {
-                                    let handle = self.heap.len();
-                                    self.heap.push(Some(ClassInstance {
+                                    let handle = self.oop.heap.len();
+                                    self.oop.heap.push(Some(ClassInstance {
                                         class_name: tname.clone(),
                                         properties: HashMap::default(),
                                         type_bindings: HashMap::default(),
@@ -45895,8 +45885,8 @@ impl Simulator {
                                         // `new`, which for initialization routines
                                         // (`id_actions = new();`) recurses
                                         // new -> initialize -> new … forever.
-                                        let h = self.heap.len();
-                                        self.heap.push(Some(ClassInstance {
+                                        let h = self.oop.heap.len();
+                                        self.oop.heap.push(Some(ClassInstance {
                                             class_name: tname.clone(),
                                             properties: HashMap::default(),
                                             type_bindings: HashMap::default(),
@@ -45921,8 +45911,8 @@ impl Simulator {
                                     // `new()` generically — it re-binds to the
                                     // enclosing class's constructor and
                                     // recurses.
-                                    let h = self.heap.len();
-                                    self.heap.push(Some(ClassInstance {
+                                    let h = self.oop.heap.len();
+                                    self.oop.heap.push(Some(ClassInstance {
                                         class_name: String::new(),
                                         properties: HashMap::default(),
                                         type_bindings: HashMap::default(),
@@ -48334,7 +48324,7 @@ impl Simulator {
                         return;
                     }
                     let probe_name = format!("prop@{}", a.span.start);
-                    let this_handle = self.this_stack.last().and_then(|t| *t);
+                    let this_handle = self.oop.this_stack.last().and_then(|t| *t);
                     self.pending_observed.push(ObservedProbe {
                         name: probe_name,
                         predicate: resolved_expr,
@@ -48788,12 +48778,12 @@ impl Simulator {
                                             .as_ref()
                                             .map(|s| s.name.clone())
                                             .or_else(|| {
-                                            self.class_context_stack.last().cloned().flatten()
+                                            self.oop.class_context_stack.last().cloned().flatten()
                                             })
                                             .or_else(|| {
-                                            self.this_stack.last().copied().flatten().and_then(
+                                            self.oop.this_stack.last().copied().flatten().and_then(
                                                 |h| {
-                                                        self.heap
+                                                        self.oop.heap
                                                             .get(h)
                                                             .and_then(|x| x.as_ref())
                                                             .map(|i| i.class_name.clone())
@@ -49292,7 +49282,7 @@ impl Simulator {
                                             // (so field assignments like
                                             // `reg_type = t` never ran).
                                             let is_copy_src = src_h != 0
-                                                && matches!(self.heap.get(src_h), Some(Some(src_inst))
+                                                && matches!(self.oop.heap.get(src_h), Some(Some(src_inst))
                                                     if self.class_extends(&src_inst.class_name, cn));
                                             if is_copy_src {
                                                 produced = Some(self.copy_construct(src_h));
@@ -49525,7 +49515,7 @@ impl Simulator {
                                         .classes
                                         .contains_key(cn.split('#').next().unwrap_or(cn)));
                             if cn_is_class {
-                                self.var_class_types
+                                self.oop.var_class_types
                                     .insert(d.name.name.clone(), cn.clone());
                                 // A typedef'd local (e.g. `table_q_t rq` where
                                 // `table_q_t = shared#(Foo[$])`) resolves to
@@ -49540,7 +49530,7 @@ impl Simulator {
                                     if let Some((_, Some(ta))) =
                                         self.resolve_typeref_class_with_type_args(name)
                                     {
-                                        self.var_type_args
+                                        self.oop.var_type_args
                                             .insert(d.name.name.clone(), ta);
                                     }
                                 }
@@ -49562,7 +49552,7 @@ impl Simulator {
                                 // `$cast(cb, ...)` assignment and any later
                                 // `new()` could not resolve CB, and the return
                                 // value came back null to the caller.
-                                self.var_class_types.insert(d.name.name.clone(), cn.clone());
+                                self.oop.var_class_types.insert(d.name.name.clone(), cn.clone());
                             }
                         }
                         // Record a parameterized local's declared `#(...)` type
@@ -49588,16 +49578,16 @@ impl Simulator {
                         } = data_type
                         {
                             if !type_args.is_empty() {
-                                self.var_type_args
+                                self.oop.var_type_args
                                     .insert(d.name.name.clone(), type_args.clone());
                             } else if let Some(ta) = resolved_ta {
-                                self.var_type_args
+                                self.oop.var_type_args
                                     .insert(d.name.name.clone(), ta);
                             } else {
-                                self.var_type_args.remove(&d.name.name);
+                                self.oop.var_type_args.remove(&d.name.name);
                             }
                         } else {
-                            self.var_type_args.remove(&d.name.name);
+                            self.oop.var_type_args.remove(&d.name.name);
                         }
                         // §15.3/§15.4: record a mailbox/semaphore-typed local so
                         // a later separate `name = new(bound)` allocates the right
@@ -49665,7 +49655,7 @@ impl Simulator {
                         // §8.25/§6.21. The class prefix also keeps two classes'
                         // same-named method locals from colliding.
                         let key =
-                            match (self.class_context_stack.last().and_then(|c| c.as_ref()),
+                            match (self.oop.class_context_stack.last().and_then(|c| c.as_ref()),
                                    self.current_spec.as_ref()) {
                                 (Some(cn), Some((spec_base, sig))) if spec_base == cn => {
                                     format!("{}#{}::{}::{}", cn, sig, sub_name, nm)
@@ -49932,7 +49922,7 @@ impl Simulator {
     /// class member name shadows a same-named module signal inside a method,
     /// so the this-relative field wins when present.
     fn resolve_this_event_field(&self, name: &str) -> Option<(usize, String)> {
-        let handle = self.this_stack.last().copied().flatten()?;
+        let handle = self.oop.this_stack.last().copied().flatten()?;
         let inst = self.heap_obj(handle)?;
         if inst.properties.contains_key(name) {
             Some((handle, name.to_string()))
@@ -50009,7 +49999,7 @@ impl Simulator {
             return None; // deeper chains are not modelled
         }
         let handle = if recv == "this" || recv == "super" {
-            self.this_stack.last().copied().flatten()?
+            self.oop.this_stack.last().copied().flatten()?
         } else {
             self.eval_ident_handle(recv)?
         };
@@ -50078,11 +50068,11 @@ impl Simulator {
             _ => return None,
         };
         let handle = match &recv_expr.kind {
-            ExprKind::This => self.this_stack.last().copied().flatten()?,
+            ExprKind::This => self.oop.this_stack.last().copied().flatten()?,
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
                 let n = h.path[0].name.name.as_str();
                 if n == "this" || n == "super" {
-                    self.this_stack.last().copied().flatten()?
+                    self.oop.this_stack.last().copied().flatten()?
                 } else {
                     self.eval_ident_handle(n)?
                 }
@@ -50171,9 +50161,9 @@ impl Simulator {
         }
         // A class property reached via `this` resolves differently inside the
         // callee — reject when the surrounding context could capture it.
-        if let Some(Some(handle)) = self.this_stack.last() {
+        if let Some(Some(handle)) = self.oop.this_stack.last() {
             if self
-                .heap
+                .oop.heap
                 .get(*handle)
                 .and_then(|o| o.as_ref())
                 .is_some_and(|i| i.properties.contains_key(name))
@@ -51898,7 +51888,7 @@ impl Simulator {
             // `this.prop` / `obj.prop` via MemberAccess.
             ExprKind::MemberAccess { expr: recv, member } => {
                 let h = match &recv.kind {
-                    ExprKind::This => self.this_stack.last().copied().flatten(),
+                    ExprKind::This => self.oop.this_stack.last().copied().flatten(),
                     ExprKind::Ident(hier) if hier.path.len() == 1 => {
                         self.peek_local_handle(&hier.path[0].name.name)
                     }
@@ -51921,7 +51911,7 @@ impl Simulator {
                 if self.local_stack.iter().rev().any(|m| m.contains_key(name)) {
                     return false;
                 }
-                (self.this_stack.last().copied().flatten(), name.clone())
+                (self.oop.this_stack.last().copied().flatten(), name.clone())
             }
             _ => return false,
         };
@@ -51929,7 +51919,7 @@ impl Simulator {
             Some(h) => h,
             None => return false,
         };
-        let inst = match self.heap.get(handle).and_then(|c| c.as_ref()) {
+        let inst = match self.oop.heap.get(handle).and_then(|c| c.as_ref()) {
             Some(i) => i,
             None => return false,
         };
@@ -51982,11 +51972,11 @@ impl Simulator {
                 let cn = self
                     .runtime_recv_class(recv)
                         .or_else(|| self.get_expr_type_name(recv))
-                        .or_else(|| self.class_context_stack.last().cloned().flatten());
+                        .or_else(|| self.oop.class_context_stack.last().cloned().flatten());
                     (cn, Some(member.name.clone()))
                 }
                 ExprKind::Ident(h) if h.path.len() == 1 => {
-                    let cn = self.class_context_stack.last().cloned().flatten();
+                    let cn = self.oop.class_context_stack.last().cloned().flatten();
                     (cn, Some(h.path[0].name.name.clone()))
                 }
                 ExprKind::Ident(h) if h.path.len() >= 2 => {
@@ -52001,7 +51991,7 @@ impl Simulator {
                         kind: ExprKind::Ident(h.clone()),
                         span: h.span,
                     })
-                    .or_else(|| self.var_class_types.get(first).cloned())
+                    .or_else(|| self.oop.var_class_types.get(first).cloned())
                     .or_else(|| Some(first.clone()));
                     let mn = h.path.last().unwrap().name.name.clone();
                     (cn, Some(mn))
@@ -52046,7 +52036,7 @@ impl Simulator {
     /// `call_returns_string` when static type analysis fails.
     fn runtime_recv_class(&self, recv: &Expression) -> Option<String> {
         let handle = self.eval_handle_expr(recv)?;
-        self.heap
+        self.oop.heap
             .get(handle)
             .and_then(|o| o.as_ref())
             .map(|inst| inst.class_name.clone())
@@ -52412,9 +52402,9 @@ impl Simulator {
                                     _ => None,
                                 };
                                 if let Some((h, prop)) = obj_prop {
-                                    if h != 0 && h < self.heap.len() {
+                                    if h != 0 && h < self.oop.heap.len() {
                                         let mut cur = self
-                                            .heap
+                                            .oop.heap
                                             .get(h)
                                             .and_then(|o| o.as_ref())
                                             .map(|i| i.class_name.clone());
@@ -53591,9 +53581,9 @@ impl Simulator {
         for probe in probes {
             // Push `this` so member references in the predicate resolve
             // against the property's owning class instance (if any).
-            self.this_stack.push(probe.this_handle);
+            self.oop.this_stack.push(probe.this_handle);
             let outcome = self.eval_expr(&probe.predicate).is_true();
-            self.this_stack.pop();
+            self.oop.this_stack.pop();
             // Fold into assertion_stats so the coverage DB reflects
             // concurrent-property hits without a separate channel.
             // Synthesize a "span_key" by hashing the probe name so it
@@ -53895,8 +53885,8 @@ impl Simulator {
             let segs: Vec<&str> = hier.path.iter().map(|s| s.name.name.as_str()).collect();
             // Form 1: bare `vif.member.…` — `vif` looked up against
             // the current `this` instance.
-            if let Some(Some(this_h)) = self.this_stack.last() {
-                let cls_name = if let Some(Some(inst)) = self.heap.get(*this_h) {
+            if let Some(Some(this_h)) = self.oop.this_stack.last() {
+                let cls_name = if let Some(Some(inst)) = self.oop.heap.get(*this_h) {
                     Some(inst.class_name.clone())
                 } else {
                     None
@@ -53910,7 +53900,7 @@ impl Simulator {
                         .unwrap_or(false);
                     if cls_has_vif {
                         if let Some((bound, _mp)) = self
-                            .virtual_iface_bindings
+                            .oop.virtual_iface_bindings
                             .get(&(*this_h, segs[0].to_string()))
                         {
                             let rest = segs[1..].join(".");
@@ -53931,8 +53921,8 @@ impl Simulator {
                     .or_else(|| self.get_signal_value_by_name(obj_name));
                 if let Some(v) = obj_handle_v {
                     let handle = v.to_u64().unwrap_or(0) as usize;
-                    if handle != 0 && handle < self.heap.len() {
-                        if let Some(Some(inst)) = self.heap.get(handle) {
+                    if handle != 0 && handle < self.oop.heap.len() {
+                        if let Some(Some(inst)) = self.oop.heap.get(handle) {
                             let cn = inst.class_name.clone();
                             let cls_has_vif = self
                                 .module
@@ -53942,7 +53932,7 @@ impl Simulator {
                                 .unwrap_or(false);
                             if cls_has_vif {
                                 if let Some((bound, _mp)) = self
-                                    .virtual_iface_bindings
+                                    .oop.virtual_iface_bindings
                                     .get(&(handle, segs[1].to_string()))
                                 {
                                     let rest = segs[2..].join(".");
@@ -55686,7 +55676,7 @@ impl Simulator {
     /// access.
     #[inline(always)]
     fn no_class_objects(&self) -> bool {
-        self.heap.len() <= 1
+        self.oop.heap.len() <= 1
     }
 
     /// Id-keyed write with the same bookkeeping as `fast_signal_write`'s
@@ -56174,7 +56164,7 @@ impl Simulator {
         // scope/method exit (see the note at `class_prop_type`), so this
         // binding can be stale across method calls — the result is therefore
         // NOT memoisable by AST node. That is pre-existing behaviour.
-        let class_name: String = if let Some(cn) = self.var_class_types.get(recv_head) {
+        let class_name: String = if let Some(cn) = self.oop.var_class_types.get(recv_head) {
             cn.clone()
         } else {
             let id = *self.signal_name_to_id.get(recv_head)?;
@@ -56246,7 +56236,7 @@ impl Simulator {
                 // maps, so without this it fell through to the 32-bit default
                 // and `std::randomize(prop)` drew a full 32-bit value into a
                 // 2-bit property.
-                if let Some(&Some(handle)) = self.this_stack.last() {
+                if let Some(&Some(handle)) = self.oop.this_stack.last() {
                     if let Some(w) = self.heap_prop_width(handle, leaf) {
                         return w;
                     }
@@ -58955,7 +58945,7 @@ impl Simulator {
         if let Some(pos) = name.find('#') {
             if let Ok(handle) = name[..pos].parse::<usize>() {
                 let member = &name[pos + 1..];
-                if let Some(Some(inst)) = self.heap.get(handle) {
+                if let Some(Some(inst)) = self.oop.heap.get(handle) {
                     let mut cur = Some(inst.class_name.clone());
                     while let Some(cn) = cur {
                         if let Some(cd) = self.module.classes.get(&cn) {
@@ -59014,7 +59004,7 @@ impl Simulator {
         // to `Common::this_type` instead of `Wrapper::this_type`. Walk the
         // enclosing class context up the inheritance chain.
         if target.is_none() {
-            if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            if let Some(Some(ctx)) = self.oop.class_context_stack.last().cloned() {
                 let mut cur = Some(ctx);
                 while let Some(cname) = cur {
                     if let Some(cls) = self.module.classes.get(&cname) {
@@ -59132,7 +59122,7 @@ impl Simulator {
     /// the module-level table, then any class-local typedef table.
     fn lookup_typedef_target(&self, nm: &str) -> Option<crate::ast::types::DataType> {
 
-        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+        if let Some(Some(ctx)) = self.oop.class_context_stack.last().cloned() {
             let mut cur = Some(ctx);
             while let Some(cname) = cur {
                 if let Some(cls) = self.module.classes.get(&cname) {
@@ -59544,7 +59534,7 @@ impl Simulator {
             let handle: usize = name[..pos].parse().ok()?;
             let member = &name[pos + 1..];
             let cn = self
-                .heap
+                .oop.heap
                 .get(handle)
                 .and_then(|o| o.as_ref())
                 .map(|i| i.class_name.clone())?;
@@ -60222,7 +60212,7 @@ impl Simulator {
         let (hstr, member) = name.split_once('#')?;
         let h = hstr.parse::<usize>().ok()?;
         let cn = self
-            .heap
+            .oop.heap
             .get(h)
             .and_then(|x| x.as_ref())
             .map(|i| i.class_name.clone())?;
@@ -60254,7 +60244,7 @@ impl Simulator {
             if let Some((hstr, member)) = scoped.split_once('#') {
                 if let Ok(h) = hstr.parse::<usize>() {
                     let cn = self
-                        .heap
+                        .oop.heap
                         .get(h)
                         .and_then(|o| o.as_ref())
                         .map(|inst| inst.class_name.clone());
@@ -60462,7 +60452,7 @@ impl Simulator {
         if let Some(v) = self.get_local_or_signal(name) {
             return Some(v);
         }
-        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+        if let Some(Some(ctx)) = self.oop.class_context_stack.last().cloned() {
             if let Some(v) = self.class_static_get(&ctx, name) {
                 return Some(v);
             }
@@ -60473,12 +60463,12 @@ impl Simulator {
         // property read an empty string and the `.len()` tail returned a
         // silent 0. Shadow-resolved, so a base method's `n` names the base's
         // copy.
-        if let Some(Some(handle)) = self.this_stack.last() {
+        if let Some(Some(handle)) = self.oop.this_stack.last() {
             let key = self
                 .shadowed_prop_key(name, false)
                 .unwrap_or_else(|| name.to_string());
             if let Some(v) = self
-                .heap
+                .oop.heap
                 .get(*handle)
                 .and_then(|o| o.as_ref())
                 .and_then(|i| i.properties.get(&key))
@@ -61229,13 +61219,13 @@ impl Simulator {
         let mut out: Vec<ClassConstraint> = Vec::new();
         let mut seen: HashSet<String> = HashSet::default();
         let disabled = self
-            .constraint_mode_disabled
+            .oop.constraint_mode_disabled
             .get(&handle)
             .cloned()
             .unwrap_or_default();
         let all_off = disabled.contains("*");
         let mut cur = self
-            .heap
+            .oop.heap
             .get(handle)
             .and_then(|x| x.as_ref())
             .map(|i| i.class_name.clone());
@@ -61774,7 +61764,7 @@ impl Simulator {
     fn object_rand_set(&self, handle: usize) -> HashSet<String> {
         let mut out = HashSet::default();
         let mut cur = self
-            .heap
+            .oop.heap
             .get(handle)
             .and_then(|x| x.as_ref())
             .map(|i| i.class_name.clone());
@@ -63671,7 +63661,7 @@ impl Simulator {
     /// `class_of_var` this does not require the name to be a known class, so an
     /// enum-typed destination can be recognised too.
     fn type_name_of_var(&self, vname: &str) -> Option<String> {
-        if let Some(c) = self.var_class_types.get(vname) {
+        if let Some(c) = self.oop.var_class_types.get(vname) {
             return Some(c.clone());
         }
         if let Some(sig) = self.module.signals.get(vname) {
@@ -64360,7 +64350,7 @@ impl Simulator {
         if self.shadowed_prop_names.is_empty() || !self.shadowed_prop_names.contains(name) {
             return None;
         }
-        let ctx = self.class_context_stack.last().cloned().flatten()?;
+        let ctx = self.oop.class_context_stack.last().cloned().flatten()?;
         let viewing = if from_super {
             self.module.classes.get(&ctx)?.extends.clone()?
         } else {
@@ -64379,9 +64369,9 @@ impl Simulator {
         }
         let target = target?;
         // The leaf-most declarer for the CURRENT object.
-        let handle = self.this_stack.last().copied().flatten()?;
+        let handle = self.oop.this_stack.last().copied().flatten()?;
         let leaf = self
-            .heap
+            .oop.heap
             .get(handle)
             .and_then(|o| o.as_ref())
             .map(|i| i.class_name.clone())?;
@@ -64457,9 +64447,9 @@ impl Simulator {
         // going — an emulation gap can leave a handle null where the
         // reference had one, and terminating there kills whole UVM runs.
         // In module/TB context the deref is the user's bug: fatal.
-        let in_method = self.this_stack.last().copied().flatten().is_some()
+        let in_method = self.oop.this_stack.last().copied().flatten().is_some()
             || self
-                .class_context_stack
+                .oop.class_context_stack
                 .last()
                 .cloned()
                 .flatten()
@@ -64500,7 +64490,7 @@ impl Simulator {
             return Some(vname.to_string());
         }
         // Procedural locals record their class at VarDecl exec time.
-        if let Some(c) = self.var_class_types.get(vname) {
+        if let Some(c) = self.oop.var_class_types.get(vname) {
             if self.module.classes.contains_key(c) {
                 return Some(c.clone());
             }
@@ -64563,7 +64553,7 @@ impl Simulator {
         // static variable, not a local or signal, so the checks above miss it.
         // Without this, the write falls through to instance storage and the
         // shared static cell is never updated.
-        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+        if let Some(Some(ctx)) = self.oop.class_context_stack.last().cloned() {
             let mut cur = Some(ctx);
             while let Some(cname) = cur {
                 if let Some(cd) = self.module.classes.get(&cname) {
@@ -64725,7 +64715,7 @@ impl Simulator {
         {
             return None;
         }
-        let handle = self.this_stack.last().copied().flatten()?;
+        let handle = self.oop.this_stack.last().copied().flatten()?;
         if handle == 0 {
             return None;
         }
@@ -64979,7 +64969,7 @@ impl Simulator {
                                 return None;
                             }
                             let bound = self
-                                .heap
+                                .oop.heap
                                 .get(handle)?
                                 .as_ref()?
                                 .type_bindings
@@ -65272,7 +65262,7 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) -> Option<()> {
-        if self.heap.is_empty() {
+        if self.oop.heap.is_empty() {
             return None;
         }
         // Ternary source (`local.s = cond ? a.s : b.s`): peel to the selected
@@ -65704,7 +65694,7 @@ impl Simulator {
                 total,
             } => {
                 let whole = self
-                    .heap
+                    .oop.heap
                     .get(*handle)
                     .and_then(|o| o.as_ref())
                     .and_then(|i| i.properties.get(prop))
@@ -65717,7 +65707,7 @@ impl Simulator {
                 out
             }
             ClassAggRef::Unpacked { handle, key, w } => self
-                .heap
+                .oop.heap
                 .get(*handle)
                 .and_then(|o| o.as_ref())
                 .and_then(|i| i.properties.get(key))
@@ -65741,7 +65731,7 @@ impl Simulator {
                 total,
             } => {
                 let mut whole = self
-                    .heap
+                    .oop.heap
                     .get(*handle)
                     .and_then(|o| o.as_ref())
                     .and_then(|i| i.properties.get(prop))
@@ -65755,14 +65745,14 @@ impl Simulator {
                     whole.set_bit((off + i) as usize, val.get_bit(i as usize));
                 }
                 let changed = whole != before;
-                if let Some(Some(inst)) = self.heap.get_mut(*handle) {
+                if let Some(Some(inst)) = self.oop.heap.get_mut(*handle) {
                     inst.properties.insert(prop.clone(), whole);
                 }
                 changed
             }
             ClassAggRef::Unpacked { handle, key, w } => {
                 let nv = val.resize((*w).max(1));
-                if let Some(Some(inst)) = self.heap.get_mut(*handle) {
+                if let Some(Some(inst)) = self.oop.heap.get_mut(*handle) {
                     let changed = inst.properties.get(key) != Some(&nv);
                     inst.properties.insert(key.clone(), nv);
                     return changed;
@@ -65861,7 +65851,7 @@ impl Simulator {
             ExprKind::MemberAccess { expr: base, member } => {
                 let h = match &base.kind {
                     ExprKind::This => {
-                        self.this_stack.last().copied().flatten().unwrap_or(0)
+                        self.oop.this_stack.last().copied().flatten().unwrap_or(0)
                     }
                     ExprKind::Ident(b) if b.path.len() == 1 => {
                         let nm = b.path[0].name.name.clone();
@@ -65882,7 +65872,7 @@ impl Simulator {
             return false;
         }
         let Some(cn) = self
-            .heap
+            .oop.heap
             .get(handle)
             .and_then(|o| o.as_ref())
             .map(|i| i.class_name.clone())
@@ -68848,7 +68838,7 @@ impl Simulator {
                 .filter(|&h| h != 0)
             {
                 let cn = self
-                    .heap
+                    .oop.heap
                     .get(h as usize)
                     .and_then(|o| o.as_ref())
                     .map(|i| i.class_name.clone());
@@ -69444,7 +69434,7 @@ impl Simulator {
         let canon_sig = self.canonicalize_spec_sig(base, sig);
         for (cname, prop, init) in inits {
             let spec_key = format!("{}#{}::{}", base, canon_sig, prop);
-            if self.class_statics.contains_key(&spec_key) {
+            if self.oop.class_statics.contains_key(&spec_key) {
                 continue;
             }
             let cont_kind = self
@@ -69456,8 +69446,8 @@ impl Simulator {
                 if matches!(&func.kind, ExprKind::Ident(h)
                     if h.path.len() == 1 && h.path[0].name.name == "new"));
             let v = if let (Some(kind), true) = (cont_kind, is_new) {
-                let ch = self.heap.len();
-                self.heap.push(Some(ClassInstance {
+                let ch = self.oop.heap.len();
+                self.oop.heap.push(Some(ClassInstance {
                     class_name: kind.to_string(),
                     properties: HashMap::default(),
                     type_bindings: HashMap::default(),
@@ -69470,15 +69460,15 @@ impl Simulator {
                 }
                 Value::from_u64(ch as u64, 32)
             } else {
-                self.class_context_stack.push(Some(cname.clone()));
-                self.this_stack.push(None);
+                self.oop.class_context_stack.push(Some(cname.clone()));
+                self.oop.this_stack.push(None);
 
                 let v = self.eval_expr(&init);
-                self.this_stack.pop();
-                self.class_context_stack.pop();
+                self.oop.this_stack.pop();
+                self.oop.class_context_stack.pop();
                 v
             };
-            self.class_statics.insert(spec_key.clone(), v);
+            self.oop.class_statics.insert(spec_key.clone(), v);
         }
         self.current_spec = saved_spec;
     }
@@ -69795,7 +69785,7 @@ impl Simulator {
     /// (push_back/size/pop_front/...) keys off the same spec-aware name.
     fn spec_static_coll_key(&self, name: &str) -> String {
         let this_h = self
-            .this_stack
+            .oop.this_stack
             .last()
             .copied()
             .flatten()
@@ -69806,7 +69796,7 @@ impl Simulator {
         if this_h.is_some() {
             return name.to_string();
         }
-        let Some(Some(ctx)) = self.class_context_stack.last().cloned() else {
+        let Some(Some(ctx)) = self.oop.class_context_stack.last().cloned() else {
             return name.to_string();
         };
         // Walk ctx's inheritance chain for a STATIC collection property.
@@ -70020,7 +70010,7 @@ impl Simulator {
     /// the declaring class's initial value on first access.
     fn class_static_get(&mut self, start_class: &str, prop: &str) -> Option<Value> {
         let key = self.static_prop_key(start_class, prop)?;
-        if !self.class_statics.contains_key(&key) {
+        if !self.oop.class_statics.contains_key(&key) {
             // Key head is `DeclClass` or `DeclClass#spec`; strip the spec
             // suffix to find the class whose initial value seeds the cell.
             let head = key.split("::").next().unwrap_or("");
@@ -70050,9 +70040,9 @@ impl Simulator {
                 }
             };
             let init = init_val.unwrap_or_else(|| Value::zero(32));
-            self.class_statics.insert(key.clone(), init);
+            self.oop.class_statics.insert(key.clone(), init);
         }
-        self.class_statics.get(&key).cloned()
+        self.oop.class_statics.get(&key).cloned()
     }
 
     /// Write a static class property's shared cell. Returns false if
@@ -70087,7 +70077,7 @@ impl Simulator {
                 // A same-named class vif PROPERTY written bare inside a
                 // method takes the binding path below, not the var alias.
                 let shadows_class_prop = self
-                    .this_stack
+                    .oop.this_stack
                     .last()
                     .copied()
                     .flatten()
@@ -70207,7 +70197,7 @@ impl Simulator {
             // Bare `v = ...` inside a method — `v` is `this.<v>` (a class vif
             // property). The prop_info check below filters non-vif locals.
             ExprKind::Ident(h) if h.path.len() == 1 => {
-                let handle = self.this_stack.last().copied().flatten().unwrap_or(0);
+                let handle = self.oop.this_stack.last().copied().flatten().unwrap_or(0);
                 (handle, h.path[0].name.name.clone())
             }
             ExprKind::Ident(h) if h.path.len() == 2 => {
@@ -70241,7 +70231,7 @@ impl Simulator {
                     // too) then missed the redirect and read x. This is the
                     // usual shape in a constructor that takes the interface as
                     // an argument.
-                    ExprKind::This => self.this_stack.last().copied().flatten().unwrap_or(0),
+                    ExprKind::This => self.oop.this_stack.last().copied().flatten().unwrap_or(0),
                     _ => 0,
                 };
                 (obj_handle, member.name.clone())
@@ -70280,7 +70270,7 @@ impl Simulator {
                     // spelling had no arm at all, so a driver binding its own
                     // array never recorded anything.
                     ExprKind::Ident(h) if h.path.len() == 1 => {
-                        let hh = self.this_stack.last().copied().flatten().unwrap_or(0);
+                        let hh = self.oop.this_stack.last().copied().flatten().unwrap_or(0);
                         (hh, h.path[0].name.name.clone())
                     }
                     // d.vif_arr in hier-Ident form: Ident([d, vif_arr])
@@ -70302,13 +70292,13 @@ impl Simulator {
             }
             _ => return false,
         };
-        if handle == 0 || handle >= self.heap.len() {
+        if handle == 0 || handle >= self.oop.heap.len() {
             return false;
         }
         // Look up the class to see if `prop` is virtual-iface. Strip
         // any `[idx]` suffix on the prop key so array elements match
         // the bare property declaration.
-        let class_name = if let Some(Some(inst)) = self.heap.get(handle) {
+        let class_name = if let Some(Some(inst)) = self.oop.heap.get(handle) {
             inst.class_name.clone()
         } else {
             return false;
@@ -70330,7 +70320,7 @@ impl Simulator {
         //     vif's CURRENT bound interface, not the variable name (without
         //     this the copy bound to a name that resolves to nothing -> X).
         if matches!(&rvalue.kind, ExprKind::Null) {
-            self.virtual_iface_bindings.remove(&(handle, prop));
+            self.oop.virtual_iface_bindings.remove(&(handle, prop));
             return true;
         }
         let Some(rhs_name) = self.resolve_vif_rhs_name(rvalue) else {
@@ -70339,7 +70329,7 @@ impl Simulator {
         // Record the binding. Subsequent `obj.<prop>.<member>` accesses
         // will follow it; the modport (if any) is consulted at write
         // time to emit a direction warning.
-        self.virtual_iface_bindings
+        self.oop.virtual_iface_bindings
             .insert((handle, prop), (rhs_name, modport));
         true
     }
@@ -70357,8 +70347,8 @@ impl Simulator {
             // formal/local alias (LRM §25.9), else a direct instance.
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 let raw = h.path[0].name.name.clone();
-                if let Some(th) = self.this_stack.last().copied().flatten() {
-                    if let Some((b, _)) = self.virtual_iface_bindings.get(&(th, raw.clone())) {
+                if let Some(th) = self.oop.this_stack.last().copied().flatten() {
+                    if let Some((b, _)) = self.oop.virtual_iface_bindings.get(&(th, raw.clone())) {
                         return Some(b.clone());
                     }
                 }
@@ -70390,7 +70380,7 @@ impl Simulator {
                     return Some(head.clone());
                 }
                 let oh = self.eval_ident_handle(head).unwrap_or(0);
-                self.virtual_iface_bindings
+                self.oop.virtual_iface_bindings
                     .get(&(oh, h.path[1].name.name.clone()))
                     .map(|(b, _)| b.clone())
             }
@@ -70405,7 +70395,7 @@ impl Simulator {
                     }
                 }
                 let oh = self.eval_handle_expr(expr).unwrap_or(0);
-                self.virtual_iface_bindings
+                self.oop.virtual_iface_bindings
                     .get(&(oh, member.name.clone()))
                     .map(|(b, _)| b.clone())
             }
@@ -70596,12 +70586,12 @@ impl Simulator {
         if let Some(b) = self.iface_alias_for(root) {
             return Some(b);
         }
-        if self.virtual_iface_bindings.is_empty() {
+        if self.oop.virtual_iface_bindings.is_empty() {
             return None;
         }
-        let this_h = self.this_stack.last().copied().flatten()?;
+        let this_h = self.oop.this_stack.last().copied().flatten()?;
         let cn = self
-            .heap
+            .oop.heap
             .get(this_h)
             .and_then(|o| o.as_ref())
             .map(|i| i.class_name.clone())?;
@@ -70616,7 +70606,7 @@ impl Simulator {
         if !has {
             return None;
         }
-        self.virtual_iface_bindings
+        self.oop.virtual_iface_bindings
             .get(&(this_h, root.to_string()))
             .map(|(b, _mp)| b.clone())
     }
@@ -70636,7 +70626,7 @@ impl Simulator {
             .last()
             .is_none_or(|m| m.is_empty())
             && self.viface_var_aliases.is_empty()
-            && self.virtual_iface_bindings.is_empty()
+            && self.oop.virtual_iface_bindings.is_empty()
         {
             return None;
         }
@@ -70888,14 +70878,14 @@ impl Simulator {
     /// interface instance name, if any.
     #[allow(dead_code)]
     fn virtual_iface_bound_name(&self, handle: usize, prop: &str) -> Option<String> {
-        self.virtual_iface_bindings
+        self.oop.virtual_iface_bindings
             .get(&(handle, prop.to_string()))
             .map(|(n, _)| n.clone())
     }
 
     fn class_static_set(&mut self, start_class: &str, prop: &str, val: Value) -> bool {
         if let Some(key) = self.static_prop_key(start_class, prop) {
-            self.class_statics.insert(key, val);
+            self.oop.class_statics.insert(key, val);
             true
         } else {
             false
@@ -70933,7 +70923,7 @@ impl Simulator {
         let (handle, member) = match &cur.kind {
             ExprKind::MemberAccess { expr: recv, member } => {
                 let h = match &recv.kind {
-                    ExprKind::This => self.this_stack.last().copied().flatten()?,
+                    ExprKind::This => self.oop.this_stack.last().copied().flatten()?,
                     _ => self.eval_expr(recv).to_u64().map(|h| h as usize)?,
                 };
                 (h, member.name.clone())
@@ -70941,14 +70931,14 @@ impl Simulator {
             ExprKind::Ident(h) if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) => {
                 let obj = &h.path[0].name.name;
                 let hh = if obj == "this" || obj == "super" {
-                    self.this_stack.last().copied().flatten()?
+                    self.oop.this_stack.last().copied().flatten()?
                 } else {
                     self.eval_ident_handle(obj)?
                 };
                 (hh, h.path[1].name.name.clone())
             }
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
-                let hh = self.this_stack.last().copied().flatten()?;
+                let hh = self.oop.this_stack.last().copied().flatten()?;
                 (hh, h.path[0].name.name.clone())
             }
             _ => return None,
@@ -70957,7 +70947,7 @@ impl Simulator {
             return None;
         }
         let cn = self
-            .heap
+            .oop.heap
             .get(handle)
             .and_then(|x| x.as_ref())
             .map(|i| i.class_name.clone())?;
@@ -70988,11 +70978,11 @@ impl Simulator {
         if name.contains('#') || name.contains('.') || name.contains('[') {
             return None;
         }
-        let handle = self.this_stack.last().copied().flatten()?;
+        let handle = self.oop.this_stack.last().copied().flatten()?;
         if handle == 0 {
             return None;
         }
-        let ctx = self.class_context_stack.last().cloned().flatten()?;
+        let ctx = self.oop.class_context_stack.last().cloned().flatten()?;
         let mut cur = Some(ctx);
         while let Some(cn) = cur {
             let cd = self.module.classes.get(&cn)?;
@@ -71033,7 +71023,7 @@ impl Simulator {
         // property elaboration is dim-blind for typedef'd types).
         let _raw_dbg = raw.clone();
         let concrete = self
-            .heap
+            .oop.heap
             .get(handle)
             .and_then(|o| o.as_ref())
             .and_then(|i| i.type_bindings.get(&raw).cloned())
@@ -71097,7 +71087,7 @@ impl Simulator {
             return None;
         }
         let cn = self
-            .heap
+            .oop.heap
             .get(handle)
             .and_then(|x| x.as_ref())
             .map(|i| i.class_name.clone())?;
@@ -71123,7 +71113,7 @@ impl Simulator {
             // many class methods use) fails to resolve to `<handle>#member` and
             // is silently dropped, while the bare `member[k]=1` form works.
             let handle = if obj == "this" || obj == "super" {
-                sim.this_stack.last().copied().flatten().unwrap_or(0)
+                sim.oop.this_stack.last().copied().flatten().unwrap_or(0)
             } else {
                 sim.eval_ident_handle(obj).unwrap_or(0)
             };
@@ -71131,6 +71121,7 @@ impl Simulator {
                 return None;
             }
             let cn = sim
+                .oop
                 .heap
                 .get(handle)
                 .and_then(|x| x.as_ref())
@@ -71271,7 +71262,7 @@ impl Simulator {
                 let n = h.path.len();
                 let mut handle = match self
                     .static_prop_key(&h.path[0].name.name, &h.path[1].name.name)
-                    .and_then(|k| self.class_statics.get(&k))
+                    .and_then(|k| self.oop.class_statics.get(&k))
                     .and_then(|v| v.to_u64())
                 {
                     Some(x) => x as usize,
@@ -71283,7 +71274,7 @@ impl Simulator {
                         return None;
                     }
                     handle = match self
-                        .heap
+                        .oop.heap
                         .get(handle)
                         .and_then(|o| o.as_ref())
                         .and_then(|i| i.properties.get(&seg.name.name))
@@ -71298,7 +71289,7 @@ impl Simulator {
                 }
                 let member = &h.path[n - 1].name.name;
                 let cn = self
-                    .heap
+                    .oop.heap
                     .get(handle)
                     .and_then(|x| x.as_ref())
                     .map(|i| i.class_name.clone())?;
@@ -71319,7 +71310,7 @@ impl Simulator {
                 if let Some(handle) = self.eval_handle_expr(base) {
                     if handle != 0 {
                         if let Some(cn) = self
-                            .heap
+                            .oop.heap
                             .get(handle)
                             .and_then(|x| x.as_ref())
                             .map(|i| i.class_name.clone())
@@ -71391,7 +71382,7 @@ impl Simulator {
         let cn = inst.map(|i| i.class_name.clone())?;
         let spec = inst.and_then(|i| i.spec.as_ref());
         let key = self.static_prop_key_spec(&cn, member, spec)?;
-        self.class_statics.get(&key).cloned()
+        self.oop.class_statics.get(&key).cloned()
     }
 
     /// Resolve a handle for `handle.member`: try the instance property first,
@@ -71410,7 +71401,7 @@ impl Simulator {
         let cn = inst.map(|i| i.class_name.clone())?;
         let spec = inst.and_then(|i| i.spec.as_ref());
         let key = self.static_prop_key_spec(&cn, member, spec)?;
-        self.class_statics
+        self.oop.class_statics
             .get(&key)
             .and_then(|v| v.to_u64())
             .map(|h| h as usize)
@@ -71423,7 +71414,7 @@ impl Simulator {
             // `this` resolves to the current object handle. Needed so
             // `this.member` selects/associative-writes resolve to
             // `<handle>#member` (e.g. `this.m_successors[k]=1`).
-            ExprKind::This => self.this_stack.last().copied().flatten(),
+            ExprKind::This => self.oop.this_stack.last().copied().flatten(),
             ExprKind::Ident(h) if h.path.len() == 1 => self.eval_ident_handle(&h.path[0].name.name),
             // Flattened multi-segment handle path (`a.b.c`): resolve the head
             // handle, then walk the remaining segments as property reads.
@@ -71454,7 +71445,7 @@ impl Simulator {
                     {
                         return self
                             .static_prop_key(&bh.path[0].name.name, &member.name)
-                            .and_then(|key| self.class_statics.get(&key))
+                            .and_then(|key| self.oop.class_statics.get(&key))
                             .and_then(|v| v.to_u64())
                             .map(|h| h as usize);
                     }
@@ -71788,7 +71779,7 @@ impl Simulator {
                 if let ExprKind::Ident(h) = &dest.kind {
                     if h.path.len() == 1 {
                         let dvar = &h.path[0].name.name;
-                        self.var_type_args.get(dvar).and_then(|ta| {
+                        self.oop.var_type_args.get(dvar).and_then(|ta| {
                             let frags: Vec<String> =
                                 ta.iter().filter_map(|e| self.expr_to_spec_fragment(e)).collect();
                             if frags.is_empty() { None } else { Some(frags.join(",")) }
@@ -71912,7 +71903,7 @@ impl Simulator {
                 if let ExprKind::Ident(h) = &dest.kind {
                     if h.path.len() == 1 {
                         let dvar = &h.path[0].name.name;
-                        self.var_type_args.get(dvar).and_then(|ta| {
+                        self.oop.var_type_args.get(dvar).and_then(|ta| {
                             let frags: Vec<String> =
                                 ta.iter().filter_map(|e| self.expr_to_spec_fragment(e)).collect();
                             if frags.is_empty() {
@@ -72043,7 +72034,7 @@ impl Simulator {
         // A live receiver: prefer its runtime class (covers derived objects).
         if runtime_handle != 0 {
             if let Some(cn) = self
-                .heap
+                .oop.heap
                 .get(runtime_handle)
                 .and_then(|o| o.as_ref())
                 .map(|i| i.class_name.clone())
@@ -72058,7 +72049,7 @@ impl Simulator {
                     return None; // handled via builtin-dispatch elsewhere
                 }
                 let c = self.class_of_var(name);
-                let th = self.this_stack.last().copied().flatten();
+                let th = self.oop.this_stack.last().copied().flatten();
                 let pt = th.and_then(|hh| self.prop_class_type(hh, name));
                 c.or_else(|| pt)
             }
@@ -72068,7 +72059,7 @@ impl Simulator {
                 ExprKind::Ident(b) if b.path.len() == 1 && b.path[0].selects.is_empty() => {
                     let bname = &b.path[0].name.name;
                     if bname == "this" || bname == "super" {
-                        self.this_stack.last().copied().flatten().and_then(|th| {
+                        self.oop.this_stack.last().copied().flatten().and_then(|th| {
                             self.prop_class_type(th, &member.name)
                         })
                     } else {
@@ -72081,7 +72072,7 @@ impl Simulator {
                             .and_then(|v| v.to_u64())
                             .map(|h| h as usize)
                             .or_else(|| self.eval_ident_handle(bname))
-                            .filter(|&h| h != 0 && h < self.heap.len())
+                            .filter(|&h| h != 0 && h < self.oop.heap.len())
                             .unwrap_or(0);
                         if sh != 0 {
                             self.prop_class_type(sh, &member.name)
@@ -72473,7 +72464,7 @@ impl Simulator {
             // legacy routing.
             if let ExprKind::Ident(hier) = &expr.kind {
                 if hier.path.len() == 1 && hier.path[0].name.name == "super" {
-                    if let Some(handle) = self.this_stack.last().copied().flatten() {
+                    if let Some(handle) = self.oop.this_stack.last().copied().flatten() {
                         let routed = mname == "new"
                             || self
                                 .super_call_parent()
@@ -72501,12 +72492,12 @@ impl Simulator {
                         // OR an `this`-local class property — only the
                         // former applies modes globally to the object.
                         let h_val = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
-                        if h_val != 0 && self.heap.get(h_val).and_then(|x| x.as_ref()).is_some() {
+                        if h_val != 0 && self.oop.heap.get(h_val).and_then(|x| x.as_ref()).is_some() {
                             (Some(h_val), None)
                         } else {
                             // Treat as `this.<name>`, i.e. specific rand prop
                             // or constraint name on the current this.
-                            let this_h = self.this_stack.last().and_then(|t| *t);
+                            let this_h = self.oop.this_stack.last().and_then(|t| *t);
                             (this_h, Some(h.path[0].name.name.clone()))
                         }
                     }
@@ -72539,9 +72530,9 @@ impl Simulator {
                     let enable = if args.is_empty() {
                         // Query form: return current state.
                         let table = if mname == "rand_mode" {
-                            &self.rand_mode_disabled
+                            &self.oop.rand_mode_disabled
                         } else {
-                            &self.constraint_mode_disabled
+                            &self.oop.constraint_mode_disabled
                         };
                         let disabled = table.get(&h).is_some_and(|s| {
                             if let Some(ref n) = target_name {
@@ -72555,9 +72546,9 @@ impl Simulator {
                         self.eval_expr(&args[0]).to_u64().unwrap_or(0) != 0
                     };
                     let table = if mname == "rand_mode" {
-                        &mut self.rand_mode_disabled
+                        &mut self.oop.rand_mode_disabled
                     } else {
-                        &mut self.constraint_mode_disabled
+                        &mut self.oop.constraint_mode_disabled
                     };
                     if enable {
                         if let Some(set) = table.get_mut(&h) {
@@ -72608,7 +72599,7 @@ impl Simulator {
                 if let Some(h) = self.eval_handle_expr(expr) {
                     if h != 0 {
                         let cn = self
-                            .heap
+                            .oop.heap
                             .get(h)
                             .and_then(|o| o.as_ref())
                             .map(|i| i.class_name.clone());
@@ -72653,7 +72644,7 @@ impl Simulator {
                 if let Some(h) = self.eval_handle_expr(expr) {
                     if h != 0 {
                         let cn = self
-                            .heap
+                            .oop.heap
                             .get(h)
                             .and_then(|o| o.as_ref())
                             .map(|i| i.class_name.clone());
@@ -73262,7 +73253,7 @@ impl Simulator {
                 // `rtab[name].get(i)` in resource pools (lookup_name read a
                 // null resource → get always missed).
                 let is_user_get = self
-                    .heap
+                    .oop.heap
                     .get(handle)
                     .and_then(|o| o.as_ref())
                     .is_some_and(|i| self.class_has_method(&i.class_name, "get"));
@@ -73324,7 +73315,7 @@ impl Simulator {
                 let h = base.to_u64().unwrap_or(0) as usize;
                 if h != 0 {
                     if let Some(cn) = self
-                        .heap
+                        .oop.heap
                         .get(h)
                         .and_then(|o| o.as_ref())
                         .map(|i| i.class_name.clone())
@@ -73422,7 +73413,7 @@ impl Simulator {
                         let handle = self.instantiate_class(&class_def, &[]);
                         // Hardcode data to something
                         if let Some(Some(inst)) =
-                            self.heap.get_mut(handle.to_u64().unwrap_or(0) as usize)
+                            self.oop.heap.get_mut(handle.to_u64().unwrap_or(0) as usize)
                         {
                             inst.properties
                                 .insert("data".to_string(), Value::from_u64(42, 32));
@@ -73562,7 +73553,7 @@ impl Simulator {
             }
             if let ExprKind::Ident(hier) = &expr.kind {
                 if hier.path.last().unwrap().name.name == "super" {
-                    if let Some(Some(handle)) = self.this_stack.last() {
+                    if let Some(Some(handle)) = self.oop.this_stack.last() {
                         return self.exec_super_method_call(*handle, &member.name, args);
                     }
                 }
@@ -73609,7 +73600,7 @@ impl Simulator {
                                 self.nonvirtual_target_class(&decl_base, &member.name)
                             {
                                 let runtime = self
-                                    .heap
+                                    .oop.heap
                                     .get(handle)
                                     .and_then(|o| o.as_ref())
                                     .map(|i| i.class_name.clone());
@@ -73642,7 +73633,7 @@ impl Simulator {
             // override (or a builtin name collision returned garbage) instead
             // of the parent-of-the-lexically-containing-class method.
             if len == 2 && path[0].name.name == "super" {
-                if let Some(handle) = self.this_stack.last().copied().flatten() {
+                if let Some(handle) = self.oop.this_stack.last().copied().flatten() {
                     let m = path[1].name.name.clone();
                     let routed = m == "new"
                         || self
@@ -73768,7 +73759,7 @@ impl Simulator {
                 let recv_h = recv.to_u64().unwrap_or(0) as usize;
                 let is_user_method = recv_h != 0
                     && self
-                        .heap
+                        .oop.heap
                         .get(recv_h)
                         .and_then(|o| o.as_ref())
                         .is_some_and(|i| self.class_has_method(&i.class_name, &m));
@@ -74135,7 +74126,7 @@ impl Simulator {
                     if hier.path.len() >= 3 {
                         let head = hier.path[0].name.name.as_str();
                         let mut handle = if head == "this" || head == "super" {
-                            self.this_stack.last().copied().flatten().unwrap_or(0)
+                            self.oop.this_stack.last().copied().flatten().unwrap_or(0)
                         } else {
                             self.eval_ident_handle(head).unwrap_or(0)
                         };
@@ -74144,7 +74135,7 @@ impl Simulator {
                                 break;
                             }
                             handle = self
-                                .heap
+                                .oop.heap
                                 .get(handle)
                                 .and_then(|o| o.as_ref())
                                 .and_then(|i| i.properties.get(&seg.name.name))
@@ -74153,7 +74144,7 @@ impl Simulator {
                         }
                         if handle != 0 {
                             let cn = self
-                                .heap
+                                .oop.heap
                                 .get(handle)
                                 .and_then(|x| x.as_ref())
                                 .map(|i| i.class_name.clone());
@@ -74236,7 +74227,7 @@ impl Simulator {
                         .get_signal_value_by_name(obj_name)
                         .map(|v| v.to_u64().unwrap_or(0) as usize)
                         .unwrap_or(0);
-                    if h_val != 0 && self.heap.get(h_val).and_then(|x| x.as_ref()).is_some() {
+                    if h_val != 0 && self.oop.heap.get(h_val).and_then(|x| x.as_ref()).is_some() {
                         // Middle segments name the targeted prop/constraint;
                         // empty = whole-object mode.
                         let target_name: Option<String> = if hier.path.len() >= 3 {
@@ -74267,9 +74258,9 @@ impl Simulator {
                         }
                         if args.is_empty() {
                             let table = if mname == "rand_mode" {
-                                &self.rand_mode_disabled
+                                &self.oop.rand_mode_disabled
                             } else {
-                                &self.constraint_mode_disabled
+                                &self.oop.constraint_mode_disabled
                             };
                             let disabled = table.get(&h_val).is_some_and(|s| {
                                 if let Some(ref n) = target_name {
@@ -74282,9 +74273,9 @@ impl Simulator {
                         }
                         let enable = self.eval_expr(&args[0]).to_u64().unwrap_or(0) != 0;
                         let table = if mname == "rand_mode" {
-                            &mut self.rand_mode_disabled
+                            &mut self.oop.rand_mode_disabled
                         } else {
-                            &mut self.constraint_mode_disabled
+                            &mut self.oop.constraint_mode_disabled
                         };
                         if enable {
                             if let Some(set) = table.get_mut(&h_val) {
@@ -74513,7 +74504,7 @@ impl Simulator {
                 if hier.path.len() >= 3 {
                     let head = hier.path[0].name.name.as_str();
                     let (mut handle, loop_start) = if head == "this" || head == "super" {
-                        (self.this_stack.last().copied().flatten().unwrap_or(0), 1)
+                        (self.oop.this_stack.last().copied().flatten().unwrap_or(0), 1)
                     } else if self.module.classes.contains_key(head) {
                         // `ClassName::static_prop.method()`: path[0] is a
                         // CLASS, not an object variable. Resolve the static
@@ -74523,7 +74514,7 @@ impl Simulator {
                         // static properties never bind `this` and silently
                         // no-op — instance member writes are lost.
                         let h = self.static_prop_key(head, &hier.path[1].name.name)
-                            .and_then(|k| self.class_statics.get(&k))
+                            .and_then(|k| self.oop.class_statics.get(&k))
                             .and_then(|v| v.to_u64())
                             .map(|h| h as usize)
                             .unwrap_or(0);
@@ -74536,14 +74527,14 @@ impl Simulator {
                             break;
                         }
                         handle = self
-                            .heap
+                            .oop.heap
                             .get(handle)
                             .and_then(|o| o.as_ref())
                             .and_then(|i| i.properties.get(&seg.name.name))
                             .and_then(|v| v.to_u64())
                             .unwrap_or(0) as usize;
                     }
-                    if handle != 0 && handle < self.heap.len() && self.heap[handle].is_some() {
+                    if handle != 0 && handle < self.oop.heap.len() && self.oop.heap[handle].is_some() {
                         return self.exec_method_call(handle, method_name, args);
                     }
                 }
@@ -74575,8 +74566,8 @@ impl Simulator {
                     .as_ref()
                     .and_then(|v| v.to_u64())
                     .map(|h| h as usize)
-                    .filter(|&h| h != 0 && h < self.heap.len())
-                    .and_then(|h| self.heap[h].as_ref())
+                    .filter(|&h| h != 0 && h < self.oop.heap.len())
+                    .and_then(|h| self.oop.heap[h].as_ref())
                     .is_some_and(|i| self.class_has_method(&i.class_name, method_name));
                 if !prefer_user_method {
                     if let Some(res) = self.eval_builtin_method(obj_name, method_name, args) {
@@ -74593,14 +74584,14 @@ impl Simulator {
                     // dispatch below would miss them and return null. Prefer the
                     // RUNTIME class of a live receiver, else the DECLARED type.
                     let decl_cls_opt = self.class_of_var(obj_name).or_else(|| {
-                        self.this_stack
+                        self.oop.this_stack
                             .last()
                             .copied()
                             .flatten()
                             .and_then(|th| self.prop_class_type(th, obj_name))
                     });
                     let base_cls = if handle != 0 {
-                        self.heap
+                        self.oop.heap
                             .get(handle)
                             .and_then(|o| o.as_ref())
                             .map(|i| i.class_name.clone())
@@ -74661,7 +74652,7 @@ impl Simulator {
                         if handle < self.cg_heap.len() && self.cg_heap[handle].is_some() {
                             return self.exec_cg_method_call(handle, method_name, args);
                         }
-                        if handle < self.heap.len() && self.heap[handle].is_some() {
+                        if handle < self.oop.heap.len() && self.oop.heap[handle].is_some() {
                             // §8.20: non-virtual methods bind to the DECLARED
                             // type of the receiver (see nonvirtual_target_class;
                             // the flattened `Ident([obj, method])` shape is the
@@ -74674,7 +74665,7 @@ impl Simulator {
                                     self.nonvirtual_target_class(&decl_base, method_name)
                                 {
                                     let runtime = self
-                                        .heap
+                                        .oop.heap
                                         .get(handle)
                                         .and_then(|o| o.as_ref())
                                         .map(|i| i.class_name.clone());
@@ -74776,9 +74767,9 @@ impl Simulator {
             // of the current class context. Dispatches virtually through
             // `this` when in an instance method, or as a static method
             // when there is no instance handle.
-            if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            if let Some(Some(ctx)) = self.oop.class_context_stack.last().cloned() {
                 if self.class_has_method(&ctx, name) {
-                    let this_handle = self.this_stack.last().copied().flatten().unwrap_or(0);
+                    let this_handle = self.oop.this_stack.last().copied().flatten().unwrap_or(0);
                     if this_handle != 0 {
                         // IEEE 1800-2017 §8.20: a NON-virtual method (which
                         // includes every `local` method — `local` methods
@@ -74801,7 +74792,7 @@ impl Simulator {
                         // `obj.m()` non-virtual binding above.
                         if let Some(target) = self.nonvirtual_target_class(&ctx, name) {
                             let runtime = self
-                                .heap
+                                .oop.heap
                                 .get(this_handle)
                                 .and_then(|o| o.as_ref())
                                 .map(|i| i.class_name.clone());
@@ -75034,13 +75025,13 @@ impl Simulator {
             // class's own typedef table, not the module's. Walk the current
             // class context and its ancestors.
             let mut cur = self
-                .class_context_stack
+                .oop.class_context_stack
                 .last()
                 .cloned()
                 .flatten()
                 .or_else(|| {
-                    self.this_stack.last().copied().flatten().and_then(|h| {
-                        self.heap
+                    self.oop.this_stack.last().copied().flatten().and_then(|h| {
+                        self.oop.heap
                             .get(h)
                             .and_then(|x| x.as_ref())
                             .map(|i| i.class_name.clone())
@@ -75257,7 +75248,7 @@ impl Simulator {
         for (key, off, w, _is_real) in fields {
             let cell = format!("{}{}", prop, &key[1..]);
             let Some(v) = self
-                .heap
+                .oop.heap
                 .get(handle)
                 .and_then(|o| o.as_ref())
                 .and_then(|i| i.properties.get(&cell))
@@ -75444,7 +75435,7 @@ impl Simulator {
                 // a constructor call). Without this the struct actual is never
                 // bound member-wise and the body reads every member as x.
                 let concrete = self
-                    .heap
+                    .oop.heap
                     .get(handle.unwrap_or(0))
                     .and_then(|o| o.as_ref())
                     .and_then(|i| i.type_bindings.get(tn).cloned())
@@ -76008,7 +75999,7 @@ impl Simulator {
                 {
                     self.var_typedef_types.insert(port.name.name.clone(), type_name);
                 } else if self.module.classes.contains_key(&type_name) {
-                    self.var_class_types.insert(port.name.name.clone(), type_name);
+                    self.oop.var_class_types.insert(port.name.name.clone(), type_name);
                 }
             }
             // Same §13.3 metadata registration as the task path.
@@ -76098,7 +76089,7 @@ impl Simulator {
             {
                 self.var_typedef_types.insert(ret_name.clone(), type_name);
             } else if self.module.classes.contains_key(&type_name) {
-                self.var_class_types.insert(ret_name.clone(), type_name);
+                self.oop.var_class_types.insert(ret_name.clone(), type_name);
             }
         }
         // Mark string-typed return var / params for character indexing.
@@ -76153,8 +76144,8 @@ impl Simulator {
         // mutates the caller's property directly and the copy-out writeback
         // then clobbers it with the stale formal. Args were already bound
         // above, in the caller's context.
-        self.this_stack.push(None);
-        self.class_context_stack.push(None);
+        self.oop.this_stack.push(None);
+        self.oop.class_context_stack.push(None);
         // Track the running subroutine name so `%m` inside a package function
         // resolves to `<pkg>.<name>` (see the `%m` formatter). Popped after the
         // body; recursion keeps the stack ordered.
@@ -76182,8 +76173,8 @@ impl Simulator {
         self.func_call_stack.pop();
         self.pkg_scope_stack.pop();
         self.m_scope_stack = saved_m_scope_fn;
-        self.this_stack.pop();
-        self.class_context_stack.pop();
+        self.oop.this_stack.pop();
+        self.oop.class_context_stack.pop();
         let mut result = if let Some(rv) = self.return_value.take() {
             rv
         } else if let Some(su) = self.unpacked_struct_of(&fd.return_type) {
@@ -76347,8 +76338,8 @@ impl Simulator {
         self.m_scope_stack = c.saved_m_scope;
         self.current_static_task = c.prev_static;
         if c.pushed_method_this {
-            self.this_stack.pop();
-            self.class_context_stack.pop();
+            self.oop.this_stack.pop();
+            self.oop.class_context_stack.pop();
             self.current_spec = c.saved_spec;
         }
         self.ref_binding_stack.pop();
@@ -76773,8 +76764,8 @@ impl Simulator {
     fn push_task_method_this(&mut self, handle_opt: Option<usize>, mclass: String, cleanup: &mut TaskCleanup) {
         cleanup.saved_spec = self.current_spec.clone();
         cleanup.pushed_method_this = true;
-        self.this_stack.push(handle_opt);
-        self.class_context_stack.push(Some(mclass.clone()));
+        self.oop.this_stack.push(handle_opt);
+        self.oop.class_context_stack.push(Some(mclass.clone()));
         if let Some(h) = handle_opt {
             if let Some(inst) = self.heap_obj(h) {
                 let cn = inst.class_name.clone();
@@ -77446,13 +77437,13 @@ impl Simulator {
     /// properties plus instance-scoped queue/assoc members) into a fresh heap
     /// object. Returns the new handle.
     fn copy_construct(&mut self, src_handle: usize) -> Value {
-        let src_inst = match self.heap.get(src_handle) {
+        let src_inst = match self.oop.heap.get(src_handle) {
             Some(Some(i)) => i.clone(),
             _ => return Value::zero(32),
         };
         let class_name = src_inst.class_name.clone();
-        let new_handle = self.heap.len();
-        self.heap.push(Some(src_inst));
+        let new_handle = self.oop.heap.len();
+        self.oop.heap.push(Some(src_inst));
         // Walk the class hierarchy to clone instance-scoped collections.
         let mut classes = Vec::new();
         let mut cur = Some(class_name);
@@ -78067,9 +78058,9 @@ impl Simulator {
                 }
             }
         }
-        if let Some(h) = self.this_stack.last().copied().flatten() {
+        if let Some(h) = self.oop.this_stack.last().copied().flatten() {
             if let Some(c) = self
-                .heap
+                .oop.heap
                 .get(h)
                 .and_then(|o| o.as_ref())
                 .and_then(|inst| inst.type_bindings.get(tn).cloned())
@@ -78341,9 +78332,9 @@ impl Simulator {
     /// to `#(0)`. Elaboration now records these in
     /// `ElaboratedClass::property_type_args`; this looks them up.
     fn this_property_type_args(&self, prop_name: &str) -> Option<Vec<Expression>> {
-        let h = self.this_stack.last().copied().flatten()?;
+        let h = self.oop.this_stack.last().copied().flatten()?;
         let class_name = self
-            .heap
+            .oop.heap
             .get(h)
             .and_then(|o| o.as_ref())?
             .class_name
@@ -78376,7 +78367,7 @@ impl Simulator {
             if let Some(ta) = self.module.class_type_args.get(n) {
                 return Some(ta.clone());
             }
-            if let Some(ta) = self.var_type_args.get(n) {
+            if let Some(ta) = self.oop.var_type_args.get(n) {
                 return Some(ta.clone());
             }
         }
@@ -78450,7 +78441,7 @@ impl Simulator {
                 }
             }
         }
-        let handle = self.heap.len();
+        let handle = self.oop.heap.len();
         let mut instance = ClassInstance {
             class_name: class_def.name.clone(),
             properties: HashMap::default(),
@@ -78866,13 +78857,13 @@ impl Simulator {
                 }
             }
         }
-        self.heap.push(Some(instance));
+        self.oop.heap.push(Some(instance));
         // Re-evaluate scalar property initializers against the live parameter
         // table and instance context, before the constructor runs (SV applies
         // member initializers prior to `new`'s body). `elaborate_class`
         // computed them with no params, so defaults like `= NUM_HARTS` /
         // `= XLEN` would otherwise be 0. Base-class first so derived overrides.
-        self.this_stack.push(Some(handle));
+        self.oop.this_stack.push(Some(handle));
         for cdef in classes_to_init.iter().rev() {
             if cdef.property_inits.is_empty() {
                 continue;
@@ -78882,7 +78873,7 @@ impl Simulator {
             // there (§6.19). Only `this_stack` was pushed, leaving the class
             // context unset, so `e_a v = DUP;` fell through to the flat
             // design-wide map and picked up an unrelated class's `DUP`.
-            self.class_context_stack.push(Some(cdef.name.clone()));
+            self.oop.class_context_stack.push(Some(cdef.name.clone()));
             let inits: Vec<(String, Expression)> = cdef
                 .property_inits
                 .iter()
@@ -78924,8 +78915,8 @@ impl Simulator {
                     _ => (false, &[]),
                 };
                 if let (Some(kind), true) = (cont_kind, is_new) {
-                    let ch = self.heap.len();
-                    self.heap.push(Some(ClassInstance {
+                    let ch = self.oop.heap.len();
+                    self.oop.heap.push(Some(ClassInstance {
                         class_name: kind.to_string(),
                         properties: HashMap::default(),
                         type_bindings: HashMap::default(),
@@ -78936,7 +78927,7 @@ impl Simulator {
                     } else {
                         self.mailboxes.insert(ch, std::collections::VecDeque::new());
                     }
-                    if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                    if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                         inst.properties
                             .insert(pname, Value::from_u64(ch as u64, 32));
                     }
@@ -78974,7 +78965,7 @@ impl Simulator {
                                     ctor_args,
                                     ta.as_deref(),
                                 );
-                                if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                                if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                                     inst.properties.insert(pname, v);
                                 }
                                 continue;
@@ -79042,13 +79033,13 @@ impl Simulator {
                         val.is_signed = sig.is_signed;
                     }
                 }
-                if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                     inst.properties.insert(pname, val);
                 }
             }
-            self.class_context_stack.pop();
+            self.oop.class_context_stack.pop();
         }
-        self.this_stack.pop();
+        self.oop.this_stack.pop();
         // §8.7: implicit `super.new(...)` chaining. If the constructor that
         // will run does not call super.new explicitly, run its base-class
         // constructor(s) first (base-most first), passing the `extends
@@ -79081,9 +79072,9 @@ impl Simulator {
                 cur = base;
             }
             for (cls, cargs) in chain.iter().rev() {
-                self.this_stack.push(Some(handle));
+                self.oop.this_stack.push(Some(handle));
                 self.exec_method_in_class_hierarchy(handle, cls, "new", cargs);
-                self.this_stack.pop();
+                self.oop.this_stack.pop();
             }
         }
         let saved_spec = self.current_spec.clone();
@@ -79099,7 +79090,7 @@ impl Simulator {
         // Ctor-time binding: a call on the object UNDER CONSTRUCTION starts
         // its search at the constructing class, not the runtime leaf.
         if method_name != "new" {
-            if let Some((ch, cc)) = self.ctor_class_stack.last().cloned() {
+            if let Some((ch, cc)) = self.oop.ctor_class_stack.last().cloned() {
                 if ch == handle && self.class_has_method(&cc, method_name) {
                     return self.exec_method_in_class_hierarchy(handle, &cc, method_name, args);
                 }
@@ -79154,7 +79145,7 @@ impl Simulator {
         // override of its own.
         if matches!(method_name, "srandom" | "get_randstate" | "set_randstate")
             && !self
-                .heap
+                .oop.heap
                 .get(handle)
                 .and_then(|o| o.as_ref())
                 .map(|i| self.class_has_method(&i.class_name, method_name))
@@ -79343,7 +79334,7 @@ impl Simulator {
                 _ => {}
             }
         }
-        let class_name = if let Some(Some(inst)) = self.heap.get(handle) {
+        let class_name = if let Some(Some(inst)) = self.oop.heap.get(handle) {
             inst.class_name.clone()
         } else {
             return Value::zero(32);
@@ -79369,7 +79360,7 @@ impl Simulator {
         method_name: &str,
         args: &[Expression],
     ) -> bool {
-        let mut cur_class = if let Some(Some(inst)) = self.heap.get(handle) {
+        let mut cur_class = if let Some(Some(inst)) = self.oop.heap.get(handle) {
             Some(inst.class_name.clone())
         } else {
             None
@@ -79543,7 +79534,7 @@ impl Simulator {
     /// class-wide flag rather than a per-instance one.
     fn static_constraint_owner(&self, handle: usize, name: &str) -> Option<String> {
         let mut cur = self
-            .heap
+            .oop.heap
             .get(handle)
             .and_then(|o| o.as_ref())
             .map(|i| i.class_name.clone());
@@ -79571,15 +79562,15 @@ impl Simulator {
         let key = (owner, name.to_string());
         match enable {
             None => {
-                let disabled = self.static_constraint_disabled.contains(&key);
+                let disabled = self.oop.static_constraint_disabled.contains(&key);
                 Some(Value::from_u64(if disabled { 0 } else { 1 }, 32))
             }
             Some(true) => {
-                self.static_constraint_disabled.remove(&key);
+                self.oop.static_constraint_disabled.remove(&key);
                 Some(Value::zero(32))
             }
             Some(false) => {
-                self.static_constraint_disabled.insert(key);
+                self.oop.static_constraint_disabled.insert(key);
                 Some(Value::zero(32))
             }
         }
@@ -79591,7 +79582,7 @@ impl Simulator {
     /// enclosing object's constraints may refer to its members.
     fn prop_class_type(&self, handle: usize, prop: &str) -> Option<String> {
         let mut cur = self
-            .heap
+            .oop.heap
             .get(handle)
             .and_then(|o| o.as_ref())
             .map(|i| i.class_name.clone());
@@ -79666,12 +79657,12 @@ impl Simulator {
         raw: &str,
     ) -> Option<String> {
         let owner = self
-            .heap
+            .oop.heap
             .get(handle)
             .and_then(|o| o.as_ref())
             .map(|i| i.class_name.clone())?;
         let mut binds: HashMap<String, String> = self
-            .heap
+            .oop.heap
             .get(handle)
             .and_then(|o| o.as_ref())
             .map(|i| i.type_bindings.clone())
@@ -79723,7 +79714,7 @@ impl Simulator {
         let mut out: Vec<RandColl> = Vec::new();
         let mut seen: HashSet<String> = HashSet::default();
         let mut cur = self
-            .heap
+            .oop.heap
             .get(handle)
             .and_then(|o| o.as_ref())
             .map(|i| i.class_name.clone());
@@ -81186,11 +81177,11 @@ impl Simulator {
             },
             _ => return None,
         };
-        let this = self.this_stack.last().copied().flatten()?;
+        let this = self.oop.this_stack.last().copied().flatten()?;
         // `obj` must be a class-handle member of the enclosing object.
         self.prop_class_type(this, &obj)?;
         let sub = self
-            .heap
+            .oop.heap
             .get(this)
             .and_then(|o| o.as_ref())
             .and_then(|i| i.properties.get(&obj))
@@ -81555,7 +81546,7 @@ impl Simulator {
         // back their OWN picks.
         self.randc_pending.clear();
         use rand::Rng;
-        let class_name = if let Some(Some(inst)) = self.heap.get(handle) {
+        let class_name = if let Some(Some(inst)) = self.oop.heap.get(handle) {
             inst.class_name.clone()
         } else {
             return Value::zero(32);
@@ -81575,12 +81566,12 @@ impl Simulator {
         let mut randc_set: HashSet<String> = HashSet::default();
         // §18.13 rand_mode/constraint_mode disabled sets for this instance.
         let rand_disabled = self
-            .rand_mode_disabled
+            .oop.rand_mode_disabled
             .get(&handle)
             .cloned()
             .unwrap_or_default();
         let constraint_disabled = self
-            .constraint_mode_disabled
+            .oop.constraint_mode_disabled
             .get(&handle)
             .cloned()
             .unwrap_or_default();
@@ -81701,7 +81692,7 @@ impl Simulator {
                     // class-wide, so it is keyed by the DECLARING class rather
                     // than by this instance.
                     let disabled = if con.is_static {
-                        self.static_constraint_disabled
+                        self.oop.static_constraint_disabled
                             .contains(&(cname.clone(), con_name.clone()))
                             || con_all_off
                     } else {
@@ -81885,14 +81876,14 @@ impl Simulator {
                 *w = *tw;
             }
         }
-        self.this_stack.push(Some(handle));
+        self.oop.this_stack.push(Some(handle));
         // §18.5.12: a constraint body is evaluated in the CLASS's scope, so an
         // unqualified call in a constraint (`user_func_res == calc_hash(a, b)`)
         // must resolve to a method of this class — and a bare collection member
         // (`$size(dyn_array)`) to its instance-scoped storage. Both look at
         // `class_context_stack`; without pushing it the call fell through to the
         // "unknown name" path and silently yielded 0.
-        self.class_context_stack.push(Some(class_name.clone()));
+        self.oop.class_context_stack.push(Some(class_name.clone()));
         // SV semantics: randomize() calls pre_randomize() before solving.
         if self.class_has_method(&class_name, "pre_randomize") {
             self.exec_method_call(handle, "pre_randomize", &[]);
@@ -81928,7 +81919,7 @@ impl Simulator {
             &rand_obj_props,
         ) {
             let mut backup: HashMap<String, Value> = HashMap::default();
-            if let Some(Some(inst)) = self.heap.get(handle) {
+            if let Some(Some(inst)) = self.oop.heap.get(handle) {
                 for (n, v) in &inst.properties {
                     backup.insert(n.clone(), v.clone());
                 }
@@ -81953,7 +81944,7 @@ impl Simulator {
                     } else {
                         Value::zero(*width)
                     };
-                    if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                    if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                         inst.properties.insert(name.clone(), v);
                     }
                 }
@@ -81966,13 +81957,13 @@ impl Simulator {
                     if has_post {
                         self.exec_method_call(handle, "post_randomize", &[]);
                     }
-                    self.this_stack.pop();
-                    self.class_context_stack.pop();
+                    self.oop.this_stack.pop();
+                    self.oop.class_context_stack.pop();
                     return Value::from_u64(1, 32);
                 }
             }
             // No sample landed — restore and fall through to propagation.
-            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+            if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                 for (n, v) in backup {
                     inst.properties.insert(n, v);
                 }
@@ -82006,7 +81997,7 @@ impl Simulator {
                 let coll_name = format!("{}#{}", handle, p);
                 let is_coll = self.is_associative_array(&coll_name)
                     || self
-                        .heap
+                        .oop.heap
                         .get(handle)
                         .and_then(|o| o.as_ref())
                         .map(|i| i.class_name.clone())
@@ -82315,7 +82306,7 @@ impl Simulator {
 
             // Local copy of properties for solving
             let mut current_props = HashMap::default();
-            if let Some(Some(inst)) = self.heap.get(handle) {
+            if let Some(Some(inst)) = self.oop.heap.get(handle) {
                 for (name, val) in &inst.properties {
                     current_props.insert(name.clone(), val.clone());
                     backup.insert(name.clone(), val.clone());
@@ -82400,17 +82391,17 @@ impl Simulator {
 
                         if ready {
                             // Temporary set props in instance for eval_expr if needed?
-                            // No, eval_expr uses self.signals and self.heap[handle].properties.
+                            // No, eval_expr uses self.signals and self.oop.heap[handle].properties.
                             // We need to update the instance properties during solving if eval_expr depends on them.
-                            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                            if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                                 for (n, v) in &solved_props {
                                     inst.properties.insert(n.clone(), v.clone());
                                 }
                             }
 
-                            self.this_stack.push(Some(handle));
+                            self.oop.this_stack.push(Some(handle));
                             let val = self.eval_expr(expr);
-                            self.this_stack.pop();
+                            self.oop.this_stack.pop();
 
                             solved_props.insert(name.clone(), val);
                             pids_to_solve.remove(i);
@@ -82483,7 +82474,7 @@ impl Simulator {
                             };
                             val = Value::from_f64(pick);
                             solved_props.insert(name.clone(), val.clone());
-                            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                            if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                                 inst.properties.insert(name.clone(), val);
                             }
                             pids_to_solve.remove(i);
@@ -82503,7 +82494,7 @@ impl Simulator {
                                 let pick = self.pick_randc(handle, name, &domain);
                                 val = Value::from_u64(pick, *width);
                                 solved_props.insert(name.clone(), val.clone());
-                                if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                                if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                                     inst.properties.insert(name.clone(), val);
                                 }
                                 pids_to_solve.remove(i);
@@ -82531,7 +82522,7 @@ impl Simulator {
                         }
                         val.is_signed = sgn;
                         solved_props.insert(name.clone(), val.clone());
-                        if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                        if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                             inst.properties.insert(name.clone(), val);
                         }
                         pids_to_solve.remove(i);
@@ -82578,7 +82569,7 @@ impl Simulator {
             }
 
             // Apply solved props to instance
-            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+            if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                 for (name, val) in &solved_props {
                     inst.properties.insert(name.clone(), val.clone());
                 }
@@ -82640,7 +82631,7 @@ impl Simulator {
                             let mut v = Value::from_u64(masked, w);
                             v.is_signed = s;
                             solved_props.insert(name.clone(), v.clone());
-                            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                            if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                                 inst.properties.insert(name, v);
                             }
                         }
@@ -82795,7 +82786,7 @@ impl Simulator {
                         continue;
                     }
                     let cur = self
-                        .heap
+                        .oop.heap
                         .get(handle)
                         .and_then(|o| o.as_ref())
                         .and_then(|i| i.properties.get(name))
@@ -82816,7 +82807,7 @@ impl Simulator {
                             if !members.is_empty() {
                                 let pick = members[self.cur_rng().gen_range(0..members.len())];
                                 let w = self
-                                    .heap
+                                    .oop.heap
                                     .get(handle)
                                     .and_then(|o| o.as_ref())
                                     .and_then(|i| i.properties.get(name))
@@ -83142,8 +83133,8 @@ impl Simulator {
                 if has_post {
                     self.exec_method_call(handle, "post_randomize", &[]);
                 }
-                self.this_stack.pop();
-                self.class_context_stack.pop();
+                self.oop.this_stack.pop();
+                self.oop.class_context_stack.pop();
                 return Value::from_u64(1, 32);
             }
 
@@ -83168,7 +83159,7 @@ impl Simulator {
             }
 
 
-            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+            if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                 for (name, val) in backup {
                     inst.properties.insert(name, val);
                 }
@@ -83178,8 +83169,8 @@ impl Simulator {
         // §18.4: randomize() failed — no value was actually produced, so give
         // every tentatively-drawn randc value back to its permutation cycle.
         self.randc_rollback_all();
-        self.this_stack.pop();
-        self.class_context_stack.pop();
+        self.oop.this_stack.pop();
+        self.oop.class_context_stack.pop();
         Value::zero(32)
     }
 
@@ -83222,7 +83213,7 @@ impl Simulator {
         // `rand` object handle: resolve it and target the sub-object's property.
         let sub = self.eval_expr(&base).to_u64()? as usize;
         let sub_class = self
-            .heap
+            .oop.heap
             .get(sub)
             .and_then(|o| o.as_ref())
             .map(|i| i.class_name.clone())?;
@@ -83262,14 +83253,14 @@ impl Simulator {
     fn sub_object_constraints_ok(&mut self, handle: usize, obj_props: &[String]) -> bool {
         for p in obj_props {
             let sub = self
-                .heap
+                .oop.heap
                 .get(handle)
                 .and_then(|o| o.as_ref())
                 .and_then(|i| i.properties.get(p))
                 .and_then(|v| v.to_u64())
                 .unwrap_or(0) as usize;
             let Some(sub_class) = self
-                .heap
+                .oop.heap
                 .get(sub)
                 .and_then(|o| o.as_ref())
                 .map(|i| i.class_name.clone())
@@ -83279,7 +83270,7 @@ impl Simulator {
             let mut items: Vec<ConstraintItem> = Vec::new();
             let mut seen: HashSet<String> = HashSet::default();
             let disabled = self
-                .constraint_mode_disabled
+                .oop.constraint_mode_disabled
                 .get(&sub)
                 .cloned()
                 .unwrap_or_default();
@@ -83299,8 +83290,8 @@ impl Simulator {
                 }
                 cur = cd.extends.clone();
             }
-            self.class_context_stack.push(
-                self.heap
+            self.oop.class_context_stack.push(
+                self.oop.heap
                     .get(sub)
                     .and_then(|o| o.as_ref())
                     .map(|i| i.class_name.clone()),
@@ -83315,7 +83306,7 @@ impl Simulator {
                     break;
                 }
             }
-            self.class_context_stack.pop();
+            self.oop.class_context_stack.pop();
             if !ok {
                 return false;
             }
@@ -83326,7 +83317,7 @@ impl Simulator {
     /// §18.3: whether property `prop` of the object `handle` points at is
     /// declared SIGNED (`rand integer`, `rand int`, `rand byte`, …).
     fn class_prop_signed_of(&self, handle: usize, prop: &str) -> bool {
-        let Some(Some(inst)) = self.heap.get(handle) else {
+        let Some(Some(inst)) = self.oop.heap.get(handle) else {
             return false;
         };
         let mut cur = Some(inst.class_name.clone());
@@ -83395,7 +83386,7 @@ impl Simulator {
                     return;
                 }
                 let w = match self
-                    .heap
+                    .oop.heap
                     .get(handle)
                     .and_then(|o| o.as_ref())
                     .and_then(|i| i.properties.get(&base))
@@ -83523,7 +83514,7 @@ impl Simulator {
 
     /// Set bit `bit` of instance property `prop` to `on`.
     fn write_prop_bit(&mut self, handle: usize, prop: &str, bit: u32, on: bool) {
-        if let Some(Some(inst)) = self.heap.get_mut(handle) {
+        if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
             if let Some(cur) = inst.properties.get(prop) {
                 let mut v = cur.clone();
                 if (bit as usize) < v.width as usize {
@@ -83544,7 +83535,7 @@ impl Simulator {
         // create a per-instance copy (which then shadowed the static on every
         // later read from THAT instance while every other instance still saw
         // the old value).
-        if let Some(Some(inst)) = self.heap.get(handle) {
+        if let Some(Some(inst)) = self.oop.heap.get(handle) {
             let cn = inst.class_name.clone();
             if let Some(cd) = self.module.classes.get(&cn) {
                 // Only genuine `static` members — param_defaults (class
@@ -83569,16 +83560,16 @@ impl Simulator {
                 };
                 if is_static {
                     if let Some(key) = self.static_prop_key(&cn, name) {
-                        let changed = self.class_statics.get(&key) != Some(&val);
+                        let changed = self.oop.class_statics.get(&key) != Some(&val);
                         if changed {
-                            self.class_statics.insert(key, val);
+                            self.oop.class_statics.insert(key, val);
                         }
                         return changed;
                     }
                 }
             }
         }
-        if let Some(Some(inst)) = self.heap.get_mut(handle) {
+        if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
             if inst.properties.get(name).is_none_or(|cur| *cur != val) {
                 inst.properties.insert(name.to_string(), val);
                 return true;
@@ -84050,7 +84041,7 @@ impl Simulator {
     /// raw width-masked random.
     fn prop_enum_type(&self, handle: usize, prop: &str) -> Option<String> {
         let mut cur = self
-            .heap
+            .oop.heap
             .get(handle)
             .and_then(|o| o.as_ref())
             .map(|i| i.class_name.clone());
@@ -84164,7 +84155,7 @@ impl Simulator {
         let mut fallback: Option<(String, Value)> = None;
         for name in cands {
             let Some(orig) = self
-                .heap
+                .oop.heap
                 .get(handle)
                 .and_then(|o| o.as_ref())
                 .and_then(|i| i.properties.get(&name))
@@ -84183,7 +84174,7 @@ impl Simulator {
             for (k, probe) in [0u64, 1, 2].iter().enumerate() {
                 let mut pv = Value::from_u64(*probe, width);
                 pv.is_signed = signed;
-                if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                     inst.properties.insert(name.clone(), pv);
                 }
                 let (Some((lv, ..)), Some((rv, ..))) =
@@ -84195,7 +84186,7 @@ impl Simulator {
                 d[k] = lv - rv;
             }
             // Restore before deciding — a probe must never leak.
-            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+            if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                 inst.properties.insert(name.clone(), orig.clone());
             }
             if !ok {
@@ -84282,7 +84273,7 @@ impl Simulator {
             return false;
         };
         let Some(cur) = self
-            .heap
+            .oop.heap
             .get(handle)
             .and_then(|o| o.as_ref())
             .and_then(|i| i.properties.get(&target))
@@ -84725,7 +84716,7 @@ impl Simulator {
                 // array_properties for `arr`, walking the inheritance chain.
                 let mut range: Option<(i64, i64, u32)> = None;
                 let class_name_opt = self
-                    .heap
+                    .oop.heap
                     .get(handle)
                     .and_then(|x| x.as_ref())
                     .map(|i| i.class_name.clone());
@@ -84756,7 +84747,7 @@ impl Simulator {
                     None => {
                         let mut nd: Option<Vec<(i64, i64)>> = None;
                         if let Some(mut cn) = self
-                            .heap
+                            .oop.heap
                             .get(handle)
                             .and_then(|x| x.as_ref())
                             .map(|i| i.class_name.clone())
@@ -84847,7 +84838,7 @@ impl Simulator {
                 // inheritance chain (same lookup as the Foreach arm).
                 let mut range: Option<(i64, i64, u32)> = None;
                 let mut cn = match self
-                    .heap
+                    .oop.heap
                     .get(handle)
                     .and_then(|x| x.as_ref())
                     .map(|i| i.class_name.clone())
@@ -85647,9 +85638,9 @@ impl Simulator {
     }
 
     fn check_constraint_item(&mut self, handle: usize, item: &ConstraintItem) -> bool {
-        self.this_stack.push(Some(handle));
+        self.oop.this_stack.push(Some(handle));
         let ok = self.check_constraint_item_impl(item);
-        self.this_stack.pop();
+        self.oop.this_stack.pop();
         ok
     }
 
@@ -85796,13 +85787,13 @@ impl Simulator {
 
     fn super_call_parent(&self) -> Option<String> {
         let ctx = self
-            .class_context_stack
+            .oop.class_context_stack
             .last()
             .cloned()
             .flatten()
             .or_else(|| {
-                self.this_stack.last().copied().flatten().and_then(|h| {
-                    self.heap
+                self.oop.this_stack.last().copied().flatten().and_then(|h| {
+                    self.oop.heap
                         .get(h)
                         .and_then(|o| o.as_ref())
                         .map(|i| i.class_name.clone())
@@ -86057,7 +86048,7 @@ impl Simulator {
                                     // type bindings — `this` isn't pushed
                                     // yet while formals bind.
                                     let concrete = self
-                                        .heap
+                                        .oop.heap
                                         .get(handle)
                                         .and_then(|o| o.as_ref())
                                         .and_then(|i| i.type_bindings.get(tn).cloned())
@@ -86162,7 +86153,7 @@ impl Simulator {
                         {
                             self.var_typedef_types.insert(port.name.name.clone(), type_name);
                         } else if self.module.classes.contains_key(&type_name) {
-                            self.var_class_types.insert(port.name.name.clone(), type_name.clone());
+                            self.oop.var_class_types.insert(port.name.name.clone(), type_name.clone());
                         }
                     }
                     locals.insert(port.name.name.clone(), val);
@@ -86240,7 +86231,7 @@ impl Simulator {
                         {
                             let cn = name.name.name.clone();
                             if self.module.classes.contains_key(&cn) {
-                                self.var_class_types.insert(rn.clone(), cn);
+                                self.oop.var_class_types.insert(rn.clone(), cn);
                             }
                         }
                     }
@@ -86403,21 +86394,21 @@ impl Simulator {
                         }
                     }
                 }
-                self.this_stack.push(Some(handle));
+                self.oop.this_stack.push(Some(handle));
                 self.local_stack.push(locals);
                 // Record the `local_stack` depth BEFORE this method's own
                 // frame (i.e. the count of caller frames) so that
                 // `get_expr_type_name`'s `in_any_frame` check only considers
                 // the current method's locals — not a caller's same-named
                 // local that leaked into the flat `var_class_types` map.
-                self.method_local_base.push(self.local_stack.len() - 1);
-                self.class_context_stack.push(Some(cname.clone()));
+                self.oop.method_local_base.push(self.local_stack.len() - 1);
+                self.oop.class_context_stack.push(Some(cname.clone()));
                 // §8.7 ctor-time binding (reference behavior): while class
                 // C's `new` body runs, an unqualified method call on `this`
                 // binds within C's own chain — a derived override must not
                 // run against a partially-constructed object.
                 if method_name == "new" {
-                    self.ctor_class_stack.push((handle, cname.clone()));
+                    self.oop.ctor_class_stack.push((handle, cname.clone()));
                 }
                 self.local_iface_aliases.push(iface_alias_frame);
                 // §6.21: open a static-local sync frame so a `static`
@@ -86456,10 +86447,10 @@ impl Simulator {
                     self.return_flag = saved_return;
                 }
                 if method_name == "new" {
-                    self.ctor_class_stack.pop();
+                    self.oop.ctor_class_stack.pop();
                 }
-                self.class_context_stack.pop();
-                self.method_local_base.pop();
+                self.oop.class_context_stack.pop();
+                self.oop.method_local_base.pop();
                 // §13.4.1: a method returning an UNPACKED struct has no single
                 // return cell — its members are frame leaves, so the bare name
                 // read back x. Collapse them into the packed form while the
@@ -86562,7 +86553,7 @@ impl Simulator {
                     })
                     .collect();
                 self.local_stack.pop();
-                self.this_stack.pop();
+                self.oop.this_stack.pop();
                 self.pop_and_restore_queue_frame();
                 for (param, caller) in &queue_writebacks {
                     self.writeback_queue_param(param, caller);
@@ -86648,8 +86639,8 @@ impl Simulator {
         }
         let prop = obj_name.strip_prefix("this.").unwrap_or(obj_name);
         if !prop.contains('.') {
-            if let Some(Some(th)) = self.this_stack.last().copied() {
-                if let Some(Some(inst)) = self.heap.get(th) {
+            if let Some(Some(th)) = self.oop.this_stack.last().copied() {
+                if let Some(Some(inst)) = self.oop.heap.get(th) {
                     if let Some(v) = inst.properties.get(prop) {
                         return Some(v.to_u64().unwrap_or(0) as usize);
                     }
@@ -86694,7 +86685,7 @@ impl Simulator {
                 return Self::container_base(k);
             }
             // 2. class property of the current class (walk the hierarchy).
-            if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            if let Some(Some(ctx)) = self.oop.class_context_stack.last().cloned() {
                 let mut cur = Some(ctx);
                 while let Some(cn) = cur {
                     if let Some(cd) = self.module.classes.get(&cn) {
@@ -86855,7 +86846,7 @@ impl Simulator {
             // A class property keeps its declared type on the class, not on
             // any signal — `local mailbox m;` inside a driver reaches here.
             if let Some(leaf) = hier.path.last().map(|s| s.name.name.as_str()) {
-                if let Some(Some(cur)) = self.class_context_stack.last() {
+                if let Some(Some(cur)) = self.oop.class_context_stack.last() {
                     if self
                         .module
                         .classes
@@ -86933,7 +86924,7 @@ impl Simulator {
                 // method, so `obj = new(...)` constructed `C` instead of `T`.
                 let in_any_frame = hier.path.len() == 1
                     && self
-                        .method_local_base
+                        .oop.method_local_base
                         .last()
                         .map(|&base| {
                             self.local_stack
@@ -86955,7 +86946,7 @@ impl Simulator {
                         });
                 if in_any_frame {
                     // A class-typed procedural local declared in this scope.
-                    if let Some(t) = self.var_class_types.get(&name) {
+                    if let Some(t) = self.oop.var_class_types.get(&name) {
                         return Some(t.clone());
                     }
                     // LRM §6.19.6: typedef-typed local — used by
@@ -87011,11 +87002,11 @@ impl Simulator {
                 // (`in_any_frame` was already computed above, before the
                 // signal-table lookups, so a current-scope local wins over a
                 // same-named module signal.)
-                let in_class_method = self.class_context_stack.last().is_some();
+                let in_class_method = self.oop.class_context_stack.last().is_some();
                 let trust_flat_maps = in_any_frame || !in_class_method;
                 if trust_flat_maps {
                     // A class-typed procedural local declared in this scope.
-                    if let Some(t) = self.var_class_types.get(&name) {
+                    if let Some(t) = self.oop.var_class_types.get(&name) {
                         return Some(t.clone());
                     }
                     // LRM §6.19.6: typedef-typed local — used by
@@ -87027,7 +87018,7 @@ impl Simulator {
                 // A class property referenced bare inside a method —
                 // resolve its type through the current class context.
                 if hier.path.len() == 1 && !in_any_frame {
-                    if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                    if let Some(Some(ctx)) = self.oop.class_context_stack.last().cloned() {
                         if let Some(t) = self.class_prop_type_named(&ctx, &name) {
                             return Some(t);
                         }
@@ -87036,13 +87027,13 @@ impl Simulator {
                 // Multi-segment path resolution (e.g. `stor.handle`, `ClassName::static_prop`, `obj.field.subfield`)
                 if hier.path.len() >= 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
                     let root = &hier.path[0].name.name;
-                    let curr_type = if let Some(t) = self.var_class_types.get(root) {
+                    let curr_type = if let Some(t) = self.oop.var_class_types.get(root) {
                         Some(t.clone())
                     } else if let Some(t) = self.var_typedef_types.get(root) {
                         Some(t.clone())
                     } else if self.module.classes.contains_key(root) {
                         Some(root.clone())
-                    } else if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                    } else if let Some(Some(ctx)) = self.oop.class_context_stack.last().cloned() {
                         self.class_prop_type_named(&ctx, root)
                     } else {
                         None
@@ -87118,8 +87109,8 @@ impl Simulator {
                 // `this.field` — the current instance's class (its dynamic
                 // type, so an inherited property resolves too).
                 if matches!(base.kind, ExprKind::This) {
-                    if let Some(Some(h)) = self.this_stack.last().copied() {
-                        if let Some(Some(inst)) = self.heap.get(h) {
+                    if let Some(Some(h)) = self.oop.this_stack.last().copied() {
+                        if let Some(Some(inst)) = self.oop.heap.get(h) {
                             let cn = inst.class_name.clone();
                             return self.class_prop_type_named(&cn, &member.name);
                         }
@@ -87136,7 +87127,7 @@ impl Simulator {
                         // obj.field — find obj's runtime class
                         let handle = self.eval_ident_handle(bname).unwrap_or(0);
                         if handle != 0 {
-                            if let Some(Some(inst)) = self.heap.get(handle) {
+                            if let Some(Some(inst)) = self.oop.heap.get(handle) {
                                 let cn = inst.class_name.clone();
                                 return self.class_prop_type_named(&cn, &member.name);
                             }
@@ -87187,13 +87178,13 @@ impl Simulator {
     ) -> Option<(String, Vec<Expression>)> {
         if let ExprKind::Ident(hier) = &expr.kind {
             let name = self.resolve_hier_name(hier);
-            if let Some(base) = self.var_class_types.get(&name) {
-                let ta = self.var_type_args.get(&name).cloned().unwrap_or_default();
+            if let Some(base) = self.oop.var_class_types.get(&name) {
+                let ta = self.oop.var_type_args.get(&name).cloned().unwrap_or_default();
                 return Some((base.clone(), ta));
             }
             let bname = &hier.path[0].name.name;
-            if let Some(base) = self.var_class_types.get(bname) {
-                let ta = self.var_type_args.get(bname).cloned().unwrap_or_default();
+            if let Some(base) = self.oop.var_class_types.get(bname) {
+                let ta = self.oop.var_type_args.get(bname).cloned().unwrap_or_default();
                 return Some((base.clone(), ta));
             }
         }
@@ -87415,7 +87406,7 @@ impl Simulator {
         // name: reads returned 0 and writes vanished with no diagnostic, even
         // for a uniquely-named inherited property.
         if name == "super" {
-            return self.this_stack.last().copied().flatten();
+            return self.oop.this_stack.last().copied().flatten();
         }
         if let Some(locals) = self.local_stack.last() {
             if let Some(v) = locals.get(name) {
@@ -87428,7 +87419,7 @@ impl Simulator {
         // Defer to the static fallback below.
         // LRM §8.9: a static property has ONE cell shared across instances.
         let is_static_prop = self
-            .class_context_stack
+            .oop.class_context_stack
             .last()
             .cloned()
             .flatten()
@@ -87450,17 +87441,17 @@ impl Simulator {
             })
             .unwrap_or(false);
         if !is_static_prop {
-            if let Some(Some(handle)) = self.this_stack.last() {
-                if let Some(Some(inst)) = self.heap.get(*handle) {
+            if let Some(Some(handle)) = self.oop.this_stack.last() {
+                if let Some(Some(inst)) = self.oop.heap.get(*handle) {
                     if let Some(v) = inst.properties.get(name) {
                         return v.to_u64().map(|h| h as usize);
                     }
                 }
             }
         }
-        if let Some(Some(ctx)) = self.class_context_stack.last() {
+        if let Some(Some(ctx)) = self.oop.class_context_stack.last() {
             if let Some(key) = self.static_prop_key(ctx, name) {
-                if let Some(v) = self.class_statics.get(&key) {
+                if let Some(v) = self.oop.class_statics.get(&key) {
                     return v.to_u64().map(|h| h as usize);
                 }
             }
