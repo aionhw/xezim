@@ -42127,22 +42127,38 @@ impl Simulator {
                         //   - a MemberAccess `obj.member` (lowered form, used
                         //     inside foreach bodies where the index is a loop
                         //     variable: `foreach(c.p[idx]) c.p[idx] = new()`).
-                        // Returns member=Some(obj_name, member) for these forms,
-                        // or member=None for a bare single-segment Ident `name`
-                        // (module-scope / local / static collection).
-                        let member_form: Option<(&str, String)> = match &root.kind {
-                            ExprKind::Ident(bh) if bh.path.len() >= 2 => Some((
-                                &bh.path[0].name.name,
-                                bh.path.last().unwrap().name.name.clone(),
-                            )),
-                            ExprKind::MemberAccess { expr: mbase, member } => {
-                                if let ExprKind::Ident(ob) = &mbase.kind {
-                                    Some((&ob.path[0].name.name, member.name.clone()))
-                                } else {
-                                    None
+                        // Returns member=Some((obj_name, member_chain)) for
+                        // these forms, where member_chain holds EVERY member
+                        // name along the path (["mid","base"] for
+                        // `a.mid.base`), or member=None for a bare
+                        // single-segment Ident `name` (module-scope / local /
+                        // static collection).
+                        let member_form: Option<(String, Vec<String>)> = {
+                            fn chain(e: &Expression, out: &mut Vec<String>) -> Option<String> {
+                                match &e.kind {
+                                    ExprKind::Ident(bh) => {
+                                        let obj =
+                                            bh.path.first().map(|s| s.name.name.clone())?;
+                                        for s in bh.path.iter().skip(1) {
+                                            out.push(s.name.name.clone());
+                                        }
+                                        Some(obj)
+                                    }
+                                    ExprKind::MemberAccess { expr: mbase, member } => {
+                                        let obj = chain(mbase, out)?;
+                                        out.push(member.name.clone());
+                                        Some(obj)
+                                    }
+                                    _ => None,
                                 }
                             }
-                            _ => None,
+                            let mut out = Vec::new();
+                            match chain(root, &mut out) {
+                                Some(obj) => Some((obj, out)),
+                                // single-segment Ident (`name[...]`) — the
+                                // maps above handle it, not this member form.
+                                None => None,
+                            }
                         };
                         // Compute `bname` (the collection's base name) for
                         // both root shapes: a bare/flattened `Ident`, or a
@@ -42196,12 +42212,17 @@ impl Simulator {
                                     // for BOTH the flattened `Ident([obj,p])`
                                     // and the `MemberAccess(obj,p)` shapes.
                                     // Resolve `obj`'s handle, read its class,
-                                    // and look up the property's element type.
-                                    if let Some((obj_name, member)) = member_form {
-                                        let handle = if obj_name == "this" {
+                                    // and WALK the full member chain (["mid",
+                                    // "base"] for `a.mid.base`) so a nested
+                                    // class-member collection resolves its
+                                    // element class by following each
+                                    // intermediate field's type, not just an
+                                    // (obj, single-member) surface lookup.
+                                    if let Some((obj_name, members)) = member_form {
+                                        let handle = if obj_name.as_str() == "this" {
                                             self.oop.this_stack.last().copied().flatten().unwrap_or(0)
                                         } else {
-                                            self.eval_ident_handle(obj_name).unwrap_or(0)
+                                            self.eval_ident_handle(&obj_name).unwrap_or(0)
                                         };
                                         if handle != 0 {
                                             let hcn = self
@@ -42209,21 +42230,41 @@ impl Simulator {
                                                 .get(handle)
                                                 .and_then(|x| x.as_ref())
                                                 .map(|i| i.class_name.clone());
-                                            if let Some(hcn) = hcn {
-                                                let mut cur = Some(hcn);
-                                                while let Some(cn) = cur {
-                                                    if let Some(cd) = self.module.classes.get(&cn) {
-                                                        if let Some(tn) = cd
-                                                            .properties
-                                                            .get(&member)
-                                                            .and_then(|s| s.type_name.clone())
+                                            if let Some(mut cur_name) = hcn {
+                                                for (i, m) in members.iter().enumerate() {
+                                                    // Property `m`'s class type on
+                                                    // the current class, walk
+                                                    // `extends`.
+                                                    let mut ty = None;
+                                                    let mut cc = Some(cur_name.clone());
+                                                    while let Some(cn) = cc {
+                                                        if let Some(cd) =
+                                                            self.module.classes.get(&cn)
                                                         {
-                                                            return Some(tn);
+                                                            if let Some(tn) = cd
+                                                                .properties
+                                                                .get(m)
+                                                                .and_then(|s| {
+                                                                    s.type_name.clone()
+                                                                })
+                                                            {
+                                                                ty = Some(tn);
+                                                                break;
+                                                            }
+                                                            cc = cd.extends.clone();
+                                                        } else {
+                                                            break;
                                                         }
-                                                        cur = cd.extends.clone();
-                                                    } else {
-                                                        break;
                                                     }
+                                                    let Some(t) = ty else {
+                                                        return None;
+                                                    };
+                                                    if i == members.len() - 1 {
+                                                        return Some(t);
+                                                    }
+                                                    // intermediate: the next
+                                                    // member's class starts at `t`.
+                                                    cur_name = t;
                                                 }
                                             }
                                         }
@@ -68632,6 +68673,32 @@ impl Simulator {
                     .map(|i| i.class_name.clone())?;
                 if self.class_assoc_member(&cn, member) {
                     Some(format!("{}#{}", handle, member))
+                } else {
+                    None
+                }
+            }
+            // Flattened OBJECT member chain `obj.b.carr` (3+ segments) where
+            // `obj` is a VARIABLE (the arm above handles a ClassName head).
+            // Evaluate the object part (all but the last segment) to its
+            // handle (`eval_handle_expr` walks `a.mid`), then resolve the last
+            // segment as that instance's collection. Without this,
+            // `foreach(a.mid.arr[i])` over a nested dynamic/assoc array member
+            // fell through to the bare `Ident` path, lost the owning object
+            // (`name` reduced to the leaf `arr`), and iterated nothing.
+            ExprKind::Ident(h) if h.path.len() >= 3 => {
+                let n = h.path.len();
+                let prefix = HierarchicalIdentifier {
+                    root: h.root.clone(),
+                    path: h.path[..n - 1].to_vec(),
+                    span: h.span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                };
+                let pexpr = Expression::new(ExprKind::Ident(prefix), h.span);
+                let handle = self.eval_handle_expr(&pexpr).unwrap_or(0);
+                let member = &h.path[n - 1].name.name;
+                if handle != 0 {
+                    self.handle_collection_name(handle, member)
                 } else {
                     None
                 }
