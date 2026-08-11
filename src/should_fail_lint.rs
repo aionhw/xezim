@@ -31,6 +31,9 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     // §23.3.2: map every module/interface/program to its declared port names,
     // so a named port connection to a non-existent port can be rejected.
     let port_map = build_port_map(defs);
+    // §18.5.2: scans ALL classes at once (needs the full hierarchy to walk
+    // extends chains), so it runs once rather than per-definition.
+    check_pure_constraints(elab, &mut errs);
     for def in defs {
         match def {
             SourceDefinition::Class(c) => check_class(c, &mut errs),
@@ -46,8 +49,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 for it in &m.items {
                     check_module_item(it, elab, &mut errs);
                 }
-                check_proc_net_assign(&m.items, &mut errs);
+                check_proc_net_assign(&m.items, &m.ports, &mut errs);
                 check_enum_assign(&m.items, elab, &mut errs);
+                check_specparam_use(&m.items, def.specparams(), &mut errs);
+                check_param_class_scope(&m.items, elab, &mut errs);
                 check_dynarray_assign(&m.items, elab, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
@@ -58,6 +63,8 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 for it in &m.items {
                     check_module_item(it, elab, &mut errs);
                 }
+                check_specparam_use(&m.items, def.specparams(), &mut errs);
+                check_param_class_scope(&m.items, elab, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_instantiations(&m.items, &port_map, &mut errs);
@@ -67,6 +74,8 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 for it in &m.items {
                     check_module_item(it, elab, &mut errs);
                 }
+                check_specparam_use(&m.items, def.specparams(), &mut errs);
+                check_param_class_scope(&m.items, elab, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_program_items(&m.items, &mut errs);
@@ -237,13 +246,48 @@ fn check_array_flat_init(d: &VarDeclarator, elab: &ElaboratedModule, errs: &mut 
 /// Conservative: only explicit NetDeclarations are treated as nets (output
 /// ports, where net-vs-var is ambiguous, are NOT flagged), and only `=`/`<=`
 /// targets are checked (force/release/assign are separate statement kinds).
-fn check_proc_net_assign(items: &[ModuleItem], errs: &mut Vec<String>) {
+fn check_proc_net_assign(
+    items: &[ModuleItem],
+    ports: &xezim_core::ast::module::PortList,
+    errs: &mut Vec<String>,
+) {
     use std::collections::HashSet;
+    // Body variable declarations complete an untyped ANSI port as a VARIABLE
+    // (e.g. `output b; ... logic b;` — §23.2.2.1), so they must not be treated
+    // as nets even though the header alone was untyped.
+    let mut vars: HashSet<String> = HashSet::new();
+    for it in items {
+        if let ModuleItem::DataDeclaration(dd) = it {
+            for d in &dd.declarators {
+                vars.insert(d.name.name.clone());
+            }
+        }
+    }
     let mut nets: HashSet<String> = HashSet::new();
     for it in items {
         if let ModuleItem::NetDeclaration(nd) = it {
             for d in &nd.declarators {
                 nets.insert(d.name.name.clone());
+            }
+        }
+    }
+    // §23.2.2.3: an ANSI port whose data type is omitted (or only implicit)
+    // defaults to a NET of the default net type for input/inout AND for output
+    // when the type is omitted/implicit. Only when the type is declared with
+    // the explicit `data_type` syntax (e.g. `output logic b`) is the port a
+    // variable. A body `logic`/`reg` declaration completes the untyped port as
+    // a variable instead (excluded above).
+    if let PortList::Ansi(ps) = ports {
+        for p in ps {
+            let untyped = p.data_type.is_none() || matches!(p.data_type, Some(DataType::Implicit { .. }));
+            if !untyped || p.var_kw || vars.contains(&p.name.name) {
+                continue;
+            }
+            if matches!(
+                p.direction,
+                Some(PortDirection::Output | PortDirection::Inout)
+            ) {
+                nets.insert(p.name.name.clone());
             }
         }
     }
@@ -334,11 +378,32 @@ fn is_nonenum_integral_var(e: &Expression, elab: &ElaboratedModule) -> bool {
     }
 }
 
-/// §6.19.3: reject `enum_var = <integer literal>` (no explicit cast). Covers
-/// both procedural (`e = 1;`) and continuous (`assign e = 1;`) assignments.
-/// Deliberately narrow — only a bare integer-literal RHS to a WHOLE enum
-/// variable fires, so legal enum-member / same-type / cast assignments are
-/// untouched.
+/// §6.19.4: a compound assignment (`e += x`, `e -= x`, …) is the enum var
+/// used in an arithmetic expression without a cast to its base type, which is
+/// illegal. The parser expands `e += x` to `e = e + x`, so the RHS is a
+/// `Binary` whose LEFT operand is the same enum var — that shape is the
+/// unambiguous compound-assignment case (a cast would parse as a `SystemCall`,
+/// and a plain `e = a + b` where neither side is `e` doesn't match `b`).
+fn is_enum_arith_rhs(e: &Expression, enum_var: &str) -> bool {
+    match &e.kind {
+        ExprKind::Binary { left, .. } => {
+            if let ExprKind::Ident(h) = &left.kind {
+                h.path.len() == 1 && h.path[0].name.name == enum_var && h.path[0].selects.is_empty()
+            } else {
+                false
+            }
+        }
+        ExprKind::Paren(inner) => is_enum_arith_rhs(inner, enum_var),
+        _ => false,
+    }
+}
+
+/// §6.19.3/§6.19.4: reject assigning a non-enum value to an enum variable
+/// without an explicit cast. Covers both procedural (`e = 1;`, `e += 1;`) and
+/// continuous (`assign e = 1;`) assignments. Deliberately narrow — only a
+/// bare integer-literal RHS, a definitely-integral non-enum var RHS, or the
+/// compound-assignment desugar fires, so legal enum-member / same-type / cast
+/// assignments are untouched.
 fn check_enum_assign(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut Vec<String>) {
     use std::collections::HashSet;
     let mut enum_vars: HashSet<String> = HashSet::new();
@@ -356,6 +421,28 @@ fn check_enum_assign(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut V
             }
             _ => {}
         }
+        // §6.19.3: an enum var declared INSIDE a procedural block (`initial` /
+        // `always`, incl. nested blocks) is enum-typed too — `e v; v = 1;`
+        // inside an `initial` is just as illegal as at module scope.
+        let stmt = match it {
+            ModuleItem::AlwaysConstruct(a) => &a.stmt,
+            ModuleItem::InitialConstruct(i) => &i.stmt,
+            _ => continue,
+        };
+        for_each_stmt(stmt, &mut |s| {
+            if let StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } = &s.kind
+            {
+                if resolves_to_enum(data_type, elab) {
+                    for d in declarators {
+                        enum_vars.insert(d.name.name.clone());
+                    }
+                }
+            }
+        });
     }
     if enum_vars.is_empty() {
         return;
@@ -371,7 +458,9 @@ fn check_enum_assign(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut V
         if matches!(lv.kind, ExprKind::Ident(_)) {
             if let Some(b) = base_ident(lv) {
                 if enum_vars.contains(&b)
-                    && (is_bare_integer_rhs(rv) || is_nonenum_integral_var(rv, elab))
+                    && (is_bare_integer_rhs(rv)
+                        || is_nonenum_integral_var(rv, elab)
+                        || is_enum_arith_rhs(rv, &b))
                 {
                     errs.push(format!(
                         "assignment to enum variable '{}' requires an explicit cast \
@@ -394,6 +483,53 @@ fn check_enum_assign(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut V
         if let ModuleItem::ContinuousAssign(ca) = it {
             for (l, r) in &ca.assignments {
                 flag(l, r, &enum_vars, elab, errs);
+            }
+        }
+    }
+}
+
+/// §6.20.5: a specparam "can appear in any expression that is not assigned to
+/// a parameter and is not part of the range specification of a declaration".
+/// So a parameter / localparam whose VALUE expression references a specparam
+/// (`specparam delay = 50; parameter p = delay + 2;`) is illegal — a specparam
+/// is only for timing / delay values. The parser captures specparam NAMES (the
+/// declarations themselves are parse-accept, since xezim doesn't model specify
+/// timing); here every value parameter / localparam expression is walked and
+/// any bare reference to one of those names fires. Type params (`localparam
+/// type T = ...`) can't reference a specparam by construction.
+fn check_specparam_use(
+    items: &[ModuleItem],
+    specparams: &[String],
+    errs: &mut Vec<String>,
+) {
+    if specparams.is_empty() {
+        return;
+    }
+    use std::collections::HashSet;
+    let names: HashSet<&str> = specparams.iter().map(|s| s.as_str()).collect();
+    fn walk_expr(e: &Expression, names: &HashSet<&str>, errs: &mut Vec<String>) {
+        for_each_expr(e, &mut |x| {
+            if let ExprKind::Ident(h) = &x.kind {
+                if h.path.len() == 1 && names.contains(h.path[0].name.name.as_str()) {
+                    errs.push(format!(
+                        "specparam '{}' cannot be used in a parameter value expression \
+                         (LRM 1800-2017 §6.20.5)",
+                        h.path[0].name.name
+                    ));
+                }
+            }
+        });
+    }
+    for it in items {
+        let pd = match it {
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => pd,
+            _ => continue,
+        };
+        if let crate::ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
+            for a in assignments {
+                if let Some(init) = &a.init {
+                    walk_expr(init, &names, errs);
+                }
             }
         }
     }
@@ -1118,6 +1254,141 @@ fn check_enum_values(et: &EnumType, elab: &ElaboratedModule, errs: &mut Vec<Stri
 /// §8.20: a `pure virtual` method (or any method qualified `pure`) is legal
 /// only inside a *virtual* (abstract) class or an interface class. A concrete
 /// class declaring one is an error.
+/// §8.25: "For a parameterized class C, the default specialization is C#().
+/// Other than as the prefix of the scope resolution operator, use of the
+/// unadorned name of a parameterized class shall denote the default
+/// specialization of the class." So `par_cls::member` — the unadorned name of
+/// a parameterized class as the `::` prefix — does NOT denote the default
+/// specialization and is illegal; a legal form must specialize explicitly
+/// (`par_cls#()::member`, `par_cls#(15)::member`). The AST distinguishes the
+/// two: the legal form's MemberAccess base is a `Specialization`, the illegal
+/// form's base is a bare `Ident`.
+fn check_param_class_scope(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut Vec<String>) {
+    for it in items {
+        match it {
+            ModuleItem::AlwaysConstruct(a) => {
+                for_each_stmt_expr(&a.stmt, &mut |e| check_scope_expr(e, elab, errs))
+            }
+            ModuleItem::InitialConstruct(i) => {
+                for_each_stmt_expr(&i.stmt, &mut |e| check_scope_expr(e, elab, errs))
+            }
+            ModuleItem::FinalConstruct(fc) => {
+                for_each_stmt_expr(&fc.stmt, &mut |e| check_scope_expr(e, elab, errs))
+            }
+            ModuleItem::ContinuousAssign(ca) => {
+                for (l, r) in &ca.assignments {
+                    check_scope_expr(l, elab, errs);
+                    check_scope_expr(r, elab, errs);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_scope_expr(e: &Expression, elab: &ElaboratedModule, errs: &mut Vec<String>) {
+    for_each_expr(e, &mut |x| {
+        if let ExprKind::MemberAccess { expr, .. } = &x.kind {
+            // Bare `Class::member` base: a single-segment Ident (NOT a
+            // Specialization). Only fires when that name names a
+            // parameterized class and is not shadowed by a signal.
+            let base_name = match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    h.path[0].name.name.clone()
+                }
+                _ => return,
+            };
+            if elab.signals.contains_key(&base_name) {
+                return;
+            }
+            if let Some(cls) = elab.classes.get(&base_name) {
+                // Only the class HEADER `#(...)` list makes it parameterized.
+                // `param_defaults` also holds class-BODY localparams, and a
+                // class with only body localparams is NOT parameterized
+                // (mirrors simulator's `class_is_parameterized`).
+                let has_params = !cls.param_order.is_empty() || !cls.type_param_names.is_empty();
+                if has_params {
+                    errs.push(format!(
+                        "class '{}' is parameterized; scope resolution without a \
+                         specialization ('{}::') is illegal — use '{}#(...)::' \
+                         (LRM 1800-2017 §8.25)",
+                        base_name, base_name, base_name
+                    ));
+                }
+            }
+        }
+    });
+}
+
+/// §18.5.2: "A pure constraint represents an obligation on any non-abstract
+/// derived class (i.e., a derived class that is not virtual) to provide a
+/// constraint of the same name. It shall be an error if a non-abstract class
+/// does not have an implementation of every pure constraint that it inherits.
+/// It shall be an error to declare a pure constraint in a non-abstract class."
+///
+/// Walks every elaborated class. For each non-virtual (non-interface) class:
+///  - a pure constraint DECLARED on the class itself is an error;
+///  - every pure constraint inherited from a virtual ancestor must be
+///    implemented (a non-pure constraint of the same name) somewhere in the
+///    class's own extends chain.
+fn check_pure_constraints(elab: &ElaboratedModule, errs: &mut Vec<String>) {
+    for (name, cls) in &elab.classes {
+        if cls.is_virtual || cls.is_interface {
+            continue;
+        }
+        // Pure constraint declared directly on a non-abstract class.
+        let own_pure: Vec<String> = cls
+            .constraints
+            .values()
+            .filter(|c| c.is_pure)
+            .map(|c| c.name.name.clone())
+            .collect();
+        for p in &own_pure {
+            errs.push(format!(
+                "class '{}': a pure constraint '{}' is illegal in a non-virtual class \
+                 (LRM 1800-2017 §18.5.2)",
+                name, p
+            ));
+        }
+        // Walk the extends chain, collecting every pure constraint declared
+        // by a virtual ancestor and every non-pure implementation.
+        let mut cur = cls.extends.clone();
+        let mut inherited_pure: Vec<String> = Vec::new();
+        let mut implemented: Vec<String> = cls
+            .constraints
+            .values()
+            .filter(|c| !c.is_pure)
+            .map(|c| c.name.name.clone())
+            .collect();
+        while let Some(anc_name) = cur {
+            match elab.classes.get(&anc_name) {
+                Some(anc) => {
+                    for c in anc.constraints.values() {
+                        if c.is_pure {
+                            if !inherited_pure.contains(&c.name.name) {
+                                inherited_pure.push(c.name.name.clone());
+                            }
+                        } else if !implemented.contains(&c.name.name) {
+                            implemented.push(c.name.name.clone());
+                        }
+                    }
+                    cur = anc.extends.clone();
+                }
+                None => break,
+            }
+        }
+        for p in &inherited_pure {
+            if !implemented.contains(p) {
+                errs.push(format!(
+                    "class '{}': inherited pure constraint '{}' must be implemented \
+                     (LRM 1800-2017 §18.5.2)",
+                    name, p
+                ));
+            }
+        }
+    }
+}
+
 fn check_class(c: &ClassDeclaration, errs: &mut Vec<String>) {
     if !c.virtual_kw && !c.is_interface {
         for item in &c.items {
@@ -1580,6 +1851,7 @@ fn check_new_array_target(dt: &DataType, decl: &VarDeclarator, errs: &mut Vec<St
 
 use std::collections::{HashMap, HashSet};
 use xezim_core::ast::module::PortList;
+use xezim_core::ast::types::PortDirection;
 
 /// Set of declared port names for a module/interface/program, or None when the
 /// port list is empty/unknown (so no connection is ever flagged against it).

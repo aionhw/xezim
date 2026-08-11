@@ -2519,3 +2519,127 @@ endmodule
 "#;
     assert!(rejected(SRC), "br_gh386c is an illegal cast and must be rejected");
 }
+
+#[test]
+fn group_b_enum_block_local_int_assign_rejected() {
+    // sv-tests chapter-6/6.19.3--enum_type_checking_inv.sv — the enum var is
+    // declared INSIDE a procedural block, which must be tracked too.
+    const SRC: &str = r#"module top();
+typedef enum {a, b, c, d} e;
+initial begin
+  e val;
+  val = 1;
+end
+endmodule
+"#;
+    assert!(rejected(SRC), "block-local enum var assigned an int literal (no cast) must be rejected");
+}
+
+#[test]
+fn group_b_enum_compound_assign_rejected() {
+    // sv-tests chapter-6/6.19.4--enum_numerical_expr_no_cast.sv — `e += 1`
+    // expands to `e = e + 1`: the enum is used in an arithmetic expression
+    // without a cast to its base type.
+    const SRC: &str = r#"module top();
+typedef enum {a, b, c, d} e;
+e val;
+initial begin
+  val = a;
+  val += 1;
+end
+endmodule
+"#;
+    assert!(rejected(SRC), "enum compound assignment (e += 1, no cast) must be rejected");
+}
+
+#[test]
+fn group_b_specparam_in_parameter_expr_rejected() {
+    // sv-tests chapter-6/6.20.5--specparam_inv.sv — a specparam "can appear
+    // in any expression that is not assigned to a parameter" (§6.20.5), so
+    // `parameter p = specparam_name + ...` is illegal.
+    const SRC: &str = r#"module top();
+specparam delay = 50;
+parameter p = delay + 2;
+endmodule
+"#;
+    assert!(rejected(SRC), "specparam referenced in a parameter value expression must be rejected");
+}
+
+#[test]
+fn group_b_specparam_legal_when_not_in_parameter_passes() {
+    // sv-tests chapter-6/6.20.5--specparam.sv — a standalone specparam
+    // declaration is fine; the rule only fires on parameter value exprs.
+    const SRC: &str = r#"module top();
+specparam delay = 50;
+endmodule
+"#;
+    let _ = SRC;
+    // no assertion body needed: the point is that `rejected` must be FALSE,
+    // exercised by the full suite; keep a trivial passes-style run here.
+    assert!(!rejected(SRC), "standalone specparam must NOT be rejected");
+}
+
+#[test]
+fn group_b_pure_constraint_inherited_not_implemented_rejected() {
+    // sv-tests chapter-18/18.5.2--pure-constraint_2.sv — a non-abstract
+    // derived class must implement every pure constraint it inherits.
+    const SRC: &str = r#"virtual class a;
+    pure constraint c;
+endclass
+class a2 extends a;
+endclass
+"#;
+    assert!(rejected(SRC), "inherited pure constraint must be implemented");
+}
+
+#[test]
+fn group_b_pure_constraint_implemented_passes() {
+    // sv-tests chapter-18/18.5.2--pure-constraint_0.sv — implementing the
+    // pure constraint in the derived class is legal.
+    const SRC: &str = r#"virtual class a;
+    pure constraint c;
+endclass
+class a2 extends a;
+    rand int b2;
+    constraint c { b2 == 5; }
+endclass
+"#;
+    assert!(!rejected(SRC), "implemented pure constraint must pass");
+}
+
+#[test]
+fn group_b_parametrized_class_bare_scope_rejected() {
+    // sv-tests chapter-8/8.25.1--parametrized_class_invalid_scope_resolution.sv
+    // — an unadorned parameterized class as a `::` prefix does NOT denote the
+    // default specialization (IEEE 1800-2017 §8.25).
+    const SRC: &str = r#"module class_tb ();
+	class par_cls #(int a = 25);
+		parameter int b = 23;
+	endclass
+	par_cls #(15) inst;
+	initial begin
+		inst = new;
+		$display(par_cls::b);
+	end
+endmodule
+"#;
+    assert!(rejected(SRC), "bare parameterized class scope resolution must be rejected");
+}
+
+#[test]
+fn group_b_parametrized_class_specialized_scope_passes() {
+    // sv-tests chapter-8/8.25.1--parametrized_class_scope_resolution.sv — an
+    // explicit empty specialization IS the default specialization, legal.
+    const SRC: &str = r#"module class_tb ();
+	class par_cls #(int a = 25);
+		parameter int b = 23;
+	endclass
+	par_cls #(15) inst;
+	initial begin
+		inst = new;
+		$display(par_cls#()::b);
+	end
+endmodule
+"#;
+    assert!(!rejected(SRC), "specialized parameterized class scope must pass");
+}

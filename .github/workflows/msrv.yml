@@ -12,7 +12,7 @@ jobs:
 
       - name: Checkout xezim-core
         run: |
-          git clone https://github.com/aionhw/xezim-core.git ../xezim-core
+          git clone https://github.com/opensource-elearning/xezim-core.git ../xezim-core
           echo "CORE_SHA=$(git -C ../xezim-core rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
