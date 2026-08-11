@@ -121,8 +121,8 @@ module m; initial begin
   $display("R=%s L=%0d", ai[1], ai[1].len());
 end endmodule
 "#);
-    assert!(o.contains(r#"AI='{0:"x", 1:"y"}"#), "int-keyed string assoc %p: {}", o);
-    assert!(o.contains(r#"SK='{"a":"apple"}"#), "string-keyed string assoc %p: {}", o);
+    assert!(o.contains(r#"AI='{0:"x", 1:"y" }"#), "int-keyed string assoc %p: {}", o);
+    assert!(o.contains(r#"SK='{"a":"apple" }"#), "string-keyed string assoc %p: {}", o);
     assert!(o.contains("R=y L=1"), "string-valued assoc read broke: {}", o);
 }
 

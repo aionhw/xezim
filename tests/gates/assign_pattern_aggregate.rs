@@ -97,19 +97,19 @@ fn pattern_assign_spreads_into_array_of_structs_and_assoc_element() {
         r#"ARR='{'{tgl:ON, str:"a0"}, '{tgl:OFF, str:"a1"}}"#
     );
     // `assoc[key] = '{...}` on a struct element.
-    assert_eq!(line(&sim, "CS="), r#"CS='{5:'{tgl:OFF, str:"five"}}"#);
+    assert_eq!(line(&sim, "CS="), r#"CS='{5:'{tgl:OFF, str:"five"} }"#);
 }
 
 #[test]
 fn assoc_declaration_initializers_populate_elements() {
     let sim = simulate(SRC, 100).expect("simulate failed");
 
-    assert_eq!(line(&sim, "MI="), "MI='{10:100, 20:200}");
-    assert_eq!(line(&sim, "MS="), r#"MS='{"a":1, "b":2}"#);
+    assert_eq!(line(&sim, "MI="), "MI='{10:100, 20:200 }");
+    assert_eq!(line(&sim, "MS="), r#"MS='{"a":1, "b":2 }"#);
     // The LRM §21.2.1.7 example: struct elements keyed by integer.
     assert_eq!(
         line(&sim, "CMB="),
-        r#"CMB='{10:'{tgl:OFF, str:"toggle10"}, 20:'{tgl:ON, str:"toggle20"}}"#
+        r#"CMB='{10:'{tgl:OFF, str:"toggle10"}, 20:'{tgl:ON, str:"toggle20"} }"#
     );
 
     // Populated for real, not just printable: num() counts them, a member
