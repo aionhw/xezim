@@ -19,6 +19,8 @@ mod call_time_defaults_and_string_queries;
 mod display_only_always;
 #[path = "strings/dpi_integration_tests.rs"]
 mod dpi_integration_tests;
+#[path = "strings/dpi_child_module_import.rs"]
+mod dpi_child_module_import;
 #[path = "strings/format_lrm_compliance.rs"]
 mod format_lrm_compliance;
 #[path = "strings/format_sibling_fixes.rs"]

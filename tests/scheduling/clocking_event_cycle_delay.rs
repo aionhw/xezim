@@ -67,7 +67,11 @@ endmodule
 }
 
 #[test]
-fn cycle_delay_zero_does_not_wait() {
+fn cycle_delay_zero_synchronizes_to_the_clocking_event() {
+    // §14.11: `##0` SYNCHRONIZES to the clocking event — it waits for the
+    // edge when the process is not executing at one, and is a no-op when it
+    // is. Reference-measured (this test previously pinned `Z t=0`, i.e.
+    // "never waits", without reference validation — the reference waits).
     const SRC: &str = r#"
 `timescale 1ns/1ns
 module top;
@@ -84,14 +88,46 @@ module top;
 endmodule
 "#;
     let out = output_of(&simulate(SRC, 200).expect("sim"));
-    assert!(out.contains("Z t=0"), "##0 must not wait:\n{}", out);
-    assert!(out.contains("Z3 t=25"), "##3 must wait three posedges:\n{}", out);
+    assert!(out.contains("Z t=5"), "##0 off-edge waits for the event (reference: 5):\n{}", out);
+    assert!(out.contains("Z3 t=35"), "##3 then waits three posedges (reference: 35):\n{}", out);
 }
 
 #[test]
-fn cycle_delay_single_undesignated_clocking_fallback() {
-    // No `default` keyword, but only one clocking block in scope — the
-    // pragmatic fallback uses it (strict LRM would require the designation).
+fn cycle_delay_zero_at_the_event_is_a_no_op() {
+    // Reference: not_edge=5 (##0 at t=2 waits), at_edge=5 (##0 executed at
+    // the event's own slot does not wait again). Standalone `default
+    // clocking cb;` designation form (§14.12).
+    const SRC: &str = r#"
+`timescale 1ns/1ns
+module top;
+  logic clk = 0;
+  int at_edge = -1, not_edge = -1;
+  clocking cb @(posedge clk);
+  endclocking
+  default clocking cb;
+  always #5 clk = ~clk;
+  initial begin
+    #2;
+    ##0;
+    not_edge = $time;
+    ##0;
+    at_edge = $time;
+    $display("NE=%0d AE=%0d", not_edge, at_edge);
+    $finish;
+  end
+endmodule
+"#;
+    let out = output_of(&simulate(SRC, 200).expect("sim"));
+    assert!(out.contains("NE=5 AE=5"), "##0 waits off-edge, no-ops at the edge:\n{}", out);
+}
+
+#[test]
+fn cycle_delay_single_undesignated_clocking_is_rejected() {
+    // No `default` keyword, even with only one clocking block in scope.
+    // xezim used to fall back to that sole block; §14.11 requires the
+    // designation and the reference simulator errors with "A default
+    // clocking block must be specified to use the ##n timing statement",
+    // so the lenience made xezim accept code the reference rejects.
     const SRC: &str = r#"
 `timescale 1ns/1ns
 module top;
@@ -105,6 +141,12 @@ module top;
   end
 endmodule
 "#;
-    let out = output_of(&simulate(SRC, 200).expect("sim"));
-    assert!(out.contains("F t=5"), "##1 must use the sole clocking block:\n{}", out);
+    let err = match simulate(SRC, 200) {
+        Ok(_) => panic!("##1 without a `default` clocking block must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("default clocking"),
+        "diagnostic should name the missing default clocking block, got: {err}"
+    );
 }

@@ -71,24 +71,28 @@ const RADIX_WIDTH: &str = r#"
 module tb;
   reg [7:0]  r8;
   reg [31:0] r32;
+  reg [15:0] r16;
   initial begin
     r8 = 8'h0f;
-    $display("h4=[%4h]",  r8);   // a reference simulator: "  0f"
-    $display("h04=[%04h]", r8);  // a reference simulator: "000f"
-    $display("hL4=[%-4h]", r8);  // a reference simulator: "0f  "
-    $display("o4=[%4o]",  r8);   // a reference simulator: " 017"
-    $display("b4=[%4b]",  r8);   // a reference simulator: "00001111" (width < natural)
-    $display("b04=[%04b]", r8);  // a reference simulator: "00001111"
-    $display("b10=[%10b]", r8);  // a reference simulator: "  00001111"
-    $display("h0=[%0h]",  r8);   // a reference simulator: "0f"? no -> trimmed "f"
+    $display("h4=[%4h]",  r8);   // reference: "000f" (zero-pad, `0` flag irrelevant)
+    $display("h04=[%04h]", r8);  // reference: "000f"
+    $display("hL4=[%-4h]", r8);  // reference: "f   " (minimal + right spaces)
+    $display("o4=[%4o]",  r8);   // reference: "0017"
+    $display("b4=[%4b]",  r8);   // reference: "1111" (minimal fits exactly)
+    $display("b04=[%04b]", r8);  // reference: "1111"
+    $display("b10=[%10b]", r8);  // reference: "0000001111"
+    $display("h0=[%0h]",  r8);   // reference: trimmed "f"
     r32 = 32'hFF;
-    $display("w2=[%2h]",  r32);  // a reference simulator: "000000ff" (never truncates)
-    $display("w10z=[%010h]", r32); // a reference simulator: "00000000ff"
-    // `0` flag + left-justify trims to the minimal form, then space-pads
-    // (a reference simulator pr2476430): distinct from `0` flag + right-justify, which
-    // zero-pads the natural width.
-    $display("mL8=[%-08h]", r32); // a reference simulator: "ff      "
-    $display("mR8=[%08h]",  r32); // a reference simulator: "000000ff"
+    $display("w2=[%2h]",  r32);  // reference: "ff" (minimal, never truncated)
+    $display("w10z=[%010h]", r32); // reference: "00000000ff"
+    $display("mL8=[%-08h]", r32); // reference: "ff      "
+    $display("mR8=[%08h]",  r32); // reference: "000000ff"
+    r16 = 16'h2a5;
+    $display("n2=[%2h]",  r16);  // reference: "2a5" (minimal wider than field)
+    $display("z6=[%6h]",  8'hzz);   // reference: "0000zz" (x/z run KEPT with a width)
+    $display("m6=[%6h]",  16'hxx3f);// reference: "00xx3f"
+    $display("m0=[%0h]",  16'hxx3f);// reference: "x3f" (bare %0 collapses the run)
+    $display("zero4=[%4h]", 8'h00); // reference: "0000"
   end
 endmodule
 "#;
@@ -96,19 +100,52 @@ endmodule
 #[test]
 fn radix_width_honours_zero_flag_and_natural_width() {
     let sim = simulate(RADIX_WIDTH, 100).expect("simulate failed");
-    // §21.2.1.3 — each RHS below matches a reference simulator byte-for-byte.
-    assert_eq!(line(&sim, "h4="), "h4=[  0f]");
+    // §21.2.1.3 — each RHS below matches the reference simulator
+    // byte-for-byte (re-measured 2026-08; commercial tools disagree on this
+    // family — the space-pad-to-natural-width model some of them use was
+    // xezim's previous behavior, replaced deliberately).
+    assert_eq!(line(&sim, "h4="), "h4=[000f]");
     assert_eq!(line(&sim, "h04="), "h04=[000f]");
-    assert_eq!(line(&sim, "hL4="), "hL4=[0f  ]");
-    assert_eq!(line(&sim, "o4="), "o4=[ 017]");
-    assert_eq!(line(&sim, "b4="), "b4=[00001111]");
-    assert_eq!(line(&sim, "b04="), "b04=[00001111]");
-    assert_eq!(line(&sim, "b10="), "b10=[  00001111]");
+    assert_eq!(line(&sim, "hL4="), "hL4=[f   ]");
+    assert_eq!(line(&sim, "o4="), "o4=[0017]");
+    assert_eq!(line(&sim, "b4="), "b4=[1111]");
+    assert_eq!(line(&sim, "b04="), "b04=[1111]");
+    assert_eq!(line(&sim, "b10="), "b10=[0000001111]");
     assert_eq!(line(&sim, "h0="), "h0=[f]");
-    assert_eq!(line(&sim, "w2="), "w2=[000000ff]");
+    assert_eq!(line(&sim, "w2="), "w2=[ff]");
     assert_eq!(line(&sim, "w10z="), "w10z=[00000000ff]");
-    assert_eq!(line(&sim, "mL8="), "mL8=[ff      ]"); // a reference simulator: trimmed + spaces
-    assert_eq!(line(&sim, "mR8="), "mR8=[000000ff]"); // a reference simulator: natural, zero-pad
+    assert_eq!(line(&sim, "mL8="), "mL8=[ff      ]");
+    assert_eq!(line(&sim, "mR8="), "mR8=[000000ff]");
+    assert_eq!(line(&sim, "n2="), "n2=[2a5]");
+    assert_eq!(line(&sim, "z6="), "z6=[0000zz]");
+    assert_eq!(line(&sim, "m6="), "m6=[00xx3f]");
+    assert_eq!(line(&sim, "m0="), "m0=[x3f]");
+    assert_eq!(line(&sim, "zero4="), "zero4=[0000]");
+}
+
+// ------------------------------------------------------------------- G9 --
+
+const UNFORMATTED_ARGS: &str = r#"
+module tb;
+  logic [15:0] v = 16'd677;
+  logic [7:0]  b = 8'd15;
+  initial begin
+    $display("u1=", v);          // reference: "u1=  677" (default %d width 5)
+    $display("u2=x=", v, " y=", b); // reference: "u2=x=  677 y= 15"
+    $display("u3=%h", 32'hdeadbeef, v); // reference: "u3=deadbeef  677"
+  end
+endmodule
+"#;
+
+#[test]
+fn unconsumed_args_print_default_width_decimal() {
+    // §21.2.1.2: an argument not consumed by a preceding format directive
+    // prints in the task's default radix WITH the default field width —
+    // reference-validated ("  677" for a 16-bit value, not "677").
+    let sim = simulate(UNFORMATTED_ARGS, 100).expect("simulate failed");
+    assert_eq!(line(&sim, "u1="), "u1=  677");
+    assert_eq!(line(&sim, "u2="), "u2=x=  677 y= 15");
+    assert_eq!(line(&sim, "u3="), "u3=deadbeef  677");
 }
 
 // ------------------------------------------------------------------- F4 --

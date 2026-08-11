@@ -11,6 +11,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "classes/collection_of_handles_new.rs"]
+mod collection_of_handles_new;
 #[path = "classes/array_equality_class.rs"]
 mod array_equality_class;
 #[path = "classes/class_formal_typedef_widen.rs"]

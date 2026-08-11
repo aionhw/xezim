@@ -28,11 +28,11 @@
 //! Also here: `%5s` applied the field width to a string VARIABLE but dropped
 //! it for a string LITERAL.
 //!
-//! NOT changed, deliberately: radix field padding without the `0` flag
-//! (`%4h` of 8'h0f). Two commercial simulators disagree — one pads with spaces
-//! to the natural width ("  0f", pinned in `format_sibling_fixes.rs`), the
-//! other trims to the minimal form and zero-pads ("000f"). Nothing in the
-//! sweep settles it, so xezim keeps the behaviour it already had.
+//! Radix field padding without the `0` flag (`%4h` of 8'h0f): two commercial
+//! simulators disagree — space-pad to the natural width ("  0f") vs trim to
+//! the minimal form and zero-pad ("000f"). Originally left as-was; since
+//! resolved in favour of the reference simulator's minimal+zero-pad model
+//! (G8 audit fix, pinned in `format_sibling_fixes.rs`).
 
 use xezim::simulate;
 

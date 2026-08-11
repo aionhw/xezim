@@ -200,7 +200,7 @@ pub unsafe extern "C" fn xezim_jit_blocking_assign_range_dyn(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xezim_jit_load_array_elem(sim: *mut u8, name_ptr: *const u8, idx: i64) -> u64 { unsafe {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
-    let name = std::ffi::CStr::from_ptr(name_ptr as *const i8).to_string_lossy();
+    let name = std::ffi::CStr::from_ptr(name_ptr as *const std::ffi::c_char).to_string_lossy();
     sim.jit_load_array_elem(&name, idx)
 }}
 

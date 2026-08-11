@@ -1,6 +1,10 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+// Opt-in end-of-run statistics footer (`--report-stats` / XEZIM_REPORT_STATS).
+// CLI-only plumbing, so it lives in the binary, not the library.
+mod report;
+
 // The `#[global_allocator]` lives in `xezim-core/src/lib.rs`, not here: Rust
 // allows only one per binary, and declaring it in the shared library covers the
 // test binaries and xezim-b as well as this CLI.
@@ -114,6 +118,7 @@ fn print_usage() {
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!("  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)");
     eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug)");
+    eprintln!("  --error-exit     Exit nonzero if any $error was reported ($fatal always does)");
     eprintln!("  --verbose        Per-file compile progress: each file as it is parsed and the");
     eprintln!("                   definitions (modules/interfaces/packages/...) it contributed");
     eprintln!("  --dump-files-list  Print the full resolved file list (after -f expansion):");
@@ -148,6 +153,10 @@ fn print_usage() {
     eprintln!("                     overrides a `timeunit`/`timeprecision` decl or an active `timescale.");
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
     eprintln!("                   n>=2 offloads stdout writes to a background thread.");
+    eprintln!("  --report-stats[=json]  Print an end-of-run statistics footer on stderr");
+    eprintln!("                   (human text; '=json' emits one JSON line instead). Off by");
+    eprintln!("                   default. XEZIM_REPORT_STATS=1|json enables it too; the");
+    eprintln!("                   flag wins over the environment.");
     eprintln!("  --cache          Enable the EXPERIMENTAL warm-start design cache (off by default;");
     eprintln!("                   also enabled by XEZIM_ENABLE_CACHE=1 or --cache-dir).");
     eprintln!("  --cache-dir <dir> Store/reuse content-addressed elaborated designs (implies --cache)");
@@ -887,6 +896,37 @@ fn print_resource_usage(wall_start: std::time::Instant) {
     }
 }
 
+/// Opt-in end-of-run statistics footer (`--report-stats` / XEZIM_REPORT_STATS).
+/// A no-op when the mode is Off, so a default run's output is byte-identical;
+/// when enabled the footer goes to stderr, leaving stdout (including the
+/// `Simulation finished at time ...` line scripts grep) untouched.
+/// `sim_time_ns` is None for runs that never simulate (--compile).
+fn emit_run_stats(
+    mode: report::ReportMode,
+    wall_start: std::time::Instant,
+    sim_time_ns: Option<u64>,
+) {
+    if mode == report::ReportMode::Off {
+        return;
+    }
+    let (cpu_user_ms, cpu_sys_ms) = report::cpu_times_ms();
+    let stats = report::RunStats {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        git_rev: env!("XEZIM_GIT_HASH").to_string(),
+        wall_ms: wall_start.elapsed().as_millis() as u64,
+        cpu_user_ms,
+        cpu_sys_ms,
+        peak_rss_kb: report::peak_rss_kb(),
+        hostname: report::hostname(),
+        sim_time_ns,
+    };
+    match mode {
+        report::ReportMode::Off => {}
+        report::ReportMode::Human => eprint!("{}", report::render_human(&stats)),
+        report::ReportMode::Json => eprint!("{}", report::render_json(&stats)),
+    }
+}
+
 /// Design units DECLARED at the top level of one preprocessed file, plus every
 /// identifier the file mentions. Both come from one lexer pass, so comments and
 /// string literals can never contribute a false name.
@@ -1150,6 +1190,9 @@ fn main() {
     }
     let mut mode: Mode = Mode::Simulate;
     let mut mode_explicit = false;
+    // §20.10 / issue #107: opt-in promotion of `$error` occurrences to a
+    // failing exit status. `$fatal` always fails regardless of this flag.
+    let mut error_exit = false;
     let mut sv2023_mode = true;
     let mut strict_checks = true;
     let mut source_delay_select: u8 = 1;
@@ -1216,6 +1259,9 @@ fn main() {
     let mut pdes_c910_stub: Option<String> = None;
     let mut pdes_c910_ticks: u64 = 100;
     let mut multikernel_scope: Option<String> = None;
+    // `--report-stats[=json]`; None = no flag given, fall back to the
+    // XEZIM_REPORT_STATS environment switch (resolved after the loop).
+    let mut report_stats_cli: Option<report::ReportMode> = None;
 
     let mut include_dirs: Vec<String> = Vec::new();
     let mut defines: Vec<(String, Option<String>)> = Vec::new();
@@ -1415,6 +1461,9 @@ fn main() {
                     eprintln!("Error: -v requires a library file name");
                     std::process::exit(1);
                 }
+            }
+            "--error-exit" => {
+                error_exit = true;
             }
             "--verbose" => {
                 verbose = true;
@@ -1689,6 +1738,18 @@ fn main() {
             _ if arg.starts_with("--threads=") => {
                 threads = arg["--threads=".len()..].parse().unwrap_or(1).max(1);
             }
+            "--report-stats" => {
+                report_stats_cli = Some(report::ReportMode::Human);
+            }
+            _ if arg.starts_with("--report-stats=") => {
+                let fmt = &arg["--report-stats=".len()..];
+                if fmt == "json" {
+                    report_stats_cli = Some(report::ReportMode::Json);
+                } else {
+                    eprintln!("Error: --report-stats={}: unknown format (expected 'json')", fmt);
+                    std::process::exit(1);
+                }
+            }
             "--cache-dir" => {
                 i += 1;
                 if i >= args.len() {
@@ -1880,6 +1941,12 @@ fn main() {
         }
         i += 1;
     }
+
+    // Opt-in statistics footer: the CLI flag wins over XEZIM_REPORT_STATS.
+    // Off (the default) is fully inert — nothing is collected or printed.
+    let report_mode = report_stats_cli.unwrap_or_else(|| {
+        report::mode_from_env_value(env::var("XEZIM_REPORT_STATS").ok().as_deref())
+    });
 
     if verbose {
         xezim::set_compile_verbose(true);
@@ -2081,8 +2148,15 @@ suppressed but the explicit SDF annotation still applies."
                         if sim.finished {
                             println!("($finish called)");
                         }
+                        // Footer before the exit-status checks so it also
+                        // appears for runs that end with a nonzero status.
+                        emit_run_stats(report_mode, compile_wall_start, Some(sim.time));
                         if sim.stuck_clock_aborted {
                             std::process::exit(3);
+                        }
+                        let code = exit_status_for_severities(&sim, error_exit);
+                        if code != 0 {
+                            std::process::exit(code);
                         }
                         return;
                     }
@@ -2397,6 +2471,7 @@ suppressed but the explicit SDF annotation still applies."
                 }
                 print_design_summary(&_defs, &elab);
                 print_resource_usage(compile_wall_start);
+                emit_run_stats(report_mode, compile_wall_start, None);
                 // §6.21: keep compiled artifacts consistent with the simulate
                 // path — re-issue static initializers that call simulation-time
                 // system functions as time-0 assignments (issue #26).
@@ -2492,10 +2567,17 @@ suppressed but the explicit SDF annotation still applies."
             if sim.finished {
                 println!("($finish called)");
             }
+            // Footer before the exit-status checks so it also appears for
+            // runs that end with a nonzero status.
+            emit_run_stats(report_mode, compile_wall_start, Some(sim.time));
             if sim.stuck_clock_aborted {
                 // Dead-clock watchdog aborted (XEZIM_STUCK_CLOCK=abort): fail
                 // fast so CI/regressions surface the hang instead of timing out.
                 std::process::exit(3);
+            }
+            let code = exit_status_for_severities(&sim, error_exit);
+            if code != 0 {
+                std::process::exit(code);
             }
         }
         Err(e) => {
@@ -2503,6 +2585,21 @@ suppressed but the explicit SDF annotation still applies."
             std::process::exit(1);
         }
     }
+}
+
+/// §20.10: translate end-of-run severity state into a process exit status.
+/// `$fatal` must never exit 0 — its finish_number is a diagnostics level, not
+/// a success code, so any `$fatal` fails the run. `$error` only fails when the
+/// user opts in with `--error-exit` (matching the "promote errors" switch other
+/// simulators provide), so existing flows that tolerate errors keep working.
+fn exit_status_for_severities(sim: &xezim::compiler::Simulator, error_exit: bool) -> i32 {
+    if sim.saw_fatal {
+        return 1;
+    }
+    if error_exit && sim.error_count > 0 {
+        return 1;
+    }
+    0
 }
 
 fn byte_to_line_col(source: &str, byte_offset: usize) -> (usize, usize) {

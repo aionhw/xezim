@@ -2328,6 +2328,7 @@ struct ProcessContext {
     // statement stream — see `task_cleanup` and `StatementKind::ScopePop`).
     local_iface_aliases: Vec<HashMap<String, String>>,
     ref_binding_stack: Vec<HashMap<String, Expression>>,
+    ref_alias_stack: Vec<HashMap<String, Expression>>,
     queue_frame_saves: Vec<HashMap<String, QueueLocalSave>>,
     task_cleanup: Vec<TaskCleanup>,
     // Per-call-frame map of a local dynamic-array/queue/assoc LOCAL's bare
@@ -2890,6 +2891,12 @@ pub struct Simulator {
     pub output: Vec<SimOutput>,
     capture_output: bool,
     pub finished: bool,
+    /// §20.10: a `$fatal` executed — the run must not exit 0.
+    pub saw_fatal: bool,
+    /// `$fatal`'s finish_number (0/1/2), for the exit status.
+    pub fatal_finish_number: Option<i32>,
+    /// Count of `$error` occurrences (see `--error-exit`).
+    pub error_count: u64,
     /// Set when the dead-clock watchdog aborted the run (XEZIM_STUCK_CLOCK=abort).
     /// The CLI reports a non-zero exit so CI/regressions fail fast.
     pub stuck_clock_aborted: bool,
@@ -2992,6 +2999,9 @@ pub struct Simulator {
     /// AT the edge time drives at edge+skew (§14.16.1); between edges it waits
     /// for the next edge.
     clocking_last_edge: HashMap<String, u64>,
+    /// The `default clocking` block's real name — `##0` consults its
+    /// `clocking_last_edge` entry to decide "already at the clocking event".
+    default_clocking_cb: Option<String>,
     /// LRM §14.4 `#1step` input skew — Preponed (slot-entry) value of every
     /// clocking-block INPUT signal, keyed by signal name. Captured at the top
     /// of each time slot BEFORE the active/NBA regions run (same point as
@@ -3670,6 +3680,15 @@ pub struct Simulator {
     /// SV-2023: redirected lvalues for `ref` formal parameters during a call.
     /// Top-of-stack scope is consulted when assigning to a known formal name.
     ref_binding_stack: Vec<HashMap<String, Expression>>,
+    /// §13.5.2 TRUE ALIASING for the subset of `ref` actuals whose storage is
+    /// module-visible (a plain variable, resolvable independent of the caller
+    /// frame). Reads of the formal re-read the actual and writes write through
+    /// IMMEDIATELY — a parallel process observing the actual mid-call sees the
+    /// callee's writes, and no return copy-out clobbers writes the observer
+    /// made during the call. Actuals that are caller-frame locals or aggregate
+    /// elements keep the legacy copy-in/copy-out path (entry absent here).
+    /// Pushed/popped in lockstep with `ref_binding_stack`.
+    ref_alias_stack: Vec<HashMap<String, Expression>>,
     /// Deferred teardown for inlined blocking task/method calls (LIFO). Each
     /// `ScopePop` sentinel pops and replays the top entry. Per-process (carried
     /// in ProcessContext across suspension).
@@ -6355,6 +6374,9 @@ impl Simulator {
             output: Vec::new(),
             capture_output: true,
             finished: false,
+            saw_fatal: false,
+            fatal_finish_number: None,
+            error_count: 0,
             stuck_clock_aborted: false,
             compiled: false,
             monitor: None,
@@ -6380,6 +6402,7 @@ impl Simulator {
             clocking_in_skew: HashMap::default(),
             clocking_sig_in_skew: HashMap::default(),
             clocking_last_edge: HashMap::default(),
+            default_clocking_cb: None,
             clocking_preponed: HashMap::default(),
             deferred_clocking_conts: Vec::new(),
             pending_reactive: Vec::new(),
@@ -6553,6 +6576,7 @@ impl Simulator {
             await_waiters: Vec::new(),
             auto_loop_vars: Vec::new(),
             ref_binding_stack: Vec::new(),
+            ref_alias_stack: Vec::new(),
             task_cleanup: Vec::new(),
             condition_waiters: Vec::new(),
             inactive_queue: Vec::new(),
@@ -9684,7 +9708,8 @@ impl Simulator {
         // after the loop, because arg_refs holds references into their Box
         // contents. Pre-allocate capacity to prevent mid-loop reallocation.
         let mut ptr_vals: Vec<Box<*mut c_void>> = Vec::with_capacity(arg_kinds.len());
-        let mut string_ptr_cells: Vec<Box<*const i8>> = Vec::with_capacity(arg_kinds.len());
+        let mut string_ptr_cells: Vec<Box<*const std::ffi::c_char>> =
+            Vec::with_capacity(arg_kinds.len());
         let mut open_i32_vals: Vec<Vec<i32>> = Vec::with_capacity(arg_kinds.len());
         let mut cstrings: Vec<CString> = Vec::with_capacity(arg_kinds.len());
         let mut logic_aval: Vec<Vec<u32>> = Vec::with_capacity(arg_kinds.len());
@@ -9767,7 +9792,7 @@ impl Simulator {
                             }
                         })
                         .unwrap_or_default();
-                    let init_ptr: *const i8 = if init_s.is_empty() {
+                    let init_ptr: *const std::ffi::c_char = if init_s.is_empty() {
                         std::ptr::null()
                     } else {
                         let c = CString::new(init_s).unwrap_or_else(|_| CString::new("").unwrap());
@@ -9777,7 +9802,11 @@ impl Simulator {
                     };
                     let cell = Box::new(init_ptr);
                     let p =
-                        Box::new((&*cell as *const *const i8 as *mut *const i8).cast::<c_void>());
+                        Box::new(
+                            (&*cell as *const *const std::ffi::c_char
+                                as *mut *const std::ffi::c_char)
+                                .cast::<c_void>(),
+                        );
                     string_ptr_cells.push(cell);
                     ptr_vals.push(p);
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
@@ -9995,7 +10024,7 @@ impl Simulator {
                 Value::from_u64(rv as usize as u64, 64)
             }
             DpiRetKind::String => {
-                let rv: *const i8 = unsafe { cif.call(fn_ptr, &arg_refs) };
+                let rv: *const std::ffi::c_char = unsafe { cif.call(fn_ptr, &arg_refs) };
                 if rv.is_null() {
                     Value::from_string("")
                 } else {
@@ -10157,6 +10186,12 @@ impl Simulator {
                         .insert("__xz_default_clocking".to_string(), (clk.clone(), sigs.clone()));
                     self.clocking_edge
                         .insert("__xz_default_clocking".to_string(), edge);
+                    // `##0` sync marker resolves through the same lookups.
+                    self.clocking_meta
+                        .insert("__xz_default_clocking0".to_string(), (clk.clone(), sigs.clone()));
+                    self.clocking_edge
+                        .insert("__xz_default_clocking0".to_string(), edge);
+                    self.default_clocking_cb = Some(cb_name.clone());
                 }
                 self.clocking_meta.insert(cb_name.clone(), (clk, sigs));
                 self.clocking_edge.insert(cb_name.clone(), edge);
@@ -10255,14 +10290,19 @@ impl Simulator {
         if !self.clocking_meta.contains_key("__xz_default_clocking")
             && self.clocking_meta.len() == 1
         {
+            self.default_clocking_cb = self.clocking_meta.keys().next().cloned();
             if let Some(v) = self.clocking_meta.values().next().cloned() {
                 self.clocking_meta
-                    .insert("__xz_default_clocking".to_string(), v);
+                    .insert("__xz_default_clocking".to_string(), v.clone());
+                self.clocking_meta
+                    .insert("__xz_default_clocking0".to_string(), v);
             }
             if let Some((k, e)) = self.clocking_edge.iter().next().map(|(k, e)| (k.clone(), *e)) {
                 let _ = k;
                 self.clocking_edge
                     .insert("__xz_default_clocking".to_string(), e);
+                self.clocking_edge
+                    .insert("__xz_default_clocking0".to_string(), e);
             }
         }
         // Seed the runtime string_signals set from the elab-time map so that
@@ -22952,6 +22992,7 @@ impl Simulator {
         match event {
             EventControl::Identifier(id) => {
                 id.name == "__xz_default_clocking"
+                    || id.name == "__xz_default_clocking0"
                     || self.clocking_meta.contains_key(&id.name)
             }
             // The bare `@cb` form (a HierIdentifier) is a clocking event too,
@@ -23034,6 +23075,37 @@ impl Simulator {
             if !self.is_pid_suspended(pid) {
                 self.child_finished(pid);
             }
+        }
+    }
+
+    /// Settle after a procedural blocking write (outside edge blocks).
+    ///
+    /// §5.5 + §10.3 say the driven continuous assignments' re-evaluation is a
+    /// separate ACTIVE-region update event: the writing process does NOT
+    /// yield, so its own later reads see PRE-update net values until it hits a
+    /// delay/wait. The reference simulator does exactly that
+    /// (`a=5; s1=b;` reads the OLD b). xezim settles EAGERLY here, so such a
+    /// read observes the propagated value one statement early — a real
+    /// divergence for testbench/BFM code that drives a signal and immediately
+    /// reads a continuous-assign-derived handshake.
+    ///
+    /// Eager remains the DEFAULT: switching wholesale also changes t=0
+    /// gate/UDP initialization ordering, which regressed two
+    /// reference-validated traces (`udp_primitives::edge_shorthands` q2 at
+    /// t=0, `dep_reg_entry_synth`). The correct end state is lazy propagation
+    /// with t=0 initialization kept eager; until that separation exists,
+    /// `XEZIM_LAZY_PROC_SETTLE=1` opts into the LRM/reference ordering so a
+    /// design that depends on it can be run (and diffed) without a rebuild.
+    fn settle_after_proc_write(&mut self) {
+        if self.in_edge_block {
+            return;
+        }
+        static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let lazy = *LAZY.get_or_init(|| {
+            std::env::var("XEZIM_LAZY_PROC_SETTLE").ok().as_deref() == Some("1")
+        });
+        if !lazy {
+            self.settle_combinatorial();
         }
     }
 
@@ -23992,6 +24064,7 @@ impl Simulator {
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
             // region even when no NBA DATA is queued.
             || !self.pending_nba_triggers.is_empty()
+            || !self.pending_nba_instance_triggers.is_empty()
             || self.delayed_nba_due()
         {
             self.apply_nba();
@@ -24097,6 +24170,7 @@ impl Simulator {
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
             // region even when no NBA DATA is queued.
             || !self.pending_nba_triggers.is_empty()
+            || !self.pending_nba_instance_triggers.is_empty()
             || self.delayed_nba_due()
         {
                 self.apply_nba();
@@ -25834,6 +25908,7 @@ impl Simulator {
             return_flag: self.return_flag,
             local_iface_aliases: self.local_iface_aliases.clone(),
             ref_binding_stack: self.ref_binding_stack.clone(),
+            ref_alias_stack: self.ref_alias_stack.clone(),
             queue_frame_saves: self.queue_frame_saves.clone(),
             task_cleanup: self.task_cleanup.clone(),
             local_dyn: self.local_dyn.clone(),
@@ -25857,6 +25932,7 @@ impl Simulator {
             return_flag: std::mem::replace(&mut self.return_flag, false),
             local_iface_aliases: std::mem::take(&mut self.local_iface_aliases),
             ref_binding_stack: std::mem::take(&mut self.ref_binding_stack),
+            ref_alias_stack: std::mem::take(&mut self.ref_alias_stack),
             queue_frame_saves: std::mem::take(&mut self.queue_frame_saves),
             task_cleanup: std::mem::take(&mut self.task_cleanup),
             local_dyn: std::mem::take(&mut self.local_dyn),
@@ -25874,6 +25950,7 @@ impl Simulator {
         self.return_flag = ctx.return_flag;
         self.local_iface_aliases = ctx.local_iface_aliases;
         self.ref_binding_stack = ctx.ref_binding_stack;
+        self.ref_alias_stack = ctx.ref_alias_stack;
         self.queue_frame_saves = ctx.queue_frame_saves;
         self.task_cleanup = ctx.task_cleanup;
         self.local_dyn = ctx.local_dyn;
@@ -26031,6 +26108,7 @@ impl Simulator {
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
             // region even when no NBA DATA is queued.
             || !self.pending_nba_triggers.is_empty()
+            || !self.pending_nba_instance_triggers.is_empty()
             || self.delayed_nba_due()
         {
                 self.apply_nba();
@@ -27489,6 +27567,27 @@ impl Simulator {
                         return;
                     }
                     TimingControl::Event(event) => {
+                        // §14.11 `##0`: SYNCHRONIZE to the default clocking
+                        // event — a no-op when the process is already
+                        // executing in the time slot of that event (its edge
+                        // fired at the current time); otherwise park exactly
+                        // like `@(__xz_default_clocking)`.
+                        if let EventControl::Identifier(id) = event {
+                            if id.name == "__xz_default_clocking0"
+                                && self
+                                    .default_clocking_cb
+                                    .as_ref()
+                                    .and_then(|cb| self.clocking_last_edge.get(cb))
+                                    == Some(&self.time)
+                            {
+                                // The loop increments `i` at its bottom; a bare
+                                // `continue` would re-execute this statement
+                                // forever.
+                                self.exec_statement(body);
+                                i += 1;
+                                continue;
+                            }
+                        }
                         // Suspend process until the event fires
                         // Class-field named event (`@m_event` inside a method
                         // on `this`): park on the per-instance event identity.
@@ -27517,20 +27616,15 @@ impl Simulator {
                         }
                         // `@(h.ce)`: a class-property event reached through a
                         // handle from OUTSIDE the class. `resolve_this_event_field`
-                        // above only covers a bare field on `this`.
+                        // above only covers a bare field on `this`; the general
+                        // resolver adds receivers with runtime selects
+                        // (`@(m_events[obj].all_dropped)` — the UVM objection
+                        // wait, #109) and chained handles.
                         if let Some(expr) = Self::event_control_single_expr(event) {
-                            let mut key = self.expr_handle_event_field(&expr);
-                            // Fallback: an event member reached through an
-                            // arbitrary receiver-expression that evaluates to a
-                            // class handle (e.g. an associative-array element:
-                            // `@(m_events[k].all_dropped)`). `expr_handle_event_field`
-                            // only accepts a plain `h.ce` / `this.ce` receiver;
-                            // the array-index base yields no sensitivity and the
-                            // `@` did not suspend (uvm_phase phasing livelock).
-                            if key.is_none() {
-                                key = self.expr_receiver_event_field(&expr);
-                            }
-                            if let Some(key) = key {
+                            if let Some(key) = self
+                                .expr_handle_event_field(&expr)
+                                .or_else(|| self.expr_instance_event_field_general(&expr))
+                            {
                                 let cont = vec![*body.clone()];
                                 // Chain the caller's tail rather than copying it.
                                 let cont = pc.pushed(cont, pc.start + i + 1);
@@ -30458,6 +30552,12 @@ impl Simulator {
             }
         }
         std::mem::swap(&mut self.event_waiters, &mut self.event_waiters_swap);
+        // Within-region process resumption order is LRM-indeterminate
+        // (§4.7), but the reference simulator wakes the LAST-armed waiter
+        // first — and this campaign matches the reference's observable
+        // ordering so differential runs stay comparable. Registration order
+        // is FIFO; reverse to LIFO at the single hand-off point.
+        triggered_conts.reverse();
         triggered_conts
     }
 
@@ -35146,11 +35246,18 @@ impl Simulator {
         // property splices the element's bits. Without this the write fell
         // through to a bit-select path that dropped it entirely.
         if let ExprKind::Index { expr, index } = &lhs.kind {
-            if matches!(&expr.kind,
-                ExprKind::MemberAccess { .. } | ExprKind::Ident(_) | ExprKind::This)
+            // `class_packed_elem_ref` takes references and bails immediately on
+            // an empty heap, so the old `expr.clone()` / `index.clone()` deep-
+            // copied two expression trees on EVERY indexed write — including
+            // designs with no classes at all, where the callee then returned
+            // None. That was pure allocator traffic on the hot array-store path
+            // (a 256K-element memory fill pays it 256K times). Pass the borrows
+            // and skip the call entirely when no objects exist.
+            if !self.no_class_objects()
+                && matches!(&expr.kind,
+                    ExprKind::MemberAccess { .. } | ExprKind::Ident(_) | ExprKind::This)
             {
-                let (base, idx) = (expr.clone(), index.clone());
-                if let Some(r) = self.class_packed_elem_ref(&base, &idx) {
+                if let Some(r) = self.class_packed_elem_ref(expr, index) {
                     return self.write_class_agg(&r, val);
                 }
             }
@@ -35195,6 +35302,43 @@ impl Simulator {
                             }
                         }
                         return self.class_static_set(&cn, &prop, v);
+                    }
+                }
+            }
+        }
+        // §13.5.2: a write to an ALIASED `ref` formal writes THROUGH to the
+        // caller's storage immediately, so concurrent observers of the actual
+        // see it mid-call (see `ref_alias_stack`). The storage is written BY
+        // NAME — evaluating the bound ident would hit the callee frame's own
+        // copy when the formal is named like its actual. The local copy is
+        // refreshed too, keeping any unredirected read path coherent.
+        if !self.ref_alias_stack.is_empty() {
+            if let ExprKind::Ident(h) = &lhs.kind {
+                if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    let fname = h.path[0].name.name.as_str();
+                    if let Some(storage) = self
+                        .ref_alias_stack
+                        .last()
+                        .and_then(|m| m.get(fname))
+                        .and_then(|bound| match &bound.kind {
+                            ExprKind::Ident(bh) => Some(bh.path[0].name.name.clone()),
+                            _ => None,
+                        })
+                    {
+                        let fname = fname.to_string();
+                        if let Some(frame) = self.local_stack.last_mut() {
+                            if let Some(slot) = frame.get_mut(&fname) {
+                                let fitted = if !slot.is_real && !val.is_real && slot.width > 0 {
+                                    val.resize(slot.width)
+                                } else {
+                                    val.clone()
+                                };
+                                *slot = fitted;
+                            }
+                        }
+                        let prev = self.get_signal_value_by_name(&storage);
+                        self.set_signal_value_by_name(&storage, val.clone());
+                        return prev.as_ref() != self.get_signal_value_by_name(&storage).as_ref();
                     }
                 }
             }
@@ -35744,6 +35888,46 @@ impl Simulator {
                 changed
             }
             ExprKind::Index { expr, index } => {
+                // GitHub #86 fast path: `mem[i] = v` on a module-scope 1-D
+                // FIXED unpacked array resolves to a contiguous signal id with
+                // no string work (`array_first_id`), skipping the guard chain
+                // below (packed-struct slice, class ND, queue, assoc) that a
+                // memory fill paid per element (~2 µs each, all of it name
+                // formatting + hashing). Guards: no live call frames (a
+                // task/function local could shadow the name), and the name
+                // must not be a queue/dynamic/associative collection —
+                // `module.arrays` gives those a fake 0..63 backing range, and
+                // their writes need the collection semantics below.
+                if self.local_stack.is_empty() && self.no_class_objects() {
+                    if let ExprKind::Ident(h) = &expr.kind {
+                        if h.path.iter().all(|seg| seg.selects.is_empty()) {
+                            let name = self.resolve_hier_name(h);
+                            if let Some(&(first_id, lo, hi)) =
+                                self.array_first_id.get(name.as_str())
+                            {
+                                if !self.module.queue_vars.contains(&name)
+                                    && !self.module.dynamic_arrays.contains(&name)
+                                    && !self.module.associative_arrays.contains_key(&name)
+                                    // string elements are DYNAMIC-length; the
+                                    // resize-to-declared-width below would
+                                    // truncate them (a 200-char element came
+                                    // back 16 chars) — the general path stores
+                                    // strings unresized.
+                                    && !self.module.string_signals.contains(&name)
+                                {
+                                    let idx =
+                                        self.eval_expr(index).to_i64().unwrap_or(i64::MIN);
+                                    if idx >= lo && idx <= hi {
+                                        let id = first_id + (idx - lo) as usize;
+                                        return self.fast_signal_write_id(id, val);
+                                    }
+                                    // out of range: fall through to the general
+                                    // path for its existing diagnostics/no-op.
+                                }
+                            }
+                        }
+                    }
+                }
                 // §7.4.2: `arr[i].field[k] = v` where `arr` is a PACKED array
                 // of packed structs. `arr[i]` is not a signal of its own — it
                 // is a slice of one backing vector — so the write must splice
@@ -35778,7 +35962,7 @@ impl Simulator {
                 // element k of the queue `q[i]` (§7.4.5), not a bit of a scalar.
                 // §7.4.2: a write to an N-D fixed-array class-property
                 // element lands in its per-instance cell, like the read.
-                if !self.heap.is_empty() {
+                if !self.no_class_objects() {
                     if let Some(nm) = self.class_nd_elem_name(expr, index) {
                         let prev = self.get_signal_value_by_name(&nm);
                         let fitted = match prev.as_ref() {
@@ -38297,7 +38481,7 @@ impl Simulator {
         if matches!(
             expr.kind,
             ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
-        ) && !self.heap.is_empty()
+        ) && !self.no_class_objects()
             && Self::chain_maybe_class_agg(expr, self.this_stack.last().copied().flatten().is_some())
         {
             if let Some(r) = self.class_agg_member(expr) {
@@ -38308,7 +38492,7 @@ impl Simulator {
         // `return s;` from a method, `v = obj.s;`. Its members are per-instance
         // cells with no container, so the lookups further down returned the
         // property's unused scalar cell (zero) instead of the members.
-        if !self.heap.is_empty() {
+        if !self.no_class_objects() {
             if let ExprKind::Ident(h) = &expr.kind {
                 if (h.path.len() >= 2 || self.this_stack.last().copied().flatten().is_some())
                     && h.path.iter().all(|p| p.selects.is_empty())
@@ -38455,7 +38639,7 @@ impl Simulator {
                 // §18.4: `<obj>.<agg_prop>.<member>` / `<agg_prop>.<member>`
                 // that parsed as a FLAT hier ident — same aggregate-class-
                 // property storage as the `MemberAccess` shape (see there).
-                if hier.path.len() >= 2 && !self.heap.is_empty() {
+                if hier.path.len() >= 2 && !self.no_class_objects() {
                     if let Some(r) = self.class_agg_member(expr) {
                         return self.read_class_agg(&r);
                     }
@@ -38595,6 +38779,25 @@ impl Simulator {
                     }
                     if name == "UVM_PASSIVE" {
                         return Value::from_u64(0, 32);
+                    }
+                    // §13.5.2: an ALIASED `ref` formal reads the caller's
+                    // storage NOW — external writes made while this call was
+                    // suspended must be visible (see `ref_alias_stack`). The
+                    // storage is read BY NAME, not by re-evaluating the ident:
+                    // a formal named like its actual (`task t(ref int foo);
+                    // t(foo)`) would otherwise hit the callee frame's own
+                    // copy (or recurse into this redirect).
+                    if let Some(bound) = self
+                        .ref_alias_stack
+                        .last()
+                        .and_then(|m| m.get(name.as_str()))
+                    {
+                        if let ExprKind::Ident(bh) = &bound.kind {
+                            let storage = bh.path[0].name.name.clone();
+                            if let Some(v) = self.get_signal_value_by_name(&storage) {
+                                return v;
+                            }
+                        }
                     }
                     if let Some(locals) = self.local_stack.last() {
                         if let Some(val) = locals.get(name) {
@@ -39995,7 +40198,7 @@ impl Simulator {
                 // §7.4.1: `<obj>.<prop>[i]` on a multi-dimensional PACKED array
                 // class property selects an ELEMENT, not a bit. Gated on the
                 // receiver's shape so nothing else re-evaluates `expr`.
-                if !self.heap.is_empty()
+                if !self.no_class_objects()
                     && matches!(&expr.kind,
                         ExprKind::MemberAccess { .. }
                             | ExprKind::Ident(_)
@@ -40088,7 +40291,7 @@ impl Simulator {
                 }
                 // §7.4.2: an element of an N-D fixed-array CLASS property —
                 // `obj.m[i][j]` — resolves to its per-instance cell.
-                if !self.heap.is_empty() {
+                if !self.no_class_objects() {
                     if let Some(nm) = self.class_nd_elem_name(expr, index) {
                         if let Some(v) = self.get_signal_value_by_name(&nm) {
                             return v;
@@ -43987,9 +44190,7 @@ impl Simulator {
                         };
                         let val = self.eval_expr(&new_rhs);
                         self.assign_value(&new_lhs, &val);
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -44026,9 +44227,7 @@ impl Simulator {
                                 }
                         };
                     if spread {
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -44039,9 +44238,7 @@ impl Simulator {
                 // the lvalue is not a registered packed struct.
                 if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
                     if self.try_assign_packed_struct_pattern(lvalue, items) {
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                     // §10.9.2: the same per-ELEMENT expansion the continuous
@@ -44051,9 +44248,7 @@ impl Simulator {
                     // own widths (one bit) instead of one item per element.
                     if let Some(v) = self.packed_pattern_for_lhs(lvalue, items) {
                         self.assign_value(lvalue, &v);
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -44239,9 +44434,7 @@ impl Simulator {
                                 }
                             }
                             self.set_queue_size(&name, n);
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                     }
@@ -44280,9 +44473,7 @@ impl Simulator {
                             });
                             if has_dyn && self.struct_storage_exists(&src, &su) {
                                 self.copy_unpacked_struct(&dst, &src, &su);
-                                if !self.in_edge_block {
-                                    self.settle_combinatorial();
-                                }
+                                self.settle_after_proc_write();
                                 return;
                             }
                         }
@@ -44301,9 +44492,7 @@ impl Simulator {
                                 self.copy_unpacked_struct(&dst, &src, &su);
                             }
                             self.eval_builtin_method(&obj, &pop, &[]);
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                     }
@@ -44314,9 +44503,7 @@ impl Simulator {
                 // each side is read/written by its (working) field path — the
                 // RHS is never materialized as a single (broken) struct Value.
                 if self.try_decompose_struct_class_prop_assign(lvalue, rvalue).is_some() {
-                    if !self.in_edge_block {
-                        self.settle_combinatorial();
-                    }
+                    self.settle_after_proc_write();
                     return;
                 }
                 // IEEE 1800-2023 §7.2: a whole unpacked-struct CLASS
@@ -44369,9 +44556,7 @@ impl Simulator {
                                 if let Some(src) = self.flat_member_name(rvalue) {
                                     if src != dst && self.struct_storage_exists(&src, &su) {
                                         self.copy_unpacked_struct(&dst, &src, &su.clone());
-                                        if !self.in_edge_block {
-                                            self.settle_combinatorial();
-                                        }
+                                        self.settle_after_proc_write();
                                         return;
                                     }
                                 }
@@ -44402,9 +44587,7 @@ impl Simulator {
                                 {
                                     let v = self.eval_expr(rvalue);
                                     if self.spread_into_unpacked_struct(&dst, &su.clone(), &v) {
-                                        if !self.in_edge_block {
-                                            self.settle_combinatorial();
-                                        }
+                                        self.settle_after_proc_write();
                                         return;
                                     }
                                 }
@@ -44672,9 +44855,7 @@ impl Simulator {
                                 );
                             }
                             self.set_queue_size(&lname, size);
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                             }
                         }
@@ -44711,9 +44892,7 @@ impl Simulator {
                             let w = self.lookup_signal_width(&lname).unwrap_or(1);
                             self.set_signal_value_by_name(&lname, Value::zero(w));
                         }
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -44775,9 +44954,7 @@ impl Simulator {
                         } else {
                             self.assign_value(lvalue, &sval);
                         }
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -44789,9 +44966,7 @@ impl Simulator {
                     if self.expr_assoc_name(base).is_some() {
                         let v = self.eval_expr(rvalue);
                         self.assign_value(lvalue, &v);
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -44921,9 +45096,7 @@ impl Simulator {
                                             .unwrap_or(Value::zero(1));
                                         self.set_signal_value_by_name(&lp, v);
                                     }
-                                    if !self.in_edge_block {
-                                        self.settle_combinatorial();
-                                    }
+                                    self.settle_after_proc_write();
                                     return;
                                 }
                             }
@@ -44968,9 +45141,7 @@ impl Simulator {
                                 self.set_signal_value_by_name(&ename, piece.resize(elem_w));
                                 self.widths.insert(ename, elem_w);
                             }
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                     }
@@ -45109,9 +45280,7 @@ impl Simulator {
                             msb = lo;
                         }
                     }
-                    if !self.in_edge_block {
-                        self.settle_combinatorial();
-                    }
+                    self.settle_after_proc_write();
                     return;
                 }
                 // Handle array locator methods with `with` clause: qs = arr.find with (filter)
@@ -45131,9 +45300,7 @@ impl Simulator {
                             iter_name.as_deref(),
                         );
                         self.materialize_locator(&lname, &arr_name, &mname, &idxs);
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -45271,9 +45438,7 @@ impl Simulator {
                                         self.set_queue_size(&lname, results.len() as u64);
                                     }
                                 }
-                                if !self.in_edge_block {
-                                    self.settle_combinatorial();
-                                }
+                                self.settle_after_proc_write();
                                 return;
                             }
                         }
@@ -45383,9 +45548,7 @@ impl Simulator {
                                 let handle = self.instantiate_class(&class_def, ctor_args);
                                 self.current_spec = saved_spec;
                                 self.assign_value(lvalue, &handle.resize(w));
-                                if !self.in_edge_block {
-                                    self.settle_combinatorial();
-                                }
+                                self.settle_after_proc_write();
                                 return;
                             }
                         }
@@ -45409,9 +45572,7 @@ impl Simulator {
                                 ta_cloned.as_deref(),
                             );
                             self.assign_value(lvalue, &handle.resize(w));
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                         // Bare `cg c1 = new;` / `cg c1 = new();` —
@@ -45421,9 +45582,7 @@ impl Simulator {
                         if let Some(cg_def) = self.module.covergroups.get(&tname).cloned() {
                             let handle = self.instantiate_covergroup(&cg_def, ctor_args);
                             self.assign_value(lvalue, &handle.resize(w));
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                     }
@@ -45549,9 +45708,7 @@ impl Simulator {
                                             self.set_signal_value_by_name(&dotted, fv);
                                         }
                                     }
-                                    if !self.in_edge_block {
-                                        self.settle_combinatorial();
-                                    }
+                                    self.settle_after_proc_write();
                                     return;
                                 }
                             }
@@ -45595,9 +45752,7 @@ impl Simulator {
                                     lvalue,
                                     &Value::from_u64(handle as u64, 32).resize(w),
                                 );
-                                if !self.in_edge_block {
-                                    self.settle_combinatorial();
-                                }
+                                self.settle_after_proc_write();
                                 return;
                             }
                             // Copy constructor `new <obj>` (SV 8.13): a single
@@ -45628,9 +45783,7 @@ impl Simulator {
                                     if let Some(Some(_)) = self.heap.get(src_h) {
                                         let h = self.copy_construct(src_h);
                                         self.assign_value(lvalue, &h.resize(w));
-                                        if !self.in_edge_block {
-                                            self.settle_combinatorial();
-                                        }
+                                        self.settle_after_proc_write();
                                         return;
                                     }
                                 }
@@ -45710,9 +45863,7 @@ impl Simulator {
                                                 .insert(format!("{}.size", name), size.clone());
                                         }
                                         // Do not assign to lvalue (array) itself
-                                        if !self.in_edge_block {
-                                            self.settle_combinatorial();
-                                        }
+                                        self.settle_after_proc_write();
                                         return;
                                     } else {
                                         // `lhs = new()` where the LHS type
@@ -45748,9 +45899,7 @@ impl Simulator {
                                         let name = self.resolve_hier_name(lhier);
                                         self.signals.insert(format!("{}.size", name), size.clone());
                                     }
-                                    if !self.in_edge_block {
-                                        self.settle_combinatorial();
-                                    }
+                                    self.settle_after_proc_write();
                                     return;
                                 } else {
                                     // `lhs = new()` with an unknown LHS type:
@@ -45797,9 +45946,7 @@ impl Simulator {
                             if dst != src {
                                 self.copy_whole_queue(&dst, &src);
                             }
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                     }
@@ -45841,9 +45988,7 @@ impl Simulator {
                         && (r_is_prop || self.module.dynamic_arrays.contains(&rname))
                     {
                         self.copy_whole_queue(&lname, &rname);
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -45915,9 +46060,7 @@ impl Simulator {
                         for (k, v) in entries {
                             self.signals.insert(k, v);
                         }
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                     if self.module.arrays.contains_key(&lname)
@@ -45950,9 +46093,7 @@ impl Simulator {
                                 );
                             }
                             self.set_queue_size(&lname, rsize as u64);
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                         let count = lsize.min(rsize);
@@ -45974,9 +46115,7 @@ impl Simulator {
                                 .unwrap_or(Value::zero(32));
                             self.set_signal_value_by_name(&format!("{}[{}]", lname, lidx), rval);
                         }
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -46054,9 +46193,7 @@ impl Simulator {
                                     if is_dyn {
                                         self.set_queue_size(&lname, results.len() as u64);
                                     }
-                                    if !self.in_edge_block {
-                                        self.settle_combinatorial();
-                                    }
+                                    self.settle_after_proc_write();
                                     return;
                                 }
                             }
@@ -46086,9 +46223,7 @@ impl Simulator {
                             if is_dyn {
                                 self.set_queue_size(&lname, items.len() as u64);
                             }
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                         if let ExprKind::Concatenation(exprs) = &rvalue.kind {
@@ -46218,9 +46353,7 @@ impl Simulator {
                             if is_dyn {
                                 self.set_queue_size(&lname, all_vals.len() as u64);
                             }
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                     }
@@ -46253,18 +46386,14 @@ impl Simulator {
                                 } else {
                                     self.set_queue_size(&lname, 0);
                                 }
-                                if !self.in_edge_block {
-                                    self.settle_combinatorial();
-                                }
+                                self.settle_after_proc_write();
                                 return;
                             }
                         }
                     }
                 }
                 self.assign_value(lvalue, &val);
-                if !self.in_edge_block {
-                    self.settle_combinatorial();
-                }
+                self.settle_after_proc_write();
             }
             StatementKind::NonblockingAssign {
                 lvalue,
@@ -46881,6 +47010,23 @@ impl Simulator {
                     .filter_map(|v| v.as_ref().map(|id| id.name.clone()))
                     .collect();
                 let fe_saved = self.snapshot_loop_vars(&fe_names);
+                // §6.19.6: when the collection is an associative array whose KEY
+                // is a named type (`int cnt [sev_e];`), the index variable HAS
+                // that type — `foreach (cnt[s]) s.name()` must resolve against
+                // that enum. Without the binding the hint is absent and
+                // `enum_value_name` scans every enum and picks the largest, so
+                // the key printed as a member of an unrelated enum (UVM's report
+                // summary listed `UVM_NORADIX` where a severity belonged).
+                // Registered for the loop's duration; the loop-var restore below
+                // is by value, so drop the type binding on the way out too.
+                let fe_key_type_var: Option<String> = (|| {
+                    let arr_name = Self::foreach_array_root_name(array)?;
+                    let kt = self.module.assoc_key_type_names.get(&arr_name)?.clone();
+                    let v = vars.first()?.as_ref()?.name.clone();
+                    self.var_typedef_types.insert(v.clone(), kt);
+                    Some(v)
+                })();
+                let _fe_key_guard = &fe_key_type_var;
                 // foreach index vars are automatic (§12.7.3); like for-init
                 // vars, record them so a `fork … join_none/join_any` in the
                 // body captures the per-iteration value by value (§9.3.2).
@@ -47816,6 +47962,7 @@ impl Simulator {
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
             // region even when no NBA DATA is queued.
             || !self.pending_nba_triggers.is_empty()
+            || !self.pending_nba_instance_triggers.is_empty()
         {
                             self.apply_nba();
                         }
@@ -47834,6 +47981,27 @@ impl Simulator {
                         // Same rationale as the run_process_stmts arm.
                         if let Some(fname) = self.event_control_field_name(e) {
                             if let Some(key) = self.resolve_this_event_field(&fname) {
+                                let cont = vec![*stmt.clone()];
+                                let pid = self.current_pid;
+                                self.instance_event_waiters.push(InstanceEventWaiter {
+                                    key,
+                                    pid,
+                                    continuation: cont.into(),
+                                });
+                                self.break_flag = true;
+                                return;
+                            }
+                        }
+                        // Member-reached event property (`@(h.ce)`,
+                        // `@(m_events[obj].all_dropped)`) — same routing as the
+                        // run_process_stmts arm; without it these fell into the
+                        // generic waiter below with a sensitivity that never
+                        // matches an instance event.
+                        if let Some(expr) = Self::event_control_single_expr(e) {
+                            if let Some(key) = self
+                                .expr_handle_event_field(&expr)
+                                .or_else(|| self.expr_instance_event_field_general(&expr))
+                            {
                                 let cont = vec![*stmt.clone()];
                                 let pid = self.current_pid;
                                 self.instance_event_waiters.push(InstanceEventWaiter {
@@ -49510,12 +49678,17 @@ impl Simulator {
                     }
                 }
             }
-            StatementKind::EventTrigger { name, nonblocking, .. } => {
+            StatementKind::EventTrigger { name, nonblocking, target, .. } => {
                 if *nonblocking {
                     // §15.5.2: defer to the NBA region of the current slot.
                     // Resolve a class-field instance key NOW (while `this` is
                     // live); the NBA drain cannot reconstruct it later.
                     if let Some(key) = self.resolve_this_event_field(&name.name) {
+                        self.pending_nba_instance_triggers.push(key);
+                    } else if let Some(key) = target
+                        .as_ref()
+                        .and_then(|t| self.expr_instance_event_field_general(t))
+                    {
                         self.pending_nba_instance_triggers.push(key);
                     } else {
                         self.pending_nba_triggers.push(name.name.clone());
@@ -49534,16 +49707,18 @@ impl Simulator {
                 } else {
                     None
                 };
-                let key = if key.is_none() {
-                    // `-> m_events[obj].all_dropped`: a class-property event
-                    // reached through an ASSOCIATIVE-ARRAY element (UvM
-                    // objection). `resolve_handle_event_field` only accepts a
-                    // plain receiver name, so resolve the indexed receiver.
-                    self.resolve_indexed_handle_event_field(&name.name)
-                } else {
-                    key
-                };
                 if let Some(key) = key {
+                    self.fire_instance_event(key);
+                    return;
+                }
+                // Receivers the flattened string cannot express — runtime
+                // selects (`-> m_events[obj].all_dropped`, the UVM objection
+                // drop path, #109) and chained handles — resolve from the
+                // carried target EXPRESSION.
+                if let Some(key) = target
+                    .as_ref()
+                    .and_then(|t| self.expr_instance_event_field_general(t))
+                {
                     self.fire_instance_event(key);
                     return;
                 }
@@ -49858,107 +50033,143 @@ impl Simulator {
         self.resolve_handle_event_field(&dotted)
     }
 
-    /// Evaluate an arbitrary receiver EXPRESSION to a heap instance handle.
-    /// `@(m_events[k].ce)` / `-> m_events[k].ce` reach a class-property event
-    /// through an ASSOCIATIVE-ARRAY element: the base `m_events[k]` yields the
-    /// `rec` handle, and `.ce` is the event member. `resolve_handle_event_field`
-    /// only accepts a plain receiver name (`h.ce`, `this.ce`), so these
-    /// base-an-array-index shapes fell through to a bogus sensitivity and the
-    /// `@` did not suspend. Evaluate the receiver to the live handle.
-    fn eval_receiver_handle_expr(&mut self, recv: &Expression) -> Option<usize> {
-        let v = self.eval_expr(recv);
-        let h = v.to_u64()? as usize;
-        // sanity: it must name a live object, not (e.g.) a 1-bit flag
-        if self.heap.get(h).and_then(|o| o.as_ref()).is_some() {
-            Some(h)
-        } else {
-            None
-        }
-    }
-
-    /// §15.5 instance event reached through an arbitrary receiver expression
-    /// that evaluates (at suspension time) to a class handle and a member
-    /// event: `@(m_events[k].all_dropped)`. Returns the `(handle, field)`
-    /// event identity, or `None` when the receiver is not such a shape.
-    fn expr_receiver_event_field(&mut self, e: &Expression) -> Option<(usize, String)> {
-        let (recv, member) = match &e.kind {
-            ExprKind::MemberAccess { expr, member } => {
-                (expr.as_ref(), member.name.clone())
+    /// §15.5: an event CLASS PROPERTY reached through an ARBITRARY receiver
+    /// expression — `direct.ev` (property-of-`this` handle), `m_events[key].ev`
+    /// (assoc element, runtime key), `q[0].ev` (queue element), `h.grp.ev`
+    /// (chained handles). `resolve_handle_event_field` only accepts a
+    /// select-free single-segment receiver, so all of these fell into the
+    /// delta-yield and woke at t=0 — which is exactly the UVM objection spin:
+    /// `uvm_objection::wait_for`'s `@(m_events[obj].all_dropped)` returned
+    /// immediately, so `wait_for_self_and_siblings_to_drop` re-entered it
+    /// forever and simulation never left the time step (GitHub #109, UVM
+    /// 1800.2-2017). The receiver is EVALUATED here (per §9.4.2 the event
+    /// expression is sampled when the wait executes), and the field must be a
+    /// declared `event` property of the object's class — a non-event member
+    /// keeps its existing (value-change) path.
+    fn expr_instance_event_field_general(&mut self, e: &Expression) -> Option<(usize, String)> {
+        // Split <receiver-expr>.<field>: a MemberAccess head, or a
+        // multi-segment hierarchical ident whose LAST segment is select-free.
+        let (recv_expr, field): (Expression, String) = match &e.kind {
+            ExprKind::MemberAccess { expr, member } => ((**expr).clone(), member.name.clone()),
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.last().is_some_and(|s| s.selects.is_empty()) =>
+            {
+                let mut recv = h.clone();
+                let field = recv.path.pop()?.name.name;
+                (
+                    Expression::new(ExprKind::Ident(recv), e.span),
+                    field,
+                )
             }
             _ => return None,
         };
-        let h = self.eval_receiver_handle_expr(recv)?;
-        let inst = self.heap.get(h).and_then(|o| o.as_ref())?;
-        if inst.properties.contains_key(&member) {
-            Some((h, member))
-        } else {
-            None
-        }
-    }
-
-    /// Build the AST expression `this.<base>[<idx>]` for a receiver that the
-    /// `->` parser flattened to a dotted name like `m_events[obj].all_dropped`
-    /// (UvM objection `->m_events[obj].all_dropped`). Reconstructs the
-    /// array-element receiver so it hits the SAME `eval_expr` path the
-    /// wait-side `@(m_events[obj].all_dropped)` uses, then returns the
-    /// resulting class handle.
-    fn eval_this_member_index_handle(&mut self, base: &str, idx: &str) -> Option<usize> {
-        let span = crate::ast::Span::dummy();
-        let ident_expr = |n: &str| crate::ast::expr::Expression::new(
-            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                root: None,
-                path: vec![crate::ast::expr::HierPathSegment {
-                    name: crate::ast::Identifier {
-                        name: n.to_string(),
-                        span,
-                    },
-                    selects: Vec::new(),
-                }],
-                span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
-            }),
-            span,
-        );
-        // `this.base[idx]`: a member array (of class handles) indexed by `idx`.
-        let member = crate::ast::expr::Expression::new(
-            ExprKind::MemberAccess {
-                expr: Box::new(crate::ast::expr::Expression::new(ExprKind::This, span)),
-                member: crate::ast::Identifier { name: base.to_string(), span },
-            },
-            span,
-        );
-        let receiver = crate::ast::expr::Expression::new(
-            ExprKind::Index {
-                expr: Box::new(member),
-                index: Box::new(ident_expr(idx)),
-            },
-            span,
-        );
-        let v = self.eval_expr(&receiver);
-        let h = v.to_u64()? as usize;
-        if self.heap.get(h).and_then(|o| o.as_ref()).is_some() {
-            Some(h)
-        } else {
-            None
-        }
-    }
-
-    /// §15.5 instance event reached through an ASSOCIATIVE-ARRAY element from
-    /// a flattened trigger name `m_events[obj].all_dropped`. Returns the
-    /// `(handle, field)` identity once the receiver handle holds an event
-    /// property named `field`.
-    fn resolve_indexed_handle_event_field(&mut self, dotted: &str) -> Option<(usize, String)> {
-        let (recv, field) = dotted.rsplit_once('.')?;
-        if !recv.contains('[') {
+        let handle = match &recv_expr.kind {
+            ExprKind::This => self.this_stack.last().copied().flatten()?,
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let n = h.path[0].name.name.as_str();
+                if n == "this" || n == "super" {
+                    self.this_stack.last().copied().flatten()?
+                } else {
+                    self.eval_ident_handle(n)?
+                }
+            }
+            // Selects / chains: evaluate the receiver expression to a handle.
+            _ => {
+                let h = self.eval_expr(&recv_expr).to_u64()? as usize;
+                if h == 0 {
+                    return None; // null handle
+                }
+                h
+            }
+        };
+        let inst = self.heap.get(handle).and_then(|o| o.as_ref())?;
+        if !inst.properties.contains_key(&field) {
             return None;
         }
-        let (base, idx) = recv.trim_end_matches(']').split_once('[')?;
-        let idx = idx.split('.').next().unwrap_or(idx);
-        let h = self.eval_this_member_index_handle(base, idx)?;
-        let inst = self.heap.get(h).and_then(|o| o.as_ref())?;
-        if inst.properties.contains_key(field) {
-            Some((h, field.to_string()))
+        // Walk the class hierarchy: accept only a declared `event` property.
+        // A missing property_types entry (older registration paths) falls back
+        // to accepting property existence, matching resolve_this_event_field.
+        let mut cur = Some(inst.class_name.clone());
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else { break };
+            if let Some(dt) = cd.property_types.get(&field) {
+                return if matches!(
+                    dt,
+                    DataType::Simple { kind: crate::ast::types::SimpleType::Event, .. }
+                ) {
+                    Some((handle, field))
+                } else {
+                    None
+                };
+            }
+            cur = cd.extends.clone();
+        }
+        Some((handle, field))
+    }
+
+    /// §13.5.2: decide whether a `ref` actual can be TRULY ALIASED — reads of
+    /// the formal re-read it, writes write through, no return copy-out. Only
+    /// module-visible plain variables qualify (their resolution is caller-
+    /// frame-independent, so the frozen expression evaluates identically from
+    /// inside the callee). A chained ref (the actual is itself a ref formal of
+    /// the caller) resolves through the CALLER's alias frame to the original
+    /// storage. Caller-frame locals, aggregate elements, class properties and
+    /// events return None and keep the legacy copy-in/copy-out path.
+    ///
+    /// NOTE: called AFTER the callee's local frame is pushed, so the caller's
+    /// frames are second-from-top.
+    fn ref_alias_target(&self, arg: &Expression) -> Option<Expression> {
+        let h = match &arg.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => h,
+            _ => return None,
+        };
+        let name = h.path[0].name.name.as_str();
+        // Chained ref: the caller's alias frame is still top-of-stack here
+        // (the callee's is pushed just after resolution).
+        if let Some(frozen) = self.ref_alias_stack.last().and_then(|m| m.get(name)) {
+            return Some(frozen.clone());
+        }
+        // A caller-frame local (including a non-aliased ref formal) is not
+        // module-visible — the callee cannot reach its storage by name.
+        let caller_frame = self.local_stack.iter().rev().nth(1);
+        if caller_frame.is_some_and(|f| f.contains_key(name)) {
+            return None;
+        }
+        if self
+            .ref_binding_stack
+            .last()
+            .is_some_and(|m| m.contains_key(name))
+        {
+            return None; // ref-bound in the caller but not aliasable
+        }
+        // Aggregates and strings keep their dedicated formal machinery.
+        if self.module.arrays.contains_key(name)
+            || self.module.dynamic_arrays.contains(name)
+            || self.module.queue_vars.contains(name)
+            || self.module.associative_arrays.contains_key(name)
+            || self.string_signals.contains(name)
+        {
+            return None;
+        }
+        // A class property reached via `this` resolves differently inside the
+        // callee — reject when the surrounding context could capture it.
+        if let Some(Some(handle)) = self.this_stack.last() {
+            if self
+                .heap
+                .get(*handle)
+                .and_then(|o| o.as_ref())
+                .is_some_and(|i| i.properties.contains_key(name))
+            {
+                return None;
+            }
+        }
+        // Plain module-visible variable storage only.
+        if self.signal_name_to_id.contains_key(name) || self.signals.contains_key(name) {
+            Some(arg.clone())
         } else {
             None
         }
@@ -50642,8 +50853,9 @@ impl Simulator {
                 // remaining arguments are the `$display`-style message. A bare
                 // `$fatal("msg")` (no valid finish_number) defaults to 1 and
                 // treats every argument as the message.
-                let (msg_args, _finish) = self.fatal_msg_args(args);
+                let (msg_args, finish) = self.fatal_msg_args(args);
                 self.emit_severity("Fatal", msg_args);
+                self.fatal_finish_number = Some(finish);
                 self.finished = true; // implicit $finish
             }
             "$display" | "$displayb" | "$displayh" | "$displayo" => {
@@ -51275,6 +51487,14 @@ impl Simulator {
             format!("** {}: {}", severity, body)
         };
         let ctx = format!("   Time: {}  Scope: {}", time_s.trim(), scope);
+        // §20.10: record severity occurrences so the process exit status can
+        // reflect them. `$fatal` carries an explicit finish/status semantic and
+        // must not exit 0; `$error` is counted so `--error-exit` can promote it.
+        match severity {
+            "Fatal" => self.saw_fatal = true,
+            "Error" => self.error_count = self.error_count.saturating_add(1),
+            _ => {}
+        }
         self.record_output(line.clone());
         self.record_output(ctx.clone());
         self.stdout_writeln(&line);
@@ -51576,7 +51796,20 @@ impl Simulator {
                     'b' => v.to_bin_string(),
                     'h' => v.to_hex_string(),
                     'o' => Self::bin_to_oct_string(&v.to_bin_string()),
-                    _ => v.to_dec_string(),
+                    // §21.2.1.2: an unconsumed argument prints in the task's
+                    // default DECIMAL format — which has the type's default
+                    // field width, space-padded (`$display("x=", v)` of a
+                    // 16-bit 677 is "x=  677", matching the reference
+                    // simulator), not the %0d minimal form.
+                    _ => {
+                        let core = v.to_dec_string();
+                        let dw = Self::dec_default_width(v.width, v.is_signed);
+                        if core.len() >= dw {
+                            core
+                        } else {
+                            format!("{}{}", " ".repeat(dw - core.len()), core)
+                        }
+                    }
                 });
             }
             i += 1;
@@ -52355,7 +52588,6 @@ impl Simulator {
                                                 &full,
                                                 pad_width,
                                                 left_align,
-                                                zero_pad,
                                             );
                                         } else {
                                             result.push_str(&full);
@@ -52369,7 +52601,6 @@ impl Simulator {
                                                 &full,
                                                 pad_width,
                                                 left_align,
-                                                zero_pad,
                                             );
                                         } else {
                                             result.push_str(&full);
@@ -52385,7 +52616,6 @@ impl Simulator {
                                                 &full,
                                                 pad_width,
                                                 left_align,
-                                                zero_pad,
                                             );
                                         } else {
                                             result.push_str(&full);
@@ -55433,6 +55663,33 @@ impl Simulator {
         } else {
             0
         }
+    }
+
+    /// True when NO class object can exist: the heap holds only the index-0
+    /// null sentinel (`heap: vec![None]`), so `heap.is_empty()` is NEVER true
+    /// after construction — every guard spelled that way was dead code, and
+    /// class-free designs paid the class-resolution probes on every indexed
+    /// access.
+    #[inline(always)]
+    fn no_class_objects(&self) -> bool {
+        self.heap.len() <= 1
+    }
+
+    /// Id-keyed write with the same bookkeeping as `fast_signal_write`'s
+    /// resolved branches: element-width resize, declared signedness, change
+    /// compare, `write_sig!` (which respects `forced_signals`), dirty mark.
+    #[inline]
+    fn fast_signal_write_id(&mut self, id: usize, val: &Value) -> bool {
+        let width = self.signal_widths[id];
+        let mut resized = val.resize(width);
+        resized.is_signed = self.signal_signed[id];
+        let changed = self.signal_table[id] != resized;
+        if changed {
+            write_sig!(self, id, resized);
+            self.table_modified = true;
+            self.mark_dirty_id(id);
+        }
+        changed
     }
 
     /// Fast signal write: update both signal_table and signals HashMap.
@@ -63720,32 +63977,34 @@ impl Simulator {
     /// (leading-zero-trimmed) form AND zero-pads it (`%04h` -> `000f`). A `-`
     /// flag left-justifies with trailing spaces. Passing `full` (not a
     /// pre-trimmed core) lets us honour the flag correctly.
-    fn push_radix(result: &mut String, full: &str, width: usize, left_align: bool, zero_pad: bool) {
-        // a reference simulator' radix-field model (matched byte-for-byte):
-        //   * No `0` flag: always the natural full-vector form, space-padded
-        //     (`%4h` of 8'h0f -> "  0f", `%-4h` -> "0f  ").
-        //   * `0` flag + right-justified + explicit width: natural form,
-        //     zero-padded — never trimmed below the natural width
-        //     (`%04b` of an 8-bit value stays "00001111", not "1111";
-        //     `%08o` of 16'o01234 -> "00001234").
-        //   * `0` flag + (bare `%0h` OR left-justified): the minimal
-        //     (leading-zero-trimmed) form (`%0h` -> "f", `%-08o` -> "1234    ").
-        let core = if zero_pad && (width == 0 || left_align) {
-            Self::trim_radix_zeros(full)
-        } else {
-            full.to_string()
-        };
+    fn push_radix(result: &mut String, full: &str, width: usize, left_align: bool) {
+        // The reference simulator's radix-field model, re-measured
+        // byte-for-byte (commercial tools disagree here; xezim previously
+        // followed the OTHER tool's space-pad-to-natural-width model — the
+        // switch is deliberate, see tests/strings/format_sibling_fixes.rs):
+        //   * bare `%0<r>`: minimal form — leading zeros AND a leading x/z
+        //     run collapse (`%0h` of 16'hxx3f -> "x3f", of 8'hzz -> "z").
+        //   * explicit width W: the core is the value with leading ZEROS
+        //     trimmed only — an x/z run is kept (`%6h` of 8'hzz ->
+        //     "0000zz"). Never truncated below the core (`%2h` of 16'h2a5
+        //     -> "2a5"). Right-justified pads with '0' REGARDLESS of the
+        //     `0` flag (`%4h` == `%04h` of 8'h0f -> "000f"); `-` pads with
+        //     spaces on the right (`%-4h` -> "f   ", `%-08h` of 32'hFF ->
+        //     "ff      "). Zero value: `%4h` of 8'h00 -> "0000".
+        if width == 0 {
+            result.push_str(&Self::trim_radix_zeros(full));
+            return;
+        }
+        let t = full.trim_start_matches('0');
+        let core = if t.is_empty() { "0" } else { t };
         if core.len() >= width {
-            result.push_str(&core);
+            result.push_str(core);
         } else if left_align {
-            result.push_str(&core);
+            result.push_str(core);
             result.push_str(&" ".repeat(width - core.len()));
-        } else if zero_pad {
-            result.push_str(&"0".repeat(width - core.len()));
-            result.push_str(&core);
         } else {
-            result.push_str(&" ".repeat(width - core.len()));
-            result.push_str(&core);
+            result.push_str(&"0".repeat(width - core.len()));
+            result.push_str(core);
         }
     }
 
@@ -64942,7 +65201,7 @@ impl Simulator {
     /// handle + property name, then assemble the whole unpacked-struct value.
     /// `None` for anything that is not a whole unpacked-struct class property.
     fn try_read_whole_struct_class_prop(&mut self, expr: &Expression) -> Option<Value> {
-        if self.heap.is_empty() {
+        if self.no_class_objects() {
             return None;
         }
         let (handle, prop_name) = self.class_prop_receiver(expr)?;
@@ -65063,7 +65322,7 @@ impl Simulator {
     /// parse shape — to the storage it aliases. `None` when `e` is not an
     /// aggregate class-property member.
     fn class_agg_member(&mut self, e: &Expression) -> Option<ClassAggRef> {
-        if self.heap.is_empty() {
+        if self.no_class_objects() {
             return None;
         }
         // §7.2: a member of an UNPACKED-struct property at ANY depth, and
@@ -65249,7 +65508,7 @@ impl Simulator {
         base: &Expression,
         index: &Expression,
     ) -> Option<ClassAggRef> {
-        if self.heap.is_empty() {
+        if self.no_class_objects() {
             return None;
         }
         let (handle, prop) = self.class_prop_receiver(base)?;
@@ -65382,7 +65641,7 @@ impl Simulator {
 
     /// `class_agg_member` for an already-split `<base>.<field>`.
     fn class_agg_member_parts(&mut self, base: &Expression, field: &str) -> Option<ClassAggRef> {
-        if self.heap.is_empty() {
+        if self.no_class_objects() {
             return None;
         }
         let (handle, prop) = self.class_prop_receiver(base)?;
@@ -66691,9 +66950,7 @@ impl Simulator {
                     });
                 if let Some(v) = self.packed_pattern_value(items, &dims, total_w) {
                     self.set_signal_value_by_name(base, v);
-                    if !self.in_edge_block {
-                        self.settle_combinatorial();
-                    }
+                    self.settle_after_proc_write();
                     return true;
                 }
             }
@@ -67566,7 +67823,7 @@ impl Simulator {
     /// (members stored in the heap). `None` for non-class-property operands
     /// (those are handled by the signal-namespace struct path).
     fn class_prop_struct_of(&mut self, e: &Expression) -> Option<crate::ast::types::StructUnionType> {
-        if self.heap.is_empty() {
+        if self.no_class_objects() {
             return None;
         }
         let (h, p) = self.class_prop_receiver(e)?;
@@ -68257,6 +68514,12 @@ impl Simulator {
     fn queue_eval_arg(&mut self, container_name: &str, arg: &Expression) -> Value {
         let class_name = self.module.array_elem_class.get(container_name).cloned();
         if let Some(cn) = class_name {
+            // NOTE: a BARE `new` is deliberately not accepted here. `new` is
+            // legal only in an assignment to a class handle (§8.7), so
+            // `q.push_back(new)` is invalid SystemVerilog — the reference
+            // simulator rejects it with a syntax error, and accepting it would
+            // be an accepts-invalid. The `new(...)` Call form below is
+            // pre-existing behavior.
             if let ExprKind::Call {
                 func,
                 args: call_args,
@@ -70640,7 +70903,7 @@ impl Simulator {
         base: &Expression,
         outer_index: &Expression,
     ) -> Option<String> {
-        if self.heap.is_empty() {
+        if self.no_class_objects() {
             return None;
         }
         // Collect the index chain innermost-first: base may be
@@ -72507,6 +72770,51 @@ impl Simulator {
             // `function string name()` silently returns empty (the enum lookup
             // finds no match and falls through to zero). Many user classes
             // define `name()`.
+            // §9.7 `p.status().name()`: the process state enum (FINISHED,
+            // RUNNING, WAITING, SUSPENDED, KILLED) is BUILT IN — it has no
+            // user enum table, so the generic reflection below found nothing
+            // and returned empty. Guarded on the receiver being a real
+            // process handle so a user class's own `status()` is untouched.
+            if mname == "name" && args.is_empty() {
+                if let ExprKind::Call { func, args: sargs } = &expr.kind {
+                    if sargs.is_empty() {
+                        // `p.status()` reaches here either as
+                        // MemberAccess{p, status} or flattened to the
+                        // 2-segment Ident `p.status`.
+                        let pbase: Option<Expression> = match &func.kind {
+                            ExprKind::MemberAccess { member, expr: pb }
+                                if member.name == "status" =>
+                            {
+                                Some((**pb).clone())
+                            }
+                            ExprKind::Ident(h)
+                                if h.path.len() == 2
+                                    && h.path[1].name.name == "status"
+                                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+                            {
+                                let mut base = h.clone();
+                                base.path.pop();
+                                Some(Expression::new(ExprKind::Ident(base), func.span))
+                            }
+                            _ => None,
+                        };
+                        if let Some(pb) = pbase {
+                            let h = self.eval_expr(&pb).to_u64().unwrap_or(0);
+                            if Self::proc_handle_to_pid(h).is_some() {
+                                let v = self.eval_expr(expr).to_u64().unwrap_or(0);
+                                let nm = match v {
+                                    0 => "FINISHED",
+                                    1 => "RUNNING",
+                                    2 => "WAITING",
+                                    3 => "SUSPENDED",
+                                    _ => "KILLED",
+                                };
+                                return Value::from_string(nm);
+                            }
+                        }
+                    }
+                }
+            }
             if mname == "name" && args.is_empty() {
                 let type_hint = self.get_expr_type_name(expr);
                 let is_class_with_name_method = type_hint
@@ -74968,7 +75276,13 @@ impl Simulator {
                 mv.set_bit(i as usize, v.get_bit((off + i) as usize));
             }
             if is_real {
-                let f = mv.to_u64().unwrap_or(0) as f64;
+                // `Value::from_f64` stores `f.to_bits()`, and packing copied
+                // those raw IEEE-754 bits into the aggregate — so recovering
+                // the member is `from_bits`, not an integer cast. The cast
+                // reinterpreted the bit pattern as an integer, so a struct
+                // with a `real` member assigned WHOLE (function return,
+                // assignment pattern) read 4.0 back as 4.6161896e18.
+                let f = f64::from_bits(mv.to_u64().unwrap_or(0));
                 self.write_leaf_by_name(&leaf, Value::from_f64(f));
             } else {
                 self.write_leaf_by_name(&leaf, mv);
@@ -76024,6 +76338,7 @@ impl Simulator {
             self.current_spec = c.saved_spec;
         }
         self.ref_binding_stack.pop();
+        self.ref_alias_stack.pop();
         self.local_iface_aliases.pop();
         self.continue_flag = c.saved_continue;
         self.sync_static_locals();
@@ -76380,12 +76695,27 @@ impl Simulator {
         // SV-2023: redirect NBAs targeting a `ref` formal back to the caller's
         // actual variable (IEEE 1800-2023 §13.5.2).
         let mut ref_map: HashMap<String, Expression> = HashMap::default();
+        // §13.5.2 true aliasing: where the actual is module-visible storage,
+        // record a redirect so reads/writes of the formal go THROUGH to it
+        // during the call (see `ref_alias_stack`). The callee's local frame is
+        // already pushed here, so `ref_alias_target` treats the SECOND-from-
+        // top frame as the caller when rejecting caller-local actuals.
+        let mut alias_map: HashMap<String, Expression> = HashMap::default();
         for (i, port) in td.ports.iter().enumerate() {
             if matches!(port.direction, crate::ast::types::PortDirection::Ref) && i < args.len() {
+                if let Some(frozen) = self.ref_alias_target(&args[i]) {
+                    alias_map.insert(port.name.name.clone(), frozen);
+                }
                 ref_map.insert(port.name.name.clone(), args[i].clone());
             }
         }
+        // An aliased ref writes through during the call — a return copy-out
+        // would CLOBBER writes other processes made to the actual while this
+        // call was suspended (observed: an observer's write overwritten by
+        // the callee's stale copy).
+        output_bindings.retain(|(n, _)| !alias_map.contains_key(n));
         self.ref_binding_stack.push(ref_map);
+        self.ref_alias_stack.push(alias_map);
         self.return_value = None;
         let saved_break = self.break_flag;
         let saved_continue = self.continue_flag;
@@ -79061,6 +79391,7 @@ impl Simulator {
                                 return_flag: false,
                                 local_iface_aliases: Vec::new(),
                                 ref_binding_stack: Vec::new(),
+            ref_alias_stack: Vec::new(),
                                 queue_frame_saves: Vec::new(),
                                 task_cleanup: Vec::new(),
                                 local_dyn: Vec::new(),
@@ -86444,6 +86775,16 @@ impl Simulator {
     /// type, looks it up directly; otherwise searches all enum tables for a
     /// member with that value, preferring the largest enum (which, for riscv-dv,
     /// is the instruction-name enum the lookup is almost always for).
+/// Root collection name of a `foreach` target (`a`, `a[i]`, `obj.a`).
+    fn foreach_array_root_name(expr: &Expression) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
+            ExprKind::Index { expr: base, .. } => Self::foreach_array_root_name(base),
+            ExprKind::MemberAccess { member, .. } => Some(member.name.clone()),
+            _ => None,
+        }
+    }
+
     fn enum_value_name(&self, value: u64, type_hint: Option<&str>) -> Option<String> {
         if let Some(t) = type_hint {
             if let Some(members) = self.module.enum_members.get(t) {

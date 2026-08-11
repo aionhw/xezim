@@ -160,3 +160,6 @@ mod xtrace_conformance;
 
 #[path = "scheduling/compiled_for_loops.rs"]
 mod compiled_for_loops;
+
+#[path = "scheduling/class_event_member_wait.rs"]
+mod class_event_member_wait;

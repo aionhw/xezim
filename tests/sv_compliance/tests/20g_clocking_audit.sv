@@ -47,8 +47,11 @@ module test_clocking_audit;
     @(cb); #1 `SVTEST_CHECK(q !== 8'hBB, "##N drive matured too early")
     @(cb); #1 `SVTEST_CHECK(q === 8'hBB, "##N drive did not mature")
 
-    // §14.12: ##0 is same-time, ##1 advances one cycle
-    begin int c0 = ev_hits; ##0; `SVTEST_CHECK(ev_hits == c0, "##0 advanced time") end
+    // §14.11: ##0 SYNCHRONIZES to the clocking event (reference-validated):
+    // executed off the edge (here: edge+1ns) it waits for the next event;
+    // executed at the event's own slot it is a no-op.
+    begin time t0 = $time; ##0; `SVTEST_CHECK($time > t0, "##0 off-edge must wait for the event") end
+    begin time t1 = $time; ##0; `SVTEST_CHECK($time == t1, "##0 at the event must not wait") end
 
     // §14.13: the sample-change event fired (once per changed edge, no runts)
     `SVTEST_CHECK(ev_hits >= 3 && last_seen >= 0, "@(cb.sig) event did not fire on samples")

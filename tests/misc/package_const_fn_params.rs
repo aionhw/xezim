@@ -298,3 +298,31 @@ endmodule
         msgs(&sim)
     );
 }
+
+#[test]
+fn package_param_fixpoint_heals_declarations_not_just_values() {
+    // A package parameter that references one the hoist has not reached yet
+    // (forward reference here; the same shape arises for a bare cross-package
+    // reference to a package that sorts later). Each hoist pass used to
+    // restart with no bare names visible, so the reference missed on EVERY
+    // pass, const-eval defaulted it to 0, and `X - 6` froze at -6. The
+    // parameter VALUE healed later, but any declaration sized during the bad
+    // window kept a 1-bit clamped width — value right, storage wrong, which
+    // is exactly how this hides in a large design.
+    let src = r#"
+package cfg;
+  parameter integer LOG_64B = LOG_SIZE - 6;
+  parameter integer LOG_SIZE = 12;
+endpackage
+module tb;
+  logic [cfg::LOG_64B:0] c;
+  initial $display("T|%0d %0d", $bits(c), cfg::LOG_64B);
+endmodule
+"#;
+    let sim = simulate(src, 10).expect("simulate failed");
+    assert!(
+        msgs(&sim).iter().any(|m| m == "T|7 6"),
+        "declaration must be sized from the HEALED value, got {:?}",
+        msgs(&sim)
+    );
+}

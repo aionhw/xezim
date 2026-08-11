@@ -8,3 +8,6 @@ mod work_counters;
 
 #[path = "perf/bench_host_workloads.rs"]
 mod bench_host_workloads;
+
+#[path = "perf/report_stats.rs"]
+mod report_stats;

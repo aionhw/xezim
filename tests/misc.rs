@@ -206,7 +206,17 @@ mod xselect_and_concat_flatten;
 #[path = "misc/static_method_via_handle.rs"]
 mod static_method_via_handle;
 
+#[path = "misc/array_elem_fast_write.rs"]
+mod array_elem_fast_write;
+#[path = "misc/severity_exit_status.rs"]
+mod severity_exit_status;
 #[path = "misc/preprocessor_directives.rs"]
 mod preprocessor_directives;
 #[path = "misc/package_const_fn_params.rs"]
 mod package_const_fn_params;
+#[path = "misc/ref_args_alias.rs"]
+mod ref_args_alias;
+#[path = "misc/trireg_charge_and_g_audit.rs"]
+mod trireg_charge_and_g_audit;
+#[path = "misc/process_status_name.rs"]
+mod process_status_name;

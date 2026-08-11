@@ -86,3 +86,25 @@ endmodule
     assert_eq!(u(&sim, "s_zero"), 0, "#0 hop after the waiter is still pre-NBA");
     assert_eq!(u(&sim, "r"), 1, "the flop still updates");
 }
+
+#[test]
+fn waiter_wake_order_matches_reference_lifo() {
+    // §4.7 leaves within-region resumption order indeterminate; the
+    // reference wakes the LAST-armed waiter first, and differential runs
+    // stay comparable only if xezim does too (single reversal at the
+    // drain_triggered_event_waiters hand-off).
+    let src = r#"
+`timescale 1ns/1ns
+module tb;
+  event ev;
+  int slot = 0;
+  int at_a = -1, at_b = -1;
+  initial begin @(ev) begin slot++; at_a = slot; end end
+  initial begin @(ev) begin slot++; at_b = slot; end end
+  initial begin #1 -> ev; #1 $finish; end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "at_b"), 1, "last-armed waiter wakes first");
+    assert_eq!(u(&sim, "at_a"), 2, "first-armed waiter wakes second");
+}
