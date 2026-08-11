@@ -5,6 +5,11 @@
 //!   NBA region:     non-blocking assign updates
 //!   Reactive:       edge-triggered always_ff/always_latch blocks
 
+// Sub-modules created during the codebase rework (Phase 3).
+mod ipc;
+
+use self::ipc::{EventWaiter, InstanceEventWaiter, MailboxGetWaiter, MailboxPutWaiter, SemGetWaiter};
+
 use super::elaborate::{AlwaysBlock, DpiImportSpec, ElaboratedModule, Signal};
 use super::value::{LogicBit, Value};
 use crate::ast::decl::{
@@ -1327,35 +1332,6 @@ impl EdgeKind {
 /// LRM §15.4.2: a process blocked inside `mailbox.get(var)` on an empty
 /// mailbox. The next `put` drains this waiter, assigns its value into
 /// `lvalue`, and reschedules `cont` under `pid` at the current time.
-#[derive(Debug, Clone)]
-/// A process blocked in `semaphore.get(n)` because the count was below `n`
-/// (IEEE 1800-2017 §15.3.3). Woken by a `put` that raises the count enough.
-struct SemGetWaiter {
-    pid: usize,
-    /// Keys still required.
-    n: i64,
-    cont: ProcCont,
-}
-
-struct MailboxGetWaiter {
-    pid: usize,
-    lvalue: Expression,
-    cont: ProcCont,
-    /// `peek` (not `get`): the waiter reads the front WITHOUT removing it, so
-    /// a `put` that wakes it must also leave the item in the mailbox for the
-    /// subsequent `get`/`try_get`.
-    is_peek: bool,
-}
-
-/// §15.4.1 — a process blocked on `mailbox.put(v)` because a BOUNDED mailbox is
-/// full. The value is captured at the (blocking) call; when a `get`/`try_get`
-/// frees a slot the value is stored and `cont` is rescheduled.
-struct MailboxPutWaiter {
-    pid: usize,
-    value: Value,
-    cont: ProcCont,
-}
-
 /// A process waiting for a signal edge event.
 /// SIGUSR1 -> on-demand hang report from a live run (`kill -USR1 <pid>`).
 /// The handler only flips a flag; the simulation loop prints the report at
@@ -1378,54 +1354,6 @@ pub fn install_hang_report_handler() {
 #[cfg(not(unix))]
 pub fn install_hang_report_handler() {}
 
-#[derive(Debug, Clone)]
-struct EventWaiter {
-    pid: usize,
-    /// Simulation time when this waiter parked. Drives the hang report:
-    /// waiters sorted oldest-first expose "who has been stuck longest",
-    /// and `arm_bits` tells whether the awaited signals ever moved since.
-    parked_time: u64,
-    /// Pre-resolved signal IDs for O(1) edge checking. The unresolved
-    /// `Vec<Sensitivity>` mirror was set at construction but never
-    /// consulted afterwards — dropped.
-    resolved_sensitivities: Vec<SensitivityId>,
-    /// Value (raw v,x low-64) of each `resolved_sensitivities` signal at the
-    /// moment this waiter armed. Parallel to `resolved_sensitivities`. Used to
-    /// detect a change made AFTER arming within the same snapshot generation.
-    arm_bits: Vec<(u64, u64)>,
-    continuation: ProcCont,
-    /// Each sensitivity signal's value captured AT registration time
-    /// (`raw_bits()` for the ≤64-bit fast path). The waiter fires when the
-    /// signal changes relative to this captured baseline — NOT the global
-    /// per-tick `prev_val` snapshot. This ensures NBA updates that commit
-    /// after registration in the same tick wake the waiter. It also
-    /// subsumes the old `snap_gen` guard: a `forever @(posedge clk)`
-    /// re-registered just after consuming a posedge captures clk's now-high value,
-    /// so the consumed edge cannot re-fire (IEEE 1800-2023 §9.4.2.3).
-    captured_prev: Vec<(u64, u64)>,
-    /// Full captured value for >64-bit sensitivity signals (parallel to
-    /// `captured_prev`); `None` for ≤64-bit signals.
-    captured_prev_wide: Vec<Option<Value>>,
-    /// §9.4.2 value guard for non-trivial event expressions — parallel to
-    /// `resolved_sensitivities`. `Some(v)` holds the term expression's value
-    /// at ARM time; an operand edge only counts when the expression now
-    /// evaluates differently (see `SensitivityId::value_of`).
-    guard_prev: Vec<Option<Value>>,
-    /// Number of qualifying events still required before the continuation
-    /// resumes. This collapses action-free `repeat (N) @(event);` loops into
-    /// one parked waiter instead of rebuilding their AST continuation after
-    /// every edge.
-    remaining_events: u64,
-    /// LRM §14.13: this waiter is parked on a CLOCKING event (`@(cb)` / `##N`),
-    /// not a raw `@(posedge clk)`. Its continuation must resume in the Reactive
-    /// region — AFTER the same-edge NBA updates commit and the clocking input
-    /// snapshot refreshes — so it reads post-edge design state and this cycle's
-    /// `cb.<in>` samples. Raw edge waiters keep the default "resume before
-    /// same-edge blocks" behavior (`waiters_first`), which some gate-level tbs
-    /// depend on; only clocking waiters are deferred.
-    is_clocking: bool,
-}
-
 /// A process parked on a CLASS-FIELD named event (`event m_event` inside a
 /// class, awaited/triggered as `@m_event` / `->m_event` from a method on
 /// `this`). Unlike a module-scope named event, a class `event` field has no
@@ -1434,12 +1362,6 @@ struct EventWaiter {
 /// pair is a distinct synchronization object (IEEE 1800-2023 §15.5). The key is the
 /// raw `(this_handle, field_name)`; `->`/`@` inside a method both resolve to
 /// the same `this`, so a trigger and a wait on the same object match.
-#[derive(Clone)]
-struct InstanceEventWaiter {
-    key: (usize, String),
-    pid: usize,
-    continuation: ProcCont,
-}
 
 /// Pad a string to a given width with spaces (or zeros if zero_pad).
 fn pad_string(s: &str, width: usize, zero_pad: bool) -> String {
@@ -2435,7 +2357,6 @@ struct DpiBinding {
     cif: Cif,
     fn_ptr: CodePtr,
 }
-
 
 /// Parse `<base>[<idx>]` and resolve via the compact 1D-array map.
 /// Free function so it can be shared between the `&self` resolver on
@@ -22894,83 +22815,6 @@ impl Simulator {
         }
     }
 
-    fn make_event_waiter(
-        &mut self,
-        pid: usize,
-        sens: Vec<Sensitivity>,
-        continuation: ProcCont,
-    ) -> EventWaiter {
-        self.make_event_waiter_kind(pid, sens, continuation, false)
-    }
-
-    fn make_event_waiter_kind(
-        &mut self,
-        pid: usize,
-        sens: Vec<Sensitivity>,
-        continuation: ProcCont,
-        is_clocking: bool,
-    ) -> EventWaiter {
-        let resolved: Vec<SensitivityId> = sens
-            .iter()
-            .filter_map(|s| {
-                self.signal_name_to_id
-                    .get(s.signal_name.as_str())
-                    .map(|&id| SensitivityId {
-                        signal_id: id,
-                        edge: s.edge,
-                        iff: s.iff.clone(),
-                        value_of: s.value_of.clone(),
-                    })
-            })
-            .collect();
-        // §9.4.2 value guard: capture each non-trivial term's value at arm.
-        let guard_prev: Vec<Option<Value>> = resolved
-            .iter()
-            .map(|sid| sid.value_of.clone().map(|e| self.eval_expr(&e)))
-            .collect();
-        // Capture each sensitivity signal's value AT ARM TIME, parallel to
-        // `resolved`. A waiter registered within the current snapshot
-        // generation is checked against these (not the tick-start snapshot),
-        // so only a change made AFTER it armed counts as an edge — see the
-        // firing loop in `check_edges_inner`.
-        let arm_bits: Vec<(u64, u64)> = resolved
-            .iter()
-            .map(|sid| self.signal_table[sid.signal_id].raw_bits())
-            .collect();
-        // `sens` (Vec<Sensitivity>) is consumed for resolution and dropped;
-        // EventWaiter only carries the resolved IDs from here on.
-        //
-        // Capture each sensitivity signal's current value at registration
-        // so the waiter fires on a change relative to THIS point (see the
-        // `captured_prev` field doc for the NBA reasoning).
-        let captured_prev: Vec<(u64, u64)> = resolved
-            .iter()
-            .map(|s| self.signal_table[s.signal_id].raw_bits())
-            .collect();
-        let captured_prev_wide: Vec<Option<Value>> = resolved
-            .iter()
-            .map(|s| {
-                if self.signal_widths[s.signal_id] > 64 {
-                    Some(self.signal_table[s.signal_id].clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        EventWaiter {
-            pid,
-            parked_time: self.time,
-            resolved_sensitivities: resolved,
-            arm_bits,
-            continuation,
-            captured_prev,
-            captured_prev_wide,
-            guard_prev,
-            remaining_events: 1,
-            is_clocking,
-        }
-    }
-
     /// True when an event control names a clocking block (`@(cb)`) or the
     /// synthesized default clocking used by `##N` — a clocking event whose
     /// waiter must resume in the Reactive region (see `EventWaiter::is_clocking`).
@@ -26830,8 +26674,6 @@ impl Simulator {
                 }
             }
 
-
-
             // Stage 0: normalize a parenless task/method call (LRM §13.5
             // footnote 42 + §13.5.5: parentheses may be omitted for tasks, void
             // functions, and class methods). A call written without
@@ -28845,8 +28687,6 @@ impl Simulator {
         )
     }
 
-
-
     /// Is `s` a (potentially blocking) mailbox `get`/`peek` call — `mb.get(v)`
     /// or `mb.peek(v)` (either MemberAccess or flattened hier-Ident form)? Such
     /// a call blocks when the mailbox is empty; inside a `forever` it must route
@@ -30450,104 +30290,6 @@ impl Simulator {
     /// continuation) pairs to run. Shared by the classic post-edge-block
     /// drain and the commercial-order pre-edge-block drain (see
     /// XEZIM_WAITERS_FIRST in check_edges_inner).
-    fn drain_triggered_event_waiters(&mut self) -> Vec<(usize, ProcCont)> {
-        let waiters = std::mem::take(&mut self.ipc.event_waiters);
-        self.prof_waiter_iters += waiters.len() as u64;
-        self.ipc.event_waiters_swap.clear();
-        let mut triggered_conts: Vec<(usize, ProcCont)> = Vec::new();
-        for mut waiter in waiters {
-            let mut triggered = false;
-            for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
-                let (pv, px) = waiter.captured_prev[i];
-                let pw = waiter.captured_prev_wide[i].as_ref();
-                if !self.edge_fires_prev(sid.signal_id, sid.edge, pv, px, pw) {
-                    continue;
-                }
-                // LRM §9.4.2.3: `@(posedge clk iff g)` only fires when the
-                // guard `g` holds at edge time. A false guard re-arms the
-                // waiter (it stays in event_waiters for the next edge)
-                // rather than resuming the process. Evaluated in the module
-                // scope the signal table exposes — sufficient for the usual
-                // reset/enable guards (`iff rst_l === 1'b1`, `iff en`).
-                let guard_ok = match &sid.iff {
-                    Some(g) => self.eval_expr(g).is_true(),
-                    None => true,
-                };
-                // §9.4.2: a non-trivial event expression fires only when its
-                // VALUE changed since arm — `a=2;b=1` leaving `a+b` at 3 is
-                // not an event, however many operands moved.
-                let value_ok = match (&sid.value_of, waiter.guard_prev.get(i)) {
-                    (Some(e), Some(Some(prev))) => {
-                        let e = e.clone();
-                        let prev = prev.clone();
-                        self.eval_expr(&e) != prev
-                    }
-                    _ => true,
-                };
-                if guard_ok && value_ok {
-                    triggered = true;
-                    break;
-                }
-            }
-            if triggered && waiter.remaining_events > 1 {
-                waiter.remaining_events -= 1;
-                triggered = false;
-            }
-            if triggered {
-                sim_dbg_eprintln!(
-                    "[DEBUG] waiter for process {} triggered at time {}",
-                    waiter.pid,
-                    self.time
-                );
-                if waiter.is_clocking {
-                    // §14.13: resume in the Reactive region, not here in the
-                    // Active region — defer the continuation past apply_nba +
-                    // tick_clocking_blocks so it reads post-edge state and this
-                    // cycle's clocking samples.
-                    self.deferred_clocking_conts
-                        .push((waiter.pid, waiter.continuation));
-                } else {
-                    triggered_conts.push((waiter.pid, waiter.continuation));
-                }
-            } else {
-                // Refresh this waiter's `captured_prev` baseline to each
-                // sensitivity signal's CURRENT value so that a qualifying
-                // edge occurring over multiple steps is detected.
-                //
-                // Without this, a waiter armed while its signal sits at the
-                // edge-target level can never see the NEXT edge: e.g. a
-                // process resumes on the first `@(posedge clk)` at t=5
-                // (clk=1) and immediately re-arms on the next line; its
-                // captured_prev is frozen at 1, so when clk later goes
-                // 1→0→1 the Posedge test `!pb_one && cb_one` stays false
-                // (pb_one clings to the stale 1) and the second posedge is
-                // lost — the process strands (see
-                // tests/bound_module / sequential_event_waits). Tracking the
-                // running level here preserves the same-tick NBA-region
-                // semantics captured_prev was added for (a waiter still
-                // won't fire on an edge that completed BEFORE it armed, since
-                // at arm time captured_prev already equals current), while
-                // catching cross-tick transitions through the target level.
-                for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
-                    let (cv, cx) = self.signal_table[sid.signal_id].raw_bits();
-                    waiter.captured_prev[i] = (cv, cx);
-                    if self.signal_widths[sid.signal_id] > 64 {
-                        waiter.captured_prev_wide[i] =
-                            Some(self.signal_table[sid.signal_id].clone());
-                    }
-                }
-                self.ipc.event_waiters_swap.push(waiter);
-            }
-        }
-        std::mem::swap(&mut self.ipc.event_waiters, &mut self.ipc.event_waiters_swap);
-        // Within-region process resumption order is LRM-indeterminate
-        // (§4.7), but the reference simulator wakes the LAST-armed waiter
-        // first — and this campaign matches the reference's observable
-        // ordering so differential runs stay comparable. Registration order
-        // is FIFO; reverse to LIFO at the single hand-off point.
-        triggered_conts.reverse();
-        triggered_conts
-    }
 
     /// §16.9.3 sampled-value function with an EXPLICIT clocking argument
     /// (`$rose(x, @(posedge clk))`) or, in a procedural context, the
@@ -50216,26 +49958,6 @@ impl Simulator {
     /// Each woken continuation is scheduled for the current time so it runs in
     /// the same slot's remaining active region — mirroring how a blocking
     /// `->e` resumes an `@e` waiter for a module-scope named event.
-    fn fire_instance_event(&mut self, key: (usize, String)) {
-        let now = self.time;
-        // §15.5.3: `<h>.<ev>.triggered` must read 1 for the rest of this slot.
-        // Instance events have no backing signal, so stamp the same table the
-        // name-keyed path uses, under a synthetic per-instance key.
-        let stamp = Self::instance_event_stamp_key(&key);
-        self.ipc.event_triggered_time.insert(stamp, now);
-        let mut woken = Vec::new();
-        self.ipc.instance_event_waiters.retain(|w| {
-            if w.key == key {
-                woken.push((w.pid, w.continuation.clone()));
-                false
-            } else {
-                true
-            }
-        });
-        for (pid, cont) in woken {
-            self.event_queue.schedule(now, pid, cont);
-        }
-    }
 
     /// Fire a named event NOW: toggle its 1-bit signal (the edge `@(e)`
     /// waiters arm on) and stamp `event_triggered_time` for `.triggered`.
@@ -57172,7 +56894,6 @@ impl Simulator {
         }
     }
 
-
     // NOTE: `Simulator::vcd_write_value` is GONE. It was a second, divergent
     // copy of `vcd_sink::write_vcd_value` (the two disagreed about `real` and
     // about leading-zero suppression, so a value's spelling depended on whether
@@ -57464,33 +57185,6 @@ impl Simulator {
     /// FIFO and in order (§15.3.3): a waiter is served only when the FULL
     /// count it needs is available, and it is NOT skipped in favour of a
     /// later, smaller request — that would starve a large getter.
-    fn wake_semaphore_waiters(&mut self, handle: usize) {
-        loop {
-            let count = self.ipc.semaphores.get(&handle).copied().unwrap_or(0);
-            let next_n = self
-                .ipc.semaphore_get_waiters
-                .get(&handle)
-                .and_then(|q| q.front())
-                .map(|w| w.n);
-            match next_n {
-                Some(n) if count >= n => {
-                    let w = self
-                        .ipc.semaphore_get_waiters
-                        .get_mut(&handle)
-                        .unwrap()
-                        .pop_front()
-                        .unwrap();
-                    *self.ipc.semaphores.get_mut(&handle).unwrap() = count - n;
-                    if w.cont.is_empty() {
-                        self.child_finished(w.pid);
-                    } else {
-                        self.event_queue.schedule(self.time, w.pid, w.cont);
-                    }
-                }
-                _ => break,
-            }
-        }
-    }
 
     /// §15.4.1 — record a bounded mailbox's capacity from its `new(N)` arg.
     /// N absent or 0 leaves it unbounded (no entry).
@@ -57507,28 +57201,6 @@ impl Simulator {
     /// §15.4.1 — a slot just freed on a bounded mailbox: admit one parked `put`
     /// (store its value, resume the producer). No-op for an unbounded mailbox or
     /// when no producer is waiting.
-    fn admit_mailbox_put_waiter(&mut self, handle: usize) {
-        let bound = self.ipc.mailbox_bound.get(&handle).copied().unwrap_or(0);
-        if bound == 0 {
-            return;
-        }
-        let len = self.ipc.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
-        if len >= bound {
-            return;
-        }
-        if let Some(w) = self
-            .ipc.mailbox_put_waiters
-            .get_mut(&handle)
-            .and_then(|q| q.pop_front())
-        {
-            self.ipc.mailboxes.get_mut(&handle).unwrap().push_back(w.value);
-            if w.cont.is_empty() {
-                self.child_finished(w.pid);
-            } else {
-                self.event_queue.schedule(self.time, w.pid, w.cont);
-            }
-        }
-    }
 
     fn deliver_to_mailbox_waiter(
         &mut self,
@@ -60956,7 +60628,6 @@ impl Simulator {
         }
         m(pat.as_bytes(), text.as_bytes())
     }
-
 
     /// `<call> with { constraints }`. For `std::randomize(vars) with {...}` the
     /// listed vars are randomized then narrowed by the inline constraints
@@ -65444,7 +65115,6 @@ impl Simulator {
         None
     }
 
-
     /// One candidate split: `base` names the property, `suffix` addresses a
     /// leaf beneath it. `None` when the property is not an unpacked struct or
     /// the suffix names no leaf of it — which is what lets the caller try
@@ -68529,7 +68199,6 @@ impl Simulator {
         self.eval_expr(arg)
     }
 
-
     /// §7.12.3: a reduction's result has the ELEMENT type — width AND
     /// signedness. Summing `byte fixed[4]` with u64 accumulation and a plain
     /// 32-bit result read 439 where the element-typed answer is -73 (0xB7 as
@@ -70323,7 +69992,6 @@ impl Simulator {
     /// virtual interface yields its current target (vif-to-vif copy); a plain
     /// interface-instance ident yields its own name. Returns None when the RHS
     /// is neither (so the caller falls back to a normal value assignment).
-
 
     fn resolve_vif_rhs_name(&self, rvalue: &Expression) -> Option<String> {
         match &rvalue.kind {
@@ -75823,7 +75491,6 @@ impl Simulator {
         });
         let normalized = Self::normalize_call_args(&fd.ports, args);
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
-
 
         // Set up local scope with parameters
         let mut locals = HashMap::default();
@@ -83141,7 +82808,6 @@ impl Simulator {
                     }
                 }
             }
-
 
             if let Some(Some(inst)) = self.oop.heap.get_mut(handle) {
                 for (name, val) in backup {
