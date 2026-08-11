@@ -3429,6 +3429,10 @@ pub struct Simulator {
     /// `ScopePop` sentinel pops and replays the top entry. Per-process (carried
     /// in ProcessContext across suspension).
     task_cleanup: Vec<TaskCleanup>,
+    /// Names carrying a TRUSTED `var_typedef_types` binding — created by an
+    /// active `foreach` key-type binding (§6.19.6/§12.7.3) and restored by
+    /// `restore_loop_vars`. Consulted before every other type source.
+    fe_trusted_types: HashSet<String>,
     /// Bumped whenever a `wait(expr)` condition evaluates true (a parked waiter
     /// proceeds). The condition-waiter fixpoint uses it to detect "no progress
     /// this round" and stop (genuine stall).
@@ -6305,6 +6309,7 @@ impl Simulator {
             ref_binding_stack: Vec::new(),
             ref_alias_stack: Vec::new(),
             task_cleanup: Vec::new(),
+            fe_trusted_types: HashSet::default(),
             cond_progress: 0,
             real_time: 0.0,
             fork_baselines: HashMap::default(),
@@ -44640,9 +44645,41 @@ impl Simulator {
                 // is by value, so drop the type binding on the way out too.
                 let fe_key_type_var: Option<String> = (|| {
                     let arr_name = Self::foreach_array_root_name(array)?;
-                    let kt = self.module.assoc_key_type_names.get(&arr_name)?.clone();
+                    // Module/package-scope collections record the key type in
+                    // the module map; a CLASS PROPERTY records it on its class
+                    // (§3b): walk `this`'s hierarchy when the module map
+                    // misses — UVM's `severity_count[uvm_severity]` lives on
+                    // uvm_report_server, and without this the summary printed
+                    // members of an unrelated enum for every severity.
+                    let kt = self
+                        .module
+                        .assoc_key_type_names
+                        .get(&arr_name)
+                        .cloned()
+                        .or_else(|| {
+                            let handle = self.oop.this_stack.last().copied().flatten()?;
+                            let mut cur = self
+                                .heap_obj(handle)
+                                .map(|i| i.class_name.clone());
+                            let mut seen: HashSet<String> = HashSet::default();
+                            while let Some(cn) = cur {
+                                if !seen.insert(cn.clone()) {
+                                    break;
+                                }
+                                let cd = self.module.classes.get(&cn)?;
+                                if let Some(kt) = cd.assoc_key_types.get(&arr_name) {
+                                    return Some(kt.clone());
+                                }
+                                cur = cd.extends.clone();
+                            }
+                            None
+                        })?;
                     let v = vars.first()?.as_ref()?.name.clone();
                     self.var_typedef_types.insert(v.clone(), kt);
+                    // The loop var is a FRESH declaration (§12.7.3) — its type
+                    // binding shadows class properties and stale flat-map
+                    // entries for the loop's duration (see fe_trusted_types).
+                    self.fe_trusted_types.insert(v.clone());
                     Some(v)
                 })();
                 let _fe_key_guard = &fe_key_type_var;
@@ -58026,11 +58063,16 @@ impl Simulator {
     /// save/restore). A `foreach (arr[i])` index is loop-scoped in SV, so the
     /// outer `i` must be unchanged afterward — riscv-dv's
     /// `foreach(instr_list[i]) … ; while(i < size) …` depends on it.
-    fn snapshot_loop_vars(&self, names: &[String]) -> Vec<(String, Option<Value>, bool)> {
+    fn snapshot_loop_vars(
+        &self,
+        names: &[String],
+    ) -> Vec<(String, Option<Value>, bool, Option<String>, bool)> {
         // `set_loop_var` writes local_stack when a frame exists, else signals;
         // snapshot from (and later restore to) that same location so the
         // foreach shadow is removed without clobbering the outer variable
         // (a function-local lives in `signals`, not the call frame's locals).
+        // Also snapshot the var's TYPEDEF binding and its trusted mark, so a
+        // foreach key-type binding (§6.19.6) is scoped to the loop.
         let has_frame = self.local_stack.last().is_some();
         names
             .iter()
@@ -58040,13 +58082,37 @@ impl Simulator {
                 } else {
                     self.get_signal_value_by_name(n)
                 };
-                (n.clone(), cur, has_frame)
+                (
+                    n.clone(),
+                    cur,
+                    has_frame,
+                    self.var_typedef_types.get(n).cloned(),
+                    self.fe_trusted_types.contains(n),
+                )
             })
             .collect()
     }
 
-    fn restore_loop_vars(&mut self, saved: &[(String, Option<Value>, bool)]) {
-        for (n, cur, had_frame) in saved {
+    fn restore_loop_vars(
+        &mut self,
+        saved: &[(String, Option<Value>, bool, Option<String>, bool)],
+    ) {
+        for (n, cur, had_frame, prior_td, was_trusted) in saved {
+            match prior_td {
+                Some(t) => {
+                    self.var_typedef_types.insert(n.clone(), t.clone());
+                }
+                None => {
+                    self.var_typedef_types.remove(n);
+                }
+            }
+            if *was_trusted {
+                self.fe_trusted_types.insert(n.clone());
+            } else {
+                self.fe_trusted_types.remove(n);
+            }
+        }
+        for (n, cur, had_frame, _, _) in saved {
             if *had_frame {
                 if let Some(m) = self.local_stack.last_mut() {
                     match cur {
@@ -83699,6 +83765,16 @@ impl Simulator {
         match &expr.kind {
             ExprKind::Ident(hier) => {
                 let name = self.resolve_hier_name(hier);
+                // §12.7.3: an ACTIVE foreach loop variable is a fresh
+                // declaration whose (assoc key) type shadows everything —
+                // including a same-named class property, which otherwise won
+                // below and gave UVM's severity summary the type of an
+                // unrelated ancestor property.
+                if hier.path.len() == 1 && self.fe_trusted_types.contains(&name) {
+                    if let Some(t) = self.var_typedef_types.get(&name) {
+                        return Some(t.clone());
+                    }
+                }
                 // A genuine local of the CURRENT scope must resolve before the
                 // module-signal table: `signal_name_to_id` holds module-scope
                 // declarations, and a method-local shadows a same-named module
