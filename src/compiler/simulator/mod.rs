@@ -2398,10 +2398,26 @@ struct OopState {
     /// unqualified calls on `this` bind within that class's chain (§8.7).
     ctor_class_stack: Vec<(usize, String)>,
     /// Class-typed procedural locals — variable name -> class type name.
+    /// PERSISTENT BASE: module-level / top-level (non-call) locals, plus the
+    /// backing store when no call frame is active. Method-local declarations
+    /// live in `var_class_types_frames` so the flat base map no longer waits
+    /// for a same-named local in an unrelated method (the UVM framework
+    /// declaring `uvm_sequence_base seq;` would otherwise clobber a user's
+    /// `my_sequence seq;` — see pop_and_restore_class_type_frames).
     var_class_types: HashMap<String, String>,
+    /// per-call-frame overlays for `var_class_types` (innermost last).
+    /// pushed/popped in sync with the queue/ dyn-array call frames, so a
+    /// method's class-typed locals are scoped to that call and vanish on
+    /// return, and a nested method's same-named local shadows (not clobbers)
+    /// the caller's.
+    var_class_types_frames: Vec<HashMap<String, String>>,
     /// Parameterized-class procedural locals — variable name -> the declared
-    /// `#(...)` type-parameter args (as expressions).
+    /// `#(...)` type-param args (as expressions).
     var_type_args: HashMap<String, Vec<Expression>>,
+    /// Per-call-frame overlays for `var_type_args`, parallel to
+    /// `var_class_types_frames` (a class-typed local's type-args must have
+    /// the same lifetime/hiding as its class binding).
+    var_type_args_frames: Vec<HashMap<String, Vec<Expression>>>,
     /// §18.13 rand_mode: per-instance set of rand properties disabled.
     rand_mode_disabled: HashMap<usize, HashSet<String>>,
     /// §18.13 constraint_mode: per-instance set of disabled constraint names.
@@ -6117,7 +6133,9 @@ impl Simulator {
                 virtual_iface_bindings: HashMap::default(),
                 ctor_class_stack: Vec::new(),
                 var_class_types: HashMap::default(),
+                var_class_types_frames: Vec::new(),
                 var_type_args: HashMap::default(),
+                var_type_args_frames: Vec::new(),
                 rand_mode_disabled: HashMap::default(),
                 constraint_mode_disabled: HashMap::default(),
                 static_constraint_disabled: HashSet::default(),
@@ -42139,7 +42157,7 @@ impl Simulator {
                                 .array_elem_class
                                 .get(&bname)
                                 .cloned()
-                                .or_else(|| self.oop.var_class_types.get(&bname).cloned())
+                                .or_else(|| self.oop_var_class_type_of(&bname))
                                 .or_else(|| self.declared_collection_elem_class(&bname))
                                 .or_else(|| {
                                     // Class-MEMBER collection (static or instance):
@@ -46993,8 +47011,7 @@ impl Simulator {
                                         .classes
                                         .contains_key(cn.split('#').next().unwrap_or(cn)));
                             if cn_is_class {
-                                self.oop.var_class_types
-                                    .insert(d.name.name.clone(), cn.clone());
+                                self.oop_set_var_class_type(&d.name.name, cn.clone());
                                 // A typedef'd local (e.g. `table_q_t rq` where
                                 // `table_q_t = shared#(Foo[$])`) resolves to
                                 // `cn` but hides the type_args inside the
@@ -47008,8 +47025,7 @@ impl Simulator {
                                     if let Some((_, Some(ta))) =
                                         self.resolve_typeref_class_with_type_args(name)
                                     {
-                                        self.oop.var_type_args
-                                            .insert(d.name.name.clone(), ta);
+                                        self.oop_set_var_type_args(&d.name.name, ta);
                                     }
                                 }
                             } else if self.resolve_type_param_binding(cn).is_some() {
@@ -47030,7 +47046,7 @@ impl Simulator {
                                 // `$cast(cb, ...)` assignment and any later
                                 // `new()` could not resolve CB, and the return
                                 // value came back null to the caller.
-                                self.oop.var_class_types.insert(d.name.name.clone(), cn.clone());
+                                self.oop_set_var_class_type(&d.name.name, cn.clone());
                             }
                         }
                         // Record a parameterized local's declared `#(...)` type
@@ -47056,16 +47072,14 @@ impl Simulator {
                         } = data_type
                         {
                             if !type_args.is_empty() {
-                                self.oop.var_type_args
-                                    .insert(d.name.name.clone(), type_args.clone());
+                                self.oop_set_var_type_args(&d.name.name, type_args.clone());
                             } else if let Some(ta) = resolved_ta {
-                                self.oop.var_type_args
-                                    .insert(d.name.name.clone(), ta);
+                                self.oop_set_var_type_args(&d.name.name, ta);
                             } else {
-                                self.oop.var_type_args.remove(&d.name.name);
+                                self.oop_del_var_type_args(&d.name.name);
                             }
                         } else {
-                            self.oop.var_type_args.remove(&d.name.name);
+                            self.oop_del_var_type_args(&d.name.name);
                         }
                         // §15.3/§15.4: record a mailbox/semaphore-typed local so
                         // a later separate `name = new(bound)` allocates the right
@@ -49449,7 +49463,7 @@ impl Simulator {
                         kind: ExprKind::Ident(h.clone()),
                         span: h.span,
                     })
-                    .or_else(|| self.oop.var_class_types.get(first).cloned())
+                    .or_else(|| self.oop_var_class_type_of(first))
                     .or_else(|| Some(first.clone()));
                     let mn = h.path.last().unwrap().name.name.clone();
                     (cn, Some(mn))
@@ -53622,7 +53636,7 @@ impl Simulator {
         // scope/method exit (see the note at `class_prop_type`), so this
         // binding can be stale across method calls — the result is therefore
         // NOT memoisable by AST node. That is pre-existing behaviour.
-        let class_name: String = if let Some(cn) = self.oop.var_class_types.get(recv_head) {
+        let class_name: String = if let Some(cn) = self.oop_var_class_type_of(recv_head) {
             cn.clone()
         } else {
             let id = *self.signal_name_to_id.get(recv_head)?;
@@ -57978,9 +57992,89 @@ impl Simulator {
     }
 
     /// Push a fresh queue-local save frame on entry to a subroutine.
+    /// Also pushes the class-typed-local (var_class_types / var_type_args)
+    /// per-call overlay so a subr's method-local class locals are scoped to
+    /// this call and popped on return — see `oop_var_class_type_of`.
     fn push_queue_frame(&mut self) {
         self.queue_frame_saves.push(HashMap::default());
         self.local_dyn.push(HashMap::default());
+        self.push_class_type_frames();
+    }
+
+    /// Push empty per-call-frame overlays for the class-typed-local maps
+    /// (`var_class_types` / `var_type_args`). Every call-frame entry
+    /// (`push_queue_frame`, which class methods, module functions and tasks
+    /// all call) pushes one so that a subroutine's class-typed locals are
+    /// scoped to that call and drop on return — fixing the flat-map leakage
+    /// where a same-named local in an unrelated routine (e.g. UVM
+    /// `start_phase_sequence`'s `uvm_sequence_base seq;`) overwrote a user
+    /// local (e.g. `my_sequence seq;`) in the global map.
+    fn push_class_type_frames(&mut self) {
+        self.oop.var_class_types_frames.push(HashMap::default());
+        self.oop.var_type_args_frames.push(HashMap::default());
+    }
+
+    /// Pop (and discard) the top per-call-frame overlay for the
+    /// class-typed-local maps. Called in lockstep with
+    /// `push_class_type_frames` from the queue-frame pop, so a subroutine's
+    /// method-local class locals never outlive the call.
+    fn pop_class_type_frames(&mut self) {
+        self.oop.var_class_types_frames.pop();
+        self.oop.var_type_args_frames.pop();
+    }
+
+    /// Resolve a class-typed local's declared type, walking the active call
+    /// frames innermost-first and then the persistent base map. Frames take
+    /// precedence so a nested/later method's same-named local shadows (not
+    /// clobbers) a caller's or module-level binding. Returns the base name.
+    fn oop_var_class_type_of(&self, name: &str) -> Option<String> {
+        for f in self.oop.var_class_types_frames.iter().rev() {
+            if let Some(c) = f.get(name) {
+                return Some(c.clone());
+            }
+        }
+        self.oop.var_class_types.get(name).cloned()
+    }
+
+    /// Record a class-typed local's declared base type. Routes into the top
+    /// call frame when one is active (the declaring subroutine's own locals),
+    /// else the persistent base map (module-level / top-level locals).
+    fn oop_set_var_class_type(&mut self, name: &str, cn: String) {
+        match self.oop.var_class_types_frames.last_mut() {
+            Some(f) => { f.insert(name.to_string(), cn); }
+            None => { self.oop.var_class_types.insert(name.to_string(), cn); }
+        }
+    }
+
+    /// Resolve a parameterized class-typed local's declared `#(...)` args,
+    /// walking call frames innermost-first then the persistent base.
+    fn oop_var_type_args_of(&self, name: &str) -> Option<Vec<Expression>> {
+        for f in self.oop.var_type_args_frames.iter().rev() {
+            if let Some(ta) = f.get(name) {
+                return Some(ta.clone());
+            }
+        }
+        self.oop.var_type_args.get(name).cloned()
+    }
+
+    /// Record (or clear) a class-typed local's declared type-args into the
+    /// top call frame when active, else the persistent base map.
+    fn oop_set_var_type_args(&mut self, name: &str, ta: Vec<Expression>) {
+        match self.oop.var_type_args_frames.last_mut() {
+            Some(f) => { f.insert(name.to_string(), ta); }
+            None => { self.oop.var_type_args.insert(name.to_string(), ta); }
+        }
+    }
+
+    /// Remove a class-typed local's declared type-args entry from the
+    /// current frame (or base map when no frame is active). Scoped so it
+    /// never removes a caller/sibling frame's same-named entry.
+    fn oop_del_var_type_args(&mut self, name: &str) {
+        if let Some(f) = self.oop.var_type_args_frames.last_mut() {
+            f.remove(name);
+        } else {
+            self.oop.var_type_args.remove(name);
+        }
     }
 
     /// Look up the process-unique storage key for a local dynamic-array /
@@ -58129,6 +58223,12 @@ impl Simulator {
     /// registration (a nested call declaring a same-named local would have
     /// removed the caller's queue from `module.arrays`/`dynamic_arrays`).
     fn pop_and_restore_queue_frame(&mut self) {
+        // The class-typed-local frame (var_class_types / var_type_args) is
+        // ALWAYS pushed when this routine is entered (see push_queue_frame),
+        // so pop it here unconditionally — a subroutine's method-local class
+        // locals must not outlive the call, even if this queue bookkeeping
+        // happens to have nothing to restore.
+        self.pop_class_type_frames();
         let Some(frame) = self.queue_frame_saves.pop() else {
             // queue_frame_saves and local_dyn are pushed/popped in sync; if
             // there was no save frame there is no dyn frame either.
@@ -60945,7 +61045,7 @@ impl Simulator {
     /// `class_of_var` this does not require the name to be a known class, so an
     /// enum-typed destination can be recognised too.
     fn type_name_of_var(&self, vname: &str) -> Option<String> {
-        if let Some(c) = self.oop.var_class_types.get(vname) {
+        if let Some(c) = self.oop_var_class_type_of(vname) {
             return Some(c.clone());
         }
         if let Some(sig) = self.module.signals.get(vname) {
@@ -61771,8 +61871,8 @@ impl Simulator {
             return Some(vname.to_string());
         }
         // Procedural locals record their class at VarDecl exec time.
-        if let Some(c) = self.oop.var_class_types.get(vname) {
-            if self.module.classes.contains_key(c) {
+        if let Some(c) = self.oop_var_class_type_of(vname) {
+            if self.module.classes.contains_key(&c) {
                 return Some(c.clone());
             }
             // The VarDecl may have already resolved a type parameter to a
@@ -61781,7 +61881,7 @@ impl Simulator {
             // class — otherwise `class_of_var` returns None and `$cast`
             // degenerates to the permissive path (§8.25 value-param identity).
             if c.contains('#') {
-                let base = c.split('#').next().unwrap_or(c);
+                let base = c.split('#').next().unwrap_or(&c);
                 if self.module.classes.contains_key(base) {
                     return Some(c.clone());
                 }
@@ -61794,7 +61894,7 @@ impl Simulator {
             // returns None (T is not a real class) and `$cast` falls back
             // to the permissive path (always succeeds), corrupting
             // dynamic type filtering (LRM §6.20.2/§8.25).
-            if let Some(resolved) = self.resolve_type_param_binding(c) {
+            if let Some(resolved) = self.resolve_type_param_binding(&c) {
                 if self.module.classes.contains_key(&resolved) {
                     return Some(resolved);
                 }
@@ -69013,7 +69113,7 @@ impl Simulator {
                 if let ExprKind::Ident(h) = &dest.kind {
                     if h.path.len() == 1 {
                         let dvar = &h.path[0].name.name;
-                        self.oop.var_type_args.get(dvar).and_then(|ta| {
+                        self.oop_var_type_args_of(dvar).and_then(|ta| {
                             let frags: Vec<String> =
                                 ta.iter().filter_map(|e| self.expr_to_spec_fragment(e)).collect();
                             if frags.is_empty() { None } else { Some(frags.join(",")) }
@@ -69137,7 +69237,7 @@ impl Simulator {
                 if let ExprKind::Ident(h) = &dest.kind {
                     if h.path.len() == 1 {
                         let dvar = &h.path[0].name.name;
-                        self.oop.var_type_args.get(dvar).and_then(|ta| {
+                        self.oop_var_type_args_of(dvar).and_then(|ta| {
                             let frags: Vec<String> =
                                 ta.iter().filter_map(|e| self.expr_to_spec_fragment(e)).collect();
                             if frags.is_empty() {
@@ -73232,7 +73332,7 @@ impl Simulator {
                 {
                     self.var_typedef_types.insert(port.name.name.clone(), type_name);
                 } else if self.module.classes.contains_key(&type_name) {
-                    self.oop.var_class_types.insert(port.name.name.clone(), type_name);
+                    self.oop_set_var_class_type(&port.name.name, type_name);
                 }
             }
             // Same §13.3 metadata registration as the task path.
@@ -73322,7 +73422,7 @@ impl Simulator {
             {
                 self.var_typedef_types.insert(ret_name.clone(), type_name);
             } else if self.module.classes.contains_key(&type_name) {
-                self.oop.var_class_types.insert(ret_name.clone(), type_name);
+                self.oop_set_var_class_type(&ret_name, type_name);
             }
         }
         // Mark string-typed return var / params for character indexing.
@@ -75600,7 +75700,7 @@ impl Simulator {
             if let Some(ta) = self.module.class_type_args.get(n) {
                 return Some(ta.clone());
             }
-            if let Some(ta) = self.oop.var_type_args.get(n) {
+            if let Some(ta) = self.oop_var_type_args_of(n) {
                 return Some(ta.clone());
             }
         }
@@ -83163,7 +83263,7 @@ impl Simulator {
                         });
                 if in_any_frame {
                     // A class-typed procedural local declared in this scope.
-                    if let Some(t) = self.oop.var_class_types.get(&name) {
+                    if let Some(t) = self.oop_var_class_type_of(&name) {
                         return Some(t.clone());
                     }
                     // LRM §6.19.6: typedef-typed local — used by
@@ -83223,7 +83323,7 @@ impl Simulator {
                 let trust_flat_maps = in_any_frame || !in_class_method;
                 if trust_flat_maps {
                     // A class-typed procedural local declared in this scope.
-                    if let Some(t) = self.oop.var_class_types.get(&name) {
+                    if let Some(t) = self.oop_var_class_type_of(&name) {
                         return Some(t.clone());
                     }
                     // LRM §6.19.6: typedef-typed local — used by
@@ -83244,7 +83344,7 @@ impl Simulator {
                 // Multi-segment path resolution (e.g. `stor.handle`, `ClassName::static_prop`, `obj.field.subfield`)
                 if hier.path.len() >= 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
                     let root = &hier.path[0].name.name;
-                    let curr_type = if let Some(t) = self.oop.var_class_types.get(root) {
+                    let curr_type = if let Some(t) = self.oop_var_class_type_of(root) {
                         Some(t.clone())
                     } else if let Some(t) = self.var_typedef_types.get(root) {
                         Some(t.clone())
@@ -83395,13 +83495,13 @@ impl Simulator {
     ) -> Option<(String, Vec<Expression>)> {
         if let ExprKind::Ident(hier) = &expr.kind {
             let name = self.resolve_hier_name(hier);
-            if let Some(base) = self.oop.var_class_types.get(&name) {
-                let ta = self.oop.var_type_args.get(&name).cloned().unwrap_or_default();
+            if let Some(base) = self.oop_var_class_type_of(&name) {
+                let ta = self.oop_var_type_args_of(&name).unwrap_or_default();
                 return Some((base.clone(), ta));
             }
             let bname = &hier.path[0].name.name;
-            if let Some(base) = self.oop.var_class_types.get(bname) {
-                let ta = self.oop.var_type_args.get(bname).cloned().unwrap_or_default();
+            if let Some(base) = self.oop_var_class_type_of(bname) {
+                let ta = self.oop_var_type_args_of(bname).unwrap_or_default();
                 return Some((base.clone(), ta));
             }
         }

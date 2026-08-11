@@ -637,7 +637,10 @@ impl super::Simulator {
                         {
                             self.var_typedef_types.insert(port.name.name.clone(), type_name);
                         } else if self.module.classes.contains_key(&type_name) {
-                            self.oop.var_class_types.insert(port.name.name.clone(), type_name.clone());
+                            self.oop_set_var_class_type(
+                                &port.name.name,
+                                type_name.clone(),
+                            );
                         }
                     }
                     locals.insert(port.name.name.clone(), val);
@@ -715,7 +718,7 @@ impl super::Simulator {
                         {
                             let cn = name.name.name.clone();
                             if self.module.classes.contains_key(&cn) {
-                                self.oop.var_class_types.insert(rn.clone(), cn);
+                                self.oop_set_var_class_type(rn, cn);
                             }
                         }
                     }
