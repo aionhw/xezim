@@ -64858,7 +64858,7 @@ impl Simulator {
                     }
                 })
                 .collect();
-            return Some(format!("'{{{}}}", parts.join(", ")));
+            return Some(format!("'{{{} }}", parts.join(", ")));
         }
         let Some(dt) = self.module.var_decl_types.get(name).cloned() else {
             let (dt, arr) = self.flat_path_type(name)?;
@@ -64921,7 +64921,7 @@ impl Simulator {
                     }
                 })
                 .collect();
-            return Some(format!("'{{{}}}", parts.join(", ")));
+            return Some(format!("'{{{} }}", parts.join(", ")));
         }
         // Fixed unpacked array -> element list. An element may itself be a
         // collection (`int q[3][$]`), so it goes back through `render_p_var`.

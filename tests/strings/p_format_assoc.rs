@@ -40,9 +40,9 @@ fn p_format_assoc_arrays_print_key_value_pairs() {
     let sim = simulate(SRC, 100).expect("simulate failed");
 
     // Integer keys: numeric order, not lexical ("10" < "20" < "3" lexically).
-    assert_eq!(line(&sim, "AI="), "AI='{3:30, 10:100, 20:200}");
+    assert_eq!(line(&sim, "AI="), "AI='{3:30, 10:100, 20:200 }");
     // String keys are quoted.
-    assert_eq!(line(&sim, "AS="), r#"AS='{"a":1, "b":2}"#);
+    assert_eq!(line(&sim, "AS="), r#"AS='{"a":1, "b":2 }"#);
     // Struct elements recurse (enum label + quoted string).
-    assert_eq!(line(&sim, "CS="), r#"CS='{5:'{tgl:OFF, str:"five"}}"#);
+    assert_eq!(line(&sim, "CS="), r#"CS='{5:'{tgl:OFF, str:"five"} }"#);
 }

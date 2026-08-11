@@ -21,7 +21,7 @@ module top;
   // The shape UVM's pack_string relies on: a string passed by value whose
   // name also appears as a (stale) array registration must still iterate its
   // characters, not a bogus 2.
-  function int packlen(string value);
+  function automatic int packlen(string value);
     int n = 0;
     foreach (value[index]) n++;
     return n;
