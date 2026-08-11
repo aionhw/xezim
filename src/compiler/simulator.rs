@@ -68987,9 +68987,20 @@ impl Simulator {
                 if let ExprKind::Ident(bh) = &base.kind {
                     if bh.path.len() == 1 {
                         let bname = bh.path[0].name.name.clone();
-                        let scoped = self
-                            .instance_assoc_member(&bname)
-                            .unwrap_or_else(|| bname.clone());
+                        // Per-process local dynamic/assoc array: resolve the
+                        // bare name through the per-frame rename map to its
+                        // process-unique storage key (`@all#0`) BEFORE
+                        // instance-scoping. Without this, `all[k].method()`
+                        // on a method-local assoc array of class handles
+                        // looked up `all[k]` in the global signal table and
+                        // missed the renamed local store → handle 0 → null
+                        // receiver → the mutation was silently lost.
+                        let scoped = if let Some(uq) = self.dyn_name_lookup(&bname) {
+                            uq.to_string()
+                        } else {
+                            self.instance_assoc_member(&bname)
+                                .unwrap_or_else(|| bname.clone())
+                        };
                         // A STRING-keyed assoc element (`rtab[string]`) must key
                         // by the string, not a truncated scalar — otherwise
                         // `assoc[key].method()` (a method on the element class

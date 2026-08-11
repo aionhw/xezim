@@ -104,6 +104,54 @@ fn foreach_local_string_queue() {
     assert_pass(&sim, "FSQ");
 }
 
+/// **Bug 4 — method-local assoc array of CLASS references: method-call on an
+/// element lost its mutation.**
+///
+/// `all[k].push_back(v)` where `all` is a method-LOCAL associative array of
+/// (class-handle) objects. The receiver `all[k]` resolves to the element
+/// handle via `eval_handle_expr`, whose `Index` arm looked the element up
+/// under the BARE name (`all[k]`) in the global signal table — but a
+/// method-local dynamic/assoc array is renamed to a process-unique storage
+/// key (`@all#0[k]`) by `declare_local_dyn`. The miss returned handle 0 →
+/// null receiver → the user method (Q::push_back) was never called. Fix:
+/// resolve the base through `dyn_name_lookup` before indexing. Matches the
+/// class-member case (which already worked) and the reference simulator.
+const ASSOC_LOCAL_METHOD: &str = r#"
+class Q;
+  int count;
+  int items[$];
+  function void push_back(int v); items.push_back(v); count++; endfunction
+  function int size(); return count; endfunction
+endclass
+
+class C;
+  function void test();
+    Q all[string];
+    all["a"] = new;
+    all["a"].push_back(5);
+    all["a"].push_back(7);
+    if (all["a"].size() == 2)
+      $display("ALM_PASS");
+    else
+      $display("ALM_FAIL size=%0d", all["a"].size());
+  endfunction
+endclass
+
+module top;
+  initial begin
+    C c;
+    c = new;
+    c.test();
+  end
+endmodule
+"#;
+
+#[test]
+fn assoc_local_method_elem_call() {
+    let sim = simulate(ASSOC_LOCAL_METHOD, 200).expect("simulate failed");
+    assert_pass(&sim, "ALM");
+}
+
 /// **Bug 3 — `foreach` over a string-keyed assoc array whose key contains `]`.**
 ///
 /// The key extraction used `find(']')` (first `]`) to delimit the key from
