@@ -6,8 +6,11 @@
 //!   Reactive:       edge-triggered always_ff/always_latch blocks
 
 // Sub-modules created during the codebase rework (Phase 3).
+#[path = "ipc.rs"]
 mod ipc;
+#[path = "oop.rs"]
 mod oop;
+#[path = "process.rs"]
 mod process;
 
 use self::ipc::{EventWaiter, InstanceEventWaiter, MailboxGetWaiter, MailboxPutWaiter, SemGetWaiter};
