@@ -73803,7 +73803,17 @@ impl Simulator {
         if handle == 0 {
             return None;
         }
-        let ctx = self.class_context_stack.last().cloned().flatten()?;
+        // Use the runtime class of `this` (from the heap) rather than the
+        // lexical class_context_stack.  When a bare method call (e.g. `body()`)
+        // is inlined without updating class_context_stack, the stack still
+        // holds the CALLER's class (e.g. "uvm_sequence_base"), so a foreach
+        // over a member array declared in the concrete subclass ("my_seq")
+        // would fail to resolve.  The heap always knows the actual type.
+        let ctx = self
+            .heap
+            .get(handle)
+            .and_then(|x| x.as_ref())
+            .map(|i| i.class_name.clone())?;
         let mut cur = Some(ctx);
         while let Some(cn) = cur {
             let cd = self.module.classes.get(&cn)?;
