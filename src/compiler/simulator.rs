@@ -49238,8 +49238,15 @@ impl Simulator {
                                 }
                                 self.continue_flag = false;
                             }
-                        } else if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
-                            // Fixed unpacked array: iterate its declared index range.
+                        } else if let Some(dims_1d) = self
+                            .foreach_dims(&name)
+                            .filter(|d| d.len() == 1)
+                        {
+                            // Fixed 1-D unpacked array (module-scope or class
+                            // localparam): iterate its declared index range.
+                            // foreach_dims covers both module.arrays and
+                            // ElaboratedClass::localparam_array_dims.
+                            let (lo, hi) = dims_1d[0];
                             let descending = self.module.descending_arrays.contains(&name);
                             let mut idx = lo;
                             while idx <= hi {
@@ -62909,6 +62916,42 @@ impl Simulator {
                 }
                 return Some((keys, false, var_scope, None, (32, false)));
             }
+            // Class localparam fixed-size array: static, so not in
+            // array_properties or module.arrays.  Look up the declared shape
+            // from the runtime class via the heap (not class_context_stack,
+            // which may be stale when body() is called bare from start()).
+            let lp_class = self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .filter(|&h| h != 0)
+                .and_then(|h| {
+                    self.heap
+                        .get(h)
+                        .and_then(|x| x.as_ref())
+                        .map(|i| i.class_name.clone())
+                });
+            if let Some(start_class) = lp_class {
+                let mut cur: Option<String> = Some(start_class);
+                while let Some(cn) = cur {
+                    let (dims_opt, extends) = match self.module.classes.get(&cn) {
+                        Some(cd) => (
+                            cd.localparam_array_dims.get(name.as_str()).cloned(),
+                            cd.extends.clone(),
+                        ),
+                        None => break,
+                    };
+                    if let Some(dims) = dims_opt {
+                        if let Some(&(lo, hi)) = dims.first() {
+                            let keys: Vec<String> = (lo..=hi).map(|i| i.to_string()).collect();
+                            return Some((keys, false, None, None, (32, false)));
+                        }
+                        break;
+                    }
+                    cur = extends;
+                }
+            }
             // Queue / dynamic array surfaced via `.size` shadow only.
             let (keys, is_str) = self.array_iter_keys(&name);
             if keys.is_empty() {
@@ -63657,10 +63700,34 @@ impl Simulator {
         if let Some(&(d1, d2, _)) = self.module.arrays_2d.get(name) {
             return Some(vec![d1, d2]);
         }
-        self.module
-            .arrays
-            .get(name)
-            .map(|&(lo, hi, _)| vec![(lo, hi)])
+        if let Some(&(lo, hi, _)) = self.module.arrays.get(name) {
+            return Some(vec![(lo, hi)]);
+        }
+        // Class `localparam` arrays have `is_static = true` and are excluded
+        // from module.arrays* by the `!is_static` guard in elaborate.rs.
+        // Their dims are recorded in ElaboratedClass::localparam_array_dims.
+        // Strip any class# or instance-handle# prefix to get the bare name.
+        let bare = name.rsplit_once('#').map(|(_, b)| b).unwrap_or(name);
+        let start_class = self
+            .this_stack
+            .last()
+            .copied()
+            .flatten()
+            .filter(|&h| h != 0)
+            .and_then(|h| self.heap.get(h).and_then(|x| x.as_ref()).map(|i| i.class_name.clone()))?;
+        let mut cur: Option<String> = Some(start_class);
+        while let Some(cn) = cur {
+            match self.module.classes.get(&cn) {
+                Some(cd) => {
+                    if let Some(dims) = cd.localparam_array_dims.get(bare) {
+                        return Some(dims.clone());
+                    }
+                    cur = cd.extends.clone();
+                }
+                None => break,
+            }
+        }
+        None
     }
 
     /// §20.7: the array query functions also accept a TYPE as their operand
