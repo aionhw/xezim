@@ -260,25 +260,25 @@ fn test_sv_35_disable_fork() {
 fn test_sv_36_tagged_union_patterns() {
     run_positive_compliance_test("tests_advanced", "36_tagged_union_patterns.sv");
 }
-#[ignore = "unimplemented feature (was dormant/unregistered before PR #48); un-ignore when implemented"]
 #[test]
 fn test_sv_37_z_skip_resolution() {
     run_positive_compliance_test("tests_advanced", "37_z_skip_resolution.sv");
 }
-#[ignore = "unimplemented feature (was dormant/unregistered before PR #48); un-ignore when implemented"]
 #[test]
 fn test_sv_38_resolver_dispatch() {
     run_positive_compliance_test("tests_advanced", "38_resolver_dispatch.sv");
 }
-#[ignore = "unimplemented feature (was dormant/unregistered before PR #48); un-ignore when implemented"]
 #[test]
 fn test_sv_39_builtin_nettype_resolution() {
     run_positive_compliance_test("tests_advanced", "39_builtin_nettype_resolution.sv");
 }
-#[ignore = "unimplemented feature (was dormant/unregistered before PR #48); un-ignore when implemented"]
 #[test]
 fn test_sv_40_struct_nettype_resolution() {
     run_positive_compliance_test("tests_advanced", "40_struct_nettype_resolution.sv");
+}
+#[test]
+fn test_sv_44_eenet_rnm() {
+    run_positive_compliance_test("tests_advanced", "44_eenet_rnm.sv");
 }
 #[test]
 fn test_sv_41_genfor_localparam_idx() {

@@ -19,7 +19,7 @@
 // rather than a real function-call result, because `cnt_mix` returns 3
 // which is not reachable by any static fold of [1,0,1,1,0].
 
-`include "svtest_defs.svh"
+`include "../common/svtest_defs.svh"
 
 // ----------------------------------------------------------------------------
 // Resolver functions. Each must be `automatic`, take a single unpacked-queue

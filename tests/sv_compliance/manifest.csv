@@ -44,3 +44,4 @@ file,topic,description
 43_typedef_type_id_create.sv,typedef factory alias,typedef alias of parameterised class resolved via type_id::create factory path
 43_vif_writes.sv,virtual interface writes,blocking/NBA scalar+bit-select+vector writes through a virtual interface propagate to the bound instance
 43_packed_struct_assign.sv,packed struct assignment patterns,named/ordered patterns into packed struct packed by member offset; packed-2D element continuous assign emits full-width gate
+44_eenet_rnm.sv,user-defined nettypes for RNM,EEnet struct-of-real UDN with Millman/KCL resolution over 2-4 simultaneous drivers (DVCon EU 2019 TI/Cadence pattern)
