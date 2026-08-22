@@ -51293,8 +51293,32 @@ impl Simulator {
                                     .find(|(m, _, _)| m == &member.name)
                                     .cloned()
                                 {
-                                    return base_val
+                                    let mut v = base_val
                                         .range_select((off + w - 1) as usize, off as usize);
+                                    // §6.6.7 / §7.2.1: `packed_agg_layout` is a
+                                    // 3-tuple with no is_real, so a `real`
+                                    // member projected out of a struct VALUE
+                                    // (a call result — notably a nettype
+                                    // resolution function's return) came back
+                                    // as the raw f64 BIT PATTERN: 1.5 read as
+                                    // 4609434218613702656. Restore is_real
+                                    // from the member's declared type.
+                                    let mreal = su.members.iter().any(|m| {
+                                        m.declarators
+                                            .iter()
+                                            .any(|d| d.name.name == member.name)
+                                            && matches!(
+                                                Self::resolve_type_ref(
+                                                    &m.data_type,
+                                                    &self.module.typedef_types
+                                                ),
+                                                DataType::Real { .. }
+                                            )
+                                    });
+                                    if mreal {
+                                        v.is_real = true;
+                                    }
+                                    return v;
                                 }
                             }
                         }
@@ -76165,12 +76189,21 @@ impl Simulator {
         let su = self.unpacked_struct_of(&ret)?;
         suffix.reverse();
         let want = format!("X{}", suffix.concat());
-        let (_, off, w, _) = self
+        let (_, off, w, leaf_is_real) = self
             .struct_leaf_layout("X", &su)
             .into_iter()
             .find(|(k, ..)| *k == want)?;
         let v = self.eval_expr(cur);
-        Some(v.range_select((off + w - 1) as usize, off as usize))
+        let mut out = v.range_select((off + w - 1) as usize, off as usize);
+        // `struct_leaf_layout` already knows which leaves are `real`; that flag
+        // was dropped here, so a real member projected out of a call result
+        // came back as the raw f64 BIT PATTERN (1.5 read as
+        // 4609434218613702656). This is the read path a §6.6.7 resolution
+        // function's struct return goes through — `Tsum('{...}).field1`.
+        if leaf_is_real {
+            out.is_real = true;
+        }
+        Some(out)
     }
 
     fn chain_base_packed_struct(
