@@ -36,7 +36,7 @@
 // So this test will fail on xezim at every NetType that is NOT OR-fold and
 // will pass only after Tier 1 is implemented.
 
-`include "svtest_defs.svh"
+`include "../common/svtest_defs.svh"
 
 module test_39_tier1_builtin_nettype_resolution;
   `SVTEST_INIT

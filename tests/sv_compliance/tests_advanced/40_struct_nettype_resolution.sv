@@ -22,7 +22,7 @@
 // non-primitive element type at all, or where struct field access is not
 // resolved through the driver-queue element.
 
-`include "svtest_defs.svh"
+`include "../common/svtest_defs.svh"
 
 // ---------------------------------------------------------------------------
 // User-defined struct type with a `real` field and a `bit` field.

@@ -27,7 +27,7 @@
 // So Tier 0 is more of a documentation/regression baseline than a bug
 // catch; the bug-catching tier is Tier 1 (per-NetType fold).
 
-`include "svtest_defs.svh"
+`include "../common/svtest_defs.svh"
 
 module test_37_tier0_z_skip_resolution;
   `SVTEST_INIT
