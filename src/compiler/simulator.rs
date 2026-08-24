@@ -93292,6 +93292,48 @@ impl Simulator {
             }
         }
         self.heap.push(Some(instance));
+        // Per-instance TYPE-PARAM-BOUND collection members
+        // (`#(type T=int) data;` instantiated with T bound to a queue/array
+        // typedef such as `typedef int a_i[];`). These live only in
+        // `cd.properties` generically and never reach `queue_properties` /
+        // `array_properties`, so whole-assignment / size / index / `%p` paths
+        // had no array table entry and treated `data` as a scalar. Register
+        // `<handle>#member` as a dynamic array once this instance's type
+        // bindings (set above) resolve the parameter to a concrete collection
+        // type.
+        for cdef in &classes_to_init {
+            for (prop, sig) in &cdef.properties {
+                if cdef.queue_properties.contains_key(prop)
+                    || cdef.assoc_properties.contains_key(prop)
+                    || cdef.array_properties.contains_key(prop)
+                    || cdef.array_nd_properties.contains_key(prop)
+                    || cdef.static_collections.iter().any(|(n, ..)| n == prop)
+                {
+                    continue;
+                }
+                if !self.prop_bound_collection(handle, &cdef.name, prop) {
+                    continue;
+                }
+                let raw = sig.type_name.as_deref().unwrap_or(prop);
+                let concrete = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.type_bindings.get(raw).cloned())
+                    .unwrap_or_else(|| raw.to_string());
+                let w = self
+                    .module
+                    .typedef_elem_widths
+                    .get(&concrete)
+                    .copied()
+                    .unwrap_or(sig.width)
+                    .max(1);
+                let scoped = format!("{}#{}", handle, prop);
+                self.module.dynamic_arrays.insert(scoped.clone());
+                self.module.arrays.insert(scoped.clone(), (0, 63, w));
+                self.set_queue_size(&scoped, 0);
+            }
+        }
         // Re-evaluate scalar property initializers against the live parameter
         // table and instance context, before the constructor runs (SV applies
         // member initializers prior to `new`'s body). `elaborate_class`
