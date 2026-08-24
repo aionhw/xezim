@@ -48449,6 +48449,17 @@ impl Simulator {
                         return Value::from_u64(if r { 1 } else { 0 }, 1);
                     }
                 }
+                // IEEE 1800-2017 §11.8.1: `==`/`!=` on two dynamic arrays /
+                // queues compares element-by-element (after a length check),
+                // not the container's packed scalar. UVM's
+                // `uvm_resource#(T)::do_write` guards on `val == t` for a
+                // `T`-typed queue, so a wrong scalar compare (X/garbage)
+                // made the update early-return or was otherwise unreliable.
+                if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
+                    if let Some(res) = self.compare_dyn_arrays(left, right, matches!(op, BinaryOp::Eq)) {
+                        return res;
+                    }
+                }
                 let is_arith_or_bitwise = matches!(
                     op,
                     BinaryOp::Add
@@ -55842,7 +55853,20 @@ impl Simulator {
                 let resolve_coll = |sim: &mut Self, e: &Expression| -> Option<(String, bool)> {
                     if let ExprKind::Ident(h) = &e.kind {
                         let n = Self::resolve_hier_name_static(h, &sim.module);
+                        // A bare identifier naming a COLLECTION MEMBER of
+                        // `this` must resolve to its `<handle>#member` storage
+                        // even when a same-named value-param / dyn-array is
+                        // registered from an enclosing frame. Prefer the
+                        // `this`-scoped member; a true local (instance_assoc_member
+                        // returns None) falls through to the bare name below.
+                        // Without this, a deep `Store::do_write` whose `val = t`
+                        // ran while an outer `make(T val)` value-param `val` was
+                        // still live in `module.dynamic_arrays` resolved the LHS
+                        // to bare `"val"` and the queue copy was dropped (§13.5.2).
                         if sim.module.dynamic_arrays.contains(&n) {
+                            if let Some(m) = sim.instance_assoc_member(&n) {
+                                return Some((m, true));
+                            }
                             return Some((n, false));
                         }
                     }
@@ -70763,8 +70787,28 @@ impl Simulator {
                 if let Some(v) = self.read_value_param_literal(nm) {
                     return Some(v);
                 }
-                // Otherwise keep the name verbatim (a type-parameter name
-                // like `T`, or an enum member, resolved downstream).
+                // Resolve an ENCLOSING TYPE PARAMETER (e.g. `W#(T)` where
+                // `T` is the surrounding class's type param, bound to a
+                // concrete type) to its current binding. The specialization
+                // sig must carry the CONCRETE type here — leaving the bare
+                // param name lets `canonicalize_spec_sig` mistake it for
+                // THIS class's own same-named parameter and clobber it with
+                // that parameter's declared default, so a nested generic
+                // member (`S#(T) s;` inside `W#(T)`) recorded `W#(int)`
+                // instead of `W#(int_arr)` and every downstream type-param
+                // resolution of `T` came back as the default, dropping a
+                // `T`-typed queue formal. (A genuine class/typedef name
+                // never reaches here — it resolved above — so this only
+                // fires for type-parameter references.)
+                if let Some(resolved) = self.resolve_type_param_binding(nm) {
+                    if self.module.classes.contains_key(&resolved)
+                        || self.module.typedef_types.contains_key(&resolved)
+                    {
+                        return Some(resolved);
+                    }
+                }
+                // Otherwise keep the name verbatim (an enum member, resolved
+                // downstream).
                 Some(nm.clone())
             }
             _ => None,
@@ -71985,11 +72029,18 @@ impl Simulator {
                 }
             }
         }
-        // Module-level fixed array (bare Ident).
+        // Module-level fixed array (bare Ident). A DYNAMIC array / queue is
+        // registered in `module.arrays` with the (0,-1) queue SENTINEL range
+        // (and in `dynamic_arrays`) — it is NOT a fixed array and must not be
+        // compared element-wise as the empty 0:-1 range: UVM's `val == t` on
+        // two `T`-typed queues would otherwise both resolve to (0,-1) and the
+        // guard falsely reported them equal (skipping the update).
         if let ExprKind::Ident(h) = &expr.kind {
             let name = self.resolve_hier_name(h);
             if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
-                return Some((name, lo, hi));
+                if !self.module.dynamic_arrays.contains(&name) && !(hi < lo) {
+                    return Some((name, lo, hi));
+                }
             }
         }
         None
@@ -80402,6 +80453,85 @@ impl Simulator {
         let (h, p) = self.class_prop_receiver(e)?;
         let su = self.class_prop_struct(h, &p)?;
         Self::spreads_member_wise(&su).then_some(su)
+    }
+
+    /// IEEE 1800-2017 §7.2 / §11.8.1: `==`/`!=` on two dynamic-array / queue
+    /// operands compares element-by-element (after a length check). Each
+    /// operand is resolved to its storage name — a bare dyn-array formal /
+    /// local, or a `<handle>#member` collection property — and every element
+    /// is compared. Returns `None` when neither operand is a dynamic
+    /// array / queue (caller falls through to the packed-scalar path).
+    fn compare_dyn_arrays(
+        &mut self,
+        left: &Expression,
+        right: &Expression,
+        want_eq: bool,
+    ) -> Option<Value> {
+        let ln = self.dyn_cmp_operand_name(left)?;
+        let rn = self.dyn_cmp_operand_name(right)?;
+        if ln == rn {
+            // Self-comparison is always true regardless of contents — but only
+            // when both resolve to the SAME storage; a member and an unrelated
+            // bare name (e.g. `this.val` vs an outer value-param `val`) compare
+            // by value instead.
+            let res = if want_eq { 1 } else { 0 };
+            return Some(Value::from_u64(res, 1));
+        }
+        let ls = self.get_queue_size(&ln);
+        let rs = self.get_queue_size(&rn);
+        if ls != rs {
+            return Some(Value::from_u64(if want_eq { 0 } else { 1 }, 1));
+        }
+        // Width for default values when an element is unset.
+        let w = self
+            .module
+            .arrays
+            .get(&ln)
+            .map(|t| t.2)
+            .or_else(|| self.module.arrays.get(&rn).map(|t| t.2))
+            .unwrap_or(32);
+        let mut equal = true;
+        for i in 0..ls {
+            let lv = self
+                .get_signal_value_by_name(&format!("{}[{}]", ln, i))
+                .unwrap_or_else(|| Value::zero(w));
+            let rv = self
+                .get_signal_value_by_name(&format!("{}[{}]", rn, i))
+                .unwrap_or_else(|| Value::zero(w));
+            if lv.has_unknown() || rv.has_unknown() {
+                return Some(Value::new(1)); // X propagates
+            }
+            if lv != rv {
+                equal = false;
+            }
+        }
+        let res = if want_eq { equal } else { !equal };
+        Some(Value::from_u64(if res { 1 } else { 0 }, 1))
+    }
+
+    /// Resolve an expression to a dynamic-array / queue storage name, or None
+    /// if it does not name a dynamic array / queue. Handles bare formals /
+    /// locals (`q` registered in `dynamic_arrays`), and `<handle>#member`
+    /// collection properties (via [`Self::expr_assoc_name`]).
+    fn dyn_cmp_operand_name(&mut self, e: &Expression) -> Option<String> {
+        if let ExprKind::Ident(h) = &e.kind {
+            // A bare-identifier dyn array / queue formal or local registered
+            // in `dynamic_arrays`. Consult `this`-scoped members first so a
+            // member name hidden by an unrelated outer bare registration
+            // still resolves to its own `<handle>#member` storage.
+            let n = Self::resolve_hier_name_static(h, &self.module);
+            if self.module.dynamic_arrays.contains(&n) {
+                if let Some(m) = self.instance_assoc_member(&n) {
+                    return Some(m);
+                }
+                return Some(n);
+            }
+        }
+        let an = self.expr_assoc_name(e)?;
+        if self.is_associative_array(&an) {
+            return None;
+        }
+        Some(an)
     }
 
     /// IEEE 1800-2017 §11.4.5 / §7.2: `==` and `!=` on unpacked structs compare
