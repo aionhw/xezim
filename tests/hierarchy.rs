@@ -107,6 +107,8 @@ mod submodule_net_array_shapes;
 mod submodule_two_dim_array_element;
 #[path = "hierarchy/t_bound_queue_member_storage.rs"]
 mod t_bound_queue_member_storage;
+#[path = "hierarchy/t_bound_generic_value_param_argument.rs"]
+mod t_bound_generic_value_param_argument;
 #[path = "hierarchy/t_bound_member_collection_registration.rs"]
 mod t_bound_member_collection_registration;
 #[path = "hierarchy/t_bound_queue_value_param_chain.rs"]

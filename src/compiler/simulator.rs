@@ -3479,6 +3479,15 @@ pub struct Simulator {
     /// declared in `base_class` (so unrelated/inherited statics stay shared),
     /// giving each specialization its own cell (§8.25). None = shared cell.
     current_spec: Option<(String, String)>,
+    /// Active specialization scope CHAIN (innermost last): a parameterized
+    /// `C#(params)::method()` call (`eval_call`) sets `current_spec` to the
+    /// callee for the body, so a value-parameter reference in an ACTUAL
+    /// argument that belongs to an ENCLOSING specialization (e.g. `string
+    /// FIELD` of `uvm_utils` passed into `uvm_config_db#(uvm_object)::get`)
+    /// can no longer resolve through `current_spec` alone. This stack keeps
+    /// the CALLER specializations alive so value-param resolution can walk up
+    /// to them (§13.5.1: args evaluate in the caller's scope).
+    spec_scope_stack: Vec<(String, String)>,
     /// §28.11 gate FALL delays by signal id, from
     /// `ElaboratedModule::gate_fall_delays`. Empty unless some gate used the
     /// two-delay `#(rise, fall)` form with differing values.
@@ -7321,6 +7330,7 @@ impl Simulator {
             class_statics: HashMap::default(),
             local_type_stack: Vec::new(),
             current_spec: None,
+            spec_scope_stack: Vec::new(),
             gate_fall_delay_by_id: HashMap::default(),
             spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
             spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
@@ -85777,9 +85787,21 @@ impl Simulator {
         if let Some((ref base, ref sig)) = extracted {
             self.ensure_spec_statics(base, sig);
         }
-        self.current_spec = extracted.or(saved.clone());
+        // Execute the callee with `current_spec` = the CALLER'S spec so an
+        // actual arg that is an enclosing specialization's value parameter
+        // resolves in the caller's scope; the call's own specialization stays
+        // on the scope stack for the body/method-dispatch to key per-spec.
+        // (Innermost caller last — value-param resolution walks inward.)
+        if let Some(cs) = &saved {
+            self.spec_scope_stack.push(cs.clone());
+        }
+        let pushed = saved.is_some();
+        self.current_spec = extracted.clone().or(saved.clone());
         let r = self.eval_call_inner(func, args);
         self.current_spec = saved;
+        if pushed {
+            self.spec_scope_stack.pop();
+        }
         r
     }
 
@@ -85971,9 +85993,16 @@ impl Simulator {
                             {
                                 self.ensure_spec_statics(&base, &sig);
                                 let saved = self.current_spec.take();
+                                if let Some(cs) = &saved {
+                                    self.spec_scope_stack.push(cs.clone());
+                                }
                                 self.current_spec = Some((base.clone(), sig));
                                 let res = self.exec_static_method(&base, mname, args);
+                                let had_saved = saved.is_some();
                                 self.current_spec = saved;
+                                if had_saved {
+                                    self.spec_scope_stack.pop();
+                                }
                                 if let Some(v) = res {
                                     return v;
                                 }
@@ -86714,9 +86743,16 @@ impl Simulator {
                         if let Some((base, sig)) = self.extract_spec_from_string(&resolved) {
                             self.ensure_spec_statics(&base, &sig);
                             let saved = self.current_spec.take();
+                            if let Some(cs) = &saved {
+                                self.spec_scope_stack.push(cs.clone());
+                            }
                             self.current_spec = Some((base.clone(), sig));
                             let res = self.exec_static_method(&base, mname, args);
+                            let had_saved = saved.is_some();
                             self.current_spec = saved;
+                            if had_saved {
+                                self.spec_scope_stack.pop();
+                            }
                             if let Some(v) = res {
                                 return v;
                             }
@@ -86729,9 +86765,16 @@ impl Simulator {
                     if let Some((base, sig)) = self.extract_spec_from_string(&name) {
                         self.ensure_spec_statics(&base, &sig);
                         let saved = self.current_spec.take();
+                        if let Some(cs) = &saved {
+                            self.spec_scope_stack.push(cs.clone());
+                        }
                         self.current_spec = Some((base.clone(), sig));
                         let res = self.exec_static_method(&base, mname, args);
+                        let had_saved = saved.is_some();
                         self.current_spec = saved;
+                        if had_saved {
+                            self.spec_scope_stack.pop();
+                        }
                         if let Some(v) = res {
                             return v;
                         }
@@ -86751,9 +86794,16 @@ impl Simulator {
                     if let Some((base, sig)) = self.resolve_typedef_spec(&name) {
                         self.ensure_spec_statics(&base, &sig);
                         let saved = self.current_spec.take();
+                        if let Some(cs) = &saved {
+                            self.spec_scope_stack.push(cs.clone());
+                        }
                         self.current_spec = Some((base.clone(), sig));
                         let res = self.exec_static_method(&base, mname, args);
+                        let had_saved = saved.is_some();
                         self.current_spec = saved;
+                        if had_saved {
+                            self.spec_scope_stack.pop();
+                        }
                         if let Some(v) = res {
                             return v;
                         }
@@ -87948,10 +87998,17 @@ impl Simulator {
                         if let Some((base, sig)) = self.extract_spec_from_string(&resolved) {
                             self.ensure_spec_statics(&base, &sig);
                             let saved = self.current_spec.take();
+                            if let Some(cs) = &saved {
+                                self.spec_scope_stack.push(cs.clone());
+                            }
                             self.current_spec = Some((base.clone(), sig));
                             let m = method_name.clone();
                             let res = self.exec_static_method(&base, &m, args);
+                            let had_saved = saved.is_some();
                             self.current_spec = saved;
+                            if had_saved {
+                                self.spec_scope_stack.pop();
+                            }
                             if let Some(v) = res {
                                 return v;
                             }
@@ -87966,10 +88023,17 @@ impl Simulator {
                     if let Some((base, sig)) = self.extract_spec_from_string(obj_name) {
                         self.ensure_spec_statics(&base, &sig);
                         let saved = self.current_spec.take();
+                        if let Some(cs) = &saved {
+                            self.spec_scope_stack.push(cs.clone());
+                        }
                         self.current_spec = Some((base.clone(), sig));
                         let m = method_name.clone();
                         let res = self.exec_static_method(&base, &m, args);
+                        let had_saved = saved.is_some();
                         self.current_spec = saved;
+                        if had_saved {
+                            self.spec_scope_stack.pop();
+                        }
                         if let Some(v) = res {
                             return v;
                         }
@@ -87998,9 +88062,16 @@ impl Simulator {
                         let m = method_name.clone();
                         self.ensure_spec_statics(&base, &sig);
                         let saved = self.current_spec.take();
+                        if let Some(cs) = &saved {
+                            self.spec_scope_stack.push(cs.clone());
+                        }
                         self.current_spec = Some((base.clone(), sig));
                         let res = self.exec_static_method(&base, &m, args);
+                        let had_saved = saved.is_some();
                         self.current_spec = saved;
+                        if had_saved {
+                            self.spec_scope_stack.pop();
+                        }
                         if let Some(v) = res {
                             return v;
                         }
@@ -88108,9 +88179,16 @@ impl Simulator {
                         {
                             self.ensure_spec_statics(&base, &sig);
                             let saved = self.current_spec.take();
+                            if let Some(cs) = &saved {
+                                self.spec_scope_stack.push(cs.clone());
+                            }
                             self.current_spec = Some((base.clone(), sig));
                             let res = self.exec_static_method(&base, &mname3, args);
+                            let had_saved = saved.is_some();
                             self.current_spec = saved;
+                            if had_saved {
+                                self.spec_scope_stack.pop();
+                            }
                             if let Some(v) = res {
                                 return v;
                             }
@@ -92136,7 +92214,35 @@ impl Simulator {
         Some(m)
     }
 
+    /// Resolve a value parameter `name` against the ACTIVE specialization,
+    /// and if it is not declared there, against each ENCLOSING caller
+    /// specialization on `spec_scope_stack` (`eval_call` pushes the caller's
+    /// spec when it enters a parameterized `C#(params)::method`). §13.5.1: an
+    /// actual argument is evaluated in the CALLER's scope, so a value
+    /// parameter of an enclosing specialization (e.g. `string FIELD` of
+    /// `uvm_utils` passed into `uvm_config_db#(uvm_object)::get`) must
+    /// resolve to its bound value even though `current_spec` is the callee
+    /// while the args are bound.
     fn resolve_value_param_from_spec(&mut self, name: &str) -> Option<Value> {
+        if let Some(v) = self.resolve_value_param_in_current(name) {
+            return Some(v);
+        }
+        // Not declared by the leaf/callee spec — walk the caller chain,
+        // innermost first (nearest caller wins).
+        let chain: Vec<(String, String)> = self.spec_scope_stack.clone();
+        for cs in chain.iter().rev() {
+            let saved = self.current_spec.clone();
+            self.current_spec = Some(cs.clone());
+            let v = self.resolve_value_param_in_current(name);
+            self.current_spec = saved;
+            if v.is_some() {
+                return v;
+            }
+        }
+        None
+    }
+
+    fn resolve_value_param_in_current(&mut self, name: &str) -> Option<Value> {
         // Cycle guard: a value param's specialization argument can itself
         // be a bare name that resolves back into value-param resolution for
         // the same class/specialization (e.g. class factories, where a
