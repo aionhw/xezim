@@ -113,6 +113,8 @@ mod t_bound_generic_value_param_argument;
 mod t_bound_member_collection_registration;
 #[path = "hierarchy/t_bound_queue_value_param_chain.rs"]
 mod t_bound_queue_value_param_chain;
+#[path = "hierarchy/t_no_parens_static_method.rs"]
+mod t_no_parens_static_method;
 #[path = "hierarchy/wildcard_import_shadow.rs"]
 mod wildcard_import_shadow;
 

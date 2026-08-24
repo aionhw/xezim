@@ -47863,6 +47863,24 @@ impl Simulator {
                                 .signal_name_to_id
                                 .contains_key(self.resolve_hier_name(hier).as_str())
                         {
+                            // `Class::method` with NO parens invokes a
+                            // parameterless STATIC function (LRM §13.4.1: a
+                            // no-arg function may be called by name alone).
+                            // e.g. UVM's `TYPE::type_name` in `uvm_misc`
+                            // where `type_name` is `static function string
+                            // type_name();`. Previously the flat 2-segment
+                            // ident fell through `class_static_get` (which
+                            // only reads static PROPERTIES), so the call
+                            // returned garbage instead of invoking
+                            // `comp_b::type_name()`. If it's a parameterless
+                            // static function, invoke it and return its result.
+                            if self.is_static_method(cls, prop)
+                                && self.class_parameterless_function(cls, prop)
+                            {
+                                if let Some(v) = self.exec_static_method(cls, prop, &[]) {
+                                    return v;
+                                }
+                            }
                             if let Some(v) = self.class_static_get(cls, prop) {
                                 return v;
                             }
@@ -52593,6 +52611,24 @@ impl Simulator {
                             && !self.signal_name_to_id.contains_key(cls.as_str())
                             && !self.signals.contains_key(cls)
                         {
+                            // `Class::method` with NO parens invokes a
+                            // parameterless STATIC function (LRM §13.4.1) —
+                            // the MemberAccess twin of the flat-2-segment
+                            // `Class::method` handling in the Ident arm. UVM's
+                            // `TYPE::type_name` (in `uvm_misc`) parses as
+                            // MemberAccess{`TYPE`, type_name}; the previous
+                            // `class_static_get` only read static PROPERTIES,
+                            // so the call came back empty instead of invoking
+                            // `comp_b::type_name()`.
+                            if self.is_static_method(cls, &member.name)
+                                && self.class_parameterless_function(cls, &member.name)
+                            {
+                                if let Some(v) =
+                                    self.exec_static_method(cls, &member.name, &[])
+                                {
+                                    return v;
+                                }
+                            }
                             if let Some(v) = self.class_static_get(cls, &member.name) {
                                 return v;
                             }
