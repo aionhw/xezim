@@ -869,6 +869,16 @@ fn simulate_multi_inner(
     sim.fst_file = fst_file.map(|s| s.to_string());
     sim.fst_scopes = fst_scopes.to_vec();
     sim.set_plusargs(plusargs);
+    // Clamp threads to available parallelism with warning (mirrors main.rs logic)
+    let avail = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    let threads = if threads > avail {
+        eprintln!("[xezim][warning] --threads {} clamped to available parallelism ({})", threads, avail);
+        avail
+    } else {
+        threads
+    };
     sim.set_threads(threads);
     // Default argv for vpi_get_vlog_info — the real CLI passes the
     // full tokenized list via set_args() in main.rs. Here we hand

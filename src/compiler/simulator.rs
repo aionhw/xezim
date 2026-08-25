@@ -7916,8 +7916,33 @@ impl Simulator {
     /// Configure the worker-thread count. `n >= 2` enables the background
     /// VCD writer thread; `n == 1` keeps the dump path inline.
     pub fn set_threads(&mut self, n: usize) {
-        self.threads = n.max(1);
+        self.threads = n;
         self.pdes_worker_pool = None;
+    }
+
+    /// Centralized worker cap for internal dispatch paths.
+    ///
+    /// The CLI `--threads` value (stored in `self.threads`) is the user's
+    /// requested thread count. The internal dispatch caps at 8 workers based
+    /// on measured performance (persistent-worker path measured slower than
+    /// the scoped path on c910), but never exceeds the user's request.
+    ///
+    /// Returns the effective worker count for dispatch: min(user_request, 8),
+    /// with a floor of 1. On machines where available_parallelism() fails,
+    /// defaults to 2 workers (preserving the previous .unwrap_or(2) behavior).
+    fn safe_worker_cap(&self, bound: usize) -> usize {
+        let avail = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        self.threads.min(avail).min(8).min(bound).max(1)
+    }
+
+    /// Variant for callers without a natural bound (e.g., BSP settle).
+    fn safe_worker_cap_unbounded(&self) -> usize {
+        let avail = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        self.threads.min(avail).min(8).max(1)
     }
 
     /// Reuse the runtime-neutral combinational worklist associated with an
@@ -40107,9 +40132,7 @@ impl Simulator {
                     chunks.retain(|c| !c.is_empty());
                 } else {
                     self.prof_par_dispatch_legacy += 1;
-                    let num_threads = std::thread::available_parallelism()
-                        .map(|n| n.get().min(block_slices.len()).min(8))
-                        .unwrap_or(2);
+                    let num_threads = self.safe_worker_cap(block_slices.len());
                     let chunk_size = block_slices.len().div_ceil(num_threads);
                     chunks = block_slices
                         .chunks(chunk_size)
@@ -40233,10 +40256,7 @@ impl Simulator {
                         // Experimental: persistent workers avoid OS-thread
                         // spawn, but current c910 measurements are slower
                         // than the scoped path. Keep opt-in for comparison.
-                        let worker_count = std::thread::available_parallelism()
-                            .map(|n| n.get().min(sub_chunks.len()).min(8))
-                            .unwrap_or(2)
-                            .max(1);
+                        let worker_count = self.safe_worker_cap(sub_chunks.len());
                         let recreate_pool = self
                             .pdes_worker_pool
                             .as_ref()
@@ -41436,11 +41456,7 @@ impl Simulator {
                     if par_scratch.len() >= self.bsp_par_threshold {
                         self.entry_evals += par_scratch.len() as u64;
                         dirtied.clear();
-                        let nthreads = std::thread::available_parallelism()
-                            .map(|x| x.get().min(8))
-                            .unwrap_or(2)
-                            .min(par_scratch.len())
-                            .max(1);
+                        let nthreads = self.safe_worker_cap(par_scratch.len());
                         let chunk = par_scratch.len().div_ceil(nthreads);
                         let view_ptr = view.as_mut_ptr() as usize;
                         let view_len = view.len();
