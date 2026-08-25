@@ -12,14 +12,17 @@
 //! and the whole pass is validated to hold the static-suite baseline (1005).
 
 use xezim_core::ast::decl::{
-    ClassDeclaration, ClassItem, ClassMethodKind, ClassQualifier, ModuleItem, TypedefDeclaration,
+    ClassDeclaration, ClassItem, ClassMethodKind, ClassQualifier, ModuleItem, ParameterDeclaration,
+    TypedefDeclaration,
 };
 use xezim_core::ast::expr::{
     AssignmentPatternItem, Expression, ExprKind, NumberBase, NumberLiteral, RangeKind,
 };
-use xezim_core::ast::stmt::{Statement, StatementKind, VarDeclarator};
+use xezim_core::ast::module::{AnsiPort, PortList};
+use xezim_core::ast::stmt::{CaseItem, CaseKind, ForInit, Statement, StatementKind, UniquePriority,
+                            VarDeclarator};
 use xezim_core::ast::types::{
-    DataType, EnumType, IntegerAtomType, PackedDimension, Signing, UnpackedDimension,
+    DataType, EnumType, IntegerAtomType, PackedDimension, PortDirection, Signing, UnpackedDimension,
 };
 use xezim_core::elaborate::ElaboratedModule;
 use xezim_core::SourceDefinition;
@@ -49,10 +52,12 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     check_module_item(it, elab, &local_types, &mut errs);
                 }
                 check_proc_net_assign(&m.items, &mut errs);
+                check_untyped_port_net_assign(&m.ports, &m.items, &mut errs);
                 check_enum_assign(&m.items, elab, &mut errs);
                 check_dynarray_assign(&m.items, elab, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
+                check_param_class_scope(&m.items, elab, &mut errs);
                 check_instantiations(&m.items, &port_map, &mut errs);
                 check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
             }
@@ -62,8 +67,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 for it in &m.items {
                     check_module_item(it, elab, &local_types, &mut errs);
                 }
+                check_untyped_port_net_assign(&m.ports, &m.items, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
+                check_param_class_scope(&m.items, elab, &mut errs);
                 check_instantiations(&m.items, &port_map, &mut errs);
                 check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
             }
@@ -73,8 +80,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 for it in &m.items {
                     check_module_item(it, elab, &local_types, &mut errs);
                 }
+                check_untyped_port_net_assign(&m.ports, &m.items, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
+                check_param_class_scope(&m.items, elab, &mut errs);
                 check_program_items(&m.items, &mut errs);
                 check_instantiations(&m.items, &port_map, &mut errs);
                 check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
@@ -175,7 +184,6 @@ fn check_output_port_defaults(
     ports: &[xezim_core::ast::decl::FunctionPort],
     errs: &mut Vec<String>,
 ) {
-    use xezim_core::ast::types::PortDirection;
     for p in ports {
         if p.default.is_some() && matches!(p.direction, PortDirection::Output | PortDirection::Inout)
         {
@@ -275,6 +283,263 @@ fn check_proc_net_assign(items: &[ModuleItem], errs: &mut Vec<String>) {
                     errs.push(format!(
                         "net '{}' is the target of a procedural assignment (LRM 1800-2017 \
                          §6.5 — nets need a continuous assignment)",
+                        b
+                    ));
+                }
+            }
+        });
+    }
+}
+
+/// §8.25: reject unadorned parameterized class scope resolution (`par_cls::b`).
+/// Legal form must specialize explicitly: `par_cls#()::b` or `par_cls#(15)::b`.
+/// The AST distinguishes the two: the legal form's `MemberAccess` base is a
+/// `Specialization`, the illegal form's base is a bare single-segment `Ident`.
+/// We walk every statement/continuous-assign expression and fire only when that
+/// base names a class whose HEADER `#(...)` list is non-empty
+/// (`param_order` / `type_param_names`). Body-only localparams do NOT
+/// parameterize a class, so UVM-style static-call initializers are untouched.
+fn check_param_class_scope(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut Vec<String>) {
+    use std::collections::HashSet;
+
+    // Collect parameterized class names from this module/interface/program
+    let mut param_classes: HashSet<String> = HashSet::new();
+    for it in items {
+        if let ModuleItem::ClassDeclaration(c) = it {
+            // A class is parameterized if its params list is non-empty
+            if !c.params.is_empty() {
+                param_classes.insert(c.name.name.clone());
+            }
+        }
+    }
+    if param_classes.is_empty() {
+        return;
+    }
+
+    // Walk all expressions in statements and continuous assigns
+    fn walk_expr_rec(
+        e: &Expression,
+        param_classes: &HashSet<String>,
+        errs: &mut Vec<String>,
+    ) {
+        match &e.kind {
+            ExprKind::MemberAccess { expr, .. } => {
+                // Check if base is a bare Ident naming a parameterized class
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 {
+                        let base = &h.path[0].name.name;
+                        if param_classes.contains(base) {
+                            // Found unadorned parameterized class scope resolution
+                            errs.push(format!(
+                                "parameterized class '{}' used as scope prefix without specialization \
+                                 (LRM 1800-2017 §8.25 — must write '{}#()' or '{}#(...)')",
+                                base, base, base
+                            ));
+                        }
+                    }
+                }
+                walk_expr_rec(expr, param_classes, errs);
+            }
+            ExprKind::Index { expr, .. }
+            | ExprKind::RangeSelect { expr, .. }
+            | ExprKind::Paren(expr) => {
+                walk_expr_rec(expr, param_classes, errs);
+            }
+            ExprKind::Call { func, args, .. } => {
+                walk_expr_rec(func, param_classes, errs);
+                for arg in args {
+                    walk_expr_rec(arg, param_classes, errs);
+                }
+            }
+            ExprKind::SystemCall { args, .. } => {
+                for arg in args {
+                    walk_expr_rec(arg, param_classes, errs);
+                }
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                walk_expr_rec(condition, param_classes, errs);
+                walk_expr_rec(then_expr, param_classes, errs);
+                walk_expr_rec(else_expr, param_classes, errs);
+            }
+            ExprKind::Binary { left, right, .. } => {
+                walk_expr_rec(left, param_classes, errs);
+                walk_expr_rec(right, param_classes, errs);
+            }
+            ExprKind::Unary { operand, .. } => {
+                walk_expr_rec(operand, param_classes, errs);
+            }
+            ExprKind::Concatenation(exprs) => {
+                for e in exprs {
+                    walk_expr_rec(e, param_classes, errs);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                walk_expr_rec(count, param_classes, errs);
+                for e in exprs {
+                    walk_expr_rec(e, param_classes, errs);
+                }
+            }
+            ExprKind::AssignmentPattern(items) => {
+                for item in items {
+                    walk_expr_rec(item.expr(), param_classes, errs);
+                }
+            }
+            ExprKind::Inside { expr, ranges } => {
+                walk_expr_rec(expr, param_classes, errs);
+                for r in ranges {
+                    walk_expr_rec(r, param_classes, errs);
+                }
+            }
+            ExprKind::Specialization { base, .. } => {
+                walk_expr_rec(base, param_classes, errs);
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_stmt_rec(
+        stmt: &Statement,
+        param_classes: &HashSet<String>,
+        errs: &mut Vec<String>,
+    ) {
+        match &stmt.kind {
+            xezim_core::ast::stmt::StatementKind::BlockingAssign { lvalue, rvalue, .. }
+            | xezim_core::ast::stmt::StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+                walk_expr_rec(lvalue, param_classes, errs);
+                walk_expr_rec(rvalue, param_classes, errs);
+            }
+            xezim_core::ast::stmt::StatementKind::If { condition, then_stmt, else_stmt, .. } => {
+                walk_expr_rec(condition, param_classes, errs);
+                walk_stmt_rec(then_stmt, param_classes, errs);
+                if let Some(e) = else_stmt {
+                    walk_stmt_rec(e, param_classes, errs);
+                }
+            }
+            xezim_core::ast::stmt::StatementKind::Case { expr, items, .. } => {
+                walk_expr_rec(expr, param_classes, errs);
+                for arm in items {
+                    // CaseItem has `patterns` not `expr`
+                    for pat in &arm.patterns {
+                        walk_expr_rec(pat, param_classes, errs);
+                    }
+                    if let Some(guard) = &arm.guard {
+                        walk_expr_rec(guard, param_classes, errs);
+                    }
+                    walk_stmt_rec(&arm.stmt, param_classes, errs);
+                }
+            }
+            xezim_core::ast::stmt::StatementKind::For { init, condition, step, body, .. } => {
+                for i in init {
+                    match i {
+                        xezim_core::ast::stmt::ForInit::VarDecl { init, .. }
+                        | xezim_core::ast::stmt::ForInit::Assign { rvalue: init, .. } => {
+                            walk_expr_rec(init, param_classes, errs);
+                        }
+                    }
+                }
+                if let Some(cond) = condition {
+                    walk_expr_rec(cond, param_classes, errs);
+                }
+                for s in step {
+                    walk_expr_rec(s, param_classes, errs);
+                }
+                walk_stmt_rec(body, param_classes, errs);
+            }
+            xezim_core::ast::stmt::StatementKind::Foreach { array, body, .. } => {
+                walk_expr_rec(array, param_classes, errs);
+                walk_stmt_rec(body, param_classes, errs);
+            }
+            xezim_core::ast::stmt::StatementKind::Forever { body } => {
+                walk_stmt_rec(body, param_classes, errs);
+            }
+            xezim_core::ast::stmt::StatementKind::SeqBlock { stmts, .. }
+            | xezim_core::ast::stmt::StatementKind::ParBlock { stmts, .. } => {
+                for s in stmts {
+                    walk_stmt_rec(s, param_classes, errs);
+                }
+            }
+            xezim_core::ast::stmt::StatementKind::TimingControl { stmt, .. }
+            | xezim_core::ast::stmt::StatementKind::Wait { stmt, .. } => {
+                walk_stmt_rec(stmt, param_classes, errs);
+            }
+            xezim_core::ast::stmt::StatementKind::Expr(e) => {
+                walk_expr_rec(e, param_classes, errs);
+            }
+            _ => {}
+        }
+    }
+
+    // Walk all procedural statements and continuous assigns
+    for it in items {
+        match it {
+            ModuleItem::AlwaysConstruct(a) => {
+                walk_stmt_rec(&a.stmt, &param_classes, errs);
+            }
+            ModuleItem::InitialConstruct(a) => {
+                walk_stmt_rec(&a.stmt, &param_classes, errs);
+            }
+            ModuleItem::ContinuousAssign(ca) => {
+                for (lvalue, rvalue) in &ca.assignments {
+                    walk_expr_rec(lvalue, &param_classes, errs);
+                    walk_expr_rec(rvalue, &param_classes, errs);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// §23.2.2.3, §6.5: reject procedural assignment to untyped ANSI output/inout ports.
+/// An ANSI output/inout port with an omitted or implicit data type defaults to a NET
+/// of default net type; procedural assignment (`=`/`<=`) to such a net is illegal (§6.5).
+/// A port explicitly typed with `logic`/`var` or completed by a body DataDeclaration
+/// is a variable and legal.
+fn check_untyped_port_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<String>) {
+    use std::collections::HashSet;
+
+    let mut untyped_net_ports: HashSet<String> = HashSet::new();
+
+    if let PortList::Ansi(ps) = ports {
+        for p in ps {
+            // Only output/inout ports
+            if matches!(p.direction, Some(PortDirection::Output | PortDirection::Inout)) {
+                // Check if port is untyped: no var_kw, no data_type, no net_type
+                if !p.var_kw && p.data_type.is_none() && p.net_type.is_none() {
+                    // Also check if body has a DataDeclaration completing this port
+                    let mut completed_by_body = false;
+                    for it in items {
+                        if let ModuleItem::DataDeclaration(d) = it {
+                            if d.declarators.iter().any(|decl| decl.name.name == p.name.name) {
+                                completed_by_body = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !completed_by_body {
+                        untyped_net_ports.insert(p.name.name.clone());
+                    }
+                }
+            }
+        }
+    }
+    if untyped_net_ports.is_empty() {
+        return;
+    }
+
+    let mut flagged: HashSet<String> = HashSet::new();
+    for it in items {
+        let stmt = match it {
+            ModuleItem::AlwaysConstruct(a) => &a.stmt,
+            ModuleItem::InitialConstruct(i) => &i.stmt,
+            ModuleItem::FinalConstruct(_) => continue,
+            _ => continue,
+        };
+        for_each_proc_assign_lhs(stmt, &mut |lv| {
+            if let Some(b) = base_ident(lv) {
+                if untyped_net_ports.contains(&b) && flagged.insert(b.clone()) {
+                    errs.push(format!(
+                        "untyped output/inout port '{}' is the target of a procedural assignment \
+                         (LRM 1800-2017 §23.2.2.3 + §6.5 — defaults to net type, needs continuous assignment)",
                         b
                     ));
                 }
@@ -1718,7 +1983,6 @@ fn check_new_array_target(dt: &DataType, decl: &VarDeclarator, errs: &mut Vec<St
 // ---------------------------------------------------------------------------
 
 use std::collections::{HashMap, HashSet};
-use xezim_core::ast::module::PortList;
 
 /// Set of declared port names for a module/interface/program, or None when the
 /// port list is empty/unknown (so no connection is ever flagged against it).
