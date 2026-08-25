@@ -51906,6 +51906,16 @@ impl Simulator {
                                 {
                                     return Value::from_string(&format!("class {}", n));
                                 }
+                                // A bare TYPEDEF name: render its underlying type
+                                // (§20.6.1), e.g. `typedef reg signed[4095:0]
+                                // bitstream_t;` -> "reg signed[4095:0]". Previously
+                                // this fell through to the scalar-signal branch (no
+                                // match) and the final "logic" default.
+                                if let Some(dt) = self.lookup_typedef_target(n) {
+                                    return Value::from_string(
+                                        &self.format_data_typename(&dt),
+                                    );
+                                }
                             }
                             let name = self.resolve_hier_name(hier);
                             if self.signal_name_to_id.contains_key(name.as_str()) {
@@ -102451,6 +102461,79 @@ impl Simulator {
         None
     }
 
+    /// Render a `DataType` (the target of a typedef, or a type param bound)
+    /// as a `$typename`-style string for a non-class type (IEEE 1800-2017
+    /// §20.6.1): `reg signed[4095:0]`, `logic [7:0]`, `int`, `real`, ….
+    /// Packed ranges are const-evaluated against the module parameters so a
+    /// parameterized width (`logic [W-1:0]`) renders concretely.
+    fn format_data_typename(&self, dt: &crate::ast::types::DataType) -> String {
+        use crate::ast::types::{DataType, IntegerAtomType, IntegerVectorType, PackedDimension, RealType, SimpleType, Signing};
+        let name_of = |ivt| match ivt {
+            IntegerVectorType::Bit => "bit",
+            IntegerVectorType::Logic => "logic",
+            IntegerVectorType::Reg => "reg",
+        };
+        let atom = |at: IntegerAtomType| match at {
+            IntegerAtomType::Byte => "byte",
+            IntegerAtomType::ShortInt => "shortint",
+            IntegerAtomType::Int => "int",
+            IntegerAtomType::LongInt => "longint",
+            IntegerAtomType::Integer => "integer",
+            IntegerAtomType::Time => "time",
+        };
+        let signed_suffix = |s: &Option<Signing>| match s {
+            Some(Signing::Signed) => " signed",
+            _ => "",
+        };
+        let dims_str = |dims: &[PackedDimension]| -> String {
+            let mut s = String::new();
+            for d in dims {
+                if let PackedDimension::Range { left, right, .. } = d {
+                    let l = crate::elaborate::const_eval_i64_with_params(left, Some(&self.module.parameters));
+                    let r = crate::elaborate::const_eval_i64_with_params(right, Some(&self.module.parameters));
+                    if let (Some(l), Some(r)) = (l, r) {
+                        s.push_str(&format!("[{}:{}]", l, r));
+                        continue;
+                    }
+                }
+                s.push_str("[]");
+            }
+            s
+        };
+        match dt {
+            DataType::IntegerVector { kind, signing, dimensions, .. } => {
+                let mut s = format!("{}{}", name_of(*kind), signed_suffix(signing));
+                s.push_str(&dims_str(dimensions));
+                s
+            }
+            DataType::IntegerAtom { kind, signing, .. } => {
+                format!("{}{}", atom(*kind), signed_suffix(signing))
+            }
+            DataType::Real { kind, .. } => match kind {
+                RealType::Real => "real".to_string(),
+                RealType::ShortReal => "shortreal".to_string(),
+                RealType::RealTime => "realtime".to_string(),
+            },
+            DataType::Simple { kind, .. } => match kind {
+                SimpleType::String => "string".to_string(),
+                SimpleType::Chandle => "chandle".to_string(),
+                SimpleType::Event => "event".to_string(),
+            },
+            DataType::Void(_) => "void".to_string(),
+            // A typedef to another typedef — resolve once more.
+            DataType::TypeReference { name, .. } => {
+                if let Some(dt) = self.lookup_typedef_target(&name.name.name) {
+                    self.format_data_typename(&dt)
+                } else {
+                    name.name.name.as_str().to_string()
+                }
+            }
+            // Class / struct / enum / interface typedef aliases are handled by
+            // their name branches; render the parsed name text if reachable.
+            other => format!("{:?}", other),
+        }
+    }
+
     /// Format a RESOLVED type-parameter BINDING (the concrete type a bare
     /// class type parameter `T` collapsed to) as a `$typename` string. The
     /// binding is a string like `string`, `int`, `Base`, or `base#(args)`;
@@ -102495,10 +102578,13 @@ impl Simulator {
         {
             return format!("class {}", b);
         }
-        // Not a class: a builtin was handled above, so this is a typedef to a
-        // non-class type (e.g. `uvm_bitstream_t` -> `reg signed[4095:0]`) whose
-        // underlying type xezim cannot yet render here. Leave it BARE rather
-        // than mislabelling it as a class.
+        // A bare typedef to a non-class type (e.g. `uvm_bitstream_t` ->
+        // `reg signed[4095:0]`): render its underlying type.
+        if let Some(dt) = self.lookup_typedef_target(&b) {
+            return self.format_data_typename(&dt);
+        }
+        // Not a class or a known typedef — leave the bound bare rather than
+        // mislabelling it as a class.
         b.to_string()
     }
 

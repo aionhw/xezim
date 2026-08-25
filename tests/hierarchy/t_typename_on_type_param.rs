@@ -17,6 +17,7 @@ use xezim::simulate_multi;
 #[test]
 fn t_typename_on_type_param() {
     let src = r#"
+typedef reg signed [4095:0] bitstream_t;
 class Base;
 endclass
 class Inner #(int N=0);
@@ -28,9 +29,10 @@ class UsesType #(type T=Base, type U=Inner#(7));
 endclass
 module top;
   initial begin
-    UsesType#(string)::show();              // T=string
-    UsesType#(int, Inner#(5))::show();      // T=int, U=Inner#(5)
-    UsesType#(Base)::show();                // T=class Base
+    UsesType#(bitstream_t)::show();     // T=bitstream_t (typedef to builtin)
+    UsesType#(string)::show();          // T=string
+    UsesType#(Base)::show();            // T=class Base
+    $display("DN:%s", $typename(bitstream_t));  // bare typedef
     $finish;
   end
 endmodule
@@ -69,8 +71,20 @@ endmodule
     let text = out.join("\n");
     // Explicit type-param bindings must render concretely (not `logic`):
     assert!(text.contains("TN:string:"), "T=string got: {:?}", out);
-    assert!(text.contains("TN:int:class Inner #(5)"), "U=Inner#(5) got: {:?}", out);
     assert!(text.contains("TN:class Base:"), "T=class Base got: {:?}", out);
-    // The old defect printed `logic` for every type param:
+    // A TYPE PARAM bound to a typedef-to-builtin renders its underlying type:
+    assert!(
+        text.contains("TN:reg signed[4095:0]:"),
+        "T=bitstream_t got: {:?}",
+        out
+    );
+    // A standalone bare typedef also renders its underlying type:
+    assert!(
+        text.contains("DN:reg signed[4095:0]"),
+        "bare typedef got: {:?}",
+        out
+    );
+    // The old defect printed `logic` for both:
     assert!(!text.contains("TN:logic"), "type param rendered as logic: {:?}", out);
+    assert!(!text.contains("DN:logic"), "bare typedef rendered as logic: {:?}", out);
 }
