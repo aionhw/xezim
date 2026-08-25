@@ -229,3 +229,89 @@ endmodule
     assert!(out.contains("T2_GET: 77"), "wildcard get: {}", out);
     assert!(out.contains("T3_OK"), "unset field should miss: {}", out);
 }
+
+/// A type argument that is a SPECIALIZATION of the enclosing class's own
+/// value parameter (`comp#(N)` in a method of `comp#(N)`) or one of its local
+/// type aliases (`sc_type`) must resolve through the ACTIVE specialization
+/// when it becomes a generic class's type binding.
+///
+/// `uvm_callback_iter#(comp#(N), sc_type)` inside `comp#(N)`'s dispatch
+/// previously recorded the iterator's `(T, CB)` bindings as the SYMBOLIC
+/// `comp#(N)`/`sc_type` instead of the concrete `comp#(1)`/`special_cb#(1)`.
+/// `uvm_callbacks#(T,CB)::get()` then keyed a DIFFERENT per-spec typeid/static
+/// cell than the `uvm_callbacks#(comp#(1), special_cb#(1))::add(null, cb)`
+/// that registered the callback, so the typewide callback was never seen and
+/// returned zero entries. (UVM's `09callbacks/25params` and `30iterate` pull
+/// exactly this pattern from the `uvm_do_callbacks` macro.)
+///
+/// Each value specialization must get exactly its own callback. Verified
+/// byte-for-byte against a commercial simulator: `P25_PASS`. Without the fix
+/// this self-test FAILs (`c1sz=0 c2sz=0`).
+#[test]
+fn test_params_callback_dispatch() {
+    const TEST_NAME: &str = "test_params_callback_dispatch";
+    let src = r#"
+`include "uvm_macros.svh"
+module top;
+import uvm_pkg::*;
+
+virtual class special_cb #(int N=0) extends uvm_callback;
+  function new(string name="special_cb"); super.new(name); endfunction
+  virtual function void fire(ref string q[$], input int n); endfunction
+endclass
+
+class comp #(int N=0) extends uvm_component;
+  string q[$];
+  typedef comp#(N) comp_type;
+  typedef special_cb#(N) sc_type;
+  function new(string n, uvm_component p=null); super.new(n,p); endfunction
+  `uvm_component_utils(comp)
+  `uvm_register_cb(comp_type, sc_type)
+  virtual function void do_fire();
+    uvm_callback_iter#(comp#(N), sc_type) it = new(this);
+    special_cb#(N) cb = it.first();
+    while (cb != null) begin
+      cb.fire(q, N);
+      cb = it.next();
+    end
+  endfunction
+endclass
+
+class my_sc #(int N=0) extends special_cb#(N);
+  string m_id;
+  function new(string id); m_id=id; endfunction
+  virtual function void fire(ref string q[$], input int n);
+    q.push_back($sformatf("my#(%0d)_%0d_%s", N, n, m_id));
+  endfunction
+endclass
+
+initial begin
+  comp#(1) c1 = new("c1");
+  comp#(2) c2 = new("c2");
+  begin
+    my_sc#(1) s1 = new("x1");
+    my_sc#(2) s2 = new("x2");
+    uvm_callbacks#(comp#(1), special_cb#(1))::add(null, s1);
+    uvm_callbacks#(comp#(2), special_cb#(2))::add(null, s2);
+  end
+  c1.do_fire();
+  c2.do_fire();
+  if (c1.q.size()==1 && c1.q[0]=="my#(1)_1_x1" && c2.q.size()==1 && c2.q[0]=="my#(2)_2_x2")
+    $display("P25_PASS");
+  else begin
+    $display("P25_FAIL c1sz=%0d c2sz=%0d", c1.q.size(), c2.q.size());
+    foreach(c1.q[i]) $display("  c1[%0d]=%s", i, c1.q[i]);
+    foreach(c2.q[i]) $display("  c2[%0d]=%s", i, c2.q[i]);
+  end
+  $finish;
+end
+endmodule
+"#;
+    let Some(out) = run_in_process(src) else {
+        skip_no_uvm(TEST_NAME);
+        return;
+    };
+    println!("{}", out);
+    assert!(out.contains("P25_PASS"), "parameterized callback must dispatch per-spec: {}", out);
+    assert!(!out.contains("P25_FAIL"), "got P25_FAIL: {}", out);
+}

@@ -93397,10 +93397,42 @@ impl Simulator {
                     // parameterized context (`uvm_resource#(T)` where `T` is
                     // config_db's own param) — resolve it to the concrete type so
                     // the instance's binding is `T -> int`, not `T -> T`.
-                    bound = Some(
-                        self.resolve_type_param_binding(&concrete)
-                            .unwrap_or(concrete),
-                    );
+                    let mut by_name = self
+                        .resolve_type_param_binding(&concrete)
+                        .unwrap_or(concrete);
+                    // A SPECIALIZED type argument `Comp#(N)` whose args reference
+                    // the ENCLOSING class's own value/type params (a callback
+                    // iter `uvm_callback_iter#(comp#(N), sp_cb_type)` inside
+                    // `comp#(N)`'s run_phase) must be resolved through the ACTIVE
+                    // specialization — otherwise the recorded binding stays the
+                    // symbolic `comp#(N)`/`sp_cb_type` and the instance keys a
+                    // DIFFERENT per-spec static/typeid cell than `add` does.
+                    // `resolve_type_param_binding` only handles a BARE param
+                    // name, so a `base#(args)` binding falls through to the raw
+                    // string; route it through `resolve_call_spec_params`, which
+                    // substitutes each param from the enclosing spec. A bare
+                    // TYPEDEF alias (`sp_cb_type`) is likewise followed to its
+                    // concrete specialization so the CB binding matches `add`'s
+                    // literal `special_cb#(1)`.
+                    let encl_spec = self.current_spec.clone();
+                    if by_name.contains('#') {
+                        if let Some((rb, rs)) = self.resolve_call_spec_params(
+                            self.extract_spec_from_string(&by_name),
+                            &encl_spec,
+                        ) {
+                            by_name = format!("{}#({})", rb, rs);
+                        }
+                    } else if !by_name.contains('.') {
+                        if let Some((tb, ts)) = self.resolve_typedef_spec(&by_name) {
+                            if let Some((rb, rs)) = self.resolve_call_spec_params(
+                                Some((tb.clone(), ts.clone())),
+                                &encl_spec,
+                            ) {
+                                by_name = format!("{}#({})", rb, rs);
+                            }
+                        }
+                    }
+                    bound = Some(by_name);
                 }
             } else if spec_targets_this {
                 // No explicit type_args carried this param, but the active
