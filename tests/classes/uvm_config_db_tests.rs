@@ -315,3 +315,74 @@ endmodule
     assert!(out.contains("P25_PASS"), "parameterized callback must dispatch per-spec: {}", out);
     assert!(!out.contains("P25_FAIL"), "got P25_FAIL: {}", out);
 }
+
+/// An instance-specific EVENT callback dispatched from `uvm_event#(T)::trigger`
+/// must fire exactly ONCE per trigger.
+///
+/// Two xezim bugs broke this together (09callbacks/90Mantis/6033):
+///  1) a PARAMETERIZED static task (`tester#(T)::do_it`) ran its inlined
+///     blocking body with NO active specialization (`current_spec`), so
+///     `my_cb#(T)`/`uvm_event#(T)` inside the body kept `T` SYMBOLIC and the
+///     callback never dispatched (pre_trigger_count stayed 0);
+///  2) `foreach (cb_q[i]) skip += cb_q[i].pre_trigger(...)` ran the method
+///     TWICE — `infer_width` of the `+` operand evaluated the queue-element
+///     method to read its width, then the value path ran it again
+///     (pre_trigger_count was 2x).
+/// `my_cb::pre_trigger` returns `(count % 2)` to block every OTHER trigger, so
+/// exactly ONE trigger must yield pre=1 post=0. Verified byte-for-byte against
+/// a commercial simulator: `RESULT qsz=1 pre=1 post=0`.
+#[test]
+fn test_event_callback_fires_once() {
+    const TEST_NAME: &str = "test_event_callback_fires_once";
+    let src = r#"
+`include "uvm_macros.svh"
+module top;
+  import uvm_pkg::*;
+
+  class my_cb #(type T=uvm_object) extends uvm_event_callback#(T);
+    int pre_count;
+    int post_count;
+    function new(string name="unnamed"); super.new(name); endfunction
+    virtual function bit pre_trigger(uvm_event#(T) e, T data);
+      pre_count++;
+      return (pre_count % 2);
+    endfunction
+    virtual function void post_trigger(uvm_event#(T) e, T data);
+      post_count++;
+    endfunction
+  endclass
+
+  class tester #(type T=uvm_object);
+    typedef uvm_event#(T) event_type;
+    typedef uvm_event_callback#(T) cb_type;
+    typedef my_cb#(T) my_type;
+    typedef uvm_callbacks#(event_type, cb_type) cbs;
+    static task do_it();
+      event_type evt = new("evt");
+      my_type cb = new("cb");
+      cb_type cb_q[$];
+      cbs::add(evt, cb);
+      #1;
+      evt.trigger();
+      cbs::get_all(cb_q, evt);
+      $display("RESULT qsz=%0d pre=%0d post=%0d", cb_q.size(), cb.pre_count, cb.post_count);
+    endtask
+  endclass
+
+  initial begin
+    tester#(uvm_object)::do_it();
+    $finish;
+  end
+endmodule
+"#;
+    let Some(out) = run_in_process(src) else {
+        skip_no_uvm(TEST_NAME);
+        return;
+    };
+    println!("{}", out);
+    assert!(
+        out.contains("RESULT qsz=1 pre=1 post=0"),
+        "single event trigger must run the instance callback exactly once: {}",
+        out
+    );
+}

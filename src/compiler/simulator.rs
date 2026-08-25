@@ -34601,13 +34601,7 @@ impl Simulator {
                                 if bn.is_empty() {
                                     None
                                 } else {
-                                    let spec = format!(
-                                        "{}#({})",
-                                        bn,
-                                        Self::normalize_spec_ws(type_args_text)
-                                    );
-                                    let mut cand = vec![spec.clone(), bn];
-                                    cand.retain(|c| self.module.classes.contains_key(c));
+                                    let cand = vec![bn.clone()];
                                     cand.first()
                                         .map(|c| (c.clone(), member.name.clone()))
                                 }
@@ -34634,6 +34628,25 @@ impl Simulator {
                                 self.this_stack.push(None);
                                 self.class_context_stack.push(Some(mclass));
                                 cleanup.pushed_method_this = true;
+                                // A PARAMETERIZED static task `C#(params)::task()`
+                                // must execute its body with the active
+                                // specialization (`current_spec`), exactly as a
+                                // static FUNCTION call does at its dispatch site.
+                                // Otherwise a value/type parameter referenced in
+                                // the body (e.g. `uvm_event#(T)` / `my_cb#(T)`
+                                // inside `tester#(T)::do_it`)
+                                // stays SYMBOLIC and the instance records `T -> T`
+                                // instead of `T -> uvm_object`; the per-spec
+                                // callback typeid then diverges from `add`'s and
+                                // `$cast(cb, ...)` fails (event pre_trigger count 0).
+                                if let Some((spec_base, spec_sig)) =
+                                    self.static_task_call_spec(func)
+                                {
+                                    cleanup.saved_spec = self.current_spec.clone();
+                                    self.current_spec =
+                                        Some((spec_base.clone(), spec_sig.clone()));
+                                    self.ensure_spec_statics(&spec_base, &spec_sig);
+                                }
                                 self.task_cleanup.push(cleanup);
                                 let mut cont: Vec<Statement> = td.items.clone();
                                 cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -67535,33 +67548,55 @@ impl Simulator {
         // `infer_width` probes every arithmetic/bitwise operand on each
         // evaluation, so the two `String` allocations this used to do ran in
         // every loop iteration; borrowing from `func` avoids them.
-        let (recv_head, mname): (&str, &str) = match &func.kind {
-            ExprKind::MemberAccess { expr, member } => {
-                let head = match &expr.kind {
-                    ExprKind::Ident(h) if h.path.len() == 1 => h.path[0].name.name.as_str(),
-                    _ => return None,
-                };
-                (head, member.name.as_str())
-            }
-            ExprKind::Ident(h) if h.path.len() == 2 => {
-                (h.path[0].name.name.as_str(), h.path[1].name.name.as_str())
+        //
+        // A method on a COLLECTION ELEMENT of class type — `cb_q[0].f()`, a
+        // queue/dyn-array of class handles — has an `Index` receiver, not an
+        // `Ident`. It previously returned None here, so `infer_width` fell
+        // back to `eval_expr(expr)`, RUNNING the method purely to read its
+        // width: `skip += cb_q[i].f()` executed `f` TWICE (once for the width
+        // probe, once for the value). Resolve the ELEMENT class and take the
+        // return width off the method, never by calling it.
+        let mname: &str = match &func.kind {
+            ExprKind::MemberAccess { member, .. } => member.name.as_str(),
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                h.path.last().unwrap().name.name.as_str()
             }
             _ => return None,
         };
-        // Resolve the receiver's class type. Common cases only — a bare
-        // local of class type, or a class-typed signal. Subtler resolutions
-        // (properties of `this`, typedef locals, …) return None and keep the
-        // prior fallback.
-        //
-        // NOTE: `var_class_types` is a FLAT accumulator never cleared on
-        // scope/method exit (see the note at `class_prop_type`), so this
-        // binding can be stale across method calls — the result is therefore
-        // NOT memoisable by AST node. That is pre-existing behaviour.
-        let class_name: String = if let Some(cn) = self.var_class_types.get(recv_head) {
-            cn.clone()
-        } else {
-            let id = *self.signal_name_to_id.get(recv_head)?;
-            self.signal_type_names.get(&id)?.clone()
+        let class_name: String = match &func.kind {
+            // `recv.m(...)` where `recv` is a plain class variable.
+            ExprKind::MemberAccess { expr, .. } => match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 => {
+                    match self.resolve_receiver_class(&h.path[0].name.name) {
+                        Some(c) => c,
+                        None => return None,
+                    }
+                }
+                // `cb_q[0].m(...)`: the receiver is an Index over a
+                // class-handle collection.
+                ExprKind::Index { expr: base, .. } => {
+                    let bn = match &base.kind {
+                        ExprKind::Ident(bh) if bh.path.len() == 1 => {
+                            &bh.path[0].name.name
+                        }
+                        _ => return None,
+                    };
+                    let bn = bn.to_string();
+                    match self.declared_collection_elem_class(&bn) {
+                        Some(c) => c,
+                        None => return None,
+                    }
+                }
+                _ => return None,
+            },
+            // `recv.m(...)` flattened to a 2-segment hierarchical identifier.
+            ExprKind::Ident(h) if h.path.len() == 2 => {
+                match self.resolve_receiver_class(&h.path[0].name.name) {
+                    Some(c) => c,
+                    None => return None,
+                }
+            }
+            _ => return None,
         };
         // Walk the inheritance chain read-only to the method's return type.
         // `extends` must be cloned per level: the borrow of a `classes` entry
@@ -67589,6 +67624,22 @@ impl Simulator {
             cur = cd.extends.clone()?;
         }
         None
+    }
+
+    /// The class type of a bare RECEIVER identifier (`obj` in `obj.m()`): a
+    /// class-typed local or signal. `None` when untracked — the caller then
+    /// keeps its prior fallback behaviour.
+    ///
+    /// NOTE: `var_class_types` is a FLAT accumulator never cleared on
+    /// scope/method exit, so this binding can be stale across method calls;
+    /// the result is therefore NOT memoisable by AST node. That is
+    /// pre-existing behaviour.
+    fn resolve_receiver_class(&self, recv_head: &str) -> Option<String> {
+        if let Some(cn) = self.var_class_types.get(recv_head) {
+            return Some(cn.clone());
+        }
+        let id = *self.signal_name_to_id.get(recv_head)?;
+        self.signal_type_names.get(&id).cloned()
     }
 
     fn infer_lhs_width(&mut self, expr: &Expression) -> u32 {
@@ -85764,6 +85815,21 @@ impl Simulator {
         }
     }
 
+    /// Extract the active `(base_class, sig)` for a PARAMETERIZED static task
+    /// call `C#(params)::task()` reached in Stage 1c (blocking inline). `C` is
+    /// keyed bare in `module.classes`, so the specialization text is otherwise
+    /// dropped and the inlined body runs with no active spec — a value/type
+    /// parameter referenced in the body stays symbolic (
+    /// `my_cb#(T)` inside `tester#(T)::do_it` recorded `T -> T`). Route the
+    /// `#(params)` through the same typedef/param resolution a static
+    /// FUNCTION call uses, so the body's type bindings key the concrete
+    /// specialization. `None` for a plain (non-specialized) static call.
+    fn static_task_call_spec(&self, func: &Expression) -> Option<(String, String)> {
+        let (bn, args_text) = Self::extract_call_spec(func)?;
+        let raw = format!("{}#({})", bn, args_text);
+        self.resolve_call_spec_params(self.extract_spec_from_string(&raw), &self.current_spec.clone())
+    }
+
     fn strip_spec_shape(e: &Expression) -> Expression {
         match &e.kind {
             ExprKind::Specialization { base, .. } => Self::strip_spec_shape(base),
@@ -101928,10 +101994,19 @@ impl Simulator {
         if self.module.classes.contains_key(&cn)
             || self.module.covergroups.contains_key(&cn)
         {
-            Some(cn)
-        } else {
-            None
+            return Some(cn);
         }
+        // The element is declared with a TYPEDEF alias
+        // (`typedef uvm_event_callback#(T) cb_type; … cb_type q[$];`), so the
+        // declared NAME is not a class key. Follow the alias to its base class
+        // so `class_method_return_width` can walk the chain for the return type.
+        if let Some((base, _)) = self.resolve_typedef_spec(&cn) {
+            return Some(base);
+        }
+        if let Some(c) = self.resolve_simple_typedef_class(&cn) {
+            return Some(c);
+        }
+        None
     }
 
     fn get_expr_type_name(&self, expr: &Expression) -> Option<String> {
