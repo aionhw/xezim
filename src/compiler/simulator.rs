@@ -102528,6 +102528,30 @@ impl Simulator {
                     name.name.name.as_str().to_string()
                 }
             }
+            // A `virtual <iface>` handle type. Carry the `#(params)` now
+            // preserved by the parser so an inline spec
+            // `uvm_resource_db#(virtual mem_if#(8,8))` records the concrete
+            // width-carrying type name instead of dropping the args (which
+            // made the resource-pool's per-T type key for read_by_type
+            // diverge from set, so the vif was never found — "no bus
+            // interface available"). The params are rendered via
+            // `expr_to_spec_fragment`, so literal args stay `8, 8`.
+            DataType::Interface { name, modport, type_args, .. } => {
+                let mut s = format!("virtual {}", name.name);
+                if !type_args.is_empty() {
+                    let frags: Vec<String> = type_args
+                        .iter()
+                        .filter_map(|a| self.expr_to_spec_fragment(a))
+                        .collect();
+                    if !frags.is_empty() {
+                        s += &format!("#({})", frags.join(","));
+                    }
+                }
+                if let Some(mp) = modport {
+                    s += &format!(".{}", mp.name);
+                }
+                s
+            }
             // Class / struct / enum / interface typedef aliases are handled by
             // their name branches; render the parsed name text if reachable.
             other => format!("{:?}", other),

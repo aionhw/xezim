@@ -332,6 +332,53 @@ endmodule
 /// exactly ONE trigger must yield pre=1 post=0. Verified byte-for-byte against
 /// a commercial simulator: `RESULT qsz=1 pre=1 post=0`.
 #[test]
+fn test_resdb_virtual_if_type_key() {
+    const TEST_NAME: &str = "test_resdb_virtual_if_type_key";
+    let src = r#"
+`include "uvm_macros.svh"
+interface mif #(int W=4)(input bit clk);
+  logic [W-1:0] a;
+endinterface
+module top;
+  import uvm_pkg::*;
+  bit clk;
+  mif #(8) u(clk);
+  virtual mif #(8) r;
+  initial begin
+    uvm_resource_db#(virtual mif #(8))::set("vif", "mif", u, null);
+    if (uvm_resource_db#(virtual mif #(8))::read_by_type("vif", r))
+      $display("VIFDB_PASS");
+    else
+      $display("VIFDB_FAIL");
+    $finish;
+  end
+endmodule
+"#;
+    let Some(out) = run_in_process(src) else {
+        skip_no_uvm(TEST_NAME);
+        return;
+    };
+    println!("{}", out);
+    // 08resources/05seq: `uvm_resource_db#(virtual mem_if#(8,8))::set` then
+    // `::read_by_type` must find the same pool cell. The pool keys by the
+    // parameterized TYPE of `uvm_resource#(T)`; for a `virtual <iface>#(W)`
+    // handle T the parser used to DROP `#(W)` and the type-arg serializer fell
+    // back to a Rust `Debug` of the interface DataType, so writer and reader
+    // keyed DIFFERENT cells and `read_by_type` returned null (drivers printed
+    // "no bus interface available"). Preserve the interface args and render
+    // `virtual <iface>#(W)` consistently.
+    assert!(
+        out.contains("VIFDB_PASS"),
+        "virtual-interface resource read_by_type must match set; got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("VIFDB_FAIL"),
+        "virtual-interface resource read_by_type must match set; got:\n{}",
+        out
+    );
+}
+
 fn test_event_callback_fires_once() {
     const TEST_NAME: &str = "test_event_callback_fires_once";
     let src = r#"
