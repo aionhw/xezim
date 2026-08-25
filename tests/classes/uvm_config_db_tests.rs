@@ -371,6 +371,8 @@ module top;
 
   initial begin
     tester#(uvm_object)::do_it();
+    tester#(string)::do_it();
+    tester#(uvm_bitstream_t)::do_it();
     $finish;
   end
 endmodule
@@ -380,9 +382,24 @@ endmodule
         return;
     };
     println!("{}", out);
+    // Each of the three specializations (uvm_object, string, uvm_bitstream_t)
+    // must dispatch its instance callback exactly once. The `string` and
+    // `uvm_bitstream_t` cases additionally exercise NESTED typedef
+    // resolution — `cbs` = `uvm_callbacks#(event_type, cb_type)` with
+    // `event_type`/`cb_type` themselves typedef to `uvm_event#(T)` /
+    // `uvm_event_callback#(T)` — because their `T` differs from the default
+    // `uvm_object`, so a symbolic/`Obj`-default collapse would key a
+    // different cell than `add` and yield `qsz=0 pre=0`.
+    for line in out.lines().filter(|l| l.contains("RESULT")) {
+        assert!(
+            line.contains("RESULT qsz=1 pre=1 post=0"),
+            "single event trigger must run the instance callback exactly once: {}",
+            out
+        );
+    }
     assert!(
-        out.contains("RESULT qsz=1 pre=1 post=0"),
-        "single event trigger must run the instance callback exactly once: {}",
+        out.matches("RESULT qsz=1 pre=1 post=0").count() == 3,
+        "all three tester specializations must dispatch once; got: {}",
         out
     );
 }
