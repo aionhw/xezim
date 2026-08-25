@@ -117,6 +117,8 @@ mod t_bound_queue_value_param_chain;
 mod t_no_parens_static_method;
 #[path = "hierarchy/t_nested_value_param_in_type_arg.rs"]
 mod t_nested_value_param_in_type_arg;
+#[path = "hierarchy/t_local_queue_index_growth.rs"]
+mod t_local_queue_index_growth;
 #[path = "hierarchy/wildcard_import_shadow.rs"]
 mod wildcard_import_shadow;
 
