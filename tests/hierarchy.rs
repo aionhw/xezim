@@ -125,6 +125,8 @@ mod t_queue_elem_method_return_width;
 mod t_new_in_call_argument;
 #[path = "hierarchy/t_push_back_new_queue_element.rs"]
 mod t_push_back_new_queue_element;
+#[path = "hierarchy/t_long_string_local_not_truncated.rs"]
+mod t_long_string_local_not_truncated;
 #[path = "hierarchy/t_nested_typedef_spec_resolution.rs"]
 mod t_nested_typedef_spec_resolution;
 #[path = "hierarchy/t_typename_on_type_param.rs"]

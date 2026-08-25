@@ -44049,7 +44049,16 @@ impl Simulator {
                             // $urandom` keeps only the low 8 bits). STRING
                             // locals are exempt (1024-bit internal packed
                             // text).
-                            let is_str = self.string_signals.contains(name.as_str());
+                            let is_str = self.string_signals.contains(name.as_str())
+                                // §6.16: a method/block-local string whose
+                                // name isn't registered in `string_signals`
+                                // (not every body local is) can still hold a
+                                // value LONGER than the 1024-bit string
+                                // placeholder — no integral type is declared
+                                // wider, so a wider value is necessarily a
+                                // string, and resizing it to 1024 would chop
+                                // it to 128 chars from the FRONT.
+                                || (!val.is_real && val.width > 1024);
                             let fitted = if !val.is_real && !is_str {
                                 if let Some(&target_w) = self.widths.get(name) {
                                     let mut f = if val.width != target_w {
@@ -59687,7 +59696,25 @@ impl Simulator {
                                     }
                                 }
                             }
-                            produced.unwrap_or_else(|| self.eval_expr_ctx(init_expr, w).resize(w))
+                            produced.unwrap_or_else(|| {
+                                let ev = self.eval_expr_ctx(init_expr, w);
+                                // §6.16: a STRING local declared with an
+                                // initializer (`string s = <long literal or
+                                // method return>`) must not be resized to the
+                                // 1024-bit table placeholder — `resize(1024)`
+                                // truncates a longer string from the TOP (the
+                                // FRONT of the text), dropping it to 128 chars.
+                                // The separate-assignment path exempts strings
+                                // (assign_value's `is_str` guard); this
+                                // decl-with-init path must too. A string-valued
+                                // init but non-string declared type still
+                                // resizes normally.
+                                if Self::is_string_data_type(data_type) && !ev.is_real {
+                                    ev
+                                } else {
+                                    ev.resize(w)
+                                }
+                            })
                         } else {
                             default_v.clone()
                         };
