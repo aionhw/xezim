@@ -59180,6 +59180,16 @@ impl Simulator {
                                 };
                                 self.module.arrays.insert(name.clone(), (0, -1, w));
                                 self.module.dynamic_arrays.insert(name.clone());
+                                // A LOCAL queue `T q[$]` is NOT registered in
+                                // `queue_vars` by elaboration (module/package
+                                // scope only), so the `q[i] = v` (i == size) growth
+                                // gate in `assign_value` missed it and an empty
+                                // queue never grew — `q[0] = x` on a fresh local
+                                // queue left `.size()` at 0 and dropped the element
+                                // (broke UVM get_all's `all_callbacks[0] = cb`).
+                                if matches!(first, UnpackedDimension::Queue { .. }) {
+                                    self.module.queue_vars.insert(name.clone());
+                                }
                                 self.widths.insert(name.clone(), w);
                                 self.set_queue_size(&name, 0);
                                 // §7.4.5: a LOCAL `T a[][16]` / `a[$][16]` —
