@@ -90293,6 +90293,36 @@ impl Simulator {
             } else {
                 Value::zero(32)
             };
+            // §13.5: a bare `new(...)` ACTUAL bound to a CLASS-typed formal
+            // (`f(new("x"))` with `formal C x`) has no LHS variable to
+            // borrow its class from, so `eval_expr` (which infers the class
+            // from the enclosing assignment/declaration lvalue) returns a
+            // stale/zero handle and the object is never constructed. Build it
+            // here with the formal's declared class type instead. This is
+            // distinct from the `obj = new()` / `C c = new()` paths, which
+            // infer the type from the target.
+            if i < args.len() {
+                let is_bare_new = matches!(&args[i].kind,
+                    ExprKind::Call { func, .. } if matches!(&func.kind,
+                        ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new")
+                    );
+                if is_bare_new {
+                    let mut cls_name = None;
+                    if let DataType::TypeReference { name: tn, .. } = &port.data_type {
+                        let cn = tn.name.name.clone();
+                        if self.module.classes.contains_key(&cn) {
+                            cls_name = Some(cn);
+                        }
+                    }
+                    if let Some(cn) = cls_name {
+                        if let Some(cd) = self.module.classes.get(&cn).cloned() {
+                            if let ExprKind::Call { args: cargs, .. } = &args[i].kind {
+                                val = self.instantiate_class(&cd, cargs);
+                            }
+                        }
+                    }
+                }
+            }
             // §13.5.2 / §6.10 / §10.7: a scalar integral formal adopts its
             // declared port's width and signedness, so `input signed [5:0] v`
             // sign-extends `v` in later arithmetic and a `real` actual bound to
@@ -101308,6 +101338,35 @@ impl Simulator {
                     } else {
                         Value::zero(32)
                     };
+                    // §13.5: a bare `new(...)` ACTUAL bound to a CLASS-typed
+                    // formal of a class METHOD (`c.add(new("x"))` with
+                    // `function void add(N n)`) has no LHS variable to borrow
+                    // its class from, so `eval_expr` returns a stale/zero
+                    // handle and the object is never constructed. Build it
+                    // with the formal's declared class type (same rationale as
+                    // the exec_function_call path).
+                    if i < args.len() {
+                        let is_bare_new = matches!(&args[i].kind,
+                            ExprKind::Call { func, .. } if matches!(&func.kind,
+                                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new")
+                            );
+                        if is_bare_new {
+                            let mut cls_name = None;
+                            if let DataType::TypeReference { name: tn, .. } = &port.data_type {
+                                let cn = tn.name.name.clone();
+                                if self.module.classes.contains_key(&cn) {
+                                    cls_name = Some(cn);
+                                }
+                            }
+                            if let Some(cn) = cls_name {
+                                if let Some(cd) = self.module.classes.get(&cn).cloned() {
+                                    if let ExprKind::Call { args: cargs, .. } = &args[i].kind {
+                                        val = self.instantiate_class(&cd, cargs);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // §13.5.1/§6.18/§10.7: a scalar INTEGRAL formal adopts its
                     // declared (possibly typedef-derived) width and signedness.
                     // Without this a class-method formal declared as a wider
