@@ -92954,6 +92954,57 @@ impl Simulator {
             let r_sig = Self::normalize_spec_ws(&r_inner.join(","));
             return format!("{}#({})", cb, r_sig);
         }
+        // A bare class-member TYPEDEF to a `virtual <iface>#(params)` handle
+        // (e.g. `typedef virtual mem_if#(ADDR_SIZE,DATA_SIZE) if_t;` inside
+        // `mem_driver#(8,8)`), used as a resource type key
+        // (`uvm_resource_db#(if_t)`). Expand it to the CONCRETE interface
+        // handle `virtual <iface>#(<params resolved against the enclosing
+        // spec>)` so the DRIVER's `read_by_type` (`uvm_resource#(if_t)`)
+        // keys the same pool cell as the ENV's `set`
+        // (`uvm_resource_db#(virtual mem_if#(8,8))`). Without this, the
+        // reader's T stayed the symbolic typedef name `if_t`, its
+        // `uvm_resource#(if_t)` static `my_type` cell was distinct from the
+        // writer's `uvm_resource#(virtualmem_if#(8,8))`, and the pool
+        // handle-compare never matched ("no bus interface
+        // available" in every driver/monitor). The params are the DECLARING
+        // class's value params (`ADDR_SIZE`/`DATA_SIZE`), resolved here
+        // against `enclosing` — which is the `mem_driver#(8,8)`
+        // specialization at this call site.
+        if let Some(crate::ast::types::DataType::Interface {
+            name: iname,
+            modport,
+            type_args,
+            ..
+        }) = self.lookup_typedef_target(p)
+        {
+            let ta_empty = type_args.is_empty();
+            let mut arg_frags: Vec<String> = Vec::new();
+            let mut ok = true;
+            for a in type_args {
+                match self.expr_to_spec_fragment(&a) {
+                    Some(f) => arg_frags.push(f),
+                    None => { ok = false; break; }
+                }
+            }
+            if ta_empty || ok {
+                let mut s = format!("virtual{}", iname.name);
+                if !arg_frags.is_empty() {
+                    // Each arg may still be a SYMBOLIC value/type parameter of
+                    // the declaring class (`ADDR_SIZE`) — resolve it through
+                    // the enclosing spec, and normalize whitespace so the key
+                    // matches the parser's/top-level `virtualmif#(8,8)`.
+                    let resolved: Vec<String> = arg_frags
+                        .iter()
+                        .map(|f| Self::normalize_spec_ws(&self.resolve_call_spec_arg(f.trim(), enclosing)))
+                        .collect();
+                    s += &format!("#({})", resolved.join(","));
+                }
+                if let Some(mp) = modport {
+                    s += &format!(".{}", mp.name);
+                }
+                return Self::normalize_spec_ws(&s);
+            }
+        }
         Self::normalize_spec_ws(p)
     }
 
@@ -93578,6 +93629,43 @@ impl Simulator {
                             ) {
                                 by_name = format!("{}#({})", rb, rs);
                             }
+                        } else if let Some(crate::ast::types::DataType::Interface {
+                            name: iname, modport, mut type_args, ..
+                        }) = self.lookup_typedef_target(&by_name)
+                        {
+                            // A bare class-member TYPEDEF to a `virtual
+                            // <iface>#(params)` handle (e.g.
+                            // `typedef virtual mem_if#(ADDR_SIZE,DATA_SIZE)
+                            // if_t;` inside `mem_driver#(8,8)`) bound to a
+                            // class's T (`uvm_resource#(if_t)`, or the
+                            // resource-DB impl `#(if_t)`). `resolve_typedef_spec`
+                            // only follows CLASS typedefs, so a bare
+                            // interface-typedef fell through and the bound
+                            // stayed the symbolic `if_t` — the reader's
+                            // per-spec static `my_type` cell diverged from the
+                            // writer's `virtualmem_if#(8,8)`. Expand it here,
+                            // resolving the params against the enclosing spec
+                            // (the declaring driver/monitor specialization).
+                            let mut s = format!("virtual{}", iname.name);
+                            if !type_args.is_empty() {
+                                let mut resolved = Vec::new();
+                                let mut ok = true;
+                                for a in type_args.drain(..) {
+                                    match self.expr_to_spec_fragment(&a) {
+                                        Some(f) => resolved.push(Self::normalize_spec_ws(
+                                            &self.resolve_call_spec_arg(f.trim(), &encl_spec),
+                                        )),
+                                        None => { ok = false; break; }
+                                    }
+                                }
+                                if ok {
+                                    s += &format!("#({})", resolved.join(","));
+                                }
+                            }
+                            if let Some(mp) = modport {
+                                s += &format!(".{}", mp.name);
+                            }
+                            by_name = Self::normalize_spec_ws(&s);
                         }
                     }
                     bound = Some(by_name);

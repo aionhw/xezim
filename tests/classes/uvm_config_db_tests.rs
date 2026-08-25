@@ -379,6 +379,64 @@ endmodule
     );
 }
 
+#[test]
+fn test_resdb_class_member_typedef_vif() {
+    const TEST_NAME: &str = "test_resdb_class_member_typedef_vif";
+    // 08resources/05seq: a DRIVER/MONITOR reads its virtual interface with
+    // `READ_BY_TYPE` through a CLASS-MEMBER TYPEDEF to a parameterized
+    // interface (`typedef virtual mem_if#(ADDR_SIZE,DATA_SIZE) if_t;` inside
+    // `mem_driver#(8,8)`), which the ENV seeded under a concrete signature
+    // (`uvm_resource_db#(virtual mem_if#(8,8))::set`). The pool keys by the
+    // per-spec static `uvm_resource#(T)` handle, so reader and writer must
+    // resolve T to the SAME signature. The reader's T was the bare typedef
+    // name `if_t` (never expanded), so its `uvm_resource#(if_t)` cell was
+    // distinct from the writer's `uvm_resource#(virtualmem_if#(8,8))` and
+    // `read_by_type` returned null ("no bus interface available").
+    let src = r#"
+`include "uvm_macros.svh"
+interface mif #(int W=4)(input bit clk);
+  logic [W-1:0] a;
+endinterface
+class driver #(int W=8);
+  typedef virtual mif#(W) if_t;
+  virtual mif#(W) r;
+  function void build();
+    if (uvm_resource_db#(if_t)::read_by_type("vif", r))
+      $display("IFTSCOPE_PASS");
+    else
+      $display("IFTSCOPE_FAIL");
+  endfunction
+endclass
+module top;
+  import uvm_pkg::*;
+  bit clk;
+  mif#(4) u(clk);
+  driver#(4) d;
+  initial begin
+    uvm_resource_db#(virtual mif#(4))::set("vif", "mif", u, null);
+    d = new();
+    d.build();
+    $finish;
+  end
+endmodule
+"#;
+    let Some(out) = run_in_process(src) else {
+        skip_no_uvm(TEST_NAME);
+        return;
+    };
+    println!("{}", out);
+    assert!(
+        out.contains("IFTSCOPE_PASS"),
+        "driver read_by_type via class-member typedef must resolve T to the interface; got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("IFTSCOPE_FAIL"),
+        "driver read_by_type via class-member typedef must resolve T to the interface; got:\n{}",
+        out
+    );
+}
+
 fn test_event_callback_fires_once() {
     const TEST_NAME: &str = "test_event_callback_fires_once";
     let src = r#"
