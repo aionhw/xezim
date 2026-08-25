@@ -73,6 +73,40 @@ module tb;
 endmodule
 "#;
 
+/// Sibling shapes found by auditing the fix against the pre-fix binary: the
+/// same width gap reached through a WRITE index, an indexed part-select, and a
+/// ternary. Each is a distinct compile path from the plain read, so each can
+/// regress on its own.
+///
+/// The write case is the worst of the three — `w[(i<<6)] = v` sent all four
+/// stores to index 0, so three quarters of the array silently kept its fill
+/// value and element 0 held whichever store ran last.
+const SIBLING_PATHS: &str = r#"
+module tb;
+  logic [7:0] arr [255:0];
+  logic [7:0] w [255:0];
+  logic [63:0] vec;
+  logic [3:0] psel [3:0];
+  logic [7:0] tern [3:0];
+  int ok;
+  always_comb begin
+    for (int k = 0; k < 256; ++k) w[k] = 8'hEE;
+    for (int i = 0; i < 4; ++i) w[i << 6] = i[7:0] + 8'd1;   // WRITE index
+  end
+  always_comb for (int i = 0; i < 4; ++i) psel[i] = vec[(i << 3) +: 4];
+  always_comb for (int i = 0; i < 4; ++i) tern[i] = arr[(i > 0) ? (i << 6) : 8'd7];
+  initial begin
+    for (int k = 0; k < 256; ++k) arr[k] = k[7:0];
+    vec = 64'hDEADBEEF12345678;
+    #1;
+    ok = (w[0] == 1 && w[64] == 2 && w[128] == 3 && w[192] == 4)
+      && (w[5] == 8'hEE)                                  // untouched stays filled
+      && (psel[0] == 4'h8 && psel[1] == 4'h6 && psel[2] == 4'h4 && psel[3] == 4'h2)
+      && (tern[0] == 7 && tern[1] == 64 && tern[2] == 128 && tern[3] == 192);
+  end
+endmodule
+"#;
+
 /// The reported shape end to end: a two-stage S-box lookup driven entirely by
 /// shifted loop variables must return the real table entry.
 const SBOX: &str = r#"
@@ -125,6 +159,15 @@ fn block_local_decl_shifted_inside_an_array_index_keeps_its_width() {
         ok_flag(BLOCK_LOCAL_DECL),
         1,
         "a block-local declaration lost its width inside an array index"
+    );
+}
+
+#[test]
+fn write_index_partselect_and_ternary_siblings_keep_their_width() {
+    assert_eq!(
+        ok_flag(SIBLING_PATHS),
+        1,
+        "a write index, indexed part-select, or ternary lost its block-local width"
     );
 }
 

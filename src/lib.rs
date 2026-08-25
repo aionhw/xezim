@@ -628,6 +628,29 @@ fn reinstall_ooc_constraint_bodies(
 }
 
 /// Simulate a single source string.
+
+/// Realtime-clock stopwatch for HUMAN-FACING phase/profile reports.
+///
+/// `std::time::Instant` is CLOCK_MONOTONIC, and on this project's WSL2 host
+/// the monotonic clock drifts several percent FAST of realtime (+7.1%
+/// measured directly, 2026-08-25). Instant-based report spans then exceed
+/// the process wall `/usr/bin/time` sees — 306.9 s "simulation" against a
+/// 302.1 s process on one c906 run — which is impossible for a real duration
+/// and corrupts cross-simulator comparisons. `SystemTime` is CLOCK_REALTIME
+/// and matches external harnesses. A realtime step (NTP) can only distort a
+/// printed report, never simulation semantics: scheduling keeps `Instant`.
+#[derive(Clone, Copy)]
+pub struct WallTimer(std::time::SystemTime);
+
+impl WallTimer {
+    pub fn now() -> Self {
+        Self(std::time::SystemTime::now())
+    }
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.0.elapsed().unwrap_or_default()
+    }
+}
+
 pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, String> {
     simulate_multi(
         &[source.to_string()],
@@ -761,8 +784,8 @@ fn simulate_multi_inner(
     collapse_islands: bool,
     multikernel_scope: Option<&str>,
 ) -> Result<compiler::Simulator, String> {
-    let total_start = std::time::Instant::now();
-    let compilation_start = std::time::Instant::now();
+    let total_start = WallTimer::now();
+    let compilation_start = WallTimer::now();
     // IEEE 1800-2017 §9.4.5: the parser discards intra-assignment delays
     // (`lhs = #d rhs`); canonicalize them into a marker call the simulator
     // implements (see `intra_delay`) before parsing.
@@ -999,7 +1022,7 @@ fn simulate_multi_inner(
         }
     }
 
-    let simulation_start = std::time::Instant::now();
+    let simulation_start = WallTimer::now();
     sim.simulate();
     eprintln!(
         "[PHASE] simulation: {:.1}ms",
@@ -1045,8 +1068,8 @@ pub fn pdes_c910_stub_multi(
     lp_a_prefix: &str,
     n_ticks: u64,
 ) -> Result<(), String> {
-    let total_start = std::time::Instant::now();
-    let parse_start = std::time::Instant::now();
+    let total_start = WallTimer::now();
+    let parse_start = WallTimer::now();
     let (definitions, elab) = parse_and_elaborate_multi(
         sources,
         top_module_name,

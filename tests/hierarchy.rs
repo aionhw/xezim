@@ -23,6 +23,8 @@ mod bind_directive_basic;
 mod bind_in_module;
 #[path = "hierarchy/bind_path_through_library_module.rs"]
 mod bind_path_through_library_module;
+#[path = "hierarchy/bind_through_nested_part_select.rs"]
+mod bind_through_nested_part_select;
 #[path = "hierarchy/dump_merged_sv_library_dedup.rs"]
 mod dump_merged_sv_library_dedup;
 #[path = "hierarchy/port_net_driven_from_inside.rs"]
@@ -99,6 +101,8 @@ mod pkg_subroutines_and_unit_scope;
 mod repro_import;
 #[path = "hierarchy/resource_pool_scope_lookup.rs"]
 mod resource_pool_scope_lookup;
+#[path = "hierarchy/colliding_actual_child_body.rs"]
+mod colliding_actual_child_body;
 #[path = "hierarchy/same_name_port_hop.rs"]
 mod same_name_port_hop;
 #[path = "hierarchy/submodule_net_array_shapes.rs"]

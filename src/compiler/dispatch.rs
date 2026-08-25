@@ -84,6 +84,7 @@ pub enum Opcode {
     CmpBranch,
     MoveResize,
     WaitDelayReg,
+    BinOpConstAdd2,
     WaitEdge,
 }
 
@@ -179,6 +180,7 @@ impl Opcode {
             Insn::CmpBranch(..) => Self::CmpBranch,
             Insn::MoveResize(..) => Self::MoveResize,
             Insn::WaitDelayReg(..) => Self::WaitDelayReg,
+            Insn::BinOpConstAdd2(..) => Self::BinOpConstAdd2,
             Insn::WaitEdge(..) => Self::WaitEdge,
         }
     }
@@ -189,7 +191,7 @@ impl Opcode {
     }
 }
 
-pub const NUM_OPCODES: usize = 76;
+pub const NUM_OPCODES: usize = 77;
 
 /// Sizes the opcode-census arrays, which are indexed by `Opcode as usize`. A
 /// stale value panics at run time under `XEZIM_OPCODE_CENSUS=1`, so pin it to

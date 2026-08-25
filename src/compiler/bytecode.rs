@@ -77,6 +77,30 @@ static FUSED_BINOP_CONST: [std::sync::atomic::AtomicU64; BinOpConstKind::COUNT] 
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Static count of `Move ; <assign>` pairs where the Move was forwarded into
+/// the assign's value operand (see `forward_move_into_assign`).
+static FUSED_MOVE_FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Static count of `ClearSigned` insns deleted because the register provably
+/// held an unsigned value already (see `elide_provably_unsigned_scrubs`).
+static ELIDED_SCRUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Static count of `AddC ; AddC` pairs merged into one `BinOpConstAdd2`
+/// dispatch (see `fuse_addc2`).
+static FUSED_ADDC2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn addc2_count() -> u64 {
+    FUSED_ADDC2.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn elided_scrub_count() -> u64 {
+    ELIDED_SCRUBS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn census_pair_fusions() -> u64 {
+    FUSED_MOVE_FWD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Static count of constant-operand ALU fusions performed, per
 /// [`BinOpConstKind`] (same index order as the enum).
 pub fn binop_const_fusions() -> [u64; BinOpConstKind::COUNT] {
@@ -90,6 +114,16 @@ pub fn binop_const_fusions() -> [u64; BinOpConstKind::COUNT] {
 /// constant-fed ALU ops the census actually shows (`Add`, `Eq`, `CaseEq`)
 /// keeps the `Insn` enum — and the ~25 analysis sites that match on it — with
 /// a single new case to reason about instead of three.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AddC2 {
+    pub d1: RegId,
+    pub s1: RegId,
+    pub k1: Value,
+    pub d2: RegId,
+    pub s2: RegId,
+    pub k2: Value,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CmpKind {
     Eq,
@@ -458,6 +492,14 @@ pub enum Insn {
     /// character the unfused arms, so the 4-state, signedness and §5.7.1
     /// `is_fill` rules cannot drift.
     BinOpConst(RegId, RegId, Box<Value>, BinOpConstKind), // (dest, src, const, kind)
+    /// Superinstruction: TWO independent (or chained — executed in order)
+    /// constant adds in ONE dispatch. The c906 opcode census measured
+    /// `AddC -> AddC` as the hottest adjacent pair (415 M, 6.5% of the
+    /// stream) and they are NOT dataflow-foldable (different registers), so
+    /// the win is deleting one trip through the discriminant-load /
+    /// jump-table / indirect-jump dispatch chain per pair. Formed only under
+    /// `XEZIM_FUSE_ADDC2=1` (see `fuse_addc2`).
+    BinOpConstAdd2(Box<AddC2>),
 
     /// Roadmap steps 11-12 (compiled process FSMs): suspend the executing
     /// PROCESS for the delay whose VALUE is in the register (converted to
@@ -530,6 +572,12 @@ impl Insn {
         use Insn::*;
         match self {
             Nop => {}
+            BinOpConstAdd2(a) => {
+                a.d1 += rb;
+                a.s1 += rb;
+                a.d2 += rb;
+                a.s2 += rb;
+            }
             Jump(t) => *t += ib,
             BranchIfSignalFalse(_, t, _) => *t += ib,
             BranchIfFalse(a, t) | BranchUnlessZero(a, t) => {
@@ -693,6 +741,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::NbaAssignArrayRange(..) => "NbaArrRng",
         Insn::NbaAssignArrayRead(..) => "NbaArrRd",
         Insn::BinOpConst(_, _, _, BinOpConstKind::Add) => "AddC",
+        Insn::BinOpConstAdd2(..) => "AddC2",
         Insn::WaitDelayReg(..) => "WaitDly",
         Insn::WaitEdge(..) => "WaitEdge",
         Insn::BinOpConst(_, _, _, BinOpConstKind::Eq) => "EqC",
@@ -893,6 +942,11 @@ pub struct BytecodeCompiler<'a> {
     /// then only excludes 1D/packed bases as before. Set via
     /// `set_multi_dim_arrays`.
     multi_dim_arrays: Option<&'a HashSet<String>>,
+    /// Names the elaborator recorded as DYNAMIC arrays / QUEUES. Used only to
+    /// keep their element STORES off the dense array fast path (see
+    /// `collection_store_denied`); their READS are unaffected.
+    dynamic_arrays: Option<&'a HashSet<String>>,
+    queue_vars: Option<&'a HashSet<String>>,
     /// Packed-struct field layout: container name → ordered
     /// `(member, lsb_offset, width)`. Lets a member-write LHS like
     /// `s.m0` (parsed as a 2-segment `Ident(["<scope>.s", "m0"])` after
@@ -959,6 +1013,8 @@ impl<'a> BytecodeCompiler<'a> {
             inline_ret: None,
             inline_ret_jumps: Vec::new(),
             multi_dim_arrays: None,
+            dynamic_arrays: None,
+            queue_vars: None,
             packed_struct_fields: None,
         }
     }
@@ -1225,6 +1281,40 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_multi_dim_arrays(&mut self, s: &'a HashSet<String>) {
         self.multi_dim_arrays = Some(s);
+    }
+
+    pub fn set_collection_denies(&mut self, dyn_arrays: &'a HashSet<String>, queues: &'a HashSet<String>) {
+        self.dynamic_arrays = Some(dyn_arrays);
+        self.queue_vars = Some(queues);
+    }
+
+    /// Must an element STORE to this name avoid the dense array fast path?
+    ///
+    /// A dynamic array / queue element carries a signal TWIN, so
+    /// `lookup_array_name` resolved it and the store wrote that id --- but a
+    /// reader of the COLLECTION does not depend on it, so nothing was ever
+    /// re-evaluated and readers silently served stale (or x) data. Bailing
+    /// sends the enclosing block to the interpreter, whose `assign_value` /
+    /// queued-lvalue NBA commit notify correctly --- the same route
+    /// ASSOCIATIVE arrays already take just above. Static arrays keep the fast
+    /// path: their element ids ARE what readers depend on.
+    fn collection_store_denied(&self, hier: &HierarchicalIdentifier) -> bool {
+        let (Some(d), Some(q)) = (self.dynamic_arrays, self.queue_vars) else {
+            return false;
+        };
+        let raw = Self::hier_raw_name(hier);
+        if d.contains(&raw) || q.contains(&raw) {
+            return true;
+        }
+        if let Some(scope) = &self.scope_hint {
+            let qual = format!("{}.{}", scope, raw);
+            if d.contains(&qual) || q.contains(&qual) {
+                return true;
+            }
+        }
+        hier.path
+            .last()
+            .is_some_and(|s| d.contains(&s.name.name) || q.contains(&s.name.name))
     }
 
     pub fn set_array_first_id(&mut self, arrays: &'a HashMap<Arc<str>, (usize, i64, i64)>) {
@@ -4311,6 +4401,71 @@ impl<'a> BytecodeCompiler<'a> {
             .unwrap_or(0)
     }
 
+    /// ASCENDING declared range (`logic [0:23]`): bit/part labels mirror
+    /// against the right bound — the low-bound rebase the emitted insns use
+    /// cannot express that, so such selects must run on the AST interpreter.
+    fn dim_is_ascending(d: Option<(i64, i64)>) -> bool {
+        matches!(d, Some((l, r)) if l < r)
+    }
+
+    /// Trailing bit/part select whose base is an Index CHAIN over a signal
+    /// whose packed dims need label mapping — an ELEMENT of an unpacked
+    /// collection declared `logic [31:8]`/`logic [0:23]` style, or a packed
+    /// element under such an inner dim. The emitted select/store insns index
+    /// raw physical bits, so these shapes must bail to the AST interpreter
+    /// (which maps labels via `select_base_elem_dim`).
+    fn elem_chain_needs_ast(&self, base: &Expression) -> bool {
+        let mut cur = base;
+        let mut layers = 0usize;
+        while let ExprKind::Index { expr: inner, .. } = &cur.kind {
+            cur = inner;
+            layers += 1;
+        }
+        if layers == 0 {
+            return false;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return false;
+        };
+        let raw = Self::hier_raw_name(h);
+        let leaf = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+        let Some(dims) = self.packed_full_dims.and_then(|m| {
+            m.get(raw.as_str()).or_else(|| m.get(leaf))
+        }) else {
+            return false;
+        };
+        let is_coll = |n: &str| -> bool {
+            self.array_first_id.is_some_and(|m| m.contains_key(n))
+                || self.multi_dim_arrays.is_some_and(|s| s.contains(n))
+                || self.dynamic_arrays.is_some_and(|s| s.contains(n))
+                || self.queue_vars.is_some_and(|s| s.contains(n))
+                || self.assoc_arrays.is_some_and(|m| m.contains_key(n))
+        };
+        let needs = |d: &(i64, i64)| d.0 < d.1 || d.0.min(d.1) != 0;
+        if is_coll(raw.as_str()) || is_coll(leaf) {
+            // The exact unpacked depth is not knowable here — be
+            // conservative: any mapping dim forces the AST path.
+            dims.iter().any(needs)
+        } else {
+            dims.get(layers).is_some_and(needs)
+        }
+    }
+
+    /// Combined guard for the plain bit/range select and store arms: bail
+    /// when the base needs a label mapping those arms do not emit. A packed
+    /// multi-D Ident base is excluded — its element machinery normalizes
+    /// slots itself (including ascending outer dims).
+    fn sel_base_needs_ast(&self, base: &Expression) -> bool {
+        match &base.kind {
+            ExprKind::Ident(h) => {
+                self.packed_elem_width_of(h).filter(|&w| w > 1).is_none()
+                    && Self::dim_is_ascending(self.packed_outer_dim(h))
+            }
+            ExprKind::Index { .. } => self.elem_chain_needs_ast(base),
+            _ => false,
+        }
+    }
+
     fn flattened_const_range_target(
         &self,
         expr: &Expression,
@@ -6482,6 +6637,13 @@ impl<'a> BytecodeCompiler<'a> {
                 // correct throughout because it goes through the AST
                 // interpreter, which rebases — so the bug only showed in
                 // assign / always_comb / always_ff, which compile to bytecode.
+                //
+                // §7.4.1/§11.5.1: ascending or element-of-collection bases
+                // need label mapping the rebase cannot express — AST only.
+                if self.sel_base_needs_ast(expr) {
+                    self.bail("bit_sel_base_maps");
+                    return None;
+                }
                 let base = self.compile_expr(expr, 0)?;
                 let base_lo = match &expr.kind {
                     ExprKind::Ident(h) => self.declared_low_bound(h),
@@ -6517,6 +6679,12 @@ impl<'a> BytecodeCompiler<'a> {
                 ..
             } => match kind {
                 RangeKind::Constant => {
+                    // §7.4.1/§11.5.1: ascending or element-of-collection
+                    // bases need label mapping — AST path only.
+                    if self.sel_base_needs_ast(expr) {
+                        self.bail("range_sel_base_maps");
+                        return None;
+                    }
                     let base = self.compile_expr(expr, 0)?;
                     if let (Some(l), Some(r)) =
                         (self.eval_const_expr(left), self.eval_const_expr(right))
@@ -6566,6 +6734,12 @@ impl<'a> BytecodeCompiler<'a> {
                     Some(dest)
                 }
                 RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                    // §7.4.1/§11.5.1: ascending or element-of-collection
+                    // bases need label mapping — AST path only.
+                    if self.sel_base_needs_ast(expr) {
+                        self.bail("range_sel_base_maps");
+                        return None;
+                    }
                     // `sig[idx +: W]` / `sig[idx -: W]` — W must be constant.
                     // Emit idx register, then compute hi/lo via Add/Sub with a
                     // const (W-1), and reuse existing RangeSelect insn.
@@ -7082,6 +7256,12 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             }
             ExprKind::Index { expr, index } => {
+                // §7.4.1/§11.5.1: ascending or element-of-collection bases
+                // need label mapping the stores below do not emit — AST only.
+                if self.sel_base_needs_ast(expr) {
+                    self.bail("nba_sel_base_maps");
+                    return false;
+                }
                 if let Some(id) = self.const_multi_dim_array_elem_signal_id(lhs) {
                     self.emit(Insn::NbaAssign(as_sig_id(id), val_reg, width));
                     return true;
@@ -7089,6 +7269,10 @@ impl<'a> BytecodeCompiler<'a> {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if self.is_assoc_target(hier) {
                         self.bail("nba_target_assoc");
+                        return false;
+                    }
+                    if self.collection_store_denied(hier) {
+                        self.bail("nba_target_collection");
                         return false;
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
@@ -7159,6 +7343,12 @@ impl<'a> BytecodeCompiler<'a> {
                 right,
                 kind,
             } => {
+                // §7.4.1/§11.5.1: ascending or element-of-collection bases
+                // need label mapping the stores below do not emit — AST only.
+                if self.sel_base_needs_ast(expr) {
+                    self.bail("nba_range_base_maps");
+                    return false;
+                }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(id) = self.lookup_signal_id(hier) {
                         // §7.4.1: rebase declared indices to physical offsets
@@ -7402,6 +7592,14 @@ impl<'a> BytecodeCompiler<'a> {
         // width and the write becomes a no-op. Assumes [N-1:0] outer bounds
         // (the packed-of-packed typedef shape); other locals have no elem
         // entry and keep the bail-to-AST behavior.
+        // §7.4.1/§11.5.1: ascending or element-of-collection select bases
+        // need label mapping the stores below do not emit — AST only.
+        if let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &lhs.kind {
+            if self.sel_base_needs_ast(expr) {
+                self.bail("blocking_sel_base_maps");
+                return false;
+            }
+        }
         if let ExprKind::Index { expr, index } = &lhs.kind {
             if let ExprKind::Ident(h) = &expr.kind {
                 let raw = Self::hier_raw_name(h);
@@ -7543,6 +7741,10 @@ impl<'a> BytecodeCompiler<'a> {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if self.is_assoc_target(hier) {
                         self.bail("blocking_target_assoc");
+                        return false;
+                    }
+                    if self.collection_store_denied(hier) {
+                        self.bail("blocking_target_collection");
                         return false;
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
@@ -8656,7 +8858,14 @@ impl<'a> BytecodeCompiler<'a> {
         // pattern is disjoint from `fuse_array_read_nba`'s, so the order
         // between the two does not matter.
         Self::fuse_binop_const(&mut self.insns);
+        // After fuse_binop_const, before fuse_cmp_branch_move_resize: its
+        // Move;Resize pattern is disjoint from the Move;Assign one here.
+        Self::forward_move_into_assign(&mut self.insns);
         Self::fuse_cmp_branch_move_resize(&mut self.insns);
+        // Last, so it sees the final insn stream (fusions above both create
+        // and absorb sign scrubs).
+        Self::elide_provably_unsigned_scrubs(&mut self.insns, self.signal_signed);
+        Self::fuse_addc2(&mut self.insns);
         Self::compact_nops(&mut self.insns);
         // Trim unused capacity. `Vec::push` doubles the backing buffer
         // when it overflows, so a freshly compiled block can sit on
@@ -8762,6 +8971,7 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::Replicate(_, s, _) => *s == r,
             // Its other operand is the embedded constant, not a register.
             Insn::BinOpConst(_, s, _, _) => *s == r,
+            Insn::BinOpConstAdd2(a) => a.s1 == r || a.s2 == r,
             Insn::BitSelect(_, b, i) => *b == r || *i == r,
             Insn::BitSelectConst(_, b, _) => *b == r,
             Insn::RangeSelect(_, b, l, rr) => *b == r || *l == r || *rr == r,
@@ -9615,6 +9825,12 @@ impl<'a> BytecodeCompiler<'a> {
             if j >= insns.len() {
                 continue;
             }
+            // NOTE (measured 2026-08-25): commutative `l == c` arms were
+            // tried here and are UNREACHABLE — operands compile left-first,
+            // so a LEFT constant's LoadConst is separated from the op by the
+            // right operand's load and never sits in this pass's window. The
+            // 76 M adjacent `LoadConst -> CaseEq` census pairs are therefore
+            // const-RIGHT shapes rejected by the width conditions below.
             let (d, l, kind) = match insns[j] {
                 Insn::Add(d, l, r) if r == c => (d, l, BinOpConstKind::Add),
                 Insn::Eq(d, l, r) if r == c => (d, l, BinOpConstKind::Eq),
@@ -9782,6 +9998,11 @@ impl<'a> BytecodeCompiler<'a> {
 
                 // Result width varies per entry; drop tracking for the dest.
                 Insn::CaseLut(d, ..) => store(&mut rw, *d, None),
+                // Two dests; widths follow operand widths — drop tracking.
+                Insn::BinOpConstAdd2(a) => {
+                    store(&mut rw, a.d1, None);
+                    store(&mut rw, a.d2, None);
+                }
                 // Control only; defines nothing.
                 Insn::CaseJump(..) | Insn::CaseMaskJump(..) => {}
                 // Fused compare+branch: the embedded scratch gets the 1-bit
@@ -10058,6 +10279,316 @@ impl<'a> BytecodeCompiler<'a> {
     /// A target that pointed AT a removed `Nop` moves to the next surviving
     /// instruction, which is exactly where control would have arrived anyway;
     /// `len` (one past the end, used by loop exits) maps to the new length.
+    /// Is any instruction after `j` reading `r`? Conservative liveness for
+    /// the census-pair peepholes below: any later read — even one past a
+    /// redefinition — counts as live, which can only forgo an optimization,
+    /// never miscompile one.
+    fn reg_read_after(insns: &[Insn], j: usize, r: RegId) -> bool {
+        insns[j + 1..].iter().any(|x| Self::insn_reads_reg(x, r))
+    }
+
+    /// Branch-target map shared by the census-pair peepholes: rewriting or
+    /// deleting an instruction is only sound when control cannot enter the
+    /// pattern's interior from elsewhere.
+    fn branch_target_map(insns: &[Insn]) -> Vec<bool> {
+        let mut is_target = vec![false; insns.len() + 1];
+        for insn in insns.iter() {
+            match insn {
+                Insn::CaseJump(_, cj) => {
+                    for &t in cj.table.iter().chain(std::iter::once(&cj.default)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
+                Insn::CaseMaskJump(_, mj) => {
+                    for &t in mj.table.iter().chain(std::iter::once(&mj.xz_path)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
+                Insn::BranchIfFalse(_, t)
+                | Insn::BranchUnlessZero(_, t)
+                | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::CmpBranch(_, _, _, _, t)
+                | Insn::Jump(t)
+                    if (*t as usize) < is_target.len() =>
+                {
+                    is_target[*t as usize] = true;
+                }
+                _ => {}
+            }
+        }
+        is_target
+    }
+
+    /// `Move(d, s) ; <assign whose VALUE reg is d>` → assign reads `s`
+    /// directly, Move deleted.
+    ///
+    /// `propagate_copies` above folds the PRODUCER side (`producer ; Move`
+    /// retargets the producer), but the c906 opcode census showed the
+    /// CONSUMER side alive at scale: `Move -> BlockingAssignRange` was 5.3%
+    /// of all executed instructions (337 M dynamic pairs on cmark it1) —
+    /// the Move's source is produced far earlier, so the producer-side pass
+    /// never sees it. Sound when nothing can jump into the pair's interior
+    /// and `d` has no later reader.
+    fn forward_move_into_assign(insns: &mut [Insn]) {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| {
+            !matches!(std::env::var("XEZIM_FUSE").as_deref(), Ok("0"))
+                && !matches!(std::env::var("XEZIM_FUSE_MOVEFWD").as_deref(), Ok("0"))
+        }) || insns.len() < 2
+            || Self::has_backward_branch(insns)
+        {
+            return;
+        }
+        let is_target = Self::branch_target_map(insns);
+        for i in 0..insns.len() - 1 {
+            let Insn::Move(d, s) = insns[i] else {
+                continue;
+            };
+            if d == s {
+                continue;
+            }
+            // Next surviving instruction; only Nops may sit between, and no
+            // branch may land inside (i, j].
+            let mut j = i + 1;
+            let mut blocked = false;
+            while j < insns.len() {
+                if is_target[j] {
+                    blocked = true;
+                    break;
+                }
+                if !matches!(insns[j], Insn::Nop) {
+                    break;
+                }
+                j += 1;
+            }
+            if blocked || j >= insns.len() {
+                continue;
+            }
+            let vref = match &mut insns[j] {
+                Insn::BlockingAssign(_, v, _)
+                | Insn::NbaAssign(_, v, _)
+                | Insn::BlockingAssignRange(_, _, _, v)
+                | Insn::NbaAssignRange(_, _, _, v) => v,
+                _ => continue,
+            };
+            if *vref != d {
+                continue;
+            }
+            if Self::reg_read_after(insns, j, d) {
+                continue;
+            }
+            match &mut insns[j] {
+                Insn::BlockingAssign(_, v, _)
+                | Insn::NbaAssign(_, v, _)
+                | Insn::BlockingAssignRange(_, _, _, v)
+                | Insn::NbaAssignRange(_, _, _, v) => *v = s,
+                _ => unreachable!(),
+            }
+            insns[i] = Insn::Nop;
+            FUSED_MOVE_FWD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Delete `ClearSigned(r)` when `r` provably already holds an UNSIGNED
+    /// value — the scrub is then a no-op and removing it cannot change
+    /// anything.
+    ///
+    /// The c906 opcode census measured ClearSigned at 8.0% of the executed
+    /// stream (506 M / run): sign scrubs are emitted defensively at §11.8.1
+    /// mixed-signedness sites, but most registers already carry unsigned
+    /// values. This is a single forward pass tracking a per-register
+    /// "provably unsigned" set, built only from rules VERIFIED against the
+    /// `Value` method each executor calls:
+    ///
+    /// * compares / case-compares / logical ops -> 1-bit unsigned
+    /// * `bitwise_and/or/xor`, `range_select`, `bit_select`, `concat_refs`
+    ///   -> `is_signed: false` unconditionally
+    /// * `add/sub/mul` -> signed only when BOTH operands signed
+    /// * `shift_left/right`, `bitwise_not`, replicate, `Move`/`MoveResize`
+    ///   -> preserve/propagate the source flag
+    /// * `Resize` extends by the value's own flag and keeps it — no change
+    ///
+    /// Every join point (branch target) wipes the set; any instruction not
+    /// understood wipes the set; `SetSigned` un-cleans its register. All
+    /// three fallbacks only FORGO deletions, never enable a wrong one.
+    fn elide_provably_unsigned_scrubs(insns: &mut [Insn], signal_signed: &[bool]) {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| {
+            !matches!(std::env::var("XEZIM_FUSE").as_deref(), Ok("0"))
+                && !matches!(std::env::var("XEZIM_FUSE_SCRUBS").as_deref(), Ok("0"))
+        }) || insns.is_empty()
+        {
+            return;
+        }
+        let is_target = Self::branch_target_map(insns);
+        let mut clean: std::collections::HashSet<RegId> = std::collections::HashSet::new();
+        let sig_unsigned =
+            |sig: u32| -> bool { signal_signed.get(sig as usize).is_some_and(|s| !*s) };
+        for i in 0..insns.len() {
+            if is_target[i] {
+                clean.clear();
+            }
+            // set_to(d, c): record the DEST's new cleanliness. Computed before
+            // mutation so a dest that is also a source reads its OLD state.
+            let mut set_to: Option<(RegId, bool)> = None;
+            let mut elide = false;
+            match &insns[i] {
+                Insn::Nop => {}
+                // -- 1-bit unsigned results --
+                Insn::Eq(d, _, _)
+                | Insn::Neq(d, _, _)
+                | Insn::CaseEq(d, _, _)
+                | Insn::CasezEq(d, _, _)
+                | Insn::CasexEq(d, _, _)
+                | Insn::Lt(d, _, _)
+                | Insn::Leq(d, _, _)
+                | Insn::Gt(d, _, _)
+                | Insn::Geq(d, _, _)
+                | Insn::LogAnd(d, _, _)
+                | Insn::LogOr(d, _, _)
+                | Insn::LogNot(d, _) => set_to = Some((*d, true)),
+                // -- unconditionally unsigned constructors --
+                Insn::BitAnd(d, _, _)
+                | Insn::BitOr(d, _, _)
+                | Insn::BitXor(d, _, _)
+                | Insn::LoadSignalBit(d, _, _)
+                | Insn::LoadSignalRange(d, _, _, _)
+                | Insn::Concat(d, _) => set_to = Some((*d, true)),
+                // -- signed only when BOTH operands are --
+                Insn::Add(d, l, r) | Insn::Sub(d, l, r) | Insn::Mul(d, l, r) => {
+                    set_to = Some((*d, clean.contains(l) || clean.contains(r)))
+                }
+                // -- flag preserved / propagated from the source --
+                Insn::BitNot(d, sr)
+                | Insn::Shl(d, sr, _)
+                | Insn::Shr(d, sr, _)
+                | Insn::Replicate(d, sr, _)
+                | Insn::Move(d, sr)
+                | Insn::MoveResize(d, sr, _) => set_to = Some((*d, clean.contains(sr))),
+                Insn::Resize(_, _) => {}
+                Insn::LoadConst(d, v) => set_to = Some((*d, !v.is_signed && !v.is_real)),
+                Insn::LoadSignal(d, sig) => set_to = Some((*d, sig_unsigned(*sig))),
+                Insn::LoadSignalSigned(d, _) => set_to = Some((*d, false)),
+                Insn::BinOpConst(d, sr, k, kind) => {
+                    let c = match kind {
+                        BinOpConstKind::Eq | BinOpConstKind::CaseEq | BinOpConstKind::Xor => true,
+                        BinOpConstKind::Add => clean.contains(sr) || !k.is_signed,
+                    };
+                    set_to = Some((*d, c));
+                }
+                Insn::ClearSigned(r) => {
+                    if clean.contains(r) {
+                        elide = true;
+                    } else {
+                        set_to = Some((*r, true));
+                    }
+                }
+                Insn::SetSigned(r) => set_to = Some((*r, false)),
+                // -- no register writes: state flows through --
+                Insn::Jump(_)
+                | Insn::BranchIfFalse(_, _)
+                | Insn::BranchUnlessZero(_, _)
+                | Insn::BranchIfSignalFalse(_, _, _)
+                | Insn::CmpBranch(_, _, _, _, _)
+                | Insn::BlockingAssign(_, _, _)
+                | Insn::NbaAssign(_, _, _)
+                | Insn::BlockingAssignRange(_, _, _, _)
+                | Insn::NbaAssignRange(_, _, _, _)
+                | Insn::BlockingAssignBitDyn(_, _, _)
+                | Insn::NbaAssignBitDyn(_, _, _)
+                | Insn::BlockingAssignArray(_, _, _, _)
+                | Insn::NbaAssignArray(_, _, _, _)
+                | Insn::BlockingAssignArrayRange(_, _, _, _, _)
+                | Insn::NbaAssignArrayRange(_, _, _, _, _)
+                | Insn::NbaAssignArrayRead(_, _, _, _) => {}
+                // -- anything else: unknown effects, forget everything --
+                _ => clean.clear(),
+            }
+            if elide {
+                insns[i] = Insn::Nop;
+                ELIDED_SCRUBS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            if let Some((d, c)) = set_to {
+                if c {
+                    clean.insert(d);
+                } else {
+                    clean.remove(&d);
+                }
+            }
+        }
+    }
+
+    /// Merge two adjacent constant adds into one `BinOpConstAdd2` dispatch.
+    /// Pure dispatch amortization — both adds still execute, in order, so
+    /// chained (`s2 == d1`) and independent pairs are equally sound; the only
+    /// constraint is that control cannot enter between them. OPT-IN
+    /// (`XEZIM_FUSE_ADDC2=1`): the new variant must stay off until every
+    /// backend either handles it (interpreter, two-state lowering) or bails
+    /// per-block (JIT/AOT return None on unsupported insns) — forming it by
+    /// default would silently change which blocks those backends accept.
+    fn fuse_addc2(insns: &mut [Insn]) {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| matches!(std::env::var("XEZIM_FUSE_ADDC2").as_deref(), Ok("1")))
+            || insns.len() < 2
+        {
+            return;
+        }
+        let is_target = Self::branch_target_map(insns);
+        let mut i = 0;
+        while i + 1 < insns.len() {
+            let Insn::BinOpConst(_, _, _, BinOpConstKind::Add) = insns[i] else {
+                i += 1;
+                continue;
+            };
+            let mut j = i + 1;
+            let mut blocked = false;
+            while j < insns.len() {
+                if is_target[j] {
+                    blocked = true;
+                    break;
+                }
+                if !matches!(insns[j], Insn::Nop) {
+                    break;
+                }
+                j += 1;
+            }
+            if blocked || j >= insns.len() {
+                i += 1;
+                continue;
+            }
+            let Insn::BinOpConst(_, _, _, BinOpConstKind::Add) = insns[j] else {
+                i = j;
+                continue;
+            };
+            let Insn::BinOpConst(d1, s1, k1, _) = std::mem::replace(&mut insns[i], Insn::Nop)
+            else {
+                unreachable!()
+            };
+            let Insn::BinOpConst(d2, s2, k2, _) = std::mem::replace(&mut insns[j], Insn::Nop)
+            else {
+                unreachable!()
+            };
+            insns[i] = Insn::BinOpConstAdd2(Box::new(AddC2 {
+                d1,
+                s1,
+                k1: *k1,
+                d2,
+                s2,
+                k2: *k2,
+            }));
+            FUSED_ADDC2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            i = j + 1;
+        }
+    }
+
     fn compact_nops(insns: &mut Vec<Insn>) {
         if !insns.iter().any(|i| matches!(i, Insn::Nop)) {
             return;
@@ -10424,6 +10955,16 @@ pub enum TsInsn {
     /// Nonblocking write: queue `regs[s] & mask` (width `w`) with §10.4.2
     /// last-write-wins and the eval-time elision, exactly as `NbaAssign`.
     StoreNba { sig: u32, s: u16, w: u32, mask: u64 },
+    /// NBA of a compile-time CONSTANT (`q <= 8'h3f;`) — the single largest
+    /// two-state bail on c906 (1,189 edge blocks). Non-abortable: the value
+    /// was validated 2-state at lowering.
+    ConstStoreNba { sig: u32, v: u64, w: u32 },
+    /// Partial-bit NBA (`q[hi:lo] <= v`). Mirrors the 4-state executor's
+    /// `compose_inline_range_bits` merge against the pending-or-current
+    /// value — the composition works on raw bit PLANES, so an X base flows
+    /// through instead of aborting; only the SOURCE must be 2-state, and it
+    /// is (it lives in a ts register). Non-abortable.
+    RangeStoreNba { sig: u32, hi: u32, lo: u32, s: u16, mask: u64 },
     /// Dynamic array-element read: eid = first + (regs[idx] - lo). ABORTS
     /// the two-state run (caller re-runs 4-state) when the index is out of
     /// range or the element holds X — both produce X in 4-state. Lowering
@@ -10934,6 +11475,31 @@ pub fn lower_two_state(
                     TsInsn::LogOr { d, a, b }
                 });
             }
+            Insn::BinOpConstAdd2(a) => {
+                // Exactly the two `AddC` lowerings the pair had before
+                // merging — in order, so a chained `s2 == d1` sees d1's
+                // freshly defined width.
+                let w1 = rw[a.s1 as usize]?;
+                let v1 = clean_const(&a.k1)?;
+                let wr1 = w1.max(a.k1.width);
+                def!(rw, a.d1, wr1);
+                out.push(TsInsn::AddC {
+                    d: a.d1 as u16,
+                    s: a.s1 as u16,
+                    k: v1,
+                    mask: ts_mask(wr1),
+                });
+                let w2 = rw[a.s2 as usize]?;
+                let v2 = clean_const(&a.k2)?;
+                let wr2 = w2.max(a.k2.width);
+                def!(rw, a.d2, wr2);
+                out.push(TsInsn::AddC {
+                    d: a.d2 as u16,
+                    s: a.s2 as u16,
+                    k: v2,
+                    mask: ts_mask(wr2),
+                });
+            }
             Insn::BinOpConst(d, s, k, kind) => {
                 let w = rw[*s as usize]?;
                 let v = clean_const(k)?;
@@ -11097,6 +11663,42 @@ pub fn lower_two_state(
                     out.push(TsInsn::Store { sig: sig as u32, s: *r as u16, mask: ts_mask(*w) });
                 }
             }
+            Insn::NbaAssignConst(sig, k, w) => {
+                let sig = *sig as usize;
+                if sig >= signal_widths.len() || signal_real[sig] || *w > 64 {
+                    return None;
+                }
+                let v = clean_const(k)?;
+                side_effects = true;
+                out.push(TsInsn::ConstStoreNba {
+                    sig: sig as u32,
+                    v: v & ts_mask(*w),
+                    w: *w,
+                });
+            }
+            Insn::NbaAssignRange(sig, hi, lo, r) => {
+                let sig = *sig as usize;
+                if sig >= signal_widths.len()
+                    || signal_real[sig]
+                    || signal_widths[sig] > 64
+                {
+                    return None;
+                }
+                let cw = rw[*r as usize]?;
+                let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
+                let w = high - low + 1;
+                if cw > 64 || high >= 64 {
+                    return None;
+                }
+                side_effects = true;
+                out.push(TsInsn::RangeStoreNba {
+                    sig: sig as u32,
+                    hi: high,
+                    lo: low,
+                    s: *r as u16,
+                    mask: ts_mask(w),
+                });
+            }
             Insn::NbaAssign(sig, r, w) => {
                 let sig = *sig as usize;
                 let cw = rw[*r as usize]?;
@@ -11207,11 +11809,6 @@ pub fn lower_two_state(
                 }
             }
             Insn::NbaAssignArrayRead(dst, array, idx_sig, w) => {
-                // Reads an element (abortable on X/out-of-range) AND queues —
-                // the read must still precede every side effect.
-                if side_effects {
-                    return None;
-                }
                 let (first, lo, hi) = array_span(array)?;
                 let isig = *idx_sig as usize;
                 let d = *dst as usize;
@@ -11220,6 +11817,26 @@ pub fn lower_two_state(
                     || d >= signal_widths.len()
                     || signal_real[d]
                 {
+                    return None;
+                }
+                // Historically the read was ABORTABLE (X index, X data,
+                // out-of-range), so it had to precede every side effect: a
+                // mid-block bail replays the block 4-state, and queued NBAs
+                // would double-apply. Two of the three abort sources are now
+                // gone — X element DATA is queued as a 4-state Value (the NBA
+                // queue holds Values; see the executor), and an X INDEX is
+                // impossible when the guard covers `isig`. When the array
+                // also spans the index's whole range (RAM with power-of-two
+                // depth: lo == 0, hi >= 2^idx_w - 1), out-of-range is
+                // statically impossible too — the read is then NON-abortable
+                // and may follow side effects. Anything else keeps the old
+                // ordering rule. c906: 536 edge blocks bailed here.
+                let idx_w = signal_widths[isig];
+                let statically_in_range = lo <= 0
+                    && idx_w < 63
+                    && hi >= (1i64 << idx_w) - 1
+                    && !stored.contains(&(isig as u32));
+                if side_effects && !statically_in_range {
                     return None;
                 }
                 note_read(isig, 0, signal_widths[isig], true, stored.contains(&(isig as u32)), &mut reads_whole, &mut reads_slice);

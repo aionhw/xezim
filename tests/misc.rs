@@ -21,6 +21,8 @@ mod assign_z_passthrough;
 mod audit_sibling_fixes;
 #[path = "misc/bind_upward_refs.rs"]
 mod bind_upward_refs;
+#[path = "misc/interconnect_and_var_ports.rs"]
+mod interconnect_and_var_ports;
 #[path = "misc/blocking_task_call.rs"]
 mod blocking_task_call;
 #[path = "misc/c910_create_en_cont_assign.rs"]

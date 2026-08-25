@@ -45,3 +45,6 @@ file,topic,description
 43_vif_writes.sv,virtual interface writes,blocking/NBA scalar+bit-select+vector writes through a virtual interface propagate to the bound instance
 43_packed_struct_assign.sv,packed struct assignment patterns,named/ordered patterns into packed struct packed by member offset; packed-2D element continuous assign emits full-width gate
 44_eenet_rnm.sv,user-defined nettypes for RNM,EEnet struct-of-real UDN with Millman/KCL resolution over 2-4 simultaneous drivers (DVCon EU 2019 TI/Cadence pattern)
+45_package_nettype.sv,user-defined nettypes in packages,nettype declared in a package used via wildcard import and qualified Pkg::name reference
+46_nettype_hierarchy.sv,user-defined nettypes across hierarchy,nettype nets driven from several module instances through ports; Millman resolution over a nested dut catches per-port double resolution
+47_nettype_coercion.sv,nettype coercion of implicit nets,implicit net used as a port actual takes the port user-defined nettype (§6.6.8/§23.3.3)

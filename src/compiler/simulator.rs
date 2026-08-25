@@ -984,6 +984,17 @@ struct NbaEntry {
     /// all while the other advanced at double rate, so its `forever` divider
     /// never reached its threshold and the clock it drove never toggled.
     static_key: Option<String>,
+    /// §8.3 + §4.9.4: the `this` handle in scope when the NBA was SCHEDULED.
+    ///
+    /// The slow path commits through `assign_value` in the NBA region, AFTER
+    /// the process context has been restored to the event-loop caller — so
+    /// `this_stack` is empty there and a CLASS PROPERTY target resolved to
+    /// nothing. Every `prop <= val` inside a class method was silently
+    /// DROPPED: scalars, vectors, static arrays, queues and dynamic arrays
+    /// alike, while a blocking write in the same method worked. Captured here
+    /// and re-pushed for the apply, exactly as `static_key` pins the declaring
+    /// frame.
+    this_handle: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -2641,7 +2652,142 @@ fn resolve_array_elem_id(
     Some(first_id + (idx - lo) as usize)
 }
 
+/// Opt-in packed word storage for large narrow memories
+/// (`XEZIM_PACKED_MEM=1`).
+///
+/// c906 census: 35.06 M of its 35.11 M signals are array cells, and the big
+/// ones are all BYTE-wide RAMs — 16 separate 8-bit `ram*.mem` arrays standing
+/// in for one 128-bit word. Each cell costs 56 B to carry 8 bits: a 32 B
+/// `Value` plus 24 B of per-signal side tables (width/signed/real/
+/// inline_bits/has_xz/dirty). Packed, a cell is 2 B (value + x/z), which the
+/// census measures as a **27.7x** cut — 1.96 GB -> 0.07 GB.
+///
+/// ADMISSION is deliberately narrow to start: element width <= 8 and an array
+/// big enough to have skipped per-element name registration. Width <= 8 makes
+/// the packed stride exactly ONE BYTE, so the `first_id + (idx - lo)` cell
+/// arithmetic every caller already performs stays correct with no change —
+/// the id simply addresses a byte in the arena instead of a `signal_table`
+/// slot. A variable stride would have required rewriting every one of those
+/// call sites.
+///
+/// Cell ids for packed arrays live ABOVE `PACKED_BASE`, so any site that still
+/// indexes `signal_table` with one fails loudly (out of bounds) rather than
+/// silently reading the wrong cell.
+pub(crate) const PACKED_BASE: usize = 1usize << 48;
+
+#[inline]
+pub(crate) fn is_packed_id(id: usize) -> bool {
+    id >= PACKED_BASE
+}
+
+fn packed_mem_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("XEZIM_PACKED_MEM").map(|v| v != "0").unwrap_or(false)
+    })
+}
+
+/// Byte-per-cell arena backing every admitted array.
+#[derive(Default)]
+pub(crate) struct PackedMem {
+    /// Value bits (bit i of the cell, 0/1).
+    pub vals: Vec<u8>,
+    /// x/z mask, same indexing: 0 = known, 1 = x/z.
+    pub xz: Vec<u8>,
+    /// Declared element width per cell. One byte each — admission caps the
+    /// width at 8, and carrying it here keeps every access site a plain index
+    /// instead of a per-array lookup. Still leaves the cell at 3 B vs 56 B.
+    pub w: Vec<u8>,
+}
+
+impl PackedMem {
+    #[inline]
+    fn off(id: usize) -> usize {
+        id - PACKED_BASE
+    }
+    /// Raw cell contents — `(val_bits, xz_bits, width)` with NO `Value`
+    /// constructed. The RAM hot path moves whole words between the arena and
+    /// a VM register; building a `Value` per access showed up as ~4% in
+    /// `cell_read` plus ~3.5% in the allocator on a c906 cmark profile.
+    #[inline]
+    pub(crate) fn raw(&self, id: usize) -> (u64, u64, u32) {
+        let o = Self::off(id);
+        match (self.vals.get(o), self.xz.get(o), self.w.get(o)) {
+            (Some(&v), Some(&x), Some(&w)) => (v as u64, x as u64, (w as u32).max(1)),
+            _ => (0, 1, 1),
+        }
+    }
+
+    /// Store raw bits into a cell; true when it changed.
+    #[inline]
+    pub(crate) fn set_raw(&mut self, id: usize, v: u64, x: u64) -> bool {
+        let o = Self::off(id);
+        if o >= self.vals.len() {
+            return false;
+        }
+        let (nv, nx) = (v as u8, x as u8);
+        let changed = self.vals[o] != nv || self.xz[o] != nx;
+        if changed {
+            self.vals[o] = nv;
+            self.xz[o] = nx;
+        }
+        changed
+    }
+
+    #[inline]
+    pub(crate) fn width(&self, id: usize) -> u32 {
+        self.w.get(Self::off(id)).copied().unwrap_or(1).max(1) as u32
+    }
+    #[inline]
+    pub(crate) fn read(&self, id: usize) -> Value {
+        let o = Self::off(id);
+        let w = self.w.get(o).copied().unwrap_or(1).max(1) as u32;
+        match (self.vals.get(o), self.xz.get(o)) {
+            (Some(&v), Some(&x)) => Value::from_inline(v as u64, x as u64, w),
+            _ => Value::new(w),
+        }
+    }
+    /// Returns true when the cell actually changed.
+    #[inline]
+    pub(crate) fn write(&mut self, id: usize, val: &Value) -> bool {
+        let o = Self::off(id);
+        if o >= self.vals.len() {
+            return false;
+        }
+        let (v, x) = val.raw_bits();
+        let (nv, nx) = (v as u8, x as u8);
+        let changed = self.vals[o] != nv || self.xz[o] != nx;
+        if changed {
+            self.vals[o] = nv;
+            self.xz[o] = nx;
+        }
+        changed
+    }
+}
+
 #[inline(always)]
+/// Element width of a bytecode array operand, so an out-of-range or x/z-index
+/// READ can yield x at the ELEMENT width. A 1-bit x zero-extends into a wider
+/// element (`0000000x`), which silently turns "unknown" into "almost all
+/// zero" — an AES S-box indexed by an uninitialized input must stay all-x.
+fn bytecode_array_elem_width(
+    array: &super::bytecode::ArrayOperand,
+    array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
+    signal_table: &[Value],
+) -> u32 {
+    let first = match array {
+        super::bytecode::ArrayOperand::Dense { first_id, .. } => Some(*first_id),
+        super::bytecode::ArrayOperand::Named(name) => {
+            array_first_id.get(name.as_str()).map(|&(f, _, _)| f)
+        }
+    };
+    first
+        .and_then(|f| signal_table.get(f))
+        .map(|v| v.width)
+        .unwrap_or(1)
+        .max(1)
+}
+
 fn resolve_bytecode_array_elem(
     array: &super::bytecode::ArrayOperand,
     idx: i64,
@@ -2951,6 +3097,9 @@ impl std::ops::DerefMut for SignalMap {
     }
 }
 
+/// Mid-exec ts aborts tolerated per block before demotion.
+const TS_ABORT_DEMOTE: u16 = 8;
+
 #[derive(Clone)]
 enum CombPlan {
     Unresolved,
@@ -2996,6 +3145,10 @@ pub struct Simulator {
     active_force_skips: u64,
     /// Fast signal table: indexed by signal_id for O(1) access.
     signal_table: Vec<Value>,
+    /// Packed byte storage for admitted large narrow arrays; cells addressed
+    /// by ids at or above `PACKED_BASE` (see `PackedMem`). Empty unless
+    /// `XEZIM_PACKED_MEM=1`.
+    packed: PackedMem,
     /// Parallel array: 1 byte per signal_id, non-zero iff that signal
     /// currently has any X/Z bits. Maintained by `write_sig!` and a few
     /// in-place mutators. Used by the JIT's inline X/Z prelude (avoids
@@ -4540,6 +4693,21 @@ pub struct Simulator {
     prof_ts_bail_forced: u64,
     prof_ts_bail_xread: u64,
     prof_ts_bail_abort: u64,
+    /// Set by `ts_guard_and_exec`: the last `false` came from a MID-EXEC
+    /// abort (partial ts work + full 4-state replay), not a cheap guard
+    /// bail. Callers use it to DEMOTE chronically aborting blocks — the TS
+    /// NBA admission exposed blocks whose guards pass but whose bodies hit
+    /// an abortable op (blocking reads of X RAM data) on most evals: 67 M
+    /// aborts/run, each paying guard + partial exec + replay, a net LOSS vs
+    /// never admitting. Demotion returns such a block to exactly its
+    /// pre-admission engine; clean runners keep the fast path.
+    ts_exec_aborted: bool,
+    /// Per-slot mid-exec abort counts; at `TS_ABORT_DEMOTE` the slot flips
+    /// to No / Interp for the rest of the run. (Re-promotion after init
+    /// settles is future work.)
+    ts_edge_abortn: Vec<u16>,
+    ts_comb_abortn: Vec<u16>,
+    comb_plan_abortn: Vec<u16>,
     /// XEZIM_PROFILE_REPORT=1: reference-style ranked profile (by design
     /// unit / instance / construct). Implies per-entry and per-edge-block
     /// nanosecond attribution.
@@ -6048,7 +6216,7 @@ impl Simulator {
         let signed_signals: HashSet<String> = HashSet::default();
         let real_signals: HashSet<String> = HashSet::default();
 
-        let phase_materialize = std::time::Instant::now();
+        let phase_materialize = crate::WallTimer::now();
         Self::materialize_implicit_contassign_nets(&mut module);
         Self::rewrite_edge_select_sensitivities(&mut module);
         // §18.3/§18.4: publish class-local `typedef enum`/`typedef struct`
@@ -6700,7 +6868,7 @@ impl Simulator {
         // replacement for the per-element entries.
         let mut array_first_id: HashMap<Arc<str>, (usize, i64, i64)> =
             HashMap::with_capacity_and_hasher(module.arrays.len(), Default::default());
-        let phase_arrays_1d = std::time::Instant::now();
+        let phase_arrays_1d = crate::WallTimer::now();
         let _ = (
             "[ARR] arrays={} arrays_2d={} arrays_nd={} signals_pre={} names_pre={}",
             module.arrays.len(),
@@ -6717,11 +6885,47 @@ impl Simulator {
         arrays_sorted.sort_by(|a, b| a.0.cmp(b.0));
         // Scratch buffer for per-element names (see `push_elem_named`).
         let mut elem_name_buf = String::with_capacity(96);
+        // Memory census (`XEZIM_MEM_CENSUS=1`): size the word-aggregation
+        // opportunity before changing any representation. Every array cell
+        // currently costs a full `Value` plus one entry in each per-signal side
+        // table (width/signed/real/inline-bits/has_xz/dirty), which for a
+        // byte-wide RAM is ~60 B to carry 8 bits of data. Packed word storage
+        // would cost `ceil(w/8)` bytes for the value and the same for the x/z
+        // mask. Reports per-array and in total so the go/no-go is a number, not
+        // an argument -- same census-first shape the AOT template dedup used.
+        let mem_census = std::env::var_os("XEZIM_MEM_CENSUS").is_some();
+        let mut census: Vec<(String, usize, u32)> = Vec::new();
+        let packed_mem = packed_mem_enabled();
+        let mut packed_mem_arena = PackedMem::default();
+        let mut packed_arrays: std::collections::HashSet<String> =
+            std::collections::HashSet::default();
+        let mut packed_cells: usize = 0;
         for (base, &(lo, hi, w)) in arrays_sorted {
+            let count = (hi - lo + 1).max(0) as usize;
+            if mem_census && count > 0 {
+                census.push((base.clone(), count, w));
+            }
+            let register_names = count <= large_array_threshold;
+            // Packed admission: a wide-enough, NARROW array that already
+            // forgoes per-element names. Width <= 8 keeps the cell stride at
+            // one byte so `first_id + (idx - lo)` still addresses the right
+            // cell (see PackedMem). Cells get ids above PACKED_BASE and no
+            // `signal_table` / side-table entries at all — that omission IS
+            // the 27.7x saving.
+            if packed_mem && !register_names && w <= 8 && count > 0 {
+                let first_id = PACKED_BASE + packed_mem_arena.vals.len();
+                array_first_id.insert(Arc::from(base.as_str()), (first_id, lo, hi));
+                packed_arrays.insert(base.clone());
+                let init = array_init(w);
+                let (iv, ix) = init.raw_bits();
+                packed_mem_arena.vals.resize(packed_mem_arena.vals.len() + count, iv as u8);
+                packed_mem_arena.xz.resize(packed_mem_arena.xz.len() + count, ix as u8);
+                packed_mem_arena.w.resize(packed_mem_arena.w.len() + count, w as u8);
+                packed_cells += count;
+                continue;
+            }
             let first_id = signal_table.len();
             array_first_id.insert(Arc::from(base.as_str()), (first_id, lo, hi));
-            let count = (hi - lo + 1).max(0) as usize;
-            let register_names = count <= large_array_threshold;
             if false && count >= 1000 {
                 let _ = (&base, count, register_names);
             }
@@ -6816,6 +7020,48 @@ impl Simulator {
                     signal_table[id] = Value::all_z(signal_widths_vec[id]);
                 }
             }
+        }
+        if packed_mem && packed_cells > 0 {
+            eprintln!(
+                "[PACKED-MEM] arrays={} cells={} arena={:.2} MB (vs {:.2} MB unpacked)",
+                packed_arrays.len(),
+                packed_cells,
+                (packed_mem_arena.vals.len() + packed_mem_arena.xz.len() + packed_mem_arena.w.len()) as f64 / 1e6,
+                (packed_cells * (std::mem::size_of::<Value>() + 24)) as f64 / 1e6,
+            );
+        }
+        if mem_census {
+            // Per-cell cost today: the Value itself plus the fixed-size
+            // per-signal side tables that are indexed by signal_id.
+            const SIDE_BYTES: usize = 4 /*width*/ + 1 /*signed*/ + 1 /*real*/
+                + 16 /*inline_bits*/ + 1 /*has_xz*/ + 1 /*dirty*/;
+            let per_cell_now = std::mem::size_of::<Value>() + SIDE_BYTES;
+            census.sort_by(|a, b| b.1.cmp(&a.1));
+            let (mut tot_cells, mut tot_now, mut tot_packed) = (0usize, 0usize, 0usize);
+            eprintln!("[MEM-CENSUS] Value={}B side={}B per_cell={}B",
+                std::mem::size_of::<Value>(), SIDE_BYTES, per_cell_now);
+            for (name, count, w) in census.iter().take(20) {
+                let packed = ((*w as usize).div_ceil(8)) * 2 * count;
+                eprintln!(
+                    "[MEM-CENSUS] {:>12} cells x {:>4}b  now {:>7.1} MB  packed {:>6.1} MB  {:>5.1}x  {}",
+                    count, w,
+                    (count * per_cell_now) as f64 / 1e6,
+                    packed as f64 / 1e6,
+                    (count * per_cell_now) as f64 / packed.max(1) as f64,
+                    name,
+                );
+            }
+            for (_, count, w) in &census {
+                tot_cells += count;
+                tot_now += count * per_cell_now;
+                tot_packed += ((*w as usize).div_ceil(8)) * 2 * count;
+            }
+            eprintln!(
+                "[MEM-CENSUS] TOTAL arrays={} cells={} now={:.2} GB packed={:.2} GB ratio={:.1}x",
+                census.len(), tot_cells,
+                tot_now as f64 / 1e9, tot_packed as f64 / 1e9,
+                tot_now as f64 / tot_packed.max(1) as f64,
+            );
         }
         let arrays_1d_ms = phase_arrays_1d.elapsed().as_secs_f64() * 1000.0;
         let phase_arrays_other = std::time::Instant::now();
@@ -7229,6 +7475,7 @@ impl Simulator {
             jit_nba_side_queue: Vec::new(),
             jit_nba_side_len: 0,
             signal_table,
+            packed: packed_mem_arena,
             signal_name_to_id,
             scope_parents_by_leaf,
             array_elem_ids: HashMap::default(),
@@ -7622,6 +7869,10 @@ impl Simulator {
             prof_ts_bail_forced: 0,
             prof_ts_bail_xread: 0,
             prof_ts_bail_abort: 0,
+            ts_exec_aborted: false,
+            ts_edge_abortn: Vec::new(),
+            ts_comb_abortn: Vec::new(),
+            comb_plan_abortn: Vec::new(),
             profile_report: std::env::var("XEZIM_PROFILE_REPORT").ok().as_deref() == Some("1"),
             prof_entry_ns: Vec::new(),
             comb_dep_entries: Vec::new(),
@@ -15999,6 +16250,48 @@ impl Simulator {
         }
     }
 
+    /// Does the subtree contain a statement-level `@(...)` EVENT control?
+    /// Same displacement class as `stmt_contains_delay_control`, nested-wait
+    /// flavor: on the edge path a body `@(posedge clk)` / `repeat (n)
+    /// @(posedge clk)` executes as if it were absent (the synchronous
+    /// executor cannot suspend), so a credit-paced response block streamed
+    /// its beats back-to-back and its `resp_vld` handshake alternated. Such
+    /// a body must be a PROCESS: the park machinery suspends at the inner
+    /// wait and §9.2.2 miss-edges-while-busy semantics match the reference.
+    /// The block's OWN head control was already stripped by
+    /// `extract_sensitivity`, so any event control seen here is nested.
+    fn stmt_contains_event_control(stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::TimingControl { control, stmt: inner } => {
+                matches!(control, TimingControl::Event(_))
+                    || Self::stmt_contains_event_control(inner)
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().any(Self::stmt_contains_event_control)
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::stmt_contains_event_control(then_stmt)
+                    || else_stmt
+                        .as_ref()
+                        .is_some_and(|e| Self::stmt_contains_event_control(e))
+            }
+            StatementKind::Case { items, .. } => items
+                .iter()
+                .any(|it| Self::stmt_contains_event_control(&it.stmt)),
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. } => Self::stmt_contains_event_control(body),
+            _ => false,
+        }
+    }
+
     fn count_timing_controls(stmt: &Statement) -> usize {
         match &stmt.kind {
             StatementKind::TimingControl { stmt: inner, .. } => {
@@ -16453,6 +16746,11 @@ impl Simulator {
                     // star_sensitivity suite's defect #1). Level blocks keep
                     // their established edge-path delay handling.
                     || (!all_level && Self::stmt_contains_delay_control(&body))
+                    // A nested `@(...)` wait is the same class: the edge
+                    // path's synchronous executor cannot suspend, so it ran
+                    // the inner wait as a no-op (a `repeat (lat) @(posedge
+                    // clk)` paced response streamed with zero latency).
+                    || (!all_level && Self::stmt_contains_event_control(&body))
                 {
                     let forever_stmt = Statement::new(
                         StatementKind::Forever {
@@ -16641,6 +16939,7 @@ impl Simulator {
         compiler.set_packed_full_dims(&self.module.packed_full_dims);
         compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
         compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+        compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
         compiler.set_array_first_id(&self.array_first_id);
         compiler.set_string_signals(&self.module.string_signals);
         compiler.set_signal_real(&self.signal_real);
@@ -17977,6 +18276,16 @@ impl Simulator {
                     }
                     return true;
                 }
+                if self.ts_exec_aborted {
+                    if eidx >= self.comb_plan_abortn.len() {
+                        self.comb_plan_abortn.resize(eidx + 1, 0);
+                    }
+                    self.comb_plan_abortn[eidx] =
+                        self.comb_plan_abortn[eidx].saturating_add(1);
+                    if self.comb_plan_abortn[eidx] >= TS_ABORT_DEMOTE {
+                        self.comb_plan[eidx] = CombPlan::Interp;
+                    }
+                }
                 // Dynamic guard bail (force on a target, X input): the
                 // unplanned chain tried the JIT next. Rare path — the full
                 // slot lookup is fine here.
@@ -18248,7 +18557,19 @@ impl Simulator {
             return false;
         };
         let ts = ts.clone();
-        self.ts_guard_and_exec(&ts)
+        let ok = self.ts_guard_and_exec(&ts);
+        if !ok && self.ts_exec_aborted {
+            let counts = if edge { &mut self.ts_edge_abortn } else { &mut self.ts_comb_abortn };
+            if eidx >= counts.len() {
+                counts.resize(eidx + 1, 0);
+            }
+            counts[eidx] = counts[eidx].saturating_add(1);
+            if counts[eidx] >= TS_ABORT_DEMOTE {
+                let slots = if edge { &mut self.ts_edge } else { &mut self.ts_comb };
+                slots[eidx] = TsSlot::No;
+            }
+        }
+        ok
     }
 
     /// Per-eval guards + execution: no forces (stores bypass force
@@ -18256,6 +18577,7 @@ impl Simulator {
     /// path), and every read X-free (width ≤ 64 was proven at lower time,
     /// so storage is Inline and raw_bits is exact).
     fn ts_guard_and_exec(&mut self, ts: &super::bytecode::TwoStateBlock) -> bool {
+        self.ts_exec_aborted = false;
         if self.warn_x {
             self.prof_ts_bail_warnx += 1;
             return false;
@@ -18299,6 +18621,7 @@ impl Simulator {
         }
         if !self.exec_two_state(ts) {
             self.prof_ts_bail_abort += 1;
+            self.ts_exec_aborted = true;
             return false;
         }
         self.prof_ts_evals += 1;
@@ -18615,11 +18938,20 @@ impl Simulator {
                     }
                     let eid = op.first as usize + (i - op.lo) as usize;
                     let (ev, ex) = self.signal_table[eid].raw_bits();
-                    if ex != 0 {
-                        bail!();
-                    }
                     let m = if op.w >= 64 { u64::MAX } else { (1u64 << op.w) - 1 };
-                    self.ts_store_nba(op.dst as usize, ev & m, op.w);
+                    if ex != 0 {
+                        // X element data: the destination is an NBA QUEUE
+                        // entry, which holds a full 4-state Value — queue it
+                        // instead of aborting the whole block. On this
+                        // design 95% of cells carry X, so the abort was the
+                        // common case, and a mid-block abort is what forces
+                        // reads to precede every side effect.
+                        let mut v = Value::from_inline(ev & m, ex & m, op.w.max(1));
+                        v.is_signed = false;
+                        self.ts_store_nba_val(op.dst as usize, v);
+                    } else {
+                        self.ts_store_nba(op.dst as usize, ev & m, op.w);
+                    }
                 }
                 TsInsn::Store { sig, s, mask } => {
                     let v = regs[*s as usize] & mask;
@@ -18628,6 +18960,44 @@ impl Simulator {
                 TsInsn::StoreNba { sig, s, w, mask } => {
                     let v = regs[*s as usize] & mask;
                     self.ts_store_nba(*sig as usize, v, *w);
+                }
+                TsInsn::ConstStoreNba { sig, v, w } => {
+                    self.ts_store_nba(*sig as usize, *v, *w);
+                }
+                TsInsn::RangeStoreNba { sig, hi, lo, s, mask } => {
+                    // Mirror of the 4-state `NbaAssignRange` fast arm: merge
+                    // into the pending entry when one exists, else seed from
+                    // the signal, with eval-time elision. Plane-based, so an
+                    // X base composes instead of aborting.
+                    let id = *sig as usize;
+                    let (src_v, src_x) = (regs[*s as usize] & mask, 0u64);
+                    if let Some(i) = self.nba_fast_index.get(id) {
+                        let target = &mut self.nba_fast[i].value;
+                        let (base_v, base_x) = target.raw_bits();
+                        let (new_v, new_x) = Self::compose_inline_range_bits(
+                            base_v, base_x, src_v, src_x, *lo, *hi,
+                        );
+                        target.set_inline_bits(new_v, new_x);
+                        target.is_signed = self.signal_signed[id];
+                    } else {
+                        let (base_v, base_x) = self.signal_table[id].raw_bits();
+                        let (new_v, new_x) = Self::compose_inline_range_bits(
+                            base_v, base_x, src_v, src_x, *lo, *hi,
+                        );
+                        if new_v == base_v && new_x == base_x {
+                            self.prof_nba_elided += 1;
+                        } else {
+                            let mut nv =
+                                Value::from_inline(new_v, new_x, self.signal_widths[id]);
+                            nv.is_signed = self.signal_signed[id];
+                            self.nba_fast_index.insert(id, self.nba_fast.len());
+                            self.nba_fast.push(NbaFast {
+                                block_index: 0,
+                                signal_id: id,
+                                value: nv,
+                            });
+                        }
+                    }
                 }
                 // ---- wide bank ----
                 TsInsn::WLoadSig { d, sig } => {
@@ -18943,6 +19313,44 @@ impl Simulator {
                     let v = regs[*s as usize] & mask;
                     self.ts_store_nba(*sig as usize, v, *w);
                 }
+                TsInsn::ConstStoreNba { sig, v, w } => {
+                    self.ts_store_nba(*sig as usize, *v, *w);
+                }
+                TsInsn::RangeStoreNba { sig, hi, lo, s, mask } => {
+                    // Mirror of the 4-state `NbaAssignRange` fast arm: merge
+                    // into the pending entry when one exists, else seed from
+                    // the signal, with eval-time elision. Plane-based, so an
+                    // X base composes instead of aborting.
+                    let id = *sig as usize;
+                    let (src_v, src_x) = (regs[*s as usize] & mask, 0u64);
+                    if let Some(i) = self.nba_fast_index.get(id) {
+                        let target = &mut self.nba_fast[i].value;
+                        let (base_v, base_x) = target.raw_bits();
+                        let (new_v, new_x) = Self::compose_inline_range_bits(
+                            base_v, base_x, src_v, src_x, *lo, *hi,
+                        );
+                        target.set_inline_bits(new_v, new_x);
+                        target.is_signed = self.signal_signed[id];
+                    } else {
+                        let (base_v, base_x) = self.signal_table[id].raw_bits();
+                        let (new_v, new_x) = Self::compose_inline_range_bits(
+                            base_v, base_x, src_v, src_x, *lo, *hi,
+                        );
+                        if new_v == base_v && new_x == base_x {
+                            self.prof_nba_elided += 1;
+                        } else {
+                            let mut nv =
+                                Value::from_inline(new_v, new_x, self.signal_widths[id]);
+                            nv.is_signed = self.signal_signed[id];
+                            self.nba_fast_index.insert(id, self.nba_fast.len());
+                            self.nba_fast.push(NbaFast {
+                                block_index: 0,
+                                signal_id: id,
+                                value: nv,
+                            });
+                        }
+                    }
+                }
                 TsInsn::WLoadSig { .. }
                 | TsInsn::WConst { .. }
                 | TsInsn::WXor { .. }
@@ -18999,6 +19407,24 @@ impl Simulator {
     /// NBA writeback: exact mirror of the `NbaAssign` exec arm — §10.4.2
     /// last-write-wins via nba_fast_index, eval-time elision otherwise.
     #[inline]
+    /// `ts_store_nba` for an already-built (possibly 4-STATE) Value — the
+    /// NBA queue holds full Values, so an X element read by a two-state
+    /// block can be queued without the block aborting.
+    fn ts_store_nba_val(&mut self, id: usize, val: Value) {
+        if let Some(i) = self.nba_fast_index.get(id) {
+            self.nba_fast[i].value = val;
+        } else if self.signal_table[id] != val {
+            self.nba_fast_index.insert(id, self.nba_fast.len());
+            self.nba_fast.push(NbaFast {
+                block_index: 0,
+                signal_id: id,
+                value: val,
+            });
+        } else {
+            self.prof_nba_elided += 1;
+        }
+    }
+
     fn ts_store_nba(&mut self, id: usize, v: u64, w: u32) {
         let val = Value::from_u64(v, w);
         if let Some(i) = self.nba_fast_index.get(id) {
@@ -19262,6 +19688,44 @@ impl Simulator {
                     let v = regs[*s as usize] & mask;
                     self.ts_store_nba(*sig as usize, v, *w);
                 }
+                TsInsn::ConstStoreNba { sig, v, w } => {
+                    self.ts_store_nba(*sig as usize, *v, *w);
+                }
+                TsInsn::RangeStoreNba { sig, hi, lo, s, mask } => {
+                    // Mirror of the 4-state `NbaAssignRange` fast arm: merge
+                    // into the pending entry when one exists, else seed from
+                    // the signal, with eval-time elision. Plane-based, so an
+                    // X base composes instead of aborting.
+                    let id = *sig as usize;
+                    let (src_v, src_x) = (regs[*s as usize] & mask, 0u64);
+                    if let Some(i) = self.nba_fast_index.get(id) {
+                        let target = &mut self.nba_fast[i].value;
+                        let (base_v, base_x) = target.raw_bits();
+                        let (new_v, new_x) = Self::compose_inline_range_bits(
+                            base_v, base_x, src_v, src_x, *lo, *hi,
+                        );
+                        target.set_inline_bits(new_v, new_x);
+                        target.is_signed = self.signal_signed[id];
+                    } else {
+                        let (base_v, base_x) = self.signal_table[id].raw_bits();
+                        let (new_v, new_x) = Self::compose_inline_range_bits(
+                            base_v, base_x, src_v, src_x, *lo, *hi,
+                        );
+                        if new_v == base_v && new_x == base_x {
+                            self.prof_nba_elided += 1;
+                        } else {
+                            let mut nv =
+                                Value::from_inline(new_v, new_x, self.signal_widths[id]);
+                            nv.is_signed = self.signal_signed[id];
+                            self.nba_fast_index.insert(id, self.nba_fast.len());
+                            self.nba_fast.push(NbaFast {
+                                block_index: 0,
+                                signal_id: id,
+                                value: nv,
+                            });
+                        }
+                    }
+                }
                 TsInsn::WLoadSig { .. }
                 | TsInsn::WConst { .. }
                 | TsInsn::WXor { .. }
@@ -19454,6 +19918,7 @@ impl Simulator {
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+            compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
             compiler.set_signal_real(&self.signal_real);
@@ -19536,6 +20001,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 compiler.set_array_first_id(&self.array_first_id);
                 compiler.set_string_signals(&self.module.string_signals);
                 compiler.set_signal_real(&self.signal_real);
@@ -19566,6 +20032,7 @@ impl Simulator {
                 delay_compiler.set_assoc_arrays(&self.module.associative_arrays);
                 delay_compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 delay_compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                delay_compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 delay_compiler.set_array_first_id(&self.array_first_id);
                 delay_compiler.set_string_signals(&self.module.string_signals);
                 delay_compiler.set_signal_real(&self.signal_real);
@@ -20309,6 +20776,10 @@ impl Simulator {
                 // the embedded constant, which the elided `LoadConst` would
                 // have cloned into `vm_regs[r]` verbatim — so the 4-state,
                 // signedness and §5.7.1 `is_fill` rules cannot drift.
+                Insn::BinOpConstAdd2(a) => {
+                    vm_regs[a.d1 as usize] = vm_regs[a.s1 as usize].add(&a.k1);
+                    vm_regs[a.d2 as usize] = vm_regs[a.s2 as usize].add(&a.k2);
+                }
                 Insn::BinOpConst(d, s, k, kind) => {
                     use super::bytecode::BinOpConstKind as K;
                     let (d, s) = (*d as usize, *s as usize);
@@ -20658,7 +21129,22 @@ impl Simulator {
                     // Direct compute via array_first_id — no format!() / no
                     // HashMap miss on cell access. Parallel-path equivalent
                     // of the sequential array_elem_ids cache.
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    // §7.4.6 / §11.5.1: an UNKNOWN index reads x, NOT element 0.
+                    // `to_u64()` returns None for an x/z value, and the old
+                    // `unwrap_or(0)` silently read arr[0] — an AES S-box
+                    // indexed by an uninitialized input returned real table
+                    // data, so downstream logic resolved to a definite WRONG
+                    // value instead of propagating x. A sentinel below `lo`
+                    // makes the element resolve MISS, taking the existing
+                    // out-of-range arm that already yields x.
+                    let idx = {
+                        let ir = &vm_regs[*idx_reg as usize];
+                        // x/z index: force a resolve MISS so the existing
+                        // out-of-range arm yields x. `to_u64()` masks x bits to
+                        // ZERO and never returns None, so it cannot be used to
+                        // detect this -- the old code silently read arr[0].
+                        if ir.has_xz() { i64::MIN } else { ir.to_u64().unwrap_or(0) as i64 }
+                    };
                     let id = resolve_bytecode_array_elem(
                         array_name,
                         idx,
@@ -20668,7 +21154,9 @@ impl Simulator {
                     if let Some(eid) = id {
                         vm_regs[*dest as usize] = signal_table[eid].clone();
                     } else {
-                        vm_regs[*dest as usize] = Value::new(1);
+                        vm_regs[*dest as usize] = Value::new(
+                            bytecode_array_elem_width(array_name, array_first_id, signal_table),
+                        );
                     }
                 }
                 Insn::NbaAssignArray(array_name, idx_reg, val_reg, width) => {
@@ -20921,6 +21409,10 @@ impl Simulator {
                 // the embedded constant, which the elided `LoadConst` would
                 // have cloned into `vm_regs[r]` verbatim — so the 4-state,
                 // signedness and §5.7.1 `is_fill` rules cannot drift.
+                Insn::BinOpConstAdd2(a) => {
+                    vm_regs[a.d1 as usize] = vm_regs[a.s1 as usize].add(&a.k1);
+                    vm_regs[a.d2 as usize] = vm_regs[a.s2 as usize].add(&a.k2);
+                }
                 Insn::BinOpConst(d, s, k, kind) => {
                     use super::bytecode::BinOpConstKind as K;
                     let (d, s) = (*d as usize, *s as usize);
@@ -21205,7 +21697,22 @@ impl Simulator {
                         vm_regs[*l as usize].power(&vm_regs[*r as usize]);
                 }
                 Insn::LoadArrayElem(dest, array_name, idx_reg) => {
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    // §7.4.6 / §11.5.1: an UNKNOWN index reads x, NOT element 0.
+                    // `to_u64()` returns None for an x/z value, and the old
+                    // `unwrap_or(0)` silently read arr[0] — an AES S-box
+                    // indexed by an uninitialized input returned real table
+                    // data, so downstream logic resolved to a definite WRONG
+                    // value instead of propagating x. A sentinel below `lo`
+                    // makes the element resolve MISS, taking the existing
+                    // out-of-range arm that already yields x.
+                    let idx = {
+                        let ir = &vm_regs[*idx_reg as usize];
+                        // x/z index: force a resolve MISS so the existing
+                        // out-of-range arm yields x. `to_u64()` masks x bits to
+                        // ZERO and never returns None, so it cannot be used to
+                        // detect this -- the old code silently read arr[0].
+                        if ir.has_xz() { i64::MIN } else { ir.to_u64().unwrap_or(0) as i64 }
+                    };
                     let id = resolve_bytecode_array_elem(
                         array_name,
                         idx,
@@ -21215,7 +21722,9 @@ impl Simulator {
                     if let Some(eid) = id {
                         vm_regs[*dest as usize] = view[eid].clone();
                     } else {
-                        vm_regs[*dest as usize] = Value::new(1);
+                        vm_regs[*dest as usize] = Value::new(
+                            bytecode_array_elem_width(array_name, array_first_id, view),
+                        );
                     }
                 }
                 // ── Immediate (blocking) writes — comb semantics ──
@@ -21688,6 +22197,16 @@ impl Simulator {
                 if self.ts_guard_and_exec(&ts) {
                     return true;
                 }
+                if self.ts_exec_aborted {
+                    if block_idx >= self.ts_edge_abortn.len() {
+                        self.ts_edge_abortn.resize(block_idx + 1, 0);
+                    }
+                    self.ts_edge_abortn[block_idx] =
+                        self.ts_edge_abortn[block_idx].saturating_add(1);
+                    if self.ts_edge_abortn[block_idx] >= TS_ABORT_DEMOTE {
+                        self.ts_edge[block_idx] = TsSlot::No;
+                    }
+                }
             }
             _ => {
                 if let Some(cb) = self.compiled_edge_blocks[block_idx].take() {
@@ -22015,6 +22534,29 @@ impl Simulator {
                 // verbatim (width/is_signed/is_real/is_fill included) — same
                 // `vm_*` fast helper, same `Value` fallback, so the 4-state,
                 // signedness and §5.7.1 `is_fill` rules cannot drift.
+                Insn::BinOpConstAdd2(a) => {
+                    // Each half runs EXACTLY the K::Add path below — same
+                    // vm_add_sub fast helper, same Value fallback — so the
+                    // superinstruction cannot drift from the pair it merged.
+                    match vm_add_sub(&self.vm_regs[a.s1 as usize], &a.k1, false) {
+                        Some((v, x, w, sg)) => {
+                            vm_store(&mut self.vm_regs[a.d1 as usize], v, x, w, sg)
+                        }
+                        None => {
+                            self.vm_regs[a.d1 as usize] =
+                                self.vm_regs[a.s1 as usize].add(&a.k1)
+                        }
+                    }
+                    match vm_add_sub(&self.vm_regs[a.s2 as usize], &a.k2, false) {
+                        Some((v, x, w, sg)) => {
+                            vm_store(&mut self.vm_regs[a.d2 as usize], v, x, w, sg)
+                        }
+                        None => {
+                            self.vm_regs[a.d2 as usize] =
+                                self.vm_regs[a.s2 as usize].add(&a.k2)
+                        }
+                    }
+                }
                 Insn::BinOpConst(d, s, k, kind) => {
                     use super::bytecode::BinOpConstKind as K;
                     let (d, s) = (*d as usize, *s as usize);
@@ -22445,6 +22987,10 @@ impl Simulator {
                         &self.array_first_id,
                         &self.signal_name_to_id,
                     ) {
+                        Some(eid) if is_packed_id(eid) => {
+                            let (v, x, _) = self.packed.raw(eid);
+                            Value::from_inline(v, x, *width)
+                        }
                         Some(eid) => self.signal_table[eid].resize_for_assign(*width),
                         None => Value::new(1).resize_for_assign(*width),
                     };
@@ -22931,7 +23477,22 @@ impl Simulator {
                     // (thousands of array reads per clock). The cache is
                     // populated lazily by `get_array_elem_id` on first
                     // miss; subsequent calls are a Vec index away.
-                    let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    // §7.4.6 / §11.5.1: an UNKNOWN index reads x, NOT element 0.
+                    // `to_u64()` returns None for an x/z value, and the old
+                    // `unwrap_or(0)` silently read arr[0] — an AES S-box
+                    // indexed by an uninitialized input returned real table
+                    // data, so downstream logic resolved to a definite WRONG
+                    // value instead of propagating x. A sentinel below `lo`
+                    // makes the element resolve MISS, taking the existing
+                    // out-of-range arm that already yields x.
+                    let idx = {
+                        let ir = &self.vm_regs[*idx_reg as usize];
+                        // x/z index: force a resolve MISS so the existing
+                        // out-of-range arm yields x. `to_u64()` masks x bits to
+                        // ZERO and never returns None, so it cannot be used to
+                        // detect this -- the old code silently read arr[0].
+                        if ir.has_xz() { i64::MIN } else { ir.to_u64().unwrap_or(0) as i64 }
+                    };
                     if let Some(eid) = resolve_bytecode_array_elem(
                         array_name,
                         idx,
@@ -22941,10 +23502,13 @@ impl Simulator {
                         // SoA read fast path (XEZIM_INLINE_BITS=1); with
                         // XEZIM_ARRAY_SOA_SHADOW=1 also assert coherence with
                         // the canonical signal_table before trusting it.
-                        if eid < soa_len && self.soa_read_ok[eid] {
+                        if is_packed_id(eid) {
+                            let (v, x, w) = self.packed.raw(eid);
+                            vm_store(&mut self.vm_regs[*dest as usize], v, x, w, false);
+                        } else if eid < soa_len && self.soa_read_ok[eid] {
                             let [v, x] = self.signal_inline_bits[eid];
                             if self.soa_shadow {
-                                let (cv, cx) = self.signal_table[eid].raw_bits();
+                                let (cv, cx) = self.cell_read(eid).raw_bits();
                                 if v != cv || x != cx {
                                     eprintln!(
                                         "[SOA-SHADOW] LoadArrayElem mismatch eid={} inline=({:#x},{:#x}) table=({:#x},{:#x}) — aborting",
@@ -22959,8 +23523,14 @@ impl Simulator {
                             self.vm_regs[*dest as usize].copy_from(&self.signal_table[eid]);
                         }
                     } else {
-                        // `Value::new(1)` — a 1-bit X.
-                        vm_store(&mut self.vm_regs[*dest as usize], 0, 1, 1, false);
+                        // x/z or out-of-range index: x at the ELEMENT width.
+                        let w = bytecode_array_elem_width(
+                            array_name,
+                            &self.array_first_id,
+                            &self.signal_table,
+                        );
+                        let xm = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                        vm_store(&mut self.vm_regs[*dest as usize], 0, xm, w, false);
                     }
                 }
                 Insn::NbaAssignArray(array_name, idx_reg, val_reg, width) => {
@@ -22974,7 +23544,12 @@ impl Simulator {
                         let val = self.vm_regs[*val_reg as usize].resize(*width);
                         // Eval-time elision — array element write that
                         // matches current storage is dropped before queue.
-                        if self.signal_table[eid] != val {
+                        if is_packed_id(eid) {
+                            let (bv, bx) = val.raw_bits();
+                            if self.packed.set_raw(eid, bv, bx) {
+                                self.table_modified = true;
+                            }
+                        } else if self.signal_table[eid] != val {
                             self.nba_fast_index.insert(eid, self.nba_fast.len());
                             self.nba_fast.push(NbaFast {
                                 block_index: 0,
@@ -22996,7 +23571,12 @@ impl Simulator {
                     ) {
                         let mut val = self.vm_regs[*val_reg as usize].resize_for_assign(*width);
                         val.is_signed = self.signal_signed[eid];
-                        if self.signal_table[eid] != val {
+                        if is_packed_id(eid) {
+                            let (bv, bx) = val.raw_bits();
+                            if self.packed.set_raw(eid, bv, bx) {
+                                self.table_modified = true;
+                            }
+                        } else if self.signal_table[eid] != val {
                             write_sig!(self, eid, val);
                             if !self.dirty_signals[eid] {
                                 self.dirty_signals[eid] = true;
@@ -23480,6 +24060,16 @@ impl Simulator {
             writes.clear();
             Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
             Self::collect_lhs_writes(&ca.lhs, &self.module, &mut writes);
+            // Substituted port actuals whose bare name collides with a child
+            // declaration arrive ROOT-marked (core rewrite_expr_impl, issue
+            // #128: `.v_node(out_val)` into a module with its own `out_val`).
+            // `collect_expr_reads` flattens the root away, so gather the
+            // rooted names separately: such a read resolves ABSOLUTELY, and
+            // the scope-candidate machinery below must not requalify it back
+            // into the child — that self-loop (dep AND eval on `b0.out_val`)
+            // silently severed the parent feedback path.
+            let mut rooted_reads: HashSet<String> = HashSet::default();
+            Self::collect_rooted_ident_names(&ca.rhs, &mut rooted_reads);
             // A bare LHS that IS a registered top-level signal resolves
             // absolutely — force no scope hint (both inferences would
             // otherwise scope a multi-driven net's folded
@@ -23711,6 +24301,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 compiler.set_array_first_id(&self.array_first_id);
                 // Without the function table, `compile_pure_call` cannot even
                 // LOOK UP a callee, so any RHS containing a function call
@@ -23779,6 +24370,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_array_first_id(&self.array_first_id);
                 // Same omission as the single-dest site above: without the
@@ -23880,7 +24472,11 @@ impl Simulator {
             let entry_is_bytecode = matches!(&item, CombItem::CompiledContAssign { .. });
             for r in &reads {
                 let mut found = false;
-                if entry_is_bytecode && !r.contains('.') {
+                // Root-marked read: the name is absolute by construction —
+                // never scope-qualify it (bytecode resolve_ident and the AST
+                // resolver both honor the root the same way).
+                let read_is_rooted = rooted_reads.contains(r.as_str());
+                if entry_is_bytecode && !r.contains('.') && !read_is_rooted {
                     if let Some(scope) = &scope_hint {
                         let q = format!("{}.{}", scope, r);
                         if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
@@ -23899,7 +24495,7 @@ impl Simulator {
                     // re-fired when the port copy actually arrived. Register the
                     // scoped id too; a superset sensitivity only costs an extra
                     // evaluation, while missing one loses the value entirely.
-                    if !entry_is_bytecode && !r.contains('.') {
+                    if !entry_is_bytecode && !r.contains('.') && !read_is_rooted {
                         for sc in [scope_hint.as_ref(), write_scope.as_ref()] {
                             if let Some(scope) = sc {
                                 if let Some(&sid) = self
@@ -23920,7 +24516,7 @@ impl Simulator {
                 // lockstep with the signal id the VM will read; otherwise a
                 // successfully compiled entry remains "unresolved" and is
                 // needlessly evaluated on every settle call.
-                if !entry_is_bytecode || r.contains('.') {
+                if (!entry_is_bytecode || r.contains('.')) && !read_is_rooted {
                     if let Some(scope) = &scope_hint {
                         let qualified = format!("{}.{}", scope, r);
                         if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
@@ -24471,6 +25067,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                     compiler.set_packed_full_dims(&self.module.packed_full_dims);
                     compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                    compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                     compiler.set_array_first_id(&self.array_first_id);
                     compiler.top_module_name = Some(self.module.name.clone());
                     // Enable AST fallback so partially-unsupported constructs
@@ -27562,6 +28159,93 @@ impl Simulator {
         None
     }
 
+    /// Names of ROOT-marked identifiers (`root = Some("$root")`) in an
+    /// expression — substituted port actuals whose bare name collides with a
+    /// child declaration (core rewrite_expr_impl, issue #128). These resolve
+    /// absolutely; the CA dependency machinery uses this set to keep the
+    /// scope-candidate requalification off them.
+    fn collect_rooted_ident_names(e: &Expression, out: &mut HashSet<String>) {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if h.root.is_some() {
+                    let name = h
+                        .path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    out.insert(name);
+                }
+                for seg in &h.path {
+                    for sel in &seg.selects {
+                        Self::collect_rooted_ident_names(sel, out);
+                    }
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::collect_rooted_ident_names(left, out);
+                Self::collect_rooted_ident_names(right, out);
+            }
+            ExprKind::Unary { operand, .. } => Self::collect_rooted_ident_names(operand, out),
+            ExprKind::Paren(inner) => Self::collect_rooted_ident_names(inner, out),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::collect_rooted_ident_names(condition, out);
+                Self::collect_rooted_ident_names(then_expr, out);
+                Self::collect_rooted_ident_names(else_expr, out);
+            }
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    Self::collect_rooted_ident_names(p, out);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                Self::collect_rooted_ident_names(count, out);
+                for p in exprs {
+                    Self::collect_rooted_ident_names(p, out);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                Self::collect_rooted_ident_names(expr, out);
+                Self::collect_rooted_ident_names(index, out);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::collect_rooted_ident_names(expr, out);
+                Self::collect_rooted_ident_names(left, out);
+                Self::collect_rooted_ident_names(right, out);
+            }
+            ExprKind::MemberAccess { expr, .. } => Self::collect_rooted_ident_names(expr, out),
+            ExprKind::Call { func, args } => {
+                Self::collect_rooted_ident_names(func, out);
+                for a in args {
+                    Self::collect_rooted_ident_names(a, out);
+                }
+            }
+            ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    Self::collect_rooted_ident_names(a, out);
+                }
+            }
+            ExprKind::AssignmentPattern(items) => {
+                for it in items {
+                    Self::collect_rooted_ident_names(it.expr(), out);
+                }
+            }
+            ExprKind::Inside { expr, ranges } => {
+                Self::collect_rooted_ident_names(expr, out);
+                for r in ranges {
+                    Self::collect_rooted_ident_names(r, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn collect_expr_reads(
         expr: &Expression,
         module: &ElaboratedModule,
@@ -27603,6 +28287,34 @@ impl Simulator {
                 // signal) so a whole-struct write (`bar = ...`) re-fires readers
                 // like `assign foo = bar.bar0`. Without it the dotted name never
                 // receives a change event and the reader stays X.
+                // A COLLECTION query/reduction (`q.sum()`, `d.size()`)
+                // parses as a dotted Ident but is NOT a member signal: the
+                // name `q.sum` resolves to nothing, so the entry depended on
+                // something that never exists. A continuous assign survived
+                // that by accident (an unresolved read re-evaluates on every
+                // settle); an `always_comb` reading `q.sum()` never re-fired
+                // on an element write and returned 0 forever. Depend on what
+                // element writes actually mark: the elements themselves, plus
+                // the `.size` proxy for resize.
+                if let Some(dot) = name.rfind('.') {
+                    let (base, meth) = (&name[..dot], &name[dot + 1..]);
+                    if matches!(
+                        meth,
+                        "sum" | "product" | "min" | "max" | "and" | "or" | "xor" | "size" | "num"
+                    ) && (module.dynamic_arrays.contains(base)
+                        || module.queue_vars.contains(base)
+                        || module.associative_arrays.contains_key(base))
+                    {
+                        let base = base.to_string();
+                        reads.insert(format!("{}.size", base));
+                        if let Some((lo, hi, _)) = module.arrays.get(&base) {
+                            for i in *lo..=*hi {
+                                reads.insert(format!("{}[{}]", base, i));
+                            }
+                        }
+                        return;
+                    }
+                }
                 if let Some(dot) = name.rfind('.') {
                     let parent = &name[..dot];
                     if !module.signals.contains_key(&name)
@@ -27631,6 +28343,28 @@ impl Simulator {
                         // dependency and never re-fired. It now shares the
                         // `.size` proxy the dynamic/queue case uses.
                         reads.insert(format!("{}.size", name));
+                        // ...but the proxy is only touched when the collection
+                        // RESIZES. A dynamic array is registered in
+                        // `module.arrays` as well, so its elements own signal
+                        // ids, and an element STORE marks those ids -- never
+                        // the proxy. Depending on the proxy alone left a reader
+                        // of `d[i]` frozen on whatever it saw during the time-0
+                        // settle: every later write, blocking or NBA, marked an
+                        // id nothing depended on. (A write issued BEFORE that
+                        // settle appeared to work, which is what made this look
+                        // NBA-specific.) Record the element dependency too,
+                        // exactly as the fixed-array arm below does.
+                        if let Some((lo, hi, _)) = module.arrays.get(&name) {
+                            if let Some(i) = Self::constant_array_index(index, module) {
+                                if (*lo..=*hi).contains(&i) {
+                                    reads.insert(format!("{}[{}]", name, i));
+                                }
+                            } else {
+                                for i in *lo..=*hi {
+                                    reads.insert(format!("{}[{}]", name, i));
+                                }
+                            }
+                        }
                     } else if let Some((lo, hi, _)) = module.arrays.get(&name) {
                         if let Some(i) = Self::constant_array_index(index, module) {
                             if (*lo..=*hi).contains(&i) {
@@ -30784,6 +31518,8 @@ impl Simulator {
     fn event_loop_singlethread(&mut self, tick_barrier: Option<&crate::multikernel::ClockBarrier>) {
         Self::install_interrupt_handler();
         let sim_start = std::time::Instant::now();
+        // Realtime twin for the human-facing report (see crate::WallTimer).
+        let sim_start_rt = crate::WallTimer::now();
         let mut iters: u64 = 0;
         let max_iters = self.max_time * 1000;
         let mut accum = PerTickAccum::default();
@@ -31251,7 +31987,7 @@ impl Simulator {
         let t_process = accum.t_process;
         let t_snap = accum.t_snap;
         let t_sched = accum.t_sched;
-        let sim_elapsed = sim_start.elapsed();
+        let sim_elapsed = sim_start_rt.elapsed();
         eprintln!("[PROF] settle={:.1}ms edges={:.1}ms nba={:.1}ms process={:.1}ms snap={:.1}ms sched={:.1}ms",
             t_settle as f64/1e6, t_edges as f64/1e6, t_nba as f64/1e6,
             t_process as f64/1e6, t_snap as f64/1e6, t_sched as f64/1e6);
@@ -31408,6 +32144,18 @@ impl Simulator {
                 f[2],
                 f[3],
                 f.iter().sum::<u64>()
+            );
+            eprintln!(
+                "[FUSE] Move-into-assign forwards (static sites): {}",
+                super::bytecode::census_pair_fusions()
+            );
+            eprintln!(
+                "[FUSE] provably-unsigned scrubs elided (static sites): {}",
+                super::bytecode::elided_scrub_count()
+            );
+            eprintln!(
+                "[FUSE] AddC2 superinstructions (static sites): {}",
+                super::bytecode::addc2_count()
             );
         }
         // XEZIM_OPCODE_CENSUS=1: dynamic opcode + adjacent-pair histogram for
@@ -32165,6 +32913,7 @@ impl Simulator {
             Insn::NbaAssignArrayRead(..) => "NbaAssignArrayRead",
             // Split by kind: the pair census is only useful if the three
             // fused ALU ops stay distinguishable.
+            Insn::BinOpConstAdd2(..) => "AddC2",
             Insn::BinOpConst(_, _, _, k) => match k {
                 super::bytecode::BinOpConstKind::Add => "BinOpConstAdd",
                 super::bytecode::BinOpConstKind::Eq => "BinOpConstEq",
@@ -33861,6 +34610,7 @@ impl Simulator {
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+            compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
             compiler.set_signal_real(&self.signal_real);
@@ -33917,7 +34667,25 @@ impl Simulator {
         let mut reads: HashSet<String> = HashSet::default();
         let mut writes: HashSet<String> = HashSet::default();
         Self::collect_stmt_reads(stmt, &self.module, &mut reads, &mut writes);
-        if writes.is_empty() || reads.is_empty() {
+        if writes.is_empty() {
+            return false;
+        }
+        // A DYNAMIC array is a collection, not a signal, so its name maps to
+        // no id below: the dependency walk found nothing, the loop compiled,
+        // and the compiled element store skipped the dirty-marking the AST
+        // interpreter store does. `always_comb` readers were then never
+        // re-evaluated and silently kept stale (or x) data --- `for (k) a[k] =
+        // v;` on `logic [7:0] a [];` left a reader at x while `a[0]` really
+        // held the written value. Treat any write to one as feedback so the
+        // loop stays interpreted, which notifies correctly. Static arrays and
+        // queues resolve through the walk normally and keep compiling.
+        if writes.iter().any(|w| {
+            let base = w.split('[').next().unwrap_or(w);
+            self.module.dynamic_arrays.contains(base)
+        }) {
+            return true;
+        }
+        if reads.is_empty() {
             return false;
         }
         let to_id = |n: &String| self.signal_name_to_id.get(n.as_str()).copied();
@@ -34063,6 +34831,7 @@ impl Simulator {
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+            compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
             compiler.set_signal_real(&self.signal_real);
@@ -37198,6 +37967,28 @@ impl Simulator {
             ExprKind::Index { expr, index } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
+                    // A DYNAMIC array / QUEUE element carries a signal TWIN in
+                    // `signal_name_to_id`, so the lookup below used to resolve
+                    // it and the NBA took the fast path: `apply_nba_entry`
+                    // wrote that id and marked IT dirty, but a comb reader of
+                    // the COLLECTION does not depend on that id, so it was
+                    // never re-evaluated. The value landed (a direct read
+                    // returned it) while every reader silently served stale
+                    // data --- and a later BLOCKING write did notify, which is
+                    // what made it look intermittent.
+                    //
+                    // Returning None routes them through the queued-lvalue
+                    // path, which commits via `assign_value` --- the same
+                    // function blocking assignment uses, and the one
+                    // ASSOCIATIVE arrays already take (they are not in
+                    // `module.arrays`, which is why assoc was always correct).
+                    // Static arrays keep the fast path: their element ids ARE
+                    // what comb readers depend on.
+                    if self.module.dynamic_arrays.contains(&name)
+                        || self.module.queue_vars.contains(&name)
+                    {
+                        return None;
+                    }
                     if self.module.arrays.contains_key(&name) {
                         // `$` here is the collection's last index (§11.4.12);
                         // without the bound it evaluates to u64::MAX and the
@@ -37571,7 +38362,15 @@ impl Simulator {
                 continue;
             }
             if let Some(lhs) = entry.lhs {
-                self.assign_value(&lhs, &entry.value);
+                // Re-establish the scheduling context so a class-property
+                // target resolves (see NbaEntry::this_handle).
+                if let Some(h) = entry.this_handle {
+                    self.this_stack.push(Some(h));
+                    self.assign_value(&lhs, &entry.value);
+                    self.this_stack.pop();
+                } else {
+                    self.assign_value(&lhs, &entry.value);
+                }
             }
         }
         // §15.5.2 deferred `->>` triggers fire with the NBA flush.
@@ -43190,7 +43989,12 @@ impl Simulator {
                     {
                         let idx = self.eval_expr(index).to_i64()?;
                         if let Some(id) = self.get_array_elem_id(&bname, idx) {
-                            return Some((format!("{}[{}]", bname, idx), Some(id)));
+                            // A packed cell has no id-keyed force slot; fall
+                            // through so the force degrades to a plain write
+                            // rather than indexing a table it is not in.
+                            if !is_packed_id(id) {
+                                return Some((format!("{}[{}]", bname, idx), Some(id)));
+                            }
                         }
                     }
                 }
@@ -44497,6 +45301,42 @@ impl Simulator {
                 changed
             }
             ExprKind::Index { expr, index } => {
+                // §7.4.1 / §11.5.1: BIT write into an ELEMENT of an unpacked
+                // array/queue/assoc whose declared packed range needs label
+                // mapping (`logic [31:8] a[0:0]; a[0][8] = b` — storage bit
+                // 0, not 8; ascending mirrors). The arms below all treat the
+                // trailing index as a raw storage offset, so the write landed
+                // on the wrong bit. Width must match the dim exactly — a
+                // multi-packed element's trailing index selects a SLICE and
+                // belongs to the packed-element machinery below.
+                if let Some((dl, dr)) = self.select_base_elem_dim(expr) {
+                    if dl < dr || dl.min(dr) != 0 {
+                        let dim_w = (dl - dr).unsigned_abs() + 1;
+                        if let Some(en) = self.flat_member_name(expr) {
+                            if let Some(cur) = self.get_signal_value_by_name(&en) {
+                                if cur.width as u64 == dim_w {
+                                    let idx_v = self.eval_expr(index);
+                                    if idx_v.has_xz() {
+                                        return false; // §11.5.1: x/z index selects nothing
+                                    }
+                                    let l = idx_v.to_i64().unwrap_or(i64::MIN);
+                                    let phys = if dl >= dr { l - dr } else { dr - l };
+                                    if phys < 0 || phys >= cur.width as i64 {
+                                        return false; // out-of-range bit write discarded
+                                    }
+                                    let nb = val.get_bit(0);
+                                    let changed = cur.get_bit(phys as usize) != nb;
+                                    if changed {
+                                        let mut nv = cur;
+                                        nv.set_bit(phys as usize, nb);
+                                        self.set_signal_value_by_name(&en, nv);
+                                    }
+                                    return changed;
+                                }
+                            }
+                        }
+                    }
+                }
                 // §7.4.1: packed ELEMENT write on a plain packed-of-packed
                 // variable (`u8_vec16_t y; y[i] = v;`) — splice
                 // [i*ew +: ew], honoring the by-NAME storage of
@@ -45715,6 +46555,7 @@ impl Simulator {
                 // than bit — so each of those must keep the RAW indices and is
                 // excluded here. Bit-selects are already correct in both
                 // directions; this closes the part-select WRITE gap.
+                let mut elem_ascending_dim: Option<(i64, i64)> = None;
                 if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
                     let is_multi_d = self
@@ -45743,6 +46584,22 @@ impl Simulator {
                                 }
                             }
                         }
+                    }
+                } else if let Some((dl, dr)) = self.select_base_elem_dim(expr) {
+                    // ELEMENT of an unpacked array/queue/assoc, same mapping
+                    // as the read side: descending offsets the labels here;
+                    // an ascending dim mirrors msb/lsb after they are formed
+                    // (the plain-Ident ascending block below stays untouched).
+                    if dl >= dr {
+                        let lo_b = dr;
+                        if lo_b != 0 {
+                            li -= lo_b;
+                            if matches!(kind, RangeKind::Constant) {
+                                ri -= lo_b;
+                            }
+                        }
+                    } else {
+                        elem_ascending_dim = Some((dl, dr));
                     }
                 }
                 let (msb_i, lsb_i): (i64, i64) = match kind {
@@ -45818,6 +46675,18 @@ impl Simulator {
                             msb = new_msb;
                             lsb = new_lsb;
                         }
+                    } else if let Some((dl, dr)) = elem_ascending_dim {
+                        // Ascending ELEMENT dim (`logic [0:23] a[0:0];
+                        // a[0][0:7] = v`): labels mirror against the right
+                        // bound — physical = right - label — so the formed
+                        // [msb:lsb] label pair swaps and shifts as one.
+                        let _ = dl;
+                        let (new_msb, new_lsb) = (
+                            (dr - lsb as i64).max(0) as usize,
+                            (dr - msb as i64).max(0) as usize,
+                        );
+                        msb = new_msb;
+                        lsb = new_lsb;
                     }
                 }
                 // Unpacked array slice assignment: copy element-by-element
@@ -45932,6 +46801,24 @@ impl Simulator {
                     _ => None,
                 };
                 if let Some(id) = target_id {
+                    // Packed cell: no signal_table slot, so the whole-word
+                    // path below cannot apply. Splice the bits into the cell.
+                    if is_packed_id(id) {
+                        let w = self.packed.width(id);
+                        let mut cur = self.packed.read(id);
+                        let hi = (msb as usize).min(w.saturating_sub(1) as usize);
+                        for i in lsb..=hi {
+                            let src = if src_base < 0 { i as i64 + src_base } else { i as i64 - lsb as i64 };
+                            if src >= 0 && (src as u32) < val.width {
+                                cur.set_bit(i, val.get_bit(src as usize));
+                            }
+                        }
+                        let changed = self.packed.write(id, &cur);
+                        if changed {
+                            self.table_modified = true;
+                        }
+                        return changed;
+                    }
                     let width = self.signal_widths[id] as usize;
                     // Whole-word fast path: if the range covers the whole
                     // signal, skip the per-bit loop. A NEGATIVE low bound is
@@ -46462,6 +47349,36 @@ impl Simulator {
                                     return changed;
                                 }
                             }
+                        }
+                    }
+                    // Deeper chains (array-of-queues element:
+                    // `qa[0][0][31:24] = v`): the arm above resolves only ONE
+                    // Index layer — build the flat element name for the whole
+                    // chain and apply the same read-modify-write.
+                    if let Some(ename) = self.flat_member_name(expr) {
+                        if let Some(cur) = self.get_signal_value_by_name(&ename) {
+                            let w = cur.width as usize;
+                            let mut nv = cur.clone();
+                            let mut changed = false;
+                            let hi2 = msb.min(w.saturating_sub(1));
+                            let base = if src_base < 0 { src_base } else { lsb as i64 };
+                            if msb_i >= 0 && hi2 >= lsb {
+                                for i in lsb..=hi2 {
+                                    let src = i as i64 - base;
+                                    if src < 0 {
+                                        continue;
+                                    }
+                                    let nb = val.get_bit(src as usize);
+                                    if nv.get_bit(i) != nb {
+                                        nv.set_bit(i, nb);
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            if changed {
+                                self.set_signal_value_by_name(&ename, nv);
+                            }
+                            return changed;
                         }
                     }
                 }
@@ -47088,6 +48005,68 @@ impl Simulator {
 
     /// §7.4.1: bit offset of ELEMENT `idx` of the packed multi-D signal
     /// `name`, normalized against the declared outer dimension — a descending
+    /// Declared packed dimension a trailing bit/part select on `base` indexes
+    /// into, when `base` is a chain of Index layers over an identifier —
+    /// an ELEMENT of an unpacked array/queue/assoc (`logic [31:8] q[$];
+    /// q[0][31:8]`), or a packed element (`logic [1:0][31:8] p; p[0][...]`).
+    /// Index layers up to the collection's unpacked depth consume no packed
+    /// dims; each further layer consumes one. Returns the ORIENTED (left,
+    /// right) pair so callers can map labels for both a non-zero lower bound
+    /// and an ascending range: physical = label - right (descending) /
+    /// right - label (ascending). None for a plain Ident base (layers = 0 —
+    /// the existing plain-signal paths own that) or when nothing is recorded.
+    fn select_base_elem_dim(&self, base: &Expression) -> Option<(i64, i64)> {
+        let mut cur = base;
+        let mut layers = 0usize;
+        while let ExprKind::Index { expr: inner, .. } = &cur.kind {
+            cur = inner;
+            layers += 1;
+        }
+        if layers == 0 {
+            return None;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        let nm = self.resolve_hier_name(h);
+        let dims = self.module.packed_full_dims.get(&nm)?;
+        let mut udepth = if let Some((sh, _)) = self.module.arrays_nd.get(&nm) {
+            sh.len()
+        } else if self.module.arrays_2d.contains_key(&nm) {
+            2
+        } else if self.module.arrays.contains_key(&nm)
+            || self.module.dynamic_arrays.contains(&nm)
+            || self.module.associative_arrays.contains_key(&nm)
+        {
+            1
+        } else {
+            0
+        };
+        // Element-is-collection (array of queues): the flat element keys
+        // `nm[...]` add one more unpacked layer.
+        if udepth > 0 && layers > udepth {
+            let elem_prefix = format!("{}[", nm);
+            if self
+                .module
+                .dynamic_arrays
+                .iter()
+                .any(|k| k.starts_with(elem_prefix.as_str()))
+                || self
+                    .module
+                    .associative_arrays
+                    .keys()
+                    .any(|k| k.starts_with(elem_prefix.as_str()))
+            {
+                udepth += 1;
+            }
+        }
+        if layers < udepth {
+            // An unpacked SLICE (a row of a 2-D array), not a packed element.
+            return None;
+        }
+        dims.get(layers - udepth).copied()
+    }
+
     /// `[N-1:0]` maps idx→(idx-lo)·w, an ASCENDING `[0:N-1]` mirrors the slot
     /// order (element 0 is the TOP slot). The raw `idx*elem_w` computation is
     /// only right for the normalized descending case.
@@ -49093,6 +50072,22 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // §7.4.6 / §11.5.1: an x/z index reads x at the ELEMENT width,
+                // NOT element 0. `to_u64`/`to_i64` mask x bits to zero and
+                // never fail, so every `unwrap_or` below silently addressed
+                // element 0 and an unknown index returned real array data.
+                // Only for a side-effect-free index, so the extra evaluation
+                // cannot run a call twice.
+                if let ExprKind::Ident(h) = &expr.kind
+                    && Self::cond_expr_is_effect_free(index)
+                {
+                    let nm = self.resolve_hier_name(h);
+                    if let Some(&(_, _, ew)) = self.module.arrays.get(&nm) {
+                        if self.eval_expr(index).has_xz() {
+                            return Value::new(ew.max(1));
+                        }
+                    }
+                }
                 // §7.4.2: `arr[i]…[j].field[k]` over a PACKED array of packed
                 // structs. `arr[i]` is a bit slice of one backing vector, so
                 // there is no `arr[i]` signal to select from — resolve the
@@ -50026,17 +51021,64 @@ impl Simulator {
                 // `[msb:lsb]` form has two indices (LRM §7.4.1 / §11.5.1).
                 let mut li = self.eval_expr(left).to_i64().unwrap_or(0);
                 let mut ri = self.eval_expr(right).to_i64().unwrap_or(0);
-                if let ExprKind::Ident(h) = &expr.kind {
-                    let nm = self.resolve_hier_name(h);
-                    if let Some(dims) = self.module.packed_full_dims.get(&nm) {
-                        if let Some(&(dl, dr)) = dims.first() {
-                            let lo_b = dl.min(dr);
-                            if lo_b != 0 {
-                                li -= lo_b;
-                                if matches!(kind, RangeKind::Constant) {
-                                    ri -= lo_b;
-                                }
+                // Plain packed vector: the declared lower bound offsets the
+                // labels (`logic [7:4] v; v[6:5]` → storage bits [2:1]),
+                // mirroring the WRITE path. Ascending plain vectors were
+                // intercepted by the ascending arm above.
+                let plain_dim: Option<(i64, i64)> = match &expr.kind {
+                    ExprKind::Ident(h) => {
+                        let nm = self.resolve_hier_name(h);
+                        self.module
+                            .packed_full_dims
+                            .get(&nm)
+                            .and_then(|d| d.first())
+                            .copied()
+                    }
+                    _ => None,
+                };
+                if let Some((dl, dr)) = plain_dim.filter(|&(l, r)| l >= r) {
+                    let _ = dl;
+                    if dr != 0 {
+                        li -= dr;
+                        if matches!(kind, RangeKind::Constant) {
+                            ri -= dr;
+                        }
+                    }
+                } else if let Some((dl, dr)) = self.select_base_elem_dim(expr) {
+                    // ELEMENT of an unpacked array/queue/assoc (or a packed
+                    // element): `logic [31:8] q[$]; q[0][31:8]` selects the
+                    // whole element (this read xxabcd — bits 23:8 plus
+                    // out-of-range x — before). Descending offsets the labels
+                    // by the low bound; an ASCENDING dim mirrors them
+                    // (physical = right - label), handled by a direct select
+                    // since the shared tail below is descending-only.
+                    if dl < dr {
+                        let phys_hi: i64;
+                        let phys_lo: i64;
+                        match kind {
+                            RangeKind::Constant => {
+                                phys_hi = dr - li.min(ri);
+                                phys_lo = dr - li.max(ri);
                             }
+                            RangeKind::IndexedUp => {
+                                phys_hi = dr - li;
+                                phys_lo = dr - li - (ri - 1);
+                            }
+                            RangeKind::IndexedDown => {
+                                phys_hi = dr - li + (ri - 1);
+                                phys_lo = dr - li;
+                            }
+                        }
+                        if phys_lo >= 0 && phys_hi >= phys_lo {
+                            return base.range_select(phys_hi as usize, phys_lo as usize);
+                        }
+                        return base.range_select_signed(phys_hi, phys_lo);
+                    }
+                    let lo_b = dr.min(dl);
+                    if lo_b != 0 {
+                        li -= lo_b;
+                        if matches!(kind, RangeKind::Constant) {
+                            ri -= lo_b;
                         }
                     }
                 }
@@ -56664,6 +57706,8 @@ impl Simulator {
                             value: val.resize_for_assign(w),
                             resolved_id: None,
                             static_key: Some(key),
+                            // No `lhs` to re-resolve, so no context needed.
+                            this_handle: None,
                         });
                         return;
                     }
@@ -56705,11 +57749,13 @@ impl Simulator {
                             val.resize_for_assign(w)
                         };
                         let static_key = self.nba_static_key_for_lvalue(lvalue);
+                        let this_handle = self.this_stack.last().copied().flatten();
                         self.nba_queue.push(NbaEntry {
                             lhs: Some(frozen),
                             value: qval,
                             resolved_id: None,
                             static_key,
+                            this_handle,
                         });
                     }
                 } else if let Some(id) = self.resolve_nba_target(lvalue) {
@@ -56728,11 +57774,13 @@ impl Simulator {
                         val.resize_for_assign(w)
                     };
                     let static_key = self.nba_static_key_for_lvalue(lvalue);
+                    let this_handle = self.this_stack.last().copied().flatten();
                     self.nba_queue.push(NbaEntry {
                         lhs: Some(frozen),
                         value: qval,
                         resolved_id: None,
                         static_key,
+                        this_handle,
                     });
                 }
             }
@@ -66376,6 +67424,50 @@ impl Simulator {
 
     /// Mark a signal as dirty by ID
     #[inline]
+    /// Read a cell by id, transparently across the signal table and the
+    /// packed arena (see `PackedMem`).
+    #[inline]
+    fn cell_read(&self, id: usize) -> Value {
+        if is_packed_id(id) {
+            self.packed.read(id)
+        } else {
+            self.signal_table[id].clone()
+        }
+    }
+
+    /// Width of a cell by id, across both stores.
+    #[inline]
+    fn cell_width(&self, id: usize) -> u32 {
+        if is_packed_id(id) {
+            self.packed.width(id)
+        } else {
+            self.signal_widths[id]
+        }
+    }
+
+    /// Write a cell by id; returns true when it changed. A packed cell has no
+    /// comb dependents of its own (admission requires an unnamed bulk array),
+    /// so only the table-modified flag needs updating.
+    #[inline]
+    fn cell_write(&mut self, id: usize, val: &Value) -> bool {
+        if is_packed_id(id) {
+            let changed = self.packed.write(id, val);
+            if changed {
+                self.table_modified = true;
+            }
+            return changed;
+        }
+        let w = self.signal_widths[id];
+        let resized = val.resize(w);
+        if self.signal_table[id] != resized {
+            write_sig!(self, id, resized);
+            self.mark_dirty_id(id);
+            self.table_modified = true;
+            return true;
+        }
+        false
+    }
+
     fn mark_dirty_id(&mut self, id: usize) {
         let has_comb_deps = id + 1 >= self.comb_dep_offsets.len()
             || self.comb_dep_offsets[id] != self.comb_dep_offsets[id + 1];
@@ -67108,6 +68200,9 @@ impl Simulator {
     #[inline]
     pub(crate) fn jit_load_array_elem(&mut self, name: &str, idx: i64) -> u64 {
         if let Some(eid) = self.get_array_elem_id(name, idx) {
+            if is_packed_id(eid) {
+                return self.packed.read(eid).to_u64().unwrap_or(0);
+            }
             debug_assert!(
                 self.signal_widths[eid] <= 64,
                 "jit_load_array_elem called on wide elem array={} idx={} width={}",

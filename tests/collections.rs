@@ -13,6 +13,10 @@
 
 #[path = "collections/array_element_collection.rs"]
 mod array_element_collection;
+#[path = "collections/dyn_array_loop_write_notifies.rs"]
+mod dyn_array_loop_write_notifies;
+#[path = "collections/collection_write_open_gaps.rs"]
+mod collection_write_open_gaps;
 #[path = "collections/array_locator_and_reduction.rs"]
 mod array_locator_and_reduction;
 #[path = "collections/array_locator_index.rs"]
