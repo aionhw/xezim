@@ -1944,11 +1944,27 @@ fn run_main() -> i32 {
             "--threads" => {
                 i += 1;
                 if i < args.len() {
-                    threads = args[i].parse().unwrap_or(1).max(1);
+                    let requested = args[i].parse().unwrap_or(1);
+                    if requested == 0 {
+                        eprintln!("Error: --threads requires a positive integer (>= 1)");
+                        std::process::exit(1);
+                    }
+                    threads = requested;
                 }
             }
             _ if arg.starts_with("--threads=") => {
-                threads = arg["--threads=".len()..].parse().unwrap_or(1).max(1);
+                let requested = arg["--threads=".len()..].parse().unwrap_or(1);
+                if requested == 0 {
+                    eprintln!("Error: --threads requires a positive integer (>= 1)");
+                    std::process::exit(1);
+                }
+                threads = requested;
+            }
+            // Clamp --threads to available parallelism with warning
+            // (after all args are parsed, so we can check the final value)
+            "--help" => {
+                print_usage();
+                std::process::exit(0);
             }
             "--report-stats" => {
                 report_stats_cli = Some(report::ReportMode::Human);
@@ -2350,6 +2366,14 @@ suppressed but the explicit SDF annotation still applies."
                         sim.fst_file = fst_file.clone();
                         sim.fst_scopes = fst_scopes.clone();
                         sim.set_plusargs(&plusargs);
+                        // Clamp --threads to available parallelism with warning
+                        let avail = std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(2);
+                        if threads > avail {
+                            eprintln!("[xezim][warning] --threads {} clamped to available parallelism ({})", threads, avail);
+                            threads = avail;
+                        }
                         sim.set_threads(threads);
                         // Pass the full CLI invocation (binary name +
                         // all args + plusargs) so vpi_get_vlog_info

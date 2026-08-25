@@ -19,3 +19,6 @@ mod packed_matrix_workload;
 mod packed_record_edge_loop;
 #[path = "perf/design_shape_regression.rs"]
 mod design_shape_regression;
+
+#[path = "perf/threads_clamp.rs"]
+mod threads_clamp;

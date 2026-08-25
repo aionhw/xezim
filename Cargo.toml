@@ -61,6 +61,7 @@ fst-reader = "0.17"
 # check that its header declares the compression (XTrace §6.8). Same version
 # xezim-core writes the stream with.
 zstd = "0.13"
+tempfile = "3.14"
 
 [build-dependencies]
 cc = "1"
