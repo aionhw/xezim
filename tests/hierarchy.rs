@@ -123,6 +123,8 @@ mod t_local_queue_index_growth;
 mod t_queue_elem_method_return_width;
 #[path = "hierarchy/t_nested_typedef_spec_resolution.rs"]
 mod t_nested_typedef_spec_resolution;
+#[path = "hierarchy/t_typename_on_type_param.rs"]
+mod t_typename_on_type_param;
 #[path = "hierarchy/wildcard_import_shadow.rs"]
 mod wildcard_import_shadow;
 

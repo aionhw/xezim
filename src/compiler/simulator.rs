@@ -51862,6 +51862,25 @@ impl Simulator {
                                 }
                             }
                         }
+                        // `$typename(T)` where `T` is a TYPE PARAMETER of the
+                        // active class specialization — resolve it to its
+                        // concrete bound and format it (
+                        // `$typename(T)` inside `tester#(T)` gave "logic"
+                        // instead of the bound type). `Tname` is a class-scoped
+                        // type param of the enclosing class, so it is not a
+                        // builtin keyword (handled above), a specialization, a
+                        // class key, or a signal — it fell through to the
+                        // default "logic".
+                        if let ExprKind::Ident(hier) = &arg.kind {
+                            if hier.path.len() == 1 {
+                                let nm = &hier.path[0].name.name;
+                                if let Some(bound) = self.resolve_type_param_binding(nm) {
+                                    return Value::from_string(
+                                        &self.format_typename_bound(&bound),
+                                    );
+                                }
+                            }
+                        }
                         // A Specialization expression given directly, e.g.
                         // $typename(foo#(bar#(xyz),88)) — IEEE 1800-2017 §21.7.
                         if let ExprKind::Specialization { base, type_args_text } = &arg.kind {
@@ -102430,6 +102449,57 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// Format a RESOLVED type-parameter BINDING (the concrete type a bare
+    /// class type parameter `T` collapsed to) as a `$typename` string. The
+    /// binding is a string like `string`, `int`, `Base`, or `base#(args)`;
+    /// mirror the §21.7 shape — a builtin keyword bare, a class as
+    /// `class <name>` / `class <name> #(<args>)`.
+    fn format_typename_bound(&self, bound: &str) -> String {
+        let b = bound.trim();
+        if matches!(
+            b,
+            "bit"
+                | "logic"
+                | "reg"
+                | "byte"
+                | "shortint"
+                | "int"
+                | "longint"
+                | "integer"
+                | "time"
+                | "real"
+                | "shortreal"
+                | "realtime"
+                | "string"
+                | "chandle"
+                | "event"
+        ) {
+            return b.to_string();
+        }
+        if let Some(pos) = b.find('#') {
+            let base = b[..pos].trim().to_string();
+            let rest = &b[pos..]; // `#(args...)`
+            let args = rest.trim_start_matches('#').trim_start_matches('(');
+            let args = args.strip_suffix(')').unwrap_or(args);
+            return format!(
+                "class {} #({})",
+                base,
+                self.format_typename_args_text(args)
+            );
+        }
+        // A real class / covergroup name -> `class <name>`.
+        if self.module.classes.contains_key(&b.to_string())
+            || self.module.covergroups.contains_key(&b.to_string())
+        {
+            return format!("class {}", b);
+        }
+        // Not a class: a builtin was handled above, so this is a typedef to a
+        // non-class type (e.g. `uvm_bitstream_t` -> `reg signed[4095:0]`) whose
+        // underlying type xezim cannot yet render here. Leave it BARE rather
+        // than mislabelling it as a class.
+        b.to_string()
     }
 
     /// Format the `$typename` string for a class type (IEEE 1800-2017 §21.7):
