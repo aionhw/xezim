@@ -6189,7 +6189,7 @@ impl Simulator {
         let signed_signals: HashSet<String> = HashSet::default();
         let real_signals: HashSet<String> = HashSet::default();
 
-        let phase_materialize = std::time::Instant::now();
+        let phase_materialize = crate::WallTimer::now();
         Self::materialize_implicit_contassign_nets(&mut module);
         Self::rewrite_edge_select_sensitivities(&mut module);
         // §18.3/§18.4: publish class-local `typedef enum`/`typedef struct`
@@ -6841,7 +6841,7 @@ impl Simulator {
         // replacement for the per-element entries.
         let mut array_first_id: HashMap<Arc<str>, (usize, i64, i64)> =
             HashMap::with_capacity_and_hasher(module.arrays.len(), Default::default());
-        let phase_arrays_1d = std::time::Instant::now();
+        let phase_arrays_1d = crate::WallTimer::now();
         let _ = (
             "[ARR] arrays={} arrays_2d={} arrays_nd={} signals_pre={} names_pre={}",
             module.arrays.len(),
@@ -31157,6 +31157,8 @@ impl Simulator {
     fn event_loop_singlethread(&mut self, tick_barrier: Option<&crate::multikernel::ClockBarrier>) {
         Self::install_interrupt_handler();
         let sim_start = std::time::Instant::now();
+        // Realtime twin for the human-facing report (see crate::WallTimer).
+        let sim_start_rt = crate::WallTimer::now();
         let mut iters: u64 = 0;
         let max_iters = self.max_time * 1000;
         let mut accum = PerTickAccum::default();
@@ -31624,7 +31626,7 @@ impl Simulator {
         let t_process = accum.t_process;
         let t_snap = accum.t_snap;
         let t_sched = accum.t_sched;
-        let sim_elapsed = sim_start.elapsed();
+        let sim_elapsed = sim_start_rt.elapsed();
         eprintln!("[PROF] settle={:.1}ms edges={:.1}ms nba={:.1}ms process={:.1}ms snap={:.1}ms sched={:.1}ms",
             t_settle as f64/1e6, t_edges as f64/1e6, t_nba as f64/1e6,
             t_process as f64/1e6, t_snap as f64/1e6, t_sched as f64/1e6);
