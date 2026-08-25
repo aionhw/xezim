@@ -81609,8 +81609,92 @@ impl Simulator {
     /// (registered via `module.array_elem_class`) and the arg is a
     /// bare `new(<args>)` call, construct an instance of that class
     /// and return its handle. Otherwise fall back to regular eval.
+    ///
+    /// Resolve the element CLASS for a class-element queue (bare `new(...)`
+    /// push): `array_elem_class` covers class-typed ASSOCIATIVE arrays, and a
+    /// `p_elem_type` fallback covers local/module-scope queues, but a class-
+    /// MEMBER queue is stored under `<handle>#member`, whose element type
+    /// lives in the declaring class's `property_types` (§8.10), chased through
+    /// inheritance and a member-local typedef. Returns None if the resolved
+    /// element type is not a module-known class.
+    fn member_queue_elem_class(&self, obj_name: &str) -> Option<String> {
+        if !obj_name.contains('#') && !obj_name.contains('[') {
+            return None;
+        }
+        let (handle, member) = match obj_name.split_once('#') {
+            Some(parts) => parts,
+            None => return None,
+        };
+        let member = member.split('[').next().unwrap_or(member);
+        let Ok(handle) = handle.parse::<usize>() else {
+            return None;
+        };
+        let mut cn = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        let mut guard = 0usize;
+        while let Some(cur) = cn {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cur) else {
+                break;
+            };
+            if let Some(dt) = cd.property_types.get(member) {
+                // Chase a member-local typedef (`typedef virtual Foo if_t;`
+                // / `typedef Node if_t;`) through the class's own table just
+                // like the struct path does.
+                let resolved = match dt {
+                    crate::ast::types::DataType::TypeReference { name: tn, .. } => cd
+                        .typedef_targets
+                        .get(&tn.name.name)
+                        .cloned()
+                        .unwrap_or_else(|| dt.clone()),
+                    other => other.clone(),
+                };
+                if let crate::ast::types::DataType::TypeReference { name: tn, .. } =
+                    self.resolve_dt(&resolved)
+                {
+                    let n = tn.name.name.clone();
+                    if self.module.classes.contains_key(&n) {
+                        return Some(n);
+                    }
+                    return None;
+                }
+                return None;
+            }
+            cn = cd.extends.clone();
+        }
+        None
+    }
+
     fn queue_eval_arg(&mut self, container_name: &str, arg: &Expression) -> Value {
-        let class_name = self.module.array_elem_class.get(container_name).cloned();
+        let mut class_name = self.module.array_elem_class.get(container_name).cloned();
+        // Fallback: element-class registrations (`array_elem_class`) cover
+        // class-typed associative arrays, but a LOCAL / module-scope queue
+        // (`Node q[$]`) and bare class-valued members left the map empty, so
+        // `q.push_back(new(...))` fell through to `eval_expr` and stored a
+        // garbage handle (queue reads came back non-null but blank). Derive
+        // the class from the declared element type instead.
+        if class_name.is_none() {
+            if let Some(crate::ast::types::DataType::TypeReference {
+                name: tn, ..
+            }) = self.p_elem_type(container_name)
+            {
+                let cn = tn.name.name.clone();
+                if self.module.classes.contains_key(&cn) {
+                    class_name = Some(cn);
+                }
+            }
+        }
+        // Class-MEMBER queue: `p_elem_type` has no entry for the
+        // `<handle>#member` storage key, so resolve from the declaring class.
+        if class_name.is_none() {
+            class_name = self.member_queue_elem_class(container_name);
+        }
         if let Some(cn) = class_name {
             // NOTE: a BARE `new` is deliberately not accepted here. `new` is
             // legal only in an assignment to a class handle (§8.7), so
