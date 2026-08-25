@@ -2652,6 +2652,119 @@ fn resolve_array_elem_id(
     Some(first_id + (idx - lo) as usize)
 }
 
+/// Opt-in packed word storage for large narrow memories
+/// (`XEZIM_PACKED_MEM=1`).
+///
+/// c906 census: 35.06 M of its 35.11 M signals are array cells, and the big
+/// ones are all BYTE-wide RAMs — 16 separate 8-bit `ram*.mem` arrays standing
+/// in for one 128-bit word. Each cell costs 56 B to carry 8 bits: a 32 B
+/// `Value` plus 24 B of per-signal side tables (width/signed/real/
+/// inline_bits/has_xz/dirty). Packed, a cell is 2 B (value + x/z), which the
+/// census measures as a **27.7x** cut — 1.96 GB -> 0.07 GB.
+///
+/// ADMISSION is deliberately narrow to start: element width <= 8 and an array
+/// big enough to have skipped per-element name registration. Width <= 8 makes
+/// the packed stride exactly ONE BYTE, so the `first_id + (idx - lo)` cell
+/// arithmetic every caller already performs stays correct with no change —
+/// the id simply addresses a byte in the arena instead of a `signal_table`
+/// slot. A variable stride would have required rewriting every one of those
+/// call sites.
+///
+/// Cell ids for packed arrays live ABOVE `PACKED_BASE`, so any site that still
+/// indexes `signal_table` with one fails loudly (out of bounds) rather than
+/// silently reading the wrong cell.
+pub(crate) const PACKED_BASE: usize = 1usize << 48;
+
+#[inline]
+pub(crate) fn is_packed_id(id: usize) -> bool {
+    id >= PACKED_BASE
+}
+
+fn packed_mem_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("XEZIM_PACKED_MEM").map(|v| v != "0").unwrap_or(false)
+    })
+}
+
+/// Byte-per-cell arena backing every admitted array.
+#[derive(Default)]
+pub(crate) struct PackedMem {
+    /// Value bits (bit i of the cell, 0/1).
+    pub vals: Vec<u8>,
+    /// x/z mask, same indexing: 0 = known, 1 = x/z.
+    pub xz: Vec<u8>,
+    /// Declared element width per cell. One byte each — admission caps the
+    /// width at 8, and carrying it here keeps every access site a plain index
+    /// instead of a per-array lookup. Still leaves the cell at 3 B vs 56 B.
+    pub w: Vec<u8>,
+}
+
+impl PackedMem {
+    #[inline]
+    fn off(id: usize) -> usize {
+        id - PACKED_BASE
+    }
+    /// Raw cell contents — `(val_bits, xz_bits, width)` with NO `Value`
+    /// constructed. The RAM hot path moves whole words between the arena and
+    /// a VM register; building a `Value` per access showed up as ~4% in
+    /// `cell_read` plus ~3.5% in the allocator on a c906 cmark profile.
+    #[inline]
+    pub(crate) fn raw(&self, id: usize) -> (u64, u64, u32) {
+        let o = Self::off(id);
+        match (self.vals.get(o), self.xz.get(o), self.w.get(o)) {
+            (Some(&v), Some(&x), Some(&w)) => (v as u64, x as u64, (w as u32).max(1)),
+            _ => (0, 1, 1),
+        }
+    }
+
+    /// Store raw bits into a cell; true when it changed.
+    #[inline]
+    pub(crate) fn set_raw(&mut self, id: usize, v: u64, x: u64) -> bool {
+        let o = Self::off(id);
+        if o >= self.vals.len() {
+            return false;
+        }
+        let (nv, nx) = (v as u8, x as u8);
+        let changed = self.vals[o] != nv || self.xz[o] != nx;
+        if changed {
+            self.vals[o] = nv;
+            self.xz[o] = nx;
+        }
+        changed
+    }
+
+    #[inline]
+    pub(crate) fn width(&self, id: usize) -> u32 {
+        self.w.get(Self::off(id)).copied().unwrap_or(1).max(1) as u32
+    }
+    #[inline]
+    pub(crate) fn read(&self, id: usize) -> Value {
+        let o = Self::off(id);
+        let w = self.w.get(o).copied().unwrap_or(1).max(1) as u32;
+        match (self.vals.get(o), self.xz.get(o)) {
+            (Some(&v), Some(&x)) => Value::from_inline(v as u64, x as u64, w),
+            _ => Value::new(w),
+        }
+    }
+    /// Returns true when the cell actually changed.
+    #[inline]
+    pub(crate) fn write(&mut self, id: usize, val: &Value) -> bool {
+        let o = Self::off(id);
+        if o >= self.vals.len() {
+            return false;
+        }
+        let (v, x) = val.raw_bits();
+        let (nv, nx) = (v as u8, x as u8);
+        let changed = self.vals[o] != nv || self.xz[o] != nx;
+        if changed {
+            self.vals[o] = nv;
+            self.xz[o] = nx;
+        }
+        changed
+    }
+}
+
 #[inline(always)]
 /// Element width of a bytecode array operand, so an out-of-range or x/z-index
 /// READ can yield x at the ELEMENT width. A 1-bit x zero-extends into a wider
@@ -3029,6 +3142,10 @@ pub struct Simulator {
     active_force_skips: u64,
     /// Fast signal table: indexed by signal_id for O(1) access.
     signal_table: Vec<Value>,
+    /// Packed byte storage for admitted large narrow arrays; cells addressed
+    /// by ids at or above `PACKED_BASE` (see `PackedMem`). Empty unless
+    /// `XEZIM_PACKED_MEM=1`.
+    packed: PackedMem,
     /// Parallel array: 1 byte per signal_id, non-zero iff that signal
     /// currently has any X/Z bits. Maintained by `write_sig!` and a few
     /// in-place mutators. Used by the JIT's inline X/Z prelude (avoids
@@ -6741,11 +6858,47 @@ impl Simulator {
         arrays_sorted.sort_by(|a, b| a.0.cmp(b.0));
         // Scratch buffer for per-element names (see `push_elem_named`).
         let mut elem_name_buf = String::with_capacity(96);
+        // Memory census (`XEZIM_MEM_CENSUS=1`): size the word-aggregation
+        // opportunity before changing any representation. Every array cell
+        // currently costs a full `Value` plus one entry in each per-signal side
+        // table (width/signed/real/inline-bits/has_xz/dirty), which for a
+        // byte-wide RAM is ~60 B to carry 8 bits of data. Packed word storage
+        // would cost `ceil(w/8)` bytes for the value and the same for the x/z
+        // mask. Reports per-array and in total so the go/no-go is a number, not
+        // an argument -- same census-first shape the AOT template dedup used.
+        let mem_census = std::env::var_os("XEZIM_MEM_CENSUS").is_some();
+        let mut census: Vec<(String, usize, u32)> = Vec::new();
+        let packed_mem = packed_mem_enabled();
+        let mut packed_mem_arena = PackedMem::default();
+        let mut packed_arrays: std::collections::HashSet<String> =
+            std::collections::HashSet::default();
+        let mut packed_cells: usize = 0;
         for (base, &(lo, hi, w)) in arrays_sorted {
+            let count = (hi - lo + 1).max(0) as usize;
+            if mem_census && count > 0 {
+                census.push((base.clone(), count, w));
+            }
+            let register_names = count <= large_array_threshold;
+            // Packed admission: a wide-enough, NARROW array that already
+            // forgoes per-element names. Width <= 8 keeps the cell stride at
+            // one byte so `first_id + (idx - lo)` still addresses the right
+            // cell (see PackedMem). Cells get ids above PACKED_BASE and no
+            // `signal_table` / side-table entries at all — that omission IS
+            // the 27.7x saving.
+            if packed_mem && !register_names && w <= 8 && count > 0 {
+                let first_id = PACKED_BASE + packed_mem_arena.vals.len();
+                array_first_id.insert(Arc::from(base.as_str()), (first_id, lo, hi));
+                packed_arrays.insert(base.clone());
+                let init = array_init(w);
+                let (iv, ix) = init.raw_bits();
+                packed_mem_arena.vals.resize(packed_mem_arena.vals.len() + count, iv as u8);
+                packed_mem_arena.xz.resize(packed_mem_arena.xz.len() + count, ix as u8);
+                packed_mem_arena.w.resize(packed_mem_arena.w.len() + count, w as u8);
+                packed_cells += count;
+                continue;
+            }
             let first_id = signal_table.len();
             array_first_id.insert(Arc::from(base.as_str()), (first_id, lo, hi));
-            let count = (hi - lo + 1).max(0) as usize;
-            let register_names = count <= large_array_threshold;
             if false && count >= 1000 {
                 let _ = (&base, count, register_names);
             }
@@ -6840,6 +6993,48 @@ impl Simulator {
                     signal_table[id] = Value::all_z(signal_widths_vec[id]);
                 }
             }
+        }
+        if packed_mem && packed_cells > 0 {
+            eprintln!(
+                "[PACKED-MEM] arrays={} cells={} arena={:.2} MB (vs {:.2} MB unpacked)",
+                packed_arrays.len(),
+                packed_cells,
+                (packed_mem_arena.vals.len() + packed_mem_arena.xz.len() + packed_mem_arena.w.len()) as f64 / 1e6,
+                (packed_cells * (std::mem::size_of::<Value>() + 24)) as f64 / 1e6,
+            );
+        }
+        if mem_census {
+            // Per-cell cost today: the Value itself plus the fixed-size
+            // per-signal side tables that are indexed by signal_id.
+            const SIDE_BYTES: usize = 4 /*width*/ + 1 /*signed*/ + 1 /*real*/
+                + 16 /*inline_bits*/ + 1 /*has_xz*/ + 1 /*dirty*/;
+            let per_cell_now = std::mem::size_of::<Value>() + SIDE_BYTES;
+            census.sort_by(|a, b| b.1.cmp(&a.1));
+            let (mut tot_cells, mut tot_now, mut tot_packed) = (0usize, 0usize, 0usize);
+            eprintln!("[MEM-CENSUS] Value={}B side={}B per_cell={}B",
+                std::mem::size_of::<Value>(), SIDE_BYTES, per_cell_now);
+            for (name, count, w) in census.iter().take(20) {
+                let packed = ((*w as usize).div_ceil(8)) * 2 * count;
+                eprintln!(
+                    "[MEM-CENSUS] {:>12} cells x {:>4}b  now {:>7.1} MB  packed {:>6.1} MB  {:>5.1}x  {}",
+                    count, w,
+                    (count * per_cell_now) as f64 / 1e6,
+                    packed as f64 / 1e6,
+                    (count * per_cell_now) as f64 / packed.max(1) as f64,
+                    name,
+                );
+            }
+            for (_, count, w) in &census {
+                tot_cells += count;
+                tot_now += count * per_cell_now;
+                tot_packed += ((*w as usize).div_ceil(8)) * 2 * count;
+            }
+            eprintln!(
+                "[MEM-CENSUS] TOTAL arrays={} cells={} now={:.2} GB packed={:.2} GB ratio={:.1}x",
+                census.len(), tot_cells,
+                tot_now as f64 / 1e9, tot_packed as f64 / 1e9,
+                tot_now as f64 / tot_packed.max(1) as f64,
+            );
         }
         let arrays_1d_ms = phase_arrays_1d.elapsed().as_secs_f64() * 1000.0;
         let phase_arrays_other = std::time::Instant::now();
@@ -7253,6 +7448,7 @@ impl Simulator {
             jit_nba_side_queue: Vec::new(),
             jit_nba_side_len: 0,
             signal_table,
+            packed: packed_mem_arena,
             signal_name_to_id,
             scope_parents_by_leaf,
             array_elem_ids: HashMap::default(),
@@ -22531,6 +22727,10 @@ impl Simulator {
                         &self.array_first_id,
                         &self.signal_name_to_id,
                     ) {
+                        Some(eid) if is_packed_id(eid) => {
+                            let (v, x, _) = self.packed.raw(eid);
+                            Value::from_inline(v, x, *width)
+                        }
                         Some(eid) => self.signal_table[eid].resize_for_assign(*width),
                         None => Value::new(1).resize_for_assign(*width),
                     };
@@ -23042,10 +23242,13 @@ impl Simulator {
                         // SoA read fast path (XEZIM_INLINE_BITS=1); with
                         // XEZIM_ARRAY_SOA_SHADOW=1 also assert coherence with
                         // the canonical signal_table before trusting it.
-                        if eid < soa_len && self.soa_read_ok[eid] {
+                        if is_packed_id(eid) {
+                            let (v, x, w) = self.packed.raw(eid);
+                            vm_store(&mut self.vm_regs[*dest as usize], v, x, w, false);
+                        } else if eid < soa_len && self.soa_read_ok[eid] {
                             let [v, x] = self.signal_inline_bits[eid];
                             if self.soa_shadow {
-                                let (cv, cx) = self.signal_table[eid].raw_bits();
+                                let (cv, cx) = self.cell_read(eid).raw_bits();
                                 if v != cv || x != cx {
                                     eprintln!(
                                         "[SOA-SHADOW] LoadArrayElem mismatch eid={} inline=({:#x},{:#x}) table=({:#x},{:#x}) — aborting",
@@ -23081,7 +23284,12 @@ impl Simulator {
                         let val = self.vm_regs[*val_reg as usize].resize(*width);
                         // Eval-time elision — array element write that
                         // matches current storage is dropped before queue.
-                        if self.signal_table[eid] != val {
+                        if is_packed_id(eid) {
+                            let (bv, bx) = val.raw_bits();
+                            if self.packed.set_raw(eid, bv, bx) {
+                                self.table_modified = true;
+                            }
+                        } else if self.signal_table[eid] != val {
                             self.nba_fast_index.insert(eid, self.nba_fast.len());
                             self.nba_fast.push(NbaFast {
                                 block_index: 0,
@@ -23103,7 +23311,12 @@ impl Simulator {
                     ) {
                         let mut val = self.vm_regs[*val_reg as usize].resize_for_assign(*width);
                         val.is_signed = self.signal_signed[eid];
-                        if self.signal_table[eid] != val {
+                        if is_packed_id(eid) {
+                            let (bv, bx) = val.raw_bits();
+                            if self.packed.set_raw(eid, bv, bx) {
+                                self.table_modified = true;
+                            }
+                        } else if self.signal_table[eid] != val {
                             write_sig!(self, eid, val);
                             if !self.dirty_signals[eid] {
                                 self.dirty_signals[eid] = true;
@@ -43378,7 +43591,12 @@ impl Simulator {
                     {
                         let idx = self.eval_expr(index).to_i64()?;
                         if let Some(id) = self.get_array_elem_id(&bname, idx) {
-                            return Some((format!("{}[{}]", bname, idx), Some(id)));
+                            // A packed cell has no id-keyed force slot; fall
+                            // through so the force degrades to a plain write
+                            // rather than indexing a table it is not in.
+                            if !is_packed_id(id) {
+                                return Some((format!("{}[{}]", bname, idx), Some(id)));
+                            }
                         }
                     }
                 }
@@ -46111,6 +46329,24 @@ impl Simulator {
                     _ => None,
                 };
                 if let Some(id) = target_id {
+                    // Packed cell: no signal_table slot, so the whole-word
+                    // path below cannot apply. Splice the bits into the cell.
+                    if is_packed_id(id) {
+                        let w = self.packed.width(id);
+                        let mut cur = self.packed.read(id);
+                        let hi = (msb as usize).min(w.saturating_sub(1) as usize);
+                        for i in lsb..=hi {
+                            let src = if src_base < 0 { i as i64 + src_base } else { i as i64 - lsb as i64 };
+                            if src >= 0 && (src as u32) < val.width {
+                                cur.set_bit(i, val.get_bit(src as usize));
+                            }
+                        }
+                        let changed = self.packed.write(id, &cur);
+                        if changed {
+                            self.table_modified = true;
+                        }
+                        return changed;
+                    }
                     let width = self.signal_widths[id] as usize;
                     // Whole-word fast path: if the range covers the whole
                     // signal, skip the per-bit loop. A NEGATIVE low bound is
@@ -66460,6 +66696,50 @@ impl Simulator {
 
     /// Mark a signal as dirty by ID
     #[inline]
+    /// Read a cell by id, transparently across the signal table and the
+    /// packed arena (see `PackedMem`).
+    #[inline]
+    fn cell_read(&self, id: usize) -> Value {
+        if is_packed_id(id) {
+            self.packed.read(id)
+        } else {
+            self.signal_table[id].clone()
+        }
+    }
+
+    /// Width of a cell by id, across both stores.
+    #[inline]
+    fn cell_width(&self, id: usize) -> u32 {
+        if is_packed_id(id) {
+            self.packed.width(id)
+        } else {
+            self.signal_widths[id]
+        }
+    }
+
+    /// Write a cell by id; returns true when it changed. A packed cell has no
+    /// comb dependents of its own (admission requires an unnamed bulk array),
+    /// so only the table-modified flag needs updating.
+    #[inline]
+    fn cell_write(&mut self, id: usize, val: &Value) -> bool {
+        if is_packed_id(id) {
+            let changed = self.packed.write(id, val);
+            if changed {
+                self.table_modified = true;
+            }
+            return changed;
+        }
+        let w = self.signal_widths[id];
+        let resized = val.resize(w);
+        if self.signal_table[id] != resized {
+            write_sig!(self, id, resized);
+            self.mark_dirty_id(id);
+            self.table_modified = true;
+            return true;
+        }
+        false
+    }
+
     fn mark_dirty_id(&mut self, id: usize) {
         let has_comb_deps = id + 1 >= self.comb_dep_offsets.len()
             || self.comb_dep_offsets[id] != self.comb_dep_offsets[id + 1];
@@ -67192,6 +67472,9 @@ impl Simulator {
     #[inline]
     pub(crate) fn jit_load_array_elem(&mut self, name: &str, idx: i64) -> u64 {
         if let Some(eid) = self.get_array_elem_id(name, idx) {
+            if is_packed_id(eid) {
+                return self.packed.read(eid).to_u64().unwrap_or(0);
+            }
             debug_assert!(
                 self.signal_widths[eid] <= 64,
                 "jit_load_array_elem called on wide elem array={} idx={} width={}",
