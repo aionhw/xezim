@@ -82386,14 +82386,34 @@ impl Simulator {
 
     /// Parse a string like `ClassName#(arg1,arg2)` into `(ClassName, "arg1,arg2")`.
     fn extract_spec_from_string(&self, s: &str) -> Option<(String, String)> {
-        if let Some(hash_idx) = s.find("#(") {
-            if s.ends_with(')') {
-                let base = s[..hash_idx].to_string();
-                let sig = s[hash_idx + 2..s.len() - 1].to_string();
-                if self.get_class_def(&base).is_some() {
-                    return Some((base, sig));
-                }
-            }
+        // Whitespace-tolerant scan for `Base#(args)`. The parser reconstructs
+        // parameterized type text with spaces around the `#`/parens
+        // (`special_comp # ( N )`). Previously the code only matched the
+        // compact `#(` form, so a SYMBOLIC value-param nested type argument
+        // (e.g. `uvm_typeid#(special_comp#(N))` from inside
+        // `special_comp#(N)`) was never parsed here — the value param `N`
+        // stayed unresolved and fell back to its default, producing a
+        // wrong-per-spec typeid/assoc key. Match `#` optionally followed by
+        // spaces then `(`. `normalize_spec_ws` later canonically strips
+        // remaining whitespace inside `sig`. Returns `(base, raw_sig)` where
+        // base is the (possibly still symbolic) class name; callers that
+        // need to re-extract nested specs keep whitespace handling here so
+        // the raw sig is unchanged for further resolution.
+        let bs = s.trim();
+        let hash_idx = bs.find('#')?;
+        let rest = &bs[hash_idx + 1..];
+        let lparen = rest.find('(')?;
+        let base = bs[..hash_idx].trim().to_string();
+        if !bs.ends_with(')') {
+            return None;
+        }
+        // `sig` is everything between `(` and the final `)`, preserving any
+        // inner whitespace verbatim (the caller canonicalizes via
+        // `normalize_spec_ws`).
+        let open_paren = hash_idx + 1 + lparen;
+        let sig = bs[open_paren + 1..bs.len() - 1].to_string();
+        if self.get_class_def(&base).is_some() {
+            return Some((base, sig));
         }
         None
     }
