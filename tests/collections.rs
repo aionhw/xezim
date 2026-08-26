@@ -73,6 +73,12 @@ mod sort_with_clause;
 mod struct_collections_across_calls;
 #[path = "collections/stream_justify_assoc_default_partsel.rs"]
 mod stream_justify_assoc_default_partsel;
+#[path = "collections/class_static_method_shadowing.rs"]
+mod class_static_method_shadowing;
+#[path = "collections/static_class_assoc_persist.rs"]
+mod static_class_assoc_persist;
+#[path = "collections/static_sibling_collection_isolation.rs"]
+mod static_sibling_collection_isolation;
 #[path = "collections/whole_array_continuous_assign.rs"]
 mod whole_array_continuous_assign;
 #[path = "collections/string_foreach_content.rs"]

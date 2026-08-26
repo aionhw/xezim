@@ -3614,6 +3614,16 @@ pub struct Simulator {
     /// keyed `"ClassName::propname"` where ClassName is the class that
     /// declared the static property.
     class_statics: HashMap<String, Value>,
+    /// Bare names of STATIC collections (queues / assoc / dyn arrays) that are
+    /// declared by MORE THAN ONE sibling class under the same name, so their
+    /// shared bare-name storage would otherwise alias (`cA::q` vs `cB::q`).
+    /// Computed during elaboration from `static_prop_key` over every class;
+    /// `spec_static_coll_key` consults this set to qualify ONLY these, leaving
+    /// the non-colliding static collections (e.g. `uvm_domain::m_domains`)
+    /// on their original bare-name storage — a broad rewrite split their
+    /// storage across the many bare-name access paths and broke the phase
+    /// graph.
+    colliding_static_colls: HashSet<String>,
     /// Per-frame overlay for class/typedef types of frame-locals. The
     /// global var_class_types/var_typedef_types are keyed by BARE name and
     /// shared across every process, so a class-typed local declared in one
@@ -7625,6 +7635,7 @@ impl Simulator {
             dist_picked_once: HashSet::default(),
             rand_ranges: HashMap::default(),
             class_statics: HashMap::default(),
+            colliding_static_colls: HashSet::default(),
             local_type_stack: Vec::new(),
             current_spec: None,
             spec_scope_stack: Vec::new(),
@@ -11910,6 +11921,90 @@ impl Simulator {
                     .entry(name.clone())
                     .or_insert((0, 63, width));
                 self.set_queue_size(&name, 0);
+            }
+        }
+        // Detect SIBLING-COLLIDING static collections: a bare collection name
+        // declared by MORE THAN ONE class resolves to multiple distinct
+        // class-qualified keys (`cA::q`, `cB::q`). For these, register the
+        // per-class key so `ClassName::coll` accesses are isolated; the bare
+        // global cell above is still used by unqualified accesses, matching
+        // the pre-existing design. Non-colliding static collections (declared
+        // by exactly one class, e.g. `uvm_domain::m_domains`) keep their
+        // bare-name storage unchanged — qualifying them split storage across
+        // the phase-graph access paths that read `m_domains` by bare name.
+        let class_names: Vec<String> = self.module.classes.keys().cloned().collect();
+        let mut bare_to_keys: HashMap<String, Vec<String>> = HashMap::default();
+        for cn in &class_names {
+            let owned: Vec<(String, bool, u32)> = self
+                .module
+                .classes
+                .get(cn)
+                .map(|cd| cd.static_collections.iter().cloned().collect())
+                .unwrap_or_default();
+            for (memname, _is_assoc, _width) in owned {
+                if let Some(st) = self.static_prop_key(cn, &memname) {
+                    if st != memname {
+                        bare_to_keys.entry(memname).or_default().push(st);
+                    }
+                }
+            }
+        }
+        let mut colliding: HashSet<String> = HashSet::default();
+        for (bare, keys) in &bare_to_keys {
+            let mut distinct: Vec<String> = keys.clone();
+            distinct.sort();
+            distinct.dedup();
+            if distinct.len() > 1 {
+                // A genuine SIBLING collision: the same bare collection name is
+                // declared by more than one class that are NOT in an
+                // ancestor/descendant relationship (e.g. the four sibling
+                // `uvm_cmdline_set_*::settings` queues all extending
+                // `uvm_cmdline_setting_base`). EXCLUDE inheritance shadowing
+                // (a base class + macro-inlined members in its subclasses, such
+                // as `uvm_sequence_library`'s `m_typewide_sequences`) — there
+                // the base-class static methods read/write the DECLARING
+                // (base) class's cell, and the bare-name storage that predates
+                // this fix is the correct shared cell. Qualifying such a name
+                // split base-vs-subclass accesses and emptied the base cell.
+                let owning: Vec<&str> = distinct
+                    .iter()
+                    .map(|k| k.split("::").next().unwrap_or(""))
+                    .collect();
+                let is_inheritance_shadow = owning.iter().any(|a| {
+                    owning.iter().any(|b| a != b && self.class_extends(a, b))
+                });
+                if !is_inheritance_shadow {
+                    colliding.insert(bare.clone());
+                }
+            }
+        }
+        if !colliding.is_empty() {
+            self.colliding_static_colls = colliding;
+            // Register the per-class storage key for each colliding static
+            // collection so `ClassName::coll` accesses are isolated.
+            for cn in &class_names {
+                let owned: Vec<(String, bool, u32)> = self
+                    .module
+                    .classes
+                    .get(cn)
+                    .map(|cd| cd.static_collections.iter().cloned().collect())
+                    .unwrap_or_default();
+                for (memname, is_assoc, width) in owned {
+                    if !self.colliding_static_colls.contains(&memname) {
+                        continue;
+                    }
+                    let Some(st) = self.static_prop_key(cn, &memname) else { continue };
+                    if st == memname {
+                        continue;
+                    }
+                    if is_assoc {
+                        self.module.associative_arrays.entry(st.clone()).or_insert(false);
+                    } else {
+                        self.module.dynamic_arrays.insert(st.clone());
+                        self.module.arrays.entry(st.clone()).or_insert((0, 63, width));
+                        self.set_queue_size(&st, 0);
+                    }
+                }
             }
         }
 
@@ -46297,6 +46392,15 @@ impl Simulator {
                         }
                     }
                     let idx_val = self.eval_expr(index);
+                    // Per-spec storage key for STATIC collection properties of
+                    // parameterized classes: element storage must use the
+                    // spec-aware key (matching the read path's `store_name`),
+                    // or writes land under the plain `arr[k]` name while reads
+                    // look up `Holder#spec::arr[k]` and see nothing. Without
+                    // this, a static assoc array (e.g. uvm_config_db's reuse
+                    // pool `m_rsc[uvm_component]`) loses every element between
+                    // calls — config_db::set never reuses a prior resource.
+                    let store_name = self.spec_static_coll_key(&name);
                     // §7.8.2: an associative index containing x/z is invalid.
                     // The write is ignored (with a warning) — it must not fold
                     // the unknown bits away and clobber a real element.
@@ -46346,7 +46450,7 @@ impl Simulator {
                                 return changed;
                             }
                         }
-                        let elem_name = format!("{}[{}]", name, idx_str);
+                        let elem_name = format!("{}[{}]", store_name, idx_str);
                         if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
                             let width = self.signal_widths[id];
                             let mut resized =
@@ -84330,13 +84434,19 @@ impl Simulator {
                     && cd.static_collections.iter().any(|(n, _, _)| n == name)
                 {
                     if let Some(key) = self.static_prop_key(&ctx, name) {
-                        // ONLY rewrite for a parameterized class with an
-                        // active specialization (key carries `#spec`). For a
-                        // non-parameterized class the key is just
-                        // `Class::prop` — identical storage to the bare name
-                        // used by the many access paths we do NOT touch here,
-                        // so rewriting would split storage and break them.
+                        // Parameterized classes with an active specialization
+                        // (key carries `#spec`) always get per-spec storage.
                         if key.contains('#') {
+                            return key;
+                        }
+                        // SIBLING-COLLIDING static collections (same bare
+                        // name declared by several classes) are qualified to
+                        // `DeclClass::member` so `cA::q` and `cB::q` do not
+                        // alias. Non-colliding statics (e.g.
+                        // `uvm_domain::m_domains`) stay on the bare name — a
+                        // broad rewrite split their storage across bare-name
+                        // access paths and broke the phase graph.
+                        if self.colliding_static_colls.contains(name) {
                             return key;
                         }
                     }
@@ -88303,8 +88413,20 @@ impl Simulator {
                 if let Some(scoped) = self.instance_assoc_member(&name) {
                     name = scoped;
                 }
-                if let Some(res) = self.eval_builtin_method(&name, mname, args) {
-                    return res;
+                // A bare CLASS name is a static-method receiver, never a
+                // collection. Without this gate, `uvm_config_db#(T)::exists(...)`
+                // (method name colliding with the collection `exists` builtin)
+                // is swallowed by `eval_builtin_method`'s `exists` handler, which
+                // returns false for a non-array name — silently failing config_db
+                // lookups while `set`/`get` (not collection-builtin names)
+                // dispatched correctly. Let the call fall through to the static
+                // class-method dispatch below instead.
+                if !(self.module.classes.contains_key(&name)
+                    && self.class_has_method(&name, mname))
+                {
+                    if let Some(res) = self.eval_builtin_method(&name, mname, args) {
+                        return res;
+                    }
                 }
                 // Package scope resolution: `pkg::func(args)`. Only when LHS is an
                 // explicitly known package name — not a class, signal, or handle.
@@ -89021,6 +89143,37 @@ impl Simulator {
                         return res;
                     }
                 }
+                // SIBLING-COLLIDING STATIC collection receiver
+                // `ClassName::coll.method(...)` (module scope; class context is
+                // None here). `expr_assoc_name` can't resolve it (the class
+                // name isn't an object handle) and `resolve_hier_name` below
+                // collapses it to the bare member name, so `cA::q` and `cB::q`
+                // alias. Route to the class-qualified static key, which the
+                // collision-set registration already added to the array tables
+                // — the `dynamic_arrays`/`arrays`/assoc contains-check below
+                // therefore only matches for genuinely-colliding statics,
+                // leaving non-colliding ones on their bare-name path below.
+                if let ExprKind::Ident(bh) = &base_expr.kind {
+                    if bh.path.len() == 2
+                        && bh.path.iter().all(|s| s.selects.is_empty())
+                        && self.module.classes.contains_key(&bh.path[0].name.name)
+                    {
+                        let cls = &bh.path[0].name.name;
+                        let cp = &bh.path[1].name.name;
+                        if let Some(st) = self.static_prop_key(cls, cp) {
+                            if self.is_associative_array(&st)
+                                || self.module.arrays.contains_key(&st)
+                                || self.module.dynamic_arrays.contains(&st)
+                            {
+                                if let Some(res) =
+                                    self.eval_builtin_method(&st, &m, args)
+                                {
+                                    return res;
+                                }
+                            }
+                        }
+                    }
+                }
                 // Module/package-scope array (NOT a class-instance member):
                 // `expr_assoc_name` only resolves class members, so a plain
                 // module-level `int aa[string]` / queue / dynamic array would
@@ -89087,7 +89240,17 @@ impl Simulator {
                         .get(recv_h)
                         .and_then(|o| o.as_ref())
                         .is_some_and(|i| self.class_has_method(&i.class_name, &m));
-                if !is_user_method {
+                // A bare CLASS-NAME receiver (`Class::size()` / `Class::len()`) is
+                // a STATIC method call, not a string/reference value. `recv`
+                // evaluates to 0 (no handle), so the eval-by-value check above
+                // misses it and the byte-length fallback below would swallow the
+                // call (returning 0). Detect a registered class declaring `m` and
+                // let it fall through to the static method dispatch — the sibling
+                // of the `exists`/collection-builtin fix upstream.
+                let is_static_class_recv = matches!(&base_expr.kind, ExprKind::Ident(bh)
+                    if self.module.classes.contains_key(&bh.path[0].name.name)
+                        && self.class_has_method(&bh.path[0].name.name, &m));
+                if !is_user_method && !is_static_class_recv {
                     if matches!(m.as_str(), "len" | "size" | "getc" | "substr") {
                         if let ExprKind::Ident(bh) = &base_expr.kind {
                             let bn = self.resolve_hier_name(bh);
