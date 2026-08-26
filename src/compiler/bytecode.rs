@@ -11452,6 +11452,11 @@ pub enum TsInsn {
     Xor { d: u16, a: u16, b: u16 },
     And { d: u16, a: u16, b: u16 },
     Or { d: u16, a: u16, b: u16 },
+    /// regs[d] = if regs[c] != 0 { regs[a] } else { regs[b] } — §11.4.11
+    /// conditional. Two-state values are X-free by the eval-site prefilter,
+    /// so the 4-state arm's unknown-condition bit-merge cannot arise and the
+    /// selector reduces to plain SV truthiness (non-zero).
+    Sel { d: u16, c: u16, a: u16, b: u16 },
     /// regs[d] = !regs[s] & mask (mask = source width).
     Not { d: u16, s: u16, mask: u64 },
     XorC { d: u16, s: u16, k: u64 },
@@ -11500,6 +11505,12 @@ pub enum TsInsn {
     /// through instead of aborting; only the SOURCE must be 2-state, and it
     /// is (it lives in a ts register). Non-abortable.
     RangeStoreNba { sig: u32, hi: u32, lo: u32, s: u16, mask: u64 },
+    /// Blocking counterpart of `RangeStoreNba`: splice regs[s] into
+    /// signal[hi:lo] immediately (§10.4.1), preserving the bits outside the
+    /// window. The TS bail census measured `BlockingAssignRange` gating
+    /// 133.2M interpreter evaluations on the C906 SoC — 42.9% of them, the
+    /// single largest reason two-state lowering gave up.
+    RangeStore { sig: u32, hi: u32, lo: u32, s: u16, mask: u64 },
     /// Dynamic array-element read: eid = first + (regs[idx] - lo). ABORTS
     /// the two-state run (caller re-runs 4-state) when the index is out of
     /// range or the element holds X — both produce X in 4-state. Lowering
@@ -11895,6 +11906,48 @@ pub fn lower_two_state(
                     }
                 });
             }
+            // A plain register copy. Lowered as `d = s | s`, which is exact
+            // (`x | x == x`) and needs no new opcode or executor arm — the
+            // wide bank has the same identity. Worth an arm at all because
+            // the TS bail census measured `Move` gating 43.8M interpreter
+            // evaluations on the C906 SoC (14.1% of all of them): the block
+            // was not doing anything two-state could not express, it just
+            // had no lowering.
+            Insn::Move(d, s) => {
+                let w = rw[*s as usize]?;
+                def!(rw, *d, w);
+                let (d, s) = (*d as u16, *s as u16);
+                out.push(if w > 64 {
+                    TsInsn::WOr { d, a: s, b: s }
+                } else {
+                    TsInsn::Or { d, a: s, b: s }
+                });
+            }
+            // §11.4.11 conditional. The TS bail census measured `Select`
+            // gating 57.8M interpreter evaluations (18.6%) — muxes are
+            // everywhere in RTL and nothing about them resists two-state.
+            // Both branches must share a width: the 4-state arm yields the
+            // CHOSEN branch's own width, and a downstream `Not`/`Range` masks
+            // by the register width, so adopting the max would change those
+            // results. Unequal branches bail (conservative, still covers the
+            // ordinary same-width mux).
+            Insn::Select(d, c, a, b) => {
+                let (wc, wa, wb) = (
+                    rw[*c as usize]?,
+                    rw[*a as usize]?,
+                    rw[*b as usize]?,
+                );
+                if wa != wb || wa > 64 || wc > 64 {
+                    return None;
+                }
+                def!(rw, *d, wa);
+                out.push(TsInsn::Sel {
+                    d: *d as u16,
+                    c: *c as u16,
+                    a: *a as u16,
+                    b: *b as u16,
+                });
+            }
             Insn::BitXor(d, a, b) | Insn::BitAnd(d, a, b) | Insn::BitOr(d, a, b) => {
                 let (wa, wb) = (rw[*a as usize]?, rw[*b as usize]?);
                 let (aw, bw) = (wa > 64, wb > 64);
@@ -12209,6 +12262,30 @@ pub fn lower_two_state(
                     sig: sig as u32,
                     v: v & ts_mask(*w),
                     w: *w,
+                });
+            }
+            Insn::BlockingAssignRange(sig, hi, lo, r) => {
+                let sig = *sig as usize;
+                if sig >= signal_widths.len()
+                    || signal_real[sig]
+                    || signal_widths[sig] > 64
+                {
+                    return None;
+                }
+                let cw = rw[*r as usize]?;
+                let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
+                let w = high - low + 1;
+                if cw > 64 || high >= 64 {
+                    return None;
+                }
+                side_effects = true;
+                stored.push(sig as u32);
+                out.push(TsInsn::RangeStore {
+                    sig: sig as u32,
+                    hi: high,
+                    lo: low,
+                    s: *r as u16,
+                    mask: ts_mask(w),
                 });
             }
             Insn::NbaAssignRange(sig, hi, lo, r) => {

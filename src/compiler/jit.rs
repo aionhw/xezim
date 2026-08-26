@@ -2118,6 +2118,28 @@ mod enabled {
                     let zero = builder.ins().iconst(types::I64, 0);
                     let one = builder.ins().iconst(types::I64, 1);
                     st2(builder, pointer_type, regs, xz, *dest, zero, one);
+                } else if sw > 64 && *bit >= 64 {
+                    // WIDE signal, bit above the low plane word. The fast
+                    // path below loads only that low word and emits
+                    // `v >> bit`; a shift amount >= 64 is masked to
+                    // `bit & 63`, so `sig[242]` silently returned bit 50 of
+                    // the low word — a wrong-but-plausible value that
+                    // propagated as real data. (`block_signals_fit_u64`
+                    // admits this shape on the stated assumption that bits
+                    // >= 64 take the slice bridge; only `LoadSignalRange`
+                    // actually did.) Take the same bridge here: it addresses
+                    // any window of a wide signal and returns it at bit 0.
+                    let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                    let loc = builder.ins().iconst(types::I32, *bit as i64);
+                    let wc = builder.ins().iconst(types::I32, 1);
+                    let call = builder.ins().call(load_slice_ref, &[sim_ptr, id, loc, wc]);
+                    let v = builder.inst_results(call)[0];
+                    let xcall = builder.ins().call(load_slice_xz_ref, &[sim_ptr, id, loc, wc]);
+                    let x = builder.inst_results(xcall)[0];
+                    let one = builder.ins().iconst(types::I64, 1);
+                    let vb = builder.ins().band(v, one);
+                    let xb = builder.ins().band(x, one);
+                    st2(builder, pointer_type, regs, xz, *dest, vb, xb);
                 } else {
                     let (v, x) = match raw_sig_loads(builder, pointer_type, inline_storage, *sig_id)
                     {
