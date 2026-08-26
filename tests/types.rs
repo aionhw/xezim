@@ -133,6 +133,8 @@ mod parameter_const_eval_corners;
 mod pattern_params_and_call_member;
 #[path = "types/power_operator_signedness.rs"]
 mod power_operator_signedness;
+#[path = "types/signed_mixed_equality.rs"]
+mod signed_mixed_equality;
 #[path = "types/property_value_param_binding.rs"]
 mod property_value_param_binding;
 #[path = "types/range_select_param_arith.rs"]

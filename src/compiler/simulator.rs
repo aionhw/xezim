@@ -78216,15 +78216,25 @@ impl Simulator {
         // 1-bit 1; without normalizing signedness, `resize_for_assign(1)`
         // inherits the literal's `is_signed=true`, yielding a signed-1-bit
         // value that reads back as -1 (IEEE 1800-2023 §6.6.1, §10.7).
-        // Only normalize on the resize path (width differs) — touching the
-        // width-match path perturbs tests that rely on the RHS signedness
-        // flowing through unchanged for same-width assignments.
+        //
+        // The same-width path must ALSO stamp the declared signedness.
+        // A `byte` field is signed, so `byte f; f = 'haa` (an unsigned 8-bit
+        // literal, same width 8) must read back signed (-86), not unsigned
+        // (170); keeping the RHS signedness here let the literal's unsigned
+        // flag flow into a same-width byte field and `$display("%0d", f)` /
+        // the UVM table printer showed 170 where the reference shows -86.
         if val.is_real {
             return val.clone();
         }
         match self.heap_prop_width(handle, prop) {
-            Some(w) if w != val.width => {
-                let mut fitted = val.resize_for_assign(w);
+            Some(w) => {
+                let mut fitted = if w != val.width {
+                    val.resize_for_assign(w)
+                } else {
+                    val.clone()
+                };
+                // Declared signedness governs stored signedness on BOTH the
+                // resize and the width-match paths.
                 fitted.is_signed = self.class_prop_signed_of(handle, prop);
                 fitted
             }
