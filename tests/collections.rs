@@ -41,6 +41,8 @@ mod constant_array_index_dependency;
 mod cont_assign_2d_array_index0;
 #[path = "collections/dyn_array_of_mailboxes.rs"]
 mod dyn_array_of_mailboxes;
+#[path = "collections/external_spec_static_assoc.rs"]
+mod external_spec_static_assoc;
 #[path = "collections/fixed_array_member_initializer.rs"]
 mod fixed_array_member_initializer;
 #[path = "collections/fixed_array_member_pattern_forms.rs"]

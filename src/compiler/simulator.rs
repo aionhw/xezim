@@ -50720,6 +50720,26 @@ impl Simulator {
                     ExprKind::MemberAccess { .. } => self.flat_member_name(expr),
                     _ => None,
                 };
+                // A class-QUALIFIED static collection accessed EXTERNALLY
+                // (`Class::member[k]` / `Class#(spec)::member[k]`, flattened by
+                // `flat_member_name` to `Class.member`) must resolve to the
+                // per-specialization static key `Class#spec::member` — the same
+                // key the static-method element/read paths use via
+                // `spec_static_coll_key`. Otherwise the external element access
+                // reads the empty bare-name/dotted global cell while the static
+                // write landed on the spec-keyed store, silently yielding null.
+                let mut idx_base_name = idx_base_name;
+                if let Some(nm) = idx_base_name.as_deref() {
+                    if let Some((cn, member)) = nm.split_once('.') {
+                        if self.module.classes.contains_key(cn) {
+                            if let Some(k) = self.static_prop_key(cn, member) {
+                                if k.contains('#') {
+                                    idx_base_name = Some(k);
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(mut name) = idx_base_name {
                     if let Some(scoped) = self.instance_assoc_member(&name) {
                         name = scoped;
@@ -72031,6 +72051,17 @@ impl Simulator {
         if self.module.associative_arrays.contains_key(name) {
             return true;
         }
+        // Per-specialization STATIC collection spec-key of a PARAMETERIZED
+        // class: `Class#spec::member` (or a plain `Class::member`). Element
+        // storage is keyed by this spec-key (the write/read paths rewrite via
+        // `spec_static_coll_key`), so `is_associative_array` must recognise
+        // it or `.size()`/`.num()`/`delete` on the spec-keyed receiver see a
+        // non-array and read 0 (assoc grown elements become invisible). The
+        // numeric-`<handle>#member` arm above only handles INSTANCE members;
+        // a spec-key's leading segment is `Class#spec`, not a handle.
+        if let Some(sc) = self.class_scoped_static_collection(name) {
+            return sc;
+        }
         // Per-instance class member: `<handle>#<member>`.
         if let Some(pos) = name.find('#') {
             if let Ok(handle) = name[..pos].parse::<usize>() {
@@ -72065,6 +72096,54 @@ impl Simulator {
             return true;
         }
         false
+    }
+
+    /// Recognise a CLASS-SCOPED STATIC collection spec-key of the form
+    /// `Class::member` or `Class#spec::member` (per-specialization storage for
+    /// a parameterized class). Returns true iff `member` is a registered
+    /// STATIC ASSOCIATIVE collection declared by the named class or one of its
+    /// ancestors. Mirrors the instance-member arm above, but for class-scoped
+    /// static storage keys (which the element/read paths yield via
+    /// `spec_static_coll_key`), so dispatch on the rewritten spec-key agrees
+    /// with the bare-name registration.
+    fn class_scoped_static_collection(&self, name: &str) -> Option<bool> {
+        let (idx, is_spec) = if let Some(p) = name.find("::") {
+            (p, true)
+        } else {
+            return None;
+        };
+        let member = &name[idx + 2..];
+        // Class name = text before `::`, minus a possible `#spec` suffix.
+        let qual = &name[..idx];
+        let cname = match qual.find('#') {
+            Some(hp) => &qual[..hp],
+            None => qual,
+        };
+        if cname.is_empty() || !self.module.classes.contains_key(cname) {
+            return None;
+        }
+        // Only treat the SPEC-key form as a static-collection reference;
+        // a plain `Class::member` may be a class-scoped constant or a
+        // generic access we should not hijack.
+        if !is_spec && !self.module.associative_arrays.contains_key(member) {
+            return None;
+        }
+        let mut cur = Some(cname.to_string());
+        while let Some(cn) = cur {
+            if let Some(cd) = self.module.classes.get(&cn) {
+                if cd
+                    .static_collections
+                    .iter()
+                    .any(|(n, is_assoc, _)| n == member && *is_assoc)
+                {
+                    return Some(true);
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        Some(false)
     }
 
     /// Strip trailing `[key]` index segments from a possibly-indexed storage
@@ -86441,7 +86520,6 @@ impl Simulator {
     /// base expression is either a bare member (`m` — uses `this`) or a
     /// member of another object (`obj.m`). Returns `<handle>#<member>`.
     fn expr_assoc_name(&mut self, expr: &Expression) -> Option<String> {
-        // `obj`/`member` pair → instance-scoped name if `member` is an
         // associative property of the object the handle points at.
         let obj_member = |sim: &Self, obj: &str, member: &str| -> Option<String> {
             // `this.member` — resolve via the current `this` handle, not a
@@ -86490,6 +86568,25 @@ impl Simulator {
                     // assoc-array first()/next() iteration silently fails.
                     if self.module.classes.contains_key(&bh.path[0].name.name) {
                         if self.is_associative_array(&member.name) {
+                            // For a PARAMETERIZED class the static collection
+                            // is stored PER-SPECIALIZATION (element/read paths
+                            // rewrite via `spec_static_coll_key` to
+                            // `Class#spec::member`), so the external
+                            // `Class#(spec)::member` access must resolve to
+                            // that spec-key too — a bare-name receiver reads
+                            // the EMPTY global cell and reports size 0 / hits
+                            // nothing, while the static method wrote to the
+                            // spec-keyed store. A non-parameterized (or
+                            // un-specialised) static keeps its bare global
+                            // name.
+                            if let Some(k) = self.static_prop_key(
+                                &bh.path[0].name.name,
+                                &member.name,
+                            ) {
+                                if k.contains('#') {
+                                    return Some(k);
+                                }
+                            }
                             return Some(member.name.clone());
                         }
                         // §8.9: `ClassName::S[i]` — the class-qualified
@@ -86503,6 +86600,35 @@ impl Simulator {
                         }
                     }
                     obj_member(self, &bh.path[0].name.name, &member.name)
+                }
+                // `Class#(spec)::member` — base is a SPECIALIZATION of a class
+                // name (the spec wrapper keeps this separate from the plain
+                // `Ident` arm above). Strip the specialization and recurse so
+                // the class-static-collection arm runs and yields the
+                // per-spec storage key. Set `current_spec` around the call so
+                // `static_prop_key` folds the spec into the key (the outer
+                // `expr_has_specialization` strip that normally sets it is not
+                // in play on this indexed element path).
+                ExprKind::Specialization { base, type_args_text } => {
+                    let cn = match &base.kind {
+                        ExprKind::Ident(h) if h.path.len() == 1 => h.path[0].name.name.clone(),
+                        _ => String::new(),
+                    };
+                    if cn.is_empty() || !self.module.classes.contains_key(&cn) {
+                        return None;
+                    }
+                    if self.is_associative_array(&member.name) {
+                        let spec = (cn.clone(), type_args_text.clone());
+                        if let Some(k) =
+                            self.static_prop_key_spec(&cn, &member.name, Some(&spec))
+                        {
+                            if k.contains('#') {
+                                return Some(k);
+                            }
+                        }
+                        return Some(member.name.clone());
+                    }
+                    None
                 }
                 // `arr[i].member` — base is an array INDEX expression.
                 // Evaluate the element to a class handle and resolve the
@@ -86684,6 +86810,15 @@ impl Simulator {
                         return obj_member(self, &bh.path[0].name.name, &member.name);
                     }
                 }
+                // A `Class#(spec)::member` base — strip the SPECIALIZATION so
+                // the class-static-collection resolution above runs; with the
+                // spec wrapper intact `eval_handle_expr` treats the class name
+                // as an object handle (0 → None) and the element access falls
+                // through to a null read.
+                if let ExprKind::Specialization { .. } = &base.kind {
+                    let stripped = Self::strip_spec_shape(base);
+                    return self.expr_assoc_name(&stripped);
+                }
                 // Indexed base (`arr[i].member`, e.g. `main_program[hart].q`):
                 // evaluate the element's handle and scope the member to it.
                 if let Some(handle) = self.eval_handle_expr(base) {
@@ -86705,8 +86840,6 @@ impl Simulator {
             _ => None,
         }
     }
-
-    /// Evaluate a scalar expression to an i64 in a `&self` context (literals,
     /// const exprs, and simple loop/local/signal variables). Used to resolve
     /// array indices when computing instance-scoped member names.
     /// Immutable resolution of an array-index expression to a `Value` (for the
