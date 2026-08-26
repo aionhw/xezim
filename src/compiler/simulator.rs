@@ -5586,6 +5586,7 @@ impl Simulator {
                     || cd.array_properties.contains_key(pname)
                     || cd.array_nd_properties.contains_key(pname)
                     || cd.static_collections.iter().any(|(n, ..)| n == pname)
+                    || cd.static_fixed_arrays.iter().any(|(n, ..)| n == pname)
                 {
                     continue;
                 }
@@ -5617,6 +5618,27 @@ impl Simulator {
                         }
                         Some(UD::Queue { .. }) | Some(UD::Unsized(_)) => {
                             cd.static_collections.push((pname, false, w));
+                        }
+                        // Fixed-size static array reached through a typedef
+                        // (`typedef int arr_t[3]; static arr_t S;`) — same
+                        // shared-store treatment as the direct declaration
+                        // (see `static_fixed_arrays` in elaborate.rs).
+                        Some(UD::Expression { expr, .. }) => {
+                            if let Some(n) =
+                                super::elaborate::const_eval_i64_with_params(expr, Some(&params))
+                            {
+                                if n > 0 {
+                                    cd.static_fixed_arrays.push((pname, 0, n - 1, w));
+                                }
+                            }
+                        }
+                        Some(UD::Range { left, right, .. }) => {
+                            if let (Some(l), Some(r)) = (
+                                super::elaborate::const_eval_i64_with_params(left, Some(&params)),
+                                super::elaborate::const_eval_i64_with_params(right, Some(&params)),
+                            ) {
+                                cd.static_fixed_arrays.push((pname, l.min(r), l.max(r), w));
+                            }
                         }
                         _ => {}
                     }
@@ -6986,11 +7008,23 @@ impl Simulator {
                     }
                 }
             });
-            if elem_dt.is_some_and(|dt| {
-                super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
-            }) {
-                for id in first_id..signal_table.len() {
-                    signal_signed_vec[id] = true;
+            if let Some(dt) = elem_dt {
+                if super::elaborate::is_type_signed_resolved(dt, &module.typedef_types) {
+                    for id in first_id..signal_table.len() {
+                        signal_signed_vec[id] = true;
+                    }
+                }
+                // Element REALNESS inheritance (`real T[4]`): the push
+                // helpers default every element to integral, so the
+                // two-state lowering admitted real arrays and read/wrote
+                // their elements as raw f64 BITS (a compiled `T[k] + x`
+                // returned 4.6e18-looking garbage while the AST path was
+                // right). Everything keying on per-element `signal_real`
+                // needs this — same shape as the §6.11.1 signedness loop.
+                if super::elaborate::is_type_real_resolved(dt, &module.typedef_types) {
+                    for id in first_id..signal_table.len() {
+                        signal_real_vec[id] = true;
+                    }
                 }
             }
         }
@@ -7094,6 +7128,14 @@ impl Simulator {
                     signal_signed_vec[id] = true;
                 }
             }
+            // Element REALNESS inheritance — see the 1-D loop.
+            if module.var_decl_types.get(base).is_some_and(|dt| {
+                super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
+            }) {
+                for id in first_id..signal_table.len() {
+                    signal_real_vec[id] = true;
+                }
+            }
         }
         let mut arrays_nd_sorted: Vec<(&String, &(Vec<(i64, i64)>, u32))> =
             module.arrays_nd.iter().collect();
@@ -7131,6 +7173,14 @@ impl Simulator {
             }) {
                 for id in first_id..signal_table.len() {
                     signal_signed_vec[id] = true;
+                }
+            }
+            // Element REALNESS inheritance — see the 1-D loop.
+            if module.var_decl_types.get(base).is_some_and(|dt| {
+                super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
+            }) {
+                for id in first_id..signal_table.len() {
+                    signal_real_vec[id] = true;
                 }
             }
         }
@@ -11860,6 +11910,53 @@ impl Simulator {
                     .entry(name.clone())
                     .or_insert((0, 63, width));
                 self.set_queue_size(&name, 0);
+            }
+        }
+
+        // Fixed-size static array members (`static int S[3]`) share ONE store
+        // per class (§8.9), so — like the collections above — they register
+        // globally under the bare name rather than per-instance as
+        // `<handle>#name`. Bounds are real (not the 0..63 queue buffer), and
+        // every element is defaulted so an index read or `foreach` sees a
+        // populated range instead of x.
+        let static_fixed: Vec<(String, String, i64, i64, u32)> = self
+            .module
+            .classes
+            .values()
+            .flat_map(|c| {
+                c.static_fixed_arrays
+                    .iter()
+                    .map(|(n, lo, hi, w)| (c.name.clone(), n.clone(), *lo, *hi, *w))
+            })
+            .collect();
+        // §8.9: ONE copy per DECLARING class — the store is keyed
+        // `{Class}::{member}` (each class's static_fixed_arrays lists only
+        // its OWN declarations, so the key is by construction the declarer;
+        // inherited access walks the chain via `static_fixed_key_in`). Two
+        // classes declaring the same member name get separate stores.
+        for (cls, name, lo, hi, width) in static_fixed {
+            let key = format!("{}::{}", cls, name);
+            self.module.arrays.entry(key.clone()).or_insert((lo, hi, width));
+            // §6.8: a 4-STATE element type defaults to x, not 0 — only
+            // two-state elements (int/byte/bit...) start at zero. The
+            // declared type is on the owning class's property table.
+            let two_state = self
+                .module
+                .classes
+                .get(&cls)
+                .and_then(|c| c.property_types.get(&name))
+                .is_some_and(|dt| {
+                    super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types)
+                });
+            let default = if two_state {
+                Value::zero(width)
+            } else {
+                Value::all_x(width)
+            };
+            for i in lo..=hi {
+                let elem = format!("{}[{}]", key, i);
+                self.widths.insert(elem.clone(), width);
+                self.signals.entry(elem).or_insert_with(|| default.clone());
             }
         }
 
@@ -16939,6 +17036,7 @@ impl Simulator {
         compiler.set_packed_full_dims(&self.module.packed_full_dims);
         compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
         compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
         compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
         compiler.set_array_first_id(&self.array_first_id);
         compiler.set_string_signals(&self.module.string_signals);
@@ -19918,6 +20016,7 @@ impl Simulator {
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
             compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
@@ -20001,6 +20100,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
                 compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 compiler.set_array_first_id(&self.array_first_id);
                 compiler.set_string_signals(&self.module.string_signals);
@@ -20032,6 +20132,7 @@ impl Simulator {
                 delay_compiler.set_assoc_arrays(&self.module.associative_arrays);
                 delay_compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 delay_compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                delay_compiler.set_arrays_2d(&self.module.arrays_2d);
                 delay_compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 delay_compiler.set_array_first_id(&self.array_first_id);
                 delay_compiler.set_string_signals(&self.module.string_signals);
@@ -24301,6 +24402,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
                 compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 compiler.set_array_first_id(&self.array_first_id);
                 // Without the function table, `compile_pure_call` cannot even
@@ -24370,6 +24472,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
                 compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_array_first_id(&self.array_first_id);
@@ -25067,6 +25170,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                     compiler.set_packed_full_dims(&self.module.packed_full_dims);
                     compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
                     compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                     compiler.set_array_first_id(&self.array_first_id);
                     compiler.top_module_name = Some(self.module.name.clone());
@@ -31146,7 +31250,9 @@ impl Simulator {
             non_clock_change = true;
         }
 
-        self.fire_clock_generators();
+        // Clock generators fire AFTER the first wheel drain below — see the
+        // de facto interleave note at the call site.
+        let mut clocks_fired = false;
 
         let _t = profile_timing.then(std::time::Instant::now);
         let has_active = self.event_queue.next_time() == Some(self.time);
@@ -31193,6 +31299,21 @@ impl Simulator {
                 if !self.is_pid_suspended(pid) {
                     self.child_finished(pid);
                 }
+            }
+            // De facto §4.5 interleave (verified against the major
+            // implementations): a process whose `#delay` expires exactly at
+            // a clock-toggle time resumes and runs to its NEXT timing
+            // control BEFORE the clock toggles — so a `@(posedge clk)` it
+            // reaches catches THIS slot's edge, and a `clk` read sees the
+            // pre-toggle value. Firing the generators before the wheel
+            // drain made xezim skip that edge: LRM-legal (§4.7 leaves the
+            // interleave open) but against the run-to-next-time-control
+            // model everyone else implements — a task ending in `#N` that
+            // lands on a posedge shifted the caller's whole
+            // `repeat(M) @(posedge clk)` sequence by one period.
+            if !clocks_fired {
+                clocks_fired = true;
+                self.fire_clock_generators();
             }
             if self.finished || self.zero_delay_defer_pending {
                 // Pending same-time activations remain in the timing wheel.
@@ -34610,6 +34731,7 @@ impl Simulator {
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
             compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
@@ -34831,6 +34953,7 @@ impl Simulator {
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
             compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
@@ -46148,6 +46271,16 @@ impl Simulator {
                     if let Some(scoped) = self.instance_assoc_member(&name) {
                         name = scoped;
                     }
+                    // §8.9: `Cls::S[i] = v` reaches here with the resolver's
+                    // bare-leaf collapse of the 2-segment form; the original
+                    // segments name the qualified store.
+                    if !self.module.arrays.contains_key(&name) {
+                        if let Some(h) = hier_opt {
+                            if let Some(k) = self.static_fixed_key_from_hier(h) {
+                                name = k;
+                            }
+                        }
+                    }
                     // A bare name inside a SUBMODULE process resolves under
                     // the process's instance scope (name_resolve_hint), like
                     // scalar reads/writes already do.
@@ -52777,6 +52910,14 @@ impl Simulator {
                                     aname = scoped;
                                 }
                             }
+                            // §8.9: `$size(Cls::S)` — the resolver collapses
+                            // the 2-segment form to the bare leaf; map from
+                            // the original segments to the qualified store.
+                            if !self.module.arrays.contains_key(&aname) {
+                                if let Some(k) = self.static_fixed_key_from_hier(hier) {
+                                    aname = k;
+                                }
+                            }
                             // Every unpacked dimension, outermost first. Only the
                             // 1-D table was consulted, so `$size(m, 2)` — and even
                             // `$size(m)` on a 2-D/N-D array — returned 0.
@@ -54294,6 +54435,12 @@ impl Simulator {
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
+                // §5.7 (issue #31): a PROCEDURAL-only literal never passes
+                // through elaboration const-eval, so the wrap warning has to
+                // fire here too. Slow path only (the cached-value fast path
+                // above returns first), and the shared dedupe means a literal
+                // already reported at elaboration stays quiet.
+                super::elaborate::warn_unsized_decimal_wrap(*size, base, value);
                 let mut v = Value::from_str_radix(value, r, w);
                 // Cache inline values (width <= 64)
                 if w <= 64 {
@@ -78324,6 +78471,12 @@ impl Simulator {
                 {
                     return None;
                 }
+                // A fixed-size STATIC array stores globally under its bare
+                // name, so its `[i]` element leaves are NOT reachable through
+                // the per-instance struct machinery either.
+                if cd.static_fixed_arrays.iter().any(|(n, ..)| n == prop) {
+                    return None;
+                }
                 if let Some(DataType::Struct(su)) = cd.property_types.get(prop) {
                     return Some(su.clone());
                 }
@@ -79141,6 +79294,9 @@ impl Simulator {
                 // too (§7.4.2) — route them to the collection paths, not
                 // the packed-select machinery.
                 || cd.static_collections.iter().any(|(n, _, _)| n == prop)
+                // A fixed-size static array indexes its unpacked dimension
+                // first as well — it is an array, just a globally-stored one.
+                || cd.static_fixed_arrays.iter().any(|(n, ..)| n == prop)
             {
                 return None;
             }
@@ -81750,14 +81906,9 @@ impl Simulator {
     ) -> Option<Value> {
         let ln = self.dyn_cmp_operand_name(left)?;
         let rn = self.dyn_cmp_operand_name(right)?;
-        if ln == rn {
-            // Self-comparison is always true regardless of contents — but only
-            // when both resolve to the SAME storage; a member and an unrelated
-            // bare name (e.g. `this.val` vs an outer value-param `val`) compare
-            // by value instead.
-            let res = if want_eq { 1 } else { 0 };
-            return Some(Value::from_u64(res, 1));
-        }
+        // NO same-storage shortcut: a queue holding an x element makes BOTH
+        // `q == q` and `q != q` come out 0 on the reference simulator, so
+        // self-comparison must run the element walk like any other pair.
         let ls = self.get_queue_size(&ln);
         let rs = self.get_queue_size(&rn);
         if ls != rs {
@@ -81780,7 +81931,11 @@ impl Simulator {
                 .get_signal_value_by_name(&format!("{}[{}]", rn, i))
                 .unwrap_or_else(|| Value::zero(w));
             if lv.has_unknown() || rv.has_unknown() {
-                return Some(Value::new(1)); // X propagates
+                // Reference behavior: an x/z element makes the comparison
+                // neither equal NOR unequal — both `==` and `!=` yield 0
+                // (verified: `q1 == q1` and `q1 != q1` with an 8'hxx element
+                // both print 0 there; returning x instead rendered `%b` as x).
+                return Some(Value::from_u64(0, 1));
             }
             if lv != rv {
                 equal = false;
@@ -85777,14 +85932,78 @@ impl Simulator {
         Some(name)
     }
 
+    /// §8.9: the store key of a fixed-size STATIC array member reachable
+    /// from `class_name`'s inheritance chain — `{DeclaringClass}::{member}`,
+    /// nearest declarer first (a subclass redeclaring the name hides the
+    /// base's copy; an inherited-only member resolves to the base's key, so
+    /// every subclass shares the ONE store §8.9 prescribes).
+    fn static_fixed_key_in(&self, class_name: &str, member: &str) -> Option<String> {
+        let mut cur = Some(class_name.to_string());
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if cd.static_fixed_arrays.iter().any(|(n, ..)| n == member) {
+                return Some(format!("{}::{}", cn, member));
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// §8.9: a source-spelled `Cls::member` (or the flattened `Cls.member`
+    /// an inlined path can produce) naming a fixed-size static array,
+    /// resolved through Cls's chain to the DECLARING class's store key —
+    /// `C::B` inherited from `Base` maps to `Base::B`.
+    /// §8.9: hier-shape-aware variant — `Cls::member` may reach resolution
+    /// as a TWO-SEGMENT Ident whose leaf the generic resolver collapses to
+    /// (`resolve_hier_name([C, R])` yields bare "R"), losing the class. Map
+    /// from the ORIGINAL segments instead.
+    fn static_fixed_key_from_hier(
+        &self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<String> {
+        match hier.path.len() {
+            1 => self.static_fixed_key_for_name(&hier.path[0].name.name),
+            2 if hier.path[0].selects.is_empty() => {
+                let cls = &hier.path[0].name.name;
+                if !self.module.classes.contains_key(cls) {
+                    return None;
+                }
+                self.static_fixed_key_in(cls, &hier.path[1].name.name)
+            }
+            _ => None,
+        }
+    }
+
+    fn static_fixed_key_for_name(&self, name: &str) -> Option<String> {
+        let (cls, member) = name
+            .split_once("::")
+            .or_else(|| name.split_once('.'))?;
+        if member.is_empty() || member.contains(':') || member.contains('.') {
+            return None;
+        }
+        if !self.module.classes.contains_key(cls) {
+            return None;
+        }
+        self.static_fixed_key_in(cls, member)
+    }
+
     fn instance_assoc_member(&self, name: &str) -> Option<String> {
+        // §8.9: `Cls::member` / flattened `Cls.member` spellings of a static
+        // fixed array resolve to the declaring class's store BEFORE the
+        // dotted-name guard below can reject them.
+        if let Some(k) = self.static_fixed_key_for_name(name) {
+            return Some(k);
+        }
         if name.contains('#') || name.contains('.') || name.contains('[') {
             return None;
         }
-        let handle = self.this_stack.last().copied().flatten()?;
-        if handle == 0 {
-            return None;
-        }
+        // §8.9: inside a STATIC method there is no `this`; the lexical class
+        // context still resolves a bare static-array member to its store.
+        let Some(handle) = self.this_stack.last().copied().flatten().filter(|&h| h != 0)
+        else {
+            let ctx = self.class_context_stack.last().cloned().flatten()?;
+            return self.static_fixed_key_in(&ctx, name);
+        };
         // Use the runtime class of `this` (from the heap) rather than the
         // lexical class_context_stack.  When a bare method call (e.g. `body()`)
         // is inlined without updating class_context_stack, the stack still
@@ -85806,6 +86025,11 @@ impl Simulator {
                 || self.prop_bound_collection(handle, &cn, name)
             {
                 return Some(format!("{}#{}", handle, name));
+            }
+            // §8.9: a fixed-size STATIC array resolves to its class-qualified
+            // shared store, not a per-instance name.
+            if cd.static_fixed_arrays.iter().any(|(n, ..)| n == name) {
+                return Some(format!("{}::{}", cn, name));
             }
             cur = cd.extends.clone();
         }
@@ -85910,7 +86134,9 @@ impl Simulator {
         {
             Some(format!("{}#{}", handle, member))
         } else {
-            None
+            // §8.9: a fixed-size static array member of the receiver's class
+            // chain names the class-qualified shared store.
+            self.static_fixed_key_in(&cn, member)
         }
     }
 
@@ -85946,7 +86172,9 @@ impl Simulator {
                 // array/queue typedef — a per-spec collection property.
                 Some(format!("{}#{}", handle, member))
             } else {
-                None
+                // §8.9: a fixed-size static array member names the
+                // class-qualified shared store.
+                sim.static_fixed_key_in(&cn, member)
             }
         };
         match &expr.kind {
@@ -85963,10 +86191,19 @@ impl Simulator {
                     // globally by bare name). Without this, obj_member treats
                     // the class name as an object handle (0 → None), and the
                     // assoc-array first()/next() iteration silently fails.
-                    if self.module.classes.contains_key(&bh.path[0].name.name)
-                        && self.is_associative_array(&member.name)
-                    {
-                        return Some(member.name.clone());
+                    if self.module.classes.contains_key(&bh.path[0].name.name) {
+                        if self.is_associative_array(&member.name) {
+                            return Some(member.name.clone());
+                        }
+                        // §8.9: `ClassName::S[i]` — the class-qualified
+                        // shared store of a fixed-size static array,
+                        // resolved through the chain (a subclass scope may
+                        // name an inherited static).
+                        if let Some(k) =
+                            self.static_fixed_key_in(&bh.path[0].name.name, &member.name)
+                        {
+                            return Some(k);
+                        }
                     }
                     obj_member(self, &bh.path[0].name.name, &member.name)
                 }

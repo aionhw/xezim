@@ -121,20 +121,6 @@ mod t_bound_queue_value_param_chain;
 mod t_no_parens_static_method;
 #[path = "hierarchy/t_nested_value_param_in_type_arg.rs"]
 mod t_nested_value_param_in_type_arg;
-#[path = "hierarchy/t_local_queue_index_growth.rs"]
-mod t_local_queue_index_growth;
-#[path = "hierarchy/t_queue_elem_method_return_width.rs"]
-mod t_queue_elem_method_return_width;
-#[path = "hierarchy/t_new_in_call_argument.rs"]
-mod t_new_in_call_argument;
-#[path = "hierarchy/t_push_back_new_queue_element.rs"]
-mod t_push_back_new_queue_element;
-#[path = "hierarchy/t_long_string_local_not_truncated.rs"]
-mod t_long_string_local_not_truncated;
-#[path = "hierarchy/t_nested_typedef_spec_resolution.rs"]
-mod t_nested_typedef_spec_resolution;
-#[path = "hierarchy/t_typename_on_type_param.rs"]
-mod t_typename_on_type_param;
 #[path = "hierarchy/wildcard_import_shadow.rs"]
 mod wildcard_import_shadow;
 

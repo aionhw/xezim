@@ -11,6 +11,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "collections/queue_eq_unknown_elems.rs"]
+mod queue_eq_unknown_elems;
 #[path = "collections/array_element_collection.rs"]
 mod array_element_collection;
 #[path = "collections/dyn_array_loop_write_notifies.rs"]

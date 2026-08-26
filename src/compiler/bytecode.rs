@@ -753,6 +753,14 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
 }
 
 /// Compiler state for converting AST → bytecode.
+#[derive(Clone)]
+struct LocalArrayBind {
+    regs: Vec<RegId>,
+    lo: i64,
+    elem_w: u32,
+    is_real: bool,
+}
+
 pub struct BytecodeCompiler<'a> {
     insns: Vec<Insn>,
     next_reg: u32,
@@ -928,6 +936,16 @@ pub struct BytecodeCompiler<'a> {
     /// values — drives `%s` semantics and resize suppression. Name-based on
     /// purpose: register ids are recycled across arms, names are not.
     local_var_is_string: HashSet<String>,
+    /// Local/formal names (in the current inline scope) bound to REAL values
+    /// (§13.3.1). Assignments into these coerce numerically via
+    /// `emit_to_real` — a plain register bind would leave an integral actual
+    /// as integer bits and `t / 2` style body arithmetic would truncate.
+    local_var_is_real: HashSet<String>,
+    /// SMALL fixed-shape local arrays of an inlined pure body (`real row
+    /// [0:3]`): one register per element, values kept WHOLE (real elements
+    /// stay real — no bit packing). A dynamic index compiles to a
+    /// compare/branch chain over the elements.
+    local_var_array: HashMap<String, LocalArrayBind>,
     /// Active inline return context: (result register — None for a void
     /// function or task —, resize width; 0 = none, e.g. strings). `return`
     /// compiles to result-move + jump; the jump indexes collect in
@@ -942,6 +960,11 @@ pub struct BytecodeCompiler<'a> {
     /// then only excludes 1D/packed bases as before. Set via
     /// `set_multi_dim_arrays`.
     multi_dim_arrays: Option<&'a HashSet<String>>,
+    /// 2-D unpacked array shapes (`module.arrays_2d`): base ->
+    /// ((lo1,hi1),(lo2,hi2),elem_w). Elements are materialized contiguously
+    /// row-major from `base[lo1][lo2]`, so a DYNAMIC `a[i][j]` read compiles
+    /// to a bounds-checked flat index over one Dense operand.
+    arrays_2d: Option<&'a HashMap<String, ((i64, i64), (i64, i64), u32)>>,
     /// Names the elaborator recorded as DYNAMIC arrays / QUEUES. Used only to
     /// keep their element STORES off the dense array fast path (see
     /// `collection_store_denied`); their READS are unaffected.
@@ -1009,10 +1032,13 @@ impl<'a> BytecodeCompiler<'a> {
             loop_continue_patches: Vec::new(),
             string_signals: None,
             local_var_is_string: HashSet::default(),
+            local_var_is_real: HashSet::default(),
+            local_var_array: HashMap::default(),
             purity_depth: std::cell::Cell::new(0),
             inline_ret: None,
             inline_ret_jumps: Vec::new(),
             multi_dim_arrays: None,
+            arrays_2d: None,
             dynamic_arrays: None,
             queue_vars: None,
             packed_struct_fields: None,
@@ -1281,6 +1307,10 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_multi_dim_arrays(&mut self, s: &'a HashSet<String>) {
         self.multi_dim_arrays = Some(s);
+    }
+
+    pub fn set_arrays_2d(&mut self, m: &'a HashMap<String, ((i64, i64), (i64, i64), u32)>) {
+        self.arrays_2d = Some(m);
     }
 
     pub fn set_collection_denies(&mut self, dyn_arrays: &'a HashSet<String>, queues: &'a HashSet<String>) {
@@ -1610,8 +1640,17 @@ impl<'a> BytecodeCompiler<'a> {
         let dt_is_real = |dt: &crate::ast::types::DataType| {
             crate::compiler::elaborate::is_type_real(dt)
         };
-        if dt_is_real(&fd.return_type) || fd.ports.iter().any(|p| dt_is_real(&p.data_type)) {
-            self.bail("Expr_Call_real");
+        // REAL formals/return are admitted with §13.3.1 conversion at the
+        // register bind (`emit_to_real`); `Value` arithmetic and the store
+        // paths are real-aware, and `resize(64)` is identity on a real. Only
+        // ref/output REAL formals stay on the AST path — their write-back
+        // would need the reverse conversion against the actual's own type.
+        let ret_is_real = dt_is_real(&fd.return_type);
+        if fd.ports.iter().any(|p| {
+            dt_is_real(&p.data_type)
+                && !matches!(p.direction, PortDirection::Input)
+        }) {
+            self.bail("Expr_Call_real_ref");
             return None;
         }
         // Only inline a function that is PURE IN ITS ARGUMENTS: every name its
@@ -1622,7 +1661,23 @@ impl<'a> BytecodeCompiler<'a> {
         // un-rewritten copy whose free names belong to another scope. It also
         // keeps the AST path's sensitivity handling (which follows a callee's
         // reads) authoritative for such functions.
-        if !self.fn_is_pure_in(&fd, name.rsplit_once('.').map(|(p, _)| p)) {
+        // Module-signal READS are admissible when the free names resolve
+        // unambiguously: a DOTTED registration's body was rewritten to
+        // instance-qualified (absolute) names, and a bare registration with
+        // no dotted twin can only be the top module's own copy (§13.4.2 —
+        // the value may then depend on module state, and the CA dependency
+        // machinery follows callee reads, so re-evaluation still triggers).
+        // Writes to module state stay disqualifying either way.
+        let allow_ext_reads = name.contains('.')
+            || self.functions.is_some_and(|f| {
+                let suffix = format!(".{}", name);
+                !f.keys().any(|k| k.ends_with(suffix.as_str()))
+            });
+        if !self.fn_is_pure_in_ext(
+            &fd,
+            name.rsplit_once('.').map(|(p, _)| p),
+            allow_ext_reads,
+        ) {
             if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
                 eprintln!("[INLINE-FAIL] fn {} reason=impure", name);
             }
@@ -1664,6 +1719,7 @@ impl<'a> BytecodeCompiler<'a> {
         let mut elem_binds: Vec<(String, u32)> = Vec::new();
         let mut ref_writes: Vec<(Expression, RegId, u32)> = Vec::new();
         let mut string_formal_names: Vec<String> = Vec::new();
+        let mut real_formal_names: Vec<String> = Vec::new();
         for (i, (p, a)) in fd.ports.iter().zip(args).enumerate() {
             if matches!(p.direction, PortDirection::Ref)
                 && (matches!(&a.kind, ExprKind::Ident(h) if self.local_var_reg_of(h).is_some())
@@ -1684,6 +1740,7 @@ impl<'a> BytecodeCompiler<'a> {
             } else {
                 self.port_effective_width(&fd.ports, i, Some(&name))
             };
+            let formal_is_real = dt_is_real(&p.data_type);
             let slot = self.alloc_reg();
             if matches!(p.direction, PortDirection::Output) {
                 // §13.5.3: an output formal does NOT read the actual; it
@@ -1694,11 +1751,18 @@ impl<'a> BytecodeCompiler<'a> {
                 let v = self.compile_expr(a, w)?;
                 self.emit(Insn::Move(slot, v));
             }
-            if w > 0 {
+            if w > 0 && !formal_is_real {
                 self.emit(Insn::Resize(slot, w));
+            }
+            if formal_is_real {
+                // §13.3.1: an integral actual CONVERTS to the real formal.
+                self.emit_to_real(slot);
             }
             if formal_is_string {
                 string_formal_names.push(p.name.name.clone());
+            }
+            if formal_is_real {
+                real_formal_names.push(p.name.name.clone());
             }
             binds.push((p.name.name.clone(), (slot, w)));
             if let Some(ew) = self.decl_elem_width_in(&p.data_type, Some(&name)) {
@@ -1718,6 +1782,8 @@ impl<'a> BytecodeCompiler<'a> {
         let qpfx = name.rsplit_once('.').map(|(p, _)| p.to_string());
         let saved_locals = std::mem::take(&mut self.local_var_regs);
         let saved_local_strings = std::mem::take(&mut self.local_var_is_string);
+        let saved_local_reals = std::mem::take(&mut self.local_var_is_real);
+        let saved_local_arrays = std::mem::take(&mut self.local_var_array);
         let saved_local_elems = std::mem::take(&mut self.local_var_elem);
         for (n, b) in binds {
             if let Some(pfx) = &qpfx {
@@ -1736,6 +1802,19 @@ impl<'a> BytecodeCompiler<'a> {
                 self.local_var_is_string.insert(format!("{pfx}.{n}"));
             }
             self.local_var_is_string.insert(n.clone());
+        }
+        for n in &real_formal_names {
+            if let Some(pfx) = &qpfx {
+                self.local_var_is_real.insert(format!("{pfx}.{n}"));
+            }
+            self.local_var_is_real.insert(n.clone());
+        }
+        if ret_is_real {
+            if let Some(pfx) = &qpfx {
+                self.local_var_is_real
+                    .insert(format!("{}.{}", pfx, fd.name.name.name));
+            }
+            self.local_var_is_real.insert(fd.name.name.name.clone());
         }
         if ret_is_string {
             if let Some(pfx) = &qpfx {
@@ -1793,6 +1872,8 @@ impl<'a> BytecodeCompiler<'a> {
         self.inlining_stack.pop();
         self.local_var_regs = saved_locals;
         self.local_var_is_string = saved_local_strings;
+        self.local_var_is_real = saved_local_reals;
+        self.local_var_array = saved_local_arrays;
         self.local_var_elem = saved_local_elems;
         if !ok {
             if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
@@ -1804,7 +1885,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
             return None;
         }
-        if ret_w > 0 {
+        if ret_w > 0 && !ret_is_real {
             self.emit(Insn::Resize(ret_slot, ret_w));
         }
         Some(ret_slot)
@@ -1829,9 +1910,24 @@ impl<'a> BytecodeCompiler<'a> {
                     ..
                 } => {
                     for d in declarators {
+                        let is_real =
+                            crate::compiler::elaborate::is_type_real(data_type);
                         if !d.dimensions.is_empty() {
-                            self.bail("Expr_Call_local_array");
-                            return false;
+                            // A SMALL fixed-shape local array (`real row
+                            // [0:3]`) — the working-buffer shape every
+                            // interpolation helper uses — becomes one
+                            // register per element; a dynamic index selects
+                            // by compare/branch chain (see
+                            // `compile_local_array_read`). Anything else
+                            // (queues, big or non-constant shapes) keeps the
+                            // AST path.
+                            if d.init.is_some()
+                                || !self.bind_local_array(&d.name.name, &d.dimensions, data_type, is_real)
+                            {
+                                self.bail("Expr_Call_local_array");
+                                return false;
+                            }
+                            continue;
                         }
                         let is_string = matches!(
                             data_type,
@@ -1854,7 +1950,10 @@ impl<'a> BytecodeCompiler<'a> {
                                 self.emit(Insn::LoadConst(slot, Box::new(init)));
                             }
                         }
-                        if w > 0 {
+                        if is_real {
+                            self.local_var_is_real.insert(d.name.name.clone());
+                            self.emit_to_real(slot);
+                        } else if w > 0 {
                             self.emit(Insn::Resize(slot, w));
                         }
                         if is_string {
@@ -2456,6 +2555,241 @@ impl<'a> BytecodeCompiler<'a> {
         self.local_var_regs.get(&seg.name.name).copied()
     }
 
+    /// Bind a small fixed-shape local array to per-element registers. One
+    /// dimension, constant bounds, at most 32 elements; every element starts
+    /// at the element type's default. Returns false when the shape does not
+    /// qualify (the caller bails to the AST path).
+    fn bind_local_array(
+        &mut self,
+        name: &str,
+        dims: &[crate::ast::types::UnpackedDimension],
+        data_type: &crate::ast::types::DataType,
+        is_real: bool,
+    ) -> bool {
+        use crate::ast::types::UnpackedDimension as UD;
+        if dims.len() != 1 {
+            return false;
+        }
+        let (lo, hi): (i64, i64) = match &dims[0] {
+            UD::Range { left, right, .. } => {
+                let (Some(l), Some(r)) = (
+                    self.eval_const_expr(left).map(|v| v as i64),
+                    self.eval_const_expr(right).map(|v| v as i64),
+                ) else {
+                    return false;
+                };
+                (l.min(r), l.max(r))
+            }
+            UD::Expression { expr: e, .. } => {
+                let Some(n) = self.eval_const_expr(e).map(|v| v as i64) else {
+                    return false;
+                };
+                if n <= 0 {
+                    return false;
+                }
+                (0, n - 1)
+            }
+            _ => return false,
+        };
+        let count = hi - lo + 1;
+        if !(1..=32).contains(&count) {
+            return false;
+        }
+        let elem_w = self.decl_width(data_type);
+        if elem_w == 0 || (elem_w > 64 && !is_real) {
+            return false;
+        }
+        let default = self.type_default_value(data_type, elem_w);
+        let mut regs = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let r = self.alloc_reg();
+            self.emit(Insn::LoadConst(r, Box::new(default.clone())));
+            regs.push(r);
+        }
+        self.local_var_array.insert(
+            name.to_string(),
+            LocalArrayBind { regs, lo, elem_w, is_real },
+        );
+        true
+    }
+
+    /// Element READ of a register-bound local array. A constant index picks
+    /// the register directly; a dynamic one selects by compare/branch chain
+    /// (out-of-range reads keep the element default — the type's x/0 — which
+    /// matches §7.4.6 for the x case and is unreachable for well-formed
+    /// loops).
+    fn compile_local_array_read(&mut self, name: &str, idx: &Expression) -> Option<RegId> {
+        let ab = self.local_var_array.get(name)?.clone();
+        if let Some(k) = self.eval_const_expr(idx) {
+            let i = (k as i64).checked_sub(ab.lo)?;
+            let src = *ab.regs.get(usize::try_from(i).ok()?)?;
+            let r = self.alloc_reg();
+            self.emit(Insn::Move(r, src));
+            return Some(r);
+        }
+        let idx_r = self.compile_expr(idx, 0)?;
+        let out = self.alloc_reg();
+        let default = if ab.is_real {
+            Value::from_f64(0.0)
+        } else {
+            Value::new(ab.elem_w)
+        };
+        self.emit(Insn::LoadConst(out, Box::new(default)));
+        let kreg = self.alloc_reg();
+        let creg = self.alloc_reg();
+        for (i, &er) in ab.regs.iter().enumerate() {
+            self.emit(Insn::LoadConst(
+                kreg,
+                Box::new(Value::from_u64((ab.lo + i as i64) as u64, 32)),
+            ));
+            self.emit(Insn::Eq(creg, idx_r, kreg));
+            let br = self.insns.len();
+            self.emit(Insn::BranchIfFalse(creg, 0));
+            self.emit(Insn::Move(out, er));
+            let after = self.insns.len() as u32;
+            self.insns[br] = Insn::BranchIfFalse(creg, after);
+        }
+        Some(out)
+    }
+
+    /// Element WRITE of a register-bound local array (same chain shape as the
+    /// read). The stored value is coerced per the element type: real elements
+    /// convert numerically, integral ones resize.
+    fn compile_local_array_write(
+        &mut self,
+        name: &str,
+        idx: &Expression,
+        val_reg: RegId,
+    ) -> Option<bool> {
+        let ab = self.local_var_array.get(name)?.clone();
+        // Coerce ONCE into a scratch, then move into the selected element.
+        let v = self.alloc_reg();
+        self.emit(Insn::Move(v, val_reg));
+        if ab.is_real {
+            self.emit_to_real(v);
+        } else {
+            self.emit(Insn::Resize(v, ab.elem_w));
+        }
+        if let Some(k) = self.eval_const_expr(idx) {
+            let i = (k as i64).checked_sub(ab.lo)?;
+            let dst = *ab.regs.get(usize::try_from(i).ok()?)?;
+            self.emit(Insn::Move(dst, v));
+            return Some(true);
+        }
+        let idx_r = self.compile_expr(idx, 0)?;
+        let kreg = self.alloc_reg();
+        let creg = self.alloc_reg();
+        for (i, &er) in ab.regs.iter().enumerate() {
+            self.emit(Insn::LoadConst(
+                kreg,
+                Box::new(Value::from_u64((ab.lo + i as i64) as u64, 32)),
+            ));
+            self.emit(Insn::Eq(creg, idx_r, kreg));
+            let br = self.insns.len();
+            self.emit(Insn::BranchIfFalse(creg, 0));
+            self.emit(Insn::Move(er, v));
+            let after = self.insns.len() as u32;
+            self.insns[br] = Insn::BranchIfFalse(creg, after);
+        }
+        Some(true)
+    }
+
+    /// DYNAMIC element read of a 2-D unpacked array (`a[i][j]` with
+    /// non-constant indices). Elements are materialized contiguously
+    /// row-major (see the simulator's arrays_2d build loop), so the read is a
+    /// bounds-checked flat index over one Dense operand:
+    /// `flat = (i-lo1)*ncols + (j-lo2)`; an out-of-range index in EITHER
+    /// dimension yields x (§7.4.6), which the per-dim guard folds into the
+    /// flat index by driving it out of the Dense operand's own range.
+    fn compile_2d_array_read(
+        &mut self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+        i_expr: &Expression,
+        j_expr: &Expression,
+    ) -> Option<RegId> {
+        let raw = Self::hier_raw_name(hier);
+        let arrays_2d = self.arrays_2d?;
+        let (key, ((lo1, hi1), (lo2, hi2), _w)) = arrays_2d
+            .get(raw.as_str())
+            .map(|s| (raw.clone(), *s))
+            .or_else(|| {
+                self.scope_hint.as_ref().and_then(|sc| {
+                    let q = format!("{}.{}", sc, raw);
+                    arrays_2d.get(q.as_str()).map(|s| (q, *s))
+                })
+            })?;
+        if lo1 < 0 || lo2 < 0 {
+            return None;
+        }
+        let first_id = *self
+            .signal_name_to_id
+            .get(format!("{}[{}][{}]", key, lo1, lo2).as_str())?;
+        let ncols = hi2 - lo2 + 1;
+        let count = (hi1 - lo1 + 1) * ncols;
+        let iv = self.compile_expr(i_expr, 0)?;
+        let jv = self.compile_expr(j_expr, 0)?;
+        // In-range test per §7.4.6. The flat index is forced to `count`
+        // (one past the Dense range) when either dimension is out of
+        // range, and LoadArrayElem's own bounds check turns that into x.
+        let lo1_r = self.alloc_reg();
+        self.emit(Insn::LoadConst(lo1_r, Box::new(Value::from_u64(lo1 as u64, 32))));
+        let hi1_r = self.alloc_reg();
+        self.emit(Insn::LoadConst(hi1_r, Box::new(Value::from_u64(hi1 as u64, 32))));
+        let lo2_r = self.alloc_reg();
+        self.emit(Insn::LoadConst(lo2_r, Box::new(Value::from_u64(lo2 as u64, 32))));
+        let hi2_r = self.alloc_reg();
+        self.emit(Insn::LoadConst(hi2_r, Box::new(Value::from_u64(hi2 as u64, 32))));
+        let ok = self.alloc_reg();
+        let t = self.alloc_reg();
+        self.emit(Insn::Geq(ok, iv, lo1_r));
+        self.emit(Insn::Leq(t, iv, hi1_r));
+        self.emit(Insn::BitAnd(ok, ok, t));
+        self.emit(Insn::Geq(t, jv, lo2_r));
+        self.emit(Insn::BitAnd(ok, ok, t));
+        self.emit(Insn::Leq(t, jv, hi2_r));
+        self.emit(Insn::BitAnd(ok, ok, t));
+        // flat = (i-lo1)*ncols + (j-lo2)
+        let flat = self.alloc_reg();
+        self.emit(Insn::Sub(flat, iv, lo1_r));
+        let nc = self.alloc_reg();
+        self.emit(Insn::LoadConst(nc, Box::new(Value::from_u64(ncols as u64, 32))));
+        self.emit(Insn::Mul(flat, flat, nc));
+        let jrel = self.alloc_reg();
+        self.emit(Insn::Sub(jrel, jv, lo2_r));
+        self.emit(Insn::Add(flat, flat, jrel));
+        // guard: !ok -> flat = count (out of the Dense range -> x)
+        let br = self.insns.len();
+        self.emit(Insn::BranchIfFalse(ok, 0));
+        let after_ok = self.insns.len() as u32 + 2;
+        self.emit(Insn::Jump(after_ok));
+        let oob = self.insns.len() as u32;
+        self.emit(Insn::LoadConst(flat, Box::new(Value::from_u64(count as u64, 32))));
+        self.insns[br] = Insn::BranchIfFalse(ok, oob);
+        let dest = self.alloc_reg();
+        self.emit(Insn::LoadArrayElem(
+            dest,
+            Box::new(ArrayOperand::Dense {
+                name: key,
+                first_id,
+                lo: 0,
+                hi: count - 1,
+            }),
+            flat,
+        ));
+        Some(dest)
+    }
+
+    /// §13.3.1 numeric conversion to real, in place. Emitted as
+    /// `reg = reg * 1.0(real)`: `Value::mul` with a real operand converts the
+    /// other side via `to_f64`, which is EXACTLY `Value::from_f64(v.to_f64())`
+    /// — so no new opcode (and the JIT/AOT handle it for free). A no-op for a
+    /// value that is already real.
+    fn emit_to_real(&mut self, reg: RegId) {
+        let one = self.alloc_reg();
+        self.emit(Insn::LoadConst(one, Box::new(Value::from_f64(1.0))));
+        self.emit(Insn::Mul(reg, reg, one));
+    }
+
     /// True when `fd`'s body reads only its formals, its own declared locals
     /// and compile-time constants — i.e. its result depends on nothing but the
     /// arguments. Conservative: any construct not understood here says "no".
@@ -2472,17 +2806,35 @@ impl<'a> BytecodeCompiler<'a> {
     /// real RTL. Stripping the function's own prefix restores the intended
     /// test: is every name a formal, a local, or a constant?
     fn fn_is_pure_in(&self, fd: &FunctionDeclaration, prefix: Option<&str>) -> bool {
+        self.fn_is_pure_in_ext(fd, prefix, false)
+    }
+
+    /// `allow_ext_reads`: additionally accept free names as module-state
+    /// READS (the caller has established they resolve unambiguously — see
+    /// `compile_pure_call`). Assignment TARGETS are always held to the strict
+    /// rule: an inlined body must not write module state.
+    fn fn_is_pure_in_ext(
+        &self,
+        fd: &FunctionDeclaration,
+        prefix: Option<&str>,
+        allow_ext_reads: bool,
+    ) -> bool {
         const MAX_PURITY_DEPTH: u32 = 8;
         if self.purity_depth.get() >= MAX_PURITY_DEPTH {
             return false;
         }
         self.purity_depth.set(self.purity_depth.get() + 1);
-        let ok = self.fn_is_pure_in_inner(fd, prefix);
+        let ok = self.fn_is_pure_in_inner(fd, prefix, allow_ext_reads);
         self.purity_depth.set(self.purity_depth.get() - 1);
         ok
     }
 
-    fn fn_is_pure_in_inner(&self, fd: &FunctionDeclaration, prefix: Option<&str>) -> bool {
+    fn fn_is_pure_in_inner(
+        &self,
+        fd: &FunctionDeclaration,
+        prefix: Option<&str>,
+        allow_ext_reads: bool,
+    ) -> bool {
         let mut bound: HashSet<String> = HashSet::default();
         bound.insert(fd.name.name.name.clone());
         for p in &fd.ports {
@@ -2494,7 +2846,12 @@ impl<'a> BytecodeCompiler<'a> {
                 bound.insert(format!("{pfx}.{n}"));
             }
         }
-        fn expr_ok(e: &Expression, bound: &HashSet<String>, me: &BytecodeCompiler) -> bool {
+        fn expr_ok(
+            e: &Expression,
+            bound: &HashSet<String>,
+            me: &BytecodeCompiler,
+            ext: bool,
+        ) -> bool {
             match &e.kind {
                 ExprKind::Ident(h) => {
                     if h.path.len() != 1 {
@@ -2503,42 +2860,46 @@ impl<'a> BytecodeCompiler<'a> {
                     let n = &h.path[0].name.name;
                     // A dotted name is only acceptable when it is one of the
                     // qualified spellings inserted above; anything else
-                    // reaching outside the function stays impure.
-                    if n.contains('.') && !bound.contains(n) {
+                    // reaching outside the function stays impure — unless the
+                    // caller allows module-state READS (`ext`), in which case
+                    // a free name (dotted or bare) is a signal read the body
+                    // compiler resolves (or bails on) itself.
+                    if n.contains('.') && !bound.contains(n) && !ext {
                         return false;
                     }
-                    let known = bound.contains(n)
+                    let known = ext
+                        || bound.contains(n)
                         || me.params.is_some_and(|p| p.contains_key(n));
-                    known && h.path[0].selects.iter().all(|sel| expr_ok(sel, bound, me))
+                    known && h.path[0].selects.iter().all(|sel| expr_ok(sel, bound, me, ext))
                 }
                 ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
-                ExprKind::Paren(i) => expr_ok(i, bound, me),
-                ExprKind::Unary { operand, .. } => expr_ok(operand, bound, me),
+                ExprKind::Paren(i) => expr_ok(i, bound, me, ext),
+                ExprKind::Unary { operand, .. } => expr_ok(operand, bound, me, ext),
                 ExprKind::Binary { left, right, .. } => {
-                    expr_ok(left, bound, me) && expr_ok(right, bound, me)
+                    expr_ok(left, bound, me, ext) && expr_ok(right, bound, me, ext)
                 }
                 ExprKind::Conditional {
                     condition,
                     then_expr,
                     else_expr,
                 } => {
-                    expr_ok(condition, bound, me)
-                        && expr_ok(then_expr, bound, me)
-                        && expr_ok(else_expr, bound, me)
+                    expr_ok(condition, bound, me, ext)
+                        && expr_ok(then_expr, bound, me, ext)
+                        && expr_ok(else_expr, bound, me, ext)
                 }
-                ExprKind::Concatenation(parts) => parts.iter().all(|p| expr_ok(p, bound, me)),
+                ExprKind::Concatenation(parts) => parts.iter().all(|p| expr_ok(p, bound, me, ext)),
                 ExprKind::Replication { count, exprs } => {
-                    expr_ok(count, bound, me) && exprs.iter().all(|p| expr_ok(p, bound, me))
+                    expr_ok(count, bound, me, ext) && exprs.iter().all(|p| expr_ok(p, bound, me, ext))
                 }
                 ExprKind::Index { expr, index } => {
-                    expr_ok(expr, bound, me) && expr_ok(index, bound, me)
+                    expr_ok(expr, bound, me, ext) && expr_ok(index, bound, me, ext)
                 }
                 ExprKind::RangeSelect {
                     expr, left, right, ..
                 } => {
-                    expr_ok(expr, bound, me)
-                        && expr_ok(left, bound, me)
-                        && expr_ok(right, bound, me)
+                    expr_ok(expr, bound, me, ext)
+                        && expr_ok(left, bound, me, ext)
+                        && expr_ok(right, bound, me, ext)
                 }
                 // A nested call keeps the function pure iff the CALLEE is
                 // itself pure-in-arguments and every argument is. AES's
@@ -2554,13 +2915,16 @@ impl<'a> BytecodeCompiler<'a> {
                     // target type/size NAME (not a data read), so only the
                     // operand arguments gate purity — `u8v_t'(128'(x))` kept
                     // branding its whole function impure.
-                    if matches!(name.as_str(), "$__xz_named_cast" | "$__xz_size_cast") {
-                        return args.iter().skip(1).all(|a| expr_ok(a, bound, me));
+                    if matches!(
+                        name.as_str(),
+                        "$__xz_named_cast" | "$__xz_size_cast" | "$__xz_type_cast"
+                    ) {
+                        return args.iter().skip(1).all(|a| expr_ok(a, bound, me, ext));
                     }
                     matches!(
                         name.as_str(),
                         "$sformatf" | "$psprintf" | "$signed" | "$unsigned"
-                    ) && args.iter().all(|a| expr_ok(a, bound, me))
+                    ) && args.iter().all(|a| expr_ok(a, bound, me, ext))
                 }
                 ExprKind::Call { func, args } => {
                     let ExprKind::Ident(h) = &func.kind else { return false };
@@ -2580,13 +2944,13 @@ impl<'a> BytecodeCompiler<'a> {
                     fd2.ports
                         .iter()
                         .all(|p| matches!(p.direction, PortDirection::Input))
-                        && args.iter().all(|a| expr_ok(a, bound, me))
+                        && args.iter().all(|a| expr_ok(a, bound, me, ext))
                         && me.fn_is_pure(fd2)
                 }
                 _ => false,
             }
         }
-        fn stmt_ok(st: &Statement, bound: &mut HashSet<String>, me: &BytecodeCompiler) -> bool {
+        fn stmt_ok(st: &Statement, bound: &mut HashSet<String>, me: &BytecodeCompiler, ext: bool) -> bool {
             match &st.kind {
                 StatementKind::Null => true,
                 StatementKind::VarDecl {
@@ -2595,7 +2959,7 @@ impl<'a> BytecodeCompiler<'a> {
                 } => {
                     for d in declarators {
                         if let Some(e) = &d.init {
-                            if !expr_ok(e, bound, me) {
+                            if !expr_ok(e, bound, me, ext) {
                                 return false;
                             }
                         }
@@ -2604,14 +2968,19 @@ impl<'a> BytecodeCompiler<'a> {
                     true
                 }
                 StatementKind::BlockingAssign { lvalue, rvalue } => {
-                    expr_ok(lvalue, bound, me) && expr_ok(rvalue, bound, me)
+                    // The TARGET is held strict regardless of `ext`: an
+                    // inlined body must not write module state. A local-array
+                    // element target (`row[n] = …`) is a bound name with a
+                    // select, which the strict Ident arm accepts; only the
+                    // INDEX may use ext reads.
+                    expr_ok(lvalue, bound, me, false) && expr_ok(rvalue, bound, me, ext)
                 }
-                StatementKind::Return(e) => e.as_ref().is_none_or(|e| expr_ok(e, bound, me)),
+                StatementKind::Return(e) => e.as_ref().is_none_or(|e| expr_ok(e, bound, me, ext)),
                 StatementKind::SeqBlock { stmts, .. } => {
                     // A block's declarations are visible to the statements that
                     // FOLLOW them, so thread one scope through the sequence.
                     let mut inner = bound.clone();
-                    stmts.iter().all(|s| stmt_ok(s, &mut inner, me))
+                    stmts.iter().all(|s| stmt_ok(s, &mut inner, me, ext))
                 }
                 StatementKind::If {
                     condition,
@@ -2619,11 +2988,11 @@ impl<'a> BytecodeCompiler<'a> {
                     else_stmt,
                     ..
                 } => {
-                    expr_ok(condition, bound, me)
-                        && stmt_ok(then_stmt, &mut bound.clone(), me)
+                    expr_ok(condition, bound, me, ext)
+                        && stmt_ok(then_stmt, &mut bound.clone(), me, ext)
                         && else_stmt
                             .as_ref()
-                            .is_none_or(|e| stmt_ok(e, &mut bound.clone(), me))
+                            .is_none_or(|e| stmt_ok(e, &mut bound.clone(), me, ext))
                 }
                 StatementKind::For {
                     init,
@@ -2635,21 +3004,21 @@ impl<'a> BytecodeCompiler<'a> {
                     for fi in init {
                         match fi {
                             ForInit::VarDecl { name, init, .. } => {
-                                if !expr_ok(init, &inner, me) {
+                                if !expr_ok(init, &inner, me, ext) {
                                     return false;
                                 }
                                 inner.insert(name.name.clone());
                             }
                             ForInit::Assign { lvalue, rvalue } => {
-                                if !expr_ok(lvalue, &inner, me) || !expr_ok(rvalue, &inner, me) {
+                                if !expr_ok(lvalue, &inner, me, false) || !expr_ok(rvalue, &inner, me, ext) {
                                     return false;
                                 }
                             }
                         }
                     }
-                    condition.as_ref().is_none_or(|c| expr_ok(c, &inner, me))
-                        && step.iter().all(|e| expr_ok(e, &inner, me))
-                        && stmt_ok(body, &mut inner, me)
+                    condition.as_ref().is_none_or(|c| expr_ok(c, &inner, me, ext))
+                        && step.iter().all(|e| expr_ok(e, &inner, me, ext))
+                        && stmt_ok(body, &mut inner, me, ext)
                 }
                 // case/casez/casex — the shape of virtually every decode
                 // helper (`assign x = f(op)` over a big casez). Leaving this
@@ -2657,19 +3026,21 @@ impl<'a> BytecodeCompiler<'a> {
                 // enclosing assign on the AST interpreter. The `matches`
                 // pattern/guard form stays conservative.
                 StatementKind::Case { expr, items, .. } => {
-                    expr_ok(expr, bound, me)
+                    expr_ok(expr, bound, me, ext)
                         && items.iter().all(|it| {
                             it.pattern.is_none()
                                 && it.guard.is_none()
-                                && it.patterns.iter().all(|p| expr_ok(p, bound, me))
-                                && stmt_ok(&it.stmt, &mut bound.clone(), me)
+                                && it.patterns.iter().all(|p| expr_ok(p, bound, me, ext))
+                                && stmt_ok(&it.stmt, &mut bound.clone(), me, ext)
                         })
                 }
                 _ => false,
             }
         }
         let mut scope = bound;
-        fd.items.iter().all(|st| stmt_ok(st, &mut scope, self))
+        fd.items
+            .iter()
+            .all(|st| stmt_ok(st, &mut scope, self, allow_ext_reads))
     }
 
     /// §13.4.1 / §6.8: the initial value of a variable of `dt` — x for a
@@ -5950,6 +6321,32 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit(Insn::Move(r, src));
                     return Some(r);
                 }
+                // Element of a register-bound LOCAL ARRAY (`row[n]` parsed as
+                // an Ident with one select).
+                if !self.local_var_array.is_empty()
+                    && hier.path.len() == 1
+                    && hier.path[0].selects.len() == 1
+                    && self.local_var_array.contains_key(hier.path[0].name.name.as_str())
+                {
+                    let name = hier.path[0].name.name.clone();
+                    let idx = hier.path[0].selects[0].clone();
+                    if let Some(r) = self.compile_local_array_read(&name, &idx) {
+                        return Some(r);
+                    }
+                    self.bail("local_array_read");
+                    return None;
+                }
+                // Dynamic element of a 2-D unpacked array, Ident-with-selects
+                // shape (`TBL[i][j]` inside an inlined body).
+                if hier.path.len() == 1 && hier.path[0].selects.len() == 2 {
+                    let i_e = hier.path[0].selects[0].clone();
+                    let j_e = hier.path[0].selects[1].clone();
+                    let mut bare = hier.clone();
+                    bare.path[0].selects.clear();
+                    if let Some(r) = self.compile_2d_array_read(&bare, &i_e, &j_e) {
+                        return Some(r);
+                    }
+                }
                 // A REAL-valued parameter wins over its signal-table twin: a
                 // header parameter gets a placeholder signal entry whose
                 // stored Value is integral/x, so loading the signal compared
@@ -6638,6 +7035,35 @@ impl<'a> BytecodeCompiler<'a> {
                 // interpreter, which rebases — so the bug only showed in
                 // assign / always_comb / always_ff, which compile to bytecode.
                 //
+                // Dynamic element of a 2-D unpacked array, nested-Index
+                // shape (`TBL[i][j]`).
+                if let ExprKind::Index { expr: inner_e, index: i_idx } = &expr.kind {
+                    if let ExprKind::Ident(h) = &inner_e.kind {
+                        if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                            let (i_e, j_e, h2) = (i_idx.as_ref().clone(), index.as_ref().clone(), h.clone());
+                            if let Some(r) = self.compile_2d_array_read(&h2, &i_e, &j_e) {
+                                return Some(r);
+                            }
+                        }
+                    }
+                }
+                // Element of a register-bound LOCAL ARRAY (`row[n]` parsed
+                // as Index over a bare Ident).
+                if !self.local_var_array.is_empty() {
+                    if let ExprKind::Ident(h) = &expr.kind {
+                        if h.path.len() == 1
+                            && h.path[0].selects.is_empty()
+                            && self.local_var_array.contains_key(h.path[0].name.name.as_str())
+                        {
+                            let name = h.path[0].name.name.clone();
+                            if let Some(r) = self.compile_local_array_read(&name, index) {
+                                return Some(r);
+                            }
+                            self.bail("local_array_read");
+                            return None;
+                        }
+                    }
+                }
                 // §7.4.1/§11.5.1: ascending or element-of-collection bases
                 // need label mapping the rebase cannot express — AST only.
                 if self.sel_base_needs_ast(expr) {
@@ -7011,6 +7437,59 @@ impl<'a> BytecodeCompiler<'a> {
                     // A Call operand keeps the interpreter path (it may return
                     // a collection the runtime packs — see the AST handler),
                     // as does a target that is a runtime signal or a real type.
+                    // §6.24.1 type cast (`real'(x)`, `int'(x)`) — mirror
+                    // the interpreter: self-determined operand, then convert.
+                    // A REAL target converts numerically (`emit_to_real`);
+                    // an integral target resizes and takes the type's
+                    // signedness (a real operand rounds per §10.7 inside
+                    // `Value::resize`). Stream operands and exotic targets
+                    // keep the AST path.
+                    "$__xz_type_cast" => {
+                        let dt = match args.first().map(|a| &a.kind) {
+                            Some(ExprKind::TypeLiteral(dt)) => dt.clone(),
+                            _ => {
+                                self.bail("type_cast_shape");
+                                return None;
+                            }
+                        };
+                        let inner = args.get(1)?;
+                        fn is_stream(e: &Expression) -> bool {
+                            match &e.kind {
+                                ExprKind::StreamOp { .. } => true,
+                                ExprKind::Paren(i) => is_stream(i),
+                                _ => false,
+                            }
+                        }
+                        if is_stream(inner) {
+                            if let Some(r) =
+                                self.emit_expr_fallback(expr, ctx_width, "type_cast_stream")
+                            {
+                                return Some(r);
+                            }
+                            self.bail("type_cast_stream");
+                            return None;
+                        }
+                        let src = self.compile_expr(inner, 0)?;
+                        let r = self.alloc_reg();
+                        self.emit(Insn::Move(r, src));
+                        if crate::compiler::elaborate::is_type_real(&dt) {
+                            self.emit_to_real(r);
+                            return Some(r);
+                        }
+                        let w = crate::compiler::elaborate::resolve_type_width(
+                            &dt,
+                            self.params,
+                            None,
+                        )
+                        .max(1);
+                        self.emit(Insn::Resize(r, w));
+                        if crate::compiler::elaborate::is_type_signed(&dt) {
+                            self.emit(Insn::SetSigned(r));
+                        } else {
+                            self.emit(Insn::ClearSigned(r));
+                        }
+                        Some(r)
+                    }
                     "$__xz_named_cast" => {
                         let target = args.first().and_then(|a| match &a.kind {
                             ExprKind::Ident(h) => {
@@ -7592,6 +8071,39 @@ impl<'a> BytecodeCompiler<'a> {
         // width and the write becomes a no-op. Assumes [N-1:0] outer bounds
         // (the packed-of-packed typedef shape); other locals have no elem
         // entry and keep the bail-to-AST behavior.
+        // Element WRITE of a register-bound LOCAL ARRAY (`row[n] = v`,
+        // either parse shape).
+        if !self.local_var_array.is_empty() {
+            let (aname, idx): (Option<&str>, Option<&Expression>) = match &lhs.kind {
+                ExprKind::Index { expr, index } => match &expr.kind {
+                    ExprKind::Ident(h)
+                        if h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                    {
+                        (Some(h.path[0].name.name.as_str()), Some(index))
+                    }
+                    _ => (None, None),
+                },
+                ExprKind::Ident(h)
+                    if h.path.len() == 1 && h.path[0].selects.len() == 1 =>
+                {
+                    (Some(h.path[0].name.name.as_str()), Some(&h.path[0].selects[0]))
+                }
+                _ => (None, None),
+            };
+            if let (Some(n), Some(ix)) = (aname, idx) {
+                if self.local_var_array.contains_key(n) {
+                    let n = n.to_string();
+                    let ix = ix.clone();
+                    return match self.compile_local_array_write(&n, &ix, val_reg) {
+                        Some(ok) => ok,
+                        None => {
+                            self.bail("local_array_write");
+                            false
+                        }
+                    };
+                }
+            }
+        }
         // §7.4.1/§11.5.1: ascending or element-of-collection select bases
         // need label mapping the stores below do not emit — AST only.
         if let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &lhs.kind {
@@ -7684,7 +8196,11 @@ impl<'a> BytecodeCompiler<'a> {
                     return false;
                 }
                 self.emit(Insn::Move(dst, val_reg));
-                if w > 0 {
+                if self.local_var_is_real.contains(name.as_str()) {
+                    // §13.3.1: a real local/formal/result converts its RHS
+                    // numerically; a Resize would bit-truncate instead.
+                    self.emit_to_real(dst);
+                } else if w > 0 {
                     self.emit(Insn::Resize(dst, w));
                 }
                 return true;
@@ -8078,6 +8594,13 @@ impl<'a> BytecodeCompiler<'a> {
                         return 0;
                     }
                 }
+                // Register-bound LOCAL ARRAY element in Ident-with-select
+                // shape (`row[0] = …` inside an inlined body).
+                if hier.path.len() == 1 && hier.path[0].selects.len() == 1 {
+                    if let Some(ab) = self.local_var_array.get(hier.path[0].name.name.as_str()) {
+                        return ab.elem_w;
+                    }
+                }
                 if let Some(id) = self.lookup_signal_id(hier) {
                     self.signal_widths[id]
                 } else if let Some((_, _, mw)) = self.packed_struct_member_target(hier) {
@@ -8089,6 +8612,15 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Index { expr, .. } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
+                    // Register-bound LOCAL ARRAY element (inlined pure body):
+                    // its declared element width. Missing this returned the
+                    // 1-bit default, whose Resize destroyed the value (a REAL
+                    // element resized-to-1 collapsed to 1.0).
+                    if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+                        if let Some(ab) = self.local_var_array.get(hier.path[0].name.name.as_str()) {
+                            return ab.elem_w;
+                        }
+                    }
                     // Register-bank local array element: the declared element
                     // width. Missing this returned the 1-bit default and a
                     // bank store truncated every value to its LSB.
@@ -8393,6 +8925,9 @@ impl<'a> BytecodeCompiler<'a> {
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
+                // §5.7 (issue #31): compiled-path literals warn here — once
+                // per literal string, deduped with the elaboration/AST sites.
+                crate::compiler::elaborate::warn_unsized_decimal_wrap(*size, base, value);
                 let mut v = Value::from_str_radix(value, r, w);
                 v.is_signed = *signed;
                 v.is_fill = xz_fill;

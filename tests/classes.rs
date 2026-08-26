@@ -13,6 +13,8 @@
 
 #[path = "classes/collection_of_handles_new.rs"]
 mod collection_of_handles_new;
+#[path = "classes/static_fixed_array_storage.rs"]
+mod static_fixed_array_storage;
 #[path = "classes/array_equality_class.rs"]
 mod array_equality_class;
 #[path = "classes/class_formal_typedef_widen.rs"]
