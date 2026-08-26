@@ -60178,6 +60178,15 @@ impl Simulator {
                     Value::from_f64(0.0)
                 } else if two_state || is_class_handle || w0 == 0 || unknown_typeref_handle {
                     Value::zero(w)
+                } else if let Some(fv) = self.enum_first_member_value(data_type, w) {
+                    // §6.19.2: an `enum` variable defaults to its FIRST
+                    // member, even when 4-state. A fresh local `e_t v;` must
+                    // therefore start at `ALPHA` (0), not X — otherwise
+                    // `void'(v.first()); do { m[v.name()] = v; v = v.next(); }
+                    // while (v != v.first())` zeroed the map (X != ALPHA is X,
+                    // so the loop exited after one entry) and every name lookup
+                    // failed. The reference initializes a local enum to `ALPHA`.
+                    fv
                 } else {
                     Value::new(w)
                 };
@@ -61326,6 +61335,22 @@ impl Simulator {
                                 || self.module.typedef_types.contains_key(&tn)
                             {
                                 self.var_typedef_types.insert(d.name.name.clone(), tn);
+                            } else if let Some(bound) = self.resolve_type_param_binding(&tn) {
+                                // `T e;` where T is a TYPE PARAMETER bound to
+                                // an enum/typedef (`holder#(e_t)`): `tn` is not
+                                // itself a declared typedef, but resolution is
+                                // only possible when the active specialization
+                                // has bound the parameter. Register the BOUND
+                                // typedef name so `local.next()/.first()/…`
+                                // (via `var_typedef_types`) can find the
+                                // enum-member list.
+                                let bound = bound.trim().to_string();
+                                if self.module.enum_members.contains_key(&bound)
+                                    || self.module.typedefs.contains_key(&bound)
+                                    || self.module.typedef_types.contains_key(&bound)
+                                {
+                                    self.var_typedef_types.insert(d.name.name.clone(), bound);
+                                }
                             }
                         }
                     }
@@ -92635,6 +92660,49 @@ impl Simulator {
             }
         }
         dt.clone()
+    }
+
+    /// §6.19.2: if `dt` names (possibly through a typedef alias) an ENUM
+    /// typedef, return a Value holding its FIRST member's value. An `enum`
+    /// variable defaults to its first enumerator even when the base is 4-state
+    /// (so a fresh local `e_t v;` reads `ALPHA`, not X). Returns None for any
+    /// non-enum type.
+    fn enum_first_member_value(&self, dt: &DataType, width: u32) -> Option<Value> {
+        use crate::ast::types::DataType;
+        let mut cur = dt;
+        for _ in 0..8 {
+            let DataType::TypeReference { name, .. } = cur else {
+                break;
+            };
+            let tn = &name.name.name;
+            if let Some(members) = self.module.enum_members.get(tn) {
+                if let Some((_, fv)) = members.first() {
+                    // Match §6.19 signedness + mask handling: enum width is
+                    // derived from the members; store the first member's value
+                    // at the declared enum width.
+                    let w = width.max(1);
+                    let emask: u64 = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                    let mut v = Value::from_u64(fv & emask, w);
+                    // An enum's base signedness follows its first member's
+                    // declaration (default unsigned).
+                    v.is_signed = self
+                        .module
+                        .enum_members
+                        .get(tn)
+                        .and_then(|ms| ms.first())
+                        .map(|(n, _)| self.lookup_signal_signed(n))
+                        .unwrap_or(false);
+                    return Some(v);
+                }
+            }
+            // Follow a typedef alias one step (e.g. `my_e -> base_e`).
+            if let Some(inner) = self.module.typedef_types.get(tn) {
+                cur = inner;
+            } else {
+                break;
+            }
+        }
+        None
     }
 
     /// Does some `name.<rest>` key exist in `packed_signal_elem_widths`?

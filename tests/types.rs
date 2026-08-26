@@ -71,6 +71,8 @@ mod enum_next_prev_count;
 mod enum_signedness_and_pkg_scope;
 #[path = "types/enum_xz_and_package_shapes.rs"]
 mod enum_xz_and_package_shapes;
+#[path = "types/enum_local_and_typeparam_methods.rs"]
+mod enum_local_and_typeparam_methods;
 #[path = "types/formal_type_metadata_and_typedef_packed_array.rs"]
 mod formal_type_metadata_and_typedef_packed_array;
 #[path = "types/forward_referenced_parameter.rs"]
