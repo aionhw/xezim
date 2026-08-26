@@ -57,6 +57,8 @@ mod class_property_param_width;
 mod class_scoped_enum;
 #[path = "classes/class_type_param_properties.rs"]
 mod class_type_param_properties;
+#[path = "classes/param_string_percent.rs"]
+mod param_string_percent;
 #[path = "classes/class_value_params.rs"]
 mod class_value_params;
 #[path = "classes/class_width_copy_fork.rs"]

@@ -79,6 +79,8 @@ mod class_static_method_shadowing;
 mod static_class_assoc_persist;
 #[path = "collections/static_sibling_collection_isolation.rs"]
 mod static_sibling_collection_isolation;
+#[path = "collections/param_typed_string_local.rs"]
+mod param_typed_string_local;
 #[path = "collections/whole_array_continuous_assign.rs"]
 mod whole_array_continuous_assign;
 #[path = "collections/string_foreach_content.rs"]

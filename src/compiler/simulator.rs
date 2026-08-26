@@ -10478,7 +10478,16 @@ impl Simulator {
         use crate::ast::types::DataType as DT;
         // Enum and real stay out: enum formals were never width-adapted and a
         // real typedef must round (not resize) — keep the prior behavior.
-        let resolved = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+        // A BARE type-param formal (`T t` with `T=int`) is resolved to its
+        // concrete builtin type first, so its width AND signedness (int is
+        // 32-bit signed) are recovered; without this the value stayed unsigned
+        // and `%p`/`%0d` of an `int` formal holding e.g. `32'hDEAD_BEEF`
+        // printed the unsigned `3735928559` instead of `-559038737`.
+        let resolved_dt = self.resolve_param_typed_dt(dt);
+        let resolved = super::elaborate::resolve_typedef_chain(
+            &resolved_dt,
+            &self.module.typedef_types,
+        );
         let is_resolved_int = matches!(
             &resolved,
             DT::IntegerVector { .. }
@@ -60090,6 +60099,12 @@ impl Simulator {
                 lifetime,
                 declarators,
             } => {
+                // §8.25 type-param-typed local: `T t;` inside a parameterized
+                // class method. The width/string-ness below key off `data_type`;
+                // a bare TypeReference keeping `resolve_type_width`'s 32-bit
+                // fallback made `T t = <long string>` truncate to 4 chars.
+                let resolved_dt = self.resolve_param_typed_dt(data_type);
+                let data_type = &resolved_dt;
                 let w0 = super::elaborate::resolve_type_width(
                     data_type,
                     Some(&self.module.parameters),
@@ -64237,8 +64252,15 @@ impl Simulator {
                                     if rendered.is_none()
                                         && self.signal_name_to_id.contains_key(flat.as_str())
                                     {
-                                        // Untyped leaf: render the raw value.
-                                        let is_str = self.string_signals.contains(&flat);
+                                        // Untyped leaf: render the raw value. The
+                                        // name may carry no `string_signals` entry
+                                        // (a param-typed formal/member `T t`/`T val`
+                                        // with `T=string`) but the EXPRESSION is still
+                                        // string-typed, so consult the same expression
+                                        // check the display path uses (via param
+                                        // binding / `string_properties`) as a fallback.
+                                        let is_str = self.string_signals.contains(&flat)
+                                            || self.expr_is_string_valued(arg);
                                         rendered = self
                                             .get_signal_value_by_name(&flat)
                                             .map(|v| Self::render_p_value(&v, is_str));
@@ -64451,8 +64473,25 @@ impl Simulator {
                                         }
                                     }
                                 }
+                                // §21.2.1.7 fallback: a leaf whose storage
+                                // carries no declared-type metadata (a
+                                // param-typed FORMAL/member `T t`/`T val` with
+                                // `T=string`) has no `var_decl_types`/
+                                // `signal_name_to_id` entry, so the type-
+                                // directed and untyped-leaf renders above both
+                                // missed it and this printed the packed ASCII
+                                // integer. The EXPRESSION is still string-typed
+                                // (via param binding / `string_properties`), so
+                                // classify it here.
                                 let v = self.eval_expr(arg);
-                                result.push_str(&v.to_dec_string());
+                                if self.expr_is_string_valued(arg) {
+                                    result.push_str(&format!(
+                                        "\"{}\"",
+                                        v.to_sv_string()
+                                    ));
+                                } else {
+                                    result.push_str(&v.to_dec_string());
+                                }
                             }
                         }
                         'm' | 'M' => {
@@ -73197,6 +73236,19 @@ impl Simulator {
     }
 
     fn get_signal_value_by_name(&self, name: &str) -> Option<Value> {
+        // A BARE name held in the CALL FRAME (a subroutine formal, a
+        // method LOCAL declared with a type-param type, or a shadowing
+        // local) must resolve to the frame's value, not a same-named module
+        // signal or an empty `render_p_*` read. Only a non-dotted name can
+        // be a plain frame entry (dotted ones are struct members, handled
+        // below).
+        if !name.contains('.') {
+            for frame in self.local_stack.iter().rev() {
+                if let Some(v) = frame.get(name) {
+                    return Some(v.clone());
+                }
+            }
+        }
         // Mirror of the write path: a dotted name the innermost frame owns is a
         // member of a subroutine-local / formal unpacked struct and is read from
         // the frame, never from the module signal table.
@@ -78401,6 +78453,88 @@ impl Simulator {
         cur
     }
 
+    /// Resolve a TYPE-PARAMETER typed `DataType` (`T t;` inside a
+    /// parameterized class method) to the concrete bound type. `resolve_dt`
+    /// only chases typedefs, so a local declared as the type param `T` kept
+    /// `resolve_type_width`'s 32-bit TypeReference fallback even when `T`
+    /// bound to `string` — a `T t = <long string>` local silently truncated
+    /// the value to 4 chars (the low 32 bits). Returns `dt.clone()` unchanged
+    /// when the type is not a directly-bound scalar type parameter, so the
+    /// caller's existing handling (class handles, typedefs, arrays) is
+    /// untouched.
+    fn resolve_param_typed_dt(&self, dt: &DataType) -> DataType {
+        use crate::ast::types::{
+            DataType as DT, IntegerAtomType, RealType, Signing, SimpleType,
+        };
+        let DT::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } = dt
+        else {
+            return dt.clone();
+        };
+        // Only a BARE type parameter (`T t;`) with no packed dims or explicit
+        // type args is a candidate; an array or specialized ref falls through.
+        if !dimensions.is_empty() || !type_args.is_empty() {
+            return dt.clone();
+        }
+        let Some(bound) = self.resolve_type_param_binding(&name.name.name) else {
+            return dt.clone();
+        };
+        // Map a directly-bound BUILTIN scalar type to a concrete DataType so
+        // the caller recovers width / signedness / string-ness. Any other
+        // bound (a class handle, a packed-vector default like `logic [W-1:0]`)
+        // falls through to the caller's existing TypeReference handling.
+        let span = name.span;
+        match bound.trim() {
+            "string" => DT::Simple {
+                kind: SimpleType::String,
+                span,
+            },
+            "byte" => DT::IntegerAtom {
+                kind: IntegerAtomType::Byte,
+                signing: Some(Signing::Signed),
+                span,
+            },
+            "shortint" => DT::IntegerAtom {
+                kind: IntegerAtomType::ShortInt,
+                signing: Some(Signing::Signed),
+                span,
+            },
+            "int" => DT::IntegerAtom {
+                kind: IntegerAtomType::Int,
+                signing: Some(Signing::Signed),
+                span,
+            },
+            "longint" => DT::IntegerAtom {
+                kind: IntegerAtomType::LongInt,
+                signing: Some(Signing::Signed),
+                span,
+            },
+            "integer" => DT::IntegerAtom {
+                kind: IntegerAtomType::Integer,
+                signing: Some(Signing::Signed),
+                span,
+            },
+            "time" => DT::IntegerAtom {
+                kind: IntegerAtomType::Time,
+                signing: Some(Signing::Unsigned),
+                span,
+            },
+            "real" => DT::Real {
+                kind: RealType::Real,
+                span,
+            },
+            "shortreal" => DT::Real {
+                kind: RealType::ShortReal,
+                span,
+            },
+            _ => dt.clone(),
+        }
+    }
+
     /// Constant indices of a member's (single) unpacked dimension.
     fn member_dim_indices(
         &self,
@@ -81540,6 +81674,24 @@ impl Simulator {
                     return v.to_dec_string();
                 }
             }
+        }
+        // §8.25 type-param-typed symbol (`T t` with `T=string`): the stored
+        // type in `var_decl_types`/`flat_path_type` is a bare `TypeReference`
+        // naming the param, which `resolve_dt` doesn't chase to the bound
+        // string — so `%p` fell through to decimal and printed the ASCII bit
+        // pattern instead of the quoted text. Mirror the local-decl fix by
+        // resolving a directly-bound scalar param (string) before rendering.
+        if matches!(
+            self.resolve_param_typed_dt(dt),
+            DataType::Simple {
+                kind: SimpleType::String,
+                ..
+            }
+        ) {
+            return self
+                .get_signal_value_by_name(name)
+                .map(|v| format!("\"{}\"", v.to_sv_string()))
+                .unwrap_or_else(|| "\"\"".into());
         }
         match self.resolve_dt(dt) {
             DataType::Struct(su) => {
@@ -103259,6 +103411,62 @@ impl Simulator {
                     }
                 }
                 self.this_stack.push(Some(handle));
+                // §8.25: a FORMAL of a bare type-param type (`T t` with
+                // `T=string` or `T=int`). `current_spec` is now seeded from
+                // the instance's specialization (above), so resolve each
+                // port's declared type to its concrete bound builtin type:
+                // (1) mark string-typed formals in `string_signals` so
+                // `%p`/`%s`/string ops see them as strings (their
+                // string-ness was never registered, unlike a `T t` LOCAL
+                // which goes through VarDecl), and (2) re-stamp the formal
+                // value's SIGNEDNESS from the bound integer type. The scalar
+                // bind loop above ran while `current_spec` was STILL the
+                // caller's (or None), so `T` was unresolvable there and an
+                // `int` formal holding an unsigned caller value (e.g.
+                // `T=int` `do_write(32'hDEAD_BEEF)`) kept the unsigned
+                // stamp — `%p`/`%0d` printed `3735928559` instead of
+                // `-559038737`, matching the reference.
+                for port in ports.iter() {
+                    use crate::ast::types::{
+                        DataType as DT, RealType, Signing, SimpleType,
+                    };
+                    // ONLY a bare type-param formal (`T t`) is eligible. A
+                    // plain `string`/`int` port is NOT a TypeReference, so
+                    // `resolve_param_typed_dt` returns it unchanged — and
+                    // acting on it would double-register a normal string
+                    // formal (`name`), or worse mark a STRING QUEUE formal
+                    // (`ref string q[$]`, whose base remains Simple{String})
+                    // as a scalar string signal and corrupt queue writes
+                    // (callbacks' `doit(q)` pushed garbage).
+                    let DT::TypeReference { .. } = &port.data_type else {
+                        continue;
+                    };
+                    let resolved = self.resolve_param_typed_dt(&port.data_type);
+                    match &resolved {
+                        DT::Simple {
+                            kind: SimpleType::String,
+                            ..
+                        } => {
+                            self.string_signals.insert(port.name.name.clone());
+                        }
+                        DT::IntegerAtom { signing, .. } => {
+                            let signed = matches!(signing, Some(Signing::Signed));
+                            if let Some(v) = locals.get_mut(&port.name.name) {
+                                v.is_signed = signed;
+                            }
+                        }
+                        DT::Real {
+                            kind: RealType::Real,
+                            ..
+                        } => {
+                            if let Some(v) = locals.get_mut(&port.name.name) {
+                                v.is_real = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 // §23.8 / §23.10.1: hierarchical names in the method body
                 // resolve upward from the object's CREATION scope, not the
                 // caller's. Installed as the resolve hint (the upward walk
@@ -103662,9 +103870,15 @@ impl Simulator {
                             || self.module.enum_members.contains_key(t)
                             // §6.20.3: a TYPE-parameter name passes through —
                             // the caller resolves it to the bound concrete
-                            // type via the instance's type_bindings.
+                            // type via the instance's type_bindings. Resolve
+                            // it HERE to the bound type (e.g. `T` -> `string`)
+                            // so `%p`/`get_expr_type_name` classify a
+                            // param-typed string member correctly.
                             || cd.type_param_names.iter().any(|p| p == t)
                         {
+                            if let Some(bound) = self.resolve_type_param_binding(t) {
+                                return Some(bound);
+                            }
                             return Some(t.clone());
                         }
                         // A class-local typedef (e.g. `this_type` =
