@@ -128,23 +128,24 @@ gives the SystemVerilog-over-Verilog additions.
   functions, and **user-defined nettypes with resolution functions**
   (§6.6.7, plain SystemVerilog — no `--ams` needed). This is the substrate the
   AMS stages lower onto.
-* **`wreal` real nets** (AMS §3.8) — `wreal` plus the resolved forms
-  `wrealsum`, `wrealavg`, `wrealmin`, `wrealmax`, on net declarations and on
-  both ANSI and non-ANSI module ports. Multiple drivers on a node — including
-  drivers arriving from several instances through ports — are resolved exactly
-  once over the whole connected net. A plain `wreal` with more than one driver
-  is a clean error naming the resolved forms, never a silent pick.
+* **`wreal` real nets** (AMS §3.7) — the LRM declaration form
+  `wreal [discipline] [range] names;` on net declarations and on both ANSI and
+  non-ANSI module ports. An undriven `wreal` reads `0.0`, not `z`, as §3.7
+  requires. §3.7 defines `wreal` for a net driven by a **single** driver;
+  xezim enforces that, and a second driver on a plain `wreal` is a clean error
+  rather than a silent pick.
 
-  > The resolved-form **spelling** (a distinct net-type keyword, `wrealsum x;`)
-  > follows common vendor usage and has **not** been checked against the LRM
-  > text — AMS §3.8 may instead select resolution through a discipline or an
-  > attribute. If so, the LRM form will be added alongside; accepting both is
-  > additive. See open item 1 in [`docs/ams-plan.md`](docs/ams-plan.md).
-* **Natures and disciplines** (AMS §3.4, §3.5) — `nature … endnature`
-  (attributes, `access`, derived natures) and `discipline … enddiscipline`
-  (`potential`, `flow`, `domain continuous|discrete`) parse into the AST.
-  **Parse-only**: they are recorded for the analog stages to consume, and carry
-  no simulation semantics yet.
+  The optional discipline identifier and range are **parsed and ignored** —
+  the net is scalar and carries no discipline, so `wreal [3:0] w` elaborates
+  as one real, not four.
+* **`ground`** (AMS §3.6.4) — parse-accepted and ignored. The global reference
+  node only means something to the analog solver.
+* **Natures and disciplines** (AMS §3.6.1, §3.6.2) — `nature … endnature`
+  (open attribute set, `access`, derived natures including the
+  `discipline.potential` form) and `discipline … enddiscipline` (`potential`,
+  `flow`, `domain continuous|discrete`, and `potential.abstol = …` attribute
+  overrides) parse into the AST. **Parse-only**: recorded for the analog
+  stages to consume, with no simulation semantics yet.
 
 **What does not work yet**
 
@@ -171,6 +172,14 @@ and testbench flows. Portable code should not rely on them.
   Verilog-XL/VCS system task, **not** in the LRM. xezim matches the vendor
   semantics — a variable keeps the deposited value, and a real driver on a net
   overrides a deposit on its next update.
+* **`wrealsum` / `wrealavg` / `wrealmin` / `wrealmax`** — resolved `wreal`
+  net types, for a node with more than one driver. **Not in the Verilog-AMS
+  LRM**: §3.7 defines only `wreal`, and neither the 2.4.0 nor the 2023 edition
+  mentions these spellings anywhere. They are the de-facto vendor form for
+  real-net driver resolution, which the standard leaves to the tool, and they
+  require `--ams` like the rest of the AMS syntax. `wrealsum` sums the
+  drivers, `wrealavg` averages them, `wrealmin`/`wrealmax` select. Portable
+  Verilog-AMS should drive a `wreal` from one source and resolve in a model.
 * Gate-level-simulation CLI flags — `+nospecify`, `+notimingcheck`,
   `+delay_mode_zero`/`+delay_mode_unit`, `+mindelays`/`+typdelays`/`+maxdelays`,
   and the `-v`/`-y`/`+libext+` library flags — mirror the commercial spellings.

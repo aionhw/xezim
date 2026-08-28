@@ -17,6 +17,8 @@ mod rnm_real_foundation;
 mod wreal_nets;
 #[path = "ams/discipline_nature.rs"]
 mod discipline_nature;
+#[path = "ams/lrm_grammar.rs"]
+mod lrm_grammar;
 #[path = "ams/wreal_scale_and_dump.rs"]
 mod wreal_scale_and_dump;
 #[path = "ams/ams_mode_isolation.rs"]

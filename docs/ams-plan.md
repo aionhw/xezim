@@ -149,9 +149,15 @@ Each phase is independently shippable and ends green on
 - [x] `ams_mode.rs` helper: the AMS gate is one process-wide atomic and
       `cargo test` runs a group's cases on several threads, so gate-on and
       gate-off tests serialize on a mutex.
-- [ ] Obtain the Accellera Verilog-AMS 2.4.0 LRM PDF and drop it beside the
-      existing PDFs in `docs/` (or record the citation policy if it should not
-      be committed). **Still open** — see open item 1.
+- [x] Obtain the LRM. Both editions were downloaded from Accellera and used
+      for the §5b audit:
+      `https://www.accellera.org/images/downloads/standards/v-ams/VAMS-LRM-2-4.pdf`
+      (2.4.0, May 2014) and `.../VAMS-LRM-2023.pdf` (Feb 2024). §3.6 and §3.7
+      are identical between them.
+- [ ] Decide whether either PDF may be COMMITTED to `docs/` (open item 5).
+      Until that is settled they are not in the tree, so re-download them from
+      the URLs above before auditing new syntax — do not audit AMS from
+      memory, which is exactly how the §5b defects got in.
 
 ### S1 — real / RNM / UDN foundation — **done**
 
@@ -176,7 +182,7 @@ it silently.
 Not a regression risk for non-AMS designs: no keyword changed, and the FST fix
 only alters vars that were already classified `real` for VCD.
 
-### S2 — `wreal` real nets (AMS §3.8) — **done**
+### S2 — `wreal` real nets (AMS §3.7) — **done**
 
 Lowered onto the §6.6.7 resolver path rather than a parallel mechanism: a
 `wreal` net is tagged with a synthetic nettype (`$wrealsum`, …) whose resolver
@@ -196,7 +202,7 @@ invisible for a sum, wrong for a min/max.
 * A plain `wreal` with >1 driver is an error naming the resolved forms.
 * Pinned by `tests/ams/wreal_nets.rs` (7 tests, including gate-off).
 
-### S3 — natures and disciplines (AMS §3.4, §3.5) — **done, parse-only**
+### S3 — natures and disciplines (AMS §3.6.1, §3.6.2) — **done, parse-only**
 
 `nature … endnature` (open attribute set, `access()` accessor, derived
 `nature X : Y`) and `discipline … enddiscipline` (`potential`, `flow`,
@@ -316,18 +322,65 @@ neither is obvious from the feature description:
   the flag and the design would simulate under the wrong dialect. `ams=` is
   now in the salt.
 
+## 5b. LRM audit (Accellera VAMS 2.4.0 and VAMS-2023)
+
+Both editions were obtained and the implementation checked against their
+syntax boxes. §3.6 and §3.7 are unchanged between them, so a finding against
+one holds for both. Six defects, four of them silent:
+
+| # | Finding | Was |
+|---|---|---|
+| 1 | `wrealsum`/`wrealavg`/`wrealmin`/`wrealmax` are **not in the LRM** (§3.7 defines only `wreal`) | documented as an AMS feature |
+| 2 | Section citations wrong throughout: natures are **§3.6.1** (not §3.4), disciplines **§3.6.2** (not §3.5), real nets **§3.7** (not §3.8) | ~40 wrong citations in code, tests and docs |
+| 3 | `wreal <discipline> <name>;` (§3.7) — discipline taken as the DATA TYPE, so the net lost `real` | silent; reals truncated to the LSB |
+| 4 | `wreal [3:0] w;` (§3.7) — range taken as packed dims, net lost `real` | silent, same corruption |
+| 5 | `nature n : electrical.potential;` (§3.6.1 `parent_nature`) — `.potential` skipped, the DISCIPLINE recorded as the parent | silent |
+| 6 | `potential.abstol = 1u;` (§3.6.2 `nature_attribute_override`) — no rule | hard parse error on legal source |
+| 7 | `ground gnd;` (§3.6.4) — keyword reserved with no rule behind it | hard parse error, self-inflicted by the keyword gate |
+
+All seven are fixed, and `tests/ams/lrm_grammar.rs` pins each against the
+LRM's own syntax boxes and examples. Findings 3-5 asserted on the AST rather
+than on "no errors", because they parsed cleanly while being wrong.
+
+What the audit CONFIRMED as correct: an undriven `wreal` reads `0.0` rather
+than `z` (§3.7); rejecting a second driver on a plain `wreal` matches §3.7's
+"driven by a single driver"; natures and disciplines are top-level
+declarations that do not nest (§3.6.1, §3.6.2); the optional `;` after
+`nature X`/`discipline X`; the open nature-attribute set (§3.6.1's
+`nature_attribute_identifier` ends in `| identifier`); and signal-flow
+disciplines binding only one of potential/flow (§3.6.2).
+
+Still not implemented, and now known rather than assumed: the discipline
+identifier and range on a `wreal` are parsed and **dropped** (the net is
+scalar and undisciplined, so `wreal [3:0] w` is one real, not four);
+`ground` is parse-accepted and dropped; §3.7's rule that a `wreal` joined to
+a `wire`/`tri` through a port resolves to `wreal` is not modelled. §3.7's
+second production, `wreal w = expr;`, works and is now tested.
+
 ## 6. Open items — decide before writing code
 
-1. **`wreal` resolution spelling — OPEN, and shipped on a judgement call.**
-   S2 implements the distinct-net-type-keyword form (`wrealsum x;`), which is
-   the spelling in common vendor use. It was **not** verified against the LRM
-   text: no copy of Accellera Verilog-AMS 2.4.0 is available in this tree, and
-   AMS §3.8 may instead select resolution via a discipline or an attribute on a
-   plain `wreal`. Confirm against the standard; if the LRM form differs, add it
-   alongside — accepting both is additive and breaks nothing already written.
-   The same caveat applies to whether a plain multi-driver `wreal` is an error
-   (what S2 does, and the safe choice — it never invents a number) or resolves
-   to an unknown real.
+1. ~~**`wreal` resolution spelling**~~ **ANSWERED — audited against the LRM,
+   and the implementation was wrong.** Both Accellera **VAMS 2.4.0** (May 2014)
+   and **VAMS-2023** (Feb 2024) were obtained and searched. §3.7 is byte-
+   identical in the two editions and its grammar admits exactly one net-type
+   keyword:
+
+   ```
+   net_declaration ::=
+     | wreal [ discipline_identifier ] [ range ] list_of_net_identifiers ;
+     | wreal [ discipline_identifier ] [ range ] list_of_net_decl_assignments ;
+   ```
+
+   `wrealsum`, `wrealavg`, `wrealmin`, `wrealmax`, `wreal4state` appear
+   **nowhere** in either document — nor does `realresolve`. They are vendor
+   extensions, and the README now documents them under "Non-standard
+   extensions" beside `$deposit` rather than as an AMS feature.
+
+   §3.7 also settles the multi-driver question the other open item raised: a
+   `wreal` "can be used for real-valued nets which are driven by a **single**
+   driver", so rejecting a second driver on a plain `wreal` is the standard's
+   own position, not a conservative guess.
+
 2. **Unknown state on a real net.** AMS real nets have an explicit unknown;
    `Value{is_real}` has no X/Z plane for reals. Options: a NaN sentinel, or a
    separate flag on `Signal`. Affects VCD output and every real comparison.

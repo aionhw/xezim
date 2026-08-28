@@ -1,4 +1,4 @@
-//! Stage 2 of Verilog-AMS support: `wreal` real nets (AMS §3.8).
+//! Stage 2 of Verilog-AMS support: `wreal` real nets (AMS §3.7).
 //!
 //! A `wreal` is the discrete real-number-modeling net — it carries a real
 //! value rather than a bit vector, and its multiple drivers fold through a
@@ -16,7 +16,7 @@ use crate::ams_mode::{with_ams, without_ams};
 use crate::util::{r, u};
 use xezim::simulate;
 
-/// AMS §3.8: a plain `wreal` carries a real value. Without the implicit real
+/// AMS §3.7: a plain `wreal` carries a real value. Without the implicit real
 /// data type the net elaborates as a 1-bit implicit wire and every real driven
 /// onto it truncates to its LSB.
 #[test]
@@ -38,7 +38,7 @@ endmodule
     assert_eq!(r(&sim, "n"), 1.25);
 }
 
-/// AMS §3.8 driver resolution, all four resolved forms over the same three
+/// AMS §3.7 driver resolution, all four resolved forms over the same three
 /// drivers. `avg` divides by a REAL count — an integer division there would
 /// silently floor the average.
 #[test]
@@ -90,7 +90,7 @@ endmodule
     assert_eq!(r(&sim, "n"), 1.5);
 }
 
-/// AMS §3.8: a plain `wreal` permits ONE driver. Two must be a clean error —
+/// AMS §3.7: a plain `wreal` permits ONE driver. Two must be a clean error —
 /// silently picking one would produce a plausible waveform from a design the
 /// standard does not define.
 #[test]

@@ -47,7 +47,7 @@ discipline electrical;
 enddiscipline
 "#;
 
-/// AMS §3.4: a nature's attributes are RETAINED, not skipped to `endnature`.
+/// AMS §3.6.1: a nature's attributes are RETAINED, not skipped to `endnature`.
 /// `abstol` is the solver's convergence tolerance and `access` names the
 /// quantity function — dropping either makes the declaration decorative.
 #[test]
@@ -77,7 +77,7 @@ fn a_nature_retains_its_attributes() {
     assert!(voltage.parent.is_none());
 }
 
-/// AMS §3.4 derived nature: `nature Hi : Voltage;` refines a base. The parent
+/// AMS §3.6.1 derived nature: `nature Hi : Voltage;` refines a base. The parent
 /// link is what an analog stage needs to inherit the unresolved attributes.
 #[test]
 fn a_derived_nature_records_its_parent() {
@@ -101,12 +101,15 @@ endnature
             _ => None,
         })
         .expect("nature Voltage_hi");
-    assert_eq!(hi.parent.as_ref().map(|p| p.name.as_str()), Some("Voltage"));
+    match hi.parent.as_ref().expect("parent") {
+        sv_parser::ast::decl::ParentNature::Nature(id) => assert_eq!(id.name, "Voltage"),
+        other => panic!("expected a plain nature parent, got {other:?}"),
+    }
     assert_eq!(hi.attributes.len(), 1, "only the override is declared here");
     assert_eq!(hi.attributes[0].0.name, "abstol");
 }
 
-/// AMS §3.5: a discipline binds the potential and flow natures its nets carry.
+/// AMS §3.6.2: a discipline binds the potential and flow natures its nets carry.
 /// `electrical` is the one every analog testbench starts from.
 #[test]
 fn a_discipline_binds_its_potential_and_flow_natures() {
@@ -124,7 +127,7 @@ fn a_discipline_binds_its_potential_and_flow_natures() {
     assert_eq!(elec.domain, None, "no explicit domain in this declaration");
 }
 
-/// AMS §3.5 `domain discrete` — how AMS types a plain digital net. Both domain
+/// AMS §3.6.2 `domain discrete` — how AMS types a plain digital net. Both domain
 /// spellings must round-trip.
 #[test]
 fn a_discipline_records_an_explicit_domain() {
