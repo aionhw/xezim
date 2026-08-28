@@ -4572,6 +4572,11 @@ pub struct Simulator {
     elem_dotted_bases: RefCell<Option<HashSet<String>>>,
     /// Compact per-net trace table: (signal_table index, FST signal id).
     fst_trace: Vec<(usize, FstSignalId)>,
+    /// Declared-real per `fst_trace` slot. A var declared with FST's native
+    /// real slot must render every change to 8 bytes, so the encoding is
+    /// keyed off the DECLARATION here rather than off `Value::is_real` —
+    /// which is false for an unassigned `real` still reading X.
+    fst_real: Vec<bool>,
     /// Signal id → `fst_trace` slots, for the shared incremental dirty-set
     /// change detection (see the `dump_dirty` field docs). Empty ⇒ full scan.
     fst_id_to_trace: Vec<Vec<u32>>,
@@ -7891,6 +7896,7 @@ impl Simulator {
             fn_pure_cache: HashMap::default(),
             elem_dotted_bases: RefCell::new(None),
             fst_trace: Vec::new(),
+            fst_real: Vec::new(),
             fst_id_to_trace: Vec::new(),
             fst_prev_signals: Vec::new(),
             comb_entries: Vec::new(),
@@ -71831,8 +71837,8 @@ impl Simulator {
     /// background writer exists to absorb it. This wrapper keeps the
     /// simulator-side call site (the t=0 header snapshot) reading naturally.
     #[inline]
-    fn fst_format_value(val: &Value) -> Vec<u8> {
-        super::fst_sink::fst_format_value(val)
+    fn fst_format_value(val: &Value, is_real: bool) -> Vec<u8> {
+        super::fst_sink::fst_format_value(val, is_real)
     }
 
     /// Open the FST file, write the hierarchy (scopes + vars), transition to
@@ -71877,7 +71883,8 @@ impl Simulator {
         // storing the backing signal_table index per leaf.
         struct FstNode {
             children: BTreeMap<String, FstNode>,
-            signals: Vec<(String, u32, usize)>, // (leaf, width, signal_table idx)
+            // (leaf, width, signal_table idx, declared-real)
+            signals: Vec<(String, u32, usize, bool)>,
         }
         impl FstNode {
             fn new() -> Self {
@@ -71898,6 +71905,11 @@ impl Simulator {
                 _ => continue,
             };
             let width = self.lookup_signal_width(name).unwrap_or(1);
+            // §21.7.2.1's `real` classification, shared with the VCD writer.
+            // FST has a native real slot; without this every real dumped as a
+            // 64-bit vector holding the float's raw bit image, so `real r =
+            // 1.25` read back as 0x3FF4000000000000 in a viewer.
+            let is_real = matches!(self.dump_var_kind(name, tbl_id), VcdVarKind::Real);
             let parts: Vec<&str> = name.split('.').collect();
             let (scope_parts, leaf) = if parts.len() > 1 {
                 (&parts[..parts.len() - 1], parts[parts.len() - 1])
@@ -71911,27 +71923,35 @@ impl Simulator {
                     .entry(part.to_string())
                     .or_insert_with(FstNode::new);
             }
-            node.signals.push((leaf.to_string(), width, tbl_id));
+            node.signals.push((leaf.to_string(), width, tbl_id, is_real));
         }
 
         // DFS-emit scopes/vars, collecting (signal_table idx, FstSignalId).
         let mut trace: Vec<(usize, FstSignalId)> = Vec::new();
+        // Declared-real, parallel to `trace` (see the `fst_real` field docs).
+        let mut reals: Vec<bool> = Vec::new();
         let mut id_to_fst: HashMap<usize, FstSignalId> = HashMap::default();
         fn emit<W: std::io::Write + std::io::Seek>(
             header: &mut FstHeaderWriter<W>,
             name: &str,
             node: &FstNode,
             trace: &mut Vec<(usize, FstSignalId)>,
+            reals: &mut Vec<bool>,
             id_to_fst: &mut HashMap<usize, FstSignalId>,
         ) {
             let _ = header.scope(name, "", FstScopeType::Module);
-            for (leaf, width, tbl_id) in &node.signals {
+            for (leaf, width, tbl_id, is_real) in &node.signals {
                 // Aliased nets (same signal_table id) reuse one FST id.
                 let alias = id_to_fst.get(tbl_id).copied();
+                let (sig_type, var_type) = if *is_real {
+                    (FstSignalType::real(), FstVarType::Real)
+                } else {
+                    (FstSignalType::bit_vec((*width).max(1)), FstVarType::Wire)
+                };
                 let fid = match header.var(
                     leaf,
-                    FstSignalType::bit_vec((*width).max(1)),
-                    FstVarType::Wire,
+                    sig_type,
+                    var_type,
                     FstVarDirection::Implicit,
                     alias,
                 ) {
@@ -71941,15 +71961,16 @@ impl Simulator {
                 if alias.is_none() {
                     id_to_fst.insert(*tbl_id, fid);
                     trace.push((*tbl_id, fid));
+                    reals.push(*is_real);
                 }
             }
             for (child_name, child) in &node.children {
-                emit(header, child_name, child, trace, id_to_fst);
+                emit(header, child_name, child, trace, reals, id_to_fst);
             }
             let _ = header.up_scope();
         }
         let top_name = self.module.name.clone();
-        emit(&mut header, &top_name, &root, &mut trace, &mut id_to_fst);
+        emit(&mut header, &top_name, &root, &mut trace, &mut reals, &mut id_to_fst);
 
         let mut body = match header.finish() {
             Ok(b) => b,
@@ -71965,9 +71986,9 @@ impl Simulator {
         // t=0 snapshot + seed prev.
         let _ = body.time_change(self.time);
         let mut prev: Vec<Value> = Vec::with_capacity(trace.len());
-        for (tbl_id, fid) in &trace {
+        for (idx, (tbl_id, fid)) in trace.iter().enumerate() {
             let val = self.signal_table[*tbl_id].clone();
-            let _ = body.signal_change(*fid, &Self::fst_format_value(&val));
+            let _ = body.signal_change(*fid, &Self::fst_format_value(&val, reals[idx]));
             prev.push(val);
         }
 
@@ -71976,6 +71997,7 @@ impl Simulator {
         self.fst_id_to_trace = self.build_dump_id_to_trace(&trace);
         self.enable_dump_dirty_tracking();
         self.fst_trace = trace;
+        self.fst_real = reals;
         self.fst_prev_signals = prev;
         self.fst_path = Some(filename.to_string());
         self.fst_writer = Some(if self.dump_writer_threaded() {
@@ -71999,14 +72021,14 @@ impl Simulator {
         // them (`fst_sink::fst_format_value`). A `Value` <=64 bits wide is
         // inline storage, so this clone is a 24-byte memcpy with no allocation
         // — strictly cheaper than the per-bit `Vec<u8>` render it replaces.
-        let mut changes: Vec<(FstSignalId, Value)> = Vec::new();
+        let mut changes: Vec<(FstSignalId, Value, bool)> = Vec::new();
         macro_rules! check_fst_slot {
             ($idx:expr_2021) => {{
                 let idx = $idx;
                 let tbl_id = self.fst_trace[idx].0;
                 let val = &self.signal_table[tbl_id];
                 if self.fst_prev_signals[idx] != *val {
-                    changes.push((self.fst_trace[idx].1, val.clone()));
+                    changes.push((self.fst_trace[idx].1, val.clone(), self.fst_real[idx]));
                     self.fst_prev_signals[idx] = val.clone();
                 }
             }};

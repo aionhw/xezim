@@ -26,10 +26,12 @@
 //! width, an alias, or a value. Decoding is also what a viewer does, which is
 //! the behaviour worth pinning.
 //!
-//! Three declaration-level gaps are known and NOT yet fixed; their tests are
-//! `#[ignore]`d with the reason on each, so they gate the fix rather than
-//! silently blessing the current output. Run them with
-//! `cargo test --test gates -- --ignored`.
+//! Declaration-level gaps that are known and NOT yet fixed have `#[ignore]`d
+//! tests with the reason on each, so they gate the fix rather than silently
+//! blessing the current output. Run them with
+//! `cargo test --test gates -- --ignored`. F3 (real dumped as its raw
+//! IEEE-754 bit pattern) is FIXED and its test now runs; F4 (event traced as
+//! a level) and F5 (var type + bit range) remain.
 
 use std::collections::HashMap;
 use std::io::BufReader;
@@ -474,12 +476,13 @@ fn var_declarations_carry_the_right_type_and_bit_range() {
     assert_eq!(fst.var("top.asc").name, "asc [0:7]");
 }
 
-/// Every var is declared `FstSignalType::bit_vec`, so a `real` becomes a
-/// 64-bit vector carrying the float's raw bit image: `real r = 1.25` decodes
-/// as 0x3FF4000000000000. VCD and XTrace both carry explicit fixes for this;
-/// `fst-writer` exposes `FstSignalType::real()`.
+/// F3 (FIXED). Every var used to be declared `FstSignalType::bit_vec`, so a
+/// `real` became a 64-bit vector carrying the float's raw bit image: `real r =
+/// 1.25` decoded as 0x3FF4000000000000. Reals now declare FST's native real
+/// slot (`FstSignalType::real()` / `FstVarType::Real`) and their changes are
+/// written as the f64's 8 raw bytes, which is what a viewer decodes back to a
+/// double — parity with the VCD (`r<decimal>`) and XTrace paths.
 #[test]
-#[ignore = "F3: real is dumped as its raw IEEE-754 bit pattern (fix pending)"]
 fn real_variables_decode_as_reals() {
     let fst = dump("real", KITCHEN);
     assert_eq!(fst.var("top.r").tpe, FstVarType::Real);
