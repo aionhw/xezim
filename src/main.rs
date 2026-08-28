@@ -206,6 +206,7 @@ fn print_usage() {
     eprintln!("  --fst-scope <hier>  Restrict the FST dump to signals under <hier>");
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
     eprintln!("  --sv2017         Parse as IEEE 1800-2017 (default is 1800-2023)");
+    eprintln!("  --ams            Enable Verilog-AMS syntax (also on for .vams/.va sources)");
     eprintln!("  --sv2023         Parse as IEEE 1800-2023 (default; kept for back-compat)");
     eprintln!("  --no-strict      Disable strict negative-test diagnostics (accept LRM-illegal");
     eprintln!("                   constructs instead of erroring; default is strict/on)");
@@ -1738,6 +1739,13 @@ fn run_main() -> i32 {
                 sv_parser::set_sv2023(false);
                 sv2023_mode = false;
             }
+            // Verilog-AMS (Accellera 2.4.0) syntax. OFF by default: AMS
+            // reserves words that are legal SystemVerilog identifiers, so
+            // enabling it unconditionally would reject designs that compile
+            // today. See docs/ams-plan.md.
+            "--ams" => {
+                sv_parser::set_ams(true);
+            }
             // Strict negative-test diagnostics (reject LRM-illegal constructs).
             // ON by default; `--no-strict` (alias `--lenient`) turns it off.
             "--strict" => {
@@ -2227,6 +2235,22 @@ fn run_main() -> i32 {
         std::process::exit(1);
     }
 
+    // A `.vams` / `.va` source turns Verilog-AMS syntax on for the whole run,
+    // the way a `.sv` extension selects SystemVerilog for other tools. The
+    // gate is process-wide (one lexer keyword table per run), so it is set
+    // once here from the FULL file list rather than per file. `--ams` already
+    // set it; this only ever turns it on.
+    if source_files.iter().any(|f| {
+        matches!(
+            std::path::Path::new(f)
+                .extension()
+                .and_then(|e| e.to_str()),
+            Some("vams") | Some("va")
+        )
+    }) {
+        sv_parser::set_ams(true);
+    }
+
     // XTrace option validation. Every one of these degrades to what we really
     // emit and SAYS SO — the header must never claim a level, a format or a
     // transport the file does not carry (XTrace §6, §24).
@@ -2300,10 +2324,15 @@ suppressed but the explicit SDF annotation still applies."
     if design_cache_enabled && mode == Mode::Simulate {
         let directory = design_cache_dir.clone().unwrap_or_else(default_design_cache_dir);
         let dependency_files = design_dependency_files(&lib_files, &lib_dirs, lib_exts.as_deref());
+        // `ams` belongs here for the same reason `sv2023` does: it changes
+        // which words are keywords, so the SAME source elaborates differently
+        // under it. Without it in the salt, a cached `--ams` artifact would be
+        // reused by a later run without the flag (and the reverse), and the
+        // design would silently simulate under the wrong dialect.
         let semantic_salt = format!(
-            "sv2023={};strict={};delay_select={};module_timescale={:?};lib_dirs={:?};lib_files={:?};lib_exts={:?};nospecify={}",
-            sv2023_mode, strict_checks, source_delay_select, module_timescale_args,
-            lib_dirs, lib_files, lib_exts, nospecify,
+            "sv2023={};ams={};strict={};delay_select={};module_timescale={:?};lib_dirs={:?};lib_files={:?};lib_exts={:?};nospecify={}",
+            sv2023_mode, sv_parser::is_ams(), strict_checks, source_delay_select,
+            module_timescale_args, lib_dirs, lib_files, lib_exts, nospecify,
         );
         // Set cache compression settings before cache is used
         if let Some(level) = cache_compression_level {

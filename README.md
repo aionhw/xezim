@@ -84,6 +84,80 @@ Current capabilities include:
 * **`bind` by instance path** (§23.11) — `bind top.u_dut.u_sub target_tb u_tb();`
   and the colon form bind only the named instances, with upward references from
   the bound module resolving against the instance they were bound into.
+* **Verilog-AMS, in progress** (`--ams`) — `wreal` real nets with driver
+  resolution, and natures/disciplines in the AST. Off by default.
+  See [below](#verilog-ams).
+
+### Verilog-AMS
+
+Verilog-AMS (Accellera LRM **2.4.0**) support is **in progress on the
+`ams-support` branch** and is staged — see [`docs/ams-plan.md`](docs/ams-plan.md)
+for the full phasing and [`docs/ams-contributing.md`](docs/ams-contributing.md)
+for how to add to it.
+
+Verilog-AMS is a different standard from IEEE 1800, so its sections are cited
+as `AMS §x.y` throughout the code and tests, never as a bare `§`.
+
+**Enabling it.** AMS syntax is **off by default** and must be asked for:
+
+```bash
+xezim --ams design.sv          # explicit flag
+xezim design.vams              # .vams / .va turn it on automatically
+```
+
+The parser CLI takes the same flag, which is the fastest way to check AMS
+syntax without building the simulator:
+
+```bash
+cd ../xezim-core/xezim-parser
+cargo run --bin sv-parse -- --ams --check    design.sv   # errors only
+cargo run --bin sv-parse -- --ams --dump-ast design.sv   # the parsed AST
+```
+
+This is not a convenience switch. Verilog-AMS reserves ~60 words that are legal
+SystemVerilog identifiers (`analog`, `nature`, `discipline`, `branch`, `flow`,
+`potential`, `access`, `ground`, `wreal`, …). Reserving them unconditionally
+would reject designs that compile today, so under the default they lex as
+ordinary identifiers — the same treatment `` `begin_keywords "1364-2001" ``
+gives the SystemVerilog-over-Verilog additions.
+
+**What works today**
+
+* **Real-number modeling (RNM)** — `real` variables and `wire real` nets, reals
+  across module ports at full double precision, `real` math/conversion system
+  functions, and **user-defined nettypes with resolution functions**
+  (§6.6.7, plain SystemVerilog — no `--ams` needed). This is the substrate the
+  AMS stages lower onto.
+* **`wreal` real nets** (AMS §3.8) — `wreal` plus the resolved forms
+  `wrealsum`, `wrealavg`, `wrealmin`, `wrealmax`, on net declarations and on
+  both ANSI and non-ANSI module ports. Multiple drivers on a node — including
+  drivers arriving from several instances through ports — are resolved exactly
+  once over the whole connected net. A plain `wreal` with more than one driver
+  is a clean error naming the resolved forms, never a silent pick.
+
+  > The resolved-form **spelling** (a distinct net-type keyword, `wrealsum x;`)
+  > follows common vendor usage and has **not** been checked against the LRM
+  > text — AMS §3.8 may instead select resolution through a discipline or an
+  > attribute. If so, the LRM form will be added alongside; accepting both is
+  > additive. See open item 1 in [`docs/ams-plan.md`](docs/ams-plan.md).
+* **Natures and disciplines** (AMS §3.4, §3.5) — `nature … endnature`
+  (attributes, `access`, derived natures) and `discipline … enddiscipline`
+  (`potential`, `flow`, `domain continuous|discrete`) parse into the AST.
+  **Parse-only**: they are recorded for the analog stages to consume, and carry
+  no simulation semantics yet.
+
+**What does not work yet**
+
+`analog` blocks and contribution statements (`V(a,b) <+ …`), branches, analog
+events (`cross`, `above`, `timer`, `initial_step`, `final_step`), analog
+operators (`ddt`, `idt`, `transition`, `slew`, `laplace_*`), `$abstime`, the
+analog solver itself (MNA + Newton-Raphson + LTE timestep control), and
+connect modules / `connectrules` for automatic A/D boundary insertion. Also out
+of scope: SPICE netlist import, `.ac`/`.noise` analyses, and Verilog-A compact
+device models.
+
+Regression tests live in the `ams` group (`tests/ams/`), which runs as part of
+plain `cargo test`.
 
 ### Non-standard extensions
 
