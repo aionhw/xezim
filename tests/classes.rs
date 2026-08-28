@@ -23,6 +23,26 @@ mod class_formal_typedef_widen;
 mod assoc_typedef_element_class;
 #[path = "classes/bit_class_property_signedness.rs"]
 mod bit_class_property_signedness;
+#[path = "classes/type_param_formal_stale_local.rs"]
+mod type_param_formal_stale_local;
+#[path = "classes/wait_level_sensitive_inactive_delta.rs"]
+mod wait_level_sensitive_inactive_delta;
+#[path = "classes/nested_same_named_ref_assoc_formal.rs"]
+mod nested_same_named_ref_assoc_formal;
+#[path = "classes/class_time_field_neg_one.rs"]
+mod class_time_field_neg_one;
+#[path = "classes/param_type_binding_resolves_enclosing_value_param.rs"]
+mod param_type_binding_resolves_enclosing_value_param;
+#[path = "classes/virtual_method_in_binary_is_evaluated_once.rs"]
+mod virtual_method_in_binary_is_evaluated_once;
+#[path = "classes/typename_type_param_resolves_concrete.rs"]
+mod typename_type_param_resolves_concrete;
+#[path = "classes/static_param_class_collection_reuse.rs"]
+mod static_param_class_collection_reuse;
+#[path = "classes/explicit_param_static_coll_read.rs"]
+mod explicit_param_static_coll_read;
+#[path = "classes/typename_p_subroutine_locals.rs"]
+mod typename_p_subroutine_locals;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
 #[path = "classes/class_field_named_event.rs"]

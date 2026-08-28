@@ -26,7 +26,7 @@ module top;
   endclass
 
   class test;
-    // PROPERTIES typed with value params (like 25params's a1/a2)
+    // PROPERTIES typed with value params (like the a1/a2 specialization check)
     special_comp#(1) a1;
     special_comp#(2) a2;
     function void build;

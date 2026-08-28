@@ -21593,7 +21593,14 @@ impl Simulator {
                     );
                     if let Some(eid) = id {
                         let val = vm_regs[*val_reg as usize].resize(*width);
-                        if signal_table[eid] != val {
+                        // §10.4.2 last-write-wins: see the NbaAssign arm.
+                        if let Some(i) = if nba_dup {
+                            nba_out.iter().rposition(|n| n.signal_id == eid)
+                        } else {
+                            None
+                        } {
+                            nba_out[i].value = val;
+                        } else if signal_table[eid] != val {
                             nba_out.push(NbaFast {
                                 signal_id: eid,
                                 value: val,
@@ -22397,7 +22404,14 @@ impl Simulator {
                     );
                     if let Some(eid) = id {
                         let val = vm_regs[*val_reg as usize].resize(*width);
-                        if view[eid] != val {
+                        // §10.4.2 last-write-wins: see the NbaAssign arm.
+                        if let Some(i) = if nba_dup {
+                            nba_out.iter().rposition(|n| n.signal_id == eid)
+                        } else {
+                            None
+                        } {
+                            nba_out[i].value = val;
+                        } else if view[eid] != val {
                             nba_out.push(NbaFast {
                                 signal_id: eid,
                                 value: val,
@@ -23966,13 +23980,22 @@ impl Simulator {
                         &self.signal_name_to_id,
                     ) {
                         let val = self.vm_regs[*val_reg as usize].resize(*width);
-                        // Eval-time elision — array element write that
-                        // matches current storage is dropped before queue.
+                        // §10.4.2 last-write-wins, THEN eval-time elision: an
+                        // earlier NBA in this evaluation must be OVERWRITTEN,
+                        // and the elision may only compare against the
+                        // register when nothing is pending. Eliding on the
+                        // register alone dropped a conditional override whose
+                        // value happened to equal the CURRENT value while the
+                        // unconditional default sat in the queue — a taken
+                        // branch-to-self on the 4004 committed pc+2 (issue
+                        // #142; every sibling arm already had this guard).
                         if is_packed_id(eid) {
                             let (bv, bx) = val.raw_bits();
                             if self.packed.set_raw(eid, bv, bx) {
                                 self.table_modified = true;
                             }
+                        } else if let Some(i) = self.nba_fast_index.get(eid) {
+                            self.nba_fast[i].value = val;
                         } else if self.signal_table[eid] != val {
                             self.nba_fast_index.insert(eid, self.nba_fast.len());
                             self.nba_fast.push(NbaFast {
@@ -24028,10 +24051,17 @@ impl Simulator {
                         let high_eff = high.min(sig_w.saturating_sub(1));
 
                         if low == 0 && high_eff + 1 >= sig_w {
-                            // Whole-element write — elide if same.
+                            // Whole-element write — §10.4.2 last-write-wins
+                            // against a pending entry FIRST, then elide if
+                            // same as the register. Same defect class as the
+                            // NbaAssignArray arm (issue #142): eliding on the
+                            // register alone dropped an override equal to the
+                            // current value while an earlier NBA sat queued.
                             let mut v = val.resize_for_assign(sig_w);
                             v.is_signed = self.signal_signed[eid];
-                            if self.signal_table[eid] != v {
+                            if let Some(i) = self.nba_fast_index.get(eid) {
+                                self.nba_fast[i].value = v;
+                            } else if self.signal_table[eid] != v {
                                 self.nba_fast_index.insert(eid, self.nba_fast.len());
                                 self.nba_fast.push(NbaFast {
                                     block_index: 0,
@@ -27938,9 +27968,19 @@ impl Simulator {
             // through in one edge — a shift register would collapse. Verified
             // against a commercial simulator and a reference simulator: a `q0->q1` chain must
             // shift one stage per clock. Route through the NBA queue like a flop.
-            if self.signal_table[id].get_bit_code(bit) != new_code {
+            // §10.4.2 against the PENDING value: a second fire in the same
+            // delta must update the queued value (a fire back to the current
+            // code was dropped while the first fire's entry survived), and
+            // two UDPs driving different BITS of one output word must merge
+            // rather than the second clone losing the first's bit. Keeping
+            // the entry indexed also lets the RTL NBA paths find it.
+            if let Some(i) = self.nba_fast_index.get(id) {
+                let tv = &mut self.nba_fast[i].value;
+                tv.set_bit_code(bit, new_code);
+            } else if self.signal_table[id].get_bit_code(bit) != new_code {
                 let mut v = self.signal_table[id].clone();
                 v.set_bit_code(bit, new_code);
+                self.nba_fast_index.insert(id, self.nba_fast.len());
                 self.nba_fast.push(NbaFast {
                     signal_id: id,
                     value: v,
@@ -31523,6 +31563,75 @@ impl Simulator {
         }
     }
 
+    /// Resume level-sensitive `wait(expr)` waiters parked in
+    /// `condition_waiters` whose condition has just become true. IEEE
+    /// 1800-2023 §9.7.4: `wait(cond)` is level-sensitive — the process
+    /// resumes as soon as the condition is true, INCLUDING in the same
+    /// timestep via a delta-cycle (#0) write from another process.
+    ///
+    /// Because `wait` on non-signal state (class members / locals) cannot use
+    /// the edge-triggered event_waiter path, waiters park here and are
+    /// re-checked as a bounded fixpoint: reschedule each, run the ones whose
+    /// condition now holds (its continuation may free another waiter), apply
+    /// any NBA work those runs produced, and iterate until a round advances
+    /// no waiter (the remainder are blocked on a genuinely future-time
+    /// change).
+    ///
+    /// The caller invokes this BOTH (a) inside `run_one_tick`'s active loop,
+    /// immediately before the INACTIVE (`#0`) region is promoted — so a
+    /// waiter is resumed in the SAME delta as the write that satisfied it,
+    /// before a `#0`-parked peer's continuation overwrites the value — and
+    /// (b) at the end of the tick, after the NBA region has settled, to
+    /// catch waiters satisfied by non-blocking/edge-propagated state.
+    fn drain_condition_waiters(&mut self) {
+        let mut guard = 0u32;
+        while !self.condition_waiters.is_empty()
+            && !self.finished
+            && !self.zero_delay_defer_pending
+        {
+            guard += 1;
+            if guard > 10000 {
+                break;
+            }
+            let prog_before = self.cond_progress;
+            let parked = std::mem::take(&mut self.condition_waiters);
+            for (cpid, cont) in parked {
+                self.event_queue.schedule(self.time, cpid, cont);
+            }
+            while self.event_queue.next_time() == Some(self.time)
+                && !self.finished
+                && !self.zero_delay_defer_pending
+            {
+                let Some((bpid, stmts)) = self.event_queue.pop_front(self.time) else {
+                    break;
+                };
+                self.run_scheduled_process(bpid, &stmts);
+                if !self.is_pid_suspended(bpid) {
+                    self.child_finished(bpid);
+                }
+            }
+            if !self.nba_fast.is_empty()
+                || !self.nba_queue.is_empty()
+                // §15.5.2: a bare `->>` (deferred trigger) must flush with the
+                // NBA region even when no NBA DATA is queued.
+                || !self.pending_nba_triggers.is_empty()
+                || !self.pending_nba_instance_triggers.is_empty()
+                || self.delayed_nba_due()
+            {
+                self.apply_nba();
+            }
+            if self.dirty_any {
+                self.settle_combinatorial();
+            }
+            // No waiter proceeded this round → the remainder are genuinely
+            // blocked (future-time change); stop re-checking until the next
+            // tick.
+            if self.cond_progress == prog_before {
+                break;
+            }
+        }
+    }
+
     fn run_one_tick(
         &mut self,
         accum: &mut PerTickAccum,
@@ -31647,6 +31756,19 @@ impl Simulator {
             // the NBA region — a `#0`-resumed read must see pre-NBA values
             // (reference-simulator verified; the previous NBA-first order
             // followed a differing commercial camp).
+            //
+            // Before handing control to the INACTIVE (`#0`) continuations,
+            // let any `wait(expr)` whose condition this ACTIVE batch just made
+            // true resume FIRST. Level-sensitive `wait` is a same-delta, same-
+            // timestep handoff (IEEE 1800-2023 §9.7.4); a `#0`-parked peer's
+            // continuation runs in the NEXT delta and may overwrite the value
+            // the waiter latches on — e.g. `x = 1; #0; x = 0;` with a peer
+            // `wait(x==1)` must observe the 1 and proceed, not skip straight
+            // to the 0 (the passthrough-socket AT handshake stalls when the
+            // slave's `wait(state!=BEGIN_RESP)` wakes on the clobbered value).
+            // The end-of-tick fixpoint alone is too late: the `#0` resume has
+            // already committed the overwrite by then.
+            self.drain_condition_waiters();
             if self.promote_inactive_to_active()
                 && self.event_queue.next_time() == Some(self.time)
             {
@@ -31772,56 +31894,8 @@ impl Simulator {
         }
         self.dump_write_changes();
 
-        // Condition-waiter fixpoint. A `wait(expr)` on non-signal state (class
-        // members / locals) parked in condition_waiters during the batch above
-        // instead of falsely proceeding. Now that the active + NBA regions have
-        // settled, re-check each: a waiter whose condition flipped runs its
-        // continuation (and may flip another's), so iterate to a fixpoint. Stop
-        // when a full round advances no waiter (the rest are waiting on a
-        // future-time change).
-        let mut guard = 0u32;
-        while !self.condition_waiters.is_empty() && !self.finished && !self.zero_delay_defer_pending
-        {
-            guard += 1;
-            if guard > 10000 {
-                break;
-            }
-            let prog_before = self.cond_progress;
-            let parked = std::mem::take(&mut self.condition_waiters);
-            for (cpid, cont) in parked {
-                self.event_queue.schedule(self.time, cpid, cont);
-            }
-            while self.event_queue.next_time() == Some(self.time)
-                && !self.finished
-                && !self.zero_delay_defer_pending
-            {
-                let Some((bpid, stmts)) = self.event_queue.pop_front(self.time) else {
-                    break;
-                };
-                self.run_scheduled_process(bpid, &stmts);
-                if !self.is_pid_suspended(bpid) {
-                    self.child_finished(bpid);
-                }
-            }
-            if !self.nba_fast.is_empty()
-            || !self.nba_queue.is_empty()
-            // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
-            // region even when no NBA DATA is queued.
-            || !self.pending_nba_triggers.is_empty()
-            || !self.pending_nba_instance_triggers.is_empty()
-            || self.delayed_nba_due()
-        {
-                self.apply_nba();
-            }
-            if self.dirty_any {
-                self.settle_combinatorial();
-            }
-            // No waiter proceeded this round → the remainder are genuinely
-            // blocked (future-time change); stop re-checking until the next tick.
-            if self.cond_progress == prog_before {
-                break;
-            }
-        }
+        // Condition-waiter fixpoint (level-sensitive `wait(expr)` resume).
+        self.drain_condition_waiters();
 
         // `#0` continuations parked during the POST-active stages of this
         // tick (edge cascades, reactive work) resume in the next same-time
@@ -35841,6 +35915,30 @@ impl Simulator {
                         _ => None,
                     };
                     if let Some((cls, mn)) = scoped {
+                        // A `C#(params)::task` receiver dispatches on the
+                        // bare class but must ALSO establish the receiver
+                        // specialization as `current_spec`, or a bare type
+                        // argument `T` in the task body (e.g.
+                        // `tester#(uvm_object)::do_it()` constructing
+                        // `my_cb#(T)` / `uvm_event#(T)`) resolves to the
+                        // literal `T` instead of `uvm_object`. The static
+                        // METHOD path seeds `current_spec` from the
+                        // specialization (§8.25); this static-task path was
+                        // missing it, so the body bound its parameterized
+                        // locals with `type_bindings={T:"T"}`, casting to
+                        // `uvm_callback` failed, and every `$cast` inside the
+                        // callback `get_all` saw a plain `uvm_callback` with
+                        // no callbacks.
+                        let mut recv_spec: Option<(String, String)> = None;
+                        if let ExprKind::MemberAccess { expr: mrecv, .. } = &func.kind {
+                            if let ExprKind::Specialization { .. } = &mrecv.kind {
+                                recv_spec = self
+                                    .resolve_call_spec_params(
+                                        Self::extract_call_spec(&func.clone()),
+                                        &self.current_spec.clone(),
+                                    );
+                            }
+                        }
                         if let Some((td, mclass)) = self.resolve_class_task(&cls, &mn) {
                             if self.stmts_have_blocking(&td.items) {
                                 let mut cleanup = self.bind_task_frame(&td, args);
@@ -35849,12 +35947,21 @@ impl Simulator {
                                 self.this_stack.push(None);
                                 self.class_context_stack.push(Some(mclass));
                                 cleanup.pushed_method_this = true;
+                                let saved_spec = self.current_spec.clone();
+                                if let Some((sb, ss)) = recv_spec {
+                                    self.ensure_spec_statics(&sb, &ss);
+                                    self.current_spec = Some((sb, ss));
+                                }
                                 self.task_cleanup.push(cleanup);
                                 let mut cont: Vec<Statement> = td.items.clone();
                                 cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
                                 // Chain the caller's tail instead of copying it onto the end of
                                 // the spliced body (ProcCont::pushed).
-                                self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                                self.run_process_stmts(
+                                    pid,
+                                    &pc.pushed(cont, pc.start + i + 1),
+                                );
+                                self.current_spec = saved_spec;
                                 return;
                             }
                         }
@@ -45285,7 +45392,10 @@ impl Simulator {
                             let is_str = hier
                                 .path
                                 .last()
-                                .is_some_and(|s| self.string_signals.contains(&s.name.name));
+                                .is_some_and(|s| {
+                                    self.string_signals.contains(&s.name.name)
+                                        || self.p_local_is_string(&s.name.name)
+                                });
                             let fitted = if !val.is_real && !is_str {
                                 if let Some(&target_w) = self.widths.get(&joined) {
                                     if val.width != target_w {
@@ -45327,7 +45437,8 @@ impl Simulator {
                             // $urandom` keeps only the low 8 bits). STRING
                             // locals are exempt (1024-bit internal packed
                             // text).
-                            let is_str = self.string_signals.contains(name.as_str());
+                            let is_str = self.string_signals.contains(name.as_str())
+                                || self.p_local_is_string(name);
                             let fitted = if !val.is_real && !is_str {
                                 if let Some(&target_w) = self.widths.get(name) {
                                     let mut f = if val.width != target_w {
@@ -48191,6 +48302,30 @@ impl Simulator {
                                 let changed = prev.as_ref() != Some(&resized);
                                 self.set_signal_value_by_name(&target, resized);
                                 return changed;
+                            }
+                        }
+                    }
+                }
+                // `ClassName#(params)::static_prop = ...` — a STATIC scalar /
+                // handle property write through a class SPECIALIZATION
+                // receiver (the READ path resolves it per-spec via
+                // class_static_get; the write must land in the SAME per-spec
+                // cell). Without this `C#(int)::n = 5` fell through to a
+                // bare-name store the later read never consulted.
+                if let ExprKind::Specialization { .. } = &expr.kind {
+                    if let Some((base, sig)) = self.resolve_call_spec_params(
+                        Self::extract_call_spec(expr),
+                        &self.current_spec.clone(),
+                    ) {
+                        if self.module.classes.contains_key(&base)
+                            && !self.signal_name_to_id.contains_key(base.as_str())
+                        {
+                            let saved = self.current_spec.take();
+                            self.current_spec = Some((base.clone(), sig));
+                            let ok = self.class_static_set(&base, &member.name, val.clone());
+                            self.current_spec = saved;
+                            if ok {
+                                return true;
                             }
                         }
                     }
@@ -53412,6 +53547,43 @@ impl Simulator {
                                 &self.format_class_typename(&base, &ta),
                             );
                         }
+                        // §8.25: a bare TYPE PARAMETER of the active
+                        // specialization (`$typename(T)` inside
+                        // `ger#(type T)::do_it()`), resolved through the
+                        // current spec to its CONCRETE bound type — not the
+                        // literal param name. Pre-fix this fell through to the
+                        // scalar-signal fallback and reported `logic` for a
+                        // class type (`T=uvm_object`), hiding what the body
+                        // actually specialized.
+                        if let ExprKind::Ident(hier2) = &arg.kind {
+                            if hier2.path.len() == 1 {
+                                let tnp = &hier2.path[0].name.name;
+                                if let Some(concrete) = self.resolve_type_param_binding(tnp) {
+                                    if concrete != *tnp {
+                                        return Value::from_string(
+                                            &self.typename_of_concrete(&concrete),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        // A bare `data_type` argument that names a TYPEDEF
+                        // (`$typename(my_bits_t)`): per §20.6.1a the typedef
+                        // resolves back to its built-in base, so "logic
+                        // signed [15:0]" rather than the typedef name or a
+                        // bare "logic".
+                        if let ExprKind::Ident(hier_td) = &arg.kind {
+                            if hier_td.path.len() == 1 && hier_td.path[0].selects.is_empty() {
+                                let tdn = &hier_td.path[0].name.name;
+                                if self.module.typedef_types.contains_key(tdn)
+                                    || self.lookup_typedef_target(tdn).is_some()
+                                {
+                                    if let Some(target) = self.lookup_typedef_target(tdn) {
+                                        return Value::from_string(&self.typename_of_dt(&target));
+                                    }
+                                }
+                            }
+                        }
                         // A bare class/covergroup type name, or a scalar signal.
                         if let ExprKind::Ident(hier) = &arg.kind {
                             if hier.path.len() == 1 {
@@ -53420,6 +53592,25 @@ impl Simulator {
                                     || self.module.covergroups.contains_key(n.as_str())
                                 {
                                     return Value::from_string(&format!("class {}", n));
+                                }
+                            }
+                            let leaf = hier
+                                .path
+                                .last()
+                                .map(|s| s.name.name.as_str())
+                                .unwrap_or("");
+                            // A signal or block-local var with a declared
+                            // type: render it, so `logic [15:0] v` reports
+                            // "logic [15:0]" (§20.6.1g preserves the range)
+                            // instead of a bare "logic".
+                            if let Some(dt) = self.module.var_decl_types.get(leaf).cloned() {
+                                return Value::from_string(&self.typename_of_dt(&dt));
+                            }
+                            // A var declared with a TYPEDEF'd type
+                            // (`my_bits_t v1;`): render the typedef's base.
+                            if let Some(tn) = self.var_typedef_types.get(leaf).cloned() {
+                                if let Some(target) = self.lookup_typedef_target(&tn) {
+                                    return Value::from_string(&self.typename_of_dt(&target));
                                 }
                             }
                             let name = self.resolve_hier_name(hier);
@@ -53675,6 +53866,34 @@ impl Simulator {
                 // BEFORE the object-property paths below — a class name has no
                 // runtime instance, so without this `Base::STARTED` reads 0.
                 if let ExprKind::Ident(h) = &expr.kind {
+                    // §9.7: the built-in `process` class's state enum
+                    // (`process::RUNNING` … `process::KILLED`). `process` is
+                    // not a USER-declared class (it is without a body, so no
+                    // `module.classes` entry exists), so the flattened
+                    // hier-Ident form `process::KILLED` (used at module/initial
+                    // scope) resolves it through the `process` special-case in
+                    // the Ident arm, but inside a function/task/method body the
+                    // parser represents the reference as
+                    // `MemberAccess(Ident("process"), X)` and it fell through to
+                    // an object-property read that returned 0 — so
+                    // `p.status() == process::KILLED` was ALWAYS false and
+                    // killed (zombie) processes were never cleared. Mirror the
+                    // flat-Ident handling here.
+                    if h.path.len() == 1
+                        && h.path[0].name.name == "process"
+                        && h.path[0].selects.is_empty()
+                    {
+                        if let Some(v) = match member.name.as_str() {
+                            "FINISHED" => Some(0u64),
+                            "RUNNING" => Some(1u64),
+                            "WAITING" => Some(2u64),
+                            "SUSPENDED" => Some(3u64),
+                            "KILLED" => Some(4u64),
+                            _ => None,
+                        } {
+                            return Value::from_u64(v, 32);
+                        }
+                    }
                     if h.path.len() == 1 && h.path[0].selects.is_empty()
                         && self.module.classes.contains_key(&h.path[0].name.name)
                     {
@@ -53713,6 +53932,20 @@ impl Simulator {
                                 return v.clone();
                             }
                             if let Some(v) = self.module.parameters.get(&member.name) {
+                                return v.clone();
+                            }
+                            // §26.3: a package DATA declaration — a `const` or
+                            // a plain variable — reached through `pkg::X`.
+                            // These are registered under their BARE name as a
+                            // signal (the flat-Ident path at module/initial
+                            // scope resolves them that way), so neither the
+                            // enum nor the parameter route above has an entry
+                            // and the reference fell through to read 0 inside
+                            // a subroutine body. Read the bare signal; because
+                            // the base is a real package (not a caller local),
+                            // the lookup honors the package qualification
+                            // rather than a same-named subroutine local.
+                            if let Some(v) = self.get_signal(&member.name) {
                                 return v.clone();
                             }
                         }
@@ -60739,6 +60972,18 @@ impl Simulator {
                                 };
                                 self.module.arrays.insert(name.clone(), (0, -1, w));
                                 self.module.dynamic_arrays.insert(name.clone());
+                                // A QUEUE-typed local (`int a[$];`, possibly with
+                                // a bound `[$:N]`) keeps the queue semantics -
+                                // index-at-size appends, size tracking on
+                                // `q[i] = v` back-fill - not the discard-out-of-
+                                // range rule of an unallocated dynamic array.
+                                // Mirror the module-scope classification.
+                                if matches!(
+                                    first,
+                                    UnpackedDimension::Queue { .. }
+                                ) {
+                                    self.module.queue_vars.insert(name.clone());
+                                }
                                 self.widths.insert(name.clone(), w);
                                 self.set_queue_size(&name, 0);
                                 // §7.4.5: a LOCAL `T a[][16]` / `a[$][16]` —
@@ -61337,7 +61582,7 @@ impl Simulator {
                         // (needed for signed division/modulo, comparison, and
                         // `%0d` display). A fresh decl also clears a stale
                         // same-named signed flag from another frame.
-                        if super::elaborate::is_type_signed(data_type) {
+                        if self.type_is_signed_concrete(data_type) {
                             self.signed_signals.insert(d.name.name.clone());
                         } else {
                             self.signed_signals.remove(&d.name.name);
@@ -64319,6 +64564,39 @@ impl Simulator {
                             if ai < args.len() {
                                 let arg = &args[ai];
                                 ai += 1;
+                                // §21.2.1.7: a SUBROUTINE-local scalar variable
+                                // (`int x; string s; T _t;` inside a task/
+                                // function) does not live in the module `signals`
+                                // map, so the name-based `render_p_var` path below
+                                // reads nothing and prints `x`/empty. Its runtime
+                                // value sits in the current `local_stack` frame,
+                                // reachable through `eval_expr` (the same read the
+                                // `%0d`/`%0h` arms use, which work). For a bare
+                                // scalar local, evaluate it and render directly —
+                                // quoting WHEN the declared type is `string`
+                                // (resolving a type parameter `T` to its concrete
+                                // bound, so `T=string` prints a quoted string and
+                                // `T=int` prints a number).
+                                if let ExprKind::Ident(h) = &arg.kind {
+                                    if h.path.len() == 1 && h.path[0].selects.is_empty()
+                                        && !self.local_stack.is_empty()
+                                    {
+                                        let nm = &h.path[0].name.name;
+                                        let is_local = self
+                                            .local_stack
+                                            .last()
+                                            .is_some_and(|f| f.contains_key(nm));
+                                        if is_local && !self.local_ident_is_collection(nm) {
+                                            let is_str = self
+                                                .p_local_is_string(nm);
+                                            let v = self.eval_expr(arg);
+                                            let core =
+                                                Self::render_p_value(&v, is_str);
+                                            result.push_str(&core);
+                                            continue;
+                                        }
+                                    }
+                                }
                                 // §7.12.1: an array LOCATOR call (`q.unique()`,
                                 // `q.find with (…)`, `q.min()`) RETURNS a queue.
                                 // Only the ASSIGNMENT path materialized that, so
@@ -69010,7 +69288,22 @@ impl Simulator {
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
             ExprKind::Ident(h) => {
                 let n = self.resolve_hier_name(h);
-                self.lookup_signal_width(&n)
+                if let Some(w) = self.lookup_signal_width(&n) {
+                    return Some(w);
+                }
+                // A CLASS-FIELD operand (e.g. a `time` / `longint` member of
+                // a `uvm_transaction`) isn't a module-scope signal, so the
+                // width tables above miss it. Falling back to the live
+                // receiver lets a comparison against a literal size the
+                // operand correctly: `begin_time != -1` on a 64-bit `time`
+                // field otherwise sized `-1` as 32-bit and compared
+                // 64-bit-all-ones against 32'hFFFFFFFF as NOT equal.
+                if let Some((handle, prop)) = self.class_prop_receiver(expr) {
+                    if let Some(w) = self.class_prop_width_of(handle, &prop) {
+                        return Some(w);
+                    }
+                }
+                None
             }
             ExprKind::Unary { op, operand } => match op {
                 UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot => self.lrm_self_width(operand),
@@ -69234,43 +69527,62 @@ impl Simulator {
     fn class_method_return_width(&self, func: &Expression) -> Option<u32> {
         use crate::ast::decl::ClassMethodKind;
         use crate::ast::types::DataType;
-        // Extract (receiver head name, method name) as BORROWED slices.
-        // `infer_width` probes every arithmetic/bitwise operand on each
-        // evaluation, so the two `String` allocations this used to do ran in
-        // every loop iteration; borrowing from `func` avoids them.
-        let (recv_head, mname): (&str, &str) = match &func.kind {
-            ExprKind::MemberAccess { expr, member } => {
-                let head = match &expr.kind {
-                    ExprKind::Ident(h) if h.path.len() == 1 => h.path[0].name.name.as_str(),
-                    _ => return None,
-                };
-                (head, member.name.as_str())
-            }
+        // Extract the receiver expression + method name. `infer_width` probes
+        // every arithmetic/bitwise operand each evaluation, so keep this free
+        // of allocations.
+        let (recv_expr, mname): (&Expression, &str) = match &func.kind {
+            ExprKind::MemberAccess { expr, member } => (expr, member.name.as_str()),
             ExprKind::Ident(h) if h.path.len() == 2 => {
-                (h.path[0].name.name.as_str(), h.path[1].name.name.as_str())
+                // `recv.m(...)` flattened to Ident([recv, m]). Reconstruct a
+                // borrowable Identifier for the receiver segment (no
+                // allocation).
+                let seg = h.path[0].name.name.clone();
+                if let Some(cn) = self.var_class_types.get(&seg) {
+                    return self.method_ret_width(cn, h.path[1].name.name.as_str());
+                } else if let Some(&id) = self.signal_name_to_id.get(seg.as_str()) {
+                    if let Some(cn) = self.signal_type_names.get(&id) {
+                        return self.method_ret_width(cn, h.path[1].name.name.as_str());
+                    }
+                } else if let Some(th) = self.this_stack.last().copied().flatten() {
+                    if let Some(cn) = self.prop_class_type(th, &seg) {
+                        return self.method_ret_width(&cn, h.path[1].name.name.as_str());
+                    }
+                }
+                return None;
             }
             _ => return None,
         };
-        // Resolve the receiver's class type. Common cases only — a bare
-        // local of class type, or a class-typed signal. Subtler resolutions
-        // (properties of `this`, typedef locals, …) return None and keep the
-        // prior fallback.
-        //
-        // NOTE: `var_class_types` is a FLAT accumulator never cleared on
-        // scope/method exit (see the note at `class_prop_type`), so this
-        // binding can be stale across method calls — the result is therefore
-        // NOT memoisable by AST node. That is pre-existing behaviour.
-        let class_name: String = if let Some(cn) = self.var_class_types.get(recv_head) {
-            cn.clone()
-        } else {
-            let id = *self.signal_name_to_id.get(recv_head)?;
-            self.signal_type_names.get(&id)?.clone()
+        let class_name: Option<String> = match &recv_expr.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let rn = h.path[0].name.name.clone();
+                if let Some(cn) = self.var_class_types.get(&rn) {
+                    Some(cn.clone())
+                } else if let Some(&id) = self.signal_name_to_id.get(rn.as_str()) {
+                    self.signal_type_names.get(&id).cloned()
+                } else if let Some(th) = self.this_stack.last().copied().flatten() {
+                    self.prop_class_type(th, &rn)
+                } else {
+                    None
+                }
+            }
+            ExprKind::Index { expr, .. } => Self::collection_element_class(self, expr),
+            _ => None,
         };
+        let class_name = class_name?;
+        self.method_ret_width(&class_name, mname)
+    }
+
+    /// Width of a class method's declared return type, resolved through the
+    /// inheritance chain from `class_name` (read-only; never executes the
+    /// method). `None` for a task / void / unresolvable.
+    fn method_ret_width(&self, class_name: &str, mname: &str) -> Option<u32> {
+        use crate::ast::decl::ClassMethodKind;
+        use crate::ast::types::DataType;
         // Walk the inheritance chain read-only to the method's return type.
         // `extends` must be cloned per level: the borrow of a `classes` entry
         // can't be carried across loop iterations (the entry is dropped at
         // each iteration end).
-        let mut cur = class_name;
+        let mut cur = class_name.to_string();
         while let Some(cd) = self.module.classes.get(&cur) {
             if let Some(m) = cd.methods.get(mname) {
                 if let ClassMethodKind::Function(f) = &m.kind {
@@ -69292,6 +69604,96 @@ impl Simulator {
             cur = cd.extends.clone()?;
         }
         None
+    }
+
+    /// Class type of the element of a collection-index receiver `q[i]` — the
+    /// dynamic-array / queue variable `q`'s element type (a class name when
+    /// the elements are class handles). Mirrors how a queue element member
+    /// call `cb_q[i].pre(...)` resolves its receiver class statically.
+    fn collection_element_class(
+        &self,
+        arr_expr: &Expression,
+    ) -> Option<String> {
+        let ExprKind::Ident(h) = &arr_expr.kind else {
+            return None;
+        };
+        if h.path.len() != 1 {
+            return None;
+        }
+        let name = &h.path[0].name.name;
+        if let Some(cls) = self.module.array_elem_class.get(name.as_str()) {
+            return Some(cls.clone());
+        }
+        if let Some(cls) = self.declared_collection_elem_class(name) {
+            return Some(cls);
+        }
+        // A queue/dyn-array of a TYPEDEF'd class (`cb_type cb_q[$]` where
+        // `typedef uvm_event_callback#(T) cb_type;`) has an element type that
+        // names the typedef, not a registered class — `array_elem_class` and
+        // `declared_collection_elem_class` miss it. Some queue declarations
+        // also record an EMPTY unpacked-dimensions list on `var_decl_types`
+        // (`cb_type cb_q[$]`), so resolve the (possibly typedef'd) element
+        // name to its base class regardless of recorded dimensions.
+        if let Some(dt) = self.module.var_decl_types.get(name).cloned() {
+            if let Some(elem) = Self::collection_elem_typename(&dt) {
+                if let Some(cls) = self.resolve_typeref_class_name(&elem) {
+                    return Some(cls);
+                }
+            }
+        }
+        // A COLLECTION FIELD of the enclosing class (`base_cb q[$];` as a
+        // member of `this`) is not registered in the module-scope tables; its
+        // element class comes from the property's declared type. Walk the
+        // class-context chain (leaf first) for the property, like the field
+        // element-class resolution at a collection assignment, and resolve the
+        // declared element type to a class.
+        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            let mut cur = Some(ctx);
+            let mut seen: HashSet<String> = HashSet::default();
+            while let Some(cn) = cur {
+                if !seen.insert(cn.clone()) {
+                    break;
+                }
+                let Some(cd) = self.module.classes.get(&cn) else {
+                    break;
+                };
+                if let Some(tn) = cd.properties.get(name).and_then(|s| s.type_name.clone()) {
+                    let tn = tn.trim();
+                    if let Some(cls) = self.resolve_typeref_class_name_str(tn) {
+                        return Some(cls);
+                    }
+                }
+                cur = cd.extends.clone();
+            }
+        }
+        None
+    }
+
+    /// Resolve a class name / typedef / specialization string to a class name.
+    fn resolve_typeref_class_name_str(&self, s: &str) -> Option<String> {
+        let tnname = crate::ast::types::TypeName {
+            scope: None,
+            name: crate::ast::Identifier {
+                name: s.to_string(),
+                span: crate::ast::Span::dummy(),
+            },
+            span: crate::ast::Span::dummy(),
+        };
+        self.resolve_typeref_class_name(&tnname)
+    }
+
+    /// Element type of an unpacked-collection DataType, or None for a scalar /
+    /// non-collection type.
+    fn collection_elem_typename(dt: &crate::ast::types::DataType) -> Option<crate::ast::types::TypeName> {
+        match dt {
+            crate::ast::types::DataType::TypeReference { name, dimensions, .. }
+                if !dimensions.is_empty() =>
+            {
+                Some(name.clone())
+            }
+            crate::ast::types::DataType::TypeReference { name, .. } => Some(name.clone()),
+            _ => None,
+        }
     }
 
     fn infer_lhs_width(&mut self, expr: &Expression) -> u32 {
@@ -72794,6 +73196,26 @@ impl Simulator {
                             if nm == "this_type" || nm == "this" {
                                 if let Some((b, s)) = &self.current_spec {
                                     return Some(format!("{}#({})", b, s));
+                                }
+                            }
+                            // A type arg that is a TYPEDEF of a parameterized
+                            // class (`cb_type cb_q[$]` where `typedef
+                            // uvm_event_callback#(T) cb_type;`): expand it via
+                            // `resolve_typedef_spec` so the base's own type
+                            // args are carried (and their bare params resolved
+                            // through `current_spec`). `expr_to_spec_fragment`
+                            // on the raw typedef ident otherwise returns ONLY
+                            // the base class name — dropping the `#(T)`, so
+                            // the missing param is afterwards filled with its
+                            // DECLARED DEFAULT (`uvm_object`) instead of the
+                            // enclosing `T` (`string`). That made the string /
+                            // `uvm_object` event callbacks key differently and
+                            // the string event's `get_all` missed its callback.
+                            if self.module.typedef_types.contains_key(nm.as_str())
+                                || self.lookup_typedef_target(nm.as_str()).is_some()
+                            {
+                                if let Some((tb, ts)) = self.resolve_typedef_spec(&nm) {
+                                    return Some(format!("{}#({})", tb, ts));
                                 }
                             }
                         }
@@ -78644,6 +79066,115 @@ impl Simulator {
         cur
     }
 
+    /// IEEE 1800-2017 §20.6.1 `$typename` string for a resolved (builtin)
+    /// `DataType`: the built-in keyword, then non-default signing, then the
+    /// packed-vector range (bounds as unsized decimals). A typedef /
+    /// `TypeReference` is resolved back to its built-in base type (§20.6.1a),
+    /// the default signing is removed (§20.6.1b), and vector/array ranges are
+    /// preserved (§20.6.1g).
+    fn typename_of_dt(&self, dt: &DataType) -> String {
+        use crate::ast::types::{
+            DataType, IntegerAtomType, IntegerVectorType, PackedDimension, RealType, Signing, SimpleType,
+        };
+        let cur = self.resolve_dt(dt);
+        match &cur {
+            DataType::IntegerVector { kind, signing, dimensions, .. } => {
+                let kw = match kind {
+                    IntegerVectorType::Bit => "bit",
+                    IntegerVectorType::Logic => "logic",
+                    IntegerVectorType::Reg => "reg",
+                };
+                // Vector types default to UNsigned, so only the explicit
+                // `signed` survives default-signing removal.
+                let sign = matches!(signing, Some(Signing::Signed)).then_some(" signed").unwrap_or("");
+                let mut s = format!("{}{}", kw, sign);
+                for d in dimensions {
+                    match d {
+                        PackedDimension::Range { left, right, .. } => {
+                            let l = crate::elaborate::const_eval_i64_with_params(left, None);
+                            let r = crate::elaborate::const_eval_i64_with_params(right, None);
+                            match (l, r) {
+                                (Some(l), Some(r)) => s.push_str(&format!(" [{}:{}]", l, r)),
+                                // Unresolvable bound: drop the range but keep
+                                // the base keyword.
+                                _ => return kw.to_string(),
+                            }
+                        }
+                        PackedDimension::Unsized(_) => {}
+                    }
+                }
+                s
+            }
+            DataType::IntegerAtom { kind, signing, .. } => {
+                let kw = match kind {
+                    IntegerAtomType::Byte => "byte",
+                    IntegerAtomType::ShortInt => "shortint",
+                    IntegerAtomType::Int => "int",
+                    IntegerAtomType::LongInt => "longint",
+                    IntegerAtomType::Integer => "integer",
+                    IntegerAtomType::Time => "time",
+                };
+                // Integer atoms default to signed; drop it, keep explicit
+                // `unsigned`.
+                if matches!(signing, Some(Signing::Unsigned)) {
+                    format!("{} unsigned", kw)
+                } else {
+                    kw.to_string()
+                }
+            }
+            DataType::Real { kind, .. } => match kind {
+                RealType::Real => "real".to_string(),
+                RealType::ShortReal => "shortreal".to_string(),
+                RealType::RealTime => "realtime".to_string(),
+            },
+            DataType::Simple { kind, .. } => match kind {
+                SimpleType::String => "string".to_string(),
+                SimpleType::Chandle => "chandle".to_string(),
+                SimpleType::Event => "event".to_string(),
+            },
+            DataType::Implicit { .. } => "logic".to_string(),
+            // Aggregates / classes are out of the scalar path's scope.
+            _ => "logic".to_string(),
+        }
+    }
+
+    /// `$typename` of a resolved CONCRETE type string (a type parameter's
+    /// binding, from `resolve_type_param_binding`): `class <n>` for a class /
+    /// covergroup (or a class specialization), or the base keyword with the
+    /// packed range for a built-in / typedef'd vector.
+    fn typename_of_concrete(&self, concrete: &str) -> String {
+        // A class (or a specialization `foo#(...)` whose base is a class).
+        if self.module.classes.contains_key(concrete)
+            || self.module.covergroups.contains_key(concrete)
+        {
+            return format!("class {}", concrete);
+        }
+        if let Some(n) = concrete.split('#').next() {
+            if self.module.classes.contains_key(n)
+                || self.module.covergroups.contains_key(n)
+            {
+                return format!("class {}", concrete);
+            }
+        }
+        // A typedef of a built-in / vector, e.g. `uvm_bitstream_t` ->
+        // `logic signed [4095:0]`. Resolve the target and render it.
+        if self.module.typedef_types.contains_key(concrete)
+            || self.lookup_typedef_target(concrete).is_some()
+        {
+            let target = self
+                .lookup_typedef_target(concrete)
+                .unwrap_or_else(|| crate::ast::types::DataType::Implicit {
+                    signing: None,
+                    dimensions: Vec::new(),
+                    span: crate::ast::Span::dummy(),
+                });
+            return self.typename_of_dt(&target);
+        }
+        // Otherwise a bare built-in keyword (`string`, `int`, ...) or the
+        // type name itself.
+        concrete.to_string()
+    }
+
     /// Constant indices of a member's (single) unpacked dimension.
     fn member_dim_indices(
         &self,
@@ -81523,6 +82054,109 @@ impl Simulator {
             }
         }
         format!("'{{{}}}", parts.join(", "))
+    }
+
+    /// Is a SUBROUTINE-LOCAL variable `name` a QUEUE/assoc/dynamic/fixed
+    /// array (as opposed to a plain scalar)? Local collections are handled by
+    /// `render_p_var`'s name-based element path; a scalar local is rendered by
+    /// evaluating it directly (its value is not a module signal).
+    fn local_ident_is_collection(&self, name: &str) -> bool {
+        self.module.dynamic_arrays.contains(name)
+            || self.module.associative_arrays.contains_key(name)
+            || self.module.arrays.contains_key(name)
+            || self.module.arrays_2d.contains_key(name)
+            || self.module.arrays_nd.contains_key(name)
+    }
+
+    /// Does a SUBROUTINE-LOCAL variable `name` of declared type
+    /// `var_decl_types[name]` hold a `string`? Resolves a TYPE PARAMETER (e.g.
+    /// `T _t;` where `T`→`string`) through the active specialization so the
+    /// `%p` argument quoting matches the concrete bound type.
+    fn p_local_is_string(&self, name: &str) -> bool {
+        use crate::ast::types::{DataType, SimpleType};
+        let Some(dt0) = self.module.var_decl_types.get(name).cloned() else {
+            return self.string_signals.contains(name);
+        };
+        let mut dt = dt0;
+        'walk: loop {
+            if matches!(dt, DataType::Simple { kind: SimpleType::String, .. }) {
+                return true;
+            }
+            match &dt {
+                DataType::TypeReference { name: tn, .. } => {
+                    let n = tn.name.name.as_str();
+                    // Type parameter -> concrete bound type name.
+                    if let Some(bound) = self.resolve_type_param_binding(n) {
+                        if let Some(bdt) = self.module.typedef_types.get(&bound).cloned() {
+                            dt = bdt;
+                            continue 'walk;
+                        }
+                        // `T` bound to a BUILT-IN (e.g. `T`→`int`/`string`):
+                        // only `string` is a quoted `%p` scalar.
+                        return bound == "string";
+                    }
+                    // Named typedef -> its base.
+                    if let Some(bdt) = self.module.typedef_types.get(n).cloned() {
+                        dt = bdt;
+                        continue 'walk;
+                    }
+                    // A class handle is not a string scalar.
+                    return false;
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Is a declared type SIGNED after resolving a TYPE PARAMETER to its
+    /// concrete bound (e.g. `T`→`int`) and following typedef aliases?
+    /// `is_type_signed(_resolved)` alone cannot bind `TypeReference("T")`, so a
+    /// scalar local `T _t` (in a `res#(int)` method) was never stamped signed
+    /// and `%0d`/`%p` rendered it unsigned (`3735928559`) where the reference
+    /// prints `-559038737`. Resolves the type param via the active
+    /// specialization (with the receiver-instance fallback a `super` call
+    /// needs) and judges the base kind like `is_type_signed`.
+    fn type_is_signed_concrete(&self, dt: &crate::ast::types::DataType) -> bool {
+        use crate::ast::types::DataType;
+        // Fast path: resolvable without a type parameter (typedefs only).
+        if super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types) {
+            return true;
+        }
+        let DataType::TypeReference { name: tn, .. } = dt else {
+            return super::elaborate::is_type_signed(dt);
+        };
+        let mut n = tn.name.name.to_string();
+        for _ in 0..64 {
+            // Is `n` a type parameter bound by the active specialization?
+            if let Some(bound) = self.resolve_type_param_binding(&n) {
+                // Binding to a concrete atom: judge like `is_type_signed`.
+                match bound.as_str() {
+                    "int" | "integer" | "longint" | "shortint" | "byte" => return true,
+                    _ => {
+                        let bdt = self.module.typedef_types.get(&bound).cloned();
+                        match bdt {
+                            Some(bt) if super::elaborate::is_type_signed(&bt) => return true,
+                            Some(DataType::TypeReference { name: bn, .. }) => {
+                                n = bn.name.name.to_string();
+                                continue;
+                            }
+                            _ => return false,
+                        }
+                    }
+                }
+            }
+            // Named typedef -> its base.
+            let bdt = self.module.typedef_types.get(&n).cloned();
+            match bdt {
+                Some(bt) if super::elaborate::is_type_signed(&bt) => return true,
+                Some(DataType::TypeReference { name: bn, .. }) => {
+                    n = bn.name.name.to_string();
+                    continue;
+                }
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// LRM §21.2.1.7 `%p` on the variable `name`: recursively render nested
@@ -84646,11 +85280,20 @@ impl Simulator {
                     // is active, each specialization gets its own static cell.
                     // This applies to statics declared in the spec's base class
                     // AND inherited from parameterized ancestors (per IEEE 1800-2023 §8.25).
-                    let active_spec = spec_override.or(self.current_spec.as_ref());
+                    // Fall back to synthesizing a spec from a CONCRETE receiver
+                    // (e.g. `ext1::ID()` where `ext1 extends base#(ext1)`) so any
+                    // static reachable through such a subclass is keyed per
+                    // specialization too — this is the generic home of the
+                    // concrete-receiver path, so it applies uniformly to static
+                    // calls, instance-inherited statics, and property reads.
+                    let active_spec = spec_override
+                        .or(self.current_spec.as_ref())
+                        .cloned()
+                        .or_else(|| self.derive_static_spec(start_class, &cname));
                     let key = match active_spec {
                         Some((base, sig))
-                            if (base == &cname
-                                || self.class_extends(base.as_str(), &cname))
+                            if (base == cname
+                                || self.class_extends(&base, &cname))
                                 && self.class_is_parameterized(&cname) =>
                         {
                             // For inherited statics (cname != base), derive
@@ -84660,7 +85303,7 @@ impl Simulator {
                             // `callbacks#(T,base_callback)` — which both
                             // extend `typed_callbacks#(T)` — share the
                             // same `m_tw_cb_q` static cell.
-                            if base == &cname {
+                            if base == cname {
                                 format!("{}#{}::{}", cname, self.canonicalize_spec_sig(&cname, sig.as_str()), prop)
                             } else if let Some(ancestor_sig) =
                                 self.ancestor_spec(base.as_str(), sig.as_str(), &cname)
@@ -84684,6 +85327,89 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// §8.25: derive the per-specialization signature of an ANCESTOR class
+    /// reached through a CONCRETE subclass — e.g. `ext1::ID()` where
+    /// `ext1 extends uvm_tlm_extension#(ext1)`. A static call like
+    /// `ext1::ID()` carries no `#(spec)` and has no instance, so `current_spec`
+    /// is None and inherited statics key the shared `Class::member` cell,
+    /// colliding across sibling specializations (`ext1::ID()` and
+    /// `ext2::ID()` returned the same singleton). Walk the receiver's extends
+    /// chain rebinding each parent's type params from `extends_type_args` until
+    /// `ancestor` is bound, and return its `(base, sig)` so the caller can seed
+    /// `current_spec`. Mirrors the assoc-key carry loop.
+    fn static_receiver_spec(&self, receiver: &str, ancestor: &str) -> Option<(String, String)> {
+        let mut carried: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut cur = Some(receiver.to_string());
+        let mut level = 0;
+        while let Some(cn) = cur {
+            level += 1;
+            if level > 64 {
+                return None;
+            }
+            let cd = self.module.classes.get(&cn)?;
+            if cn == ancestor {
+                let sig = self.rebind_class_sig(&cd, &carried);
+                return Some((cn, sig));
+            }
+            // Move to the parent, rebinding its type params from this class's
+            // extends type args.
+            let parent = cd.extends.clone()?;
+            if let Some(pcd) = self.module.classes.get(&parent) {
+                let order: Vec<String> = if pcd.param_order.is_empty() {
+                    pcd.type_param_names.clone()
+                } else {
+                    pcd.param_order.clone()
+                };
+                let mut next: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                for (i, pname) in order.iter().enumerate() {
+                    if let Some(arg) = cd.extends_type_args.get(i) {
+                        let a = arg.trim();
+                        let resolved = carried.get(a).cloned().unwrap_or_else(|| a.to_string());
+                        next.insert(pname.clone(), resolved);
+                    }
+                }
+                carried = next;
+            }
+            cur = Some(parent);
+        }
+        None
+    }
+
+    /// Rebuild a class's specialization signature string from a binding map of
+    /// its type/value parameter names to concrete leaves (declaration order).
+    fn rebind_class_sig(&self, cd: &crate::compiler::elaborate::ElaboratedClass, carried: &std::collections::HashMap<String, String>) -> String {
+        let order: Vec<String> = if cd.param_order.is_empty() {
+            cd.type_param_names.clone()
+        } else {
+            cd.param_order.clone()
+        };
+        order
+            .iter()
+            .map(|p| carried.get(p).cloned().unwrap_or_else(|| p.clone()))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// §8.25 generic spec derivation for a member accessed from subclass
+    /// `start_class` whose declaring class is `cname`. When no specialization is
+    /// already active (`current_spec`/`spec_override`) and `start_class` is a
+    /// CONCRETE subclass of a PARAMETERIZED `cname`, synthesize the declaring
+    /// class's specialization from the receiver's `extends_type_args`. This is
+    /// called from `static_prop_key_inner` so every static-member key — whether
+    /// reached by a static call, an instance-inherited static, or a bare
+    /// property read — is keyed per specialization regardless of the caller.
+    fn derive_static_spec(&self, start_class: &str, cname: &str) -> Option<(String, String)> {
+        if self.class_is_parameterized(start_class) || !self.class_is_parameterized(cname) {
+            return None;
+        }
+        if !self.class_extends(start_class, cname) {
+            return None;
+        }
+        self.static_receiver_spec(start_class, cname)
     }
 
     /// Resolve a CLASS-SCOPED constant `ClassName::member` — an enum literal
@@ -86250,6 +86976,41 @@ impl Simulator {
         self.static_fixed_key_in(cls, member)
     }
 
+    /// Is `member` a STATIC queue/assoc/dynamic-array collection property of
+    /// `start_class` or an ancestor (i.e. it is in `static_collections`)?
+    fn member_is_static_coll(&self, start_class: &str, member: &str) -> bool {
+        let mut cur = Some(start_class.to_string());
+        while let Some(cn) = cur {
+            if let Some(cd) = self.module.classes.get(&cn) {
+                if cd.static_collections.iter().any(|(n, _, _)| n == member) {
+                    return true;
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
+    /// Does `start_class` or an ancestor declare `name` as a STATIC
+    /// queue/assoc/dynamic-array collection (i.e. it is in
+    /// `static_collections`)?
+    fn collection_is_static_in(&self, start_class: &str, name: &str) -> bool {
+        let mut cur = Some(start_class.to_string());
+        while let Some(cn) = cur {
+            if let Some(cd) = self.module.classes.get(&cn) {
+                if cd.static_collections.iter().any(|(n, _, _)| n == name) {
+                    return true;
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
     fn instance_assoc_member(&self, name: &str) -> Option<String> {
         // §8.9: `Cls::member` / flattened `Cls.member` spellings of a static
         // fixed array resolve to the declaring class's store BEFORE the
@@ -86265,6 +87026,18 @@ impl Simulator {
         let Some(handle) = self.this_stack.last().copied().flatten().filter(|&h| h != 0)
         else {
             let ctx = self.class_context_stack.last().cloned().flatten()?;
+            // A static QUEUE/ASSOC/dynamic-ARRAY property of a (possibly
+            // parameterized) class, accessed BARE inside a static method
+            // (e.g. uvm_config_db's `static pool m_rsc[comp]`): route to its
+            // per-specialization store (`spec_static_coll_key` folds the
+            // active spec), so an ELEMENT read/write `m[k]` and the builtin
+            // ops (size/exists/...) agree on ONE store. Without this the
+            // element path resolved to the bare name ─ a DIFFERENT store from
+            // the per-spec key builtins use ─ so `m[k]=v` stored its value
+            // where the later `m[k]`/`exists` never looked (and vice-versa).
+            if self.collection_is_static_in(&ctx, name) {
+                return Some(self.spec_static_coll_key(name));
+            }
             return self.static_fixed_key_in(&ctx, name);
         };
         // Use the runtime class of `this` (from the heap) rather than the
@@ -86455,6 +87228,30 @@ impl Simulator {
                     // the class name as an object handle (0 → None), and the
                     // assoc-array first()/next() iteration silently fails.
                     if self.module.classes.contains_key(&bh.path[0].name.name) {
+                        // §8.25: an EXPLICITLY parameterized access
+                        // `config_db#(int)::m_rsc.exists(c)`/`.num()` arrives
+                        // here as a bare `Ident(config_db)` receiver (the outer
+                        // value-context eval strips the `Specialization`
+                        // wrapper before the builtin method dispatches). The
+                        // active `current_spec` still carries `(config_db,
+                        // int)`, so resolve the per-spec static-collection key
+                        // the same way the `Specialization` arm below does;
+                        // otherwise the read lands on bare `m_rsc` while the
+                        // matching write went to `config_db#(int)::m_rsc`, and
+                        // `exists()`/`num()` report empty.
+                        if let Some((cb, cs)) = &self.current_spec {
+                            if cb == &bh.path[0].name.name
+                                && self.member_is_static_coll(cb, &member.name)
+                            {
+                                let sb = cb.clone();
+                                let ss = cs.clone();
+                                let saved = self.current_spec.take();
+                                self.current_spec = Some((sb.clone(), ss));
+                                let key = self.static_prop_key(&sb, &member.name);
+                                self.current_spec = saved;
+                                return key;
+                            }
+                        }
                         if self.is_associative_array(&member.name) {
                             return Some(member.name.clone());
                         }
@@ -86512,6 +87309,32 @@ impl Simulator {
                     } else {
                         None
                     }
+                }
+                // `ClassName#(params)::static_coll` — a parameterized-class
+                // static collection (queue/assoc/array) reached through a
+                // class SPECIALIZATION receiver rather than `this`/an object.
+                // Resolve the per-spec storage key exactly like
+                // `spec_static_coll_key` does, so the assoc/queue store name
+                // matches the one builtin ops (push_back/size/...) use and is
+                // isolated per specialization. Without this the index/assoc
+                // read AND write both resolved to None, so `C#(int)::m["a"]=v`
+                // (and uvm_config_db's static per-component pool) was silently
+                // dropped on write and read back empty.
+                ExprKind::Specialization { .. } => {
+                    let Some((b, s)) = self.resolve_call_spec_params(
+                        Self::extract_call_spec(base),
+                        &self.current_spec.clone(),
+                    ) else {
+                        return None;
+                    };
+                    if self.member_is_static_coll(&b, &member.name) {
+                        let saved = self.current_spec.take();
+                        self.current_spec = Some((b.clone(), s.clone()));
+                        let key = self.static_prop_key(&b, &member.name);
+                        self.current_spec = saved;
+                        return key;
+                    }
+                    None
                 }
                 _ => None,
             },
@@ -87504,7 +88327,23 @@ impl Simulator {
                 break;
             };
             if has_method {
-                return Some(self.exec_method_in_class_hierarchy(0, &cname, method_name, args));
+                // §8.25: a static reached through a CONCRETE receiver but
+                // declared in a PARAMETERIZED ancestor (`ext1::ID()` where
+                // `ext1 extends base#(ext1)`) has no `#(spec)` on the call and
+                // no instance; seed current_spec from the receiver's extends
+                // chain so the body's BARE static member keys per-
+                // specialization. Generic: applies to any concrete receiver of
+                // a parameterized method (`derive_static_spec` is the shared
+                // path; this is its method-dispatch home).
+                if let Some(spec) = self.derive_static_spec(class_name, &cname) {
+                    let saved = self.current_spec.clone();
+                    self.current_spec = Some(spec);
+                    let v = self.exec_method_in_class_hierarchy(0, &cname, method_name, args);
+                    self.current_spec = saved;
+                    return Some(v);
+                }
+                let v = self.exec_method_in_class_hierarchy(0, &cname, method_name, args);
+                return Some(v);
             }
             cur = parent;
         }
@@ -87532,7 +88371,17 @@ impl Simulator {
                 break;
             };
             if has_method {
-                return Some(self.exec_method_in_class_hierarchy(0, &cname, method_name, args));
+                // §8.25: same generic receiver-specialization seeding as
+                // exec_static_method (see above).
+                if let Some(spec) = self.derive_static_spec(class_name, &cname) {
+                    let saved = self.current_spec.clone();
+                    self.current_spec = Some(spec);
+                    let v = self.exec_method_in_class_hierarchy(0, &cname, method_name, args);
+                    self.current_spec = saved;
+                    return Some(v);
+                }
+                let v = self.exec_method_in_class_hierarchy(0, &cname, method_name, args);
+                return Some(v);
             }
             cur = parent;
         }
@@ -90526,9 +91375,71 @@ impl Simulator {
         out
     }
 
-    /// Execute a module-level function call with arguments.
-    /// Is `dt` the `string` data type? Used to mark function return variables
-    /// and params so `var[i]` does byte (character) indexing, not bit-select.
+    /// Is a method's DECLARED return type a `string` AFTER resolving a TYPE
+    /// PARAMETER to its concrete bound (e.g. `virtual function T do_read();`
+    /// in `res#(T)`, specialized to `T=string`)? `is_string_data_type`
+    /// cannot answer that — the AST holds `TypeReference("T")`, and without
+    /// resolving it xezim treats the return as an integral width and
+    /// truncates an N-char string to 4 chars when the method returns. Only a
+    /// plainly-`string` verdict short-circuits that resize.
+    fn method_return_is_string(&self, rt: &crate::ast::types::DataType) -> bool {
+        use crate::ast::types::DataType;
+        if Self::is_string_data_type(rt) {
+            return true;
+        }
+        let DataType::TypeReference { name: tn, .. } = rt else {
+            return false;
+        };
+        // Follow a typedef chain, then a type-parameter binding, then its
+        // typedef, back to the base kind.
+        let mut n = tn.name.name.to_string();
+        loop {
+            // A type parameter in the ACTIVE specialization binds to a
+            // concrete type name (`T` -> `string` / `int` / ...).
+            let bound = self
+                .resolve_type_param_binding(&n)
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    // `current_spec` is cleared for a BASE/inherited method
+                    // reached via `super` (e.g. `super.do_read()` executes
+                    // `res#(string)::do_read` with no active specialization),
+                    // so fall back to the RECEIVER object's type bindings.
+                    let h = self.this_stack.last().copied().flatten()?;
+                    let inst = self.heap.get(h)?.as_ref()?;
+                    inst.type_bindings.get(&n).cloned()
+                });
+            if let Some(bound) = bound {
+                if bound == "string" {
+                    return true;
+                }
+                let bdt = self.module.typedef_types.get(&bound).cloned();
+                if let Some(bd) = bdt {
+                    if Self::is_string_data_type(&bd) {
+                        return true;
+                    }
+                    if let DataType::TypeReference { name: bn, .. } = &bd {
+                        n = bn.name.name.to_string();
+                        continue;
+                    }
+                }
+                return false;
+            }
+            let bdt = self.module.typedef_types.get(&n).cloned();
+            if let Some(bd) = bdt {
+                if Self::is_string_data_type(&bd) {
+                    return true;
+                }
+                if let DataType::TypeReference { name: bn, .. } = &bd {
+                    n = bn.name.name.to_string();
+                    continue;
+                }
+                return false;
+            }
+            return false;
+        }
+    }
+
+    /// Is `dt` directly the `string` data type (no typedef/param resolution)?
     fn is_string_data_type(dt: &crate::ast::types::DataType) -> bool {
         matches!(
             dt,
@@ -91184,7 +92095,7 @@ impl Simulator {
         &mut self,
         port: &crate::ast::decl::FunctionPort,
         arg: &Expression,
-    ) -> Option<(String, String)> {
+    ) -> Option<(String, String, Option<bool>)> {
         if !self.port_is_assoc_array(port) {
             return None;
         }
@@ -91209,6 +92120,7 @@ impl Simulator {
             self.signals.insert(k, v);
         }
         let is_string_key = self.is_string_keyed_array(&caller);
+        let prior = self.module.associative_arrays.get(&param).copied();
         self.module
             .associative_arrays
             .insert(param.clone(), is_string_key);
@@ -91217,17 +92129,35 @@ impl Simulator {
         if let Some(frame) = self.local_dyn.last_mut() {
             frame.insert(param.clone(), param.clone());
         }
-        Some((param, caller))
+        Some((param, caller, prior))
     }
 
-    /// Drop a formal associative array's entries and registration.
-    fn purge_assoc_param(&mut self, param: &str) {
+    /// Drop a formal associative array's entries and registration. Restores
+    /// any PRIOR registration an enclosing call had for the same name (see
+    /// `bind_assoc_param`'s captured `prior`): a nested call must not leave
+    /// the array unregistered after it returns just because its own formal
+    /// happens to share the name — the flat `module.associative_arrays` table
+    /// is shared across nesting depths.
+    fn purge_assoc_param(&mut self, param: &str, prior: Option<bool>) {
         let prefix = format!("{}[", param);
         let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
         for k in keys {
             self.signals.remove(&k);
         }
-        self.module.associative_arrays.remove(param);
+        match prior {
+            // An entry predated THIS call (it belongs to an enclosing frame
+            // whose bindings are still live) — put it back.
+            Some(is_string_key) => {
+                self.module
+                    .associative_arrays
+                    .insert(param.to_string(), is_string_key);
+            }
+            // This call created the registration; no enclosing frame wanted
+            // it — drop it.
+            None => {
+                self.module.associative_arrays.remove(param);
+            }
+        }
     }
 
     /// Copy a `ref`/`output`/`inout` associative formal back onto the caller's
@@ -91861,7 +92791,7 @@ impl Simulator {
             }
         }
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
-        let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
+        let mut assoc_params: Vec<(String, String, bool, Option<bool>)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
         // `output`/`inout`/`ref` STRUCT formals are bound member-wise (locals
         // `o.a`, `o.b`), so they bypass the whole-value `output_bindings`
@@ -91876,8 +92806,8 @@ impl Simulator {
             // An ASSOCIATIVE-array formal: functions bound nothing at all, so
             // `arr.size()` inside the body read 0.
             if i < args.len() {
-                if let Some((param, caller)) = self.bind_assoc_param(port, &args[i]) {
-                    assoc_params.push((param, caller, is_out));
+                if let Some((param, caller, prior)) = self.bind_assoc_param(port, &args[i]) {
+                    assoc_params.push((param, caller, is_out, prior));
                     continue;
                 }
                 // §13.5.2: bind member-wise, and for an output/inout/ref struct
@@ -92027,6 +92957,31 @@ impl Simulator {
                 } else if self.module.classes.contains_key(&type_name) {
                     self.record_local_class_type(&port.name.name, &type_name);
                     self.var_class_types.insert(port.name.name.clone(), type_name);
+                } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
+                    // The formal is typed with a class TYPE PARAMETER
+                    // (`IMP imp` inside a parameterized class, e.g. the
+                    // uvm_tlm_*_socket `new(name, parent, IMP imp=null)`).
+                    // `type_name` is not a real class name, so the branches
+                    // above silently skip it and `class_of_var` falls back to
+                    // a STALE same-named entry left in the flat
+                    // `var_class_types` by an unrelated scope (UVM's
+                    // config_db methods declare a local `imp` of concrete type
+                    // `uvm_config_db_implementation_t`). The local's record is
+                    // not scrubbed like a formal's, so `$cast(imp, parent)`
+                    // resolved `imp` to that WRONG class and failed it
+                    // (UVM/TLM2/NOIMP on a valid initiator socket). Record the
+                    // resolved concrete class so `$cast`/`new` see the right
+                    // type. Mirrors the local-VarDecl path (§8.25).
+                    let cn_is_class = self.module.classes.contains_key(&concrete)
+                        || (concrete.contains('#')
+                            && self
+                                .module
+                                .classes
+                                .contains_key(concrete.split('#').next().unwrap_or(&concrete)));
+                    if cn_is_class {
+                        self.record_local_class_type(&port.name.name, &concrete);
+                        self.var_class_types.insert(port.name.name.clone(), concrete);
+                    }
                 }
             }
             // Same §13.3 metadata registration as the task path.
@@ -92265,17 +93220,23 @@ impl Simulator {
             result.is_signed = super::elaborate::is_type_signed(&fd.return_type);
         }
         // Array formals copy element-wise; scalars go through `output_bindings`.
-        for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
+        for (param, caller, is_out, prior) in std::mem::take(&mut assoc_params) {
             if param == caller {
                 // Formal aliases the caller's namespace; the body's writes
                 // already live there. Copying back would duplicate, and
-                // purging would delete the caller's data. Leave as-is.
+                // purging would delete the caller's data. Restore the prior
+                // registration (a nested same-name formal must not leave the
+                // flat `module.associative_arrays` entry wrong).
+                match prior {
+                    Some(v) => { self.module.associative_arrays.insert(param.clone(), v); }
+                    None => { self.module.associative_arrays.remove(&param); }
+                }
                 continue;
             }
             if is_out {
                 self.writeback_assoc_param(&param, &caller);
             }
-            self.purge_assoc_param(&param);
+            self.purge_assoc_param(&param, prior);
         }
         // Capture the callee's queue formals now; the caller's shadowed
         // storage is restored below, and only then is the writeback
@@ -92725,7 +93686,7 @@ impl Simulator {
                 }
             }
         }
-        let mut assoc_params: Vec<(String, String, bool)> = Vec::new(); // (param_name, caller_array_name)
+        let mut assoc_params: Vec<(String, String, bool)> = Vec::new(); // (param_name, caller_array_name, is_out)
         let mut array_params: Vec<String> = Vec::new(); // param names with unpacked Range dim
         self.push_queue_frame();
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
@@ -92938,7 +93899,7 @@ impl Simulator {
                             &port.data_type,
                             &self.module.typedef_types,
                         );
-                    } else if super::elaborate::is_type_signed(&port.data_type) {
+                    } else if self.type_is_signed_concrete(&port.data_type) {
                         val.is_signed = true;
                     }
                     locals.insert(port.name.name.clone(), val);
@@ -95206,6 +96167,24 @@ impl Simulator {
                     // parameterized context (`uvm_resource#(T)` where `T` is
                     // config_db's own param) — resolve it to the concrete type so
                     // the instance's binding is `T -> int`, not `T -> T`.
+                    //
+                    // A type arg that is a SPECIALIZATION of the ENCLOSING class's
+                    // own parameter (`uvm_callback_iter#(special_comp#(N),...)` on
+                    // a special_comp#(N) instance) carries a bare value-parameter
+                    // name `N` in its `#(...)`. leaf_ident_name returns the raw
+                    // `special_comp#(N)` string, so binding `T -> "special_comp#(N)"`
+                    // captures N as literal text and every later `T`-param
+                    // resolution inside the iterator's methods (`first()` calling
+                    // `uvm_callbacks#(T,CB)::get_first`) ends up at the un-
+                    // specialized `special_comp` cell — empty typewide queue,
+                    // so `get_first`/`first()` returned null. Resolve the
+                    // `#(N)` args through the ACTIVE specialization here, so the
+                    // binding is the concrete `special_comp#(1)`.
+                    let concrete = if concrete.contains('(') && matches!(ta.kind, ExprKind::Specialization { .. }) {
+                        self.expr_to_spec_fragment(ta).unwrap_or(concrete)
+                    } else {
+                        concrete
+                    };
                     bound = Some(
                         self.resolve_type_param_binding(&concrete)
                             .unwrap_or(concrete),
@@ -102599,7 +103578,7 @@ impl Simulator {
                     .map(|name| self.snapshot_formal_metadata(name))
                     .collect();
                 let ret_is_string = matches!(&method.kind,
-                    ClassMethodKind::Function(f) if Self::is_string_data_type(&f.return_type));
+                    ClassMethodKind::Function(f) if self.method_return_is_string(&f.return_type));
                 // A packed return type whose range references a CLASS
                 // parameter (`function bit [W-1:0] mk();`) can only be
                 // sized per instance — capture it for the clamp at the
@@ -102642,7 +103621,7 @@ impl Simulator {
                 }
                 let mut queue_writebacks: Vec<(String, String)> = Vec::new();
                 let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
-                let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
+                let mut assoc_params: Vec<(String, String, bool, Option<bool>)> = Vec::new();
                 // Member-wise struct `output`/`inout`/`ref` formals bypass the
                 // whole-value `output_bindings` path (see exec_function_call).
                 let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
@@ -102668,14 +103647,14 @@ impl Simulator {
                         output_bindings.push((port.name.name.clone(), args[i].clone()));
                     }
                     if i < args.len() {
-                        if let Some((param, caller)) = self.bind_assoc_param(port, &args[i]) {
+                        if let Some((param, caller, prior)) = self.bind_assoc_param(port, &args[i]) {
                             let is_out = matches!(
                                 port.direction,
                                 PortDirection::Output
                                     | PortDirection::Inout
                                     | PortDirection::Ref
                             );
-                            assoc_params.push((param, caller, is_out));
+                            assoc_params.push((param, caller, is_out, prior));
                             continue;
                         }
                         // §13.5.2: a formal with an unpacked QUEUE / array
@@ -102874,6 +103853,13 @@ impl Simulator {
                                 val
                             };
                             val.is_signed = signed;
+                        } else if self.type_is_signed_concrete(&port.data_type) {
+                            // A TYPE-PARAMETER formal (`T t` with `T`->`int`)
+                            // isn't a resolvable integral typedef, so
+                            // `scalar_formal_integral` falls through; still
+                            // stamp the resolved signedness so `%p`/`%0d` on a
+                            // `T=int` formal renders signed like the reference.
+                            val.is_signed = true;
                         }
                     } else if super::elaborate::is_type_signed(&port.data_type) {
                         val.is_signed = true;
@@ -102888,6 +103874,30 @@ impl Simulator {
                         } else if self.module.classes.contains_key(&type_name) {
                             self.record_local_class_type(&port.name.name, &type_name);
                             self.var_class_types.insert(port.name.name.clone(), type_name.clone());
+                        } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
+                            // See the identical branch in exec_function_call's
+                            // port loop: the formal is typed with a class TYPE
+                            // PARAMETER (`IMP imp`), not a real class name. It
+                            // used to be skipped, so `class_of_var` fell back
+                            // to a STALE same-named `var_class_types` entry from
+                            // an unrelated scope (UVM's config_db methods)
+                            // and `$cast(imp, parent)` resolved `imp` to the
+                            // WRONG class — failing a valid TLM initiator
+                            // socket with UVM/TLM2/NOIMP. Record the resolved
+                            // concrete class so the cast/new sees the right
+                            // type (mirrors the local-VarDecl path, §8.25).
+                            let cn_is_class = self.module.classes.contains_key(&concrete)
+                                || (concrete.contains('#')
+                                    && self
+                                        .module
+                                        .classes
+                                        .contains_key(
+                                            concrete.split('#').next().unwrap_or(&concrete),
+                                        ));
+                            if cn_is_class {
+                                self.record_local_class_type(&port.name.name, &concrete);
+                                self.var_class_types.insert(port.name.name.clone(), concrete);
+                            }
                         }
                     }
                     locals.insert(port.name.name.clone(), val);
@@ -103134,6 +104144,26 @@ impl Simulator {
                         }
                     }
                 }
+                // §8.25 (generic receiver specialization): when a method is
+                // reached on a CONCRETE receiver (static, `ext1::ID()`; or
+                // instance, `x3.get_type_handle()`) but is DECLARED in a
+                // PARAMETERIZED ancestor (`uvm_tlm_extension#(ext1)`), the
+                // receiver's `#(...)` specialization is not captured anywhere
+                // once the body runs a BARE static member like `m_singleton`.
+                // Seed current_spec from the concrete receiver's extends chain
+                // so the body's inner static access keys per specialization.
+                if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
+                    if !self.class_is_parameterized(&inst.class_name)
+                        && self.class_is_parameterized(&cname)
+                        && self.class_extends(&inst.class_name, &cname)
+                    {
+                        if let Some(spec) =
+                            self.static_receiver_spec(&inst.class_name, &cname)
+                        {
+                            self.current_spec = Some(spec);
+                        }
+                    }
+                }
                 self.this_stack.push(Some(handle));
                 // §23.8 / §23.10.1: hierarchical names in the method body
                 // resolve upward from the object's CREATION scope, not the
@@ -103370,14 +104400,23 @@ impl Simulator {
                 // §13.5.2: copy `output`/`inout`/`ref` associative-array
                 // formals back onto the caller's AA (signal-namespace
                 // merge), then drop the formal's temporary copy.
-                for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
+                for (param, caller, is_out, prior) in std::mem::take(&mut assoc_params) {
                     if param == caller {
+                        // Identity binding — the body's writes landed directly
+                        // in the caller's namespace; just restore the prior
+                        // registration (a nested same-name formal must not
+                        // leave the flat `module.associative_arrays` entry
+                        // clobbered).
+                        match prior {
+                            Some(v) => { self.module.associative_arrays.insert(param.clone(), v); }
+                            None => { self.module.associative_arrays.remove(&param); }
+                        }
                         continue;
                     }
                     if is_out {
                         self.writeback_assoc_param(&param, &caller);
                     }
-                    self.purge_assoc_param(&param);
+                    self.purge_assoc_param(&param, prior);
                 }
                 for saved in formal_metadata.into_iter().rev() {
                     self.restore_formal_metadata(saved);

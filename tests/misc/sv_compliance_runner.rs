@@ -312,6 +312,10 @@ fn test_sv_49_specparam_hierarchical() {
     run_positive_compliance_test("tests_advanced", "49_specparam_hierarchical.sv");
 }
 #[test]
+fn test_sv_50_wreal_nets() {
+    run_positive_compliance_test("tests_advanced", "50_wreal_nets.sv");
+}
+#[test]
 fn test_sv_41_genfor_localparam_idx() {
     run_positive_compliance_test("tests_advanced", "41_genfor_localparam_idx.sv");
 }
@@ -375,4 +379,8 @@ fn test_sv_neg10_duplicate_enum_literal() {
 #[test]
 fn test_sv_neg11_missing_named_port() {
     run_negative_compliance_test("neg11_missing_named_port.sv");
+}
+#[test]
+fn test_sv_neg13_wreal_packed_range() {
+    run_negative_compliance_test("neg13_wreal_packed_range.sv");
 }

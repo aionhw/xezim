@@ -37,16 +37,16 @@ fn parse_ams(src: &str) -> sv_parser::ast::SourceText {
 
 /// §3.7: `wreal [ discipline_identifier ] [ range ] list_of_net_identifiers ;`
 ///
-/// All three shapes must keep the real data type. The discipline and the range
-/// are parsed and dropped (the net stays scalar and undisciplined), but losing
-/// `real` is the failure that matters — it is silent and it corrupts values.
+/// The bare and discipline-qualified forms must keep the real data type. The
+/// discipline is parsed and dropped (nets carry no discipline yet); losing
+/// `real` is the failure that matters, because it is silent and it rounds
+/// every value written to the net.
 #[test]
 fn every_wreal_declaration_form_keeps_the_real_type() {
     let ast = parse_ams(
         r#"
 module m;
   wreal electrical wd;
-  wreal [3:0] wv;
   wreal plain;
 endmodule
 "#,
@@ -60,8 +60,8 @@ endmodule
             _ => None,
         })
         .collect();
-    assert_eq!(nets.len(), 3, "three wreal declarations");
-    for (nd, want) in nets.iter().zip(["wd", "wv", "plain"]) {
+    assert_eq!(nets.len(), 2, "two wreal declarations");
+    for (nd, want) in nets.iter().zip(["wd", "plain"]) {
         assert!(
             matches!(nd.net_type, NetType::Wreal(_)),
             "{want}: net type must be wreal, got {:?}",
@@ -70,10 +70,39 @@ endmodule
         assert!(
             matches!(nd.data_type, DataType::Real { .. }),
             "{want}: a wreal must carry `real`, got {:?} — a real driven onto \
-             this net would truncate",
+             this net would round",
             nd.data_type
         );
         assert_eq!(nd.declarators[0].name.name, want);
+    }
+}
+
+/// §3.7's grammar admits `[ range ]`, but a ranged `wreal` is modelled as ONE
+/// real rather than a vector of them, so it is REJECTED rather than accepted
+/// and quietly flattened — accepting it makes the net an ordinary bit vector
+/// that rounds every value, which is the corruption `wreal` exists to prevent.
+///
+/// Both spellings are pinned because they reach the check by different paths:
+/// a declaration arrives as an `Implicit` with packed dimensions, an ANSI port
+/// through the port arm. They disagreed once — the declaration was accepted
+/// while the port was rejected — so neither on its own is enough.
+#[test]
+fn a_ranged_wreal_is_rejected_in_both_positions() {
+    for src in [
+        "module m; wreal [3:0] w; endmodule",
+        "module m (input wreal [3:0] p); endmodule",
+    ] {
+        let errs = with_ams(|| {
+            sv_parser::parse(src)
+                .errors
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            errs.iter().any(|e| e.contains("ranged 'wreal'")),
+            "expected a ranged-wreal diagnostic for {src:?}, got {errs:?}"
+        );
     }
 }
 

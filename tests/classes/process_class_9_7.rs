@@ -254,3 +254,69 @@ fn await_in_forever_body_blocks() {
         msgs
     );
 }
+
+// ── §9.7 enum constants (`process::KILLED`, …) inside subroutine bodies ──
+// The state-enum constants (`process::FINISHED`=0 … `process::KILLED`=4) are
+// resolved through the flat hier-Ident form at module/initial scope, but
+// inside a function/task/class-method body the parser represents `process::X`
+// as `MemberAccess(Ident("process"), X)`, which fell through to an object-
+// property read and returned 0. So `p.status() == process::KILLED` was ALWAYS
+// false inside a subroutine and a killed process's state was never
+// recognized as such (e.g. a FIFO's zombie-get sweep never cleared killed
+// waiters). The documented values apply inside subroutines.
+
+const ENUM_IN_SUBROUTINE_SRC: &str = r#"
+module top;
+  class C;
+    function int kstatus();
+      return process::KILLED;
+    endfunction
+    function bit is_killed(process p);
+      return (p.status() == process::KILLED);
+    endfunction
+  endclass
+
+  function int module_fn();
+    return process::WAITING;
+  endfunction
+
+  initial begin
+    C c;
+    process p;
+    c = new();
+    fork
+      begin
+        p = process::self();
+        #1000;
+      end
+    join_none
+    #10;
+    p.kill();
+    #1;
+    $display("RESULT kstatus_in_method=%0d", c.kstatus());     // 4
+    $display("RESULT waiting_in_function=%0d", module_fn());   // 2
+    $display("RESULT is_killed=%0d", c.is_killed(p));          // 1
+  end
+endmodule
+"#;
+
+#[test]
+fn process_enum_constants_resolve_inside_subroutines() {
+    let sim = simulate(ENUM_IN_SUBROUTINE_SRC, 1000).expect("simulate failed");
+    let msgs = messages(&sim);
+    assert!(
+        msgs.iter().any(|m| m == "RESULT kstatus_in_method=4"),
+        "process::KILLED must be 4 inside a class method; got {:?}",
+        msgs
+    );
+    assert!(
+        msgs.iter().any(|m| m == "RESULT waiting_in_function=2"),
+        "process::WAITING must be 2 inside a module function; got {:?}",
+        msgs
+    );
+    assert!(
+        msgs.iter().any(|m| m == "RESULT is_killed=1"),
+        "comparing p.status()==process::KILLED inside a method must be true for a killed process; got {:?}",
+        msgs
+    );
+}

@@ -90,12 +90,19 @@ endmodule
     assert_eq!(r(&sim, "n"), 1.5);
 }
 
-/// AMS §3.7: a plain `wreal` permits ONE driver. Two must be a clean error —
-/// silently picking one would produce a plausible waveform from a design the
-/// standard does not define.
+/// §3.7 defines `wreal` only for a net "driven by a single driver" and says
+/// nothing about more, so the multi-driver fold is tool-defined. xezim sums,
+/// which is what makes a current-summing wrapper mean what it says — several
+/// stages each drive a contribution onto a shared node and the node sees the
+/// total. Summing is also an identity on ONE driver, so §3.7's defined case is
+/// unaffected; `a_wreal_net_carries_a_real_value` pins that half.
+///
+/// (This branch briefly made two drivers an ERROR and required an explicit
+/// `wrealsum`. Trunk's sum-by-default won on merge — see
+/// `tests/sv_compliance/tests_advanced/50_wreal_nets.sv`.)
 #[test]
-fn a_plain_wreal_rejects_multiple_drivers() {
-    let err = with_ams(|| {
+fn a_plain_wreal_sums_its_drivers() {
+    let sim = with_ams(|| {
         simulate(
             r#"
 module tb;
@@ -103,20 +110,14 @@ module tb;
   real a, b;
   assign n = a;
   assign n = b;
-  initial begin a = 1.0; b = 2.0; #1; end
+  initial begin a = 1.0; b = 2.5; #1; end
 endmodule
 "#,
             10,
         )
-        .err()
-        .expect("two drivers on a plain wreal must be rejected")
+        .expect("two drivers on a plain wreal must resolve, not fail")
     });
-    assert!(err.contains("wreal"), "{}", err);
-    assert!(
-        err.contains("wrealsum"),
-        "the error must name the resolved forms: {}",
-        err
-    );
+    assert_eq!(r(&sim, "n"), 3.5);
 }
 
 /// A `wreal` crossing an ANSI module port, driven from two INSTANCES. This is
@@ -174,26 +175,50 @@ endmodule
     assert_eq!(r(&sim, "node"), 2.5);
 }
 
-/// The gate itself. `wreal`, `wrealsum`, … are NOT IEEE 1800 keywords, and
-/// reserving them unconditionally would reject designs that compile today.
-/// With AMS off they must lex as ordinary identifiers.
+/// The gate. `wreal` itself is NOT gated — trunk reserves it in the main
+/// keyword table like `uwire`, and its compliance tests use it in plain `.sv`
+/// files. The VENDOR spellings are: `wrealsum`/`wrealavg`/`wrealmin`/
+/// `wrealmax` appear in neither Verilog-AMS 2.4.0 nor VAMS-2023 (§3.7 admits
+/// `wreal` alone), so reserving them unconditionally would take four
+/// plausible identifiers away from designs that compile today.
 #[test]
-fn gate_is_off_by_default() {
+fn only_the_vendor_spellings_are_gated() {
     let sim = without_ams(|| {
         simulate(
             r#"
 module tb;
-  integer wreal, wrealsum, wrealavg, wrealmin, wrealmax;
+  integer wrealsum, wrealavg, wrealmin, wrealmax;
   initial begin
-    wreal = 1; wrealsum = 2; wrealavg = 3; wrealmin = 4; wrealmax = 5;
+    wrealsum = 2; wrealavg = 3; wrealmin = 4; wrealmax = 5;
     #1;
   end
 endmodule
 "#,
             10,
         )
-        .expect("AMS keywords must be plain identifiers with the gate off")
+        .expect("the vendor spellings must be plain identifiers with the gate off")
     });
-    assert_eq!(u(&sim, "wreal"), Some(1));
+    assert_eq!(u(&sim, "wrealsum"), Some(2));
     assert_eq!(u(&sim, "wrealmax"), Some(5));
+}
+
+/// …and `wreal` works with no flag at all, which is what trunk's compliance
+/// tests rely on.
+#[test]
+fn wreal_needs_no_flag() {
+    let sim = without_ams(|| {
+        simulate(
+            r#"
+module tb;
+  wreal n;
+  real a;
+  assign n = a;
+  initial begin a = 1.25; #1; end
+endmodule
+"#,
+            10,
+        )
+        .expect("wreal is an ordinary reserved net type")
+    });
+    assert_eq!(r(&sim, "n"), 1.25);
 }

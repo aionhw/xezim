@@ -197,3 +197,5 @@ mod waiter_cont_anyedge_wake;
 mod nested_delay_slot_servicing;
 #[path = "scheduling/finish_with_live_fork_child.rs"]
 mod finish_with_live_fork_child;
+#[path = "scheduling/nba_array_elem_last_write_wins.rs"]
+mod nba_array_elem_last_write_wins;

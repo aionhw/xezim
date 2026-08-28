@@ -357,6 +357,41 @@ scalar and undisciplined, so `wreal [3:0] w` is one real, not four);
 a `wire`/`tri` through a port resolves to `wreal` is not modelled. §3.7's
 second production, `wreal w = expr;`, works and is now tested.
 
+## 5c. Reconciliation with main (PR #36)
+
+`main` landed `wreal` independently (`aa0de17`) while this branch was building
+it. Two real implementations of one feature, so the merge was a
+reconciliation, and where the two disagreed on observable behavior **trunk
+won** — its tests are in the `sv_compliance` suite, and the alternative was
+editing trunk's tests to suit the branch.
+
+| | this branch had | merged result |
+|---|---|---|
+| `wreal` keyword | gated behind `--ams` | **ungated** — reserved like `uwire`; trunk's tests use it in plain `.sv` |
+| multiple drivers | an error, requiring `wrealsum` | **summed** — §3.7 defines only the single-driver case, so the fold is tool-defined, and summing is an identity on one driver |
+| ranged `wreal` | parsed, range dropped | **rejected** — flattening it silently makes the net a bit vector that rounds |
+| vendor spellings | gated | unchanged (still `--ams`; they are in neither LRM edition) |
+| discipline identifier | handled | kept, folded into trunk's shared helper |
+
+Structure follows trunk: its `wreal_data_type` helper is the single path for
+nets and both port forms. This branch's separate handling is gone. Keeping it
+had left the two forms disagreeing — a ranged *declaration* was accepted while
+a ranged *port* was rejected.
+
+Resolution splits by what each mechanism can express. `Sum` folds through
+trunk's `ResolvedNetKind::RealSum` alongside the other net kinds. `Avg`/`Min`/
+`Max` cannot: a streaming chain has neither the driver count an average needs
+nor all the drivers at once that a min/max needs to fold without duplicating
+its accumulator into both arms of a `?:`. Those keep the §6.6.7 resolver path,
+which collects the drivers first.
+
+One correction went the other way: trunk's `neg13_wreal_packed_range.sv` cited
+"Verilog-AMS 2.4 §3.8" and stated the language has no ranged `wreal`. §3.7 —
+the section this audit corrected — does admit
+`wreal [ discipline_identifier ] [ range ] ...`, so the range is legal syntax
+that xezim declines to model. The test's comment now says that; its behavior
+is unchanged.
+
 ## 6. Open items — decide before writing code
 
 1. ~~**`wreal` resolution spelling**~~ **ANSWERED — audited against the LRM,

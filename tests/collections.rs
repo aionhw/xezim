@@ -85,5 +85,7 @@ mod queue_dyn_write_semantics;
 
 #[path = "collections/assoc_of_struct.rs"]
 mod assoc_of_struct;
+#[path = "collections/queue_concat_index_prefilled_prefix.rs"]
+mod queue_concat_index_prefilled_prefix;
 #[path = "collections/foreach_live_size_bounds.rs"]
 mod foreach_live_size_bounds;

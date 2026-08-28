@@ -49,3 +49,4 @@ file,topic,description
 46_nettype_hierarchy.sv,user-defined nettypes across hierarchy,nettype nets driven from several module instances through ports; Millman resolution over a nested dut catches per-port double resolution
 47_nettype_coercion.sv,nettype coercion of implicit nets,implicit net used as a port actual takes the port user-defined nettype (§6.6.8/§23.3.3)
 49_specparam_hierarchical.sv,specparam hierarchical access,specparam is a module-scoped elaboration constant reachable by hierarchical name (§6.20.5/§23.3.3) including through generate scopes and specify-block uses
+50_wreal_nets.sv,Verilog-AMS wreal nets,net whose value is a real with multiple drivers resolved by summing (KCL current summing); scalar and port forms

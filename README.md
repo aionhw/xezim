@@ -128,16 +128,21 @@ gives the SystemVerilog-over-Verilog additions.
   functions, and **user-defined nettypes with resolution functions**
   (§6.6.7, plain SystemVerilog — no `--ams` needed). This is the substrate the
   AMS stages lower onto.
-* **`wreal` real nets** (AMS §3.7) — the LRM declaration form
-  `wreal [discipline] [range] names;` on net declarations and on both ANSI and
+* **`wreal` real nets** (AMS §3.7) — on net declarations and on both ANSI and
   non-ANSI module ports. An undriven `wreal` reads `0.0`, not `z`, as §3.7
-  requires. §3.7 defines `wreal` for a net driven by a **single** driver;
-  xezim enforces that, and a second driver on a plain `wreal` is a clean error
-  rather than a silent pick.
+  requires. Available with **no flag**: `wreal` is an ordinary reserved net
+  type, like `uwire`.
 
-  The optional discipline identifier and range are **parsed and ignored** —
-  the net is scalar and carries no discipline, so `wreal [3:0] w` elaborates
-  as one real, not four.
+  §3.7 defines `wreal` only for a net driven by a **single** driver and says
+  nothing about more, so the multi-driver fold is tool-defined: xezim **sums**
+  the drivers, which is what makes a current-summing wrapper mean what it says
+  and is an identity on one driver.
+
+  The optional discipline identifier is **parsed and ignored** (nets carry no
+  discipline yet). A **range is rejected**: the grammar admits
+  `wreal [ discipline ] [ range ] names`, but xezim models a `wreal` as one
+  real rather than a vector of them, and accepting the range would quietly
+  turn the net into an ordinary bit vector that rounds every value.
 * **`ground`** (AMS §3.6.4) — parse-accepted and ignored. The global reference
   node only means something to the analog solver.
 * **Natures and disciplines** (AMS §3.6.1, §3.6.2) — `nature … endnature`
@@ -172,14 +177,15 @@ and testbench flows. Portable code should not rely on them.
   Verilog-XL/VCS system task, **not** in the LRM. xezim matches the vendor
   semantics — a variable keeps the deposited value, and a real driver on a net
   overrides a deposit on its next update.
-* **`wrealsum` / `wrealavg` / `wrealmin` / `wrealmax`** — resolved `wreal`
-  net types, for a node with more than one driver. **Not in the Verilog-AMS
+* **`wrealsum` / `wrealavg` / `wrealmin` / `wrealmax`** — `wreal` net types
+  that name their driver resolution explicitly. **Not in the Verilog-AMS
   LRM**: §3.7 defines only `wreal`, and neither the 2.4.0 nor the 2023 edition
   mentions these spellings anywhere. They are the de-facto vendor form for
-  real-net driver resolution, which the standard leaves to the tool, and they
-  require `--ams` like the rest of the AMS syntax. `wrealsum` sums the
-  drivers, `wrealavg` averages them, `wrealmin`/`wrealmax` select. Portable
-  Verilog-AMS should drive a `wreal` from one source and resolve in a model.
+  real-net driver resolution, which the standard leaves to the tool, and
+  unlike plain `wreal` they require `--ams`. `wrealsum` is an explicit
+  spelling of the default; `wrealavg` averages, `wrealmin`/`wrealmax` select.
+  Portable Verilog-AMS should drive a `wreal` from one source and resolve in a
+  model.
 * Gate-level-simulation CLI flags — `+nospecify`, `+notimingcheck`,
   `+delay_mode_zero`/`+delay_mode_unit`, `+mindelays`/`+typdelays`/`+maxdelays`,
   and the `-v`/`-y`/`+libext+` library flags — mirror the commercial spellings.

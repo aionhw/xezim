@@ -9665,7 +9665,23 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         nba_targets.sort_unstable();
-        let nba_dup_targets = nba_targets.windows(2).any(|w| w[0] == w[1]);
+        // Array-element NBAs resolve their target id at RUN time (dynamic
+        // index), so two of them — or one plus a scalar NBA that a constant
+        // index folded to an element id — can collide without appearing in
+        // `nba_targets`. Any array NBA alongside another NBA marks the block
+        // conservatively; the scan it enables is a short rposition over the
+        // block's own queue, and single-NBA blocks (the overwhelming
+        // majority) still take the plain push path.
+        let array_nbas = self
+            .insns
+            .iter()
+            .filter(|i| {
+                matches!(i, Insn::NbaAssignArray(..) | Insn::NbaAssignArrayRange(..))
+            })
+            .count();
+        let total_nbas = nba_targets.len() + array_nbas;
+        let nba_dup_targets = nba_targets.windows(2).any(|w| w[0] == w[1])
+            || (array_nbas >= 1 && total_nbas >= 2);
         CompiledBlock {
             num_regs: self.next_reg,
             instructions: self.insns,
