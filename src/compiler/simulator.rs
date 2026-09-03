@@ -2473,6 +2473,12 @@ struct SvaClockedSite {
     /// and swapped in while this site's predicate is evaluated, so the
     /// property samples pre-edge values (see `eval_sva_sampled`).
     sampled_ids: Vec<usize>,
+    /// LRM §16.5 assertion kind, same u8 tagging the immediate path uses:
+    /// 0 assert, 1 assume, 2 cover. Carried here because the tally is
+    /// written long after the statement is gone, and a `cover property`
+    /// recorded as an assert both mislabels the site and counts a cycle
+    /// that simply did not hit as a failure.
+    kind: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -63918,6 +63924,11 @@ impl Simulator {
                                 pass_action: a.action.as_deref().cloned(),
                                 fail_action: a.else_action.as_deref().cloned(),
                                 sampled_ids,
+                                kind: match a.kind {
+                                    AssertionKind::Assert => 0,
+                                    AssertionKind::Assume => 1,
+                                    AssertionKind::Cover => 2,
+                                },
                             });
                         }
                         return;
@@ -69430,6 +69441,11 @@ impl Simulator {
             // LRM §16.5.1: the referenced-signal ids whose Preponed samples
             // this fire's predicates must read (see eval_sva_sampled).
             let sampled_ids = self.sva_sites[i].sampled_ids.clone();
+            // LRM §16.5: tally under the kind the source actually wrote.
+            // Every stat below used to be created as `assert`, so a
+            // `cover property` was reported as an assertion -- and a clock
+            // where it simply did not hit was reported as a FAILURE.
+            let site_kind = self.sva_sites[i].kind;
             // 1) Drain pending consequents whose counter is 1 (they're
             //    due this cycle), decrement the rest.
             let mut due: Vec<Expression> = Vec::new();
@@ -69459,7 +69475,7 @@ impl Simulator {
                         .assertion_stats
                         .entry(span_key_for_evt)
                         .or_insert_with(|| AssertionStat {
-                            kind: 0,
+                            kind: site_kind,
                             pass_count: 0,
                             fail_count: 0,
                         });
@@ -69483,11 +69499,15 @@ impl Simulator {
                         .assertion_stats
                         .entry(span_key_for_evt)
                         .or_insert_with(|| AssertionStat {
-                            kind: 0,
+                            kind: site_kind,
                             pass_count: 0,
                             fail_count: 0,
                         });
-                    stat.fail_count += 1;
+                    if site_kind != 2 {
+                        // See above: a cover does not fail, it just does
+                        // not hit.
+                        stat.fail_count += 1;
+                    }
                     self.fire_sva_action(i, false);
                 }
             }
@@ -69498,13 +69518,17 @@ impl Simulator {
                     .assertion_stats
                     .entry(span_key)
                     .or_insert_with(|| AssertionStat {
-                        kind: 0, /* assert */
+                        kind: site_kind,
                         pass_count: 0,
                         fail_count: 0,
                     });
                 if v {
                     stat.pass_count += 1;
-                } else {
+                } else if site_kind != 2 {
+                    // LRM §16.12: a cover property has hits, not verdicts.
+                    // A clock where it did not hit is simply not a hit --
+                    // counting it as a failure turns an uncovered property
+                    // into a red regression.
                     stat.fail_count += 1;
                 }
                 self.fire_sva_action(i, v);
@@ -69612,6 +69636,9 @@ impl Simulator {
         body: &Expression,
         sampled_ids: &[usize],
     ) {
+        // Same reason as in tick_sva_sites: tally under the kind the
+        // source wrote, so a `cover property` is not filed as an assert.
+        let site_kind = self.sva_sites[site_idx].kind;
         // LRM §16.6 `disable iff (g)` wrapper. The parser encodes the
         // clause as `Binary{LogAnd, !g, inner_body}`. When `g` is true
         // (so `!g` is false), the property is suppressed for this
@@ -69695,7 +69722,7 @@ impl Simulator {
                         self.assertion_stats
                         .entry(span_key)
                         .or_insert_with(|| AssertionStat {
-                            kind: 0,
+                            kind: site_kind,
                             pass_count: 0,
                             fail_count: 0,
                         });
@@ -69724,13 +69751,17 @@ impl Simulator {
                     .assertion_stats
                     .entry(span_key)
                     .or_insert_with(|| AssertionStat {
-                        kind: 0,
+                        kind: site_kind,
                         pass_count: 0,
                         fail_count: 0,
                     });
                 if outcome {
                     stat.pass_count += 1;
-                } else {
+                } else if site_kind != 2 {
+                    // LRM §16.12: a cover property has hits, not verdicts.
+                    // A clock where it did not hit is simply not a hit --
+                    // counting it as a failure turns an uncovered property
+                    // into a red regression.
                     stat.fail_count += 1;
                 }
                 self.fire_sva_action(site_idx, outcome);
@@ -69742,13 +69773,17 @@ impl Simulator {
                     .assertion_stats
                     .entry(span_key)
                     .or_insert_with(|| AssertionStat {
-                        kind: 0,
+                        kind: site_kind,
                         pass_count: 0,
                         fail_count: 0,
                     });
                 if outcome {
                     stat.pass_count += 1;
-                } else {
+                } else if site_kind != 2 {
+                    // LRM §16.12: a cover property has hits, not verdicts.
+                    // A clock where it did not hit is simply not a hit --
+                    // counting it as a failure turns an uncovered property
+                    // into a red regression.
                     stat.fail_count += 1;
                 }
                 self.fire_sva_action(site_idx, outcome);
