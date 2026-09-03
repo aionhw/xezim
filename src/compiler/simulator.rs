@@ -33309,7 +33309,10 @@ impl Simulator {
     /// ends by --max-time without $finish, and (abbreviated) with
     /// XEZIM_PROGRESS ticks.
     fn report_parked_waiters(&mut self, max_n: usize) {
-        if self.event_waiters.is_empty() && self.condition_waiters.is_empty() {
+        if self.event_waiters.is_empty()
+            && self.condition_waiters.is_empty()
+            && self.nba_region_waiters.is_empty()
+        {
             return;
         }
         let mut order: Vec<usize> = (0..self.event_waiters.len()).collect();
@@ -33386,6 +33389,21 @@ impl Simulator {
                 .unwrap_or_else(|| "<unknown location>".to_string());
             eprintln!(
                 "[xezim][hang-report]   pid {} blocked in wait(condition) — resumes at {}",
+                pid, loc
+            );
+        }
+        // §15.5: a process parked on `@(procedural_var)` for a procedural
+        // NBA-region variable (e.g. `uvm_wait_for_nba_region`'s `nba <= next_nba;
+        // @(nba)`) lingers in `nba_region_waiters` until the Reactive region's
+        // NBA commit — flush that lane before declaring a hang so a spin parked
+        // there is not reported as an unexplained block.
+        for (pid, cont) in self.nba_region_waiters.iter().take(max_n) {
+            let loc = cont
+                .first()
+                .and_then(|st| self.span_file_line_in(st.span, None))
+                .unwrap_or_else(|| "<unknown location>".to_string());
+            eprintln!(
+                "[xezim][hang-report]   pid {} parked on @(procedural-var) for the NBA region — resumes at {}",
                 pid, loc
             );
         }
@@ -34695,7 +34713,20 @@ impl Simulator {
     /// 2. If `#0` continuations are waiting in `inactive_queue`, stops after this
     ///    round so those `#0` continuations execute in this delta rather than
     ///    being starved by multi-generation cascades of condition waiters.
-    fn drain_condition_waiters_pre_inactive(&mut self) {
+    /// Drain level-sensitive `wait(expr)` waiters until none can proceed at
+    /// the current timestamp, re-resuming any that a same-tick write newly
+    /// moved into `ready_condition_waiters` even when `cond_progress` did not
+    /// step (moving to ready does not itself fire the waiter's body).
+    ///
+    /// `pre_inactive` selects the two behaviors that differ between the two
+    /// call sites:
+    ///   * `true`  — the pre-INACTIVE(`#0`) drain: do NOT apply NBA (the NBA
+    ///     region stays strictly after the inactive region, IEEE 1800-2017
+    ///     §4.5) and yield as soon as a `#0` continuation is pending, so a
+    ///     multi-generation condition-waiter cascade cannot starve it.
+    ///   * `false` — the end-of-active drain: flush any pending NBA before
+    ///     settling, and run to the full same-time fixpoint.
+    fn drain_condition_waiters(&mut self, pre_inactive: bool) {
         let mut guard = 0u32;
         while (!self.condition_waiters.is_empty() || !self.ready_condition_waiters.is_empty())
             && !self.finished
@@ -34732,68 +34763,25 @@ impl Simulator {
                     self.child_finished(bpid);
                 }
             }
-            if self.dirty_any {
-                self.settle_combinatorial();
-            }
-            if !self.inactive_queue.is_empty() {
-                break;
-            }
-            if self.cond_progress == prog_before && self.ready_condition_waiters.is_empty() {
-                break;
-            }
-        }
-    }
-
-    fn drain_condition_waiters(&mut self) {
-        let mut guard = 0u32;
-        while (!self.condition_waiters.is_empty() || !self.ready_condition_waiters.is_empty())
-            && !self.finished
-            && !self.zero_delay_defer_pending
-        {
-            guard += 1;
-            if guard > 10000 {
-                break;
-            }
-            let prog_before = self.cond_progress;
-            let ready = std::mem::take(&mut self.ready_condition_waiters);
-            for (cpid, cont) in ready {
-                self.cond_waiter_reads.remove(&cpid);
-                self.cond_read_union_dirty = true;
-                self.cond_waiter_conditions.remove(&cpid);
-                self.event_queue.schedule(self.time, cpid, cont);
-            }
-            let parked = std::mem::take(&mut self.condition_waiters);
-            for (cpid, cont) in parked {
-                self.cond_waiter_reads.remove(&cpid);
-                self.cond_read_union_dirty = true;
-                self.cond_waiter_conditions.remove(&cpid);
-                self.event_queue.schedule(self.time, cpid, cont);
-            }
-            while self.event_queue.next_time() == Some(self.time)
-                && !self.finished
-                && !self.zero_delay_defer_pending
-            {
-                let Some((bpid, stmts)) = self.event_queue.pop_front(self.time) else {
-                    break;
-                };
-                self.run_scheduled_process(bpid, &stmts);
-                if !self.is_pid_suspended(bpid) {
-                    self.child_finished(bpid);
-                }
-            }
-            if !self.nba_fast.is_empty()
-                || !self.nba_queue.is_empty()
-                // §15.5.2: a bare `->>` (deferred trigger) must flush with the
-                // NBA region even when no NBA DATA is queued.
-                || !self.pending_nba_triggers.is_empty()
-                || !self.packed_nba.is_empty()
-                || !self.pending_nba_instance_triggers.is_empty()
-                || self.delayed_nba_due()
+            if !pre_inactive
+                && (!self.nba_fast.is_empty()
+                    || !self.nba_queue.is_empty()
+                    // §15.5.2: a bare `->>` (deferred trigger) must flush with the
+                    // NBA region even when no NBA DATA is queued.
+                    || !self.pending_nba_triggers.is_empty()
+                    || !self.packed_nba.is_empty()
+                    || !self.pending_nba_instance_triggers.is_empty()
+                    || self.delayed_nba_due())
             {
                 self.apply_nba();
             }
             if self.dirty_any {
                 self.settle_combinatorial();
+            }
+            // Pre-inactive: yield to a pending `#0` continuation rather than
+            // running more cascade generations ahead of it.
+            if pre_inactive && !self.inactive_queue.is_empty() {
+                break;
             }
             // No waiter proceeded this round → the remainder are genuinely
             // blocked (future-time change); stop re-checking until the next
@@ -34945,7 +34933,7 @@ impl Simulator {
             // slave's `wait(state!=BEGIN_RESP)` wakes on the clobbered value).
             // The end-of-tick fixpoint alone is too late: the `#0` resume has
             // already committed the overwrite by then.
-            self.drain_condition_waiters_pre_inactive();
+            self.drain_condition_waiters(true);
             if self.promote_inactive_to_active()
                 && self.event_queue.next_time() == Some(self.time)
             {
@@ -35074,7 +35062,7 @@ impl Simulator {
         self.dump_write_changes();
 
         // Condition-waiter fixpoint (level-sensitive `wait(expr)` resume).
-        self.drain_condition_waiters();
+        self.drain_condition_waiters(false);
 
         // `#0` continuations parked during the POST-active stages of this
         // tick (edge cascades, reactive work) resume in the next same-time
@@ -84608,9 +84596,12 @@ impl Simulator {
         // Member of `this` (the current object) — IEEE 1800-2023 §8.14:
         // inside a class method, properties of `this` take precedence over
         // outer / unrelated procedural locals in `var_class_types`.
+        // Borrow the instance's class name (no heap allocation per lookup)
+        // so the probe in `class_prop_type_named` stays cheap on hot
+        // class-method paths.
         if let Some(h) = self.this_stack.last().copied().flatten() {
-            if let Some(cls) = self.heap.get(h).and_then(|o| o.as_ref()).map(|i| i.class_name.clone()) {
-                if let Some(tn) = self.class_prop_type_named(&cls, vname) {
+            if let Some(inst) = self.heap.get(h).and_then(|o| o.as_ref()) {
+                if let Some(tn) = self.class_prop_type_named(&inst.class_name, vname) {
                     if self.module.classes.contains_key(&tn) || tn.contains('#') {
                         return Some(tn);
                     }
