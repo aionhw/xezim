@@ -33579,7 +33579,6 @@ impl Simulator {
     }
 
     fn eval_waiter_condition(&mut self, waiter_pid: usize, cond: &Expression) -> bool {
-        let saved = self.snapshot_process_context();
         let saved_hint = self.name_resolve_hint.borrow().clone();
         let saved_scope = self.current_scope.clone();
         let saved_pid = self.current_pid;
@@ -33589,15 +33588,22 @@ impl Simulator {
             self.current_scope = scope;
         }
         let cond_held = if let Some(ctx) = self.process_contexts.remove(&waiter_pid) {
+            // The caller's context is moved aside, not cloned: the waiter's
+            // context replaces it wholesale and the original comes back
+            // untouched afterwards.
+            let saved = self.take_process_context();
             self.restore_process_context(ctx);
             let val = self.eval_expr(cond).is_true();
             let ctx = self.take_process_context();
             self.process_contexts.insert(waiter_pid, ctx);
+            self.restore_process_context(saved);
             val
         } else {
-            self.eval_expr(cond).is_true()
+            let saved = self.snapshot_process_context();
+            let val = self.eval_expr(cond).is_true();
+            self.restore_process_context(saved);
+            val
         };
-        self.restore_process_context(saved);
         *self.name_resolve_hint.borrow_mut() = saved_hint;
         self.current_scope = saved_scope;
         self.current_pid = saved_pid;
@@ -37503,8 +37509,11 @@ impl Simulator {
                     || !self.class_context_stack.is_empty()
                     || !self.method_local_base.is_empty()
                 {
-                    self.process_contexts
-                        .insert(pid, self.snapshot_process_context());
+                    // Moved, not cloned: the caller's context was empty by
+                    // the fast-path precondition, so nothing above this
+                    // frame owns the stacks the parked process leaves.
+                    let ctx = self.take_process_context();
+                    self.process_contexts.insert(pid, ctx);
                 }
             }
             self.method_local_base = saved_mlb;
@@ -37512,16 +37521,17 @@ impl Simulator {
             *self.name_resolve_hint.borrow_mut() = saved_hint;
             return;
         }
-        let mut saved = self.snapshot_process_context();
+        // The caller's context is MOVED aside (the restore below overwrites
+        // every field, so a clone bought nothing) and moved back at the end.
+        let mut saved = self.take_process_context();
         let ctx = self.process_contexts.remove(&pid).unwrap_or_default();
         self.restore_process_context(ctx);
         self.run_process_payload(pid, stmts);
-        if self.is_pid_suspended(pid) {
-            self.process_contexts
-                .insert(pid, self.snapshot_process_context());
-        } else {
-            self.process_contexts.remove(&pid);
-        }
+        let suspended = self.is_pid_suspended(pid);
+        // The process's own context is moved out once; its frames are read
+        // for the fork merge below and the whole context is parked in the
+        // table only if the process suspended.
+        let child_ctx = self.take_process_context();
         // IEEE 1800-2023 §6.21/§9.3.2: automatic variables declared in the
         // parent scope are SHARED with fork children — a child's write must be
         // visible to the parent. xezim gives each fork child a COPY of the
@@ -37538,24 +37548,24 @@ impl Simulator {
         //       copied them into the child's frame and recorded the names in
         //       `fork_signal_captures`. Write the child's changed values back
         //       into `self.signals`, which is what the parent reads from.
-        let child_frames: Vec<HashMap<String, Value>> = self.local_stack.clone();
-        let baseline = self.fork_baselines.get(&pid).cloned();
-        let signal_caps = self.fork_signal_captures.get(&pid).cloned();
+        let child_frames: &[HashMap<String, Value>] = &child_ctx.local_stack;
+        let baseline = self.fork_baselines.get(&pid);
+        let signal_caps = self.fork_signal_captures.get(&pid);
         if !child_frames.is_empty() {
             if let Some(parent_pid) = self.process_parents.get(&pid).copied() {
                 // (a) subroutine-frame merge
                 if let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) {
                     Self::merge_fork_writes(
                         &mut parent_ctx.local_stack,
-                        &child_frames,
-                        baseline.as_ref(),
+                        child_frames,
+                        baseline,
                     );
                 } else {
                     // Parent is the active process — its context is `saved`.
                     Self::merge_fork_writes(
                         &mut saved.local_stack,
-                        &child_frames,
-                        baseline.as_ref(),
+                        child_frames,
+                        baseline,
                     );
                 }
             }
@@ -37564,14 +37574,13 @@ impl Simulator {
         // `self.signals`. Write only keys the child CHANGED (relative to the
         // fork-time baseline) so an inherited-unchanged value doesn't
         // clobber a sibling's or the parent's concurrent write.
-        if let Some(caps) = &signal_caps {
+        if let Some(caps) = signal_caps {
             let top = child_frames.last();
             for nm in caps {
                 let Some(v) = top.and_then(|f| f.get(nm)) else {
                     continue;
                 };
                 let inherited_unchanged = baseline
-                    .as_ref()
                     .and_then(|b| b.last())
                     .and_then(|f| f.get(nm))
                     .is_some_and(|old| old == v);
@@ -37580,7 +37589,10 @@ impl Simulator {
                 }
             }
         }
-        if !self.is_pid_suspended(pid) {
+        if suspended {
+            self.process_contexts.insert(pid, child_ctx);
+        } else {
+            self.process_contexts.remove(&pid);
             self.fork_baselines.remove(&pid);
             self.fork_signal_captures.remove(&pid);
         }
@@ -76017,13 +76029,13 @@ impl Simulator {
         v: Value,
         cont: ProcCont,
     ) {
-        if let Some(ctx) = self.process_contexts.get(&pid).cloned() {
-            let saved = self.snapshot_process_context();
+        if let Some(ctx) = self.process_contexts.remove(&pid) {
+            let saved = self.take_process_context();
             self.restore_process_context(ctx);
             let width = self.infer_lhs_width(lvalue);
             self.assign_value(lvalue, &v.resize(width));
-            self.process_contexts
-                .insert(pid, self.snapshot_process_context());
+            let ctx = self.take_process_context();
+            self.process_contexts.insert(pid, ctx);
             self.restore_process_context(saved);
         } else {
             let width = self.infer_lhs_width(lvalue);
