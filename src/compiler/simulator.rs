@@ -59640,12 +59640,12 @@ impl Simulator {
                                     .get(&*name)
                                     .map(|&(_, _, w)| w)
                                     .unwrap_or(32);
-                                let four_state = self.p_elem_type(&name).is_some_and(|dt| {
+                                let four_state = self.p_elem_type_ref(&name).is_some_and(|dt| {
                                     use crate::ast::types::{
                                         DataType as DT, IntegerAtomType as IAT,
                                         IntegerVectorType as IVT,
                                     };
-                                    match self.resolve_dt(&dt) {
+                                    match self.resolve_dt_ref(&dt) {
                                         DT::IntegerVector {
                                             kind: IVT::Logic | IVT::Reg,
                                             ..
@@ -59860,11 +59860,11 @@ impl Simulator {
                     // this type lookup bypassed it, so the whole-struct copy
                     // silently declined and every member stayed x — while the
                     // identical code at top level worked.
-                    let dst = if self.p_elem_type(&dst).is_none() {
+                    let dst = if self.p_elem_type_ref(&dst).is_none() {
                         match self.name_resolve_hint.borrow().clone() {
                             Some(h) => {
                                 let scoped = format!("{}.{}", h, dst);
-                                if self.p_elem_type(&scoped).is_some() {
+                                if self.p_elem_type_ref(&scoped).is_some() {
                                     scoped
                                 } else {
                                     dst
@@ -59875,9 +59875,17 @@ impl Simulator {
                     } else {
                         dst
                     };
-                    if let Some(dt) = self.p_elem_type(&dst) {
-                        if let DataType::Struct(su) = self.resolve_dt(&dt) {
-                            if Self::spreads_member_wise(&su) {
+                    // Only a member-wise struct target needs its type owned;
+                    // every other assignment answers the predicate by borrow.
+                    let spread_su = self.p_elem_type_ref(&dst).and_then(|dt| {
+                        match self.resolve_dt_ref(&dt) {
+                            DataType::Struct(su) if Self::spreads_member_wise(su) => {
+                                Some(su.clone())
+                            }
+                            _ => None,
+                        }
+                    });
+                    if let Some(su) = spread_su {
                                 if let Some(src) = self.flat_member_name(rvalue) {
                                     if src != dst && self.struct_storage_exists(&src, &su) {
                                         self.copy_unpacked_struct(&dst, &src, &su.clone());
@@ -59916,8 +59924,6 @@ impl Simulator {
                                         return;
                                     }
                                 }
-                            }
-                        }
                     }
                 }
                 // `collection[key] = new(...)`: a bare `new` assigned to an
@@ -84573,11 +84579,18 @@ impl Simulator {
 
     /// Follow a typedef chain to the underlying type.
     fn resolve_dt(&self, dt: &DataType) -> DataType {
-        let mut cur = dt.clone();
+        self.resolve_dt_ref(dt).clone()
+    }
+
+    /// `resolve_dt` as a borrow: the result is either `dt` itself or an entry
+    /// of the typedef table, so read-only callers (type predicates, `matches!`)
+    /// need no clone.
+    fn resolve_dt_ref<'a>(&'a self, dt: &'a DataType) -> &'a DataType {
+        let mut cur = dt;
         for _ in 0..16 {
-            if let DataType::TypeReference { name, .. } = &cur {
+            if let DataType::TypeReference { name, .. } = cur {
                 if let Some(next) = self.module.typedef_types.get(&name.name.name) {
-                    cur = next.clone();
+                    cur = next;
                     continue;
                 }
             }
@@ -87557,11 +87570,21 @@ impl Simulator {
     /// Element type recorded for `name`, or derived from its base when `name`
     /// is a flattened sub-path (`q[i]`, which has no declaration of its own).
     fn p_elem_type(&self, name: &str) -> Option<DataType> {
+        self.p_elem_type_ref(name).map(std::borrow::Cow::into_owned)
+    }
+
+    /// `p_elem_type` without the clone: the declared type is borrowed from the
+    /// design's type tables whenever it lives there (the common case), and
+    /// only the flat-path fallback materialises an owned value. The blocking
+    /// assignment path consults this on every write purely as a predicate,
+    /// which used to clone a `DataType` (and drop it) per assignment.
+    fn p_elem_type_ref(&self, name: &str) -> Option<std::borrow::Cow<'_, DataType>> {
+        use std::borrow::Cow;
         self.module
             .var_decl_types
             .get(name)
-            .cloned()
-            .or_else(|| self.flat_path_type(name).map(|(d, _)| d))
+            .map(Cow::Borrowed)
+            .or_else(|| self.flat_path_type(name).map(|(d, _)| Cow::Owned(d)))
             .or_else(|| {
                 // An ELEMENT (`arr[2]`) carries no type of its own, but
                 // `var_decl_types` holds the container's ELEMENT type — so the
@@ -87574,7 +87597,7 @@ impl Simulator {
                 if base.is_empty() {
                     return None;
                 }
-                self.module.var_decl_types.get(base).cloned()
+                self.module.var_decl_types.get(base).map(Cow::Borrowed)
             })
     }
 
@@ -110574,7 +110597,7 @@ impl Simulator {
                 // whole-value `output_bindings` path (see exec_function_call).
                 let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
                 for (i, port) in ports.iter().enumerate() {
-                    if matches!(self.resolve_dt(&port.data_type), DataType::Struct(_)) {
+                    if matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_)) {
                         self.register_formal_type_metadata(
                             &port.name.name,
                             &port.data_type,
