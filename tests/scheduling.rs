@@ -209,3 +209,5 @@ mod labeled_block_local_hier_ref;
 mod nba_wait_for_region_yield;
 #[path = "scheduling/release_from_level_sensitive_block.rs"]
 mod release_from_level_sensitive_block;
+#[path = "scheduling/sva_instances_and_sequences.rs"]
+mod sva_instances_and_sequences;

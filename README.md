@@ -110,6 +110,28 @@ and testbench flows. Portable code should not rely on them.
 
 # What's new in 0.10
 
+### Unreleased — class covergroups, compilation-unit DPI, assertions in instances
+
+* **Covergroups declared inside classes work** (§19.3): the class-body
+  covergroup is registered, the implicit variable it declares exists, `cg = new`
+  in the constructor instantiates it, `cg.sample()` reads the object's
+  properties (also when sampled from outside through `obj.cg`), a derived class
+  that redeclares `cg` gets its own coverpoints, constructor formals
+  (`covergroup cg (int lo, int hi)`) reach the bins, `with function
+  sample(...)` formals are bound per call, and `$get_coverage()` reports the
+  mean over covergroup types. Covergroup and class handles no longer share one
+  integer namespace, which had dispatched class object 1 as covergroup 1.
+* **DPI at compilation-unit scope** (§35.5.4): `import "DPI-C"` and
+  `export "DPI-C"` written at the top of a file are visible in every module,
+  like a `$unit` function; they used to be reported as undeclared. Small
+  integral returns (`byte unsigned`, `shortint`) read at their declared width
+  and sign in expressions, and a 1-bit `logic` argument carries x/z as svLogic.
+* **Concurrent assertions inside instantiated modules and interfaces** are
+  registered and fire; inlining used to drop them silently. Sequence
+  consequents (`a |-> a ##1 b ##1 c`, `a |=> s`) walk their steps cycle by
+  cycle, named sequences with unclocked bodies expand, and `cover property`
+  is tallied as cover with misses not counted as failures.
+
 ### 0.10.4 — power intent, packed-struct codegen, opt-in waveforms (September 2026)
 
 * **Packed-struct member assignments compile** instead of falling back to the

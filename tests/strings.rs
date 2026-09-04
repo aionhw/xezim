@@ -77,3 +77,5 @@ mod compiled_sformatf_native;
 mod native_string_ops;
 #[path = "strings/string_returning_fn_inline.rs"]
 mod string_returning_fn_inline;
+#[path = "strings/dpi_unit_scope.rs"]
+mod dpi_unit_scope;

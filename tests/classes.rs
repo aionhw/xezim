@@ -258,3 +258,5 @@ mod package_class_nested_class;
 mod sqr_zero_time_loop;
 #[path = "classes/method_local_base_per_process.rs"]
 mod method_local_base_per_process;
+#[path = "classes/class_covergroups.rs"]
+mod class_covergroups;

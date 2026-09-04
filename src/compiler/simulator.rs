@@ -2431,6 +2431,9 @@ struct SvaClockedSite {
     /// Unique identifier (hash of span position) so dedup across
     /// re-executions is cheap.
     span_key: usize,
+    /// 0 assert, 1 assume, 2 cover (§16.5): a cover miss is not a failure
+    /// and fires no else-action; a cover match fires the pass action.
+    kind: u8,
     /// Resolved signal name for the clock; we re-resolve to value
     /// each tick rather than caching an id (small site count).
     clock_signal: String,
@@ -2475,9 +2478,19 @@ struct SvaClockedSite {
     sampled_ids: Vec<usize>,
 }
 
+/// Covergroup handles live above this tag; class handles are plain heap indices.
+const CG_HANDLE_TAG: usize = 1 << 30;
+
 #[derive(Debug, Clone)]
 struct CovergroupInstance {
     cg_name: String,
+    /// The object whose constructor ran `cg = new` (a class-body
+    /// covergroup): coverpoint expressions read ITS properties, so sampling
+    /// from outside the class (`e.cg.sample()`) evaluates with this `this`.
+    owner: Option<usize>,
+    /// §19.3 constructor formals bound at `new(...)`: visible to coverpoint
+    /// expressions, bins and options of this instance.
+    ctor_args: Vec<(String, Value)>,
     /// Hits: coverpoint_name -> Set of observed values
     point_hits: HashMap<String, HashSet<Value>>,
     /// Cross hits: cross_name -> Set of observed tuples
@@ -11915,9 +11928,28 @@ impl Simulator {
         for (i, kind) in arg_kinds.iter().enumerate() {
             match kind {
                 DpiArgKind::Int32In => {
+                    // §35.5.6.1: a 1-bit 4-state formal (`logic`/`reg`) travels
+                    // as svLogic — x is 3 and z is 2, not the 0 a plain
+                    // integer conversion produced.
+                    let four_state_bit = match &spec.proto {
+                        crate::ast::decl::DPIProto::Function(fd) => fd.ports.get(i),
+                        crate::ast::decl::DPIProto::Task(td) => td.ports.get(i),
+                    }
+                    .map(|pt| {
+                        !super::elaborate::is_type_two_state_resolved(&pt.data_type, &self.module.typedef_types)
+                            && self.scalar_formal_integral(&pt.data_type).is_some_and(|(w, _)| w == 1)
+                    })
+                    .unwrap_or(false);
                     let v = Box::new(
                         args.get(i)
-                            .map(|e| self.eval_expr(e).to_i64().unwrap_or(0) as i32)
+                            .map(|e| {
+                                let val = self.eval_expr(e);
+                                if four_state_bit && val.has_xz() {
+                                    if matches!(val.get_bit(0), LogicBit::Z) { 2 } else { 3 }
+                                } else {
+                                    val.to_i64().unwrap_or(0) as i32
+                                }
+                            })
                             .unwrap_or(0),
                     );
                     i32_vals.push(v);
@@ -12230,6 +12262,21 @@ impl Simulator {
                 }
             }
         };
+        // §35.5.5: the C ABI hands a small integral return back promoted to
+        // 32/64 bits; the SV side sees the DECLARED type. `byte unsigned`
+        // returning 256 and `shortint` reading 65530 in an expression were
+        // the symptoms (an assignment to a typed variable fitted it, a direct
+        // use in `$display` did not).
+        if matches!(ret_kind, DpiRetKind::Int32 | DpiRetKind::Int64) {
+            if let crate::ast::decl::DPIProto::Function(fd) = &spec.proto {
+                if let Some((w, signed)) = self.scalar_formal_integral(&fd.return_type) {
+                    if w > 0 && w <= 64 && (w != result.width || signed != result.is_signed) {
+                        result = result.resize(w);
+                        result.is_signed = signed;
+                    }
+                }
+            }
+        }
 
         // Write back output/ref/inout values.
         for (idx, kind, expr) in writebacks {
@@ -56461,6 +56508,18 @@ impl Simulator {
                 //  - a `seed` argument selects a DETERMINISTIC per-seed stream and
                 //    advances the seed in place (IEEE 1800 §20.15.2) — same seed,
                 //    same sequence.
+                // §19.8: overall coverage — the mean of every covergroup
+                // TYPE's coverage.
+                "$get_coverage" => {
+                    let names: std::collections::BTreeSet<String> =
+                        self.cg_heap.iter().flatten().map(|i| i.cg_name.clone()).collect();
+                    if names.is_empty() {
+                        Value::from_f64(0.0)
+                    } else {
+                        let sum: f64 = names.iter().map(|n| self.calculate_type_coverage(n)).sum();
+                        Value::from_f64(sum / names.len() as f64)
+                    }
+                }
                 "$urandom" => {
                     if let Some(seed_arg) = args.first() {
                         let s = self.eval_expr(seed_arg).to_u64().unwrap_or(0) as u32;
@@ -61164,7 +61223,7 @@ impl Simulator {
                         // same handle-as-u32 form as classes, just routed
                         // through the covergroup heap so sample_covergroup /
                         // instantiate_covergroup wire up.
-                        if let Some(cg_def) = self.module.covergroups.get(&tname).cloned() {
+                        if let Some(cg_def) = self.covergroup_def_for(&tname) {
                             let handle = self.instantiate_covergroup(&cg_def, ctor_args);
                             self.assign_value(lvalue, &handle.resize(w));
                             self.settle_after_proc_write();
@@ -61427,7 +61486,7 @@ impl Simulator {
                                         ta_cloned.as_deref(),
                                     )
                                 } else if let Some(cg_def) =
-                                    self.module.covergroups.get(&tname).cloned()
+                                    self.covergroup_def_for(&tname)
                                 {
                                     self.instantiate_covergroup(&cg_def, args)
                                 } else {
@@ -64280,14 +64339,23 @@ impl Simulator {
                             // referenced in the property body so their
                             // Preponed (slot-entry) values can be sampled
                             // when the assertion fires (see eval_sva_sampled).
+                            let kind: u8 = match a.kind {
+                                AssertionKind::Assert => 0,
+                                AssertionKind::Assume => 1,
+                                AssertionKind::Cover => 2,
+                            };
+                            // Named sequence / property instances INSIDE the
+                            // body (`a |=> s`) expand here, once.
+                            let body_expanded = self.sva_expand_named(body, 0);
                             let mut sampled_ids = Vec::new();
-                            self.collect_sva_signal_ids(body, &mut sampled_ids);
+                            self.collect_sva_signal_ids(&body_expanded, &mut sampled_ids);
                             sampled_ids.sort_unstable();
                             sampled_ids.dedup();
                             self.sva_sites.push(SvaClockedSite {
                                 span_key,
+                                kind,
                                 clock_signal,
-                                body: (**body).clone(),
+                                body: body_expanded,
                                 prev_clock: 2, // sentinel
                                 pending: std::collections::VecDeque::new(),
                                 s_eventually: Vec::new(),
@@ -66848,7 +66916,7 @@ impl Simulator {
                                         ta_cloned.as_deref(),
                                     )
                                 } else if let Some(cg_def) =
-                                    self.module.covergroups.get(&tname).cloned()
+                                    self.covergroup_def_for(&tname)
                                 {
                                     self.instantiate_covergroup(&cg_def, args)
                                 } else {
@@ -69580,6 +69648,162 @@ impl Simulator {
     /// clock fire (`assert property (...) <pass> else <fail>;`). Cloned out of
     /// the site first so the exec holds no borrow on `sva_sites`. A vacuous pass
     /// must NOT run the pass action, so callers pass `passed=false`/skip there.
+    /// §16.8: expand named sequence / property instances (no formals)
+    /// nested anywhere in an SVA body, so `a |=> s` sees `s`'s body.
+    fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {
+        if depth > 16 {
+            return e.clone();
+        }
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let name = h.path[0].name.name.as_str();
+                if self.module.sequences.contains(name)
+                    && self.module.property_params.get(name).map_or(true, |p| p.is_empty())
+                {
+                    if let Some(body) = self.module.property_decls.get(name) {
+                        return self.sva_expand_named(body, depth + 1);
+                    }
+                }
+                e.clone()
+            }
+            ExprKind::Binary { op, left, right } => Expression::new(
+                ExprKind::Binary {
+                    op: op.clone(),
+                    left: Box::new(self.sva_expand_named(left, depth)),
+                    right: Box::new(self.sva_expand_named(right, depth)),
+                },
+                e.span,
+            ),
+            ExprKind::Unary { op, operand } => Expression::new(
+                ExprKind::Unary { op: op.clone(), operand: Box::new(self.sva_expand_named(operand, depth)) },
+                e.span,
+            ),
+            ExprKind::Paren(inner) => Expression::new(
+                ExprKind::Paren(Box::new(self.sva_expand_named(inner, depth))),
+                e.span,
+            ),
+            _ => e.clone(),
+        }
+    }
+
+    /// A sequence expression as cycle steps `(delay, boolean)`: `a ##1 b ##2 c`
+    /// (parsed `SeqAnd(SeqAnd(a, ##1 b), ##2 c)`) becomes
+    /// `[(0,a),(1,b),(2,c)]`; a plain boolean is one delay-0 step.
+    fn sva_flatten_steps(e: &Expression, out: &mut Vec<(u32, Expression)>) {
+        match &e.kind {
+            ExprKind::Binary { op, left, right } if matches!(op, crate::ast::expr::BinaryOp::SeqAnd) => {
+                Self::sva_flatten_steps(left, out);
+                Self::sva_flatten_steps(right, out);
+            }
+            ExprKind::Binary { op, left, right } if matches!(op, crate::ast::expr::BinaryOp::HashHash) => {
+                let n: u32 = match &left.kind {
+                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { value, .. }) => {
+                        value.replace('_', "").parse().unwrap_or(1)
+                    }
+                    _ => 1,
+                };
+                let start = out.len();
+                Self::sva_flatten_steps(right, out);
+                if let Some(first) = out.get_mut(start) {
+                    first.0 += n;
+                }
+            }
+            ExprKind::Paren(inner) => Self::sva_flatten_steps(inner, out),
+            _ => out.push((0, e.clone())),
+        }
+    }
+
+    /// Rebuild `steps` (first delay already stripped) as one expression the
+    /// pending queue can carry, shaped so `sva_flatten_steps` recovers
+    /// exactly these steps when it comes due.
+    fn sva_rebuild_steps(steps: &[(u32, Expression)]) -> Expression {
+        let mk_num = |d: u32, span: crate::ast::Span| {
+            Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: d.to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                }),
+                span,
+            )
+        };
+        let mut acc: Option<Expression> = None;
+        for (i, (d, t)) in steps.iter().enumerate() {
+            let span = t.span;
+            let term = if i == 0 || *d == 0 {
+                t.clone()
+            } else {
+                Expression::new(
+                    ExprKind::Binary {
+                        op: crate::ast::expr::BinaryOp::HashHash,
+                        left: Box::new(mk_num(*d, span)),
+                        right: Box::new(t.clone()),
+                    },
+                    span,
+                )
+            };
+            acc = Some(match acc {
+                None => term,
+                Some(prev) => Expression::new(
+                    ExprKind::Binary {
+                        op: crate::ast::expr::BinaryOp::SeqAnd,
+                        left: Box::new(prev),
+                        right: Box::new(term),
+                    },
+                    span,
+                ),
+            });
+        }
+        acc.unwrap_or_else(|| mk_num(1, crate::ast::Span::dummy()))
+    }
+
+    /// Run a sequence from its first step at the CURRENT clock tick: every
+    /// leading delay-0 step is sampled now; the first failure ends the
+    /// attempt (`Some(false)`); an exhausted list is a match (`Some(true)`);
+    /// a remaining delayed step is queued for that many ticks (`None`).
+    fn sva_run_steps(
+        &mut self,
+        site_idx: usize,
+        sampled_ids: &[usize],
+        mut steps: Vec<(u32, Expression)>,
+    ) -> Option<bool> {
+        let mut idx = 0;
+        while idx < steps.len() && steps[idx].0 == 0 {
+            if !self.eval_sva_sampled(sampled_ids, &steps[idx].1) {
+                return Some(false);
+            }
+            idx += 1;
+        }
+        if idx >= steps.len() {
+            return Some(true);
+        }
+        let mut rest: Vec<(u32, Expression)> = steps.drain(idx..).collect();
+        let delay = rest[0].0;
+        rest[0].0 = 0;
+        let expr = Self::sva_rebuild_steps(&rest);
+        self.sva_sites[site_idx].pending.push_back((delay, expr));
+        None
+    }
+
+    /// Tally one finished attempt on a site: cover sites count matches only.
+    fn sva_tally(&mut self, site_idx: usize, span_key: usize, outcome: bool) {
+        let kind = self.sva_sites[site_idx].kind;
+        let stat = self
+            .assertion_stats
+            .entry(span_key)
+            .or_insert_with(|| AssertionStat { kind, pass_count: 0, fail_count: 0 });
+        stat.kind = kind;
+        if outcome {
+            stat.pass_count += 1;
+            self.fire_sva_action(site_idx, true);
+        } else if kind != 2 {
+            stat.fail_count += 1;
+            self.fire_sva_action(site_idx, false);
+        }
+    }
+
     fn fire_sva_action(&mut self, site_idx: usize, passed: bool) {
         let act = self.sva_sites.get(site_idx).and_then(|s| {
             if passed {
@@ -69859,21 +70083,11 @@ impl Simulator {
             }
             let span_key = self.sva_sites[i].span_key;
             for e in due {
-                let v = self.eval_sva_sampled(&sampled_ids, &e);
-                let stat = self
-                    .assertion_stats
-                    .entry(span_key)
-                    .or_insert_with(|| AssertionStat {
-                        kind: 0, /* assert */
-                        pass_count: 0,
-                        fail_count: 0,
-                    });
-                if v {
-                    stat.pass_count += 1;
-                } else {
-                    stat.fail_count += 1;
+                let mut steps = Vec::new();
+                Self::sva_flatten_steps(&e, &mut steps);
+                if let Some(v) = self.sva_run_steps(i, &sampled_ids, steps) {
+                    self.sva_tally(i, span_key, v);
                 }
-                self.fire_sva_action(i, v);
             }
             // 2) Process the property body for this clock fire.
             let body = self.sva_sites[i].body.clone();
@@ -70028,23 +70242,15 @@ impl Simulator {
                     // `lhs |=> ##N inner` — defer the inner check by
                     // 1+N cycles (the |=> 1-cycle defer plus the
                     // ##N delay).
-                    if let ExprKind::Binary {
-                        op: rop,
-                        left: rl,
-                        right: rr,
-                    } = &right.kind
-                    {
-                        if matches!(rop, crate::ast::expr::BinaryOp::HashHash) {
-                            let n = self.eval_expr(rl).to_u64().unwrap_or(0) as u32;
-                            self.sva_sites[site_idx]
-                                .pending
-                                .push_back((1 + n, (**rr).clone()));
-                            return;
-                        }
+                    // `|=>`: the consequent sequence starts NEXT tick.
+                    let mut steps = Vec::new();
+                    Self::sva_flatten_steps(right, &mut steps);
+                    if let Some(first) = steps.first_mut() {
+                        first.0 += 1;
                     }
-                    self.sva_sites[site_idx]
-                        .pending
-                        .push_back((1, (**right).clone()));
+                    if let Some(v) = self.sva_run_steps(site_idx, sampled_ids, steps) {
+                        self.sva_tally(site_idx, span_key, v);
+                    }
                 }
             }
             // `lhs |-> rhs` — overlapping implication. If `lhs` true,
@@ -70068,56 +70274,22 @@ impl Simulator {
                     stat.pass_count += 1; // vacuous
                     return;
                 }
-                // `lhs |-> ##N body` → defer body N cycles.
-                if let ExprKind::Binary {
-                    op: rop,
-                    left: rl,
-                    right: rr,
-                } = &right.kind
-                {
-                    if matches!(rop, crate::ast::expr::BinaryOp::HashHash) {
-                        let n = self.eval_expr(rl).to_u64().unwrap_or(0) as u32;
-                        let cycles = n.max(1);
-                        self.sva_sites[site_idx]
-                            .pending
-                            .push_back((cycles, (**rr).clone()));
-                        return;
-                    }
+                // `lhs |-> seq` (overlap): the consequent sequence starts
+                // THIS tick — leading delay-0 terms sample now, the rest is
+                // queued as cycle steps.
+                let mut steps = Vec::new();
+                Self::sva_flatten_steps(right, &mut steps);
+                if let Some(v) = self.sva_run_steps(site_idx, sampled_ids, steps) {
+                    self.sva_tally(site_idx, span_key, v);
                 }
-                // `lhs |-> rhs` (overlap): check rhs now.
-                let outcome = self.eval_sva_sampled(sampled_ids, right);
-                let stat = self
-                    .assertion_stats
-                    .entry(span_key)
-                    .or_insert_with(|| AssertionStat {
-                        kind: 0,
-                        pass_count: 0,
-                        fail_count: 0,
-                    });
-                if outcome {
-                    stat.pass_count += 1;
-                } else {
-                    stat.fail_count += 1;
-                }
-                self.fire_sva_action(site_idx, outcome);
             }
-            // Plain boolean body: tally directly each clock.
+            // Plain boolean / sequence body: evaluate each clock.
             _ => {
-                let outcome = self.eval_sva_sampled(sampled_ids, body);
-                let stat = self
-                    .assertion_stats
-                    .entry(span_key)
-                    .or_insert_with(|| AssertionStat {
-                        kind: 0,
-                        pass_count: 0,
-                        fail_count: 0,
-                    });
-                if outcome {
-                    stat.pass_count += 1;
-                } else {
-                    stat.fail_count += 1;
+                let mut steps = Vec::new();
+                Self::sva_flatten_steps(body, &mut steps);
+                if let Some(v) = self.sva_run_steps(site_idx, sampled_ids, steps) {
+                    self.sva_tally(site_idx, span_key, v);
                 }
-                self.fire_sva_action(site_idx, outcome);
             }
         }
     }
@@ -95736,8 +95908,8 @@ impl Simulator {
                 }
             }
             if handle != 0 {
-                if let Some(Some(_)) = self.cg_heap.get(handle) {
-                    return self.exec_cg_method_call(handle, &member.name, args);
+                if let Some(idx) = self.cg_index(handle) {
+                    return self.exec_cg_method_call(idx, &member.name, args);
                 }
                 // §8.20: a NON-virtual method binds to the receiver's DECLARED
                 // type, not the object's runtime type. Dispatch always started
@@ -96719,6 +96891,11 @@ impl Simulator {
                             .and_then(|v| v.to_u64())
                             .unwrap_or(0) as usize;
                     }
+                    // The walked-to property may be a covergroup instance
+                    // (`e.cg.sample()`, `e.cg.get_inst_coverage()`).
+                    if let Some(idx) = self.cg_index(handle) {
+                        return self.exec_cg_method_call(idx, method_name, args);
+                    }
                     if handle != 0 && handle < self.heap.len() && self.heap[handle].is_some() {
                         return self.exec_method_call(handle, method_name, args);
                     }
@@ -96834,8 +97011,8 @@ impl Simulator {
                                 }
                             }
                         }
-                        if handle < self.cg_heap.len() && self.cg_heap[handle].is_some() {
-                            return self.exec_cg_method_call(handle, method_name, args);
+                        if let Some(idx) = self.cg_index(handle) {
+                            return self.exec_cg_method_call(idx, method_name, args);
                         }
                         if handle < self.heap.len() && self.heap[handle].is_some() {
                             // §8.20: non-virtual methods bind to the DECLARED
@@ -96967,7 +97144,7 @@ impl Simulator {
             if let Some(class_def) = self.module.classes.get(name).cloned() {
                 return self.instantiate_class(&class_def, args);
             }
-            if let Some(cg_def) = self.module.covergroups.get(name).cloned() {
+            if let Some(cg_def) = self.covergroup_def_for(name) {
                 return self.instantiate_covergroup(&cg_def, args);
             }
             // DPI import call
@@ -100102,6 +100279,35 @@ impl Simulator {
         }
     }
 
+    /// The covergroup definition `new` instantiates for a type name: inside
+    /// a class, the class's OWN `Class::cg` (walking `extends`) wins over
+    /// the bare name, so a derived class that redeclares `cg` gets its own
+    /// coverpoints (§19.3); elsewhere the bare name.
+    fn covergroup_def_for(&self, tname: &str) -> Option<CovergroupDeclaration> {
+        let ctx: Option<String> = self
+            .this_stack
+            .last()
+            .copied()
+            .flatten()
+            .filter(|&h| h != 0)
+            .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()).map(|i| i.class_name.clone()))
+            .or_else(|| self.class_context_stack.last().cloned().flatten());
+        let mut cur = ctx;
+        while let Some(cn) = cur {
+            let base = cn.split('#').next().unwrap_or(&cn).to_string();
+            let key = format!("{}::{}", base, tname);
+            if let Some(d) = self.module.covergroups.get(&key) {
+                // The instance remembers the QUALIFIED key (sampling and
+                // coverage look the definition up by the instance's name).
+                let mut d = d.clone();
+                d.name.name = key;
+                return Some(d);
+            }
+            cur = self.module.classes.get(&base).and_then(|cd| cd.extends.clone());
+        }
+        self.module.covergroups.get(tname).cloned()
+    }
+
     fn instantiate_covergroup(
         &mut self,
         cg_def: &CovergroupDeclaration,
@@ -100110,6 +100316,21 @@ impl Simulator {
         let handle = self.cg_heap.len();
         let instance = CovergroupInstance {
             cg_name: cg_def.name.name.clone(),
+            owner: self.this_stack.last().copied().flatten().filter(|&h| h != 0),
+            ctor_args: {
+                let mut bound = Vec::new();
+                for (i, port) in cg_def.ports.iter().enumerate() {
+                    let v = if let Some(a) = _args.get(i) {
+                        self.eval_expr(a)
+                    } else if let Some(d) = &port.default {
+                        self.eval_expr(d)
+                    } else {
+                        Value::zero(32)
+                    };
+                    bound.push((port.name.name.clone(), v));
+                }
+                bound
+            },
             point_hits: HashMap::default(),
             bin_hits: HashMap::default(),
             point_history: HashMap::default(),
@@ -100138,7 +100359,24 @@ impl Simulator {
             self.cg_event_waiters.push((handle, resolved));
         }
 
-        Value::from_u64(handle as u64, 32)
+        // Tagged so a covergroup handle can never be mistaken for a class
+        // handle: both are small heap indices, and the receiver dispatch
+        // probed `cg_heap` first — class object 1 was dispatched as
+        // covergroup 1 and its method body never ran.
+        Value::from_u64((CG_HANDLE_TAG + handle) as u64, 32)
+    }
+
+    /// Decode a tagged covergroup handle to its `cg_heap` index.
+    fn cg_index(&self, handle: usize) -> Option<usize> {
+        if handle < CG_HANDLE_TAG {
+            return None;
+        }
+        let i = handle - CG_HANDLE_TAG;
+        if i < self.cg_heap.len() && self.cg_heap[i].is_some() {
+            Some(i)
+        } else {
+            None
+        }
     }
 
     fn exec_cg_method_call(
@@ -100172,7 +100410,41 @@ impl Simulator {
                 }
             }
             "sample" => {
-                self.sample_covergroup(handle);
+                // §19.8.1 `with function sample(formals)`: bind the call's
+                // arguments to the formals (fitted to their declared width)
+                // for the duration of this sample. They were dropped before,
+                // so every coverpoint over a sample argument read x.
+                let formals: Vec<crate::ast::decl::FunctionPort> = self
+                    .cg_heap
+                    .get(handle)
+                    .and_then(|x| x.as_ref())
+                    .and_then(|i| self.module.covergroups.get(&i.cg_name))
+                    .map(|d| d.sample_ports.clone())
+                    .unwrap_or_default();
+                if formals.is_empty() {
+                    self.sample_covergroup(handle);
+                } else {
+                    let mut frame: HashMap<String, Value> = HashMap::default();
+                    for (i, port) in formals.iter().enumerate() {
+                        let mut v = match _args.get(i) {
+                            Some(a) => self.eval_expr(a),
+                            None => match &port.default {
+                                Some(d) => self.eval_expr(d),
+                                None => Value::zero(32),
+                            },
+                        };
+                        if let Some((w, signed)) = self.scalar_formal_integral(&port.data_type) {
+                            if w > 0 && w != v.width {
+                                v = v.resize(w);
+                            }
+                            v.is_signed = signed;
+                        }
+                        frame.insert(port.name.name.clone(), v);
+                    }
+                    self.push_local_frame(frame);
+                    self.sample_covergroup(handle);
+                    self.pop_local_frame();
+                }
                 Value::zero(32)
             }
             _ => Value::zero(32),
@@ -100235,21 +100507,31 @@ impl Simulator {
         // this many times (per-coverpoint override falls back to the covergroup
         // option, then the LRM default of 1). §19.7 option.weight: each item's
         // weight in the covergroup's (weighted) mean.
-        fn opt_u64(e: &crate::ast::expr::Expression) -> Option<u64> {
-            match &e.kind {
-                ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
-                    let radix = match base {
-                        crate::ast::expr::NumberBase::Decimal => 10,
-                        crate::ast::expr::NumberBase::Hex => 16,
-                        crate::ast::expr::NumberBase::Octal => 8,
-                        crate::ast::expr::NumberBase::Binary => 2,
-                    };
-                    u64::from_str_radix(&value.replace('_', ""), radix).ok()
+        // Bin bounds are literals or (§19.3) the instance's constructor
+        // formals: `bins r = {[lo:hi]}` with `new(2, 5)`.
+        let ctor: &[(String, Value)] = insts.first().map(|i| i.ctor_args.as_slice()).unwrap_or(&[]);
+        let opt_u64 = |e: &crate::ast::expr::Expression| -> Option<u64> {
+            fn lit(e: &crate::ast::expr::Expression, ctor: &[(String, Value)]) -> Option<u64> {
+                match &e.kind {
+                    ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
+                        let radix = match base {
+                            crate::ast::expr::NumberBase::Decimal => 10,
+                            crate::ast::expr::NumberBase::Hex => 16,
+                            crate::ast::expr::NumberBase::Octal => 8,
+                            crate::ast::expr::NumberBase::Binary => 2,
+                        };
+                        u64::from_str_radix(&value.replace('_', ""), radix).ok()
+                    }
+                    ExprKind::Paren(i) => lit(i, ctor),
+                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => ctor
+                        .iter()
+                        .find(|(n, _)| *n == h.path[0].name.name)
+                        .and_then(|(_, v)| v.to_u64()),
+                    _ => None,
                 }
-                ExprKind::Paren(i) => opt_u64(i),
-                _ => None,
             }
-        }
+            lit(e, ctor)
+        };
         let cg_at_least = def
             .items
             .iter()
@@ -100492,6 +100774,31 @@ impl Simulator {
     }
 
     fn sample_covergroup(&mut self, handle: usize) {
+        let (owner, ctor_args) = match self.cg_heap.get(handle).and_then(|x| x.as_ref()) {
+            Some(i) => (i.owner, i.ctor_args.clone()),
+            None => return,
+        };
+        let has_args = !ctor_args.is_empty();
+        if has_args {
+            let mut frame: HashMap<String, Value> = HashMap::default();
+            for (n, v) in ctor_args {
+                frame.insert(n, v);
+            }
+            self.push_local_frame(frame);
+        }
+        if let Some(h) = owner {
+            self.this_stack.push(Some(h));
+            self.sample_covergroup_inner(handle);
+            self.this_stack.pop();
+        } else {
+            self.sample_covergroup_inner(handle);
+        }
+        if has_args {
+            self.pop_local_frame();
+        }
+    }
+
+    fn sample_covergroup_inner(&mut self, handle: usize) {
         let cg_name = if let Some(Some(inst)) = self.cg_heap.get(handle) {
             inst.cg_name.clone()
         } else {
@@ -111149,6 +111456,9 @@ impl Simulator {
                     if let Some(t) = &sig.type_name {
                         if self.module.classes.contains_key(t)
                             || self.module.enum_members.contains_key(t)
+                            // A covergroup-typed property (the implicit
+                            // variable a class-body covergroup declares).
+                            || self.module.covergroups.contains_key(t)
                             // §6.20.3: a TYPE-parameter name passes through —
                             // the caller resolves it to the bound concrete
                             // type via the instance's type_bindings.
