@@ -364,3 +364,5 @@ mod multi_dim_unpacked_arrays;
 mod real_to_integral_local;
 #[path = "types/system_function_result_width.rs"]
 mod system_function_result_width;
+#[path = "types/packed_member_select_name_collision.rs"]
+mod packed_member_select_name_collision;

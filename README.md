@@ -112,6 +112,13 @@ and testbench flows. Portable code should not rely on them.
 
 ### Unreleased — class covergroups, compilation-unit DPI, assertions in instances
 
+* **Packed-struct member selects no longer collide with same-named arrays**:
+  inside an instance, `inp.sram_renA[2]` on a struct port compiled as a
+  two-bit element select whenever any other module declared a packed
+  multi-dimensional array called `sram_renA`, because the compiler's
+  element-width and dimension lookups fell back to the bare leaf name. They
+  now try the exact name, then the instance-scoped name, and use the bare
+  leaf only for single-segment names.
 * **System-function results keep their LRM width in compiled blocks** (§20,
   §21): `$countones`, `$clog2`, `$bits`, `$size`, `$countbits`, and the other
   `int`-valued functions contribute 32 bits to an expression's context, the
