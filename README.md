@@ -112,6 +112,13 @@ and testbench flows. Portable code should not rely on them.
 
 ### Unreleased — class covergroups, compilation-unit DPI, assertions in instances
 
+* **System-function results keep their LRM width in compiled blocks** (§20,
+  §21): `$countones`, `$clog2`, `$bits`, `$size`, `$countbits`, and the other
+  `int`-valued functions contribute 32 bits to an expression's context, the
+  `bit`-valued ones 1, `$time` 64, and `$signed`/`$unsigned`/`$past` their
+  argument's width. Inside an `always_ff`, `narrow <= $countones(be) >> 3`
+  used to size the shift at the 4-bit target and truncate the count before
+  shifting; the procedural path was already right.
 * **Performance round (measured with interleaved `perf stat`, output
   byte-identical in every case):** whole-net identity buffers (`assign y = x`)
   now collapse onto their source by default (`XEZIM_BUF_COLLAPSE=0` opts

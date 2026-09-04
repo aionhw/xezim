@@ -10054,6 +10054,33 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
 
+    /// Self-determined width of a system function's RESULT (IEEE 1800-2017
+    /// §20/§21): `int`/`integer` results are 32 bits, `bit` results 1,
+    /// `time` 64, `$signed`/`$unsigned`/`$past`/`$sampled` carry their
+    /// argument's width. Real- and string-valued functions report None (no
+    /// integral width to contribute to a context).
+    fn system_function_width(&self, name: &str, args: &[Expression]) -> Option<u32> {
+        Some(match name {
+            "$countones" | "$countbits" | "$clog2" | "$bits" | "$size" | "$dimensions"
+            | "$unpacked_dimensions" | "$left" | "$right" | "$low" | "$high"
+            | "$increment" | "$rtoi" | "$random" | "$urandom" | "$urandom_range"
+            | "$stime" | "$cast" | "$shortrealtobits" | "$fopen" | "$fgetc" | "$fgets"
+            | "$fscanf" | "$sscanf" | "$fread" | "$ftell" | "$feof" | "$ferror"
+            | "$ungetc" | "$fseek" | "$rewind" | "$test$plusargs" | "$value$plusargs"
+            | "$dist_uniform" | "$dist_normal" | "$dist_exponential" | "$dist_poisson"
+            | "$dist_chi_square" | "$dist_t" | "$dist_erlang" | "$coverage_control"
+            | "$coverage_get_max" | "$coverage_get" | "$coverage_merge"
+            | "$coverage_save" => 32,
+            "$onehot" | "$onehot0" | "$isunknown" | "$isunbounded" | "$rose" | "$fell"
+            | "$stable" | "$changed" => 1,
+            "$time" | "$realtobits" => 64,
+            "$signed" | "$unsigned" | "$past" | "$sampled" => {
+                args.first().map(|a| self.expr_max_width(a))?
+            }
+            _ => return None,
+        })
+    }
+
     fn expr_max_width(&self, expr: &Expression) -> u32 {
         match &expr.kind {
             ExprKind::Ident(hier) => self
@@ -10132,6 +10159,14 @@ impl<'a> BytecodeCompiler<'a> {
                 .map(|a| self.expr_max_width(a))
                 .max()
                 .unwrap_or(0),
+            // A system FUNCTION has the result type the LRM gives it, not the
+            // width of its arguments — and certainly not 0, which the old
+            // catch-all returned: `out_step <= $countones(be) >> 3` with a
+            // 4-bit target then compiled the shift at the target's width and
+            // truncated a count of 24 to 8 before shifting.
+            ExprKind::SystemCall { name, args } => {
+                self.system_function_width(name, args).unwrap_or(0)
+            }
             ExprKind::Conditional {
                 then_expr,
                 else_expr,
