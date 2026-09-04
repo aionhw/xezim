@@ -156,21 +156,21 @@ fn sub_ns_precision_emits_no_warning() {
 }
 
 // §3.14.2 / §20.4 — a module with NO `timescale directive (and none preceding
-// it in compilation order) must REPORT the IEEE default 1s/1s via
-// $printtimescale — not the 1 ns simulation default, and not another module's
-// timescale. Regression for the leaked-testscale bug.
+// it in compilation order) must REPORT the tool default 1ps/1ps via
+// $printtimescale — not another module's timescale. Regression for the
+// leaked-testscale bug.
 #[test]
-fn no_timescale_module_reports_one_second_default() {
+fn no_timescale_module_reports_one_ps_default() {
     let o = out("module m; initial $printtimescale; endmodule");
-    assert!(o.contains("is 1s / 1s"), "no-timescale module must report 1s/1s; got: {}", o);
+    assert!(o.contains("is 1ps / 1ps"), "no-timescale module must report 1ps/1ps; got: {}", o);
 }
 
-// A directive-less module keeps xezim's 1 ns DELAY default — only the REPORTED
-// timescale changes, so `#5` is still 5 (ns), never 5 seconds.
+// A directive-less module counts delays in its 1ps default unit: `#5` is 5 ps,
+// and $time reports 5 in that same unit.
 #[test]
-fn no_timescale_module_keeps_one_ns_delays() {
+fn no_timescale_module_counts_delays_in_ps() {
     let o = out("module m; initial begin #5; $display(\"T=%0d\", $time); end endmodule");
-    assert!(o.contains("T=5"), "delay scaling must stay 1ns; got: {}", o);
+    assert!(o.contains("T=5"), "delay scaling must use the 1ps default; got: {}", o);
 }
 
 // §20.3 — `$time`/`$realtime` inside a subroutine reference the DEFINING
@@ -220,7 +220,7 @@ end endmodule
 }
 
 // A module WITHOUT its own directive but PRECEDED by one inherits it (sticky
-// §3.14.2.3) — it reports the inherited scale, not the 1s/1s default.
+// §3.14.2.3) — it reports the inherited scale, not the 1ps/1ps default.
 #[test]
 fn untimed_module_inherits_preceding_directive() {
     let o = out(r#"
@@ -231,7 +231,7 @@ module inherits_it; initial $printtimescale; endmodule
     // The module is a top, so under the multi-top wrapper its name reports as
     // `__xezim_multi_top.inherits_it`. The name is incidental — what matters is
     // that it INHERITED the preceding `1us/1ns` directive instead of defaulting
-    // to 1s/1s, so assert on the value of the inherits_it line.
+    // to 1ps/1ps, so assert on the value of the inherits_it line.
     let inherits_line = o.lines().find(|l| l.contains("inherits_it"))
         .expect("inherits_it $printtimescale line missing");
     assert!(inherits_line.contains("1us / 1ns"),

@@ -112,6 +112,11 @@ and testbench flows. Portable code should not rely on them.
 
 ### Unreleased — class covergroups, compilation-unit DPI, assertions in instances
 
+* **Default timescale is now `1ps/1ps`** for any module, interface, or package
+  without a `` `timescale `` directive (IEEE 1800 §3.14.2.2 leaves the default
+  tool-defined). Previously an untimed unit reported `1s/1s` while its delays
+  counted the design's global tick; now `#1`, `$time`, and `$realtime` all agree
+  on picoseconds. Pass `--module-timescale` to pick a different default.
 * **Covergroups declared inside classes work** (§19.3): the class-body
   covergroup is registered, the implicit variable it declares exists, `cg = new`
   in the constructor instantiates it, `cg.sample()` reads the object's
@@ -867,7 +872,7 @@ simulation at all.
 `--dump-timescales` prints the resolved timescale of every module *before* the
 run — no source `$printtimescale` calls required. It reports each definition's
 `` `timescale `` semantics (an explicit/`--module-timescale` value, or the
-`1s/1s` default when a module has none) and flags the modules that carry no
+`1ps/1ps` default when a module has none) and flags the modules that carry no
 `` `timescale ``. Combine it with `--module-timescale` to confirm an assignment
 landed where you intended.
 
@@ -876,15 +881,16 @@ $ xezim --dump-timescales design.sv
 === module timescales (3 modules) ===
   cache                        10ns / 1ns
   cpu                          1ns / 1ps
-  glue                         1s / 1s   (no `timescale — 1s/1s default)
+  glue                         1ps / 1ps   (no `timescale — 1ps/1ps default)
 ======================================
 ```
 
 A flagged module also emits the `has no timescale directive` warning in a
 mixed-timescale design; give it a source `` `timescale `` or a
-`--module-timescale` assignment to resolve it. (The reported `1s/1s` is the
-IEEE-default *display* value; such a module's effective delay unit is the
-design's global tick — a further reason to declare one explicitly.)
+`--module-timescale` assignment to resolve it. (The default is tool-defined by
+IEEE 1800 §3.14.2.2; xezim uses `1ps/1ps` for both delays and `$realtime`, so
+an untimed module's `#1` is one picosecond — declare a timescale explicitly when
+you mean something else.)
 
 ---
 

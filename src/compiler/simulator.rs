@@ -83311,24 +83311,24 @@ impl Simulator {
 
     /// §3.14.2 / §20.4 — the timescale a module REPORTS via `$printtimescale`.
     /// A module with no `timescale directive (and none preceding it in
-    /// compilation order, so it is absent from `module_timescale_exp`) reports
-    /// the IEEE default `1s / 1s` — NOT the global/top-module unit that drives
-    /// `$time` scaling. This keeps xezim's pragmatic 1 ns simulation default for
-    /// delays while matching a reference simulator's printed timescale (a
-    /// directive-less module must not display another module's timescale).
+    /// compilation order) runs on the tool default `1ps / 1ps` for both delays
+    /// and `$time`/`$realtime`; elaboration records that default in
+    /// `module_timescale_exp`, so the fallback here only covers definitions the
+    /// map never saw. A directive-less module must not display another
+    /// module's timescale.
     fn reported_timescale_exp(&self, def: &str) -> (i32, i32) {
         self.module
             .module_timescale_exp
             .get(def)
             .copied()
-            .unwrap_or((0, 0))
+            .unwrap_or((-12, -12))
     }
 
     /// `--dump-timescales`: print every module definition's timescale before the
     /// run. Shows the REPORTED unit/precision (`$printtimescale` semantics: an
-    /// explicit/inherited `timescale, or the 1s/1s default when a module has
-    /// none — flagged, since such a module's effective delay unit collapses to
-    /// the global tick). No source `$printtimescale` calls are needed.
+    /// explicit/inherited `timescale, or the 1ps/1ps tool default when a
+    /// module has none — flagged, so a mixed design shows which modules count
+    /// picoseconds by default). No source `$printtimescale` calls are needed.
     fn dump_module_timescales(&self) {
         // Every module definition reachable in the design: the top plus every
         // instantiated def_name (deduplicated, sorted for stable output).
@@ -83344,11 +83344,11 @@ impl Simulator {
         println!("=== module timescales ({} modules) ===", defs.len());
         for d in &defs {
             let (u, p) = self.reported_timescale_exp(d);
-            let has_ts = self.module.module_timescale_exp.contains_key(d);
-            let note = if has_ts {
-                ""
+            let defaulted = self.module.modules_without_timescale.iter().any(|m| m == d);
+            let note = if defaulted {
+                "   (no `timescale — 1ps/1ps default)"
             } else {
-                "   (no `timescale — 1s/1s default)"
+                ""
             };
             println!(
                 "  {:<28} {} / {}{}",

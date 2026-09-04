@@ -73,10 +73,11 @@ fn precedence_directive_global_named_local() {
 
 #[test]
 fn a_named_delay_is_scaled() {
-    // module_c gets 10ns/1ns; its `#1` must be 10ns. A 1ns reference fires at
-    // 1ns and 100ns; module_c lands between them.
+    // module_c gets 10ns/1ns; its `#1` must be 10ns. A 1ns reference (the
+    // global assignment; the tool default would be 1ps) fires at 1ns and
+    // 100ns; module_c lands between them.
     let (o, ok) = run(
-        &["--module-timescale", "module_c=10ns/1ns"],
+        &["--module-timescale", "1ns/1ns", "--module-timescale", "module_c=10ns/1ns"],
         r#"
 module module_c;
   initial begin #1; $display("C_AT"); end
@@ -173,9 +174,10 @@ fn an_edge_block_in_a_scaled_submodule_reads_time_in_its_own_unit() {
     // fire. It used to inherit whatever process ran last (the first edge
     // printed top-scaled time), because the edge block's timescale scope was
     // derived from its sensitivity signal — which, for a port-connected
-    // clock, collapses to the PARENT's `clk` and yields no scope.
+    // clock, collapses to the PARENT's `clk` and yields no scope. `top` is
+    // pinned to 1ns/1ns by the global assignment (the default would be 1ps).
     let (o, ok) = run(
-        &["--module-timescale", "counter=10ns/1ns"],
+        &["--module-timescale", "1ns/1ns", "--module-timescale", "counter=10ns/1ns"],
         r#"
 module counter (input logic clk);
   bit [7:0] cnt;
