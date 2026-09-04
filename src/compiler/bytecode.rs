@@ -9995,6 +9995,18 @@ impl<'a> BytecodeCompiler<'a> {
         match &e.kind {
             ExprKind::Number(NumberLiteral::Integer { signed, .. }) => Some(*signed),
             ExprKind::Paren(i) => self.expr_signedness(i),
+            // §20/§21: an `int`/`integer`-valued system function is SIGNED
+            // (`$countones(x) - 8 < 0` is a signed compare); `bit`, `time`
+            // and the unsigned-int ones are not; `$past`/`$sampled` carry
+            // their operand's signedness.
+            ExprKind::SystemCall { name, args }
+                if matches!(name.as_str(), "$past" | "$sampled") =>
+            {
+                args.first().and_then(|a| self.expr_signedness(a))
+            }
+            ExprKind::SystemCall { name, .. } if system_function_result(name).is_some() => {
+                system_function_result(name).map(|(_, signed)| signed)
+            }
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
                 let id = self.lookup_signal_id(h)?;
                 Some(self.signal_signed[id])
@@ -10055,30 +10067,15 @@ impl<'a> BytecodeCompiler<'a> {
 
 
     /// Self-determined width of a system function's RESULT (IEEE 1800-2017
-    /// §20/§21): `int`/`integer` results are 32 bits, `bit` results 1,
-    /// `time` 64, `$signed`/`$unsigned`/`$past`/`$sampled` carry their
-    /// argument's width. Real- and string-valued functions report None (no
-    /// integral width to contribute to a context).
+    /// §20/§21) — see `system_function_result`; `$signed`/`$unsigned`/
+    /// `$past`/`$sampled` carry their argument's width. Real- and
+    /// string-valued functions report None (no integral width to contribute
+    /// to a context).
     fn system_function_width(&self, name: &str, args: &[Expression]) -> Option<u32> {
-        Some(match name {
-            "$countones" | "$countbits" | "$clog2" | "$bits" | "$size" | "$dimensions"
-            | "$unpacked_dimensions" | "$left" | "$right" | "$low" | "$high"
-            | "$increment" | "$rtoi" | "$random" | "$urandom" | "$urandom_range"
-            | "$stime" | "$cast" | "$shortrealtobits" | "$fopen" | "$fgetc" | "$fgets"
-            | "$fscanf" | "$sscanf" | "$fread" | "$ftell" | "$feof" | "$ferror"
-            | "$ungetc" | "$fseek" | "$rewind" | "$test$plusargs" | "$value$plusargs"
-            | "$dist_uniform" | "$dist_normal" | "$dist_exponential" | "$dist_poisson"
-            | "$dist_chi_square" | "$dist_t" | "$dist_erlang" | "$coverage_control"
-            | "$coverage_get_max" | "$coverage_get" | "$coverage_merge"
-            | "$coverage_save" => 32,
-            "$onehot" | "$onehot0" | "$isunknown" | "$isunbounded" | "$rose" | "$fell"
-            | "$stable" | "$changed" => 1,
-            "$time" | "$realtobits" => 64,
-            "$signed" | "$unsigned" | "$past" | "$sampled" => {
-                args.first().map(|a| self.expr_max_width(a))?
-            }
-            _ => return None,
-        })
+        if system_function_carries_arg(name) {
+            return args.first().map(|a| self.expr_max_width(a));
+        }
+        system_function_result(name).map(|(w, _)| w)
     }
 
     fn expr_max_width(&self, expr: &Expression) -> u32 {
@@ -13930,4 +13927,33 @@ pub fn lower_two_state(
         writes: writes.into_boxed_slice(),
         writes_span: writes_span.into_boxed_slice(),
     })
+}
+
+/// IEEE 1800-2017 §20/§21 result type of a system FUNCTION as (width,
+/// signed): `int`/`integer` → (32, true); unsigned int → (32, false);
+/// `bit` → (1, false); `time` / `$realtobits` → (64, false). Real- and
+/// string-valued functions, and the ones that carry their argument's type
+/// (`system_function_carries_arg`), are None. Shared by the compiler's width
+/// and signedness inference and by the interpreter, so every path agrees.
+pub(crate) fn system_function_result(name: &str) -> Option<(u32, bool)> {
+    Some(match name {
+        "$countones" | "$countbits" | "$clog2" | "$bits" | "$size" | "$dimensions"
+        | "$unpacked_dimensions" | "$left" | "$right" | "$low" | "$high" | "$increment"
+        | "$rtoi" | "$random" | "$cast" | "$fopen" | "$fgetc" | "$fgets" | "$fscanf"
+        | "$sscanf" | "$fread" | "$ftell" | "$feof" | "$ferror" | "$ungetc" | "$fseek"
+        | "$rewind" | "$test$plusargs" | "$value$plusargs" | "$dist_uniform"
+        | "$dist_normal" | "$dist_exponential" | "$dist_poisson" | "$dist_chi_square"
+        | "$dist_t" | "$dist_erlang" | "$coverage_control" | "$coverage_get_max"
+        | "$coverage_get" | "$coverage_merge" | "$coverage_save" => (32, true),
+        "$urandom" | "$urandom_range" | "$stime" | "$shortrealtobits" => (32, false),
+        "$onehot" | "$onehot0" | "$isunknown" | "$isunbounded" | "$rose" | "$fell"
+        | "$stable" | "$changed" => (1, false),
+        "$time" | "$realtobits" => (64, false),
+        _ => return None,
+    })
+}
+
+/// System functions whose result has the TYPE of their first argument.
+pub(crate) fn system_function_carries_arg(name: &str) -> bool {
+    matches!(name, "$signed" | "$unsigned" | "$past" | "$sampled")
 }

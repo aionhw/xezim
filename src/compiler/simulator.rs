@@ -5589,6 +5589,10 @@ struct SampledWatch {
     expr: Expression,
     hist: std::collections::VecDeque<Value>,
     depth: usize,
+    /// Time of the most recent sample. A PROCEDURAL `$past` runs before this
+    /// slot's sampler (an SVA site after it), so the reader checks whether the
+    /// current edge is already at the front of `hist` before indexing.
+    last_sample_time: Option<u64>,
 }
 
 /// Empty static used as fallback name for unnamed array-element ids
@@ -10066,14 +10070,14 @@ impl Simulator {
 
     fn eval_value_plusargs(&mut self, args: &[Expression]) -> Value {
         if args.len() < 2 {
-            return Value::zero(1);
+            return Value::zero(32);
         }
         let fmt = match &args[0].kind {
             ExprKind::StringLiteral(s) => s.clone(),
             _ => self.eval_expr(&args[0]).to_sv_string(),
         };
         let Some((prefix, spec)) = Self::parse_plusarg_format(&fmt) else {
-            return Value::zero(1);
+            return Value::zero(32);
         };
 
         for arg in &self.plusargs {
@@ -10084,10 +10088,10 @@ impl Simulator {
             let suffix = &payload[prefix.len()..];
             if let Some(v) = Self::parse_plusarg_value(suffix, spec) {
                 self.assign_value(&args[1], &v);
-                return Value::from_u64(1, 1);
+                return Value::from_u64(1, 32);
             }
         }
-        Value::zero(1)
+        Value::zero(32)
     }
 
     fn system_string_arg(&mut self, expr: &Expression) -> String {
@@ -43279,15 +43283,7 @@ impl Simulator {
                 let operand = args.first()?.clone();
                 let site = expr.span.start;
                 let widx = self.sampled_watch_for(site, &operand, ec, cid, n)?;
-                let cur = match self.sampled_watches[widx].hist.front() {
-                    Some(v) => v.clone(),
-                    None => {
-                        let op = operand.clone();
-                        self.eval_expr(&op)
-                    }
-                };
-                let past = self.sampled_watches[widx].hist.get(n).cloned();
-                return Some((cur, past));
+                return Some(self.sampled_cur_and_past(widx, &operand, n));
             }
             let (clk_str, _) = self.clocking_meta.get("__xz_default_clocking")?.clone();
             // clocking_meta stores the bare clock SIGNAL name (the parser
@@ -43301,16 +43297,37 @@ impl Simulator {
         let operand = args.first()?.clone();
         let site = expr.span.start;
         let widx = self.sampled_watch_for(site, &operand, edge_code.unwrap_or(0), clk_id, n)?;
-        let w = &self.sampled_watches[widx];
-        let cur = match w.hist.front() {
-            Some(v) => v.clone(),
-            None => {
+        Some(self.sampled_cur_and_past(widx, &operand, n))
+    }
+
+    /// (current sample, `n` edges back) for a sampled-value call. The per-slot
+    /// sampler runs after the Active processes and before the SVA sites, so
+    /// when the reader runs BEFORE this slot's sample the front of the
+    /// history is the PREVIOUS edge: the current value is read live and the
+    /// past index shifts by one. A procedural `$past(v)` at the second edge
+    /// used to index past that single sample and report "no history", and
+    /// from the third edge on returned the value from two edges back.
+    fn sampled_cur_and_past(
+        &mut self,
+        widx: usize,
+        operand: &Expression,
+        n: usize,
+    ) -> (Value, Option<Value>) {
+        let sampled_this_slot = self.sampled_watches[widx].last_sample_time == Some(self.time);
+        let cur = match self.sampled_watches[widx].hist.front() {
+            Some(v) if sampled_this_slot => v.clone(),
+            _ => {
                 let op = operand.clone();
                 self.eval_expr(&op)
             }
         };
-        let past = self.sampled_watches[widx].hist.get(n).cloned();
-        Some((cur, past))
+        let idx = if sampled_this_slot { n } else { n.saturating_sub(1) };
+        let past = if n == 0 {
+            Some(cur.clone())
+        } else {
+            self.sampled_watches[widx].hist.get(idx).cloned()
+        };
+        (cur, past)
     }
 
     /// Pre-register sampled-value watches for every `$rose/$fell/$stable/
@@ -43524,6 +43541,22 @@ impl Simulator {
 
     /// Reconstruct a signal's PREPONED (slot-entry) value from the edge
     /// snapshot arrays.
+    /// Copy a signal's current value into its preponed snapshot (the
+    /// per-slot pass does this for every edge signal after a slot that wrote
+    /// something; a signal registered mid-run needs it once, immediately).
+    fn seed_prev_from_current(&mut self, id: usize) {
+        if id >= self.signal_table.len() || id >= self.prev_val.len() || id >= self.prev_xz.len() {
+            return;
+        }
+        let (v, x) = self.signal_table[id].raw_bits();
+        self.prev_val[id] = v;
+        self.prev_xz[id] = x;
+        if self.signal_widths.get(id).copied().unwrap_or(0) > 64 {
+            let cur = self.signal_table[id].clone();
+            self.prev_wide.insert(id, cur);
+        }
+    }
+
     fn preponed_value_of(&self, id: usize) -> Value {
         if let Some(w) = self.prev_wide.get(&id) {
             return w.clone();
@@ -43555,12 +43588,19 @@ impl Simulator {
             _ => EdgeKind::AnyEdge,
         };
         let sig_id = self.get_lhs_signal_id(operand);
+        // A signal registered here at run time has no preponed snapshot yet,
+        // and the snapshot pass only runs for a slot that wrote something —
+        // a declaration-initialised operand (`logic [7:0] v = 8'hA5;`) is
+        // never written, so its first sample read a stale x. Seed the
+        // snapshot from the current value on registration.
         if !self.edge_signal_ids.contains(&clk_id) {
             self.edge_signal_ids.push(clk_id);
+            self.seed_prev_from_current(clk_id);
         }
         if let Some(sid) = sig_id {
             if !self.edge_signal_ids.contains(&sid) {
                 self.edge_signal_ids.push(sid);
+                self.seed_prev_from_current(sid);
             }
         }
         let i = self.sampled_watches.len();
@@ -43571,6 +43611,7 @@ impl Simulator {
             expr: operand.clone(),
             hist: std::collections::VecDeque::new(),
             depth: depth + 1,
+            last_sample_time: None,
         });
         self.sampled_watch_site.insert(site, i);
         Some(i)
@@ -43587,6 +43628,7 @@ impl Simulator {
             if !self.check_edge_id(clk_id, edge) {
                 continue;
             }
+            self.sampled_watches[i].last_sample_time = Some(self.time);
             let sample = match self.sampled_watches[i].sig_id {
                 Some(sid) => self.preponed_value_of(sid),
                 None => {
@@ -55701,7 +55743,8 @@ impl Simulator {
                 self.assign_value(lvalue, &v);
                 v
             }
-            ExprKind::SystemCall { name, args } => match name.as_str() {
+            ExprKind::SystemCall { name, args } => {
+                let mut sys_result = match name.as_str() {
                 // §9.4.5: retrieve a pre-evaluated intra-assignment RHS
                 // (stashed by the suspend path; see make_intra_saved_expr).
                 INTRA_SAVED_MARKER => {
@@ -55738,8 +55781,10 @@ impl Simulator {
                                 return p;
                             }
                             // Not enough history yet: LRM default-value = the
-                            // operand type's default (x for 4-state).
-                            return Value::new(1);
+                            // operand type's default (x for 4-state), at the
+                            // OPERAND's width.
+                            let w = args.first().map(|a| self.infer_width(a)).unwrap_or(1);
+                            return Value::new(w.max(1));
                         }
                     }
                     let sig_name = match args.first().map(|a| &a.kind) {
@@ -56352,7 +56397,7 @@ impl Simulator {
                         Some(_) => self.eval_expr(&args[0]).to_sv_string(),
                         None => String::new(),
                     };
-                    Value::from_u64(self.test_plusarg(&pat) as u64, 1)
+                    Value::from_u64(self.test_plusarg(&pat) as u64, 32)
                 }
                 "$value$plusargs" => self.eval_value_plusargs(args),
                 "$fopen" => self.open_file_handle(args),
@@ -57676,11 +57721,28 @@ impl Simulator {
                     let self_ptr = self as *mut Simulator;
                     vpi_call_systf(self_ptr, name, args).unwrap_or_else(|| Value::zero(32))
                 }
+                // §16.9.3 `$sampled(e)` outside a property: the value in the
+                // current time step, which is the operand's current value.
+                "$sampled" => args
+                    .first()
+                    .map(|a| self.eval_expr(a))
+                    .unwrap_or(Value::zero(32)),
                 _ => {
                     self.warn_unknown_system_task(name, args);
                     Value::zero(32)
                 }
-            },
+                };
+                // §20/§21: an `int`/`integer`-valued function returns a SIGNED
+                // value (`$countones(x) - 8 < 0`, `$fgetc(fd) < 0` on EOF).
+                // The arms above build unsigned words; stamp the sign here,
+                // once, from the shared result-type table.
+                if let Some((32, true)) = super::bytecode::system_function_result(name) {
+                    if sys_result.width == 32 && !sys_result.is_real {
+                        sys_result.is_signed = true;
+                    }
+                }
+                sys_result
+            }
             ExprKind::This => {
                 if let Some(Some(handle)) = self.this_stack.last() {
                     Value::from_u64(*handle as u64, 32)
@@ -74284,6 +74346,16 @@ impl Simulator {
     fn lrm_self_width(&mut self, expr: &Expression) -> Option<u32> {
         match &expr.kind {
             ExprKind::Paren(i) => self.lrm_self_width(i),
+            ExprKind::SystemCall { name, args }
+                if super::bytecode::system_function_carries_arg(name) && !args.is_empty() =>
+            {
+                self.lrm_self_width(&args[0])
+            }
+            ExprKind::SystemCall { name, .. }
+                if super::bytecode::system_function_result(name).is_some() =>
+            {
+                super::bytecode::system_function_result(name).map(|(w, _)| w)
+            }
             ExprKind::Number(NumberLiteral::Integer { size: Some(sz), .. }) => Some(*sz),
             ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
@@ -74417,6 +74489,20 @@ impl Simulator {
             // running its calltf — twice, once here and once for the value.
             ExprKind::SystemCall { name, .. } if vpi_systf_is_func(name) => {
                 vpi_sysfunc_ret_width(name)
+            }
+            // A built-in system function's width comes from its LRM result
+            // type. Sizing it by EVALUATING (the fallback below) ran the
+            // call twice — `$urandom % n` advanced the generator twice and
+            // `$fgetc(fd) & mask` consumed two bytes.
+            ExprKind::SystemCall { name, args }
+                if super::bytecode::system_function_carries_arg(name) && !args.is_empty() =>
+            {
+                self.infer_width(&args[0])
+            }
+            ExprKind::SystemCall { name, .. }
+                if super::bytecode::system_function_result(name).is_some() =>
+            {
+                super::bytecode::system_function_result(name).map(|(w, _)| w).unwrap_or(32)
             }
             // Same for a user function: its width comes from its declared
             // return type, never from calling it. `f() + 1` used to call `f`
@@ -96571,7 +96657,7 @@ impl Simulator {
                                 Some(_) => self.eval_expr(&args[0]).to_sv_string(),
                                 None => String::new(),
                             };
-                            Value::from_u64(self.test_plusarg(&pat) as u64, 1)
+                            Value::from_u64(self.test_plusarg(&pat) as u64, 32)
                         }
                         "$value$plusargs" => self.eval_value_plusargs(args),
                         "$fopen" => self.open_file_handle(args),

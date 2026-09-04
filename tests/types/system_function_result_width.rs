@@ -92,3 +92,90 @@ endmodule
     );
     assert!(msgs.iter().any(|m| m == "O=3 S=fff8"), "got {msgs:?}");
 }
+
+// §20.9/§21.3: `int`-valued system functions are SIGNED. A count compared
+// after subtraction, and `$fgetc`'s -1 at end of file, are signed compares.
+#[test]
+fn int_valued_system_functions_are_signed() {
+    let msgs = messages(
+        r#"
+module top;
+  logic [7:0] v = 8'h03;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  logic neg_ff;
+  always_ff @(posedge clk) neg_ff <= ($countones(v) - 8) < 0;
+  initial begin
+    if (($countones(v) - 8) < 0) $display("PROC neg");
+    else $display("PROC pos");
+    if ($clog2(2) - 5 < 0) $display("CLOG neg");
+    @(posedge clk); #1 $display("FF neg=%0d", neg_ff);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    for want in ["PROC neg", "CLOG neg", "FF neg=1"] {
+        assert!(msgs.iter().any(|m| m == want), "missing {want}; got {msgs:?}");
+    }
+}
+
+// Sizing a system call by evaluating it ran the call twice: `$fgetc(fd) & 8'hff`
+// consumed two bytes per statement and `$urandom % n` advanced the generator
+// twice. The width now comes from the LRM result type, so each call runs once.
+#[test]
+fn width_inference_does_not_reevaluate_system_calls() {
+    let dir = std::env::temp_dir().join("xezim_sysfn_fgetc");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bytes.bin");
+    std::fs::write(&path, b"ABCDEF").unwrap();
+    let src = format!(
+        r#"
+module top;
+  int fd, a, b, c, eof;
+  initial begin
+    fd = $fopen("{}", "r");
+    a = $fgetc(fd) & 8'hff;
+    b = $fgetc(fd) & 8'hff;
+    c = $fgetc(fd) + 0;
+    $display("BYTES %0d %0d %0d", a, b, c);
+    repeat (3) void'($fgetc(fd));
+    eof = $fgetc(fd);
+    if (eof < 0) $display("EOF negative");
+    $fclose(fd);
+    $finish;
+  end
+endmodule
+"#,
+        path.display()
+    );
+    let msgs = messages(&src);
+    assert!(msgs.iter().any(|m| m == "BYTES 65 66 67"), "each $fgetc must run once; got {msgs:?}");
+    assert!(msgs.iter().any(|m| m == "EOF negative"), "$fgetc EOF must compare below zero; got {msgs:?}");
+}
+
+// §16.9.3: `$past` with no history yet yields the operand type's default
+// value at the OPERAND's width, and `$sampled(e)` is e's current value.
+#[test]
+fn past_default_has_operand_width_and_sampled_reads_current() {
+    let msgs = messages(
+        r#"
+module top;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  logic [7:0] v = 8'hA5;
+  int n = 0;
+  always @(posedge clk) begin
+    n++;
+    if (n == 1) $display("PAST1=%b", $past(v));
+    if (n == 2) begin
+      $display("PAST2=%h SAMPLED=%h", $past(v), $sampled(v));
+      $finish;
+    end
+  end
+endmodule
+"#,
+    );
+    assert!(msgs.iter().any(|m| m == "PAST1=xxxxxxxx"), "got {msgs:?}");
+    assert!(msgs.iter().any(|m| m == "PAST2=a5 SAMPLED=a5"), "got {msgs:?}");
+}

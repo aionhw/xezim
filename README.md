@@ -118,7 +118,15 @@ and testbench flows. Portable code should not rely on them.
   `bit`-valued ones 1, `$time` 64, and `$signed`/`$unsigned`/`$past` their
   argument's width. Inside an `always_ff`, `narrow <= $countones(be) >> 3`
   used to size the shift at the 4-bit target and truncate the count before
-  shifting; the procedural path was already right.
+  shifting; the procedural path was already right. From the audit that
+  followed: `int`-valued results are now SIGNED everywhere (`$countones(x) - 8
+  < 0` compares signed, `$fgetc` end-of-file tests below zero), the
+  interpreter no longer sizes a system call by evaluating it (`$fgetc(fd) &
+  mask` consumed two bytes and `$urandom % n` advanced the generator twice),
+  `$test$plusargs`/`$value$plusargs` return `int`, a procedural `$past(v)` is
+  no longer one edge late and reports "no history" at the operand's width,
+  `$sampled(e)` evaluates outside properties, and `$onehot`/`$onehot0`/
+  `$isunknown` fold to one bit in constant expressions.
 * **Performance round (measured with interleaved `perf stat`, output
   byte-identical in every case):** whole-net identity buffers (`assign y = x`)
   now collapse onto their source by default (`XEZIM_BUF_COLLAPSE=0` opts
