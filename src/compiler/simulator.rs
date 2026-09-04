@@ -2566,6 +2566,17 @@ enum FsmWait {
     Edge(u32),
 }
 
+/// One clocking block's per-tick poll state: its clock resolved to a
+/// signal-table id once (None: fall back to the by-name read), the edge it
+/// advances on, and the level seen on the previous tick.
+struct ClockingTick {
+    cb: String,
+    clk: String,
+    id: Option<usize>,
+    edge: EdgeKind,
+    prev: u8,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ProcessContext {
     this_stack: Vec<Option<usize>>,
@@ -3655,6 +3666,8 @@ pub struct Simulator {
     clocking_output_pending: HashMap<String, Vec<(String, Value)>>,
     /// Per-clocking-block previous clock bit (for edge detection).
     clocking_prev_clock: HashMap<String, u8>,
+    /// Per-tick clock poll table for `tick_clocking_blocks` (see there).
+    clocking_tick_cache: Vec<ClockingTick>,
     /// LRM §14.3: each clocking block's clock EDGE (`@(posedge/negedge clk)`).
     /// `tick_clocking_blocks` and `@(cb)` resolution consult this so a
     /// `@(negedge clk)` block samples/advances on the negedge, not the posedge.
@@ -8006,6 +8019,7 @@ impl Simulator {
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
+            clocking_tick_cache: Vec::new(),
             clocking_edge: HashMap::default(),
             clocking_mirror_dirty: false,
             clocking_cycle_pending: HashMap::default(),
@@ -70359,24 +70373,47 @@ impl Simulator {
         if self.clocking_meta.is_empty() {
             return;
         }
-        let cb_names: Vec<String> = self.clocking_meta.keys().cloned().collect();
-        for cb in cb_names {
-            let (clk, sigs) = self.clocking_meta.get(&cb).cloned().unwrap();
-            let cur = self
-                .get_signal_value_by_name(&clk)
-                .and_then(|v| v.to_u64())
-                .map(|u| (u & 1) as u8)
-                .unwrap_or(2);
-            let prev = *self.clocking_prev_clock.get(&cb).unwrap_or(&2);
-            self.clocking_prev_clock.insert(cb.clone(), cur);
+        // This runs after EVERY tick. The poll table resolves each block's
+        // clock to a signal-table id once and keeps the previous level, so a
+        // quiet tick costs one indexed read per block instead of cloning the
+        // block's signal list and resolving its clock by name. Rebuilt when a
+        // block is registered (the map only ever grows); iteration order is
+        // the map's, exactly as before.
+        if self.clocking_tick_cache.len() != self.clocking_meta.len() {
+            let names: Vec<String> = self.clocking_meta.keys().cloned().collect();
+            self.clocking_tick_cache = names
+                .into_iter()
+                .map(|cb| {
+                    let clk = self.clocking_meta[&cb].0.clone();
+                    let id = self.signal_name_to_id.get(clk.as_str()).copied();
+                    let edge = self
+                        .clocking_edge
+                        .get(&cb)
+                        .copied()
+                        .unwrap_or(EdgeKind::Posedge);
+                    let prev = self.clocking_prev_clock.get(&cb).copied().unwrap_or(2);
+                    ClockingTick { cb, clk, id, edge, prev }
+                })
+                .collect();
+        }
+        let mut cache = std::mem::take(&mut self.clocking_tick_cache);
+        for ent in cache.iter_mut() {
+            let cur = match ent.id {
+                Some(id) => self.signal_table[id]
+                    .to_u64()
+                    .map(|u| (u & 1) as u8)
+                    .unwrap_or(2),
+                None => self
+                    .get_signal_value_by_name(&ent.clk)
+                    .and_then(|v| v.to_u64())
+                    .map(|u| (u & 1) as u8)
+                    .unwrap_or(2),
+            };
+            let prev = ent.prev;
+            ent.prev = cur;
             // §14.3: advance on the block's declared clock edge (posedge by
             // default; negedge / any-edge when so declared).
-            let edge = self
-                .clocking_edge
-                .get(&cb)
-                .copied()
-                .unwrap_or(EdgeKind::Posedge);
-            let fired = match edge {
+            let fired = match ent.edge {
                 EdgeKind::Negedge => prev == 1 && cur == 0,
                 EdgeKind::Posedge => prev == 0 && cur == 1,
                 // `edge` / any: any resolved 0↔1 transition.
@@ -70385,6 +70422,12 @@ impl Simulator {
             if !fired {
                 continue;
             }
+            let cb = ent.cb.clone();
+            let sigs: Vec<(String, bool)> = self
+                .clocking_meta
+                .get(&cb)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default();
             // §14.16.1: record the edge time — a drive executed AT this time
             // matures at edge + output skew instead of waiting a full cycle.
             self.clocking_last_edge.insert(cb.clone(), self.time);
@@ -70524,6 +70567,7 @@ impl Simulator {
             }
             self.clocking_snapshots.insert(cb.clone(), snap);
         }
+        self.clocking_tick_cache = cache;
     }
 
     /// Resume the clocking-event waiters (`@(cb)` / `##N`) that fired this slot,
