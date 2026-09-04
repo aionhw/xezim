@@ -382,7 +382,7 @@ Larger runs measured during the 0.10 campaign:
 | lowRISC Ibex (`simple_system`) | CoreMark ×10 | score 2.477304 CoreMark/MHz, 2,765,321 instret, halt at 41,454,505 ns — byte-identical | 447s |
 | XuanTie C906 | cmark ×2 | TEST PASSED, 286,469 cycles/iteration | 516s |
 | XuanTie C910 (dual-core) | cmark ×2 | TEST PASSED, CoreMark 6.327752, halt at 34,985,250 | 8,028s, including a cold native compile of the whole design |
-| mbits-mirafra AVIP suite (UVM) | apb / spi / i3c / axi4 / axi4Lite base tests | 5 of 5 reproduce the reference's `UVM_ERROR` counts and end times exactly; `ahb` runs in xezim but the reference fails to elaborate it, and `uart` is a known open stall | 33s for axi4Lite (28s with FSM + AOT), seconds for the rest |
+| mbits-mirafra AVIP suite (UVM) | apb / spi / i3c / axi4 / axi4Lite / uart base tests | 6 of 6 reproduce the reference's `UVM_ERROR` counts and end times, run unmodified with no `--module-timescale` (the untimed BFMs take the `1ps/1ps` default); `ahb` runs in xezim but the reference fails to elaborate it | 33s for axi4Lite (28s with FSM + AOT), about 60s for uart, seconds for the rest |
 
 On these CPU workloads a commercial reference simulator is still roughly
 4–5× faster; the campaign narrowed the Ibex CoreMark gap from about 30× to

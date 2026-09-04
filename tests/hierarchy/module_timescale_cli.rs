@@ -4,7 +4,7 @@
 //!
 //! Precedence (highest first): local timeunit/timeprecision decl >
 //! active `timescale directive > named --module-timescale > global
-//! --module-timescale > 1ns/1ns default.
+//! --module-timescale > 1ps/1ps tool default.
 //!
 //! Driven through the CLI so the whole arg → validate → set → elaborate path
 //! is exercised.
