@@ -37509,11 +37509,8 @@ impl Simulator {
                     || !self.class_context_stack.is_empty()
                     || !self.method_local_base.is_empty()
                 {
-                    // Moved, not cloned: the caller's context was empty by
-                    // the fast-path precondition, so nothing above this
-                    // frame owns the stacks the parked process leaves.
-                    let ctx = self.take_process_context();
-                    self.process_contexts.insert(pid, ctx);
+                    self.process_contexts
+                        .insert(pid, self.snapshot_process_context());
                 }
             }
             self.method_local_base = saved_mlb;
@@ -93409,9 +93406,37 @@ impl Simulator {
         }
     }
 
+    /// True when `e` is built only from literals, plain names, and
+    /// arithmetic — the shapes the elaboration-time constant folder can
+    /// settle without any per-call setup. A call, system call, `$bits(type)`,
+    /// or member access is left to the runtime paths: for those the folder
+    /// clones the whole function table (or typedef table) into a throwaway
+    /// elaboration shell on every attempt, and at runtime the attempt almost
+    /// always fails anyway (the function needs `this` or a live argument).
+    /// On the axi4 UVM base test that throwaway was 6.5 % of all samples.
+    fn const_fold_shape(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(_) => true,
+            ExprKind::Ident(h) => h.path.iter().all(|s| s.selects.is_empty()),
+            ExprKind::Unary { operand, .. } => Self::const_fold_shape(operand),
+            ExprKind::Paren(inner) => Self::const_fold_shape(inner),
+            ExprKind::Binary { left, right, .. } => {
+                Self::const_fold_shape(left) && Self::const_fold_shape(right)
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                Self::const_fold_shape(condition)
+                    && Self::const_fold_shape(then_expr)
+                    && Self::const_fold_shape(else_expr)
+            }
+            _ => false,
+        }
+    }
+
     fn eval_scalar_self(&self, e: &Expression) -> Option<i64> {
-        if let Some(v) = super::elaborate::const_eval_i64_with_params(e, None) {
-            return Some(v);
+        if Self::const_fold_shape(e) {
+            if let Some(v) = super::elaborate::const_eval_i64_with_params(e, None) {
+                return Some(v);
+            }
         }
         if let ExprKind::Ident(h) = &e.kind {
             if h.path.len() == 1 {
