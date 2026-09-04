@@ -3,7 +3,8 @@
 //! instantiates it; `cg.sample()` reads the OBJECT's properties (also when
 //! sampled from outside through `obj.cg`); a derived class that redeclares
 //! `cg` gets its own coverpoints; constructor formals reach the bins; and
-//! `$get_coverage` averages the covergroup types. None of it worked: the
+//! `$get_coverage` averages the covergroup types; `option.auto_bin_max` and
+//! `cg::type_option` are honoured. None of it worked: the
 //! class-body covergroup was never registered, the implicit property did not
 //! exist (the handle stayed x), and covergroup / class handles shared one
 //! integer namespace, so class object 1 was dispatched as covergroup 1.
@@ -33,6 +34,9 @@ module top;
   bit [3:0] mv;
   covergroup mcg (int lo, int hi); cp: coverpoint mv { bins r = {[lo:hi]}; } endgroup
   mcg m = new(2, 5);
+  bit [3:0] ov;
+  covergroup ocg; type_option.goal = 80; cp: coverpoint ov { option.auto_bin_max = 2; } endgroup
+  ocg o = new;
   initial begin
     base b = new; ext e = new; withargs wa = new;
     b.v = 2; b.do_sample();
@@ -45,6 +49,9 @@ module top;
     $display("ARGS sample-args=%0.1f", wa.cg.get_inst_coverage());
     mv = 3; m.sample();
     $display("CTOR arg-bins=%0.1f", m.get_inst_coverage());
+    ov = 1; o.sample();
+    ocg::type_option.weight = 5;
+    $display("OPTS auto_bin_max=%0.1f type_weight=%0d type_goal=%0d", o.get_inst_coverage(), ocg::type_option.weight, ocg::type_option.goal);
     $display("GLOBAL %0.1f", $get_coverage());
     $finish;
   end
@@ -75,12 +82,15 @@ fn check(text: &str) {
         "EXT redeclared=25.0",
         "ARGS sample-args=12.5",
         "CTOR arg-bins=100.0",
+        // §19.7.1: auto_bin_max 2 on a 4-bit point puts value 1 in the low
+        // half (50%); type_option reads the body's goal and a scoped write.
+        "OPTS auto_bin_max=50.0 type_weight=5 type_goal=80",
     ] {
         assert!(text.contains(want), "missing `{want}`:\n{text}");
     }
-    // Four covergroup types (base::cg 12.5, ext::cg 25, withargs::cg 12.5,
-    // mcg 100): $get_coverage is their mean.
-    assert!(text.contains("GLOBAL 37.5"), "global coverage:\n{text}");
+    // Five covergroup types (base::cg 12.5, ext::cg 25, withargs::cg 12.5,
+    // mcg 100, ocg 50): $get_coverage is their mean.
+    assert!(text.contains("GLOBAL 40.0"), "global coverage:\n{text}");
 }
 
 #[test]

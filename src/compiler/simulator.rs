@@ -4595,6 +4595,10 @@ pub struct Simulator {
     /// the only state in which `ref_formal_redirect_*` can rewrite anything.
     /// Maintained on push/pop/take/restore so the hot paths test one bool.
     ref_redirect_hot: bool,
+    /// §19.7.1 `cg::type_option.<field>` per covergroup TYPE (weight, goal,
+    /// comment, strobe, merge_instances), seeded from the body's
+    /// `type_option.f = v;` items on first access.
+    cg_type_options: HashMap<String, HashMap<String, Value>>,
     /// Per-call-site receiver expressions for `obj.coll.method()` dispatch.
     method_receiver_cache: HashMap<(usize, usize, usize), std::rc::Rc<Expression>>,
     /// `resolve_typeref_class_name` memo: name -> (scope, class ctx) -> (class-table size, answer).
@@ -8261,6 +8265,7 @@ impl Simulator {
             ref_alias_stack: Vec::new(),
             ref_identity_stack: Vec::new(),
             ref_redirect_hot: false,
+            cg_type_options: HashMap::default(),
             method_receiver_cache: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
@@ -48678,6 +48683,18 @@ impl Simulator {
             }
             return changed;
         }
+        if let ExprKind::Ident(h) = &lhs.kind {
+            if h.path.len() == 3 && h.path[1].name.name == "type_option" {
+                if let Some((cg, field)) = self.cg_type_option_path(h) {
+                    // Seed the table (defaults + body items) before the write.
+                    let _ = self.cg_type_option_get(&cg, &field);
+                    if let Some(t) = self.cg_type_options.get_mut(&cg) {
+                        t.insert(field, val.clone());
+                    }
+                    return true;
+                }
+            }
+        }
         if let Some(rewritten) = self.super_rewrite(lhs) {
             return self.assign_value(&rewritten, val);
         }
@@ -52678,6 +52695,13 @@ impl Simulator {
                     if let Some(nh) = self.ref_formal_redirect_hier(hier, false) {
                         let rewritten = Expression::new(ExprKind::Ident(nh), expr.span);
                         return self.eval_expr_ctx(&rewritten, ctx_width);
+                    }
+                }
+                if hier.path.len() == 3 && hier.path[1].name.name == "type_option" {
+                    if let Some((cg, field)) = self.cg_type_option_path(hier) {
+                        if let Some(v) = self.cg_type_option_get(&cg, &field) {
+                            return v;
+                        }
                     }
                 }
                 // §26.3: a PACKAGE-scoped reference (`P::s.x` = [P, s, x])
@@ -70653,6 +70677,56 @@ impl Simulator {
     /// self` calls. Owned only on the frame-dependent paths (per-process
     /// local-dyn rename, package-ambiguous free names) and the first
     /// computation of an uncacheable shape.
+    /// `cg::type_option.<field>` — the covergroup TYPE's option table,
+    /// seeded from the body's `type_option.f = v;` items and the §19.7.1
+    /// defaults (weight 1, goal 90, strobe 0, merge_instances 0).
+    fn cg_type_option_get(&mut self, cg: &str, field: &str) -> Option<Value> {
+        if !self.module.covergroups.contains_key(cg) {
+            return None;
+        }
+        if !self.cg_type_options.contains_key(cg) {
+            let mut t: HashMap<String, Value> = HashMap::default();
+            t.insert("weight".into(), Value::from_u64(1, 32));
+            t.insert("goal".into(), Value::from_u64(90, 32));
+            t.insert("strobe".into(), Value::from_u64(0, 1));
+            t.insert("merge_instances".into(), Value::from_u64(0, 1));
+            t.insert("comment".into(), Value::from_string(""));
+            let seeds: Vec<(String, Expression)> = self
+                .module
+                .covergroups
+                .get(cg)
+                .map(|d| {
+                    d.items
+                        .iter()
+                        .filter_map(|it| match it {
+                            CovergroupItem::TypeOption { name, val } => Some((name.clone(), val.clone())),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (n, e) in seeds {
+                let v = self.eval_expr(&e);
+                t.insert(n, v);
+            }
+            self.cg_type_options.insert(cg.to_string(), t);
+        }
+        self.cg_type_options.get(cg).and_then(|t| t.get(field)).cloned()
+    }
+
+    /// The `[cg, type_option, field]` shape of a scoped type-option access.
+    fn cg_type_option_path(&self, hier: &HierarchicalIdentifier) -> Option<(String, String)> {
+        if hier.path.len() == 3
+            && hier.path.iter().all(|s| s.selects.is_empty())
+            && hier.path[1].name.name == "type_option"
+            && self.module.covergroups.contains_key(&hier.path[0].name.name)
+        {
+            Some((hier.path[0].name.name.clone(), hier.path[2].name.name.clone()))
+        } else {
+            None
+        }
+    }
+
     fn resolve_hier_name<'h>(&self, hier: &'h HierarchicalIdentifier) -> std::borrow::Cow<'h, str> {
         if self.name_stats_on {
             self.name_stats[1].set(self.name_stats[1].get() + 1);
@@ -100580,8 +100654,22 @@ impl Simulator {
                         // up to `auto_bin_max` (default 64) bins; coverage is the
                         // fraction of those bins hit — NOT 100% the moment
                         // anything is sampled. Width comes from a sampled value
-                        // (all share the coverpoint's width).
-                        const AUTO_BIN_MAX: u64 = 64;
+                        // (all share the coverpoint's width). §19.7.1
+                        // `option.auto_bin_max`: the coverpoint's own option,
+                        // else the covergroup's, else 64.
+                        #[allow(non_snake_case)]
+                        let AUTO_BIN_MAX: u64 = cp
+                            .options
+                            .iter()
+                            .find_map(|(n, v)| (n == "auto_bin_max").then(|| opt_u64(v)).flatten())
+                            .or_else(|| {
+                                def.items.iter().find_map(|it| match it {
+                                    CovergroupItem::Option { name, val } if name == "auto_bin_max" => opt_u64(val),
+                                    _ => None,
+                                })
+                            })
+                            .filter(|&n| n > 0)
+                            .unwrap_or(64);
                         let width = insts
                             .iter()
                             .filter_map(|i| i.point_hits.get(&cp_name))

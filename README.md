@@ -118,8 +118,9 @@ and testbench flows. Portable code should not rely on them.
   properties (also when sampled from outside through `obj.cg`), a derived class
   that redeclares `cg` gets its own coverpoints, constructor formals
   (`covergroup cg (int lo, int hi)`) reach the bins, `with function
-  sample(...)` formals are bound per call, and `$get_coverage()` reports the
-  mean over covergroup types. Covergroup and class handles no longer share one
+  sample(...)` formals are bound per call, `option.auto_bin_max` (coverpoint or
+  covergroup level) and `cg::type_option.<field>` are honoured, and
+  `$get_coverage()` reports the mean over covergroup types. Covergroup and class handles no longer share one
   integer namespace, which had dispatched class object 1 as covergroup 1.
 * **DPI at compilation-unit scope** (§35.5.4): `import "DPI-C"` and
   `export "DPI-C"` written at the top of a file are visible in every module,
