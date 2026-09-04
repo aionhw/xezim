@@ -118,7 +118,11 @@ and testbench flows. Portable code should not rely on them.
   multi-dimensional array called `sram_renA`, because the compiler's
   element-width and dimension lookups fell back to the bare leaf name. They
   now try the exact name, then the instance-scoped name, and use the bare
-  leaf only for single-segment names.
+  leaf only for single-segment names. Elaboration now also removes the bare
+  declarator keys that inlining a submodule registers for its own body
+  (element widths, packed dimensions, struct layouts, string signals) once
+  that instance is fully inlined, so they can no longer be matched from
+  anywhere else in the design.
 * **System-function results keep their LRM width in compiled blocks** (§20,
   §21): `$countones`, `$clog2`, `$bits`, `$size`, `$countbits`, and the other
   `int`-valued functions contribute 32 bits to an expression's context, the
