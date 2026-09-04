@@ -45,9 +45,10 @@ Facts worth knowing before the first run:
   output. `+seed=1` is the default. Use two runs + `diff` as a free sanity
   check after any config change.
 - **Timescale**: modules with no `` `timescale ``/`timeunit` get the tool
-  default, `1ps/1ps` for delays and `$realtime` alike. The public AVIP benches
-  run correctly on that default with no flag. When a testbench assumes a
-  coarser default, pass `--timescale 1ns/1ps` (a default, never an override)
+  default, `1ns/1ns` for delays and `$realtime` alike, matching the reference
+  simulator; the public AVIP benches run on it with no flag (uart alone needs
+  `--module-timescale 1ps/1ps`). When a testbench assumes a different
+  default, pass `--timescale 1ns/1ps` (a default, never an override)
   or the named `--module-timescale mod=unit/prec` form; `--dump-timescales`
   prints every module's resolution.
 - **Exit codes**: parse errors, elaboration errors, `$fatal`, and a `-s`

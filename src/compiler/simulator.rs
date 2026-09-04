@@ -83311,7 +83311,7 @@ impl Simulator {
 
     /// §3.14.2 / §20.4 — the timescale a module REPORTS via `$printtimescale`.
     /// A module with no `timescale directive (and none preceding it in
-    /// compilation order) runs on the tool default `1ps / 1ps` for both delays
+    /// compilation order) runs on the tool default `1ns / 1ns` for both delays
     /// and `$time`/`$realtime`; elaboration records that default in
     /// `module_timescale_exp`, so the fallback here only covers definitions the
     /// map never saw. A directive-less module must not display another
@@ -83321,14 +83321,14 @@ impl Simulator {
             .module_timescale_exp
             .get(def)
             .copied()
-            .unwrap_or((-12, -12))
+            .unwrap_or((-9, -9))
     }
 
     /// `--dump-timescales`: print every module definition's timescale before the
     /// run. Shows the REPORTED unit/precision (`$printtimescale` semantics: an
-    /// explicit/inherited `timescale, or the 1ps/1ps tool default when a
+    /// explicit/inherited `timescale, or the 1ns/1ns tool default when a
     /// module has none — flagged, so a mixed design shows which modules count
-    /// picoseconds by default). No source `$printtimescale` calls are needed.
+    /// nanoseconds by default). No source `$printtimescale` calls are needed.
     fn dump_module_timescales(&self) {
         // Every module definition reachable in the design: the top plus every
         // instantiated def_name (deduplicated, sorted for stable output).
@@ -83346,7 +83346,7 @@ impl Simulator {
             let (u, p) = self.reported_timescale_exp(d);
             let defaulted = self.module.modules_without_timescale.iter().any(|m| m == d);
             let note = if defaulted {
-                "   (no `timescale — 1ps/1ps default)"
+                "   (no `timescale — 1ns/1ns default)"
             } else {
                 ""
             };
