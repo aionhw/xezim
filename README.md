@@ -112,6 +112,19 @@ and testbench flows. Portable code should not rely on them.
 
 ### Unreleased — class covergroups, compilation-unit DPI, assertions in instances
 
+* **Performance round (measured with interleaved `perf stat`, output
+  byte-identical in every case):** whole-net identity buffers (`assign y = x`)
+  now collapse onto their source by default (`XEZIM_BUF_COLLAPSE=0` opts
+  out) — the pass leaves alone any net that is a `force`/`release`/procedural
+  `assign` target, any source a process writes (the copy's delta step stays
+  observable), gate-driven nets, 2-state/4-state pairs, SDF designs, and
+  designs with DPI/VPI libraries; C906 memcpy runs 10.7 % fewer instructions
+  and 14 % less wall time, bit-exact against the reference transcript. On UVM
+  workloads the runtime scalar-index helper no longer hands calls and member
+  accesses to the elaboration-time constant folder (which cloned the whole
+  function table per attempt), process contexts are moved rather than cloned
+  across wakeups, and clocking blocks poll their clock by signal id; the axi4
+  AVIP base test retires 3.7 % fewer instructions.
 * **Default timescale for untimed units is `1ns/1ns`** for any module,
   interface, or package without a `` `timescale `` directive (IEEE 1800
   §3.14.2.2 leaves the default tool-defined; this matches the reference

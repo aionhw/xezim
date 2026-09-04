@@ -3668,6 +3668,9 @@ pub struct Simulator {
     clocking_prev_clock: HashMap<String, u8>,
     /// Per-tick clock poll table for `tick_clocking_blocks` (see there).
     clocking_tick_cache: Vec<ClockingTick>,
+    /// Buffer-collapse exclusions (override-target leaves, procedural write
+    /// names), collected once while the process bodies are still present.
+    buf_collapse_write_sets: Option<(HashSet<String>, HashSet<String>)>,
     /// LRM §14.3: each clocking block's clock EDGE (`@(posedge/negedge clk)`).
     /// `tick_clocking_blocks` and `@(cb)` resolution consult this so a
     /// `@(negedge clk)` block samples/advances on the negedge, not the posedge.
@@ -8020,6 +8023,7 @@ impl Simulator {
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
             clocking_tick_cache: Vec::new(),
+            buf_collapse_write_sets: None,
             clocking_edge: HashMap::default(),
             clocking_mirror_dirty: false,
             clocking_cycle_pending: HashMap::default(),
@@ -21166,9 +21170,36 @@ impl Simulator {
         // optimizer applies), and a runtime force on the buffered name now
         // reaches the shared net. Skipped entirely under SDF (a collapsed
         // net would lose its annotated delay).
-        if std::env::var("XEZIM_BUF_COLLAPSE").map(|v| v == "1").unwrap_or(false)
+        // Whole-net identity buffers (`assign y = x`) alias onto their source
+        // by default; `XEZIM_BUF_COLLAPSE=0` turns the pass off. A net keeps
+        // its own storage when aliasing would be observable: it is a force /
+        // release / procedural-assign target anywhere in the design, its
+        // two-state-ness differs from the source (a 2-state copy must drop
+        // X/Z), the design carries SDF delays, or a DPI/VPI backdoor may look
+        // the folded name up by itself.
+        let buf_collapse_on = !matches!(std::env::var("XEZIM_BUF_COLLAPSE").as_deref(), Ok("0"))
             && self.sdf_delays.is_empty()
-        {
+            && self.module.dpi_imports.is_empty()
+            && configured_vpi_libs().is_empty()
+            && configured_dpi_libs().is_empty();
+        if buf_collapse_on {
+            // Same rule as the port pass above: never alias onto a source a
+            // process WRITES. A reader parked on the same edge that writes
+            // the source relies on the copy's delta step (reference-verified
+            // in tests/scheduling/waiter_edge_ordering.rs); gate primitives
+            // keep their z→x mapping on the net they drive. This pass runs
+            // again after the always blocks have been drained into compiled
+            // form, so the two name sets are collected on the FIRST call,
+            // while every process body is still on the module, and kept.
+            if self.buf_collapse_write_sets.is_none() {
+                self.buf_collapse_write_sets = Some((
+                    super::elaborate::collect_override_target_leaves(&self.module),
+                    super::elaborate::collect_procedural_write_names(&self.module),
+                ));
+            }
+            let (override_leaves, proc_writes) =
+                self.buf_collapse_write_sets.clone().unwrap_or_default();
+            let leaf_of = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
             let mut buf_collapsed = 0usize;
             for _ in 0..8 {
                 let mut changed = false;
@@ -21197,9 +21228,14 @@ impl Simulator {
                     if lid == rid
                         || self.signal_widths[lid] != self.signal_widths[rid]
                         || self.signal_real[lid] != self.signal_real[rid]
+                        || self.signal_two_state[lid] != self.signal_two_state[rid]
                         || self.module.events.contains(ln.as_str())
                         || self.module.events.contains(rn.as_str())
                         || ca_driver_counts.get(ln.as_str()).copied().unwrap_or(0) != 1
+                        || override_leaves.contains(&leaf_of(ln.as_str()))
+                        || override_leaves.contains(&leaf_of(rn.as_str()))
+                        || proc_writes.contains(rn.as_str())
+                        || self.signal_gate_driven.get(lid).copied().unwrap_or(false)
                     {
                         continue;
                     }
@@ -21212,7 +21248,7 @@ impl Simulator {
                     break;
                 }
             }
-            if buf_collapsed > 0 {
+            if buf_collapsed > 0 && std::env::var("XEZIM_DEBUG").is_ok() {
                 eprintln!("[BUF-COLLAPSE] {} identity buffer nets collapsed", buf_collapsed);
             }
         }
