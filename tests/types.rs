@@ -360,3 +360,5 @@ mod tf_port_typedef_packed_dims;
 mod ref_formal_element_write;
 #[path = "types/multi_dim_unpacked_arrays.rs"]
 mod multi_dim_unpacked_arrays;
+#[path = "types/real_to_integral_local.rs"]
+mod real_to_integral_local;

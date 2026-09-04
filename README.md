@@ -127,6 +127,10 @@ and testbench flows. Portable code should not rely on them.
   like a `$unit` function; they used to be reported as undeclared. Small
   integral returns (`byte unsigned`, `shortint`) read at their declared width
   and sign in expressions, and a 1-bit `logic` argument carries x/z as svLogic.
+* **A real assigned to an integral subroutine local rounds** (§6.12.2), as it
+  always did for module variables; the local used to keep the real value, so
+  `int div = freq / rate;` compared as 32.55 forever and a baud-clock divider
+  written that way never toggled.
 * **Concurrent assertions inside instantiated modules and interfaces** are
   registered and fire; inlining used to drop them silently. Sequence
   consequents (`a |-> a ##1 b ##1 c`, `a |=> s`) walk their steps cycle by

@@ -48961,6 +48961,11 @@ impl Simulator {
                 let fitted = match prev.as_ref() {
                     Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
                     Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
+                    Some(p) if !p.is_real && val.is_real => {
+                        let mut f = Self::real_to_int(val.to_f64(), p.width.max(1));
+                        f.is_signed = p.is_signed;
+                        f
+                    }
                     _ => val.clone(),
                 };
                 let changed = prev.as_ref() != Some(&fitted);
@@ -49103,6 +49108,22 @@ impl Simulator {
                                 } else {
                                     val.clone()
                                 }
+                            } else if val.is_real
+                                && !is_str
+                                && self.local_stack[last_idx].get(name).is_some_and(|p| !p.is_real)
+                            {
+                                // §6.12.2: a real assigned to an INTEGRAL local
+                                // rounds to the local's type — the module-variable
+                                // path did, the frame local kept the real, so an
+                                // `int baudDivisor = freq / rate;` compared as
+                                // 32.55 forever (uart AVIP baud clock never toggled).
+                                let (w, signed) = self.local_stack[last_idx]
+                                    .get(name)
+                                    .map(|p| (self.widths.get(name).copied().unwrap_or(p.width).max(1), p.is_signed))
+                                    .unwrap_or((32, true));
+                                let mut f = Self::real_to_int(val.to_f64(), w);
+                                f.is_signed = signed;
+                                f
                             } else {
                                 val.clone()
                             };
