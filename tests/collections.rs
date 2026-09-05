@@ -93,3 +93,5 @@ mod assoc_of_struct;
 mod queue_concat_index_prefilled_prefix;
 #[path = "collections/foreach_live_size_bounds.rs"]
 mod foreach_live_size_bounds;
+#[path = "collections/foreach_packed_multidim.rs"]
+mod foreach_packed_multidim;

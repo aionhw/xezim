@@ -63398,7 +63398,29 @@ impl Simulator {
                         }
                     }
                     if vars.len() >= 2 {
-                        if let Some(mut dims) = self.foreach_dims(&name) {
+                        // §12.7.3: the loop variables map onto the array's
+                        // dimensions left to right, unpacked first, then
+                        // packed. A PURELY packed array (`u7_t [4:0][1:0] a`,
+                        // `bit [6:0][4:0][1:0] b`) has no unpacked shape, so
+                        // `foreach_dims` is None; that used to fall through to
+                        // the single-dimension path and iterate one packed
+                        // dimension with every other variable x. Start from an
+                        // empty shape and let the packed dimensions supply
+                        // every variable.
+                        let purely_packed = self.foreach_dims(&name).is_none()
+                            && !self.module.dynamic_arrays.contains(&*name)
+                            && !self.is_associative_array(&name)
+                            && self
+                                .module
+                                .packed_full_dims
+                                .get(&*name)
+                                .is_some_and(|d| d.len() >= vars.len());
+                        let start_dims = if purely_packed {
+                            Some(Vec::new())
+                        } else {
+                            self.foreach_dims(&name)
+                        };
+                        if let Some(mut dims) = start_dims {
                             // A dynamic outer dimension (`T a[][16]`) is backed
                             // by a fixed 64-slot buffer; iterate only the
                             // CURRENT size, like the 1-var dynamic path below.
