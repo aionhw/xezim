@@ -4864,7 +4864,17 @@ impl<'a> BytecodeCompiler<'a> {
         // A multi-D PACKED base (`logic [1:0][3:0][7:0] foo`) is NOT a
         // flattening no-op: `foo[0]` selects a slice, so `foo[0][j]` must
         // not degrade to a bit-select of the whole vector (§7.4.1).
-        if self.packed_elem_width_of(hier).is_some() {
+        //
+        // Ask the SHAPE question, not the width question. `packed_elem_width_of`
+        // filters out elem_w == 1, which is right for a single-index select
+        // (element `i` of `[N-1:0][0:0]` IS physically bit `i`, so `foo[i]`
+        // may fuse as a bit-select) but wrong here: `foo[i][0]` still selects
+        // WITHIN element `i`. With the unit-width element filtered away this
+        // guard never fired, the whole-vector signal id was returned, and the
+        // caller emitted `BlockingAssignBitDyn(foo, 0)` — every `foo[i][0]`
+        // wrote bit 0 regardless of `i`. `[N-1:0][1:0]` was correct precisely
+        // because the filter let its width through and this guard bailed.
+        if self.is_packed_multi_dim(hier) {
             return None;
         }
         // A genuine 2D/ND UNPACKED array (`logic [7:0] m [2][2]`) also carries
@@ -5086,6 +5096,24 @@ impl<'a> BytecodeCompiler<'a> {
 
     /// The base's registered packed ELEMENT width (>1), if it is a
     /// multi-dimensional packed vector (`logic [3:0][7:0] x`).
+    /// True when `hier` names a packed MULTI-DIMENSIONAL signal, regardless of
+    /// its element width. `packed_elem_width_of` answers "how wide is an
+    /// element, if that width changes codegen" and so drops unit-width
+    /// elements; callers that need "is this a packed array at all" — where a
+    /// further select indexes INSIDE an element — must use this instead.
+    fn is_packed_multi_dim(&self, hier: &HierarchicalIdentifier) -> bool {
+        let raw = Self::hier_raw_name(hier);
+        self.packed_elem_widths
+            .and_then(|m| {
+                m.get(raw.as_str()).copied().or_else(|| {
+                    hier.path
+                        .last()
+                        .and_then(|s| m.get(s.name.name.as_str()).copied())
+                })
+            })
+            .is_some()
+    }
+
     fn packed_elem_width_of(&self, hier: &HierarchicalIdentifier) -> Option<u32> {
         let raw = Self::hier_raw_name(hier);
         self.packed_elem_widths

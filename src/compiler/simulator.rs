@@ -57605,23 +57605,51 @@ impl Simulator {
                         }
                     }
                     if let Some(arg) = args.first() {
+                        // Resolve the operand to the name its declared bounds
+                        // are registered under. A plain / hierarchical Ident
+                        // resolves as it always did; a HANDLE-QUALIFIED member
+                        // resolves to the instance-scoped store below.
+                        let mut aname: Option<std::borrow::Cow<str>> = None;
                         if let ExprKind::Ident(hier) = &arg.kind {
-                            let mut aname = self.resolve_hier_name(hier);
+                            let mut n = self.resolve_hier_name(hier);
                             // A fixed-size ARRAY class member lives at
                             // `<handle>#<member>`; the bare name has no dims.
-                            if let Some(scoped) = self.instance_assoc_member(&aname) {
+                            if let Some(scoped) = self.instance_assoc_member(&n) {
                                 if self.module.arrays.contains_key(&scoped) {
-                                    aname = std::borrow::Cow::Owned(scoped);
+                                    n = std::borrow::Cow::Owned(scoped);
                                 }
                             }
                             // §8.9: `$size(Cls::S)` — the resolver collapses
                             // the 2-segment form to the bare leaf; map from
                             // the original segments to the qualified store.
-                            if !self.module.arrays.contains_key(&*aname) {
+                            if !self.module.arrays.contains_key(&*n) {
                                 if let Some(k) = self.static_fixed_key_from_hier(hier) {
-                                    aname = std::borrow::Cow::Owned(k);
+                                    n = std::borrow::Cow::Owned(k);
                                 }
                             }
+                            aname = Some(n);
+                        }
+                        // §20.7: `$size(a.M)` on a class member array. The
+                        // handle-qualified spelling parses either as a
+                        // `MemberAccess`, which never entered the Ident arm at
+                        // all, or as a two-segment Ident that resolves to a
+                        // name carrying no registered shape. Either way no
+                        // bounds were found and the query fell through to the
+                        // operand's evaluated BIT WIDTH below, so every
+                        // `$size(a.M)` reported 32 while the in-method
+                        // `$size(M)` on the same member reported 3.
+                        // `foreach (a.M[i])` already iterates the member, so
+                        // the shape was known all along — only this path
+                        // missed it.
+                        if aname
+                            .as_deref()
+                            .is_none_or(|n| self.foreach_dims(n).is_none())
+                        {
+                            if let Some(scoped) = self.handle_member_array_name(arg) {
+                                aname = Some(std::borrow::Cow::Owned(scoped));
+                            }
+                        }
+                        if let Some(aname) = aname {
                             // Every unpacked dimension, outermost first. Only the
                             // 1-D table was consulted, so `$size(m, 2)` — and even
                             // `$size(m)` on a 2-D/N-D array — returned 0.
@@ -93709,6 +93737,64 @@ impl Simulator {
             }
             set
         })
+    }
+
+    /// §20.7: the instance-scoped store (`<handle>#<member>`) behind a
+    /// HANDLE-QUALIFIED array member operand — `a.M`, `this.M`. `new`
+    /// registers every fixed-size array property under that name in the
+    /// `arrays`/`arrays_2d`/`arrays_nd` tables, so once the operand resolves
+    /// to it the ordinary declared-bounds path answers the query.
+    ///
+    /// Both spellings the parser produces are accepted: an explicit
+    /// `MemberAccess`, and the flattened two-segment `Ident` — the same pair
+    /// `assign_class_collection_pattern` already resolves for whole-array
+    /// writes. Returns None unless the object's class, or an ancestor, really
+    /// declares `member` as a fixed-size array, which leaves a module
+    /// hierarchical path and a packed (non-array) member on their existing
+    /// paths.
+    fn handle_member_array_name(&self, expr: &Expression) -> Option<String> {
+        let (handle, member) = match &expr.kind {
+            ExprKind::MemberAccess { expr: base, member } => {
+                let h = match &base.kind {
+                    ExprKind::This => self.this_stack.last().copied().flatten()?,
+                    ExprKind::Ident(b) if b.path.len() == 1 && b.path[0].selects.is_empty() => {
+                        self.eval_ident_handle(&b.path[0].name.name)?
+                    }
+                    _ => return None,
+                };
+                (h, member.name.as_str())
+            }
+            ExprKind::Ident(hi)
+                if hi.path.len() == 2 && hi.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let base = &hi.path[0].name.name;
+                let h = if base == "this" || base == "super" {
+                    self.this_stack.last().copied().flatten()?
+                } else {
+                    self.eval_ident_handle(base)?
+                };
+                (h, hi.path[1].name.name.as_str())
+            }
+            _ => return None,
+        };
+        if handle == 0 {
+            return None;
+        }
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(c) = cur {
+            let Some(cd) = self.module.classes.get(&c) else { break };
+            if cd.array_properties.contains_key(member)
+                || cd.array_nd_properties.contains_key(member)
+            {
+                return Some(format!("{}#{}", handle, member));
+            }
+            cur = cd.extends.clone();
+        }
+        None
     }
 
     fn instance_assoc_member(&self, name: &str) -> Option<String> {
