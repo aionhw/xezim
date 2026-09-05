@@ -110,6 +110,18 @@ and testbench flows. Portable code should not rely on them.
 
 # What's new in 0.10
 
+### Unreleased
+
+* **Fewer per-identifier lookups inside class methods**: a bare name that
+  no class in the chain declares as a property (a local, a formal, a module
+  signal) used to trigger a class-chain walk with collection-table probes and
+  string clones on every evaluation; the verdict is now cached per class.
+  The struct-or-not question asked on every class property access no longer
+  clones the class name per level or allocates a cycle-guard set, and its
+  negative answer is cached too. An unsized literal reads its width from its
+  cached parse instead of rescanning its text. The axi4 AVIP retires 4.9 %
+  fewer instructions, output identical.
+
 ### 0.10.5 — class covergroups, DPI exports and unit scope, faster UVM (September 2026)
 * **Typedef'd packed arrays keep their dimensions inside instances**: a
   `u7_t [4:0][1:0] a` declared in an instantiated module (including every

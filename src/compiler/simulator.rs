@@ -3397,6 +3397,15 @@ pub struct Simulator {
     /// `Some(class)` = static fixed array owned by that class.
     #[allow(clippy::type_complexity)]
     class_coll_index: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
+    /// Per class: bare names that NO class in its inheritance chain declares
+    /// as a property (locals, module signals, method formals). Every bare
+    /// identifier evaluated inside a class method asked
+    /// `instance_assoc_member`, which walked the chain and probed the
+    /// collection tables per level, on every evaluation; such a name can
+    /// never become a collection member, so the verdict is cached.
+    class_non_member_cache: std::cell::RefCell<HashMap<String, HashSet<String>>>,
+    /// Per class: properties that are NOT structs (see `class_prop_struct`).
+    class_prop_struct_neg: std::cell::RefCell<HashMap<String, HashSet<String>>>,
     name_stats: [std::cell::Cell<u64>; 5],
     name_stats_on: bool,
     frame_pool: Vec<HashMap<String, Value>>,
@@ -8019,6 +8028,8 @@ impl Simulator {
             force_epoch_gen: 0,
             force_refresh_done_gen: 0,
             class_coll_index: std::cell::RefCell::new(HashMap::default()),
+            class_non_member_cache: std::cell::RefCell::new(HashMap::default()),
+            class_prop_struct_neg: std::cell::RefCell::new(HashMap::default()),
             name_stats: Default::default(),
             name_stats_on: std::env::var("XEZIM_NAME_STATS").is_ok(),
             frame_pool: Vec::new(),
@@ -59224,9 +59235,16 @@ impl Simulator {
                 // §5.7.1: an UNSIZED literal is at least 32 bits, but must not
                 // drop digits the source wrote — `'h123456789ABCDEF0` is 64 bits
                 // of value and a flat 32 kept only the low half, silently.
+                // The cached triple already carries the width the literal
+                // was parsed at; an UNSIZED literal used to recompute it from
+                // its text on every evaluation.
+                let cached = cached_val.get();
                 let w = match size {
                     Some(sz) => *sz,
-                    None => Value::unsized_literal_width(value, r_for_w),
+                    None => match cached {
+                        Some((_, _, cw)) => cw,
+                        None => Value::unsized_literal_width(value, r_for_w),
+                    },
                 };
                 // §5.7.1: an unsized all-x/all-z literal ('bx, 'hz, 'b?) is a
                 // FILL — it must replicate to the consuming context, not stop
@@ -59234,7 +59252,7 @@ impl Simulator {
                 let xz_fill =
                     size.is_none() && Value::unsized_xz_fill_char(value).is_some();
                 // Fast path: return cached value (avoids re-parsing string)
-                if let Some((vb, xz, cw)) = cached_val.get() {
+                if let Some((vb, xz, cw)) = cached {
                     if cw == w {
                         let mut v = Value::from_inline(vb, xz, w);
                         v.is_signed = *signed;
@@ -85600,14 +85618,34 @@ impl Simulator {
         // typedef name to look up, but its declared type is retained verbatim
         // in `property_types` — use it directly; whole-value access worked
         // while `s.f` read x without this.
-        if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
-            let mut cur = Some(inst.class_name.clone());
-            let mut seen: HashSet<String> = HashSet::default();
+        let class_name: &str = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.as_str())
+            .unwrap_or("");
+        // The common answer for a scalar property is "not a struct"; it
+        // depends only on the class chain and the name, so it is cached
+        // per class. The walk below used to clone the class name per level
+        // and allocate a cycle-guard set on every property access.
+        if !class_name.is_empty()
+            && self
+                .class_prop_struct_neg
+                .borrow()
+                .get(class_name)
+                .is_some_and(|set| set.contains(prop))
+        {
+            return None;
+        }
+        if !class_name.is_empty() {
+            let mut cur: Option<&str> = Some(class_name);
+            let mut hops = 0usize;
             while let Some(cn) = cur {
-                if !seen.insert(cn.clone()) {
+                hops += 1;
+                if hops > 64 {
                     break;
                 }
-                let cd = self.module.classes.get(&cn)?;
+                let cd = self.module.classes.get(cn)?;
                 // A COLLECTION property (assoc/queue/array — incl. a STATIC
                 // one, which elaboration gates out of the per-instance maps)
                 // is NOT a scalar struct: its unpacked dimension indexes
@@ -85638,18 +85676,25 @@ impl Simulator {
                 if cd.properties.contains_key(prop) {
                     break;
                 }
-                cur = cd.extends.clone();
+                cur = cd.extends.as_deref();
             }
         }
-        let tn = self.class_prop_type_name(handle, prop)?;
-        let dt = self
-            .module
-            .typedef_types
-            .get(tn.as_str())?;
-        match Self::resolve_type_ref(dt, &self.module.typedef_types) {
-            DataType::Struct(su) => Some(su),
-            _ => None,
+        let verdict = (|| {
+            let tn = self.class_prop_type_name(handle, prop)?;
+            let dt = self.module.typedef_types.get(tn.as_str())?;
+            match Self::resolve_type_ref(dt, &self.module.typedef_types) {
+                DataType::Struct(su) => Some(su),
+                _ => None,
+            }
+        })();
+        if verdict.is_none() && !class_name.is_empty() {
+            self.class_prop_struct_neg
+                .borrow_mut()
+                .entry(class_name.to_string())
+                .or_default()
+                .insert(prop.to_string());
         }
+        verdict
     }
 
     /// The CONCRETE type name a property's declared type denotes on this
@@ -93792,13 +93837,33 @@ impl Simulator {
             });
         }
         // Miss: only the per-instance type-binding case can still match.
+        if self
+            .class_non_member_cache
+            .borrow()
+            .get(ctx)
+            .is_some_and(|set| set.contains(name))
+        {
+            return None;
+        }
         let mut cur: Option<&str> = Some(ctx);
+        let mut declared = false;
         while let Some(cn) = cur {
             let cd = self.module.classes.get(cn)?;
+            declared |= cd.properties.contains_key(name);
             if self.prop_bound_collection(handle, cn, name) {
                 return Some(format!("{}#{}", handle, name));
             }
             cur = cd.extends.as_deref();
+        }
+        if !declared {
+            // Not a property anywhere in the chain: the verdict cannot
+            // depend on this instance's type bindings, so it holds for
+            // every object of the class.
+            self.class_non_member_cache
+                .borrow_mut()
+                .entry(ctx.to_string())
+                .or_default()
+                .insert(name.to_string());
         }
         None
     }
@@ -93855,6 +93920,25 @@ impl Simulator {
     /// a property declared with a type parameter that this instance binds to
     /// a typedef carrying a dynamic/queue unpacked dimension (§6.20.3)?
     fn prop_bound_collection(&self, handle: usize, class_name: &str, member: &str) -> bool {
+        // Hit path without allocations: the cached raw type and the
+        // instance's binding are borrowed, and the dimension verdict is
+        // read by `&str`.
+        {
+            let cache = self.prop_raw_ty_cache.borrow();
+            if let Some(hit) = cache.get(class_name).and_then(|m| m.get(member)) {
+                let Some(raw) = hit.as_deref() else { return false };
+                let concrete: &str = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.type_bindings.get(raw))
+                    .map(String::as_str)
+                    .unwrap_or(raw);
+                if let Some(&v) = self.collection_dim_cache.borrow().get(concrete) {
+                    return v;
+                }
+            }
+        }
         let raw_ty: Option<String> = {
             let hit = self
                 .prop_raw_ty_cache
