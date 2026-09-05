@@ -112,6 +112,17 @@ and testbench flows. Portable code should not rely on them.
 
 ### Unreleased
 
+* **`bind` with a parameter value assignment is applied**: `bind dut
+  dut_harness #(.NUM_ROWS(NUM_ROWS), .NUM_COLS(NUM_COLS)) v_tl_harness
+  (.*);` was dropped by the parser as an unrecognised directive, so the
+  harness never existed: hierarchical reads of it gave x, task calls into it
+  did nothing, and a scoreboard driven that way passed without ever
+  running. The parameters now reach the bound instance.
+* **A `ref` formal named like its actual no longer overflows the stack**:
+  `task sum(ref int cnt)` called as `sum(cnt)` rewrote the identifier to
+  itself and evaluation re-entered the redirect until the stack was gone;
+  such a formal now resolves straight to the actual's storage, for element
+  reads and writes as well.
 * **Fewer per-identifier lookups inside class methods**: a bare name that
   no class in the chain declares as a property (a local, a formal, a module
   signal) used to trigger a class-chain walk with collection-table probes and

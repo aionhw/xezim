@@ -48719,6 +48719,14 @@ impl Simulator {
         }
         let name = hier.path[0].name.name.as_str();
         if let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(name)) {
+            // A formal bound to an actual of the SAME name (`run_checks(ref
+            // u7_t [..] cnt)` called as `run_checks(cnt)`) rewrote the
+            // identifier to itself, and the evaluator re-entered this
+            // redirect on the rewritten node until the stack overflowed.
+            // Plain resolution of the name already reaches that storage.
+            if storage == name {
+                return None;
+            }
             let mut path = hier.path.clone();
             path[0].name.name = storage.clone();
             return Some(crate::ast::expr::HierarchicalIdentifier {
@@ -101307,6 +101315,18 @@ impl Simulator {
         // the callee's stale copy).
         output_bindings.retain(|(n, _)| !alias_map.contains_key(n));
         self.ref_binding_stack.push(ref_map);
+        // A `ref` formal whose actual has the SAME name (`sum(ref int cnt)`
+        // called as `sum(cnt)`) cannot be steered by the alias map: the
+        // redirect would rewrite the name to itself (see
+        // `ref_formal_redirect_hier`). Drop its frame copy instead, so plain
+        // resolution reaches the actual's storage for reads and writes.
+        if let Some(frame) = self.local_stack.last_mut() {
+            for (formal, storage) in &alias_map {
+                if formal == storage {
+                    frame.remove(formal);
+                }
+            }
+        }
         self.ref_alias_stack.push(alias_map);
         self.ref_identity_stack.push(identity_formals);
         self.refresh_ref_redirect_hot();
