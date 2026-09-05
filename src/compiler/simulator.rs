@@ -63048,11 +63048,18 @@ impl Simulator {
                     })
                     .collect();
                 let fv_saved = self.snapshot_loop_vars(&fv_names);
+                // A loop variable that shadows a module-scope variable needs
+                // its own frame. The module variable of an INLINED instance
+                // is keyed under the process scope (`u.i`), so test the
+                // scope-hinted names too: without this the first run wrote a
+                // bare `i` signal while the reads resolved through the hint
+                // to the x-valued `u.i`, and the loop never entered.
                 let shadow_frame = self.local_stack.last().is_none()
                     && init.iter().any(|fi| match fi {
                         ForInit::VarDecl { name, .. } => {
                             self.signal_name_to_id.contains_key(name.name.as_str())
                                 || self.signals.contains_key(&name.name)
+                                || self.scoped_signal_exists(&name.name)
                         }
                         _ => false,
                     });
@@ -63189,6 +63196,25 @@ impl Simulator {
                     self.pop_local_frame();
                 }
                 self.restore_loop_vars(&fv_saved);
+            }
+            // A foreach variable that shadows a module-scope variable (bare or
+            // under the process's instance scope, `u.i`) gets its own frame,
+            // like a for-init variable: without one the loop variable was
+            // written by name, resolved through the scope hint to the module
+            // variable, and the block re-triggered itself on that write.
+            // The re-dispatch below sees a local frame and takes the normal
+            // path, so every exit of that path pops nothing extra.
+            StatementKind::Foreach { vars, .. }
+                if self.local_stack.last().is_none()
+                    && vars.iter().flatten().any(|v| {
+                        self.signal_name_to_id.contains_key(v.name.as_str())
+                            || self.signals.contains_key(&v.name)
+                            || self.scoped_signal_exists(&v.name)
+                    }) =>
+            {
+                self.push_local_frame(HashMap::default());
+                self.exec_statement(stmt);
+                self.pop_local_frame();
             }
             StatementKind::Foreach { array, vars, body } => {
                 // foreach index variables are loop-scoped (SV): save the outer
@@ -78110,6 +78136,27 @@ impl Simulator {
         }
         let leaf = name.rsplit('.').next().unwrap_or(name);
         self.module.assoc_elem_widths.get(leaf).copied()
+    }
+
+    /// Does `name` resolve to a signal under the active process scope
+    /// (`<hint>.<name>`, walking up parent scopes)?
+    fn scoped_signal_exists(&self, name: &str) -> bool {
+        let hint = self.name_resolve_hint.borrow();
+        let Some(mut scope) = hint.as_deref() else {
+            return false;
+        };
+        loop {
+            let scoped = format!("{}.{}", scope, name);
+            if self.signal_name_to_id.contains_key(scoped.as_str())
+                || self.signals.contains_key(&scoped)
+            {
+                return true;
+            }
+            match scope.rsplit_once('.') {
+                Some((parent, _)) => scope = parent,
+                None => return false,
+            }
+        }
     }
 
     fn is_associative_array(&self, name: &str) -> bool {

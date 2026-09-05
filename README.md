@@ -123,6 +123,16 @@ and testbench flows. Portable code should not rely on them.
   relational bounds, `elem == e` pins, and `$countones(mask[i][j]) ==
   count[i][j]` couplings, which draw the mask with exactly that many ones.
   A `rand` class property wider than 64 bits is drawn in full as well.
+* **Loop variables shadow a same-named variable of an inlined instance**: a
+  `for (integer i = 0; ...)` or `foreach (a[i])` inside a child module that
+  also declares `integer i` at module scope now binds `i` to the loop. The
+  inliner used to prefix every use of `i` to the child's module variable
+  while the loop's own declaration stayed bare, so the loop compared an
+  x-valued `u.i` and never ran (a gray-code pointer decoder stayed at x and
+  an asynchronous FIFO popped the same word forever). The interpreted form
+  had the matching runtime defect: the loop variable was written by name
+  through the process scope, which for a `foreach` re-triggered the block
+  on its own write.
 * **Associative-array probes no longer scan the whole signal table**:
   `exists()` on an absent key, the nested-element probe behind every
   associative-array check, and `first()` / `next()` key enumeration now read
