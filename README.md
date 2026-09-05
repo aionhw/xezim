@@ -111,6 +111,16 @@ and testbench flows. Portable code should not rely on them.
 # What's new in 0.10
 
 ### 0.10.5 — class covergroups, DPI exports and unit scope, faster UVM (September 2026)
+* **Typedef'd packed arrays keep their dimensions inside instances**: a
+  `u7_t [4:0][1:0] a` declared in an instantiated module (including every
+  top of a multi-top design, which runs under the synthetic wrapper) had no
+  packed geometry recorded, so `foreach (a[i, j])` walked its 70 bits
+  instead of its 10 elements while the same module run as the selected top
+  was right. The declared dimensions are now chained with the typedef's for
+  instance variables, ports and nets alike.
+* **`--profile`** prints the end-of-run profile report (by design unit,
+  instance and construct, plus the opcode and entry histograms); the same
+  as `XEZIM_PROFILE_REPORT=1`.
 
 * **`foreach` and `std::randomize` over multi-dimensional targets**: a
   `foreach (a[i, j])` over a purely packed array (`u7_t [4:0][1:0]`,
@@ -706,6 +716,7 @@ Common options:
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
 | `--relax-implicit-static` | Accept `int x = ...;` inside a static task/function (§6.21) with a warning instead of an error — for vendor sources you cannot edit |
 | `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |
+| `--profile` | Print the `[PROF]` end-of-run profile report (edge-block, settle and timing counters). Same as `XEZIM_PROFILE_REPORT=1` |
 
 Selected env knobs (off by default unless noted):
 
@@ -725,6 +736,7 @@ Selected env knobs (off by default unless noted):
 | `XEZIM_NO_CACHE=1` | Disable the automatic elaborated-design cache |
 | `XEZIM_COMPILE_PHASES=1` | Report detailed simulator compilation phase timings |
 | `XEZIM_ALLOW_IMPLICIT_STATIC=1` | Same as `--relax-implicit-static` |
+| `XEZIM_PROFILE_REPORT=1` | Same as `--profile` |
 | `XEZIM_MAX_INST_DEPTH=N` | Instantiation-depth cap (default 200) — turns unbounded recursive instantiation into a clean error instead of memory exhaustion |
 | `XEZIM_STACK_MB=N` | Stack size of the simulation worker thread (default 1024; `0` runs on the main thread) |
 | `XEZIM_VALUE_TRACE=<substr>[,...]` | Print every committed change of signals whose hierarchical name contains a pattern: time, name, old→new value, dispatch phase, writing process origin (file:line). NBA commits are labeled `nba` |

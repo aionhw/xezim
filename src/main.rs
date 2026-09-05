@@ -122,6 +122,8 @@ fn print_usage() {
     eprintln!("  --no-strict-top  Warn and auto-detect the design root instead when -s names");
     eprintln!("                   a module that does not exist (for generated corpora whose");
     eprintln!("                   recorded top names are known-stale)");
+    eprintln!("  --profile        Print the [PROF] end-of-run profile report (edge-block, settle");
+    eprintln!("                   and timing counters). Same as XEZIM_PROFILE_REPORT=1.");
     eprintln!("  --error-exit     Exit nonzero if any $error was reported ($fatal always does)
   --relax-implicit-static  Accept `int x = ...;` inside a static subroutine
                    (§6.21) with a warning instead of an error. Also enabled by
@@ -1758,6 +1760,14 @@ fn run_main() -> i32 {
             // forward that is not "edit a vendor's source tree".
             "--relax-implicit-static" => {
                 xezim_core::elaborate::set_relax_implicit_static(true);
+            }
+            // The end-of-run [PROF] report (edge-block, settle and timing
+            // counters). Every reader consults the environment switch, so
+            // the flag sets it before the simulator is constructed.
+            "--profile" => {
+                // SAFETY: argument parsing runs single-threaded, before any
+                // simulator thread exists.
+                unsafe { std::env::set_var("XEZIM_PROFILE_REPORT", "1") };
             }
             "--verbose" => {
                 verbose = true;
