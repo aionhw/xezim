@@ -95,3 +95,5 @@ mod queue_concat_index_prefilled_prefix;
 mod foreach_live_size_bounds;
 #[path = "collections/foreach_packed_multidim.rs"]
 mod foreach_packed_multidim;
+#[path = "collections/std_randomize_multidim.rs"]
+mod std_randomize_multidim;

@@ -112,6 +112,17 @@ and testbench flows. Portable code should not rely on them.
 
 ### Unreleased — class covergroups, compilation-unit DPI, assertions in instances
 
+* **`foreach` and `std::randomize` over multi-dimensional targets**: a
+  `foreach (a[i, j])` over a purely packed array (`u7_t [4:0][1:0]`,
+  `bit [6:0][4:0][1:0]`) now iterates every named dimension, declared
+  dimensions first and then the typedef's (it used to iterate one and leave
+  `j` x). `std::randomize(...) with { foreach (a[i, j]) ... }` now draws a
+  packed target wider than 64 bits and every element of a 2-D or N-D unpacked
+  array (both were left at 0), checks the constraint body with all loop
+  variables bound (it passed vacuously before), and repairs per element:
+  relational bounds, `elem == e` pins, and `$countones(mask[i][j]) ==
+  count[i][j]` couplings, which draw the mask with exactly that many ones.
+  A `rand` class property wider than 64 bits is drawn in full as well.
 * **A `forever` / `always` process no longer re-clones its loop body on every
   wake-up**: the continuation it parks with is built once per loop and
   shared afterwards (C906 memcpy retires 4.2 % fewer instructions, output

@@ -81080,6 +81080,60 @@ impl Simulator {
     /// `assoc[<keyval>]`. The nested collection then lives under that name and
     /// reuses the ordinary queue/array machinery (`<base>.size`, `<base>[i]`).
     /// Declared index bounds of `name`, outermost dimension first.
+    /// Dimensions a constraint `foreach (a[v1, v2, ...])` iterates for its
+    /// `nvars` loop variables: the unpacked shape first, then the packed
+    /// dimensions, each normalised to (low, high); a dynamic/queue outer
+    /// dimension takes its current size. Fewer dimensions than variables
+    /// leaves the trailing variables unbound, as before.
+    /// Name of a constraint-foreach operand that `foreach_check_dims` can
+    /// iterate: unpacked arrays of any rank, queues/dynamic arrays,
+    /// associative arrays, and packed multi-dimensional variables.
+    fn foreach_check_operand_name(&mut self, expr: &Expression) -> Option<String> {
+        if let Some(n) = self.array_operand_name(expr) {
+            return Some(n);
+        }
+        let ExprKind::Ident(h) = &expr.kind else {
+            return None;
+        };
+        let mut nm = self.resolve_hier_name(h).into_owned();
+        if let Some(s) = self.instance_assoc_member(&nm) {
+            nm = s;
+        }
+        if self.module.arrays_2d.contains_key(&nm)
+            || self.module.arrays_nd.contains_key(&nm)
+            || self.is_associative_array(&nm)
+            || self.module.packed_full_dims.get(&nm).is_some_and(|d| !d.is_empty())
+        {
+            return Some(nm);
+        }
+        None
+    }
+
+    fn foreach_check_dims(&self, name: &str, nvars: usize) -> Vec<(i64, i64)> {
+        let mut dims: Vec<(i64, i64)> = match self.foreach_dims(name) {
+            Some(d) => d.into_iter().map(|(l, r)| (l.min(r), l.max(r))).collect(),
+            None if self.module.dynamic_arrays.contains(name) || self.is_associative_array(name) => {
+                vec![(0, self.get_queue_size(name) as i64 - 1)]
+            }
+            None => Vec::new(),
+        };
+        if self.module.dynamic_arrays.contains(name) && !dims.is_empty() {
+            dims[0] = (0, self.get_queue_size(name) as i64 - 1);
+        }
+        if dims.len() < nvars {
+            if let Some(pdims) = self.module.packed_full_dims.get(name) {
+                for &(l, r) in pdims.iter() {
+                    if dims.len() >= nvars {
+                        break;
+                    }
+                    dims.push((l.min(r), l.max(r)));
+                }
+            }
+        }
+        dims.truncate(nvars);
+        dims
+    }
+
     fn foreach_dims(&self, name: &str) -> Option<Vec<(i64, i64)>> {
         if let Some((shape, _)) = self.module.arrays_nd.get(name) {
             return Some(shape.clone());
@@ -81623,6 +81677,19 @@ impl Simulator {
                     ExprKind::Index { expr: b, .. } => b.as_ref(),
                     _ => array,
                 };
+                // A multi-dimensional operand (2-D/N-D unpacked array, packed
+                // multi-dimensional variable) is repaired element by element
+                // with every loop variable bound; the 1-D path below keeps
+                // its own solver.
+                if vars.len() >= 2 || self.array_operand_name(base).is_none() {
+                    if let Some(arr_name) = self.foreach_check_operand_name(base) {
+                        let dims = self.foreach_check_dims(&arr_name, vars.len());
+                        if dims.len() == vars.len() && !dims.is_empty() {
+                            self.solve_inline_foreach_multidim(item, base, vars, &dims);
+                            return;
+                        }
+                    }
+                }
                 if let Some(arr_name) = self.array_operand_name(base) {
                     // Index range: declared bounds for fixed arrays,
                     // 0..size-1 for queues / dynamic arrays.
@@ -82081,6 +82148,186 @@ impl Simulator {
     /// the interval only when the current value violates it, so
     /// cross-element relations (`arr[i] > arr[i-1]`) converge across the
     /// outer apply sweeps.
+    /// Per-element repair for a constraint `foreach (a[v1, v2, ...]) body`
+    /// over a multi-dimensional operand. For every index tuple the loop
+    /// variables are bound in a frame and each `Expr` item in the body is
+    /// applied to the element `a[v1][v2]...` (read and written through the
+    /// ordinary expression paths, so packed slices and unpacked elements
+    /// behave alike): relational operators narrow the element's range and
+    /// re-draw it inside; `elem == e` pins it; `$countones(x[...]) == elem`
+    /// (either way round) draws `x[...]` with exactly that many ones.
+    fn solve_inline_foreach_multidim(
+        &mut self,
+        body: &crate::ast::decl::ConstraintItem,
+        base: &Expression,
+        vars: &[Option<crate::ast::Identifier>],
+        dims: &[(i64, i64)],
+    ) {
+        use crate::ast::decl::ConstraintItem as CI;
+        use rand::Rng;
+        let names: Vec<Option<String>> =
+            vars.iter().map(|v| v.as_ref().map(|i| i.name.clone())).collect();
+        let items: Vec<&CI> = match body {
+            CI::Block(items) => items.iter().collect(),
+            other => vec![other],
+        };
+        let mut elem = base.clone();
+        for v in vars {
+            let Some(v) = v else { return };
+            let idx = Expression::new(
+                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                    root: None,
+                    path: vec![crate::ast::expr::HierPathSegment {
+                        name: v.clone(),
+                        selects: Vec::new(),
+                    }],
+                    span: crate::ast::Span::dummy(),
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                }),
+                crate::ast::Span::dummy(),
+            );
+            elem = Expression::new(
+                ExprKind::Index { expr: Box::new(elem), index: Box::new(idx) },
+                crate::ast::Span::dummy(),
+            );
+        }
+        let mut idx: Vec<i64> = dims.iter().map(|&(lo, _)| lo).collect();
+        if dims.iter().any(|&(lo, hi)| hi < lo) {
+            return;
+        }
+        loop {
+            let mut frame: HashMap<String, Value> = HashMap::default();
+            for (k, n) in names.iter().enumerate() {
+                if let Some(n) = n {
+                    frame.insert(n.clone(), Self::signed_loop_val(idx[k]));
+                }
+            }
+            self.push_local_frame(frame);
+            let cur = self.eval_expr(&elem);
+            let w = cur.width.max(1);
+            let (mut lo, mut hi): (i64, i64) =
+                (0, if w >= 63 { i64::MAX } else { (1i64 << w) - 1 });
+            let mut any_rel = false;
+            let mut pinned = false;
+            let mut popcount_targets: Vec<Expression> = Vec::new();
+            for it in &items {
+                let CI::Expr(e) = it else { continue };
+                let ExprKind::Binary { op, left, right } = &e.kind else { continue };
+                let on_l = Self::expr_same_ignoring_span(left, &elem);
+                let on_r = Self::expr_same_ignoring_span(right, &elem);
+                if on_l == on_r {
+                    continue;
+                }
+                let (other, eff) = if on_l {
+                    (right.as_ref(), *op)
+                } else {
+                    let m = match op {
+                        BinaryOp::Lt => BinaryOp::Gt,
+                        BinaryOp::Gt => BinaryOp::Lt,
+                        BinaryOp::Leq => BinaryOp::Geq,
+                        BinaryOp::Geq => BinaryOp::Leq,
+                        o => *o,
+                    };
+                    (left.as_ref(), m)
+                };
+                if let ExprKind::SystemCall { name, args } = &other.kind {
+                    if name == "$countones" && matches!(eff, BinaryOp::Eq) {
+                        if let Some(t) = args.first() {
+                            popcount_targets.push(t.clone());
+                        }
+                        continue;
+                    }
+                }
+                let b = self.eval_expr(other).to_i64().unwrap_or(0);
+                match eff {
+                    BinaryOp::Lt => {
+                        hi = hi.min(b.saturating_sub(1));
+                        any_rel = true;
+                    }
+                    BinaryOp::Leq => {
+                        hi = hi.min(b);
+                        any_rel = true;
+                    }
+                    BinaryOp::Gt => {
+                        lo = lo.max(b.saturating_add(1));
+                        any_rel = true;
+                    }
+                    BinaryOp::Geq => {
+                        lo = lo.max(b);
+                        any_rel = true;
+                    }
+                    BinaryOp::Eq => {
+                        let v = self.eval_expr(other).resize(w);
+                        let e2 = elem.clone();
+                        self.assign_value(&e2, &v);
+                        pinned = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !pinned && any_rel && lo <= hi {
+                let curv = cur.to_i64().unwrap_or(0);
+                if curv < lo || curv > hi {
+                    let p = if lo == hi { lo } else { self.cur_rng().gen_range(lo..=hi) };
+                    let e2 = elem.clone();
+                    self.assign_value(&e2, &Value::from_u64(p as u64, w));
+                }
+            }
+            if !popcount_targets.is_empty() {
+                let want = self.eval_expr(&elem).to_i64().unwrap_or(0).max(0) as usize;
+                for t in popcount_targets {
+                    let tw = self.eval_expr(&t).width.max(1) as usize;
+                    let ones = want.min(tw);
+                    let mut bits: Vec<usize> = (0..tw).collect();
+                    for i in (1..bits.len()).rev() {
+                        let j = self.cur_rng().gen_range(0..=i);
+                        bits.swap(i, j);
+                    }
+                    let mut v = Value::zero(tw as u32);
+                    for &b in &bits[..ones] {
+                        v.set_bit(b, LogicBit::One);
+                    }
+                    self.assign_value(&t, &v);
+                }
+            }
+            self.pop_local_frame();
+            let mut k = idx.len();
+            loop {
+                if k == 0 {
+                    return;
+                }
+                k -= 1;
+                if idx[k] < dims[k].1 {
+                    idx[k] += 1;
+                    break;
+                }
+                idx[k] = dims[k].0;
+            }
+        }
+    }
+
+    /// Structural equality of `Ident` / `Index` / `Paren` expression shapes,
+    /// ignoring source spans (a synthesized element expression never shares
+    /// the constraint's spans).
+    fn expr_same_ignoring_span(a: &Expression, b: &Expression) -> bool {
+        match (&a.kind, &b.kind) {
+            (ExprKind::Paren(x), _) => Self::expr_same_ignoring_span(x, b),
+            (_, ExprKind::Paren(y)) => Self::expr_same_ignoring_span(a, y),
+            (ExprKind::Ident(x), ExprKind::Ident(y)) => {
+                x.path.len() == y.path.len()
+                    && x.path.iter().zip(y.path.iter()).all(|(p, q)| {
+                        p.name.name == q.name.name && p.selects.is_empty() && q.selects.is_empty()
+                    })
+            }
+            (
+                ExprKind::Index { expr: xb, index: xi },
+                ExprKind::Index { expr: yb, index: yi },
+            ) => Self::expr_same_ignoring_span(xb, yb) && Self::expr_same_ignoring_span(xi, yi),
+            _ => false,
+        }
+    }
+
     fn solve_inline_foreach_elem(
         &mut self,
         item: &crate::ast::decl::ConstraintItem,
@@ -82403,20 +82650,34 @@ impl Simulator {
                     ExprKind::Index { expr: b, .. } => b.as_ref(),
                     _ => array,
                 };
-                let Some(arr_name) = self.array_operand_name(base) else {
+                // Any iterable shape, not only the 1-D unpacked arrays
+                // `array_operand_name` knows: a 2-D/N-D unpacked array and a
+                // packed multi-dimensional VARIABLE used to fall out here as
+                // "not an array" and the whole foreach passed vacuously.
+                let Some(arr_name) = self.foreach_check_operand_name(base) else {
                     return true;
                 };
-                let (lo, hi) = self
-                    .foreach_dims(&arr_name)
-                    .and_then(|d| d.first().copied())
-                    .unwrap_or_else(|| (0, self.get_queue_size(&arr_name) as i64 - 1));
-                let idx_var: Option<String> = vars
-                    .first()
-                    .and_then(|v| v.as_ref().map(|id| id.name.clone()));
-                for i in lo..=hi {
+                // Bind EVERY loop variable, over unpacked dimensions first
+                // and then the packed ones (§12.7.3). Binding only the first
+                // used to leave `j` in `d[i][j]` unbound (x) for a 2-D
+                // target, so the body compared against x and the constraint
+                // passed vacuously: `std::randomize(d) with { foreach
+                // (d[i, j]) d[i][j] < 100; }` returned 1 with every element 0.
+                let dims = self.foreach_check_dims(&arr_name, vars.len());
+                let idx_vars: Vec<Option<String>> = vars
+                    .iter()
+                    .map(|v| v.as_ref().map(|id| id.name.clone()))
+                    .collect();
+                let mut idx: Vec<i64> = dims.iter().map(|&(lo, _)| lo).collect();
+                if dims.iter().any(|&(lo, hi)| hi < lo) {
+                    return true;
+                }
+                loop {
                     let mut frame: HashMap<String, Value> = HashMap::default();
-                    if let Some(iv) = &idx_var {
-                        frame.insert(iv.clone(), Value::from_u64(i as u64, 32));
+                    for (k, iv) in idx_vars.iter().enumerate() {
+                        if let (Some(iv), Some(&i)) = (iv, idx.get(k)) {
+                            frame.insert(iv.clone(), Self::signed_loop_val(i));
+                        }
                     }
                     self.push_local_frame(frame);
                     let ok = self.check_constraint_item_impl(body);
@@ -82424,8 +82685,20 @@ impl Simulator {
                     if !ok {
                         return false;
                     }
+                    // odometer advance over the bound dimensions
+                    let mut k = idx.len();
+                    loop {
+                        if k == 0 {
+                            return true;
+                        }
+                        k -= 1;
+                        if idx[k] < dims[k].1 {
+                            idx[k] += 1;
+                            break;
+                        }
+                        idx[k] = dims[k].0;
+                    }
                 }
-                true
             }
             // Recurse so nested foreach items get the per-element check.
             CI::Block(items) => {
@@ -88551,17 +88824,50 @@ impl Simulator {
                     }
                 }
             }
+            // A multi-dimensional unpacked array (`u7_t e[5][2]`) is not in
+            // `arrays` (1-D) and was never drawn at all; draw every element
+            // by its flat name.
+            if let ExprKind::Ident(h) = &a.kind {
+                if h.path.iter().all(|s| s.selects.is_empty()) {
+                    let nm = self.resolve_hier_name(h).into_owned();
+                    let shape: Option<(Vec<(i64, i64)>, u32)> =
+                        if let Some((sh, w)) = self.module.arrays_nd.get(&nm) {
+                            Some((sh.clone(), *w))
+                        } else if let Some(&(d1, d2, w)) = self.module.arrays_2d.get(&nm) {
+                            Some((vec![d1, d2], w))
+                        } else {
+                            None
+                        };
+                    if let Some((shape, w)) = shape {
+                        let w = w.max(1);
+                        let mut suffixes: Vec<String> = vec![String::new()];
+                        for &(lo, hi) in &shape {
+                            let (lo, hi) = (lo.min(hi), lo.max(hi));
+                            let mut next = Vec::new();
+                            for sfx in &suffixes {
+                                for k in lo..=hi {
+                                    next.push(format!("{}[{}]", sfx, k));
+                                }
+                            }
+                            suffixes = next;
+                        }
+                        for sfx in suffixes {
+                            let rv = self.random_value_of_width(w);
+                            self.set_signal_value_by_name(&format!("{}{}", nm, sfx), rv);
+                        }
+                        continue;
+                    }
+                }
+            }
             let w = self.infer_lhs_width(a).max(1);
-            let rv = if w <= 64 {
-                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                Value::from_u64(self.cur_rng().r#gen::<u64>() & mask, w)
-            } else {
-                Value::zero(w)
-            };
+            // A packed target wider than 64 bits (`u7_t [4:0][1:0] d` is 70
+            // bits) used to be "drawn" as all zeros; draw every bit.
+            let rv = self.random_value_of_width(w);
             self.assign_value(a, &rv);
         }
         Value::from_u64(1, 32)
     }
+
 
     /// Evaluate an array reduction (`sum`/`product`/`min`/`max`/`and`/`or`/`xor`)
     /// with a `with (item...)` expression, binding `item` to each element.
@@ -106217,7 +106523,23 @@ impl Simulator {
                     } else if *width <= 64 {
                         Value::from_u64(self.rng.r#gen(), *width)
                     } else {
-                        Value::zero(*width)
+                        // A `rand` property wider than 64 bits (a packed
+                        // multi-dimensional array such as `u7_t [4:0][1:0]`)
+                        // was "drawn" as all zeros; draw every bit, from the
+                        // same stream this loop already uses.
+                        let mut acc = Value::zero(*width);
+                        let mut bit = 0u32;
+                        while bit < *width {
+                            let chunk: u64 = self.rng.r#gen();
+                            let n = (*width - bit).min(64);
+                            for k in 0..n {
+                                if (chunk >> k) & 1 == 1 {
+                                    acc.set_bit((bit + k) as usize, LogicBit::One);
+                                }
+                            }
+                            bit += n;
+                        }
+                        acc
                     };
                     if let Some(Some(inst)) = self.heap.get_mut(handle) {
                         inst.properties.insert(name.clone(), v);
