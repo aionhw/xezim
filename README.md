@@ -112,6 +112,17 @@ and testbench flows. Portable code should not rely on them.
 
 ### Unreleased — class covergroups, compilation-unit DPI, assertions in instances
 
+* **A `forever` / `always` process no longer re-clones its loop body on every
+  wake-up**: the continuation it parks with is built once per loop and
+  shared afterwards (C906 memcpy retires 4.2 % fewer instructions, output
+  identical). A subroutine-local `virtual` interface variable now binds in
+  the frame that owns it, so two class tasks interleaved on delays keep their
+  own bindings instead of reading each other's. `cover property` sites are
+  tallied as covers in every clocked path, including `s_eventually` /
+  `s_always` watchers and vacuous implications. From Thomas Burg's PR #150:
+  the two condition-waiter drains are one parameterised routine, the
+  `--max-time` hang report lists processes parked for the NBA region, and the
+  `this`-property probe no longer clones the class name per lookup.
 * **Packed-struct member selects no longer collide with same-named arrays**:
   inside an instance, `inp.sram_renA[2]` on a struct port compiled as a
   two-bit element select whenever any other module declared a packed
