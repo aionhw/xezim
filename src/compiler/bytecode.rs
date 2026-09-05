@@ -1560,13 +1560,29 @@ impl<'a> BytecodeCompiler<'a> {
     /// named by `hier`, if recorded. Same raw / last-segment lookup the
     /// `packed_elem_widths` sites use.
     fn packed_outer_dim(&self, hier: &HierarchicalIdentifier) -> Option<(i64, i64)> {
+        self.packed_full_dims_of(hier).and_then(|d| d.first().copied())
+    }
+
+    /// Declared packed dimensions of `hier`: exact name, then the name under
+    /// the current instance scope, then — for a SINGLE-segment name only —
+    /// the bare leaf. A multi-segment name (a struct member, a hierarchical
+    /// reference) must never match an unrelated same-named declaration
+    /// elsewhere in the design (see `packed_elem_width_of`).
+    fn packed_full_dims_of(&self, hier: &HierarchicalIdentifier) -> Option<&'a Vec<(i64, i64)>> {
         let raw = Self::hier_raw_name(hier);
-        self.packed_full_dims.and_then(|m| {
-            m.get(raw.as_str())
-                .or_else(|| hier.path.last().and_then(|s| m.get(s.name.name.as_str())))
-                .and_then(|d| d.first())
-                .copied()
-        })
+        let m = self.packed_full_dims?;
+        m.get(raw.as_str())
+            .or_else(|| {
+                self.scope_hint
+                    .as_ref()
+                    .and_then(|sc| m.get(format!("{}.{}", sc, raw).as_str()))
+            })
+            .or_else(|| {
+                if hier.path.len() != 1 {
+                    return None;
+                }
+                hier.path.last().and_then(|s| m.get(s.name.name.as_str()))
+            })
     }
 
     /// LSB bit offset of packed element `idx` given the declared outer
@@ -4942,12 +4958,7 @@ impl<'a> BytecodeCompiler<'a> {
 
     /// Declared dimensions of a chain's root, if registered.
     fn chain_root_dims(&self, hier: &HierarchicalIdentifier) -> Option<Vec<(i64, i64)>> {
-        let raw = Self::hier_raw_name(hier);
-        self.packed_full_dims.and_then(|m| {
-            m.get(raw.as_str())
-                .or_else(|| hier.path.last().and_then(|s| m.get(s.name.name.as_str())))
-                .cloned()
-        })
+        self.packed_full_dims_of(hier).cloned()
     }
 
     /// Emit a chained packed element select whose indices are NOT all
@@ -5107,11 +5118,28 @@ impl<'a> BytecodeCompiler<'a> {
         let raw = Self::hier_raw_name(hier);
         self.packed_elem_widths
             .and_then(|m| {
-                m.get(raw.as_str()).copied().or_else(|| {
-                    hier.path
-                        .last()
-                        .and_then(|s| m.get(s.name.name.as_str()).copied())
-                })
+                m.get(raw.as_str()).copied()
+                    // Inside an inlined instance the name is spelled bare
+                    // while the table holds it under the instance path.
+                    .or_else(|| {
+                        self.scope_hint
+                            .as_ref()
+                            .and_then(|sc| m.get(format!("{}.{}", sc, raw).as_str()).copied())
+                    })
+                    // The bare-leaf fallback is for a SINGLE-segment name only.
+                    // Applying it to `inp.sram_renA` (a packed-struct member
+                    // of a port) matched an unrelated `logic [3:0][1:0]
+                    // sram_renA` declared in another module, and the
+                    // member's bit-select compiled as that array's two-bit
+                    // element select: bits 2 and 3 read x.
+                    .or_else(|| {
+                        if hier.path.len() != 1 {
+                            return None;
+                        }
+                        hier.path
+                            .last()
+                            .and_then(|s| m.get(s.name.name.as_str()).copied())
+                    })
             })
             .filter(|&w| w > 1)
     }
@@ -7504,17 +7532,7 @@ impl<'a> BytecodeCompiler<'a> {
                     // must extract a W-bit slice at `i*W +: W`, not a single
                     // bit. Mirror the LHS variable-index slice path so reads
                     // and writes stay symmetric.
-                    let raw = Self::hier_raw_name(hier);
-                    let elem_w = self
-                        .packed_elem_widths
-                        .and_then(|m| {
-                            m.get(raw.as_str()).copied().or_else(|| {
-                                hier.path
-                                    .last()
-                                    .and_then(|s| m.get(s.name.name.as_str()).copied())
-                            })
-                        })
-                        .filter(|&w| w > 1);
+                    let elem_w = self.packed_elem_width_of(hier);
                     if let Some(elem_w) = elem_w {
                         let base = self.compile_expr(expr, 0)?;
                         // Constant index (the common case — genvar-unrolled
@@ -8510,17 +8528,7 @@ impl<'a> BytecodeCompiler<'a> {
                     if let Some(id) = self.lookup_signal_id(hier) {
                         // Packed multi-D NBA: `mem[i] <= data` must write the
                         // W-bit slice at `i*W +: W`. Mirrors compile_blocking_target.
-                        let raw = Self::hier_raw_name(hier);
-                        let elem_w = self
-                            .packed_elem_widths
-                            .and_then(|m| {
-                                m.get(raw.as_str()).copied().or_else(|| {
-                                    hier.path
-                                        .last()
-                                        .and_then(|s| m.get(s.name.name.as_str()).copied())
-                                })
-                            })
-                            .filter(|&w| w > 1);
+                        let elem_w = self.packed_elem_width_of(hier);
                         if let Some(elem_w) = elem_w {
                             if let Some(idx_reg) = self.compile_expr(index, 0) {
                                 // Normalize the index to a 0-based, LSB-first
@@ -9112,17 +9120,7 @@ impl<'a> BytecodeCompiler<'a> {
                         // `logic [N-1:0][W-1:0] mem_n` must write a W-bit
                         // slice at `i*W +: W`, not a single bit. Emit a
                         // RangeDyn write of `(i*W+W-1):(i*W)` instead.
-                        let raw = Self::hier_raw_name(hier);
-                        let elem_w = self
-                            .packed_elem_widths
-                            .and_then(|m| {
-                                m.get(raw.as_str()).copied().or_else(|| {
-                                    hier.path
-                                        .last()
-                                        .and_then(|s| m.get(s.name.name.as_str()).copied())
-                                })
-                            })
-                            .filter(|&w| w > 1);
+                        let elem_w = self.packed_elem_width_of(hier);
                         if let Some(elem_w) = elem_w {
                             if let Some(idx_reg) = self.compile_expr(index, 0) {
                                 // lo = slot * elem_w, where `slot` normalizes
@@ -10023,6 +10021,18 @@ impl<'a> BytecodeCompiler<'a> {
         match &e.kind {
             ExprKind::Number(NumberLiteral::Integer { signed, .. }) => Some(*signed),
             ExprKind::Paren(i) => self.expr_signedness(i),
+            // §20/§21: an `int`/`integer`-valued system function is SIGNED
+            // (`$countones(x) - 8 < 0` is a signed compare); `bit`, `time`
+            // and the unsigned-int ones are not; `$past`/`$sampled` carry
+            // their operand's signedness.
+            ExprKind::SystemCall { name, args }
+                if matches!(name.as_str(), "$past" | "$sampled") =>
+            {
+                args.first().and_then(|a| self.expr_signedness(a))
+            }
+            ExprKind::SystemCall { name, .. } if system_function_result(name).is_some() => {
+                system_function_result(name).map(|(_, signed)| signed)
+            }
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
                 let id = self.lookup_signal_id(h)?;
                 Some(self.signal_signed[id])
@@ -10081,6 +10091,18 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+
+    /// Self-determined width of a system function's RESULT (IEEE 1800-2017
+    /// §20/§21) — see `system_function_result`; `$signed`/`$unsigned`/
+    /// `$past`/`$sampled` carry their argument's width. Real- and
+    /// string-valued functions report None (no integral width to contribute
+    /// to a context).
+    fn system_function_width(&self, name: &str, args: &[Expression]) -> Option<u32> {
+        if system_function_carries_arg(name) {
+            return args.first().map(|a| self.expr_max_width(a));
+        }
+        system_function_result(name).map(|(w, _)| w)
+    }
 
     fn expr_max_width(&self, expr: &Expression) -> u32 {
         match &expr.kind {
@@ -10160,6 +10182,14 @@ impl<'a> BytecodeCompiler<'a> {
                 .map(|a| self.expr_max_width(a))
                 .max()
                 .unwrap_or(0),
+            // A system FUNCTION has the result type the LRM gives it, not the
+            // width of its arguments — and certainly not 0, which the old
+            // catch-all returned: `out_step <= $countones(be) >> 3` with a
+            // 4-bit target then compiled the shift at the target's width and
+            // truncated a count of 24 to 8 before shifting.
+            ExprKind::SystemCall { name, args } => {
+                self.system_function_width(name, args).unwrap_or(0)
+            }
             ExprKind::Conditional {
                 then_expr,
                 else_expr,
@@ -13923,4 +13953,33 @@ pub fn lower_two_state(
         writes: writes.into_boxed_slice(),
         writes_span: writes_span.into_boxed_slice(),
     })
+}
+
+/// IEEE 1800-2017 §20/§21 result type of a system FUNCTION as (width,
+/// signed): `int`/`integer` → (32, true); unsigned int → (32, false);
+/// `bit` → (1, false); `time` / `$realtobits` → (64, false). Real- and
+/// string-valued functions, and the ones that carry their argument's type
+/// (`system_function_carries_arg`), are None. Shared by the compiler's width
+/// and signedness inference and by the interpreter, so every path agrees.
+pub(crate) fn system_function_result(name: &str) -> Option<(u32, bool)> {
+    Some(match name {
+        "$countones" | "$countbits" | "$clog2" | "$bits" | "$size" | "$dimensions"
+        | "$unpacked_dimensions" | "$left" | "$right" | "$low" | "$high" | "$increment"
+        | "$rtoi" | "$random" | "$cast" | "$fopen" | "$fgetc" | "$fgets" | "$fscanf"
+        | "$sscanf" | "$fread" | "$ftell" | "$feof" | "$ferror" | "$ungetc" | "$fseek"
+        | "$rewind" | "$test$plusargs" | "$value$plusargs" | "$dist_uniform"
+        | "$dist_normal" | "$dist_exponential" | "$dist_poisson" | "$dist_chi_square"
+        | "$dist_t" | "$dist_erlang" | "$coverage_control" | "$coverage_get_max"
+        | "$coverage_get" | "$coverage_merge" | "$coverage_save" => (32, true),
+        "$urandom" | "$urandom_range" | "$stime" | "$shortrealtobits" => (32, false),
+        "$onehot" | "$onehot0" | "$isunknown" | "$isunbounded" | "$rose" | "$fell"
+        | "$stable" | "$changed" => (1, false),
+        "$time" | "$realtobits" => (64, false),
+        _ => return None,
+    })
+}
+
+/// System functions whose result has the TYPE of their first argument.
+pub(crate) fn system_function_carries_arg(name: &str) -> bool {
+    matches!(name, "$signed" | "$unsigned" | "$past" | "$sampled")
 }

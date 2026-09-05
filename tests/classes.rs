@@ -262,3 +262,7 @@ mod method_local_base_per_process;
 mod class_covergroups;
 #[path = "classes/array_query_handle_qualified_member.rs"]
 mod array_query_handle_qualified_member;
+#[path = "classes/parked_task_local_vif_alias.rs"]
+mod parked_task_local_vif_alias;
+#[path = "classes/class_randomize_multidim.rs"]
+mod class_randomize_multidim;

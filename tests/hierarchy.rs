@@ -151,3 +151,5 @@ mod modport_expression_ports;
 mod unit_scope_library_subroutine;
 #[path = "hierarchy/bind_grid_module_name_refs.rs"]
 mod bind_grid_module_name_refs;
+#[path = "hierarchy/instance_loop_local_shadows_module_var.rs"]
+mod instance_loop_local_shadows_module_var;

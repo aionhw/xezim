@@ -378,6 +378,25 @@ fn cached_env_flag(name: &'static str, slot: &'static OnceLock<bool>) -> bool {
     *slot.get_or_init(|| std::env::var(name).ok().as_deref() == Some("1"))
 }
 
+
+fn cached_env_set(name: &'static str, slot: &'static OnceLock<bool>) -> bool {
+    *slot.get_or_init(|| std::env::var_os(name).is_some())
+}
+
+macro_rules! env_set_cached {
+    ($name:literal) => {{
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        cached_env_set($name, &FLAG)
+    }};
+}
+
+macro_rules! env_is_one_cached {
+    ($name:literal) => {{
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        cached_env_flag($name, &FLAG)
+    }};
+}
+
 fn xz_copy_debug_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("XEZIM_CP_DBG").is_some())
@@ -2566,6 +2585,17 @@ enum FsmWait {
     Edge(u32),
 }
 
+/// One clocking block's per-tick poll state: its clock resolved to a
+/// signal-table id once (None: fall back to the by-name read), the edge it
+/// advances on, and the level seen on the previous tick.
+struct ClockingTick {
+    cb: String,
+    clk: String,
+    id: Option<usize>,
+    edge: EdgeKind,
+    prev: u8,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ProcessContext {
     this_stack: Vec<Option<usize>>,
@@ -3258,6 +3288,34 @@ impl SignalMap {
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// Borrowing form of `keys_with_elem_prefix`: the element keys under
+    /// `prefix` (which must end in `[`) without cloning them.
+    pub fn elem_keys_with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        let base = &prefix[..prefix.len().saturating_sub(1)];
+        let outer = Self::base_of(base).unwrap_or(base);
+        self.elems
+            .get(outer)
+            .into_iter()
+            .flat_map(|set| set.iter().map(|k| k.as_str()))
+            .filter(move |k| k.starts_with(prefix))
+    }
+
+    /// Is any key under the outermost base of `prefix` prefixed by it?
+    /// Every key that contains `[` is indexed under the text before its
+    /// FIRST `[`, so `obj[k][j]` and `obj[k].field` are both found under
+    /// `obj`; this replaces a scan of the whole map.
+    pub fn any_key_with_prefix(&self, prefix: &str) -> bool {
+        let Some(outer) = Self::base_of(prefix) else {
+            return self.map.keys().any(|k| k.starts_with(prefix));
+        };
+        self.elems
+            .get(outer)
+            .is_some_and(|set| set.iter().any(|k| k.starts_with(prefix)))
+    }
 }
 
 impl std::ops::Deref for SignalMap {
@@ -3655,6 +3713,11 @@ pub struct Simulator {
     clocking_output_pending: HashMap<String, Vec<(String, Value)>>,
     /// Per-clocking-block previous clock bit (for edge detection).
     clocking_prev_clock: HashMap<String, u8>,
+    /// Per-tick clock poll table for `tick_clocking_blocks` (see there).
+    clocking_tick_cache: Vec<ClockingTick>,
+    /// Buffer-collapse exclusions (override-target leaves, procedural write
+    /// names), collected once while the process bodies are still present.
+    buf_collapse_write_sets: Option<(HashSet<String>, HashSet<String>)>,
     /// LRM §14.3: each clocking block's clock EDGE (`@(posedge/negedge clk)`).
     /// `tick_clocking_blocks` and `@(cb)` resolution consult this so a
     /// `@(negedge clk)` block samples/advances on the negedge, not the posedge.
@@ -5357,6 +5420,18 @@ pub struct Simulator {
     /// already true) would otherwise recurse once per iteration and overflow the
     /// Rust stack; past this depth the continuation goes back to the scheduler.
     forever_depth: u32,
+    /// Continuation frames built by `exec_forever_sched`, keyed by the
+    /// process, the loop body's source span, the index of the statement it
+    /// parked on, and the site kind. The span identifies the LOOP: the
+    /// `ForeverTail` inside each continuation carries a clone of the body,
+    /// so an address key would change on every iteration (the first cut of
+    /// this cache missed on every wake-up and grew without bound). The
+    /// process id keeps two inlined instances of the same source loop —
+    /// same span, different rewritten names — apart. Before this cache
+    /// every wake-up of a `forever @(posedge clk)` / `always` process
+    /// deep-cloned its statement list and its whole body into a fresh
+    /// frame: 5 % of the c906 memcpy steady state was that cloning.
+    forever_cont_cache: HashMap<(usize, usize, usize, usize, u8), Arc<[Statement]>>,
     /// §11.8.1: while narrowing relational constraint bounds for a target whose
     /// comparison context is UNSIGNED (the target, or the other operand, is
     /// unsigned), a bound literal must be read by its unsigned value — e.g. the
@@ -5573,6 +5648,10 @@ struct SampledWatch {
     expr: Expression,
     hist: std::collections::VecDeque<Value>,
     depth: usize,
+    /// Time of the most recent sample. A PROCEDURAL `$past` runs before this
+    /// slot's sampler (an SVA site after it), so the reader checks whether the
+    /// current edge is already at the front of `hist` before indexing.
+    last_sample_time: Option<u64>,
 }
 
 /// Empty static used as fallback name for unnamed array-element ids
@@ -8006,6 +8085,8 @@ impl Simulator {
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
+            clocking_tick_cache: Vec::new(),
+            buf_collapse_write_sets: None,
             clocking_edge: HashMap::default(),
             clocking_mirror_dirty: false,
             clocking_cycle_pending: HashMap::default(),
@@ -8525,6 +8606,7 @@ impl Simulator {
             prof_par_ticks: 0,
             prof_par_blocks: 0,
             forever_depth: 0,
+            forever_cont_cache: HashMap::default(),
             constraint_cmp_unsigned: false,
             stall_iters: 0,
             zero_delay_defer_pending: false,
@@ -10048,14 +10130,14 @@ impl Simulator {
 
     fn eval_value_plusargs(&mut self, args: &[Expression]) -> Value {
         if args.len() < 2 {
-            return Value::zero(1);
+            return Value::zero(32);
         }
         let fmt = match &args[0].kind {
             ExprKind::StringLiteral(s) => s.clone(),
             _ => self.eval_expr(&args[0]).to_sv_string(),
         };
         let Some((prefix, spec)) = Self::parse_plusarg_format(&fmt) else {
-            return Value::zero(1);
+            return Value::zero(32);
         };
 
         for arg in &self.plusargs {
@@ -10066,10 +10148,10 @@ impl Simulator {
             let suffix = &payload[prefix.len()..];
             if let Some(v) = Self::parse_plusarg_value(suffix, spec) {
                 self.assign_value(&args[1], &v);
-                return Value::from_u64(1, 1);
+                return Value::from_u64(1, 32);
             }
         }
-        Value::zero(1)
+        Value::zero(32)
     }
 
     fn system_string_arg(&mut self, expr: &Expression) -> String {
@@ -21152,9 +21234,36 @@ impl Simulator {
         // optimizer applies), and a runtime force on the buffered name now
         // reaches the shared net. Skipped entirely under SDF (a collapsed
         // net would lose its annotated delay).
-        if std::env::var("XEZIM_BUF_COLLAPSE").map(|v| v == "1").unwrap_or(false)
+        // Whole-net identity buffers (`assign y = x`) alias onto their source
+        // by default; `XEZIM_BUF_COLLAPSE=0` turns the pass off. A net keeps
+        // its own storage when aliasing would be observable: it is a force /
+        // release / procedural-assign target anywhere in the design, its
+        // two-state-ness differs from the source (a 2-state copy must drop
+        // X/Z), the design carries SDF delays, or a DPI/VPI backdoor may look
+        // the folded name up by itself.
+        let buf_collapse_on = !matches!(std::env::var("XEZIM_BUF_COLLAPSE").as_deref(), Ok("0"))
             && self.sdf_delays.is_empty()
-        {
+            && self.module.dpi_imports.is_empty()
+            && configured_vpi_libs().is_empty()
+            && configured_dpi_libs().is_empty();
+        if buf_collapse_on {
+            // Same rule as the port pass above: never alias onto a source a
+            // process WRITES. A reader parked on the same edge that writes
+            // the source relies on the copy's delta step (reference-verified
+            // in tests/scheduling/waiter_edge_ordering.rs); gate primitives
+            // keep their z→x mapping on the net they drive. This pass runs
+            // again after the always blocks have been drained into compiled
+            // form, so the two name sets are collected on the FIRST call,
+            // while every process body is still on the module, and kept.
+            if self.buf_collapse_write_sets.is_none() {
+                self.buf_collapse_write_sets = Some((
+                    super::elaborate::collect_override_target_leaves(&self.module),
+                    super::elaborate::collect_procedural_write_names(&self.module),
+                ));
+            }
+            let (override_leaves, proc_writes) =
+                self.buf_collapse_write_sets.clone().unwrap_or_default();
+            let leaf_of = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
             let mut buf_collapsed = 0usize;
             for _ in 0..8 {
                 let mut changed = false;
@@ -21183,9 +21292,14 @@ impl Simulator {
                     if lid == rid
                         || self.signal_widths[lid] != self.signal_widths[rid]
                         || self.signal_real[lid] != self.signal_real[rid]
+                        || self.signal_two_state[lid] != self.signal_two_state[rid]
                         || self.module.events.contains(ln.as_str())
                         || self.module.events.contains(rn.as_str())
                         || ca_driver_counts.get(ln.as_str()).copied().unwrap_or(0) != 1
+                        || override_leaves.contains(&leaf_of(ln.as_str()))
+                        || override_leaves.contains(&leaf_of(rn.as_str()))
+                        || proc_writes.contains(rn.as_str())
+                        || self.signal_gate_driven.get(lid).copied().unwrap_or(false)
                     {
                         continue;
                     }
@@ -21198,7 +21312,7 @@ impl Simulator {
                     break;
                 }
             }
-            if buf_collapsed > 0 {
+            if buf_collapsed > 0 && std::env::var("XEZIM_DEBUG").is_ok() {
                 eprintln!("[BUF-COLLAPSE] {} identity buffer nets collapsed", buf_collapsed);
             }
         }
@@ -33242,7 +33356,10 @@ impl Simulator {
     /// ends by --max-time without $finish, and (abbreviated) with
     /// XEZIM_PROGRESS ticks.
     fn report_parked_waiters(&mut self, max_n: usize) {
-        if self.event_waiters.is_empty() && self.condition_waiters.is_empty() {
+        if self.event_waiters.is_empty()
+            && self.condition_waiters.is_empty()
+            && self.nba_region_waiters.is_empty()
+        {
             return;
         }
         let mut order: Vec<usize> = (0..self.event_waiters.len()).collect();
@@ -33319,6 +33436,21 @@ impl Simulator {
                 .unwrap_or_else(|| "<unknown location>".to_string());
             eprintln!(
                 "[xezim][hang-report]   pid {} blocked in wait(condition) — resumes at {}",
+                pid, loc
+            );
+        }
+        // §15.5: a process parked on `@(procedural_var)` for a procedural
+        // NBA-region variable (e.g. `uvm_wait_for_nba_region`'s `nba <= next_nba;
+        // @(nba)`) lingers in `nba_region_waiters` until the Reactive region's
+        // NBA commit — flush that lane before declaring a hang so a spin parked
+        // there is not reported as an unexplained block.
+        for (pid, cont) in self.nba_region_waiters.iter().take(max_n) {
+            let loc = cont
+                .first()
+                .and_then(|st| self.span_file_line_in(st.span, None))
+                .unwrap_or_else(|| "<unknown location>".to_string());
+            eprintln!(
+                "[xezim][hang-report]   pid {} parked on @(procedural-var) for the NBA region — resumes at {}",
                 pid, loc
             );
         }
@@ -33579,7 +33711,6 @@ impl Simulator {
     }
 
     fn eval_waiter_condition(&mut self, waiter_pid: usize, cond: &Expression) -> bool {
-        let saved = self.snapshot_process_context();
         let saved_hint = self.name_resolve_hint.borrow().clone();
         let saved_scope = self.current_scope.clone();
         let saved_pid = self.current_pid;
@@ -33589,15 +33720,22 @@ impl Simulator {
             self.current_scope = scope;
         }
         let cond_held = if let Some(ctx) = self.process_contexts.remove(&waiter_pid) {
+            // The caller's context is moved aside, not cloned: the waiter's
+            // context replaces it wholesale and the original comes back
+            // untouched afterwards.
+            let saved = self.take_process_context();
             self.restore_process_context(ctx);
             let val = self.eval_expr(cond).is_true();
             let ctx = self.take_process_context();
             self.process_contexts.insert(waiter_pid, ctx);
+            self.restore_process_context(saved);
             val
         } else {
-            self.eval_expr(cond).is_true()
+            let saved = self.snapshot_process_context();
+            let val = self.eval_expr(cond).is_true();
+            self.restore_process_context(saved);
+            val
         };
-        self.restore_process_context(saved);
         *self.name_resolve_hint.borrow_mut() = saved_hint;
         self.current_scope = saved_scope;
         self.current_pid = saved_pid;
@@ -33715,7 +33853,7 @@ impl Simulator {
         if !self.deferred_proc_entries.is_empty() {
             self.dirty_any = true;
         }
-        if std::env::var_os("XEZIM_PSETTLE_STATS").is_some() {
+        if env_set_cached!("XEZIM_PSETTLE_STATS") {
             self.prof_psettle_calls += 1;
             if self.settle_calls != __sc_before {
                 self.prof_psettle_deferred += 1;
@@ -34622,7 +34760,20 @@ impl Simulator {
     /// 2. If `#0` continuations are waiting in `inactive_queue`, stops after this
     ///    round so those `#0` continuations execute in this delta rather than
     ///    being starved by multi-generation cascades of condition waiters.
-    fn drain_condition_waiters_pre_inactive(&mut self) {
+    /// Drain level-sensitive `wait(expr)` waiters until none can proceed at
+    /// the current timestamp, re-resuming any that a same-tick write newly
+    /// moved into `ready_condition_waiters` even when `cond_progress` did not
+    /// step (moving to ready does not itself fire the waiter's body).
+    ///
+    /// `pre_inactive` selects the two behaviors that differ between the two
+    /// call sites:
+    ///   * `true`  — the pre-INACTIVE(`#0`) drain: do NOT apply NBA (the NBA
+    ///     region stays strictly after the inactive region, IEEE 1800-2017
+    ///     §4.5) and yield as soon as a `#0` continuation is pending, so a
+    ///     multi-generation condition-waiter cascade cannot starve it.
+    ///   * `false` — the end-of-active drain: flush any pending NBA before
+    ///     settling, and run to the full same-time fixpoint.
+    fn drain_condition_waiters(&mut self, pre_inactive: bool) {
         let mut guard = 0u32;
         while (!self.condition_waiters.is_empty() || !self.ready_condition_waiters.is_empty())
             && !self.finished
@@ -34659,68 +34810,25 @@ impl Simulator {
                     self.child_finished(bpid);
                 }
             }
-            if self.dirty_any {
-                self.settle_combinatorial();
-            }
-            if !self.inactive_queue.is_empty() {
-                break;
-            }
-            if self.cond_progress == prog_before && self.ready_condition_waiters.is_empty() {
-                break;
-            }
-        }
-    }
-
-    fn drain_condition_waiters(&mut self) {
-        let mut guard = 0u32;
-        while (!self.condition_waiters.is_empty() || !self.ready_condition_waiters.is_empty())
-            && !self.finished
-            && !self.zero_delay_defer_pending
-        {
-            guard += 1;
-            if guard > 10000 {
-                break;
-            }
-            let prog_before = self.cond_progress;
-            let ready = std::mem::take(&mut self.ready_condition_waiters);
-            for (cpid, cont) in ready {
-                self.cond_waiter_reads.remove(&cpid);
-                self.cond_read_union_dirty = true;
-                self.cond_waiter_conditions.remove(&cpid);
-                self.event_queue.schedule(self.time, cpid, cont);
-            }
-            let parked = std::mem::take(&mut self.condition_waiters);
-            for (cpid, cont) in parked {
-                self.cond_waiter_reads.remove(&cpid);
-                self.cond_read_union_dirty = true;
-                self.cond_waiter_conditions.remove(&cpid);
-                self.event_queue.schedule(self.time, cpid, cont);
-            }
-            while self.event_queue.next_time() == Some(self.time)
-                && !self.finished
-                && !self.zero_delay_defer_pending
-            {
-                let Some((bpid, stmts)) = self.event_queue.pop_front(self.time) else {
-                    break;
-                };
-                self.run_scheduled_process(bpid, &stmts);
-                if !self.is_pid_suspended(bpid) {
-                    self.child_finished(bpid);
-                }
-            }
-            if !self.nba_fast.is_empty()
-                || !self.nba_queue.is_empty()
-                // §15.5.2: a bare `->>` (deferred trigger) must flush with the
-                // NBA region even when no NBA DATA is queued.
-                || !self.pending_nba_triggers.is_empty()
-                || !self.packed_nba.is_empty()
-                || !self.pending_nba_instance_triggers.is_empty()
-                || self.delayed_nba_due()
+            if !pre_inactive
+                && (!self.nba_fast.is_empty()
+                    || !self.nba_queue.is_empty()
+                    // §15.5.2: a bare `->>` (deferred trigger) must flush with the
+                    // NBA region even when no NBA DATA is queued.
+                    || !self.pending_nba_triggers.is_empty()
+                    || !self.packed_nba.is_empty()
+                    || !self.pending_nba_instance_triggers.is_empty()
+                    || self.delayed_nba_due())
             {
                 self.apply_nba();
             }
             if self.dirty_any {
                 self.settle_combinatorial();
+            }
+            // Pre-inactive: yield to a pending `#0` continuation rather than
+            // running more cascade generations ahead of it.
+            if pre_inactive && !self.inactive_queue.is_empty() {
+                break;
             }
             // No waiter proceeded this round → the remainder are genuinely
             // blocked (future-time change); stop re-checking until the next
@@ -34872,7 +34980,7 @@ impl Simulator {
             // slave's `wait(state!=BEGIN_RESP)` wakes on the clobbered value).
             // The end-of-tick fixpoint alone is too late: the `#0` resume has
             // already committed the overwrite by then.
-            self.drain_condition_waiters_pre_inactive();
+            self.drain_condition_waiters(true);
             if self.promote_inactive_to_active()
                 && self.event_queue.next_time() == Some(self.time)
             {
@@ -35001,7 +35109,7 @@ impl Simulator {
         self.dump_write_changes();
 
         // Condition-waiter fixpoint (level-sensitive `wait(expr)` resume).
-        self.drain_condition_waiters();
+        self.drain_condition_waiters(false);
 
         // `#0` continuations parked during the POST-active stages of this
         // tick (edge cascades, reactive work) resume in the next same-time
@@ -37512,16 +37620,17 @@ impl Simulator {
             *self.name_resolve_hint.borrow_mut() = saved_hint;
             return;
         }
-        let mut saved = self.snapshot_process_context();
+        // The caller's context is MOVED aside (the restore below overwrites
+        // every field, so a clone bought nothing) and moved back at the end.
+        let mut saved = self.take_process_context();
         let ctx = self.process_contexts.remove(&pid).unwrap_or_default();
         self.restore_process_context(ctx);
         self.run_process_payload(pid, stmts);
-        if self.is_pid_suspended(pid) {
-            self.process_contexts
-                .insert(pid, self.snapshot_process_context());
-        } else {
-            self.process_contexts.remove(&pid);
-        }
+        let suspended = self.is_pid_suspended(pid);
+        // The process's own context is moved out once; its frames are read
+        // for the fork merge below and the whole context is parked in the
+        // table only if the process suspended.
+        let child_ctx = self.take_process_context();
         // IEEE 1800-2023 §6.21/§9.3.2: automatic variables declared in the
         // parent scope are SHARED with fork children — a child's write must be
         // visible to the parent. xezim gives each fork child a COPY of the
@@ -37538,24 +37647,24 @@ impl Simulator {
         //       copied them into the child's frame and recorded the names in
         //       `fork_signal_captures`. Write the child's changed values back
         //       into `self.signals`, which is what the parent reads from.
-        let child_frames: Vec<HashMap<String, Value>> = self.local_stack.clone();
-        let baseline = self.fork_baselines.get(&pid).cloned();
-        let signal_caps = self.fork_signal_captures.get(&pid).cloned();
+        let child_frames: &[HashMap<String, Value>] = &child_ctx.local_stack;
+        let baseline = self.fork_baselines.get(&pid);
+        let signal_caps = self.fork_signal_captures.get(&pid);
         if !child_frames.is_empty() {
             if let Some(parent_pid) = self.process_parents.get(&pid).copied() {
                 // (a) subroutine-frame merge
                 if let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) {
                     Self::merge_fork_writes(
                         &mut parent_ctx.local_stack,
-                        &child_frames,
-                        baseline.as_ref(),
+                        child_frames,
+                        baseline,
                     );
                 } else {
                     // Parent is the active process — its context is `saved`.
                     Self::merge_fork_writes(
                         &mut saved.local_stack,
-                        &child_frames,
-                        baseline.as_ref(),
+                        child_frames,
+                        baseline,
                     );
                 }
             }
@@ -37564,14 +37673,13 @@ impl Simulator {
         // `self.signals`. Write only keys the child CHANGED (relative to the
         // fork-time baseline) so an inherited-unchanged value doesn't
         // clobber a sibling's or the parent's concurrent write.
-        if let Some(caps) = &signal_caps {
+        if let Some(caps) = signal_caps {
             let top = child_frames.last();
             for nm in caps {
                 let Some(v) = top.and_then(|f| f.get(nm)) else {
                     continue;
                 };
                 let inherited_unchanged = baseline
-                    .as_ref()
                     .and_then(|b| b.last())
                     .and_then(|f| f.get(nm))
                     .is_some_and(|old| old == v);
@@ -37580,7 +37688,10 @@ impl Simulator {
                 }
             }
         }
-        if !self.is_pid_suspended(pid) {
+        if suspended {
+            self.process_contexts.insert(pid, child_ctx);
+        } else {
+            self.process_contexts.remove(&pid);
             self.fork_baselines.remove(&pid);
             self.fork_signal_captures.remove(&pid);
         }
@@ -39272,7 +39383,7 @@ impl Simulator {
                                             cont,
                                             is_peek: method == "peek",
                                         });
-                                    if std::env::var("XEZIM_MBX_DBG").is_ok() {
+                                    if env_set_cached!("XEZIM_MBX_DBG") {
                                         eprintln!("[MBX] t={} pid={} PARKED {} handle={}",
                                             self.time, pid, method, handle);
                                     }
@@ -39742,7 +39853,7 @@ impl Simulator {
                             return;
                         }
                         // Star/empty sensitivity — just execute body
-                        if !is_star && std::env::var_os("XEZIM_TRACE_SPIN").is_some() {
+                        if !is_star && env_set_cached!("XEZIM_TRACE_SPIN") {
                             eprintln!(
                                 "[EMPTYSENS] pid={} t={} event={:?} span={:?}",
                                 pid, self.time, event, stmt.span
@@ -41181,11 +41292,45 @@ impl Simulator {
     /// the enclosing block (its `$finish` included) the moment it broke out,
     /// which presented as a hang. Take the chain and splice with
     /// `ProcCont::pushed`, exactly like the other suspend-aware arms.
+    /// The continuation a forever loop parks with at statement `i` of its
+    /// body: `[first, rest of the body, ForeverTail { body }]`, built once
+    /// per (body, i, site) and shared afterwards. `pc.stmts` — the frame
+    /// that owns `body` — is kept alive by the entry so the address key
+    /// cannot be recycled by another allocation. The ForeverTail inside the
+    /// shared frame is what the next iteration keys on, so from the second
+    /// wake-up on every iteration of every loop is a lookup.
+    fn forever_cont(
+        &mut self,
+        pid: usize,
+        body: &Statement,
+        body_stmts: &[Statement],
+        i: usize,
+        kind: u8,
+        first: &Statement,
+    ) -> Arc<[Statement]> {
+        let key = (pid, body.span.start, body.span.end, i, kind);
+        if let Some(cont) = self.forever_cont_cache.get(&key) {
+            return cont.clone();
+        }
+        let mut cont: Vec<Statement> = Vec::with_capacity(body_stmts.len() - i + 1);
+        cont.push(first.clone());
+        cont.extend_from_slice(&body_stmts[i + 1..]);
+        cont.push(Statement::new(
+            StatementKind::ForeverTail {
+                body: Box::new(body.clone()),
+            },
+            body.span,
+        ));
+        let cont: Arc<[Statement]> = Arc::from(cont);
+        self.forever_cont_cache.insert(key, cont.clone());
+        cont
+    }
+
     fn exec_forever_sched(&mut self, pid: usize, body: &Statement, pc: &ProcCont, idx: usize) {
         let resume_at = pc.start + idx + 1;
-        let body_stmts = match &body.kind {
-            StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
-            _ => vec![body.clone()],
+        let body_stmts: &[Statement] = match &body.kind {
+            StatementKind::SeqBlock { stmts, .. } => stmts.as_slice(),
+            _ => std::slice::from_ref(body),
         };
         for (i, s) in body_stmts.iter().enumerate() {
             if self.finished {
@@ -41225,23 +41370,16 @@ impl Simulator {
                             self.inactive_queue.push((pid, pc.pushed(restart, resume_at)));
                             return;
                         }
-                        let mut cont = vec![*tbody.clone()];
-                        cont.extend_from_slice(&body_stmts[i + 1..]);
-                        cont.push(Statement::new(
-                            StatementKind::ForeverTail {
-                                body: Box::new(body.clone()),
-                            },
-                            body.span,
-                        ));
+                        let cont = self.forever_cont(pid, body, body_stmts, i, 0, tbody);
                         if delay == 0 {
                             // `forever begin ... #0 ... end` — same §4.4.2.3
                             // Inactive-region parking as the run_process_stmts
                             // Delay handler above: resume only after this
                             // tick's NBA region (commercial consensus).
-                            self.inactive_queue.push((pid, pc.pushed(cont, resume_at)));
+                            self.inactive_queue.push((pid, pc.pushed_frame(cont, resume_at)));
                         } else {
                             self.event_queue
-                                .schedule(self.time + delay, pid, pc.pushed(cont, resume_at));
+                                .schedule(self.time + delay, pid, pc.pushed_frame(cont, resume_at));
                         }
                         return;
                     }
@@ -41249,18 +41387,11 @@ impl Simulator {
                         let sens = self.event_to_sens(event);
                         let is_clk_ev = self.is_clocking_event(event);
                         if !sens.is_empty() {
-                            let mut cont = vec![*tbody.clone()];
-                            cont.extend_from_slice(&body_stmts[i + 1..]);
-                            cont.push(Statement::new(
-                                StatementKind::ForeverTail {
-                                    body: Box::new(body.clone()),
-                                },
-                                body.span,
-                            ));
+                            let cont = self.forever_cont(pid, body, body_stmts, i, 1, tbody);
                             { let w = self.make_event_waiter_kind(
                                     pid,
                                     sens,
-                                    pc.pushed(cont, resume_at),
+                                    pc.pushed_frame(cont, resume_at),
                                     is_clk_ev,
                                 ); self.event_waiters.push(w); }
                             return;
@@ -41289,14 +41420,7 @@ impl Simulator {
                 if !Self::stmt_is_mailbox_get(s) && self.blocking_call_on_null_receiver(s) {
                     return;
                 }
-                let mut cont: Vec<Statement> = vec![s.clone()];
-                cont.extend_from_slice(&body_stmts[i + 1..]);
-                cont.push(Statement::new(
-                    StatementKind::ForeverTail {
-                        body: Box::new(body.clone()),
-                    },
-                    body.span,
-                ));
+                let cont = self.forever_cont(pid, body, body_stmts, i, 2, s);
 
                 // The statement is only POTENTIALLY blocking: `wait (cond)` with
                 // cond already true runs straight through, reaches the Forever
@@ -41307,7 +41431,7 @@ impl Simulator {
                 // continuation to the scheduler as a delta at the current time.
                 // The loop then spins through the event loop, where it is bounded,
                 // and the stall detector can see it and name it.
-                let contp = pc.pushed(cont, resume_at);
+                let contp = pc.pushed_frame(cont, resume_at);
                 if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
                     self.event_queue.schedule(self.time, pid, contp);
                     return;
@@ -41333,7 +41457,7 @@ impl Simulator {
         let mut broke = false;
         while !self.finished && safety < cap {
             safety += 1;
-            for s in &body_stmts {
+            for s in body_stmts {
                 self.exec_statement(s);
                 // §12.7.2: `break` (and a `return` out of the enclosing
                 // task/function, which sets the same flag) LEAVES the loop —
@@ -43220,15 +43344,7 @@ impl Simulator {
                 let operand = args.first()?.clone();
                 let site = expr.span.start;
                 let widx = self.sampled_watch_for(site, &operand, ec, cid, n)?;
-                let cur = match self.sampled_watches[widx].hist.front() {
-                    Some(v) => v.clone(),
-                    None => {
-                        let op = operand.clone();
-                        self.eval_expr(&op)
-                    }
-                };
-                let past = self.sampled_watches[widx].hist.get(n).cloned();
-                return Some((cur, past));
+                return Some(self.sampled_cur_and_past(widx, &operand, n));
             }
             let (clk_str, _) = self.clocking_meta.get("__xz_default_clocking")?.clone();
             // clocking_meta stores the bare clock SIGNAL name (the parser
@@ -43242,16 +43358,37 @@ impl Simulator {
         let operand = args.first()?.clone();
         let site = expr.span.start;
         let widx = self.sampled_watch_for(site, &operand, edge_code.unwrap_or(0), clk_id, n)?;
-        let w = &self.sampled_watches[widx];
-        let cur = match w.hist.front() {
-            Some(v) => v.clone(),
-            None => {
+        Some(self.sampled_cur_and_past(widx, &operand, n))
+    }
+
+    /// (current sample, `n` edges back) for a sampled-value call. The per-slot
+    /// sampler runs after the Active processes and before the SVA sites, so
+    /// when the reader runs BEFORE this slot's sample the front of the
+    /// history is the PREVIOUS edge: the current value is read live and the
+    /// past index shifts by one. A procedural `$past(v)` at the second edge
+    /// used to index past that single sample and report "no history", and
+    /// from the third edge on returned the value from two edges back.
+    fn sampled_cur_and_past(
+        &mut self,
+        widx: usize,
+        operand: &Expression,
+        n: usize,
+    ) -> (Value, Option<Value>) {
+        let sampled_this_slot = self.sampled_watches[widx].last_sample_time == Some(self.time);
+        let cur = match self.sampled_watches[widx].hist.front() {
+            Some(v) if sampled_this_slot => v.clone(),
+            _ => {
                 let op = operand.clone();
                 self.eval_expr(&op)
             }
         };
-        let past = self.sampled_watches[widx].hist.get(n).cloned();
-        Some((cur, past))
+        let idx = if sampled_this_slot { n } else { n.saturating_sub(1) };
+        let past = if n == 0 {
+            Some(cur.clone())
+        } else {
+            self.sampled_watches[widx].hist.get(idx).cloned()
+        };
+        (cur, past)
     }
 
     /// Pre-register sampled-value watches for every `$rose/$fell/$stable/
@@ -43465,6 +43602,22 @@ impl Simulator {
 
     /// Reconstruct a signal's PREPONED (slot-entry) value from the edge
     /// snapshot arrays.
+    /// Copy a signal's current value into its preponed snapshot (the
+    /// per-slot pass does this for every edge signal after a slot that wrote
+    /// something; a signal registered mid-run needs it once, immediately).
+    fn seed_prev_from_current(&mut self, id: usize) {
+        if id >= self.signal_table.len() || id >= self.prev_val.len() || id >= self.prev_xz.len() {
+            return;
+        }
+        let (v, x) = self.signal_table[id].raw_bits();
+        self.prev_val[id] = v;
+        self.prev_xz[id] = x;
+        if self.signal_widths.get(id).copied().unwrap_or(0) > 64 {
+            let cur = self.signal_table[id].clone();
+            self.prev_wide.insert(id, cur);
+        }
+    }
+
     fn preponed_value_of(&self, id: usize) -> Value {
         if let Some(w) = self.prev_wide.get(&id) {
             return w.clone();
@@ -43496,12 +43649,19 @@ impl Simulator {
             _ => EdgeKind::AnyEdge,
         };
         let sig_id = self.get_lhs_signal_id(operand);
+        // A signal registered here at run time has no preponed snapshot yet,
+        // and the snapshot pass only runs for a slot that wrote something —
+        // a declaration-initialised operand (`logic [7:0] v = 8'hA5;`) is
+        // never written, so its first sample read a stale x. Seed the
+        // snapshot from the current value on registration.
         if !self.edge_signal_ids.contains(&clk_id) {
             self.edge_signal_ids.push(clk_id);
+            self.seed_prev_from_current(clk_id);
         }
         if let Some(sid) = sig_id {
             if !self.edge_signal_ids.contains(&sid) {
                 self.edge_signal_ids.push(sid);
+                self.seed_prev_from_current(sid);
             }
         }
         let i = self.sampled_watches.len();
@@ -43512,6 +43672,7 @@ impl Simulator {
             expr: operand.clone(),
             hist: std::collections::VecDeque::new(),
             depth: depth + 1,
+            last_sample_time: None,
         });
         self.sampled_watch_site.insert(site, i);
         Some(i)
@@ -43528,6 +43689,7 @@ impl Simulator {
             if !self.check_edge_id(clk_id, edge) {
                 continue;
             }
+            self.sampled_watches[i].last_sample_time = Some(self.time);
             let sample = match self.sampled_watches[i].sig_id {
                 Some(sid) => self.preponed_value_of(sid),
                 None => {
@@ -44494,7 +44656,7 @@ impl Simulator {
                 false
             } else if !qualifies {
                 false
-            } else if std::env::var("XEZIM_FORCE_PARALLEL").ok().as_deref() == Some("1") {
+            } else if env_is_one_cached!("XEZIM_FORCE_PARALLEL") {
                 true
             } else {
                 match self.par_cal_phase {
@@ -45155,7 +45317,10 @@ impl Simulator {
         // same edge updates). XEZIM_ACTIVE_REGION=0 restores the legacy
         // schedule-into-event_queue path (waiter runs in the NEXT event_loop
         // iter after apply_nba, reading post-NBA values).
-        let active_region = std::env::var("XEZIM_ACTIVE_REGION").ok().as_deref() != Some("0");
+        let active_region = {
+            static FLAG: OnceLock<bool> = OnceLock::new();
+            *FLAG.get_or_init(|| std::env::var("XEZIM_ACTIVE_REGION").ok().as_deref() != Some("0"))
+        };
         // Record continuation writes for the §9.2 rescan drain (see
         // `in_edge_cont`): these run AFTER this pass's edge detection, so
         // without recording, an AnyEdge block sensitive to a signal a
@@ -45215,7 +45380,7 @@ impl Simulator {
                 }
                 settle_guard += 1;
                 if self.finished || settle_guard > 10_000 {
-                    if std::env::var_os("XEZIM_TRACE_SPIN").is_some() && !self.finished {
+                    if env_set_cached!("XEZIM_TRACE_SPIN") && !self.finished {
                         eprintln!("[DRAINGUARD] t={} exhausted; {} waiters:", self.time, self.event_waiters.len());
                         for w in self.event_waiters.iter().take(6) {
                             let names: Vec<String> = w
@@ -49516,7 +49681,7 @@ impl Simulator {
 
                 // If this is an array or queue, and we are assigning a packed value,
                 // we might want to split it into elements.
-                if std::env::var("XEZIM_A1_DBG").is_ok() && name.contains('m') {
+                if env_set_cached!("XEZIM_A1_DBG") && name.contains('m') {
                     eprintln!("[A1DBG] whole-name write name={:?} in_arrays={} hint={:?}",
                         name, self.module.arrays.contains_key(&*name),
                         self.name_resolve_hint.borrow().clone());
@@ -49924,7 +50089,7 @@ impl Simulator {
                 // Class associative-array member element write — base may be
                 // a bare member (`m[k]=v`) or another object's (`obj.m[k]=v`).
                 if let Some(an) = self.expr_assoc_name(expr) {
-                    if std::env::var_os("XEZIM_AW_DBG").is_some() {
+                    if env_set_cached!("XEZIM_AW_DBG") {
                         eprintln!("[AW] assoc write an={} width={:?} map={:?}",
                             an, self.assoc_elem_width(&an), self.module.assoc_elem_widths);
                     }
@@ -50378,6 +50543,35 @@ impl Simulator {
                 // matched here, so hierarchical element writes were silently
                 // dropped while reads (which go through flat_member_name)
                 // worked.
+                // Element write into a packed multi-dimensional CLASS property:
+                // read-modify-write the addressed slice of the whole value.
+                if let Some((h, prop, idx_exprs)) = self.prop_index_chain(lhs) {
+                    if let Some(dims) = self.class_prop_packed_dims(h, &prop) {
+                        if idx_exprs.len() <= dims.len() {
+                            let idx: Vec<Value> =
+                                idx_exprs.iter().map(|ie| self.eval_expr(ie)).collect();
+                            if let Some(cur) = self.read_member_value(h, &prop) {
+                                if let Some((lsb, w)) =
+                                    Self::packed_chain_slice(cur.width as u64, &dims, &idx)
+                                {
+                                    let piece = val.resize(w as u32);
+                                    let mut nv = cur.clone();
+                                    for i in 0..(w as usize) {
+                                        nv.set_bit(lsb as usize + i, piece.get_bit(i));
+                                    }
+                                    let changed = nv != cur;
+                                    if changed {
+                                        if let Some(Some(inst)) = self.heap.get_mut(h) {
+                                            inst.properties.insert(prop, nv);
+                                        }
+                                    }
+                                    return changed;
+                                }
+                                return false;
+                            }
+                        }
+                    }
+                }
                 let (base_name, hier_opt): (
                     Option<std::borrow::Cow<str>>,
                     Option<&crate::ast::expr::HierarchicalIdentifier>,
@@ -52314,6 +52508,160 @@ impl Simulator {
     /// and an ascending range: physical = label - right (descending) /
     /// right - label (ascending). None for a plain Ident base (layers = 0 —
     /// the existing plain-signal paths own that) or when nothing is recorded.
+    /// Packed dimensions of a CLASS PROPERTY (`rand u7_t [4:0][1:0] d;`),
+    /// declared dimensions first and then a typedef's own, resolved from the
+    /// property's declared type. Module-scope geometry tables are keyed by
+    /// signal name, which a property never has, so without this an element
+    /// select on a packed multi-dimensional property was a single-bit select
+    /// of the whole value (`d[0][0]` read bit 0; `d[2][1] = 77` was dropped).
+    fn class_prop_packed_dims(&self, handle: usize, prop: &str) -> Option<Vec<(i64, i64)>> {
+        let cn = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let mut cur = Some(cn);
+        while let Some(c) = cur {
+            let cd = self.module.classes.get(&c)?;
+            // A property with UNPACKED dimensions (`bit [1:0][7:0] tbl [4]`)
+            // is a collection: its index selects an element, not a slice.
+            if cd.array_properties.contains_key(prop) || cd.array_nd_properties.contains_key(prop) {
+                return None;
+            }
+            if let Some(dt) = cd.property_types.get(prop) {
+                let dims = super::elaborate::packed_full_dims_chained(
+                    dt,
+                    &self.module.parameters,
+                    &self.module.typedef_types,
+                )?;
+                return if dims.len() >= 2 { Some(dims) } else { None };
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// If `expr` is an index chain `root[i]...[k]` whose root names a class
+    /// property (a bare property of `this`, not shadowed by a local or a
+    /// signal, or `obj.prop` on a handle), return the handle, the property
+    /// name, and the index expressions outermost first.
+    fn prop_index_chain<'e>(
+        &mut self,
+        expr: &'e Expression,
+    ) -> Option<(usize, String, Vec<&'e Expression>)> {
+        self.prop_index_chain_inner(expr, None)
+    }
+
+    /// Same as `prop_index_chain` for an `Index` already split into its base
+    /// and outermost index (the eval arm destructures the node, shadowing
+    /// the whole expression).
+    fn prop_index_chain_parts<'e>(
+        &mut self,
+        base: &'e Expression,
+        outer: &'e Expression,
+    ) -> Option<(usize, String, Vec<&'e Expression>)> {
+        self.prop_index_chain_inner(base, Some(outer))
+    }
+
+    fn prop_index_chain_inner<'e>(
+        &mut self,
+        expr: &'e Expression,
+        outer: Option<&'e Expression>,
+    ) -> Option<(usize, String, Vec<&'e Expression>)> {
+        let mut rev: Vec<&'e Expression> = Vec::new();
+        if let Some(o) = outer {
+            rev.push(o);
+        }
+        let mut cur = expr;
+        while let ExprKind::Index { expr: b, index } = &cur.kind {
+            rev.push(index);
+            cur = b;
+        }
+        if rev.is_empty() {
+            return None;
+        }
+        let (handle, prop) = match &cur.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let name = &h.path[0].name.name;
+                if self.local_stack.last().is_some_and(|f| f.contains_key(name))
+                    || self.signal_name_to_id.contains_key(name.as_str())
+                {
+                    return None;
+                }
+                let handle = self.this_stack.last().copied().flatten()?;
+                let has = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .is_some_and(|i| i.properties.contains_key(name));
+                if !has {
+                    return None;
+                }
+                (handle, name.clone())
+            }
+            ExprKind::Ident(h) if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) => {
+                let obj = self.eval_ident_handle(&h.path[0].name.name)?;
+                if obj == 0 || obj >= self.heap.len() {
+                    return None;
+                }
+                (obj, h.path[1].name.name.clone())
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                let obj = self.eval_handle_expr(base)?;
+                if obj == 0 || obj >= self.heap.len() {
+                    return None;
+                }
+                (obj, member.name.clone())
+            }
+            _ => return None,
+        };
+        rev.reverse();
+        Some((handle, prop, rev))
+    }
+
+    /// Bit slice (lsb, width) addressed by an index chain into a packed
+    /// value of `total` bits with dimensions `dims` (outermost first), using
+    /// the same slot arithmetic as the signal path: descending dimensions
+    /// place index `lo` at the bottom, ascending ones at the top. None when
+    /// an index is out of range or X.
+    fn packed_chain_slice(total: u64, dims: &[(i64, i64)], idx: &[Value]) -> Option<(u64, u64)> {
+        let mut w = total;
+        let mut lsb: i64 = 0;
+        for (k, iv) in idx.iter().enumerate() {
+            let (dl, dr) = *dims.get(k)?;
+            let count = (dl - dr).unsigned_abs() + 1;
+            if count == 0 || w % count != 0 {
+                return None;
+            }
+            w /= count;
+            if iv.has_xz() {
+                return None;
+            }
+            let i = iv.to_i64()?;
+            let lo_b = dl.min(dr);
+            let off = i - lo_b;
+            if off < 0 || off as u64 >= count {
+                return None;
+            }
+            let slot = if dl >= dr { off } else { (count as i64 - 1) - off };
+            lsb += slot * w as i64;
+        }
+        Some((lsb as u64, w))
+    }
+
+    /// Width of the sub-array addressed by `n` indices into `dims`.
+    fn packed_chain_width(total: u64, dims: &[(i64, i64)], n: usize) -> u64 {
+        let mut w = total;
+        for k in 0..n.min(dims.len()) {
+            let (dl, dr) = dims[k];
+            let c = (dl - dr).unsigned_abs() + 1;
+            if c > 0 && w % c == 0 {
+                w /= c;
+            }
+        }
+        w.max(1)
+    }
+
     fn select_base_elem_dim(&self, base: &Expression) -> Option<(i64, i64)> {
         let mut cur = base;
         let mut layers = 0usize;
@@ -54473,6 +54821,25 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // Element select on a packed multi-dimensional CLASS property.
+                if let Some((h, prop, idx_exprs)) = self.prop_index_chain_parts(expr, index) {
+                    if let Some(dims) = self.class_prop_packed_dims(h, &prop) {
+                        if idx_exprs.len() <= dims.len() {
+                            let idx: Vec<Value> =
+                                idx_exprs.iter().map(|ie| self.eval_expr(ie)).collect();
+                            if let Some(base_v) = self.read_member_value(h, &prop) {
+                                return match Self::packed_chain_slice(base_v.width as u64, &dims, &idx) {
+                                    Some((lsb, w)) => {
+                                        base_v.range_select((lsb + w - 1) as usize, lsb as usize)
+                                    }
+                                    None => Value::new(
+                                        Self::packed_chain_width(base_v.width as u64, &dims, idx.len()) as u32,
+                                    ),
+                                };
+                            }
+                        }
+                    }
+                }
                 // Every shape probe below used to re-resolve this same base
                 // identifier from scratch — up to ten resolutions, each with
                 // its own allocation, per indexed read. On an axi4Lite UVM run
@@ -54599,7 +54966,7 @@ impl Simulator {
                         }
                     }
                 }
-                if std::env::var("XEZIM_EV_DBG").is_ok() {
+                if env_set_cached!("XEZIM_EV_DBG") {
                     eprintln!(
                         "[EVDBG] idx-eval base_fmn={:?} qb={:?} ean={:?} nin={:?}",
                         self.flat_member_name(expr),
@@ -55642,7 +56009,8 @@ impl Simulator {
                 self.assign_value(lvalue, &v);
                 v
             }
-            ExprKind::SystemCall { name, args } => match name.as_str() {
+            ExprKind::SystemCall { name, args } => {
+                let mut sys_result = match name.as_str() {
                 // §9.4.5: retrieve a pre-evaluated intra-assignment RHS
                 // (stashed by the suspend path; see make_intra_saved_expr).
                 INTRA_SAVED_MARKER => {
@@ -55679,8 +56047,10 @@ impl Simulator {
                                 return p;
                             }
                             // Not enough history yet: LRM default-value = the
-                            // operand type's default (x for 4-state).
-                            return Value::new(1);
+                            // operand type's default (x for 4-state), at the
+                            // OPERAND's width.
+                            let w = args.first().map(|a| self.infer_width(a)).unwrap_or(1);
+                            return Value::new(w.max(1));
                         }
                     }
                     let sig_name = match args.first().map(|a| &a.kind) {
@@ -56293,7 +56663,7 @@ impl Simulator {
                         Some(_) => self.eval_expr(&args[0]).to_sv_string(),
                         None => String::new(),
                     };
-                    Value::from_u64(self.test_plusarg(&pat) as u64, 1)
+                    Value::from_u64(self.test_plusarg(&pat) as u64, 32)
                 }
                 "$value$plusargs" => self.eval_value_plusargs(args),
                 "$fopen" => self.open_file_handle(args),
@@ -57645,11 +58015,28 @@ impl Simulator {
                     let self_ptr = self as *mut Simulator;
                     vpi_call_systf(self_ptr, name, args).unwrap_or_else(|| Value::zero(32))
                 }
+                // §16.9.3 `$sampled(e)` outside a property: the value in the
+                // current time step, which is the operand's current value.
+                "$sampled" => args
+                    .first()
+                    .map(|a| self.eval_expr(a))
+                    .unwrap_or(Value::zero(32)),
                 _ => {
                     self.warn_unknown_system_task(name, args);
                     Value::zero(32)
                 }
-            },
+                };
+                // §20/§21: an `int`/`integer`-valued function returns a SIGNED
+                // value (`$countones(x) - 8 < 0`, `$fgetc(fd) < 0` on EOF).
+                // The arms above build unsigned words; stamp the sign here,
+                // once, from the shared result-type table.
+                if let Some((32, true)) = super::bytecode::system_function_result(name) {
+                    if sys_result.width == 32 && !sys_result.is_real {
+                        sys_result.is_signed = true;
+                    }
+                }
+                sys_result
+            }
             ExprKind::This => {
                 if let Some(Some(handle)) = self.this_stack.last() {
                     Value::from_u64(*handle as u64, 32)
@@ -59609,12 +59996,12 @@ impl Simulator {
                                     .get(&*name)
                                     .map(|&(_, _, w)| w)
                                     .unwrap_or(32);
-                                let four_state = self.p_elem_type(&name).is_some_and(|dt| {
+                                let four_state = self.p_elem_type_ref(&name).is_some_and(|dt| {
                                     use crate::ast::types::{
                                         DataType as DT, IntegerAtomType as IAT,
                                         IntegerVectorType as IVT,
                                     };
-                                    match self.resolve_dt(&dt) {
+                                    match self.resolve_dt_ref(&dt) {
                                         DT::IntegerVector {
                                             kind: IVT::Logic | IVT::Reg,
                                             ..
@@ -59829,11 +60216,11 @@ impl Simulator {
                     // this type lookup bypassed it, so the whole-struct copy
                     // silently declined and every member stayed x — while the
                     // identical code at top level worked.
-                    let dst = if self.p_elem_type(&dst).is_none() {
+                    let dst = if self.p_elem_type_ref(&dst).is_none() {
                         match self.name_resolve_hint.borrow().clone() {
                             Some(h) => {
                                 let scoped = format!("{}.{}", h, dst);
-                                if self.p_elem_type(&scoped).is_some() {
+                                if self.p_elem_type_ref(&scoped).is_some() {
                                     scoped
                                 } else {
                                     dst
@@ -59844,9 +60231,17 @@ impl Simulator {
                     } else {
                         dst
                     };
-                    if let Some(dt) = self.p_elem_type(&dst) {
-                        if let DataType::Struct(su) = self.resolve_dt(&dt) {
-                            if Self::spreads_member_wise(&su) {
+                    // Only a member-wise struct target needs its type owned;
+                    // every other assignment answers the predicate by borrow.
+                    let spread_su = self.p_elem_type_ref(&dst).and_then(|dt| {
+                        match self.resolve_dt_ref(&dt) {
+                            DataType::Struct(su) if Self::spreads_member_wise(su) => {
+                                Some(su.clone())
+                            }
+                            _ => None,
+                        }
+                    });
+                    if let Some(su) = spread_su {
                                 if let Some(src) = self.flat_member_name(rvalue) {
                                     if src != dst && self.struct_storage_exists(&src, &su) {
                                         self.copy_unpacked_struct(&dst, &src, &su.clone());
@@ -59885,8 +60280,6 @@ impl Simulator {
                                         return;
                                     }
                                 }
-                            }
-                        }
                     }
                 }
                 // `collection[key] = new(...)`: a bare `new` assigned to an
@@ -62683,11 +63076,18 @@ impl Simulator {
                     })
                     .collect();
                 let fv_saved = self.snapshot_loop_vars(&fv_names);
+                // A loop variable that shadows a module-scope variable needs
+                // its own frame. The module variable of an INLINED instance
+                // is keyed under the process scope (`u.i`), so test the
+                // scope-hinted names too: without this the first run wrote a
+                // bare `i` signal while the reads resolved through the hint
+                // to the x-valued `u.i`, and the loop never entered.
                 let shadow_frame = self.local_stack.last().is_none()
                     && init.iter().any(|fi| match fi {
                         ForInit::VarDecl { name, .. } => {
                             self.signal_name_to_id.contains_key(name.name.as_str())
                                 || self.signals.contains_key(&name.name)
+                                || self.scoped_signal_exists(&name.name)
                         }
                         _ => false,
                     });
@@ -62824,6 +63224,25 @@ impl Simulator {
                     self.pop_local_frame();
                 }
                 self.restore_loop_vars(&fv_saved);
+            }
+            // A foreach variable that shadows a module-scope variable (bare or
+            // under the process's instance scope, `u.i`) gets its own frame,
+            // like a for-init variable: without one the loop variable was
+            // written by name, resolved through the scope hint to the module
+            // variable, and the block re-triggered itself on that write.
+            // The re-dispatch below sees a local frame and takes the normal
+            // path, so every exit of that path pops nothing extra.
+            StatementKind::Foreach { vars, .. }
+                if self.local_stack.last().is_none()
+                    && vars.iter().flatten().any(|v| {
+                        self.signal_name_to_id.contains_key(v.name.as_str())
+                            || self.signals.contains_key(&v.name)
+                            || self.scoped_signal_exists(&v.name)
+                    }) =>
+            {
+                self.push_local_frame(HashMap::default());
+                self.exec_statement(stmt);
+                self.pop_local_frame();
             }
             StatementKind::Foreach { array, vars, body } => {
                 // foreach index variables are loop-scoped (SV): save the outer
@@ -63132,6 +63551,10 @@ impl Simulator {
                 }
                 if let ExprKind::Ident(hier) = &array.kind {
                     let mut name = self.resolve_hier_name(hier);
+                    // Packed multi-dimensional CLASS property (`foreach (c.d[i, j])`
+                    // over `bit [6:0] [4:0][1:0] d`): the geometry lives on the
+                    // class type, not in the module-level packed tables.
+                    let mut prop_packed_dims: Option<Vec<(i64, i64)>> = None;
                     // A subroutine-LOCAL queue/dyn array lives under its
                     // per-process rename — and shadows any same-named class
                     // member (§8.10). Without this, `foreach (pp[j])` over a
@@ -63142,8 +63565,8 @@ impl Simulator {
                         name = std::borrow::Cow::Owned(rn.to_string());
                     } else {
                         let spec_key = self.spec_static_coll_key(&name);
-                        if spec_key != name {
-                            name = std::borrow::Cow::Owned(spec_key);
+                        if let std::borrow::Cow::Owned(k) = spec_key {
+                            name = std::borrow::Cow::Owned(k);
                         } else if let Some(scoped) = self.instance_assoc_member(&name) {
                             name = std::borrow::Cow::Owned(scoped);
                         }
@@ -63192,6 +63615,29 @@ impl Simulator {
                                 || self.module.arrays_nd.contains_key(&scoped)
                             {
                                 name = std::borrow::Cow::Owned(scoped);
+                            } else if let Some(pd) = self.class_prop_packed_dims(
+                                h,
+                                hier.path.last().map(|s| s.name.name.as_str()).unwrap_or(""),
+                            ) {
+                                if pd.len() >= vars.len() {
+                                    prop_packed_dims = Some(pd);
+                                }
+                            }
+                        }
+                    }
+                    // Same geometry for a bare property name inside a method
+                    // (`foreach (d[i, j])` with `this` implied).
+                    if prop_packed_dims.is_none()
+                        && hier.path.len() == 1
+                        && hier.path[0].selects.is_empty()
+                        && self.foreach_dims(&name).is_none()
+                        && !self.module.packed_full_dims.contains_key(&*name)
+                    {
+                        if let Some(h) = self.this_stack.last().copied().flatten().filter(|&h| h != 0) {
+                            if let Some(pd) = self.class_prop_packed_dims(h, &hier.path[0].name.name) {
+                                if pd.len() >= vars.len() {
+                                    prop_packed_dims = Some(pd);
+                                }
                             }
                         }
                     }
@@ -63285,7 +63731,30 @@ impl Simulator {
                         }
                     }
                     if vars.len() >= 2 {
-                        if let Some(mut dims) = self.foreach_dims(&name) {
+                        // §12.7.3: the loop variables map onto the array's
+                        // dimensions left to right, unpacked first, then
+                        // packed. A PURELY packed array (`u7_t [4:0][1:0] a`,
+                        // `bit [6:0][4:0][1:0] b`) has no unpacked shape, so
+                        // `foreach_dims` is None; that used to fall through to
+                        // the single-dimension path and iterate one packed
+                        // dimension with every other variable x. Start from an
+                        // empty shape and let the packed dimensions supply
+                        // every variable.
+                        let purely_packed = prop_packed_dims.is_some()
+                            || (self.foreach_dims(&name).is_none()
+                                && !self.module.dynamic_arrays.contains(&*name)
+                                && !self.is_associative_array(&name)
+                                && self
+                                    .module
+                                    .packed_full_dims
+                                    .get(&*name)
+                                    .is_some_and(|d| d.len() >= vars.len()));
+                        let start_dims = if purely_packed {
+                            Some(Vec::new())
+                        } else {
+                            self.foreach_dims(&name)
+                        };
+                        if let Some(mut dims) = start_dims {
                             // A dynamic outer dimension (`T a[][16]`) is backed
                             // by a fixed 64-slot buffer; iterate only the
                             // CURRENT size, like the 1-var dynamic path below.
@@ -63307,7 +63776,10 @@ impl Simulator {
                             // record (e.g. a bare `reg [W-1:0]` element).
                             let mut descs: Vec<bool> = vec![false; dims.len()];
                             if dims.len() < vars.len() {
-                                if let Some(pdims) = self.module.packed_full_dims.get(&*name) {
+                                if let Some(pdims) = prop_packed_dims
+                                    .as_ref()
+                                    .or_else(|| self.module.packed_full_dims.get(&*name))
+                                {
                                     for &(l, r) in pdims.iter() {
                                         if dims.len() >= vars.len() {
                                             break;
@@ -64872,7 +65344,7 @@ impl Simulator {
                             &self.module.typedef_types,
                         ) {
                             if !fields.is_empty() {
-                                if std::env::var("XEZIM_PSDBG").is_ok() {
+                                if env_set_cached!("XEZIM_PSDBG") {
                                     eprintln!("[PSDBG] register packed local {}", d.name.name);
                                 }
                                 self.module
@@ -70114,6 +70586,8 @@ impl Simulator {
             // Otherwise the watcher persists. At end-of-sim, any
             // remaining watcher counts as FAIL (handled later).
             let span_key_for_evt = self.sva_sites[i].span_key;
+            // §16.5: tally under the kind the source wrote (assert/assume/cover).
+            let site_kind = self.sva_sites[i].kind;
             let watchers: Vec<Expression> = std::mem::take(&mut self.sva_sites[i].s_eventually);
             for w in watchers {
                 let outcome = self.eval_sva_sampled(&sampled_ids, &w);
@@ -70122,7 +70596,7 @@ impl Simulator {
                         .assertion_stats
                         .entry(span_key_for_evt)
                         .or_insert_with(|| AssertionStat {
-                            kind: 0,
+                            kind: site_kind,
                             pass_count: 0,
                             fail_count: 0,
                         });
@@ -70146,11 +70620,14 @@ impl Simulator {
                         .assertion_stats
                         .entry(span_key_for_evt)
                         .or_insert_with(|| AssertionStat {
-                            kind: 0,
+                            kind: site_kind,
                             pass_count: 0,
                             fail_count: 0,
                         });
-                    stat.fail_count += 1;
+                    if site_kind != 2 {
+                        // §16.12: a cover has hits, not verdicts.
+                        stat.fail_count += 1;
+                    }
                     self.fire_sva_action(i, false);
                 }
             }
@@ -70265,6 +70742,9 @@ impl Simulator {
         body: &Expression,
         sampled_ids: &[usize],
     ) {
+        // §16.5: tally under the kind the source wrote; a cover has hits,
+        // not verdicts, so it is never filed as an assert here either.
+        let site_kind = self.sva_sites[site_idx].kind;
         // LRM §16.6 `disable iff (g)` wrapper. The parser encodes the
         // clause as `Binary{LogAnd, !g, inner_body}`. When `g` is true
         // (so `!g` is false), the property is suppressed for this
@@ -70340,7 +70820,7 @@ impl Simulator {
                         self.assertion_stats
                         .entry(span_key)
                         .or_insert_with(|| AssertionStat {
-                            kind: 0,
+                            kind: site_kind,
                             pass_count: 0,
                             fail_count: 0,
                         });
@@ -70378,24 +70858,47 @@ impl Simulator {
         if self.clocking_meta.is_empty() {
             return;
         }
-        let cb_names: Vec<String> = self.clocking_meta.keys().cloned().collect();
-        for cb in cb_names {
-            let (clk, sigs) = self.clocking_meta.get(&cb).cloned().unwrap();
-            let cur = self
-                .get_signal_value_by_name(&clk)
-                .and_then(|v| v.to_u64())
-                .map(|u| (u & 1) as u8)
-                .unwrap_or(2);
-            let prev = *self.clocking_prev_clock.get(&cb).unwrap_or(&2);
-            self.clocking_prev_clock.insert(cb.clone(), cur);
+        // This runs after EVERY tick. The poll table resolves each block's
+        // clock to a signal-table id once and keeps the previous level, so a
+        // quiet tick costs one indexed read per block instead of cloning the
+        // block's signal list and resolving its clock by name. Rebuilt when a
+        // block is registered (the map only ever grows); iteration order is
+        // the map's, exactly as before.
+        if self.clocking_tick_cache.len() != self.clocking_meta.len() {
+            let names: Vec<String> = self.clocking_meta.keys().cloned().collect();
+            self.clocking_tick_cache = names
+                .into_iter()
+                .map(|cb| {
+                    let clk = self.clocking_meta[&cb].0.clone();
+                    let id = self.signal_name_to_id.get(clk.as_str()).copied();
+                    let edge = self
+                        .clocking_edge
+                        .get(&cb)
+                        .copied()
+                        .unwrap_or(EdgeKind::Posedge);
+                    let prev = self.clocking_prev_clock.get(&cb).copied().unwrap_or(2);
+                    ClockingTick { cb, clk, id, edge, prev }
+                })
+                .collect();
+        }
+        let mut cache = std::mem::take(&mut self.clocking_tick_cache);
+        for ent in cache.iter_mut() {
+            let cur = match ent.id {
+                Some(id) => self.signal_table[id]
+                    .to_u64()
+                    .map(|u| (u & 1) as u8)
+                    .unwrap_or(2),
+                None => self
+                    .get_signal_value_by_name(&ent.clk)
+                    .and_then(|v| v.to_u64())
+                    .map(|u| (u & 1) as u8)
+                    .unwrap_or(2),
+            };
+            let prev = ent.prev;
+            ent.prev = cur;
             // §14.3: advance on the block's declared clock edge (posedge by
             // default; negedge / any-edge when so declared).
-            let edge = self
-                .clocking_edge
-                .get(&cb)
-                .copied()
-                .unwrap_or(EdgeKind::Posedge);
-            let fired = match edge {
+            let fired = match ent.edge {
                 EdgeKind::Negedge => prev == 1 && cur == 0,
                 EdgeKind::Posedge => prev == 0 && cur == 1,
                 // `edge` / any: any resolved 0↔1 transition.
@@ -70404,6 +70907,12 @@ impl Simulator {
             if !fired {
                 continue;
             }
+            let cb = ent.cb.clone();
+            let sigs: Vec<(String, bool)> = self
+                .clocking_meta
+                .get(&cb)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default();
             // §14.16.1: record the edge time — a drive executed AT this time
             // matures at edge + output skew instead of waiting a full cycle.
             self.clocking_last_edge.insert(cb.clone(), self.time);
@@ -70543,6 +71052,7 @@ impl Simulator {
             }
             self.clocking_snapshots.insert(cb.clone(), snap);
         }
+        self.clocking_tick_cache = cache;
     }
 
     /// Resume the clocking-event waiters (`@(cb)` / `##N`) that fired this slot,
@@ -74217,6 +74727,16 @@ impl Simulator {
     fn lrm_self_width(&mut self, expr: &Expression) -> Option<u32> {
         match &expr.kind {
             ExprKind::Paren(i) => self.lrm_self_width(i),
+            ExprKind::SystemCall { name, args }
+                if super::bytecode::system_function_carries_arg(name) && !args.is_empty() =>
+            {
+                self.lrm_self_width(&args[0])
+            }
+            ExprKind::SystemCall { name, .. }
+                if super::bytecode::system_function_result(name).is_some() =>
+            {
+                super::bytecode::system_function_result(name).map(|(w, _)| w)
+            }
             ExprKind::Number(NumberLiteral::Integer { size: Some(sz), .. }) => Some(*sz),
             ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
@@ -74350,6 +74870,20 @@ impl Simulator {
             // running its calltf — twice, once here and once for the value.
             ExprKind::SystemCall { name, .. } if vpi_systf_is_func(name) => {
                 vpi_sysfunc_ret_width(name)
+            }
+            // A built-in system function's width comes from its LRM result
+            // type. Sizing it by EVALUATING (the fallback below) ran the
+            // call twice — `$urandom % n` advanced the generator twice and
+            // `$fgetc(fd) & mask` consumed two bytes.
+            ExprKind::SystemCall { name, args }
+                if super::bytecode::system_function_carries_arg(name) && !args.is_empty() =>
+            {
+                self.infer_width(&args[0])
+            }
+            ExprKind::SystemCall { name, .. }
+                if super::bytecode::system_function_result(name).is_some() =>
+            {
+                super::bytecode::system_function_result(name).map(|(w, _)| w).unwrap_or(32)
             }
             // Same for a user function: its width comes from its declared
             // return type, never from calling it. `f() + 1` used to call `f`
@@ -76028,7 +76562,7 @@ impl Simulator {
                 // A consumed slot may admit a parked bounded-put producer.
                 self.admit_mailbox_put_waiter(handle);
             }
-            if std::env::var("XEZIM_MBX_DBG").is_ok() {
+            if env_set_cached!("XEZIM_MBX_DBG") {
                 eprintln!(
                     "[MBX] t={} DRAIN deliver to pid={} is_peek={} handle={}",
                     self.time, pid, is_peek, handle
@@ -76045,13 +76579,13 @@ impl Simulator {
         v: Value,
         cont: ProcCont,
     ) {
-        if let Some(ctx) = self.process_contexts.get(&pid).cloned() {
-            let saved = self.snapshot_process_context();
+        if let Some(ctx) = self.process_contexts.remove(&pid) {
+            let saved = self.take_process_context();
             self.restore_process_context(ctx);
             let width = self.infer_lhs_width(lvalue);
             self.assign_value(lvalue, &v.resize(width));
-            self.process_contexts
-                .insert(pid, self.snapshot_process_context());
+            let ctx = self.take_process_context();
+            self.process_contexts.insert(pid, ctx);
             self.restore_process_context(saved);
         } else {
             let width = self.infer_lhs_width(lvalue);
@@ -77632,9 +78166,36 @@ impl Simulator {
         self.module.assoc_elem_widths.get(leaf).copied()
     }
 
+    /// Does `name` resolve to a signal under the active process scope
+    /// (`<hint>.<name>`, walking up parent scopes)?
+    fn scoped_signal_exists(&self, name: &str) -> bool {
+        let hint = self.name_resolve_hint.borrow();
+        let Some(mut scope) = hint.as_deref() else {
+            return false;
+        };
+        loop {
+            let scoped = format!("{}.{}", scope, name);
+            if self.signal_name_to_id.contains_key(scoped.as_str())
+                || self.signals.contains_key(&scoped)
+            {
+                return true;
+            }
+            match scope.rsplit_once('.') {
+                Some((parent, _)) => scope = parent,
+                None => return false,
+            }
+        }
+    }
+
     fn is_associative_array(&self, name: &str) -> bool {
         if self.module.associative_arrays.contains_key(name) {
             return true;
+        }
+        // Every remaining branch needs a `#` (scoped member) or a trailing
+        // `]` (nested element): one byte scan replaces up to three char
+        // searches, a second map probe and a `format!` on the hot path.
+        if !name.ends_with(']') && !name.as_bytes().contains(&b'#') {
+            return false;
         }
         // A per-specialization static-collection storage key
         // (`Class#spec::member`, e.g. `wrapper#e_t::map`) rewritten by
@@ -77733,7 +78294,7 @@ impl Simulator {
     /// the `name->id` index), so a nested assoc element (stored as
     /// `base[k1][k2]...`) is visible.
     fn signal_name_prefix_present(&self, prefix: &str) -> bool {
-        self.signals.keys().any(|k| k.starts_with(prefix))
+        self.signals.any_key_with_prefix(prefix)
             || !self.assoc_static_keys(prefix).is_empty()
     }
 
@@ -78824,15 +79385,13 @@ impl Simulator {
         // `special-:{ chars{}[0123456789] _` are legal assoc string keys,
         // §7.11) — take up to the LAST `]` so such brackets are not mistaken
         // for an index end.
-        let idx_keys = self.signals.keys_with_elem_prefix(&prefix);
         // The `signal_name_to_id` half of this enumeration is fixed for the
         // run (see `assoc_static_keys_cache`), so scan it once per prefix
         // instead of on every call.
         let static_keys = self.assoc_static_keys(&prefix);
-        let mut keys: Vec<String> = idx_keys
-            .iter()
-            .map(|k| k.as_str())
-            .filter(|k| k.starts_with(&prefix))
+        let mut keys: Vec<String> = self
+            .signals
+            .elem_keys_with_prefix(&prefix)
             .chain(static_keys.iter().map(|k| &**k))
             .filter_map(|k| {
                 let rest = &k[prefix.len()..];
@@ -80883,6 +81442,60 @@ impl Simulator {
     /// `assoc[<keyval>]`. The nested collection then lives under that name and
     /// reuses the ordinary queue/array machinery (`<base>.size`, `<base>[i]`).
     /// Declared index bounds of `name`, outermost dimension first.
+    /// Dimensions a constraint `foreach (a[v1, v2, ...])` iterates for its
+    /// `nvars` loop variables: the unpacked shape first, then the packed
+    /// dimensions, each normalised to (low, high); a dynamic/queue outer
+    /// dimension takes its current size. Fewer dimensions than variables
+    /// leaves the trailing variables unbound, as before.
+    /// Name of a constraint-foreach operand that `foreach_check_dims` can
+    /// iterate: unpacked arrays of any rank, queues/dynamic arrays,
+    /// associative arrays, and packed multi-dimensional variables.
+    fn foreach_check_operand_name(&mut self, expr: &Expression) -> Option<String> {
+        if let Some(n) = self.array_operand_name(expr) {
+            return Some(n);
+        }
+        let ExprKind::Ident(h) = &expr.kind else {
+            return None;
+        };
+        let mut nm = self.resolve_hier_name(h).into_owned();
+        if let Some(s) = self.instance_assoc_member(&nm) {
+            nm = s;
+        }
+        if self.module.arrays_2d.contains_key(&nm)
+            || self.module.arrays_nd.contains_key(&nm)
+            || self.is_associative_array(&nm)
+            || self.module.packed_full_dims.get(&nm).is_some_and(|d| !d.is_empty())
+        {
+            return Some(nm);
+        }
+        None
+    }
+
+    fn foreach_check_dims(&self, name: &str, nvars: usize) -> Vec<(i64, i64)> {
+        let mut dims: Vec<(i64, i64)> = match self.foreach_dims(name) {
+            Some(d) => d.into_iter().map(|(l, r)| (l.min(r), l.max(r))).collect(),
+            None if self.module.dynamic_arrays.contains(name) || self.is_associative_array(name) => {
+                vec![(0, self.get_queue_size(name) as i64 - 1)]
+            }
+            None => Vec::new(),
+        };
+        if self.module.dynamic_arrays.contains(name) && !dims.is_empty() {
+            dims[0] = (0, self.get_queue_size(name) as i64 - 1);
+        }
+        if dims.len() < nvars {
+            if let Some(pdims) = self.module.packed_full_dims.get(name) {
+                for &(l, r) in pdims.iter() {
+                    if dims.len() >= nvars {
+                        break;
+                    }
+                    dims.push((l.min(r), l.max(r)));
+                }
+            }
+        }
+        dims.truncate(nvars);
+        dims
+    }
+
     fn foreach_dims(&self, name: &str) -> Option<Vec<(i64, i64)>> {
         if let Some((shape, _)) = self.module.arrays_nd.get(name) {
             return Some(shape.clone());
@@ -81426,6 +82039,19 @@ impl Simulator {
                     ExprKind::Index { expr: b, .. } => b.as_ref(),
                     _ => array,
                 };
+                // A multi-dimensional operand (2-D/N-D unpacked array, packed
+                // multi-dimensional variable) is repaired element by element
+                // with every loop variable bound; the 1-D path below keeps
+                // its own solver.
+                if vars.len() >= 2 || self.array_operand_name(base).is_none() {
+                    if let Some(arr_name) = self.foreach_check_operand_name(base) {
+                        let dims = self.foreach_check_dims(&arr_name, vars.len());
+                        if dims.len() == vars.len() && !dims.is_empty() {
+                            self.solve_inline_foreach_multidim(item, base, vars, &dims);
+                            return;
+                        }
+                    }
+                }
                 if let Some(arr_name) = self.array_operand_name(base) {
                     // Index range: declared bounds for fixed arrays,
                     // 0..size-1 for queues / dynamic arrays.
@@ -81884,6 +82510,186 @@ impl Simulator {
     /// the interval only when the current value violates it, so
     /// cross-element relations (`arr[i] > arr[i-1]`) converge across the
     /// outer apply sweeps.
+    /// Per-element repair for a constraint `foreach (a[v1, v2, ...]) body`
+    /// over a multi-dimensional operand. For every index tuple the loop
+    /// variables are bound in a frame and each `Expr` item in the body is
+    /// applied to the element `a[v1][v2]...` (read and written through the
+    /// ordinary expression paths, so packed slices and unpacked elements
+    /// behave alike): relational operators narrow the element's range and
+    /// re-draw it inside; `elem == e` pins it; `$countones(x[...]) == elem`
+    /// (either way round) draws `x[...]` with exactly that many ones.
+    fn solve_inline_foreach_multidim(
+        &mut self,
+        body: &crate::ast::decl::ConstraintItem,
+        base: &Expression,
+        vars: &[Option<crate::ast::Identifier>],
+        dims: &[(i64, i64)],
+    ) {
+        use crate::ast::decl::ConstraintItem as CI;
+        use rand::Rng;
+        let names: Vec<Option<String>> =
+            vars.iter().map(|v| v.as_ref().map(|i| i.name.clone())).collect();
+        let items: Vec<&CI> = match body {
+            CI::Block(items) => items.iter().collect(),
+            other => vec![other],
+        };
+        let mut elem = base.clone();
+        for v in vars {
+            let Some(v) = v else { return };
+            let idx = Expression::new(
+                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                    root: None,
+                    path: vec![crate::ast::expr::HierPathSegment {
+                        name: v.clone(),
+                        selects: Vec::new(),
+                    }],
+                    span: crate::ast::Span::dummy(),
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                }),
+                crate::ast::Span::dummy(),
+            );
+            elem = Expression::new(
+                ExprKind::Index { expr: Box::new(elem), index: Box::new(idx) },
+                crate::ast::Span::dummy(),
+            );
+        }
+        let mut idx: Vec<i64> = dims.iter().map(|&(lo, _)| lo).collect();
+        if dims.iter().any(|&(lo, hi)| hi < lo) {
+            return;
+        }
+        loop {
+            let mut frame: HashMap<String, Value> = HashMap::default();
+            for (k, n) in names.iter().enumerate() {
+                if let Some(n) = n {
+                    frame.insert(n.clone(), Self::signed_loop_val(idx[k]));
+                }
+            }
+            self.push_local_frame(frame);
+            let cur = self.eval_expr(&elem);
+            let w = cur.width.max(1);
+            let (mut lo, mut hi): (i64, i64) =
+                (0, if w >= 63 { i64::MAX } else { (1i64 << w) - 1 });
+            let mut any_rel = false;
+            let mut pinned = false;
+            let mut popcount_targets: Vec<Expression> = Vec::new();
+            for it in &items {
+                let CI::Expr(e) = it else { continue };
+                let ExprKind::Binary { op, left, right } = &e.kind else { continue };
+                let on_l = Self::expr_same_ignoring_span(left, &elem);
+                let on_r = Self::expr_same_ignoring_span(right, &elem);
+                if on_l == on_r {
+                    continue;
+                }
+                let (other, eff) = if on_l {
+                    (right.as_ref(), *op)
+                } else {
+                    let m = match op {
+                        BinaryOp::Lt => BinaryOp::Gt,
+                        BinaryOp::Gt => BinaryOp::Lt,
+                        BinaryOp::Leq => BinaryOp::Geq,
+                        BinaryOp::Geq => BinaryOp::Leq,
+                        o => *o,
+                    };
+                    (left.as_ref(), m)
+                };
+                if let ExprKind::SystemCall { name, args } = &other.kind {
+                    if name == "$countones" && matches!(eff, BinaryOp::Eq) {
+                        if let Some(t) = args.first() {
+                            popcount_targets.push(t.clone());
+                        }
+                        continue;
+                    }
+                }
+                let b = self.eval_expr(other).to_i64().unwrap_or(0);
+                match eff {
+                    BinaryOp::Lt => {
+                        hi = hi.min(b.saturating_sub(1));
+                        any_rel = true;
+                    }
+                    BinaryOp::Leq => {
+                        hi = hi.min(b);
+                        any_rel = true;
+                    }
+                    BinaryOp::Gt => {
+                        lo = lo.max(b.saturating_add(1));
+                        any_rel = true;
+                    }
+                    BinaryOp::Geq => {
+                        lo = lo.max(b);
+                        any_rel = true;
+                    }
+                    BinaryOp::Eq => {
+                        let v = self.eval_expr(other).resize(w);
+                        let e2 = elem.clone();
+                        self.assign_value(&e2, &v);
+                        pinned = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !pinned && any_rel && lo <= hi {
+                let curv = cur.to_i64().unwrap_or(0);
+                if curv < lo || curv > hi {
+                    let p = if lo == hi { lo } else { self.cur_rng().gen_range(lo..=hi) };
+                    let e2 = elem.clone();
+                    self.assign_value(&e2, &Value::from_u64(p as u64, w));
+                }
+            }
+            if !popcount_targets.is_empty() {
+                let want = self.eval_expr(&elem).to_i64().unwrap_or(0).max(0) as usize;
+                for t in popcount_targets {
+                    let tw = self.eval_expr(&t).width.max(1) as usize;
+                    let ones = want.min(tw);
+                    let mut bits: Vec<usize> = (0..tw).collect();
+                    for i in (1..bits.len()).rev() {
+                        let j = self.cur_rng().gen_range(0..=i);
+                        bits.swap(i, j);
+                    }
+                    let mut v = Value::zero(tw as u32);
+                    for &b in &bits[..ones] {
+                        v.set_bit(b, LogicBit::One);
+                    }
+                    self.assign_value(&t, &v);
+                }
+            }
+            self.pop_local_frame();
+            let mut k = idx.len();
+            loop {
+                if k == 0 {
+                    return;
+                }
+                k -= 1;
+                if idx[k] < dims[k].1 {
+                    idx[k] += 1;
+                    break;
+                }
+                idx[k] = dims[k].0;
+            }
+        }
+    }
+
+    /// Structural equality of `Ident` / `Index` / `Paren` expression shapes,
+    /// ignoring source spans (a synthesized element expression never shares
+    /// the constraint's spans).
+    fn expr_same_ignoring_span(a: &Expression, b: &Expression) -> bool {
+        match (&a.kind, &b.kind) {
+            (ExprKind::Paren(x), _) => Self::expr_same_ignoring_span(x, b),
+            (_, ExprKind::Paren(y)) => Self::expr_same_ignoring_span(a, y),
+            (ExprKind::Ident(x), ExprKind::Ident(y)) => {
+                x.path.len() == y.path.len()
+                    && x.path.iter().zip(y.path.iter()).all(|(p, q)| {
+                        p.name.name == q.name.name && p.selects.is_empty() && q.selects.is_empty()
+                    })
+            }
+            (
+                ExprKind::Index { expr: xb, index: xi },
+                ExprKind::Index { expr: yb, index: yi },
+            ) => Self::expr_same_ignoring_span(xb, yb) && Self::expr_same_ignoring_span(xi, yi),
+            _ => false,
+        }
+    }
+
     fn solve_inline_foreach_elem(
         &mut self,
         item: &crate::ast::decl::ConstraintItem,
@@ -82206,20 +83012,34 @@ impl Simulator {
                     ExprKind::Index { expr: b, .. } => b.as_ref(),
                     _ => array,
                 };
-                let Some(arr_name) = self.array_operand_name(base) else {
+                // Any iterable shape, not only the 1-D unpacked arrays
+                // `array_operand_name` knows: a 2-D/N-D unpacked array and a
+                // packed multi-dimensional VARIABLE used to fall out here as
+                // "not an array" and the whole foreach passed vacuously.
+                let Some(arr_name) = self.foreach_check_operand_name(base) else {
                     return true;
                 };
-                let (lo, hi) = self
-                    .foreach_dims(&arr_name)
-                    .and_then(|d| d.first().copied())
-                    .unwrap_or_else(|| (0, self.get_queue_size(&arr_name) as i64 - 1));
-                let idx_var: Option<String> = vars
-                    .first()
-                    .and_then(|v| v.as_ref().map(|id| id.name.clone()));
-                for i in lo..=hi {
+                // Bind EVERY loop variable, over unpacked dimensions first
+                // and then the packed ones (§12.7.3). Binding only the first
+                // used to leave `j` in `d[i][j]` unbound (x) for a 2-D
+                // target, so the body compared against x and the constraint
+                // passed vacuously: `std::randomize(d) with { foreach
+                // (d[i, j]) d[i][j] < 100; }` returned 1 with every element 0.
+                let dims = self.foreach_check_dims(&arr_name, vars.len());
+                let idx_vars: Vec<Option<String>> = vars
+                    .iter()
+                    .map(|v| v.as_ref().map(|id| id.name.clone()))
+                    .collect();
+                let mut idx: Vec<i64> = dims.iter().map(|&(lo, _)| lo).collect();
+                if dims.iter().any(|&(lo, hi)| hi < lo) {
+                    return true;
+                }
+                loop {
                     let mut frame: HashMap<String, Value> = HashMap::default();
-                    if let Some(iv) = &idx_var {
-                        frame.insert(iv.clone(), Value::from_u64(i as u64, 32));
+                    for (k, iv) in idx_vars.iter().enumerate() {
+                        if let (Some(iv), Some(&i)) = (iv, idx.get(k)) {
+                            frame.insert(iv.clone(), Self::signed_loop_val(i));
+                        }
                     }
                     self.push_local_frame(frame);
                     let ok = self.check_constraint_item_impl(body);
@@ -82227,8 +83047,20 @@ impl Simulator {
                     if !ok {
                         return false;
                     }
+                    // odometer advance over the bound dimensions
+                    let mut k = idx.len();
+                    loop {
+                        if k == 0 {
+                            return true;
+                        }
+                        k -= 1;
+                        if idx[k] < dims[k].1 {
+                            idx[k] += 1;
+                            break;
+                        }
+                        idx[k] = dims[k].0;
+                    }
                 }
-                true
             }
             // Recurse so nested foreach items get the per-element check.
             CI::Block(items) => {
@@ -83339,24 +84171,24 @@ impl Simulator {
 
     /// §3.14.2 / §20.4 — the timescale a module REPORTS via `$printtimescale`.
     /// A module with no `timescale directive (and none preceding it in
-    /// compilation order, so it is absent from `module_timescale_exp`) reports
-    /// the IEEE default `1s / 1s` — NOT the global/top-module unit that drives
-    /// `$time` scaling. This keeps xezim's pragmatic 1 ns simulation default for
-    /// delays while matching a reference simulator's printed timescale (a
-    /// directive-less module must not display another module's timescale).
+    /// compilation order) runs on the tool default `1ns / 1ns` for both delays
+    /// and `$time`/`$realtime`; elaboration records that default in
+    /// `module_timescale_exp`, so the fallback here only covers definitions the
+    /// map never saw. A directive-less module must not display another
+    /// module's timescale.
     fn reported_timescale_exp(&self, def: &str) -> (i32, i32) {
         self.module
             .module_timescale_exp
             .get(def)
             .copied()
-            .unwrap_or((0, 0))
+            .unwrap_or((-9, -9))
     }
 
     /// `--dump-timescales`: print every module definition's timescale before the
     /// run. Shows the REPORTED unit/precision (`$printtimescale` semantics: an
-    /// explicit/inherited `timescale, or the 1s/1s default when a module has
-    /// none — flagged, since such a module's effective delay unit collapses to
-    /// the global tick). No source `$printtimescale` calls are needed.
+    /// explicit/inherited `timescale, or the 1ns/1ns tool default when a
+    /// module has none — flagged, so a mixed design shows which modules count
+    /// nanoseconds by default). No source `$printtimescale` calls are needed.
     fn dump_module_timescales(&self) {
         // Every module definition reachable in the design: the top plus every
         // instantiated def_name (deduplicated, sorted for stable output).
@@ -83372,11 +84204,11 @@ impl Simulator {
         println!("=== module timescales ({} modules) ===", defs.len());
         for d in &defs {
             let (u, p) = self.reported_timescale_exp(d);
-            let has_ts = self.module.module_timescale_exp.contains_key(d);
-            let note = if has_ts {
-                ""
+            let defaulted = self.module.modules_without_timescale.iter().any(|m| m == d);
+            let note = if defaulted {
+                "   (no `timescale — 1ns/1ns default)"
             } else {
-                "   (no `timescale — 1s/1s default)"
+                ""
             };
             println!(
                 "  {:<28} {} / {}{}",
@@ -84421,9 +85253,12 @@ impl Simulator {
         // Member of `this` (the current object) — IEEE 1800-2023 §8.14:
         // inside a class method, properties of `this` take precedence over
         // outer / unrelated procedural locals in `var_class_types`.
+        // Borrow the instance's class name (no heap allocation per lookup)
+        // so the probe in `class_prop_type_named` stays cheap on hot
+        // class-method paths.
         if let Some(h) = self.this_stack.last().copied().flatten() {
-            if let Some(cls) = self.heap.get(h).and_then(|o| o.as_ref()).map(|i| i.class_name.clone()) {
-                if let Some(tn) = self.class_prop_type_named(&cls, vname) {
+            if let Some(inst) = self.heap.get(h).and_then(|o| o.as_ref()) {
+                if let Some(tn) = self.class_prop_type_named(&inst.class_name, vname) {
                     if self.module.classes.contains_key(&tn) || tn.contains('#') {
                         return Some(tn);
                     }
@@ -84512,11 +85347,18 @@ impl Simulator {
 
     /// Follow a typedef chain to the underlying type.
     fn resolve_dt(&self, dt: &DataType) -> DataType {
-        let mut cur = dt.clone();
+        self.resolve_dt_ref(dt).clone()
+    }
+
+    /// `resolve_dt` as a borrow: the result is either `dt` itself or an entry
+    /// of the typedef table, so read-only callers (type predicates, `matches!`)
+    /// need no clone.
+    fn resolve_dt_ref<'a>(&'a self, dt: &'a DataType) -> &'a DataType {
+        let mut cur = dt;
         for _ in 0..16 {
-            if let DataType::TypeReference { name, .. } = &cur {
+            if let DataType::TypeReference { name, .. } = cur {
                 if let Some(next) = self.module.typedef_types.get(&name.name.name) {
-                    cur = next.clone();
+                    cur = next;
                     continue;
                 }
             }
@@ -87496,11 +88338,21 @@ impl Simulator {
     /// Element type recorded for `name`, or derived from its base when `name`
     /// is a flattened sub-path (`q[i]`, which has no declaration of its own).
     fn p_elem_type(&self, name: &str) -> Option<DataType> {
+        self.p_elem_type_ref(name).map(std::borrow::Cow::into_owned)
+    }
+
+    /// `p_elem_type` without the clone: the declared type is borrowed from the
+    /// design's type tables whenever it lives there (the common case), and
+    /// only the flat-path fallback materialises an owned value. The blocking
+    /// assignment path consults this on every write purely as a predicate,
+    /// which used to clone a `DataType` (and drop it) per assignment.
+    fn p_elem_type_ref(&self, name: &str) -> Option<std::borrow::Cow<'_, DataType>> {
+        use std::borrow::Cow;
         self.module
             .var_decl_types
             .get(name)
-            .cloned()
-            .or_else(|| self.flat_path_type(name).map(|(d, _)| d))
+            .map(Cow::Borrowed)
+            .or_else(|| self.flat_path_type(name).map(|(d, _)| Cow::Owned(d)))
             .or_else(|| {
                 // An ELEMENT (`arr[2]`) carries no type of its own, but
                 // `var_decl_types` holds the container's ELEMENT type — so the
@@ -87513,7 +88365,7 @@ impl Simulator {
                 if base.is_empty() {
                     return None;
                 }
-                self.module.var_decl_types.get(base).cloned()
+                self.module.var_decl_types.get(base).map(Cow::Borrowed)
             })
     }
 
@@ -88334,17 +89186,50 @@ impl Simulator {
                     }
                 }
             }
+            // A multi-dimensional unpacked array (`u7_t e[5][2]`) is not in
+            // `arrays` (1-D) and was never drawn at all; draw every element
+            // by its flat name.
+            if let ExprKind::Ident(h) = &a.kind {
+                if h.path.iter().all(|s| s.selects.is_empty()) {
+                    let nm = self.resolve_hier_name(h).into_owned();
+                    let shape: Option<(Vec<(i64, i64)>, u32)> =
+                        if let Some((sh, w)) = self.module.arrays_nd.get(&nm) {
+                            Some((sh.clone(), *w))
+                        } else if let Some(&(d1, d2, w)) = self.module.arrays_2d.get(&nm) {
+                            Some((vec![d1, d2], w))
+                        } else {
+                            None
+                        };
+                    if let Some((shape, w)) = shape {
+                        let w = w.max(1);
+                        let mut suffixes: Vec<String> = vec![String::new()];
+                        for &(lo, hi) in &shape {
+                            let (lo, hi) = (lo.min(hi), lo.max(hi));
+                            let mut next = Vec::new();
+                            for sfx in &suffixes {
+                                for k in lo..=hi {
+                                    next.push(format!("{}[{}]", sfx, k));
+                                }
+                            }
+                            suffixes = next;
+                        }
+                        for sfx in suffixes {
+                            let rv = self.random_value_of_width(w);
+                            self.set_signal_value_by_name(&format!("{}{}", nm, sfx), rv);
+                        }
+                        continue;
+                    }
+                }
+            }
             let w = self.infer_lhs_width(a).max(1);
-            let rv = if w <= 64 {
-                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                Value::from_u64(self.cur_rng().r#gen::<u64>() & mask, w)
-            } else {
-                Value::zero(w)
-            };
+            // A packed target wider than 64 bits (`u7_t [4:0][1:0] d` is 70
+            // bits) used to be "drawn" as all zeros; draw every bit.
+            let rv = self.random_value_of_width(w);
             self.assign_value(a, &rv);
         }
         Value::from_u64(1, 32)
     }
+
 
     /// Evaluate an array reduction (`sum`/`product`/`min`/`max`/`and`/`or`/`xor`)
     /// with a `with (item...)` expression, binding `item` to each element.
@@ -89461,8 +90346,16 @@ impl Simulator {
         // rewrite the bare member name to the spec-aware storage key so each
         // specialization gets its own element/size cells. No-op for instance
         // methods and non-static/non-collection names.
+        if env_set_cached!("XEZIM_BM_CENSUS") {
+            eprintln!(
+                "[bm] {} {} this={}",
+                obj_name,
+                mname,
+                self.this_stack.last().copied().flatten().is_some()
+            );
+        }
         let _resolved = self.spec_static_coll_key(obj_name);
-        let obj_name = _resolved.as_str();
+        let obj_name: &str = &_resolved;
         // §8.10: inside a class method, a MEMBER collection shadows any
         // same-named module/package-scope collection. Several callers gate
         // on the bare name being registered globally before trying the
@@ -89472,9 +90365,10 @@ impl Simulator {
         // elements (backdoor hdl paths came back empty). Rewrite centrally:
         // bare name + declared by the current class + not a true local.
         let _inst_scoped;
-        let obj_name = if !obj_name.contains('#')
-            && !obj_name.contains('.')
-            && !obj_name.contains('[')
+        let obj_name = if !obj_name
+            .as_bytes()
+            .iter()
+            .any(|&b| matches!(b, b'#' | b'.' | b'['))
         {
             // §8.10 precedence for a BARE receiver — see
             // `bare_receiver_is_class_handle`.
@@ -90108,10 +91002,8 @@ impl Simulator {
                     // under `<assoc>[<key>].size` / `<assoc>[<key>][i]`.
                     || self.signals.contains_key(&format!("{}.size", elem_name))
                     || self.module.dynamic_arrays.contains(&elem_name)
-                    || self
-                        .signals
-                        .keys()
-                        .any(|k| k.starts_with(&nested_prefix) || k.starts_with(&member_prefix));
+                    || self.signals.any_key_with_prefix(&nested_prefix)
+                    || self.signals.any_key_with_prefix(&member_prefix);
                 return Some(Value::from_u64(found as u64, 1));
             }
         }
@@ -90724,7 +91616,7 @@ impl Simulator {
     /// non-collection / non-static names are returned unchanged. Applied
     /// centrally in `eval_builtin_method` so every builtin
     /// (push_back/size/pop_front/...) keys off the same spec-aware name.
-    fn spec_static_coll_key(&self, name: &str) -> String {
+    fn spec_static_coll_key<'n>(&self, name: &'n str) -> std::borrow::Cow<'n, str> {
         let this_h = self
             .this_stack
             .last()
@@ -90735,10 +91627,10 @@ impl Simulator {
         // (`<handle>#name`), not static. A static method carries a ZERO
         // `this` handle, so filter that out.
         if this_h.is_some() {
-            return name.to_string();
+            return std::borrow::Cow::Borrowed(name);
         }
         let Some(Some(ctx)) = self.class_context_stack.last().cloned() else {
-            return name.to_string();
+            return std::borrow::Cow::Borrowed(name);
         };
         // Walk ctx's inheritance chain for a STATIC collection property.
         // Static collections are registered in `static_collections`
@@ -90759,7 +91651,7 @@ impl Simulator {
                         // storage and break the many bare-name accessors
                         // (including the UVM phase machinery).
                         if key.contains('#') || self.static_coll_name_collides(name) {
-                            return key;
+                            return std::borrow::Cow::Owned(key);
                         }
                     }
                 }
@@ -90768,7 +91660,7 @@ impl Simulator {
                 break;
             }
         }
-        name.to_string()
+        std::borrow::Cow::Borrowed(name)
     }
 
     /// Walk the class hierarchy from `start_class` and return the
@@ -91443,11 +92335,29 @@ impl Simulator {
                             }
                         }
                     }
+                    // A subroutine LOCAL `virtual ifc lv;` (the top frame owns
+                    // the name) binds in the frame's alias map, which travels
+                    // with the process context across a park. The global map
+                    // is keyed by the bare name only: two class tasks each
+                    // holding a local `lv` bound to different interfaces and
+                    // interleaved on delays saw each other's binding (a1's
+                    // `lv.id` read a2's interface after a2's task had run).
+                    let frame_local = self
+                        .local_stack
+                        .last()
+                        .is_some_and(|f| f.contains_key(name))
+                        && !self.local_iface_aliases.is_empty();
                     if matches!(&rvalue.kind, ExprKind::Null) {
                         // Clear the alias, then FALL THROUGH so the normal
                         // value path stores the null handle — keeping a
                         // later `vif == null` true.
-                        self.viface_var_aliases.remove(name);
+                        if frame_local {
+                            if let Some(f) = self.local_iface_aliases.last_mut() {
+                                f.remove(name);
+                            }
+                        } else {
+                            self.viface_var_aliases.remove(name);
+                        }
                     } else if matches!(&rvalue.kind, ExprKind::Call { .. }) {
                         // `vd = mgr.get_vif();` — run the call; the callee's
                         // return recorded the bound instance (see the Return
@@ -91456,7 +92366,13 @@ impl Simulator {
                         self.last_vif_return = None;
                         let v = self.eval_expr(rvalue);
                         if let Some(bound) = self.last_vif_return.take() {
-                            self.viface_var_aliases.insert(name.to_string(), bound);
+                            if frame_local {
+                                if let Some(f) = self.local_iface_aliases.last_mut() {
+                                    f.insert(name.to_string(), bound);
+                                }
+                            } else {
+                                self.viface_var_aliases.insert(name.to_string(), bound);
+                            }
                         }
                         self.assign_value(lvalue, &v);
                         return true;
@@ -91473,7 +92389,13 @@ impl Simulator {
                                 hsh ^= b as u64;
                                 hsh = hsh.wrapping_mul(0x100000001b3);
                             }
-                            self.viface_var_aliases.insert(name, bound);
+                            if frame_local {
+                                if let Some(f) = self.local_iface_aliases.last_mut() {
+                                    f.insert(name.clone(), bound);
+                                }
+                            } else {
+                                self.viface_var_aliases.insert(name, bound);
+                            }
                             self.assign_value(
                                 lvalue,
                                 &Value::from_u64((hsh & 0x7FFF_FFFF) | 1, 32),
@@ -92920,7 +93842,7 @@ impl Simulator {
             // the per-spec key builtins use ─ so `m[k]=v` stored its value
             // where the later `m[k]`/`exists` never looked (and vice-versa).
             if self.collection_is_static_in(&ctx, name) {
-                return Some(self.spec_static_coll_key(name));
+                return Some(self.spec_static_coll_key(name).into_owned());
             }
             return self.static_fixed_key_in(&ctx, name);
         };
@@ -93483,9 +94405,37 @@ impl Simulator {
         }
     }
 
+    /// True when `e` is built only from literals, plain names, and
+    /// arithmetic — the shapes the elaboration-time constant folder can
+    /// settle without any per-call setup. A call, system call, `$bits(type)`,
+    /// or member access is left to the runtime paths: for those the folder
+    /// clones the whole function table (or typedef table) into a throwaway
+    /// elaboration shell on every attempt, and at runtime the attempt almost
+    /// always fails anyway (the function needs `this` or a live argument).
+    /// On the axi4 UVM base test that throwaway was 6.5 % of all samples.
+    fn const_fold_shape(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(_) => true,
+            ExprKind::Ident(h) => h.path.iter().all(|s| s.selects.is_empty()),
+            ExprKind::Unary { operand, .. } => Self::const_fold_shape(operand),
+            ExprKind::Paren(inner) => Self::const_fold_shape(inner),
+            ExprKind::Binary { left, right, .. } => {
+                Self::const_fold_shape(left) && Self::const_fold_shape(right)
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                Self::const_fold_shape(condition)
+                    && Self::const_fold_shape(then_expr)
+                    && Self::const_fold_shape(else_expr)
+            }
+            _ => false,
+        }
+    }
+
     fn eval_scalar_self(&self, e: &Expression) -> Option<i64> {
-        if let Some(v) = super::elaborate::const_eval_i64_with_params(e, None) {
-            return Some(v);
+        if Self::const_fold_shape(e) {
+            if let Some(v) = super::elaborate::const_eval_i64_with_params(e, None) {
+                return Some(v);
+            }
         }
         if let ExprKind::Ident(h) = &e.kind {
             if h.path.len() == 1 {
@@ -96517,7 +97467,7 @@ impl Simulator {
                                 Some(_) => self.eval_expr(&args[0]).to_sv_string(),
                                 None => String::new(),
                             };
-                            Value::from_u64(self.test_plusarg(&pat) as u64, 1)
+                            Value::from_u64(self.test_plusarg(&pat) as u64, 32)
                         }
                         "$value$plusargs" => self.eval_value_plusargs(args),
                         "$fopen" => self.open_file_handle(args),
@@ -106000,7 +106950,23 @@ impl Simulator {
                     } else if *width <= 64 {
                         Value::from_u64(self.rng.r#gen(), *width)
                     } else {
-                        Value::zero(*width)
+                        // A `rand` property wider than 64 bits (a packed
+                        // multi-dimensional array such as `u7_t [4:0][1:0]`)
+                        // was "drawn" as all zeros; draw every bit, from the
+                        // same stream this loop already uses.
+                        let mut acc = Value::zero(*width);
+                        let mut bit = 0u32;
+                        while bit < *width {
+                            let chunk: u64 = self.rng.r#gen();
+                            let n = (*width - bit).min(64);
+                            for k in 0..n {
+                                if (chunk >> k) & 1 == 1 {
+                                    acc.set_bit((bit + k) as usize, LogicBit::One);
+                                }
+                            }
+                            bit += n;
+                        }
+                        acc
                     };
                     if let Some(Some(inst)) = self.heap.get_mut(handle) {
                         inst.properties.insert(name.clone(), v);
@@ -106847,30 +107813,6 @@ impl Simulator {
             // constrained value; sizing it earlier yields the scalar's raw,
             // unconstrained draw and the `.size() == m.length` acceptance then
             // fails. `unique {}` runs last over the settled elements.
-            let mut pinned_elems: HashSet<String> = HashSet::default();
-            if !rand_colls.is_empty() {
-                self.solve_array_sizes(&rand_colls, &constraints);
-                // Fresh random baseline for every element of a dynamic /
-                // associative member (fixed arrays keep the legacy pool pass).
-                // §18.4.1: a CLASS-element collection (`rand obj arr[]`) holds
-                // object handles that are randomized RECURSIVELY — never drawn
-                // as scalars, or the handle is overwritten with junk.
-                for c in &rand_colls {
-                    if c.kind == CollKind::Fixed || c.is_object_elem {
-                        continue;
-                    }
-                    for key in self.coll_elem_keys(c) {
-                        let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
-                        let v = self.draw_elem(c.width, prev);
-                        self.write_coll_elem(&key, v);
-                    }
-                }
-                self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
-                self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
-                for c in &unique_colls {
-                    self.enforce_unique_coll(c, &constraints, &pinned_elems);
-                }
-            }
 
             // Push rand SCALAR enum fields off any reserved value implied by
             // `!(field inside {…})` / `field != X` exclusions. Iterated so
@@ -106929,102 +107871,11 @@ impl Simulator {
             }
 
             // Randomize rand fixed-array elements now that the scalar fields
-            // their exclusions reference (sp/tp/scratch_reg) are solved. For
-            // Collect array names that have a *positive* foreach constraint
-            // (`foreach (arr[i]) arr[i] inside {…}`); the rand_array loop
-            // would otherwise overwrite the per-index slices solve_forced
-            // wrote. Those arrays are still seeded by the later second
-            // solve_forced pass.
-            let foreach_constrained_arrays: HashSet<String> = {
-                let mut set = HashSet::default();
-                // Only a POSITIVE `arr[i] inside {…}` body is something
-                // solve_forced_array_elem can solve — only those arrays must
-                // be left to it. A negated-only body (`!(arr[i] inside {…})`,
-                // riscv-dv's gpr_c) is exclusion-shaped: the rand_array pool
-                // pass below handles it via collect_array_exclusions (and
-                // picks distinct elements), so such arrays must NOT be
-                // skipped here — skipping left gpr[0] free to keep ZERO and
-                // emit an illegal `la x0, _start`.
-                fn has_positive_inside(item: &ConstraintItem) -> bool {
-                    match item {
-                        ConstraintItem::Expr(e) => match &e.kind {
-                            ExprKind::Inside { .. } => true,
-                            // §18.5.7: equality / relational element bodies
-                            // (`arr[i] == i + 5`, `arr[i] < K`) are also
-                            // solved per-index by solve_forced_array_elem,
-                            // so the pool pass must not re-seed them either.
-                            // Exactly ONE side must be an element ref —
-                            // cross-element relations (`arr[i] < arr[i+1]`)
-                            // are not solved there and keep pool seeding.
-                            ExprKind::Binary { op, left, right } => {
-                                let li = matches!(&left.kind, ExprKind::Index { .. });
-                                let ri = matches!(&right.kind, ExprKind::Index { .. });
-                                matches!(
-                                    op,
-                                    BinaryOp::Eq
-                                        | BinaryOp::Lt
-                                        | BinaryOp::Leq
-                                        | BinaryOp::Gt
-                                        | BinaryOp::Geq
-                                ) && (li != ri)
-                            }
-                            _ => false,
-                        },
-                        ConstraintItem::Inside { .. } => true,
-                        ConstraintItem::Block(items) => items.iter().any(has_positive_inside),
-                        ConstraintItem::Soft(inner) => has_positive_inside(inner),
-                        _ => false,
-                    }
-                }
-                fn walk(item: &ConstraintItem, out: &mut HashSet<String>) {
-                    if let ConstraintItem::Foreach {
-                        array, item: body, ..
-                    } = item
-                    {
-                        // Only skip the pool pass for arrays whose foreach body
-                        // has a POSITIVE `inside` (what solve_forced_array_elem
-                        // can solve); negated-only bodies are exclusion-shaped
-                        // and belong to the pool pass.
-                        if !has_positive_inside(body.as_ref()) {
-                            return;
-                        }
-                        let inner_h = match &array.kind {
-                            ExprKind::Index { expr: b, .. } => match &b.kind {
-                                ExprKind::Ident(h) => Some(h),
-                                _ => None,
-                            },
-                            ExprKind::Ident(h) => Some(h),
-                            _ => None,
-                        };
-                        if let Some(h) = inner_h {
-                            if !h.path.is_empty() {
-                                out.insert(h.path[0].name.name.clone());
-                            }
-                        }
-                    }
-                    if let ConstraintItem::Block(items) = item {
-                        for it in items {
-                            walk(it, out);
-                        }
-                    }
-                    if let ConstraintItem::Soft(inner) = item {
-                        walk(inner, out);
-                    }
-                }
-                for con in &constraints {
-                    for item in &con.items {
-                        walk(item, &mut set);
-                    }
-                }
-                set
-            };
+            // their exclusions reference (sp/tp/scratch_reg) are solved.
             // each element pick a valid enum member outside the array's
             // `foreach !(elem inside {…})` exclusion, distinct across the array
             // (best-effort `unique{}`).
             for (prop, scoped, lo, hi, width, enum_t) in &rand_arrays {
-                if foreach_constrained_arrays.contains(prop) {
-                    continue; // solve_forced will handle this in the next pass
-                }
                 let excluded = self.collect_array_exclusions(prop, &constraints);
                 let pool: Vec<u64> = if let Some(et) = enum_t {
                     self.module
@@ -107060,8 +107911,12 @@ impl Simulator {
                     } else {
                         0
                     };
-                    self.signals
-                        .insert(format!("{}[{}]", scoped, i), Value::from_u64(v, *width));
+                    let val = if !pool.is_empty() || *width <= 64 {
+                        Value::from_u64(v, *width)
+                    } else {
+                        self.random_value_of_width(*width)
+                    };
+                    self.signals.insert(format!("{}[{}]", scoped, i), val);
                 }
             }
 
@@ -107069,9 +107924,6 @@ impl Simulator {
             // shape, unless a positive foreach body owns the array (same
             // skip-set as the 1-D pool pass above).
             for (prop, scoped, shape, width) in &rand_nd_arrays {
-                if foreach_constrained_arrays.contains(prop) {
-                    continue; // solve_forced will handle this in the next pass
-                }
                 if shape.iter().any(|&(lo, hi)| hi < lo) {
                     continue;
                 }
@@ -107089,8 +107941,13 @@ impl Simulator {
                     } else {
                         0
                     };
-                    self.signals
-                        .insert(format!("{}{}", scoped, suffix), Value::from_u64(v, *width));
+                    // Elements wider than 64 bits were left at zero.
+                    let val = if *width <= 64 {
+                        Value::from_u64(v, *width)
+                    } else {
+                        self.random_value_of_width(*width)
+                    };
+                    self.signals.insert(format!("{}{}", scoped, suffix), val);
                     let mut k = shape.len();
                     loop {
                         if k == 0 {
@@ -107117,6 +107974,63 @@ impl Simulator {
             // multi-expression `unique {a, b, arr[0:2]}` desugars to (each `!=`
             // re-pick respects its target's declared range, so this cannot
             // knock a scalar out of its `inside` set).
+            // The array draws above run AFTER the first repair pass and
+            // overwrite whatever it wrote into array elements (`a[0] == 5`,
+            // foreach bodies). Arrays under a foreach used to be skipped
+            // instead, which left them undrawn: a zero that already satisfied
+            // `e[i] < 100` was kept, and repeated randomize() calls returned
+            // the same values. Draw everything, then repair the hard items and
+            // the foreach items once more against the fresh draws.
+            {
+                fn has_foreach(item: &ConstraintItem) -> bool {
+                    match item {
+                        ConstraintItem::Foreach { .. } => true,
+                        ConstraintItem::Block(items) => items.iter().any(has_foreach),
+                        ConstraintItem::Soft(inner) => has_foreach(inner),
+                        _ => false,
+                    }
+                }
+                for _pass in 0..4 {
+                    let mut changed = false;
+                    for item in constraints
+                        .iter()
+                        .flat_map(|c| c.items.iter())
+                        .chain(inline.iter())
+                        .filter(|it| !matches!(it, ConstraintItem::Soft(_)) || has_foreach(it))
+                    {
+                        if self.solve_forced(handle, item, &rand_set) {
+                            changed = true;
+                        }
+                    }
+                    if !changed {
+                        break;
+                    }
+                }
+            }
+            let mut pinned_elems: HashSet<String> = HashSet::default();
+            if !rand_colls.is_empty() {
+                self.solve_array_sizes(&rand_colls, &constraints);
+                // Fresh random baseline for every element of a dynamic /
+                // associative member (fixed arrays keep the legacy pool pass).
+                // §18.4.1: a CLASS-element collection (`rand obj arr[]`) holds
+                // object handles that are randomized RECURSIVELY — never drawn
+                // as scalars, or the handle is overwritten with junk.
+                for c in &rand_colls {
+                    if c.kind == CollKind::Fixed || c.is_object_elem {
+                        continue;
+                    }
+                    for key in self.coll_elem_keys(c) {
+                        let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
+                        let v = self.draw_elem(c.width, prev);
+                        self.write_coll_elem(&key, v);
+                    }
+                }
+                self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
+                self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
+                for c in &unique_colls {
+                    self.enforce_unique_coll(c, &constraints, &pinned_elems);
+                }
+            }
             {
                 fn collect_unique_items<'a>(
                     item: &'a ConstraintItem,
@@ -108985,7 +109899,10 @@ impl Simulator {
                 // `foreach (m[i,j])` constraint found no range and was dropped
                 // silently — randomize() still returned 1 and every element
                 // came out unconstrained.
-                let Some((dims, elem_w)) = self.fixed_foreach_dims(handle, &arr_name) else {
+                let Some((dims, elem_w)) = self
+                    .fixed_foreach_dims(handle, &arr_name)
+                    .or_else(|| self.packed_prop_foreach_dims(handle, &arr_name))
+                else {
                     return false;
                 };
                 // One loop variable per leading dimension (§12.7.3).
@@ -109234,9 +110151,8 @@ impl Simulator {
                 let elem_name = format!("{}{}", arr_name, idx);
                 // A CLASS array element lives under the instance-scoped key;
                 // the bare name only exists for a module-level array.
-                let scoped_key = format!("{}#{}{}", handle, arr_name, idx);
                 let cur = self
-                    .get_signal_value_by_name(&scoped_key)
+                    .class_elem_load(handle, arr_name, idx)
                     .or_else(|| self.get_signal_value_by_name(&elem_name))
                     .unwrap_or_else(|| Value::zero(32));
                 if self.value_in_ranges(&cur, range) {
@@ -109244,7 +110160,7 @@ impl Simulator {
                 }
                 let width = cur.width.max(32);
                 if let Some(picked) = self.pick_from_ranges(range, width, cur.is_signed) {
-                    self.signals.insert(scoped_key, picked.clone());
+                    self.class_elem_store(handle, arr_name, idx, picked.clone());
                     self.set_signal_value_by_name(&elem_name, picked.clone());
                     return true;
                 }
@@ -109283,8 +110199,7 @@ impl Simulator {
                     if let Some(picked) = self.pick_from_ranges(&cr, width, cur.is_signed) {
                         // Write to the scoped per-element key (`<handle>#arr[i]`)
                         // — the place exec_randomize wrote the random baseline.
-                        let scoped_key = format!("{}#{}{}", handle, arr_name, idx);
-                        self.signals.insert(scoped_key, picked.clone());
+                        self.class_elem_store(handle, arr_name, idx, picked.clone());
                         // Also try the unscoped form for module-level arrays.
                         self.set_signal_value_by_name(&elem_name, picked);
                         return true;
@@ -109337,13 +110252,12 @@ impl Simulator {
                         (left, m)
                     };
                     let elem_name = format!("{}{}", arr_name, idx);
-                    let scoped_key = format!("{}#{}{}", handle, arr_name, idx);
                     let cur = self
                         .get_signal_value_by_name(&elem_name)
-                        .or_else(|| self.signals.get(&scoped_key).cloned());
+                        .or_else(|| self.class_elem_load(handle, arr_name, idx));
                     let w = cur.as_ref().map(|v| v.width).unwrap_or(32).max(1);
                     let write_elem = |s: &mut Self, v: Value| {
-                        s.signals.insert(scoped_key.clone(), v.clone());
+                        s.class_elem_store(handle, arr_name, idx, v.clone());
                         s.set_signal_value_by_name(&elem_name, v);
                     };
                     match eff {
@@ -109471,6 +110385,66 @@ impl Simulator {
     /// The FIXED shape of a class rand array member, walking the inheritance
     /// chain: 1-D from `array_properties`, N-D from `array_nd_properties`.
     /// Returns (per-dimension bounds, element width).
+    /// foreach geometry of a packed multi-dimensional class property
+    /// (`bit [6:0] [4:0][1:0] d`): the packed dims normalised to (lo, hi)
+    /// and the width of one addressed element.
+    fn packed_prop_foreach_dims(
+        &self,
+        handle: usize,
+        arr_name: &str,
+    ) -> Option<(Vec<(i64, i64)>, u32)> {
+        let pd = self.class_prop_packed_dims(handle, arr_name)?;
+        let total = self.read_member_value(handle, arr_name)?.width as u64;
+        let ew = Self::packed_chain_width(total, &pd, pd.len()) as u32;
+        Some((pd.iter().map(|&(l, r)| (l.min(r), l.max(r))).collect(), ew))
+    }
+
+    fn parse_idx_suffix(idx: &str) -> Option<Vec<Value>> {
+        let mut out = Vec::new();
+        for part in idx.split('[').skip(1) {
+            let n: i64 = part.strip_suffix(']')?.trim().parse().ok()?;
+            out.push(Value::from_u64(n as u64, 32));
+        }
+        Some(out)
+    }
+
+    /// Read one element of a class array property addressed by an index
+    /// suffix (`[1][0]`): the per-element `<handle>#arr[1][0]` signal for
+    /// unpacked arrays, a bit slice of the property for packed ones.
+    fn class_elem_load(&self, handle: usize, arr_name: &str, idx: &str) -> Option<Value> {
+        if let Some(dims) = self.class_prop_packed_dims(handle, arr_name) {
+            let base = self.read_member_value(handle, arr_name)?;
+            let iv = Self::parse_idx_suffix(idx)?;
+            let (lsb, w) = Self::packed_chain_slice(base.width as u64, &dims, &iv)?;
+            return Some(base.range_select((lsb + w - 1) as usize, lsb as usize));
+        }
+        self.get_signal_value_by_name(&format!("{}#{}{}", handle, arr_name, idx))
+    }
+
+    fn class_elem_store(&mut self, handle: usize, arr_name: &str, idx: &str, v: Value) {
+        if let Some(dims) = self.class_prop_packed_dims(handle, arr_name) {
+            let (Some(cur), Some(iv)) = (
+                self.read_member_value(handle, arr_name),
+                Self::parse_idx_suffix(idx),
+            ) else {
+                return;
+            };
+            let Some((lsb, w)) = Self::packed_chain_slice(cur.width as u64, &dims, &iv) else {
+                return;
+            };
+            let piece = v.resize(w as u32);
+            let mut nv = cur;
+            for i in 0..(w as usize) {
+                nv.set_bit(lsb as usize + i, piece.get_bit(i));
+            }
+            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                inst.properties.insert(arr_name.to_string(), nv);
+            }
+            return;
+        }
+        self.signals.insert(format!("{}#{}{}", handle, arr_name, idx), v);
+    }
+
     fn fixed_foreach_dims(
         &self,
         handle: usize,
@@ -110543,7 +111517,7 @@ impl Simulator {
                 // whole-value `output_bindings` path (see exec_function_call).
                 let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
                 for (i, port) in ports.iter().enumerate() {
-                    if matches!(self.resolve_dt(&port.data_type), DataType::Struct(_)) {
+                    if matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_)) {
                         self.register_formal_type_metadata(
                             &port.name.name,
                             &port.data_type,

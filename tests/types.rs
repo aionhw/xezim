@@ -362,3 +362,7 @@ mod ref_formal_element_write;
 mod multi_dim_unpacked_arrays;
 #[path = "types/real_to_integral_local.rs"]
 mod real_to_integral_local;
+#[path = "types/system_function_result_width.rs"]
+mod system_function_result_width;
+#[path = "types/packed_member_select_name_collision.rs"]
+mod packed_member_select_name_collision;

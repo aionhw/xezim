@@ -138,8 +138,10 @@ endmodule
 
 #[test]
 fn buffer_net_collapse_is_observationally_identical() {
-    let (_, base) = run(BUF_DESIGN, "buf_base", &[]);
-    let (text, folded) = run(BUF_DESIGN, "buf_on", &[("XEZIM_BUF_COLLAPSE", "1")]);
+    // The pass is on by default; `=0` is the opt-out, and the census line
+    // it prints is gated behind XEZIM_DEBUG.
+    let (_, base) = run(BUF_DESIGN, "buf_base", &[("XEZIM_BUF_COLLAPSE", "0")]);
+    let (text, folded) = run(BUF_DESIGN, "buf_on", &[("XEZIM_DEBUG", "1")]);
     assert!(
         !base.is_empty(),
         "baseline produced no program output — the test would be vacuous"
@@ -171,11 +173,11 @@ fn edge_block_merge_is_observationally_identical() {
 /// the configuration the benchmarks use.
 #[test]
 fn collapse_and_merge_together_are_identical() {
-    let (_, base) = run(MERGE_DESIGN, "both_base", &[]);
+    let (_, base) = run(MERGE_DESIGN, "both_base", &[("XEZIM_BUF_COLLAPSE", "0")]);
     let (_, both) = run(
         MERGE_DESIGN,
         "both_on",
-        &[("XEZIM_BUF_COLLAPSE", "1"), ("XEZIM_EDGE_MERGE", "2")],
+        &[("XEZIM_EDGE_MERGE", "2")],
     );
     assert!(!base.is_empty(), "baseline produced no program output");
     assert_eq!(base, both, "collapse+merge changed observable output");
