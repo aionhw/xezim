@@ -260,3 +260,5 @@ mod sqr_zero_time_loop;
 mod method_local_base_per_process;
 #[path = "classes/class_covergroups.rs"]
 mod class_covergroups;
+#[path = "classes/parked_task_local_vif_alias.rs"]
+mod parked_task_local_vif_alias;

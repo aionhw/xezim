@@ -982,8 +982,15 @@ tests, and tooling all move the project forward:
 
 * **Thomas Burg** — class-system and UVM fixes: static-property chains through
   object handles (§8.25), associative-array method dispatch and ref-writeback,
-  `ClassName::static_prop` access, parser-gap self-tests, and test-harness
-  hardening.
+  `ClassName::static_prop` access, parser-gap self-tests, test-harness
+  hardening, per-process bookkeeping for methods that park mid-body, the
+  condition-waiter drain de-duplication, and the NBA-region lane in the
+  `--max-time` hang report.
+* **Vrajesh Prakhya** — real-number modelling coverage: Verilog-AMS `wreal`
+  nets resolved by summing, user-defined nettypes across the hierarchy and in
+  packages (§6.6.7, §6.6.8), real-ness of members projected from call results,
+  negative-test registrations, and the diagnosis that `cover property` sites
+  were tallied as failing assertions.
 * **Oscar Gustafsson** — expanded VPI functionality (`vpi_get_value`,
   `ObjectValType`), CI setup, and clippy cleanups.
 * **Chen Ben Haroosh** — submodule-inline generate-for elaboration: genvar-

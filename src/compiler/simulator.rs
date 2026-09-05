@@ -5373,6 +5373,18 @@ pub struct Simulator {
     /// already true) would otherwise recurse once per iteration and overflow the
     /// Rust stack; past this depth the continuation goes back to the scheduler.
     forever_depth: u32,
+    /// Continuation frames built by `exec_forever_sched`, keyed by the
+    /// process, the loop body's source span, the index of the statement it
+    /// parked on, and the site kind. The span identifies the LOOP: the
+    /// `ForeverTail` inside each continuation carries a clone of the body,
+    /// so an address key would change on every iteration (the first cut of
+    /// this cache missed on every wake-up and grew without bound). The
+    /// process id keeps two inlined instances of the same source loop —
+    /// same span, different rewritten names — apart. Before this cache
+    /// every wake-up of a `forever @(posedge clk)` / `always` process
+    /// deep-cloned its statement list and its whole body into a fresh
+    /// frame: 5 % of the c906 memcpy steady state was that cloning.
+    forever_cont_cache: HashMap<(usize, usize, usize, usize, u8), Arc<[Statement]>>,
     /// §11.8.1: while narrowing relational constraint bounds for a target whose
     /// comparison context is UNSIGNED (the target, or the other operand, is
     /// unsigned), a bound literal must be read by its unsigned value — e.g. the
@@ -8547,6 +8559,7 @@ impl Simulator {
             prof_par_ticks: 0,
             prof_par_blocks: 0,
             forever_depth: 0,
+            forever_cont_cache: HashMap::default(),
             constraint_cmp_unsigned: false,
             stall_iters: 0,
             zero_delay_defer_pending: false,
@@ -41244,11 +41257,45 @@ impl Simulator {
     /// the enclosing block (its `$finish` included) the moment it broke out,
     /// which presented as a hang. Take the chain and splice with
     /// `ProcCont::pushed`, exactly like the other suspend-aware arms.
+    /// The continuation a forever loop parks with at statement `i` of its
+    /// body: `[first, rest of the body, ForeverTail { body }]`, built once
+    /// per (body, i, site) and shared afterwards. `pc.stmts` — the frame
+    /// that owns `body` — is kept alive by the entry so the address key
+    /// cannot be recycled by another allocation. The ForeverTail inside the
+    /// shared frame is what the next iteration keys on, so from the second
+    /// wake-up on every iteration of every loop is a lookup.
+    fn forever_cont(
+        &mut self,
+        pid: usize,
+        body: &Statement,
+        body_stmts: &[Statement],
+        i: usize,
+        kind: u8,
+        first: &Statement,
+    ) -> Arc<[Statement]> {
+        let key = (pid, body.span.start, body.span.end, i, kind);
+        if let Some(cont) = self.forever_cont_cache.get(&key) {
+            return cont.clone();
+        }
+        let mut cont: Vec<Statement> = Vec::with_capacity(body_stmts.len() - i + 1);
+        cont.push(first.clone());
+        cont.extend_from_slice(&body_stmts[i + 1..]);
+        cont.push(Statement::new(
+            StatementKind::ForeverTail {
+                body: Box::new(body.clone()),
+            },
+            body.span,
+        ));
+        let cont: Arc<[Statement]> = Arc::from(cont);
+        self.forever_cont_cache.insert(key, cont.clone());
+        cont
+    }
+
     fn exec_forever_sched(&mut self, pid: usize, body: &Statement, pc: &ProcCont, idx: usize) {
         let resume_at = pc.start + idx + 1;
-        let body_stmts = match &body.kind {
-            StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
-            _ => vec![body.clone()],
+        let body_stmts: &[Statement] = match &body.kind {
+            StatementKind::SeqBlock { stmts, .. } => stmts.as_slice(),
+            _ => std::slice::from_ref(body),
         };
         for (i, s) in body_stmts.iter().enumerate() {
             if self.finished {
@@ -41288,23 +41335,16 @@ impl Simulator {
                             self.inactive_queue.push((pid, pc.pushed(restart, resume_at)));
                             return;
                         }
-                        let mut cont = vec![*tbody.clone()];
-                        cont.extend_from_slice(&body_stmts[i + 1..]);
-                        cont.push(Statement::new(
-                            StatementKind::ForeverTail {
-                                body: Box::new(body.clone()),
-                            },
-                            body.span,
-                        ));
+                        let cont = self.forever_cont(pid, body, body_stmts, i, 0, tbody);
                         if delay == 0 {
                             // `forever begin ... #0 ... end` — same §4.4.2.3
                             // Inactive-region parking as the run_process_stmts
                             // Delay handler above: resume only after this
                             // tick's NBA region (commercial consensus).
-                            self.inactive_queue.push((pid, pc.pushed(cont, resume_at)));
+                            self.inactive_queue.push((pid, pc.pushed_frame(cont, resume_at)));
                         } else {
                             self.event_queue
-                                .schedule(self.time + delay, pid, pc.pushed(cont, resume_at));
+                                .schedule(self.time + delay, pid, pc.pushed_frame(cont, resume_at));
                         }
                         return;
                     }
@@ -41312,18 +41352,11 @@ impl Simulator {
                         let sens = self.event_to_sens(event);
                         let is_clk_ev = self.is_clocking_event(event);
                         if !sens.is_empty() {
-                            let mut cont = vec![*tbody.clone()];
-                            cont.extend_from_slice(&body_stmts[i + 1..]);
-                            cont.push(Statement::new(
-                                StatementKind::ForeverTail {
-                                    body: Box::new(body.clone()),
-                                },
-                                body.span,
-                            ));
+                            let cont = self.forever_cont(pid, body, body_stmts, i, 1, tbody);
                             { let w = self.make_event_waiter_kind(
                                     pid,
                                     sens,
-                                    pc.pushed(cont, resume_at),
+                                    pc.pushed_frame(cont, resume_at),
                                     is_clk_ev,
                                 ); self.event_waiters.push(w); }
                             return;
@@ -41352,14 +41385,7 @@ impl Simulator {
                 if !Self::stmt_is_mailbox_get(s) && self.blocking_call_on_null_receiver(s) {
                     return;
                 }
-                let mut cont: Vec<Statement> = vec![s.clone()];
-                cont.extend_from_slice(&body_stmts[i + 1..]);
-                cont.push(Statement::new(
-                    StatementKind::ForeverTail {
-                        body: Box::new(body.clone()),
-                    },
-                    body.span,
-                ));
+                let cont = self.forever_cont(pid, body, body_stmts, i, 2, s);
 
                 // The statement is only POTENTIALLY blocking: `wait (cond)` with
                 // cond already true runs straight through, reaches the Forever
@@ -41370,7 +41396,7 @@ impl Simulator {
                 // continuation to the scheduler as a delta at the current time.
                 // The loop then spins through the event loop, where it is bounded,
                 // and the stall detector can see it and name it.
-                let contp = pc.pushed(cont, resume_at);
+                let contp = pc.pushed_frame(cont, resume_at);
                 if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
                     self.event_queue.schedule(self.time, pid, contp);
                     return;
@@ -41396,7 +41422,7 @@ impl Simulator {
         let mut broke = false;
         while !self.finished && safety < cap {
             safety += 1;
-            for s in &body_stmts {
+            for s in body_stmts {
                 self.exec_statement(s);
                 // §12.7.2: `break` (and a `return` out of the enclosing
                 // task/function, which sets the same flag) LEAVES the loop —
@@ -70213,6 +70239,8 @@ impl Simulator {
             // Otherwise the watcher persists. At end-of-sim, any
             // remaining watcher counts as FAIL (handled later).
             let span_key_for_evt = self.sva_sites[i].span_key;
+            // §16.5: tally under the kind the source wrote (assert/assume/cover).
+            let site_kind = self.sva_sites[i].kind;
             let watchers: Vec<Expression> = std::mem::take(&mut self.sva_sites[i].s_eventually);
             for w in watchers {
                 let outcome = self.eval_sva_sampled(&sampled_ids, &w);
@@ -70221,7 +70249,7 @@ impl Simulator {
                         .assertion_stats
                         .entry(span_key_for_evt)
                         .or_insert_with(|| AssertionStat {
-                            kind: 0,
+                            kind: site_kind,
                             pass_count: 0,
                             fail_count: 0,
                         });
@@ -70245,11 +70273,14 @@ impl Simulator {
                         .assertion_stats
                         .entry(span_key_for_evt)
                         .or_insert_with(|| AssertionStat {
-                            kind: 0,
+                            kind: site_kind,
                             pass_count: 0,
                             fail_count: 0,
                         });
-                    stat.fail_count += 1;
+                    if site_kind != 2 {
+                        // §16.12: a cover has hits, not verdicts.
+                        stat.fail_count += 1;
+                    }
                     self.fire_sva_action(i, false);
                 }
             }
@@ -70364,6 +70395,9 @@ impl Simulator {
         body: &Expression,
         sampled_ids: &[usize],
     ) {
+        // §16.5: tally under the kind the source wrote; a cover has hits,
+        // not verdicts, so it is never filed as an assert here either.
+        let site_kind = self.sva_sites[site_idx].kind;
         // LRM §16.6 `disable iff (g)` wrapper. The parser encodes the
         // clause as `Binary{LogAnd, !g, inner_body}`. When `g` is true
         // (so `!g` is false), the property is suppressed for this
@@ -70439,7 +70473,7 @@ impl Simulator {
                         self.assertion_stats
                         .entry(span_key)
                         .or_insert_with(|| AssertionStat {
-                            kind: 0,
+                            kind: site_kind,
                             pass_count: 0,
                             fail_count: 0,
                         });
@@ -91613,11 +91647,29 @@ impl Simulator {
                             }
                         }
                     }
+                    // A subroutine LOCAL `virtual ifc lv;` (the top frame owns
+                    // the name) binds in the frame's alias map, which travels
+                    // with the process context across a park. The global map
+                    // is keyed by the bare name only: two class tasks each
+                    // holding a local `lv` bound to different interfaces and
+                    // interleaved on delays saw each other's binding (a1's
+                    // `lv.id` read a2's interface after a2's task had run).
+                    let frame_local = self
+                        .local_stack
+                        .last()
+                        .is_some_and(|f| f.contains_key(name))
+                        && !self.local_iface_aliases.is_empty();
                     if matches!(&rvalue.kind, ExprKind::Null) {
                         // Clear the alias, then FALL THROUGH so the normal
                         // value path stores the null handle — keeping a
                         // later `vif == null` true.
-                        self.viface_var_aliases.remove(name);
+                        if frame_local {
+                            if let Some(f) = self.local_iface_aliases.last_mut() {
+                                f.remove(name);
+                            }
+                        } else {
+                            self.viface_var_aliases.remove(name);
+                        }
                     } else if matches!(&rvalue.kind, ExprKind::Call { .. }) {
                         // `vd = mgr.get_vif();` — run the call; the callee's
                         // return recorded the bound instance (see the Return
@@ -91626,7 +91678,13 @@ impl Simulator {
                         self.last_vif_return = None;
                         let v = self.eval_expr(rvalue);
                         if let Some(bound) = self.last_vif_return.take() {
-                            self.viface_var_aliases.insert(name.to_string(), bound);
+                            if frame_local {
+                                if let Some(f) = self.local_iface_aliases.last_mut() {
+                                    f.insert(name.to_string(), bound);
+                                }
+                            } else {
+                                self.viface_var_aliases.insert(name.to_string(), bound);
+                            }
                         }
                         self.assign_value(lvalue, &v);
                         return true;
@@ -91643,7 +91701,13 @@ impl Simulator {
                                 hsh ^= b as u64;
                                 hsh = hsh.wrapping_mul(0x100000001b3);
                             }
-                            self.viface_var_aliases.insert(name, bound);
+                            if frame_local {
+                                if let Some(f) = self.local_iface_aliases.last_mut() {
+                                    f.insert(name.clone(), bound);
+                                }
+                            } else {
+                                self.viface_var_aliases.insert(name, bound);
+                            }
                             self.assign_value(
                                 lvalue,
                                 &Value::from_u64((hsh & 0x7FFF_FFFF) | 1, 32),
