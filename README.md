@@ -110,7 +110,7 @@ and testbench flows. Portable code should not rely on them.
 
 # What's new in 0.10
 
-### Unreleased — class covergroups, compilation-unit DPI, assertions in instances
+### 0.10.5 — class covergroups, DPI exports and unit scope, faster UVM (September 2026)
 
 * **`foreach` and `std::randomize` over multi-dimensional targets**: a
   `foreach (a[i, j])` over a purely packed array (`u7_t [4:0][1:0]`,
