@@ -123,6 +123,18 @@ and testbench flows. Portable code should not rely on them.
   relational bounds, `elem == e` pins, and `$countones(mask[i][j]) ==
   count[i][j]` couplings, which draw the mask with exactly that many ones.
   A `rand` class property wider than 64 bits is drawn in full as well.
+* **Associative-array probes no longer scan the whole signal table**:
+  `exists()` on an absent key, the nested-element probe behind every
+  associative-array check, and `first()` / `next()` key enumeration now read
+  the per-array element index (one set per array) instead of comparing
+  every signal name in the design against a prefix. The associative-array
+  check itself exits after one byte scan when the name can only be a plain
+  collection, the static-collection key is borrowed instead of allocated on
+  every builtin-method call, and a dozen per-call debug and tuning flags
+  (`XEZIM_ACTIVE_REGION`, `XEZIM_TRACE_SPIN`, `XEZIM_PSETTLE_STATS`, the
+  `*_DBG` switches) are read once. The axi4 AVIP retires 6.7 % fewer
+  instructions, output identical. `XEZIM_BM_CENSUS=1` prints every builtin
+  method call as `[bm] <receiver> <method>` for aggregation.
 * **`obj.randomize()` over multi-dimensional properties**: a packed
   multi-dimensional class property (`rand u7_t [4:0][1:0] d`) now has element
   geometry, so `d[i][j]` reads and writes address the element (they were

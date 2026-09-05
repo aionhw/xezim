@@ -378,6 +378,25 @@ fn cached_env_flag(name: &'static str, slot: &'static OnceLock<bool>) -> bool {
     *slot.get_or_init(|| std::env::var(name).ok().as_deref() == Some("1"))
 }
 
+
+fn cached_env_set(name: &'static str, slot: &'static OnceLock<bool>) -> bool {
+    *slot.get_or_init(|| std::env::var_os(name).is_some())
+}
+
+macro_rules! env_set_cached {
+    ($name:literal) => {{
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        cached_env_set($name, &FLAG)
+    }};
+}
+
+macro_rules! env_is_one_cached {
+    ($name:literal) => {{
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        cached_env_flag($name, &FLAG)
+    }};
+}
+
 fn xz_copy_debug_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("XEZIM_CP_DBG").is_some())
@@ -3268,6 +3287,34 @@ impl SignalMap {
             .get(base)
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Borrowing form of `keys_with_elem_prefix`: the element keys under
+    /// `prefix` (which must end in `[`) without cloning them.
+    pub fn elem_keys_with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        let base = &prefix[..prefix.len().saturating_sub(1)];
+        let outer = Self::base_of(base).unwrap_or(base);
+        self.elems
+            .get(outer)
+            .into_iter()
+            .flat_map(|set| set.iter().map(|k| k.as_str()))
+            .filter(move |k| k.starts_with(prefix))
+    }
+
+    /// Is any key under the outermost base of `prefix` prefixed by it?
+    /// Every key that contains `[` is indexed under the text before its
+    /// FIRST `[`, so `obj[k][j]` and `obj[k].field` are both found under
+    /// `obj`; this replaces a scan of the whole map.
+    pub fn any_key_with_prefix(&self, prefix: &str) -> bool {
+        let Some(outer) = Self::base_of(prefix) else {
+            return self.map.keys().any(|k| k.starts_with(prefix));
+        };
+        self.elems
+            .get(outer)
+            .is_some_and(|set| set.iter().any(|k| k.starts_with(prefix)))
     }
 }
 
@@ -33806,7 +33853,7 @@ impl Simulator {
         if !self.deferred_proc_entries.is_empty() {
             self.dirty_any = true;
         }
-        if std::env::var_os("XEZIM_PSETTLE_STATS").is_some() {
+        if env_set_cached!("XEZIM_PSETTLE_STATS") {
             self.prof_psettle_calls += 1;
             if self.settle_calls != __sc_before {
                 self.prof_psettle_deferred += 1;
@@ -39336,7 +39383,7 @@ impl Simulator {
                                             cont,
                                             is_peek: method == "peek",
                                         });
-                                    if std::env::var("XEZIM_MBX_DBG").is_ok() {
+                                    if env_set_cached!("XEZIM_MBX_DBG") {
                                         eprintln!("[MBX] t={} pid={} PARKED {} handle={}",
                                             self.time, pid, method, handle);
                                     }
@@ -39806,7 +39853,7 @@ impl Simulator {
                             return;
                         }
                         // Star/empty sensitivity — just execute body
-                        if !is_star && std::env::var_os("XEZIM_TRACE_SPIN").is_some() {
+                        if !is_star && env_set_cached!("XEZIM_TRACE_SPIN") {
                             eprintln!(
                                 "[EMPTYSENS] pid={} t={} event={:?} span={:?}",
                                 pid, self.time, event, stmt.span
@@ -44609,7 +44656,7 @@ impl Simulator {
                 false
             } else if !qualifies {
                 false
-            } else if std::env::var("XEZIM_FORCE_PARALLEL").ok().as_deref() == Some("1") {
+            } else if env_is_one_cached!("XEZIM_FORCE_PARALLEL") {
                 true
             } else {
                 match self.par_cal_phase {
@@ -45270,7 +45317,10 @@ impl Simulator {
         // same edge updates). XEZIM_ACTIVE_REGION=0 restores the legacy
         // schedule-into-event_queue path (waiter runs in the NEXT event_loop
         // iter after apply_nba, reading post-NBA values).
-        let active_region = std::env::var("XEZIM_ACTIVE_REGION").ok().as_deref() != Some("0");
+        let active_region = {
+            static FLAG: OnceLock<bool> = OnceLock::new();
+            *FLAG.get_or_init(|| std::env::var("XEZIM_ACTIVE_REGION").ok().as_deref() != Some("0"))
+        };
         // Record continuation writes for the §9.2 rescan drain (see
         // `in_edge_cont`): these run AFTER this pass's edge detection, so
         // without recording, an AnyEdge block sensitive to a signal a
@@ -45330,7 +45380,7 @@ impl Simulator {
                 }
                 settle_guard += 1;
                 if self.finished || settle_guard > 10_000 {
-                    if std::env::var_os("XEZIM_TRACE_SPIN").is_some() && !self.finished {
+                    if env_set_cached!("XEZIM_TRACE_SPIN") && !self.finished {
                         eprintln!("[DRAINGUARD] t={} exhausted; {} waiters:", self.time, self.event_waiters.len());
                         for w in self.event_waiters.iter().take(6) {
                             let names: Vec<String> = w
@@ -49631,7 +49681,7 @@ impl Simulator {
 
                 // If this is an array or queue, and we are assigning a packed value,
                 // we might want to split it into elements.
-                if std::env::var("XEZIM_A1_DBG").is_ok() && name.contains('m') {
+                if env_set_cached!("XEZIM_A1_DBG") && name.contains('m') {
                     eprintln!("[A1DBG] whole-name write name={:?} in_arrays={} hint={:?}",
                         name, self.module.arrays.contains_key(&*name),
                         self.name_resolve_hint.borrow().clone());
@@ -50039,7 +50089,7 @@ impl Simulator {
                 // Class associative-array member element write — base may be
                 // a bare member (`m[k]=v`) or another object's (`obj.m[k]=v`).
                 if let Some(an) = self.expr_assoc_name(expr) {
-                    if std::env::var_os("XEZIM_AW_DBG").is_some() {
+                    if env_set_cached!("XEZIM_AW_DBG") {
                         eprintln!("[AW] assoc write an={} width={:?} map={:?}",
                             an, self.assoc_elem_width(&an), self.module.assoc_elem_widths);
                     }
@@ -54916,7 +54966,7 @@ impl Simulator {
                         }
                     }
                 }
-                if std::env::var("XEZIM_EV_DBG").is_ok() {
+                if env_set_cached!("XEZIM_EV_DBG") {
                     eprintln!(
                         "[EVDBG] idx-eval base_fmn={:?} qb={:?} ean={:?} nin={:?}",
                         self.flat_member_name(expr),
@@ -63461,8 +63511,8 @@ impl Simulator {
                         name = std::borrow::Cow::Owned(rn.to_string());
                     } else {
                         let spec_key = self.spec_static_coll_key(&name);
-                        if spec_key != name {
-                            name = std::borrow::Cow::Owned(spec_key);
+                        if let std::borrow::Cow::Owned(k) = spec_key {
+                            name = std::borrow::Cow::Owned(k);
                         } else if let Some(scoped) = self.instance_assoc_member(&name) {
                             name = std::borrow::Cow::Owned(scoped);
                         }
@@ -65240,7 +65290,7 @@ impl Simulator {
                             &self.module.typedef_types,
                         ) {
                             if !fields.is_empty() {
-                                if std::env::var("XEZIM_PSDBG").is_ok() {
+                                if env_set_cached!("XEZIM_PSDBG") {
                                     eprintln!("[PSDBG] register packed local {}", d.name.name);
                                 }
                                 self.module
@@ -76458,7 +76508,7 @@ impl Simulator {
                 // A consumed slot may admit a parked bounded-put producer.
                 self.admit_mailbox_put_waiter(handle);
             }
-            if std::env::var("XEZIM_MBX_DBG").is_ok() {
+            if env_set_cached!("XEZIM_MBX_DBG") {
                 eprintln!(
                     "[MBX] t={} DRAIN deliver to pid={} is_peek={} handle={}",
                     self.time, pid, is_peek, handle
@@ -78066,6 +78116,12 @@ impl Simulator {
         if self.module.associative_arrays.contains_key(name) {
             return true;
         }
+        // Every remaining branch needs a `#` (scoped member) or a trailing
+        // `]` (nested element): one byte scan replaces up to three char
+        // searches, a second map probe and a `format!` on the hot path.
+        if !name.ends_with(']') && !name.as_bytes().contains(&b'#') {
+            return false;
+        }
         // A per-specialization static-collection storage key
         // (`Class#spec::member`, e.g. `wrapper#e_t::map`) rewritten by
         // `spec_static_coll_key` / `obj_member` for a parameterized-class
@@ -78163,7 +78219,7 @@ impl Simulator {
     /// the `name->id` index), so a nested assoc element (stored as
     /// `base[k1][k2]...`) is visible.
     fn signal_name_prefix_present(&self, prefix: &str) -> bool {
-        self.signals.keys().any(|k| k.starts_with(prefix))
+        self.signals.any_key_with_prefix(prefix)
             || !self.assoc_static_keys(prefix).is_empty()
     }
 
@@ -79254,15 +79310,13 @@ impl Simulator {
         // `special-:{ chars{}[0123456789] _` are legal assoc string keys,
         // §7.11) — take up to the LAST `]` so such brackets are not mistaken
         // for an index end.
-        let idx_keys = self.signals.keys_with_elem_prefix(&prefix);
         // The `signal_name_to_id` half of this enumeration is fixed for the
         // run (see `assoc_static_keys_cache`), so scan it once per prefix
         // instead of on every call.
         let static_keys = self.assoc_static_keys(&prefix);
-        let mut keys: Vec<String> = idx_keys
-            .iter()
-            .map(|k| k.as_str())
-            .filter(|k| k.starts_with(&prefix))
+        let mut keys: Vec<String> = self
+            .signals
+            .elem_keys_with_prefix(&prefix)
             .chain(static_keys.iter().map(|k| &**k))
             .filter_map(|k| {
                 let rest = &k[prefix.len()..];
@@ -90217,8 +90271,16 @@ impl Simulator {
         // rewrite the bare member name to the spec-aware storage key so each
         // specialization gets its own element/size cells. No-op for instance
         // methods and non-static/non-collection names.
+        if env_set_cached!("XEZIM_BM_CENSUS") {
+            eprintln!(
+                "[bm] {} {} this={}",
+                obj_name,
+                mname,
+                self.this_stack.last().copied().flatten().is_some()
+            );
+        }
         let _resolved = self.spec_static_coll_key(obj_name);
-        let obj_name = _resolved.as_str();
+        let obj_name: &str = &_resolved;
         // §8.10: inside a class method, a MEMBER collection shadows any
         // same-named module/package-scope collection. Several callers gate
         // on the bare name being registered globally before trying the
@@ -90228,9 +90290,10 @@ impl Simulator {
         // elements (backdoor hdl paths came back empty). Rewrite centrally:
         // bare name + declared by the current class + not a true local.
         let _inst_scoped;
-        let obj_name = if !obj_name.contains('#')
-            && !obj_name.contains('.')
-            && !obj_name.contains('[')
+        let obj_name = if !obj_name
+            .as_bytes()
+            .iter()
+            .any(|&b| matches!(b, b'#' | b'.' | b'['))
         {
             // §8.10 precedence for a BARE receiver — see
             // `bare_receiver_is_class_handle`.
@@ -90864,10 +90927,8 @@ impl Simulator {
                     // under `<assoc>[<key>].size` / `<assoc>[<key>][i]`.
                     || self.signals.contains_key(&format!("{}.size", elem_name))
                     || self.module.dynamic_arrays.contains(&elem_name)
-                    || self
-                        .signals
-                        .keys()
-                        .any(|k| k.starts_with(&nested_prefix) || k.starts_with(&member_prefix));
+                    || self.signals.any_key_with_prefix(&nested_prefix)
+                    || self.signals.any_key_with_prefix(&member_prefix);
                 return Some(Value::from_u64(found as u64, 1));
             }
         }
@@ -91480,7 +91541,7 @@ impl Simulator {
     /// non-collection / non-static names are returned unchanged. Applied
     /// centrally in `eval_builtin_method` so every builtin
     /// (push_back/size/pop_front/...) keys off the same spec-aware name.
-    fn spec_static_coll_key(&self, name: &str) -> String {
+    fn spec_static_coll_key<'n>(&self, name: &'n str) -> std::borrow::Cow<'n, str> {
         let this_h = self
             .this_stack
             .last()
@@ -91491,10 +91552,10 @@ impl Simulator {
         // (`<handle>#name`), not static. A static method carries a ZERO
         // `this` handle, so filter that out.
         if this_h.is_some() {
-            return name.to_string();
+            return std::borrow::Cow::Borrowed(name);
         }
         let Some(Some(ctx)) = self.class_context_stack.last().cloned() else {
-            return name.to_string();
+            return std::borrow::Cow::Borrowed(name);
         };
         // Walk ctx's inheritance chain for a STATIC collection property.
         // Static collections are registered in `static_collections`
@@ -91515,7 +91576,7 @@ impl Simulator {
                         // storage and break the many bare-name accessors
                         // (including the UVM phase machinery).
                         if key.contains('#') || self.static_coll_name_collides(name) {
-                            return key;
+                            return std::borrow::Cow::Owned(key);
                         }
                     }
                 }
@@ -91524,7 +91585,7 @@ impl Simulator {
                 break;
             }
         }
-        name.to_string()
+        std::borrow::Cow::Borrowed(name)
     }
 
     /// Walk the class hierarchy from `start_class` and return the
@@ -93648,7 +93709,7 @@ impl Simulator {
             // the per-spec key builtins use ─ so `m[k]=v` stored its value
             // where the later `m[k]`/`exists` never looked (and vice-versa).
             if self.collection_is_static_in(&ctx, name) {
-                return Some(self.spec_static_coll_key(name));
+                return Some(self.spec_static_coll_key(name).into_owned());
             }
             return self.static_fixed_key_in(&ctx, name);
         };

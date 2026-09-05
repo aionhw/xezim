@@ -21,6 +21,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_BC_DUMP", "Dump compiled bytecode blocks after compilation"),
     ("XEZIM_BC_DUMP_FULL", "Dump compiled bytecode including full insn operands"),
     ("XEZIM_BD_DBG", "Debug: trace block-local declaration binding"),
+    ("XEZIM_BM_CENSUS", "Census: print every builtin-method call as `[bm] <receiver> <method> this=<bool>` (aggregate with sort | uniq -c)"),
     ("XEZIM_BSP_PAR", "Parallel settle: enable bulk-synchronous parallel comb settle (0/1)"),
     ("XEZIM_BSP_PAR_THRESHOLD", "Parallel settle: min comb entries per level before threads are used"),
     ("XEZIM_BSP_SETTLE", "Parallel settle: enable levelized BSP settle algorithm (0/1)"),
