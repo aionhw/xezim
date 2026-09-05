@@ -10978,10 +10978,14 @@ impl Simulator {
             "extern long long __xezim_dpi_export_dispatch(long long id, long long n, const long long* a);\n",
         );
         let mut emitted = 0usize;
+        let c_names = self.module.dpi_export_c_names.clone();
         for (id, name) in exports.iter().enumerate() {
             let Some((ret, args)) = self.dpi_export_signature(name) else {
                 continue;
             };
+            // The symbol the C side links against: the export's alias when
+            // one was declared, else the SV name.
+            let c_name: &str = c_names.get(id).map(|s| s.as_str()).unwrap_or(name);
             let supported = ret != DpiExpKind::Bad && !args.contains(&DpiExpKind::Bad);
             let params: Vec<String> = if supported {
                 args.iter().enumerate().map(|(i, k)| format!("{} a{}", c_ty(*k), i)).collect()
@@ -11000,9 +11004,9 @@ impl Simulator {
                 );
                 let ret_c = if ret == DpiExpKind::Void { "void" } else { "long long" };
                 if ret == DpiExpKind::Void {
-                    body.push_str(&format!("void {}({}) {{ }}\n", name, param_list));
+                    body.push_str(&format!("void {}({}) {{ }}\n", c_name, param_list));
                 } else {
-                    body.push_str(&format!("{} {}({}) {{ return 0; }}\n", ret_c, name, param_list));
+                    body.push_str(&format!("{} {}({}) {{ return 0; }}\n", ret_c, c_name, param_list));
                 }
                 emitted += 1;
                 continue;
@@ -11029,15 +11033,15 @@ impl Simulator {
             match ret {
                 DpiExpKind::Void => body.push_str(&format!(
                     "void {}({}) {{\n{}    (void){};\n}}\n",
-                    name, param_list, pack, call
+                    c_name, param_list, pack, call
                 )),
                 DpiExpKind::Real => body.push_str(&format!(
                     "double {}({}) {{\n{}    long long __r = {};\n    double __d; memcpy(&__d, &__r, 8); return __d;\n}}\n",
-                    name, param_list, pack, call
+                    c_name, param_list, pack, call
                 )),
                 _ => body.push_str(&format!(
                     "{} {}({}) {{\n{}    return ({}){};\n}}\n",
-                    c_ty(ret), name, param_list, pack, c_ty(ret), call
+                    c_ty(ret), c_name, param_list, pack, c_ty(ret), call
                 )),
             }
             emitted += 1;

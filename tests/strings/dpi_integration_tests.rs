@@ -191,6 +191,37 @@ fn dpi_export_roundtrip_test() {
 }
 
 #[test]
+fn dpi_export_alias_and_package_test() {
+    // §35.5.4: C calls exported SV subroutines through their C LINKAGE
+    // names — an alias, an export in a package no module imports, and a
+    // compilation-unit alias. The alias was dropped and package exports
+    // were never registered: `undefined symbol` on the first C call.
+    assert_dpi_pass(
+        "tests/dpi/export_alias_pkg.c",
+        "export_alias_pkg",
+        "tests/dpi/export_alias_pkg_test.sv",
+    );
+}
+
+#[test]
+fn dpi_export_in_wildcard_imported_package_test() {
+    assert_dpi_pass(
+        "tests/dpi/export_pkg_import.c",
+        "export_pkg_import_wild",
+        "tests/dpi/export_pkg_wildcard_test.sv",
+    );
+}
+
+#[test]
+fn dpi_export_in_explicitly_imported_package_test() {
+    assert_dpi_pass(
+        "tests/dpi/export_pkg_import.c",
+        "export_pkg_import_expl",
+        "tests/dpi/export_pkg_explicit_test.sv",
+    );
+}
+
+#[test]
 fn dpi_simple_test() {
     assert_dpi_pass(
         "tests/dpi/simple_dpi.c",

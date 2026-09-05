@@ -123,6 +123,14 @@ and testbench flows. Portable code should not rely on them.
   relational bounds, `elem == e` pins, and `$countones(mask[i][j]) ==
   count[i][j]` couplings, which draw the mask with exactly that many ones.
   A `rand` class property wider than 64 bits is drawn in full as well.
+* **`export "DPI-C"` aliases and package-scope exports reach C**: an export
+  with a C linkage name (`export "DPI-C" c_reg_write = task reg_write;`)
+  now emits the `c_reg_write` symbol the loaded library calls (it emitted the
+  SV name, and the library died with `undefined symbol: c_reg_write` on its
+  first call). Exports declared inside a package are registered whether the
+  package is wildcard-imported, imported by name, or never imported (they
+  name a global symbol either way); an unimported package's subroutine is
+  reached under its qualified name.
 * **Loop variables shadow a same-named variable of an inlined instance**: a
   `for (integer i = 0; ...)` or `foreach (a[i])` inside a child module that
   also declares `integer i` at module scope now binds `i` to the loop. The
