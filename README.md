@@ -123,6 +123,18 @@ and testbench flows. Portable code should not rely on them.
   relational bounds, `elem == e` pins, and `$countones(mask[i][j]) ==
   count[i][j]` couplings, which draw the mask with exactly that many ones.
   A `rand` class property wider than 64 bits is drawn in full as well.
+* **`obj.randomize()` over multi-dimensional properties**: a packed
+  multi-dimensional class property (`rand u7_t [4:0][1:0] d`) now has element
+  geometry, so `d[i][j]` reads and writes address the element (they were
+  single-bit selects) and `foreach (d[i, j])` iterates every element from a
+  method or from the module. Elements of a 2-D array property wider than
+  64 bits are drawn (they stayed 0). Every fixed array property is drawn on
+  every call and the constraint repair then runs over the fresh draws: arrays
+  under a `foreach` used to be skipped by the draw and repaired from their
+  previous values, so `e[i] < 100` kept zeros and repeated calls returned the
+  same values, and the draw used to clobber element pins (`a[0] == 5`
+  returned 0) and `foreach` bodies that read another drawn array
+  (`$countones(m[i][j]) == e[i][j]`).
 * **A `forever` / `always` process no longer re-clones its loop body on every
   wake-up**: the continuation it parks with is built once per loop and
   shared afterwards (C906 memcpy retires 4.2 % fewer instructions, output

@@ -50493,6 +50493,35 @@ impl Simulator {
                 // matched here, so hierarchical element writes were silently
                 // dropped while reads (which go through flat_member_name)
                 // worked.
+                // Element write into a packed multi-dimensional CLASS property:
+                // read-modify-write the addressed slice of the whole value.
+                if let Some((h, prop, idx_exprs)) = self.prop_index_chain(lhs) {
+                    if let Some(dims) = self.class_prop_packed_dims(h, &prop) {
+                        if idx_exprs.len() <= dims.len() {
+                            let idx: Vec<Value> =
+                                idx_exprs.iter().map(|ie| self.eval_expr(ie)).collect();
+                            if let Some(cur) = self.read_member_value(h, &prop) {
+                                if let Some((lsb, w)) =
+                                    Self::packed_chain_slice(cur.width as u64, &dims, &idx)
+                                {
+                                    let piece = val.resize(w as u32);
+                                    let mut nv = cur.clone();
+                                    for i in 0..(w as usize) {
+                                        nv.set_bit(lsb as usize + i, piece.get_bit(i));
+                                    }
+                                    let changed = nv != cur;
+                                    if changed {
+                                        if let Some(Some(inst)) = self.heap.get_mut(h) {
+                                            inst.properties.insert(prop, nv);
+                                        }
+                                    }
+                                    return changed;
+                                }
+                                return false;
+                            }
+                        }
+                    }
+                }
                 let (base_name, hier_opt): (
                     Option<std::borrow::Cow<str>>,
                     Option<&crate::ast::expr::HierarchicalIdentifier>,
@@ -52429,6 +52458,160 @@ impl Simulator {
     /// and an ascending range: physical = label - right (descending) /
     /// right - label (ascending). None for a plain Ident base (layers = 0 —
     /// the existing plain-signal paths own that) or when nothing is recorded.
+    /// Packed dimensions of a CLASS PROPERTY (`rand u7_t [4:0][1:0] d;`),
+    /// declared dimensions first and then a typedef's own, resolved from the
+    /// property's declared type. Module-scope geometry tables are keyed by
+    /// signal name, which a property never has, so without this an element
+    /// select on a packed multi-dimensional property was a single-bit select
+    /// of the whole value (`d[0][0]` read bit 0; `d[2][1] = 77` was dropped).
+    fn class_prop_packed_dims(&self, handle: usize, prop: &str) -> Option<Vec<(i64, i64)>> {
+        let cn = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let mut cur = Some(cn);
+        while let Some(c) = cur {
+            let cd = self.module.classes.get(&c)?;
+            // A property with UNPACKED dimensions (`bit [1:0][7:0] tbl [4]`)
+            // is a collection: its index selects an element, not a slice.
+            if cd.array_properties.contains_key(prop) || cd.array_nd_properties.contains_key(prop) {
+                return None;
+            }
+            if let Some(dt) = cd.property_types.get(prop) {
+                let dims = super::elaborate::packed_full_dims_chained(
+                    dt,
+                    &self.module.parameters,
+                    &self.module.typedef_types,
+                )?;
+                return if dims.len() >= 2 { Some(dims) } else { None };
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// If `expr` is an index chain `root[i]...[k]` whose root names a class
+    /// property (a bare property of `this`, not shadowed by a local or a
+    /// signal, or `obj.prop` on a handle), return the handle, the property
+    /// name, and the index expressions outermost first.
+    fn prop_index_chain<'e>(
+        &mut self,
+        expr: &'e Expression,
+    ) -> Option<(usize, String, Vec<&'e Expression>)> {
+        self.prop_index_chain_inner(expr, None)
+    }
+
+    /// Same as `prop_index_chain` for an `Index` already split into its base
+    /// and outermost index (the eval arm destructures the node, shadowing
+    /// the whole expression).
+    fn prop_index_chain_parts<'e>(
+        &mut self,
+        base: &'e Expression,
+        outer: &'e Expression,
+    ) -> Option<(usize, String, Vec<&'e Expression>)> {
+        self.prop_index_chain_inner(base, Some(outer))
+    }
+
+    fn prop_index_chain_inner<'e>(
+        &mut self,
+        expr: &'e Expression,
+        outer: Option<&'e Expression>,
+    ) -> Option<(usize, String, Vec<&'e Expression>)> {
+        let mut rev: Vec<&'e Expression> = Vec::new();
+        if let Some(o) = outer {
+            rev.push(o);
+        }
+        let mut cur = expr;
+        while let ExprKind::Index { expr: b, index } = &cur.kind {
+            rev.push(index);
+            cur = b;
+        }
+        if rev.is_empty() {
+            return None;
+        }
+        let (handle, prop) = match &cur.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let name = &h.path[0].name.name;
+                if self.local_stack.last().is_some_and(|f| f.contains_key(name))
+                    || self.signal_name_to_id.contains_key(name.as_str())
+                {
+                    return None;
+                }
+                let handle = self.this_stack.last().copied().flatten()?;
+                let has = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .is_some_and(|i| i.properties.contains_key(name));
+                if !has {
+                    return None;
+                }
+                (handle, name.clone())
+            }
+            ExprKind::Ident(h) if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) => {
+                let obj = self.eval_ident_handle(&h.path[0].name.name)?;
+                if obj == 0 || obj >= self.heap.len() {
+                    return None;
+                }
+                (obj, h.path[1].name.name.clone())
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                let obj = self.eval_handle_expr(base)?;
+                if obj == 0 || obj >= self.heap.len() {
+                    return None;
+                }
+                (obj, member.name.clone())
+            }
+            _ => return None,
+        };
+        rev.reverse();
+        Some((handle, prop, rev))
+    }
+
+    /// Bit slice (lsb, width) addressed by an index chain into a packed
+    /// value of `total` bits with dimensions `dims` (outermost first), using
+    /// the same slot arithmetic as the signal path: descending dimensions
+    /// place index `lo` at the bottom, ascending ones at the top. None when
+    /// an index is out of range or X.
+    fn packed_chain_slice(total: u64, dims: &[(i64, i64)], idx: &[Value]) -> Option<(u64, u64)> {
+        let mut w = total;
+        let mut lsb: i64 = 0;
+        for (k, iv) in idx.iter().enumerate() {
+            let (dl, dr) = *dims.get(k)?;
+            let count = (dl - dr).unsigned_abs() + 1;
+            if count == 0 || w % count != 0 {
+                return None;
+            }
+            w /= count;
+            if iv.has_xz() {
+                return None;
+            }
+            let i = iv.to_i64()?;
+            let lo_b = dl.min(dr);
+            let off = i - lo_b;
+            if off < 0 || off as u64 >= count {
+                return None;
+            }
+            let slot = if dl >= dr { off } else { (count as i64 - 1) - off };
+            lsb += slot * w as i64;
+        }
+        Some((lsb as u64, w))
+    }
+
+    /// Width of the sub-array addressed by `n` indices into `dims`.
+    fn packed_chain_width(total: u64, dims: &[(i64, i64)], n: usize) -> u64 {
+        let mut w = total;
+        for k in 0..n.min(dims.len()) {
+            let (dl, dr) = dims[k];
+            let c = (dl - dr).unsigned_abs() + 1;
+            if c > 0 && w % c == 0 {
+                w /= c;
+            }
+        }
+        w.max(1)
+    }
+
     fn select_base_elem_dim(&self, base: &Expression) -> Option<(i64, i64)> {
         let mut cur = base;
         let mut layers = 0usize;
@@ -54588,6 +54771,25 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // Element select on a packed multi-dimensional CLASS property.
+                if let Some((h, prop, idx_exprs)) = self.prop_index_chain_parts(expr, index) {
+                    if let Some(dims) = self.class_prop_packed_dims(h, &prop) {
+                        if idx_exprs.len() <= dims.len() {
+                            let idx: Vec<Value> =
+                                idx_exprs.iter().map(|ie| self.eval_expr(ie)).collect();
+                            if let Some(base_v) = self.read_member_value(h, &prop) {
+                                return match Self::packed_chain_slice(base_v.width as u64, &dims, &idx) {
+                                    Some((lsb, w)) => {
+                                        base_v.range_select((lsb + w - 1) as usize, lsb as usize)
+                                    }
+                                    None => Value::new(
+                                        Self::packed_chain_width(base_v.width as u64, &dims, idx.len()) as u32,
+                                    ),
+                                };
+                            }
+                        }
+                    }
+                }
                 // Every shape probe below used to re-resolve this same base
                 // identifier from scratch — up to ten resolutions, each with
                 // its own allocation, per indexed read. On an axi4Lite UVM run
@@ -63245,6 +63447,10 @@ impl Simulator {
                 }
                 if let ExprKind::Ident(hier) = &array.kind {
                     let mut name = self.resolve_hier_name(hier);
+                    // Packed multi-dimensional CLASS property (`foreach (c.d[i, j])`
+                    // over `bit [6:0] [4:0][1:0] d`): the geometry lives on the
+                    // class type, not in the module-level packed tables.
+                    let mut prop_packed_dims: Option<Vec<(i64, i64)>> = None;
                     // A subroutine-LOCAL queue/dyn array lives under its
                     // per-process rename — and shadows any same-named class
                     // member (§8.10). Without this, `foreach (pp[j])` over a
@@ -63305,6 +63511,29 @@ impl Simulator {
                                 || self.module.arrays_nd.contains_key(&scoped)
                             {
                                 name = std::borrow::Cow::Owned(scoped);
+                            } else if let Some(pd) = self.class_prop_packed_dims(
+                                h,
+                                hier.path.last().map(|s| s.name.name.as_str()).unwrap_or(""),
+                            ) {
+                                if pd.len() >= vars.len() {
+                                    prop_packed_dims = Some(pd);
+                                }
+                            }
+                        }
+                    }
+                    // Same geometry for a bare property name inside a method
+                    // (`foreach (d[i, j])` with `this` implied).
+                    if prop_packed_dims.is_none()
+                        && hier.path.len() == 1
+                        && hier.path[0].selects.is_empty()
+                        && self.foreach_dims(&name).is_none()
+                        && !self.module.packed_full_dims.contains_key(&*name)
+                    {
+                        if let Some(h) = self.this_stack.last().copied().flatten().filter(|&h| h != 0) {
+                            if let Some(pd) = self.class_prop_packed_dims(h, &hier.path[0].name.name) {
+                                if pd.len() >= vars.len() {
+                                    prop_packed_dims = Some(pd);
+                                }
                             }
                         }
                     }
@@ -63407,14 +63636,15 @@ impl Simulator {
                         // dimension with every other variable x. Start from an
                         // empty shape and let the packed dimensions supply
                         // every variable.
-                        let purely_packed = self.foreach_dims(&name).is_none()
-                            && !self.module.dynamic_arrays.contains(&*name)
-                            && !self.is_associative_array(&name)
-                            && self
-                                .module
-                                .packed_full_dims
-                                .get(&*name)
-                                .is_some_and(|d| d.len() >= vars.len());
+                        let purely_packed = prop_packed_dims.is_some()
+                            || (self.foreach_dims(&name).is_none()
+                                && !self.module.dynamic_arrays.contains(&*name)
+                                && !self.is_associative_array(&name)
+                                && self
+                                    .module
+                                    .packed_full_dims
+                                    .get(&*name)
+                                    .is_some_and(|d| d.len() >= vars.len()));
                         let start_dims = if purely_packed {
                             Some(Vec::new())
                         } else {
@@ -63442,7 +63672,10 @@ impl Simulator {
                             // record (e.g. a bare `reg [W-1:0]` element).
                             let mut descs: Vec<bool> = vec![false; dims.len()];
                             if dims.len() < vars.len() {
-                                if let Some(pdims) = self.module.packed_full_dims.get(&*name) {
+                                if let Some(pdims) = prop_packed_dims
+                                    .as_ref()
+                                    .or_else(|| self.module.packed_full_dims.get(&*name))
+                                {
                                     for &(l, r) in pdims.iter() {
                                         if dims.len() >= vars.len() {
                                             break;
@@ -107386,30 +107619,6 @@ impl Simulator {
             // constrained value; sizing it earlier yields the scalar's raw,
             // unconstrained draw and the `.size() == m.length` acceptance then
             // fails. `unique {}` runs last over the settled elements.
-            let mut pinned_elems: HashSet<String> = HashSet::default();
-            if !rand_colls.is_empty() {
-                self.solve_array_sizes(&rand_colls, &constraints);
-                // Fresh random baseline for every element of a dynamic /
-                // associative member (fixed arrays keep the legacy pool pass).
-                // §18.4.1: a CLASS-element collection (`rand obj arr[]`) holds
-                // object handles that are randomized RECURSIVELY — never drawn
-                // as scalars, or the handle is overwritten with junk.
-                for c in &rand_colls {
-                    if c.kind == CollKind::Fixed || c.is_object_elem {
-                        continue;
-                    }
-                    for key in self.coll_elem_keys(c) {
-                        let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
-                        let v = self.draw_elem(c.width, prev);
-                        self.write_coll_elem(&key, v);
-                    }
-                }
-                self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
-                self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
-                for c in &unique_colls {
-                    self.enforce_unique_coll(c, &constraints, &pinned_elems);
-                }
-            }
 
             // Push rand SCALAR enum fields off any reserved value implied by
             // `!(field inside {…})` / `field != X` exclusions. Iterated so
@@ -107468,102 +107677,11 @@ impl Simulator {
             }
 
             // Randomize rand fixed-array elements now that the scalar fields
-            // their exclusions reference (sp/tp/scratch_reg) are solved. For
-            // Collect array names that have a *positive* foreach constraint
-            // (`foreach (arr[i]) arr[i] inside {…}`); the rand_array loop
-            // would otherwise overwrite the per-index slices solve_forced
-            // wrote. Those arrays are still seeded by the later second
-            // solve_forced pass.
-            let foreach_constrained_arrays: HashSet<String> = {
-                let mut set = HashSet::default();
-                // Only a POSITIVE `arr[i] inside {…}` body is something
-                // solve_forced_array_elem can solve — only those arrays must
-                // be left to it. A negated-only body (`!(arr[i] inside {…})`,
-                // riscv-dv's gpr_c) is exclusion-shaped: the rand_array pool
-                // pass below handles it via collect_array_exclusions (and
-                // picks distinct elements), so such arrays must NOT be
-                // skipped here — skipping left gpr[0] free to keep ZERO and
-                // emit an illegal `la x0, _start`.
-                fn has_positive_inside(item: &ConstraintItem) -> bool {
-                    match item {
-                        ConstraintItem::Expr(e) => match &e.kind {
-                            ExprKind::Inside { .. } => true,
-                            // §18.5.7: equality / relational element bodies
-                            // (`arr[i] == i + 5`, `arr[i] < K`) are also
-                            // solved per-index by solve_forced_array_elem,
-                            // so the pool pass must not re-seed them either.
-                            // Exactly ONE side must be an element ref —
-                            // cross-element relations (`arr[i] < arr[i+1]`)
-                            // are not solved there and keep pool seeding.
-                            ExprKind::Binary { op, left, right } => {
-                                let li = matches!(&left.kind, ExprKind::Index { .. });
-                                let ri = matches!(&right.kind, ExprKind::Index { .. });
-                                matches!(
-                                    op,
-                                    BinaryOp::Eq
-                                        | BinaryOp::Lt
-                                        | BinaryOp::Leq
-                                        | BinaryOp::Gt
-                                        | BinaryOp::Geq
-                                ) && (li != ri)
-                            }
-                            _ => false,
-                        },
-                        ConstraintItem::Inside { .. } => true,
-                        ConstraintItem::Block(items) => items.iter().any(has_positive_inside),
-                        ConstraintItem::Soft(inner) => has_positive_inside(inner),
-                        _ => false,
-                    }
-                }
-                fn walk(item: &ConstraintItem, out: &mut HashSet<String>) {
-                    if let ConstraintItem::Foreach {
-                        array, item: body, ..
-                    } = item
-                    {
-                        // Only skip the pool pass for arrays whose foreach body
-                        // has a POSITIVE `inside` (what solve_forced_array_elem
-                        // can solve); negated-only bodies are exclusion-shaped
-                        // and belong to the pool pass.
-                        if !has_positive_inside(body.as_ref()) {
-                            return;
-                        }
-                        let inner_h = match &array.kind {
-                            ExprKind::Index { expr: b, .. } => match &b.kind {
-                                ExprKind::Ident(h) => Some(h),
-                                _ => None,
-                            },
-                            ExprKind::Ident(h) => Some(h),
-                            _ => None,
-                        };
-                        if let Some(h) = inner_h {
-                            if !h.path.is_empty() {
-                                out.insert(h.path[0].name.name.clone());
-                            }
-                        }
-                    }
-                    if let ConstraintItem::Block(items) = item {
-                        for it in items {
-                            walk(it, out);
-                        }
-                    }
-                    if let ConstraintItem::Soft(inner) = item {
-                        walk(inner, out);
-                    }
-                }
-                for con in &constraints {
-                    for item in &con.items {
-                        walk(item, &mut set);
-                    }
-                }
-                set
-            };
+            // their exclusions reference (sp/tp/scratch_reg) are solved.
             // each element pick a valid enum member outside the array's
             // `foreach !(elem inside {…})` exclusion, distinct across the array
             // (best-effort `unique{}`).
             for (prop, scoped, lo, hi, width, enum_t) in &rand_arrays {
-                if foreach_constrained_arrays.contains(prop) {
-                    continue; // solve_forced will handle this in the next pass
-                }
                 let excluded = self.collect_array_exclusions(prop, &constraints);
                 let pool: Vec<u64> = if let Some(et) = enum_t {
                     self.module
@@ -107599,8 +107717,12 @@ impl Simulator {
                     } else {
                         0
                     };
-                    self.signals
-                        .insert(format!("{}[{}]", scoped, i), Value::from_u64(v, *width));
+                    let val = if !pool.is_empty() || *width <= 64 {
+                        Value::from_u64(v, *width)
+                    } else {
+                        self.random_value_of_width(*width)
+                    };
+                    self.signals.insert(format!("{}[{}]", scoped, i), val);
                 }
             }
 
@@ -107608,9 +107730,6 @@ impl Simulator {
             // shape, unless a positive foreach body owns the array (same
             // skip-set as the 1-D pool pass above).
             for (prop, scoped, shape, width) in &rand_nd_arrays {
-                if foreach_constrained_arrays.contains(prop) {
-                    continue; // solve_forced will handle this in the next pass
-                }
                 if shape.iter().any(|&(lo, hi)| hi < lo) {
                     continue;
                 }
@@ -107628,8 +107747,13 @@ impl Simulator {
                     } else {
                         0
                     };
-                    self.signals
-                        .insert(format!("{}{}", scoped, suffix), Value::from_u64(v, *width));
+                    // Elements wider than 64 bits were left at zero.
+                    let val = if *width <= 64 {
+                        Value::from_u64(v, *width)
+                    } else {
+                        self.random_value_of_width(*width)
+                    };
+                    self.signals.insert(format!("{}{}", scoped, suffix), val);
                     let mut k = shape.len();
                     loop {
                         if k == 0 {
@@ -107656,6 +107780,63 @@ impl Simulator {
             // multi-expression `unique {a, b, arr[0:2]}` desugars to (each `!=`
             // re-pick respects its target's declared range, so this cannot
             // knock a scalar out of its `inside` set).
+            // The array draws above run AFTER the first repair pass and
+            // overwrite whatever it wrote into array elements (`a[0] == 5`,
+            // foreach bodies). Arrays under a foreach used to be skipped
+            // instead, which left them undrawn: a zero that already satisfied
+            // `e[i] < 100` was kept, and repeated randomize() calls returned
+            // the same values. Draw everything, then repair the hard items and
+            // the foreach items once more against the fresh draws.
+            {
+                fn has_foreach(item: &ConstraintItem) -> bool {
+                    match item {
+                        ConstraintItem::Foreach { .. } => true,
+                        ConstraintItem::Block(items) => items.iter().any(has_foreach),
+                        ConstraintItem::Soft(inner) => has_foreach(inner),
+                        _ => false,
+                    }
+                }
+                for _pass in 0..4 {
+                    let mut changed = false;
+                    for item in constraints
+                        .iter()
+                        .flat_map(|c| c.items.iter())
+                        .chain(inline.iter())
+                        .filter(|it| !matches!(it, ConstraintItem::Soft(_)) || has_foreach(it))
+                    {
+                        if self.solve_forced(handle, item, &rand_set) {
+                            changed = true;
+                        }
+                    }
+                    if !changed {
+                        break;
+                    }
+                }
+            }
+            let mut pinned_elems: HashSet<String> = HashSet::default();
+            if !rand_colls.is_empty() {
+                self.solve_array_sizes(&rand_colls, &constraints);
+                // Fresh random baseline for every element of a dynamic /
+                // associative member (fixed arrays keep the legacy pool pass).
+                // §18.4.1: a CLASS-element collection (`rand obj arr[]`) holds
+                // object handles that are randomized RECURSIVELY — never drawn
+                // as scalars, or the handle is overwritten with junk.
+                for c in &rand_colls {
+                    if c.kind == CollKind::Fixed || c.is_object_elem {
+                        continue;
+                    }
+                    for key in self.coll_elem_keys(c) {
+                        let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
+                        let v = self.draw_elem(c.width, prev);
+                        self.write_coll_elem(&key, v);
+                    }
+                }
+                self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
+                self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
+                for c in &unique_colls {
+                    self.enforce_unique_coll(c, &constraints, &pinned_elems);
+                }
+            }
             {
                 fn collect_unique_items<'a>(
                     item: &'a ConstraintItem,
@@ -109524,7 +109705,10 @@ impl Simulator {
                 // `foreach (m[i,j])` constraint found no range and was dropped
                 // silently — randomize() still returned 1 and every element
                 // came out unconstrained.
-                let Some((dims, elem_w)) = self.fixed_foreach_dims(handle, &arr_name) else {
+                let Some((dims, elem_w)) = self
+                    .fixed_foreach_dims(handle, &arr_name)
+                    .or_else(|| self.packed_prop_foreach_dims(handle, &arr_name))
+                else {
                     return false;
                 };
                 // One loop variable per leading dimension (§12.7.3).
@@ -109773,9 +109957,8 @@ impl Simulator {
                 let elem_name = format!("{}{}", arr_name, idx);
                 // A CLASS array element lives under the instance-scoped key;
                 // the bare name only exists for a module-level array.
-                let scoped_key = format!("{}#{}{}", handle, arr_name, idx);
                 let cur = self
-                    .get_signal_value_by_name(&scoped_key)
+                    .class_elem_load(handle, arr_name, idx)
                     .or_else(|| self.get_signal_value_by_name(&elem_name))
                     .unwrap_or_else(|| Value::zero(32));
                 if self.value_in_ranges(&cur, range) {
@@ -109783,7 +109966,7 @@ impl Simulator {
                 }
                 let width = cur.width.max(32);
                 if let Some(picked) = self.pick_from_ranges(range, width, cur.is_signed) {
-                    self.signals.insert(scoped_key, picked.clone());
+                    self.class_elem_store(handle, arr_name, idx, picked.clone());
                     self.set_signal_value_by_name(&elem_name, picked.clone());
                     return true;
                 }
@@ -109822,8 +110005,7 @@ impl Simulator {
                     if let Some(picked) = self.pick_from_ranges(&cr, width, cur.is_signed) {
                         // Write to the scoped per-element key (`<handle>#arr[i]`)
                         // — the place exec_randomize wrote the random baseline.
-                        let scoped_key = format!("{}#{}{}", handle, arr_name, idx);
-                        self.signals.insert(scoped_key, picked.clone());
+                        self.class_elem_store(handle, arr_name, idx, picked.clone());
                         // Also try the unscoped form for module-level arrays.
                         self.set_signal_value_by_name(&elem_name, picked);
                         return true;
@@ -109876,13 +110058,12 @@ impl Simulator {
                         (left, m)
                     };
                     let elem_name = format!("{}{}", arr_name, idx);
-                    let scoped_key = format!("{}#{}{}", handle, arr_name, idx);
                     let cur = self
                         .get_signal_value_by_name(&elem_name)
-                        .or_else(|| self.signals.get(&scoped_key).cloned());
+                        .or_else(|| self.class_elem_load(handle, arr_name, idx));
                     let w = cur.as_ref().map(|v| v.width).unwrap_or(32).max(1);
                     let write_elem = |s: &mut Self, v: Value| {
-                        s.signals.insert(scoped_key.clone(), v.clone());
+                        s.class_elem_store(handle, arr_name, idx, v.clone());
                         s.set_signal_value_by_name(&elem_name, v);
                     };
                     match eff {
@@ -110010,6 +110191,66 @@ impl Simulator {
     /// The FIXED shape of a class rand array member, walking the inheritance
     /// chain: 1-D from `array_properties`, N-D from `array_nd_properties`.
     /// Returns (per-dimension bounds, element width).
+    /// foreach geometry of a packed multi-dimensional class property
+    /// (`bit [6:0] [4:0][1:0] d`): the packed dims normalised to (lo, hi)
+    /// and the width of one addressed element.
+    fn packed_prop_foreach_dims(
+        &self,
+        handle: usize,
+        arr_name: &str,
+    ) -> Option<(Vec<(i64, i64)>, u32)> {
+        let pd = self.class_prop_packed_dims(handle, arr_name)?;
+        let total = self.read_member_value(handle, arr_name)?.width as u64;
+        let ew = Self::packed_chain_width(total, &pd, pd.len()) as u32;
+        Some((pd.iter().map(|&(l, r)| (l.min(r), l.max(r))).collect(), ew))
+    }
+
+    fn parse_idx_suffix(idx: &str) -> Option<Vec<Value>> {
+        let mut out = Vec::new();
+        for part in idx.split('[').skip(1) {
+            let n: i64 = part.strip_suffix(']')?.trim().parse().ok()?;
+            out.push(Value::from_u64(n as u64, 32));
+        }
+        Some(out)
+    }
+
+    /// Read one element of a class array property addressed by an index
+    /// suffix (`[1][0]`): the per-element `<handle>#arr[1][0]` signal for
+    /// unpacked arrays, a bit slice of the property for packed ones.
+    fn class_elem_load(&self, handle: usize, arr_name: &str, idx: &str) -> Option<Value> {
+        if let Some(dims) = self.class_prop_packed_dims(handle, arr_name) {
+            let base = self.read_member_value(handle, arr_name)?;
+            let iv = Self::parse_idx_suffix(idx)?;
+            let (lsb, w) = Self::packed_chain_slice(base.width as u64, &dims, &iv)?;
+            return Some(base.range_select((lsb + w - 1) as usize, lsb as usize));
+        }
+        self.get_signal_value_by_name(&format!("{}#{}{}", handle, arr_name, idx))
+    }
+
+    fn class_elem_store(&mut self, handle: usize, arr_name: &str, idx: &str, v: Value) {
+        if let Some(dims) = self.class_prop_packed_dims(handle, arr_name) {
+            let (Some(cur), Some(iv)) = (
+                self.read_member_value(handle, arr_name),
+                Self::parse_idx_suffix(idx),
+            ) else {
+                return;
+            };
+            let Some((lsb, w)) = Self::packed_chain_slice(cur.width as u64, &dims, &iv) else {
+                return;
+            };
+            let piece = v.resize(w as u32);
+            let mut nv = cur;
+            for i in 0..(w as usize) {
+                nv.set_bit(lsb as usize + i, piece.get_bit(i));
+            }
+            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                inst.properties.insert(arr_name.to_string(), nv);
+            }
+            return;
+        }
+        self.signals.insert(format!("{}#{}{}", handle, arr_name, idx), v);
+    }
+
     fn fixed_foreach_dims(
         &self,
         handle: usize,
