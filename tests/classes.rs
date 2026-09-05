@@ -260,3 +260,5 @@ mod sqr_zero_time_loop;
 mod method_local_base_per_process;
 #[path = "classes/class_covergroups.rs"]
 mod class_covergroups;
+#[path = "classes/array_query_handle_qualified_member.rs"]
+mod array_query_handle_qualified_member;
