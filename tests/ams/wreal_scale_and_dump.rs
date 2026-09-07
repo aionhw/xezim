@@ -127,7 +127,11 @@ endmodule
 "#,
         path.to_str().unwrap()
     );
+    // Waveform dumping is opt-in (`--wave` on the CLI); the library entry
+    // point needs the switch thrown explicitly.
+    xezim::compiler::simulator::set_wave_enabled(true);
     with_ams(|| simulate(&src, 100).expect("simulate"));
+    xezim::compiler::simulator::set_wave_enabled(false);
     let vcd = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("no VCD written to {}: {}", path.display(), e));
     let _ = std::fs::remove_file(&path);
