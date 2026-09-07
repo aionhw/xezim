@@ -384,3 +384,7 @@ fn test_sv_neg11_missing_named_port() {
 fn test_sv_neg13_wreal_packed_range() {
     run_negative_compliance_test("neg13_wreal_packed_range.sv");
 }
+#[test]
+fn test_sv_neg14_wreal_explicit_type() {
+    run_negative_compliance_test("neg14_wreal_explicit_type.sv");
+}

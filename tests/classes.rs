@@ -61,6 +61,8 @@ mod class_local_typedef_aa;
 mod class_local_typedef_resolution;
 #[path = "classes/class_method_dispatch.rs"]
 mod class_method_dispatch;
+#[path = "classes/bare_parameterless_method_call.rs"]
+mod bare_parameterless_method_call;
 #[path = "classes/method_default_this_call.rs"]
 mod method_default_this_call;
 #[path = "classes/class_name_method_shadow.rs"]
@@ -91,6 +93,12 @@ mod constraint_arrays_ordering;
 mod constraint_dyn_size_pinned_scalar;
 #[path = "classes/constraint_foreach_and_casts.rs"]
 mod constraint_foreach_and_casts;
+#[path = "classes/chained_member_element_access.rs"]
+mod chained_member_element_access;
+#[path = "classes/foreach_member_multidim.rs"]
+mod foreach_member_multidim;
+#[path = "classes/constraint_foreach_conditional.rs"]
+mod constraint_foreach_conditional;
 #[path = "classes/constraint_funcs_aggregates.rs"]
 mod constraint_funcs_aggregates;
 #[path = "classes/constraint_inline_enclosing_scope.rs"]
@@ -129,6 +137,8 @@ mod ivtest_class_struct_cluster;
 mod localparam_class_not_parameterized;
 #[path = "classes/nonvirtual_dispatch_fscanf_process.rs"]
 mod nonvirtual_dispatch_fscanf_process;
+#[path = "classes/static_member_method_collision.rs"]
+mod static_member_method_collision;
 #[path = "classes/out_of_class_method_shadow.rs"]
 mod out_of_class_method_shadow;
 #[path = "classes/param_typedef_ctor_resolution.rs"]
@@ -171,6 +181,8 @@ mod struct_formal_and_config_foreach;
 mod typename_param_class;
 #[path = "classes/unpacked_struct_class_property_whole_value.rs"]
 mod unpacked_struct_class_property_whole_value;
+#[path = "classes/nested_seq_method_dispatch.rs"]
+mod nested_seq_method_dispatch;
 #[path = "classes/uvm_config_db_tests.rs"]
 mod uvm_config_db_tests;
 #[path = "classes/uvm_factory_linkage.rs"]
@@ -218,6 +230,8 @@ mod struct_prop_whole_copy;
 mod randomize_obj_array_property;
 #[path = "classes/static_assoc_struct_pool.rs"]
 mod static_assoc_struct_pool;
+#[path = "classes/static_collection_qualified_access.rs"]
+mod static_collection_qualified_access;
 #[path = "classes/vif_static_roundtrip.rs"]
 mod vif_static_roundtrip;
 #[path = "classes/vif_property_named_like_instance.rs"]
@@ -230,3 +244,31 @@ mod class_localparam_array;
 mod member_collection_runtime_class;
 #[path = "classes/enum_local_shadows_flat_maps.rs"]
 mod enum_local_shadows_flat_maps;
+#[path = "classes/ref_formal_shadows_property.rs"]
+mod ref_formal_shadows_property;
+#[path = "classes/field_init_once_in_order.rs"]
+mod field_init_once_in_order;
+#[path = "classes/caller_local_shadows_this_cast.rs"]
+mod caller_local_shadows_this_cast;
+#[path = "classes/condition_waiter_yields_to_inactive.rs"]
+mod condition_waiter_yields_to_inactive;
+#[path = "classes/package_class_nested_class.rs"]
+mod package_class_nested_class;
+#[path = "classes/sqr_zero_time_loop.rs"]
+mod sqr_zero_time_loop;
+#[path = "classes/method_local_base_per_process.rs"]
+mod method_local_base_per_process;
+#[path = "classes/class_covergroups.rs"]
+mod class_covergroups;
+#[path = "classes/array_query_handle_qualified_member.rs"]
+mod array_query_handle_qualified_member;
+#[path = "classes/parked_task_local_vif_alias.rs"]
+mod parked_task_local_vif_alias;
+#[path = "classes/class_randomize_multidim.rs"]
+mod class_randomize_multidim;
+#[path = "classes/class_method_sibling_instance_oomr.rs"]
+mod class_method_sibling_instance_oomr;
+#[path = "classes/method_int_formal_zero_extends.rs"]
+mod method_int_formal_zero_extends;
+#[path = "classes/handle_chain_read_in_instance_task.rs"]
+mod handle_chain_read_in_instance_task;

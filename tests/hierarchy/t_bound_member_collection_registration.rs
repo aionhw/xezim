@@ -42,7 +42,7 @@ endmodule
 "#;
     let out: Vec<String> = simulate_multi(
         &[src.to_string()], 1000, Some("top"), &[], &[], None, false, None, None,
-        &[], &[], 1, None, &[], 0, u64::MAX, None, &[], None, None, None, None, false, None,
+        &[], &[], None, &[], 0, u64::MAX, None, &[], None, None, None, None, false, None,
     )
     .expect("sim")
     .output

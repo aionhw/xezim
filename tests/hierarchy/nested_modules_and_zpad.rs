@@ -59,10 +59,17 @@ endmodule
     assert!(has(&sim, "T|top"));
 }
 
-/// Reference: wide=zzzz1010 — the 4 unconnected high bits of the 8-bit input
-/// float z; the connected low bits carry the actual.
+/// §23.3.3.6: a port connection is an implicit continuous assignment, so a
+/// narrower actual on an INPUT port zero-extends to the formal width.
+///
+/// DELIBERATE reference divergence: the reference simulator leaves the
+/// unconnected high bits z (wide=zzzz1010 measured, and this test used to pin
+/// that), but the other major simulator zero-extends, and the LRM reading
+/// favors extension. The z bits walked through a production DUT's CDC and
+/// stalled its write path as X (the cv8s DRAM testbench), which settled the
+/// choice. INOUT ports keep the z-fill — they are bidirectional.
 #[test]
-fn narrow_actual_on_wider_input_port_z_pads() {
+fn narrow_actual_on_wider_input_port_zero_extends() {
     let src = r#"
 module child(input [7:0] wide, output [3:0] narrow_o);
   assign narrow_o = wide[3:0];
@@ -76,14 +83,15 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
-    assert_eq!(line(&sim, "T|wide="), "T|wide=zzzz1010");
+    assert_eq!(line(&sim, "T|wide="), "T|wide=00001010");
     assert_eq!(line(&sim, "T|no="), "T|no=1010");
 }
 
-/// Reference: z-fill applies to SIGNED actuals too (s=zzzz11111011 for -5,
-/// u=zzzz10100101) — net connections never sign-extend.
+/// §10.7 via §23.3.3.6: a SIGNED narrower actual sign-extends to the input
+/// port width, like the RHS of any continuous assignment. (Same deliberate
+/// reference divergence as above — the reference z-fills, s=zzzz11111011.)
 #[test]
-fn signed_narrow_actual_still_z_pads() {
+fn signed_narrow_actual_sign_extends() {
     let src = r#"
 module cp_s(output wire logic signed [11:0] dst, input wire logic signed [11:0] src);
   assign dst = src;
@@ -99,5 +107,40 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
-    assert_eq!(line(&sim, "T|s="), "T|s=zzzz11111011");
+    assert_eq!(line(&sim, "T|s="), "T|s=111111111011");
 }
+
+/// The production shape that settled the §23.3.3.6 choice: a testbench tying
+/// unused DUT input ports to narrow sized constants (`.vld_p1(1'b0)` on a
+/// 2-bit port). The z upper bit crossed a CDC as X and stalled the DUT's
+/// write path. Nine-case matrix from the report, xrun-validated.
+#[test]
+fn narrow_constants_and_vars_zero_extend_on_input_ports() {
+    let src = r#"
+module sink2 (output logic [3:0] o, input logic [3:0] p); assign o = p; endmodule
+module sink1 (output logic o, input logic p);              assign o = p; endmodule
+module tb;
+  logic [3:0] a, b, c, d, e, f, g, h4;
+  logic i1;
+  logic [1:0] var1 = 2'b00;
+  sink2 uA (.o(a),  .p(1'b0));    // 1-bit sized const
+  sink2 uB (.o(b),  .p(2'b0));    // 2-bit sized const
+  sink2 uC (.o(c),  .p(0));       // unsized
+  sink2 uD (.o(d),  .p(1'b1));
+  sink2 uE (.o(e),  .p(1));
+  sink2 uF (.o(f),  .p(2'b10));
+  sink2 uG (.o(g),  .p(var1));    // narrow VARIABLE
+  sink2 uH (.o(h4), .p(4'd0));    // width-matched
+  sink1 uI (.o(i1), .p(1'b0));
+  initial begin
+    #1 $display("T|m=%b%b%b%b%b%b%b%b%b", a, b, c, d, e, f, g, h4, i1);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 10).expect("simulate failed");
+    assert_eq!(
+        line(&sim, "T|m="),
+        "T|m=000000000000000100010010000000000"
+    );
+}
+

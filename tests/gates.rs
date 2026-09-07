@@ -17,14 +17,28 @@ mod assign_pattern_aggregate;
 mod drive_strength_pull;
 #[path = "gates/dump_merged_sv.rs"]
 mod dump_merged_sv;
+#[path = "gates/fn_return_member_inlines.rs"]
+mod fn_return_member_inlines;
 #[path = "gates/fst_roundtrip.rs"]
 mod fst_roundtrip;
+#[path = "gates/opt_pass_equivalence.rs"]
+mod opt_pass_equivalence;
+#[path = "gates/packed_member_nba_compiles.rs"]
+mod packed_member_nba_compiles;
+#[path = "gates/packed_member_nesting_compiles.rs"]
+mod packed_member_nesting_compiles;
+#[path = "gates/streaming_op_compiles.rs"]
+mod streaming_op_compiles;
 #[path = "gates/specify_flags.rs"]
 mod specify_flags;
+#[path = "gates/two_d_array_store_compiles.rs"]
+mod two_d_array_store_compiles;
 #[path = "gates/tran_and_implicit_nets.rs"]
 mod tran_and_implicit_nets;
 #[path = "gates/udp_primitives.rs"]
 mod udp_primitives;
+#[path = "gates/wave_flag_gates_dumping.rs"]
+mod wave_flag_gates_dumping;
 #[path = "gates/vcd_lrm_compliance.rs"]
 mod vcd_lrm_compliance;
 #[path = "gates/dump_formats_agree.rs"]
@@ -33,3 +47,5 @@ mod dump_formats_agree;
 mod fst_time_table_breakeven;
 #[path = "gates/interrupt_finalizes_dumps.rs"]
 mod interrupt_finalizes_dumps;
+#[path = "gates/cont_assign_packed2d_unit_inner.rs"]
+mod cont_assign_packed2d_unit_inner;

@@ -118,7 +118,7 @@ fn issue_26_static_init_sysfuncs() {
     let plusargs = vec!["TEST_MODE".to_string(), "SEED_VAL=42".to_string()];
     let sim = xezim::simulate_multi(
         &[src], 100_000, None, &[], &[], None, false, None, None, &[],
-        &plusargs, 1, None, &[], 0, u64::MAX, None, &[], None, None, None,
+        &plusargs, None, &[], 0, u64::MAX, None, &[], None, None, None,
         None, false, None,
     )
     .expect("simulate failed");

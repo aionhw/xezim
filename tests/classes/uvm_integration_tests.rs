@@ -118,7 +118,6 @@ fn run_uvm_opt(
         None,
         &defines,
         &[],
-        1,
         None,
         &[],
         0,
@@ -392,7 +391,6 @@ endmodule
         None,
         &[], // NO defines — UVM_NO_DPI deliberately absent
         &["+UVM_CONFIG_DB_TRACE".to_string()],
-        1,
         None,
         &[],
         0,

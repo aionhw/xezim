@@ -1,0 +1,19 @@
+set_level_shifter low_to_main -domain {PD_LOW} -applies_to both -rule both
+# All multiplier outputs clamp to 0 ...
+set_isolation mul_iso_all \
+    -domain PD_MUL \
+    -isolation_power_net VMAIN \
+    -isolation_ground_net GND \
+    -applies_to outputs \
+    -clamp_value 0 \
+    -isolation_signal mul_iso \
+    -isolation_sense high
+# ... except the zero flag, which clamps to 1.
+set_isolation mul_iso_zero \
+    -domain PD_MUL \
+    -isolation_power_net VMAIN \
+    -isolation_ground_net GND \
+    -clamp_value 1 \
+    -elements {u_mul/zero} \
+    -isolation_signal mul_iso \
+    -isolation_sense high

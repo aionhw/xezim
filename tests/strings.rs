@@ -11,10 +11,14 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "strings/local_string_array_init.rs"]
+mod local_string_array_init;
 #[path = "strings/assoc_in_always_ff_and_string_element_methods.rs"]
 mod assoc_in_always_ff_and_string_element_methods;
 #[path = "strings/call_time_defaults_and_string_queries.rs"]
 mod call_time_defaults_and_string_queries;
+#[path = "strings/class_member_string_queue_element_via_path.rs"]
+mod class_member_string_queue_element_via_path;
 #[path = "strings/display_only_always.rs"]
 mod display_only_always;
 #[path = "strings/dpi_integration_tests.rs"]
@@ -53,6 +57,8 @@ mod ref_arg_assoc_writeback;
 mod ref_arg_collection_writeback;
 #[path = "strings/string_eq_relational_2state.rs"]
 mod string_eq_relational_2state;
+#[path = "strings/string_flag_not_clobbered_by_samed_name_local.rs"]
+mod string_flag_not_clobbered_by_samed_name_local;
 #[path = "strings/string_index_ref_queue.rs"]
 mod string_index_ref_queue;
 #[path = "strings/string_is_dynamic.rs"]
@@ -71,3 +77,5 @@ mod compiled_sformatf_native;
 mod native_string_ops;
 #[path = "strings/string_returning_fn_inline.rs"]
 mod string_returning_fn_inline;
+#[path = "strings/dpi_unit_scope.rs"]
+mod dpi_unit_scope;

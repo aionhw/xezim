@@ -4,10 +4,10 @@
 //! runtime; the frameless local landed on the module signal and the block's
 //! writes clobbered it. Fixed by alpha-renaming such locals at Simulator
 //! construction (`rename_process_shadowed_locals`): the rename survives
-//! suspension, keeps two processes' same-named locals distinct, skips NAMED
-//! blocks (their locals stay hierarchically referenceable, §23.9), and skips
-//! any name a nested block redeclares. Reference-validated (tmp/ac/ac16b,
-//! ac25b).
+//! suspension, keeps two processes' same-named locals distinct (whether the
+//! body is unnamed, auto-named, or explicitly labelled — all flatten to the
+//! same bare-name `signals` slot), and skips any name a nested block
+//! redeclares. Reference-validated (tmp/ac/ac16b, ac25b).
 //!
 //! Also: §21.2.1.3 `%0h` of an all-x value prints a single collapsed "x",
 //! not one x per digit — leading x/z runs trim like leading zeros.
@@ -79,4 +79,59 @@ endmodule
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "r1"), 0xAA, "local keeps its own value");
     assert_eq!(u(&sim, "r2"), 0x5C, "module var takes the real write");
+}
+
+/// §6.21 — two processes declaring the SAME frameless block-local name that
+/// shadows NO module symbol. The old rename only fired for module-shadowing
+/// locals, so these bare-name locals collided in the shared `signals` table:
+/// each process's read picked up the other's (last-write-wins) value. The
+/// cross-process collision scan salts them per-process. Reference-validated
+/// (tmp/svrun/localsame_unnamed.sv, wc5u.sv, wc9u.sv — byte-for-byte).
+#[test]
+fn cross_process_same_named_frameless_local_stays_distinct() {
+    let src = r#"
+module tb;
+  logic [7:0] r1, r2;
+  initial begin
+    logic [7:0] v;
+    v = 8'h10;
+    #1 r1 = v;
+  end
+  initial begin
+    logic [7:0] v;
+    v = 8'h1;
+    #1 r2 = v;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "r1"), 0x10, "p1 reads its OWN local, not p2's");
+    assert_eq!(u(&sim, "r2"), 0x1, "p2 reads its OWN local");
+}
+
+/// The SAME collision holds for a body that carries an explicit label — a
+/// named block's body locals land in the flat `signals` table exactly like an
+/// unnamed block's (the process executor has no per-process block-scope frame
+/// for either), so a cross-process same-named local must be salted identically.
+/// Reference-validated (tmp/svrun/localsame.sv — byte-for-byte).
+#[test]
+fn cross_process_same_named_frameless_local_stays_distinct_named_blocks() {
+    let src = r#"
+module tb;
+  logic [7:0] r1, r2;
+  initial begin : p1
+    logic [7:0] v;
+    v = 8'h10;
+    #1 r1 = v;
+  end
+  initial begin : p2
+    logic [7:0] v;
+    v = 8'h1;
+    #1 r2 = v;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "r1"), 0x10, "p1 reads its OWN local, not p2's");
+    assert_eq!(u(&sim, "r2"), 0x1, "p2 reads its OWN local");
 }

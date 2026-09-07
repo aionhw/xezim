@@ -55,6 +55,9 @@ fn run(tag: &str) -> (Vec<String>, Vec<u64>) {
     let _ = std::fs::remove_file(&path);
 
     let src = SRC.replace("@VCD@", path.to_str().unwrap());
+    // Waveform dumping is opt-in (`--wave` on the CLI); this test compares the
+    // dump against $monitor, so it needs it on.
+    xezim::compiler::simulator::set_wave_enabled(true);
     let sim = simulate(&src, 100_000_000).expect("simulate failed");
 
     let mons: Vec<String> = sim

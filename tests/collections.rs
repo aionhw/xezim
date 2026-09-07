@@ -51,6 +51,8 @@ mod foreach_blocking_resume;
 mod foreach_negative_dims;
 #[path = "collections/lrm_clause7_arrays.rs"]
 mod lrm_clause7_arrays;
+#[path = "collections/mailbox_array_new.rs"]
+mod mailbox_array_new;
 #[path = "collections/mailbox_bounded.rs"]
 mod mailbox_bounded;
 #[path = "collections/multidim_assoc_array.rs"]
@@ -67,6 +69,8 @@ mod queue_local_shadow_restore;
 mod queue_member_init;
 #[path = "collections/queue_ops_and_dist.rs"]
 mod queue_ops_and_dist;
+#[path = "collections/sibling_static_collection_collision.rs"]
+mod sibling_static_collection_collision;
 #[path = "collections/sort_with_clause.rs"]
 mod sort_with_clause;
 #[path = "collections/struct_collections_across_calls.rs"]
@@ -89,3 +93,7 @@ mod assoc_of_struct;
 mod queue_concat_index_prefilled_prefix;
 #[path = "collections/foreach_live_size_bounds.rs"]
 mod foreach_live_size_bounds;
+#[path = "collections/foreach_packed_multidim.rs"]
+mod foreach_packed_multidim;
+#[path = "collections/std_randomize_multidim.rs"]
+mod std_randomize_multidim;

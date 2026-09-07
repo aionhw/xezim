@@ -192,3 +192,52 @@ endmodule
     assert_eq!(u(&sim, "thread_unshifted"), 1, "obj.randomize() consumed draws from the thread's $urandom stream");
     assert_eq!(u(&sim, "object_unshifted"), 1, "a process reseed disturbed the object's random stream");
 }
+
+/// §18.14.1: an otherwise-UNSEEDED object's `randomize()` draws from its
+/// calling process's stream, so `process::self().srandom(s)` (reapplied before
+/// each call) makes a FRESH object's randomize() reproducible from `s` alone —
+/// even across intervening draws on that same stream. (A UVM `uvm_info` in
+/// between is irrelevant precisely because the seed is reapplied.)
+/// This is the regression behind `process::self().srandom` making the
+/// report-message report-catcher's repeated randomize()es bit-identical.
+#[test]
+fn process_seed_makes_unseeded_object_randomize_reproducible() {
+    const SRC: &str = r#"
+module tb;
+  class Obj;
+    rand byte unsigned d;
+  endclass
+
+  Obj o;
+  byte unsigned r1, r2;
+  int repeats1 = 0;
+  int repeats2 = 0;
+
+  initial begin
+    process p;
+    p = process::self();
+
+    // Reapply the SAME process seed before each fresh object's randomize().
+    p.srandom(100);
+    o = new(); void'(o.randomize()); r1 = o.d;
+    p.srandom(100);
+    o = new(); void'(o.randomize()); r2 = o.d;
+    if (r1 == r2) repeats1 = 1;
+
+    // Draws consumed from the thread stream BETWEEN the reseeds (here a
+    // $urandom, standing in for UVM message machinery mid-run) do not matter:
+    // the reapplied seed right before randomize() pins the next draw.
+    void'($urandom());            // consume a draw, then re-seed
+    p.srandom(100);
+    o = new(); void'(o.randomize()); r1 = o.d;
+    void'($urandom());            // consume a draw, then re-seed again
+    p.srandom(100);
+    o = new(); void'(o.randomize()); r2 = o.d;
+    if (r1 == r2) repeats2 = 1;
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulation failed");
+    assert_eq!(u(&sim, "repeats1"), 1, "process srandom(seed) did not reproduce an unseeded object's randomize()");
+    assert_eq!(u(&sim, "repeats2"), 1, "a thread draw between reseeding and randomize() shifted the result");
+}

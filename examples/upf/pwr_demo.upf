@@ -1,0 +1,36 @@
+# Power intent for pwr_demo_top (IEEE 1801 / UPF 2.x command subset).
+set_design_top pwr_demo_top
+
+# Always-on domain: the two supply ports of the block.
+create_power_domain PD_TOP
+create_supply_net VDD -domain PD_TOP
+create_supply_port VDD -domain PD_TOP -direction in
+connect_supply_net VDD -ports {VDD}
+create_supply_net VSS -domain PD_TOP
+create_supply_port VSS -domain PD_TOP -direction in
+connect_supply_net VSS -ports {VSS}
+set_domain_supply_net PD_TOP -primary_power_net VDD -primary_ground_net VSS
+
+# Switchable accelerator domain: accumulator plus its configuration register.
+create_power_domain PD_ACC -elements {u_acc u_cfg}
+create_supply_net VDD_ACC -domain PD_ACC
+create_supply_net VSS -domain PD_ACC -reuse
+set_domain_supply_net PD_ACC -primary_power_net VDD_ACC -primary_ground_net VSS
+
+# Header switch: VDD -> VDD_ACC while acc_on is high.
+create_power_switch acc_sw \
+    -domain PD_ACC \
+    -input_supply_port  {vin VDD} \
+    -output_supply_port {vout VDD_ACC} \
+    -control_port       {ctl acc_on} \
+    -on_state           {acc_up vin {ctl}} \
+    -off_state          {acc_down {!ctl}}
+
+# Clamp the domain outputs to 0 while acc_iso_en is high.
+set_isolation acc_iso -domain PD_ACC -applies_to outputs \
+    -clamp_value 0 -isolation_power_net VDD -isolation_ground_net VSS
+set_isolation_control acc_iso -domain PD_ACC \
+    -isolation_signal acc_iso_en -isolation_sense high
+
+# The configuration register keeps its value through the power-down.
+set_retention cfg_ret -domain PD_ACC -elements {u_cfg}

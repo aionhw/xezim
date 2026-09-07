@@ -1,0 +1,35 @@
+# Power intent for core_blk (renamed stand-in). Scope: the core block.
+set_design_top core_blk
+# Always-on domain with the three supply ports.
+create_power_domain PD_MAIN
+create_supply_net VMAIN -domain PD_MAIN
+create_supply_port VMAIN -domain PD_MAIN -direction in
+connect_supply_net VMAIN -ports {VMAIN}
+create_supply_net VLOW -domain PD_MAIN
+create_supply_port VLOW -domain PD_MAIN -direction in
+connect_supply_net VLOW -ports {VLOW}
+create_supply_net GND -domain PD_MAIN
+create_supply_port GND -domain PD_MAIN -direction in
+connect_supply_net GND -ports {GND}
+set_domain_supply_net PD_MAIN -primary_power_net VMAIN -primary_ground_net GND
+# Low-voltage domain: control + registers.
+create_power_domain PD_LOW \
+    -elements {u_ctl u_regs}
+create_supply_net VLOW -domain PD_LOW -reuse
+create_supply_net GND -domain PD_LOW -reuse
+set_domain_supply_net PD_LOW -primary_power_net VLOW -primary_ground_net GND
+set_retention regs_ret -domain PD_LOW -elements {u_regs}
+# Switched multiplier domain.
+create_power_domain PD_MUL -elements {u_mul}
+create_supply_net VMUL -domain PD_MUL
+create_supply_net GND -domain PD_MUL -reuse
+set_domain_supply_net PD_MUL -primary_power_net VMUL -primary_ground_net GND
+create_power_switch mul_sw \
+    -domain PD_MUL \
+    -input_supply_port {vin VMAIN} \
+    -output_supply_port {vout VMUL} \
+    -control_port {ctrl_off mul_off} \
+    -on_state {mul_on vin {!ctrl_off}} \
+    -off_state {mul_gated {ctrl_off}}
+load_upf pwr_iso.upf
+load_upf pwr_pst.upf

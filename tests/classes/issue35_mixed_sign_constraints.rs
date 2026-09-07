@@ -150,7 +150,6 @@ endmodule
             None,
             &[],
             &plus,
-            1,
             None,
             &[],
             0,

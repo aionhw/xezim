@@ -118,7 +118,12 @@ fn print_usage() {
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!("  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)");
     eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug)");
-    eprintln!("  --strict-top     Error out if -s names a module that does not exist");
+    eprintln!("  --strict-top     Error out if -s names a module that does not exist (default)");
+    eprintln!("  --no-strict-top  Warn and auto-detect the design root instead when -s names");
+    eprintln!("                   a module that does not exist (for generated corpora whose");
+    eprintln!("                   recorded top names are known-stale)");
+    eprintln!("  --profile        Print the [PROF] end-of-run profile report (edge-block, settle");
+    eprintln!("                   and timing counters). Same as XEZIM_PROFILE_REPORT=1.");
     eprintln!("  --error-exit     Exit nonzero if any $error was reported ($fatal always does)
   --relax-implicit-static  Accept `int x = ...;` inside a static subroutine
                    (§6.21) with a warning instead of an error. Also enabled by
@@ -127,6 +132,10 @@ fn print_usage() {
     eprintln!("                   definitions (modules/interfaces/packages/...) it contributed");
     eprintln!("  --dump-files-list  Print the full resolved file list (after -f expansion):");
     eprintln!("                     sources in parse order, -v library files, -y library dirs");
+    eprintln!("  --upf <file>             Load IEEE 1801 power intent (repeatable): supply nets, power");
+    eprintln!("                           switches, domain corruption, isolation; UPF package functions");
+    eprintln!("  --upf-top <path>         Instance the UPF scope applies to (default: first instance of");
+    eprintln!("                           the set_design_top module)");
     eprintln!("  --dump-merged-sv <file>  Write the sources, fully preprocessed (`ifdef");
     eprintln!("                     resolved, macros expanded, `includes inlined), into one");
     eprintln!("                     self-contained .sv file — a standalone repro for");
@@ -160,8 +169,6 @@ fn print_usage() {
     eprintln!("  -timescale <unit>/<prec>     spelled as other simulators spell it. Same rule:");
     eprintln!("                     it is a DEFAULT for design elements with no timescale");
     eprintln!("                     directive, and never overrides an explicit one.");
-    eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
-    eprintln!("                   n>=2 offloads stdout writes to a background thread.");
     eprintln!("  --report-stats[=json]  Print an end-of-run statistics footer on stderr");
     eprintln!("                   (human text; '=json' emits one JSON line instead). Off by");
     eprintln!("                   default. XEZIM_REPORT_STATS=1|json enables it too; the");
@@ -202,6 +209,11 @@ fn print_usage() {
     eprintln!("  --xtrace-profile <name>  @profile header value (default: minimal).");
     eprintln!("  --xtrace-compress <none|zstd>  Compress the XTrace stream (declared in");
     eprintln!("                   the @compression header; forces a '.zst' file name).");
+    eprintln!("  --wave           Compile the model WITH waveform support, enabling the");
+    eprintln!("                   `$dumpfile`/`$dumpvars` VCD tasks. Off by default: an");
+    eprintln!("                   active dump forces loops onto the slower AST path and");
+    eprintln!("                   builds a per-signal trace table, so a run that never");
+    eprintln!("                   dumps should not pay for it. `--fst`/`--xtrace` imply it.");
     eprintln!("  --fst <file>     Emit an FST (GTKWave binary) waveform dump to <file>.");
     eprintln!("  --fst-scope <hier>  Restrict the FST dump to signals under <hier>");
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
@@ -707,6 +719,9 @@ fn process_command_file(
                 }
                 "--strict-top" => {
                     xezim::set_strict_top(true);
+                }
+                "--no-strict-top" => {
+                    xezim::set_strict_top(false);
                 }
                 _ if t.starts_with("+define+") => {
                     push_plus_define(t, defines);
@@ -1222,7 +1237,12 @@ fn strip_duplicate_unit_subroutines(
 /// the merged file rebuilds standalone, with no -v/-y flags. Whole files are
 /// appended (a cell library groups related primitives); if one also defines a
 /// name the primary sources already define, the re-compile will say so.
-fn append_adopted_libs_to_merged(merged_out: &str) {
+fn append_adopted_libs_to_merged(
+    merged_out: &str,
+    primary_texts: &[String],
+    primary_labels: &[String],
+    kept: Option<&[usize]>,
+) {
     let adopted = xezim::adopted_lib_files();
     if adopted.is_empty() {
         return;
@@ -1231,6 +1251,13 @@ fn append_adopted_libs_to_merged(merged_out: &str) {
     let mut nfiles = 0usize;
     let mut nmods = 0usize;
     let mut nstripped = 0usize;
+    // References made INSIDE the adopted library texts. The `-s <top>` file
+    // closure is lexical over the PRIMARY sources only, so a primary file
+    // whose module is instantiated solely from a library file was dropped
+    // from the merged output — the dump then contained the instantiation but
+    // not the definition and did not re-run standalone. Collect the library
+    // refs here and re-add such primaries below.
+    let mut lib_refs: Vec<String> = Vec::new();
     // Seed from the primary sources already in the file, so a library copy of
     // a task the design itself defines is suppressed too.
     let mut seen_subs: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1267,6 +1294,10 @@ fn append_adopted_libs_to_merged(merged_out: &str) {
         };
         nfiles += 1;
         nmods += mods.len();
+        {
+            let (_decl, refs, _bind) = scan_units_and_refs(&text);
+            lib_refs.extend(refs);
+        }
         let (text, nstrip) = strip_duplicate_unit_subroutines(&text, &mut seen_subs);
         nstripped += nstrip;
         extra.push_str(&format!(
@@ -1282,6 +1313,58 @@ fn append_adopted_libs_to_merged(merged_out: &str) {
     }
     if nfiles == 0 {
         return;
+    }
+    // Re-add primary files the `-s` closure dropped but the adopted library
+    // text references (transitively: a re-added primary may itself pull in
+    // further dropped primaries). Mirrors elaboration order — a name declared
+    // by a primary resolves there before any library fallback.
+    if let Some(kept) = kept {
+        let scanned: Vec<_> = primary_texts.iter().map(|t| scan_units_and_refs(t)).collect();
+        let mut owner: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (fi, (declared, _, _)) in scanned.iter().enumerate() {
+            for name in declared {
+                owner.entry(name.as_str()).or_insert(fi);
+            }
+        }
+        let mut included = vec![false; primary_texts.len()];
+        for &fi in kept {
+            if fi < included.len() {
+                included[fi] = true;
+            }
+        }
+        let mut queue = lib_refs;
+        let mut added: Vec<usize> = Vec::new();
+        while let Some(name) = queue.pop() {
+            if let Some(&fi) = owner.get(name.as_str()) {
+                if !included[fi] {
+                    included[fi] = true;
+                    added.push(fi);
+                    queue.extend(scanned[fi].1.iter().cloned());
+                }
+            }
+        }
+        added.sort_unstable();
+        for fi in &added {
+            let (text, nstrip) =
+                strip_duplicate_unit_subroutines(&primary_texts[*fi], &mut seen_subs);
+            nstripped += nstrip;
+            extra.push_str(&format!(
+                "
+// ===== primary file re-added: {} (referenced only from an adopted library) =====
+",
+                primary_labels[*fi]
+            ));
+            extra.push_str(&text);
+            if !extra.ends_with('\n') {
+                extra.push('\n');
+            }
+        }
+        if !added.is_empty() {
+            println!(
+                "Re-added {} primary file(s) referenced only from adopted libraries",
+                added.len()
+            );
+        }
     }
     if let Err(e) = std::fs::OpenOptions::new()
         .append(true)
@@ -1442,16 +1525,18 @@ fn run_main() -> i32 {
     let mut xtrace_format = "text".to_string();
     let mut xtrace_profile: Option<String> = None;
     let mut xtrace_compress: Option<String> = None;
+    let mut wave = false;
     let mut fst_file: Option<String> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
     let mut dump_files_list = false;
     let mut dump_merged_sv: Option<String> = None;
+    let mut upf_files: Vec<String> = Vec::new();
+    let mut upf_top: Option<String> = None;
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut vpi_libs: Vec<String> = Vec::new();
     let mut module_timescale_args: Vec<String> = Vec::new();
     let mut plusargs: Vec<String> = Vec::new();
-    let mut threads: usize = 1;
     let mut emit_hypergraph: Option<String> = None;
     let mut load_partition: Option<String> = None;
     let mut write_profile: Option<String> = None;
@@ -1677,6 +1762,14 @@ fn run_main() -> i32 {
             "--relax-implicit-static" => {
                 xezim_core::elaborate::set_relax_implicit_static(true);
             }
+            // The end-of-run [PROF] report (edge-block, settle and timing
+            // counters). Every reader consults the environment switch, so
+            // the flag sets it before the simulator is constructed.
+            "--profile" => {
+                // SAFETY: argument parsing runs single-threaded, before any
+                // simulator thread exists.
+                unsafe { std::env::set_var("XEZIM_PROFILE_REPORT", "1") };
+            }
             "--verbose" => {
                 verbose = true;
             }
@@ -1693,6 +1786,9 @@ fn run_main() -> i32 {
             // the exit status catches a typo'd or stale top.
             "--strict-top" => {
                 xezim::set_strict_top(true);
+            }
+            "--no-strict-top" => {
+                xezim::set_strict_top(false);
             }
             "-V" => {
                 print_version();
@@ -1917,6 +2013,9 @@ fn run_main() -> i32 {
             _ if arg.starts_with("--xtrace-compress=") => {
                 xtrace_compress = Some(arg["--xtrace-compress=".len()..].to_string());
             }
+            "--wave" => {
+                wave = true;
+            }
             "--fst" => {
                 i += 1;
                 if i < args.len() {
@@ -1942,6 +2041,26 @@ fn run_main() -> i32 {
             "--dump-files-list" => {
                 dump_files_list = true;
             }
+            "--upf" => {
+                i += 1;
+                if i < args.len() {
+                    upf_files.push(args[i].clone());
+                    xezim_core::upf::add_upf_file(args[i].clone());
+                } else {
+                    eprintln!("Error: --upf requires a UPF file name");
+                    std::process::exit(1);
+                }
+            }
+            "--upf-top" => {
+                i += 1;
+                if i < args.len() {
+                    upf_top = Some(args[i].clone());
+                    xezim_core::upf::set_upf_top(args[i].clone());
+                } else {
+                    eprintln!("Error: --upf-top requires an instance path");
+                    std::process::exit(1);
+                }
+            }
             "--dump-merged-sv" => {
                 i += 1;
                 if i < args.len() {
@@ -1955,13 +2074,9 @@ fn run_main() -> i32 {
                 dump_merged_sv = Some(arg["--dump-merged-sv=".len()..].to_string());
             }
             "--threads" => {
+                // Removed. Consume the count so it isn't taken for a source file.
                 i += 1;
-                if i < args.len() {
-                    threads = args[i].parse().unwrap_or(1).max(1);
-                }
-            }
-            _ if arg.starts_with("--threads=") => {
-                threads = arg["--threads=".len()..].parse().unwrap_or(1).max(1);
+                eprintln!("Warning: --threads has been removed (ignored)");
             }
             "--report-stats" => {
                 report_stats_cli = Some(report::ReportMode::Human);
@@ -2281,6 +2396,13 @@ fn run_main() -> i32 {
         }
     }
     xezim::compiler::simulator::set_xtrace_options(xtrace_profile.clone(), xtrace_compress.clone());
+    // `--fst`/`--xtrace` are explicit dump requests, so they enable waveform
+    // support on their own; `--wave` is what a source-driven `$dumpvars` needs.
+    // Installed BEFORE elaboration: the model is built differently when a dump
+    // can run (see `for_loop_needs_ast`).
+    xezim::compiler::simulator::set_wave_enabled(
+        wave || fst_file.is_some() || xtrace_file.is_some(),
+    );
 
     // Install the --module-timescale configuration before any elaboration.
     if !module_timescale_args.is_empty() {
@@ -2384,13 +2506,18 @@ suppressed but the explicit SDF annotation still applies."
                         sim.fst_file = fst_file.clone();
                         sim.fst_scopes = fst_scopes.clone();
                         sim.set_plusargs(&plusargs);
-                        sim.set_threads(threads);
                         // Pass the full CLI invocation (binary name +
                         // all args + plusargs) so vpi_get_vlog_info
                         // can hand the same argv back to UVM.
                         sim.set_args(&args);
                         let compilation_start = std::time::Instant::now();
                         sim.compile();
+                        if !sim.compile_errors.is_empty() {
+                            for e in &sim.compile_errors {
+                                eprintln!("Error: {}", e);
+                            }
+                            std::process::exit(1);
+                        }
                         eprintln!(
                             "[PHASE] compilation: {:.1}ms",
                             compilation_start.elapsed().as_secs_f64() * 1000.0
@@ -2502,6 +2629,7 @@ suppressed but the explicit SDF annotation still applies."
     // re-runnable repro for parse/elaboration debugging. Blank lines left by
     // the preprocessor are kept so line numbers inside each section still
     // match the per-file diagnostics.
+    let mut merged_kept: Option<Vec<usize>> = None;
     if let Some(ref merged_out) = dump_merged_sv {
         // With `-s <top>`, keep only the files needed to elaborate that top —
         // the whole point of the flag is cutting a 125-file build down to a
@@ -2522,6 +2650,9 @@ suppressed but the explicit SDF annotation still applies."
             None => (0..preprocessed_sources.len()).collect(),
         };
         let pruned = keep.len() < preprocessed_sources.len();
+        if pruned {
+            merged_kept = Some(keep.clone());
+        }
         let mut out = String::new();
         out.push_str(&format!(
             "// Merged preprocessed sources — xezim {} ({} file(s))\n\
@@ -2744,7 +2875,12 @@ suppressed but the explicit SDF annotation still applies."
                     xezim::compiler::elaborate::iprof_dump();
                 }
                 if let Some(ref mo) = dump_merged_sv {
-                    append_adopted_libs_to_merged(mo);
+                    append_adopted_libs_to_merged(
+                        mo,
+                        &preprocessed_sources,
+                        &file_labels,
+                        merged_kept.as_deref(),
+                    );
                 }
                 print_design_summary(&_defs, &elab);
                 print_resource_usage(compile_wall_start);
@@ -2821,7 +2957,6 @@ suppressed but the explicit SDF annotation still applies."
         sdf_select,
         &defines,
         &plusargs,
-        threads,
         xtrace_file.as_deref(),
         &xtrace_scopes,
         xtrace_from_ns,
@@ -2838,7 +2973,12 @@ suppressed but the explicit SDF annotation still applies."
         Ok(sim) => {
             println!("------------------------------");
             if let Some(ref mo) = dump_merged_sv {
-                append_adopted_libs_to_merged(mo);
+                append_adopted_libs_to_merged(
+                    mo,
+                    &preprocessed_sources,
+                    &file_labels,
+                    merged_kept.as_deref(),
+                );
             }
             println!("Simulation finished at time {}", sim.time);
             {

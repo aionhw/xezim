@@ -11,6 +11,14 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "hierarchy/flat_actual_struct_port.rs"]
+mod flat_actual_struct_port;
+#[path = "hierarchy/nested_member_in_instance.rs"]
+mod nested_member_in_instance;
+#[path = "hierarchy/undefined_call_in_instance.rs"]
+mod undefined_call_in_instance;
+#[path = "hierarchy/implicit_net_name_collision.rs"]
+mod implicit_net_name_collision;
 #[path = "hierarchy/typedef_array_ports_in_children.rs"]
 mod typedef_array_ports_in_children;
 #[path = "hierarchy/unpacked_struct_port.rs"]
@@ -25,6 +33,8 @@ mod bind_in_module;
 mod bind_path_through_library_module;
 #[path = "hierarchy/bind_through_nested_part_select.rs"]
 mod bind_through_nested_part_select;
+#[path = "hierarchy/dump_merged_sv_adopted_primary.rs"]
+mod dump_merged_sv_adopted_primary;
 #[path = "hierarchy/dump_merged_sv_library_dedup.rs"]
 mod dump_merged_sv_library_dedup;
 #[path = "hierarchy/port_net_driven_from_inside.rs"]
@@ -135,3 +145,21 @@ mod modport_shape_battery;
 mod nonansi_modport_port_decl;
 #[path = "hierarchy/library_dir_on_demand.rs"]
 mod library_dir_on_demand;
+#[path = "hierarchy/modport_expression_ports.rs"]
+mod modport_expression_ports;
+#[path = "hierarchy/unit_scope_library_subroutine.rs"]
+mod unit_scope_library_subroutine;
+#[path = "hierarchy/bind_grid_module_name_refs.rs"]
+mod bind_grid_module_name_refs;
+#[path = "hierarchy/instance_loop_local_shadows_module_var.rs"]
+mod instance_loop_local_shadows_module_var;
+#[path = "hierarchy/multi_top_typedef_packed_dims.rs"]
+mod multi_top_typedef_packed_dims;
+#[path = "hierarchy/bind_with_parameters.rs"]
+mod bind_with_parameters;
+#[path = "hierarchy/ref_formal_same_name.rs"]
+mod ref_formal_same_name;
+#[path = "hierarchy/instance_block_locals_shadow_module_names.rs"]
+mod instance_block_locals_shadow_module_names;
+#[path = "hierarchy/instance_collections_resolve_by_scope.rs"]
+mod instance_collections_resolve_by_scope;

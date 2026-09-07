@@ -120,7 +120,6 @@ fn dump(tag: &str, src: &str) -> Fst {
         None,
         &[],
         &[],
-        1,
         None,
         &[],
         0,
@@ -430,7 +429,6 @@ fn scope_filter_restricts_the_dump_to_the_named_subtree() {
         None,
         &[],
         &[],
-        1,
         None,
         &[],
         0,
@@ -507,4 +505,88 @@ fn an_event_emits_a_pulse_at_every_trigger() {
         .map(|v| v.iter().filter(|(_, x)| x == "1").map(|(t, _)| *t).collect())
         .unwrap_or_default();
     assert_eq!(pulses, vec![5, 15, 25], "one pulse per trigger");
+}
+
+/// A `--fst-scope` that selects nothing must not leave an FST behind. An FST
+/// with no variables is not a readable file — GTKWave and `fst2vcd` both
+/// refuse to open it — so writing one hands the user a broken artifact where
+/// the count line (`[FST] dumping 0 signals`) is the only clue. The common
+/// cause is a generate block: the scopes are `gen[0]`/`gen[1]`, so a bare
+/// `--fst-scope top.gen` matches nothing.
+#[test]
+fn a_scope_that_selects_nothing_warns_and_writes_no_file() {
+    let bin = {
+        let mut p = std::env::current_exe().expect("current_exe");
+        p.pop();
+        if p.ends_with("deps") {
+            p.pop();
+        }
+        p.join("xezim")
+    };
+    let dir = std::env::temp_dir().join(format!("xezim_fst_scope_none_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let sv = dir.join("h.sv");
+    std::fs::write(
+        &sv,
+        r#"
+module top;
+  logic clk = 0;
+  logic [15:0] top_sig;
+  always #5 clk = ~clk;
+  always @(posedge clk) top_sig <= top_sig + 1;
+  genvar g;
+  generate for (g = 0; g < 2; g++) begin : gen
+    logic [1:0] gsig;
+    always @(posedge clk) gsig <= gsig + 1;
+  end endgenerate
+  initial begin repeat (5) @(posedge clk); $finish; end
+endmodule
+"#,
+    )
+    .expect("write");
+
+    let run = |scope: &str, out: &std::path::Path| -> String {
+        let _ = std::fs::remove_file(out);
+        let o = std::process::Command::new(&bin)
+            .current_dir(&dir)
+            .args(["--simulate", "--max-time", "200", "-s", "top", "--fst-scope", scope, "--fst"])
+            .arg(out)
+            .arg(&sv)
+            .output()
+            .expect("run xezim");
+        String::from_utf8_lossy(&o.stderr).into_owned()
+    };
+
+    // A generate block named without its index selects nothing.
+    let gen_fst = dir.join("gen.fst");
+    let err = run("top.gen", &gen_fst);
+    assert!(
+        !gen_fst.exists(),
+        "an FST with no variables must not be written:\n{err}"
+    );
+    assert!(
+        err.contains("matched no signals") && err.contains("top.gen[0]"),
+        "expected a warning pointing at the indexed form:\n{err}"
+    );
+
+    // A plain typo must NOT be told to add an index.
+    let typo_fst = dir.join("typo.fst");
+    let err = run("top.nope", &typo_fst);
+    assert!(!typo_fst.exists(), "no file for an unmatched scope:\n{err}");
+    assert!(
+        err.contains("matched no signals") && !err.contains("generate block"),
+        "a typo must not get generate-block advice:\n{err}"
+    );
+
+    // The indexed form still works, and a good scope alongside a bad one
+    // still produces a readable dump.
+    let ok_fst = dir.join("ok.fst");
+    let err = run("top.gen[0]", &ok_fst);
+    assert!(ok_fst.exists(), "indexed generate scope must dump:\n{err}");
+    let fst = decode(&ok_fst);
+    assert!(
+        fst.has("top.gen[0].gsig"),
+        "have {:?}",
+        fst.paths()
+    );
 }

@@ -40,7 +40,7 @@ fn run_and_read(param_as_wire: bool) -> String {
         cmd.env("XEZIM_VCD_PARAM_AS_WIRE", "1");
     }
     let out = cmd
-        .args(["-s", "tb", "--max-time", "100"])
+        .args(["-s", "tb", "--max-time", "100", "--wave"])
         .arg(&sv)
         .output()
         .expect("run xezim");

@@ -68,6 +68,9 @@ fn run(mode: Waveform) {
     if let Some(path) = files.waveform.as_deref() {
         match mode {
             Waveform::Vcd => {
+                // Source-driven `$dumpvars` needs `--wave`; `--fst`/`--xtrace`
+                // below are explicit dump requests and imply it.
+                command.arg("--wave");
                 command.arg(format!("+PACKED_MATRIX_VCD={}", path.display()));
             }
             Waveform::Fst => {

@@ -1,0 +1,7 @@
+add_port_state VMAIN -state {MainVolt 1.2}
+add_port_state mul_sw/vout -state {MainVolt 1.2}
+add_port_state mul_sw/vout -state {MUL_OFF off}
+add_port_state GND -state {ZeroVolt 0.0}
+create_pst core_pst -supplies {VMAIN mul_sw/vout}
+add_pst_state MUL_OFF -pst core_pst -state {MainVolt MUL_OFF}
+add_pst_state MUL_ON -pst core_pst -state {MainVolt MainVolt}

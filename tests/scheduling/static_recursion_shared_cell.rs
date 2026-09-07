@@ -9,7 +9,7 @@ use std::process::Command;
 /// mutation was invisible to the caller frames and the static was effectively
 /// re-initialised to its declaration value on every re-entry. That reset UVM's
 /// `static bit first` in `main_phase` on every `phase.jump(reset)` re-entry
-/// (40phasing/06started_ended), livelocking the phase scheduler.
+/// (the phase-start/end-sequence case), livelocking the phase scheduler.
 ///
 /// This recursive method accumulates into a shared static; the outermost
 /// activation must read 4 after four increments. Matched byte-for-byte against

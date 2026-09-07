@@ -650,11 +650,38 @@ impl Insn {
                     *r += rb;
                 }
             }
+            // NBA stores carry registers but never branch targets, so they
+            // rebase like any other operand. (Comb-region fusion refuses NBA
+            // members through its own `insn_ok` gate, so admitting them here
+            // does not loosen that pass; edge-block merging needs them —
+            // a flop body is NBAs and nothing else.)
+            NbaAssign(_, a, _) => *a += rb,
+            NbaAssignConst(..) => {}
+            NbaAssignRange(_, _, _, a) => *a += rb,
+            NbaAssignRangeDyn(_, a, b, c) => {
+                *a += rb;
+                *b += rb;
+                *c += rb;
+            }
+            NbaAssignBitDyn(_, a, b) => {
+                *a += rb;
+                *b += rb;
+            }
+            NbaAssignArray(_, a, b, _) => {
+                *a += rb;
+                *b += rb;
+            }
+            NbaAssignArrayRange(_, a, b, c, d) => {
+                *a += rb;
+                *b += rb;
+                *c += rb;
+                *d += rb;
+            }
+            // Signal-to-signal fused array read: no registers at all.
+            NbaAssignArrayRead(..) => {}
             LoadProcessLocal(..) | Format(..) | CaseJump(..) | CaseMaskJump(..)
-            | StmtFallback(..) | EvalExprFallback(..) | NbaAssign(..)
-            | NbaAssignConst(..) | NbaAssignRange(..) | NbaAssignRangeDyn(..)
-            | NbaAssignBitDyn(..) | NbaAssignArray(..) | NbaAssignArrayRange(..)
-            | NbaAssignArrayRead(..) | WaitDelayReg(..) | WaitEdge(..) => return false,
+            | StmtFallback(..) | EvalExprFallback(..)
+            | WaitDelayReg(..) | WaitEdge(..) => return false,
         }
         true
     }
@@ -849,6 +876,11 @@ pub struct BytecodeCompiler<'a> {
     /// bytecode compilation can fold module params (e.g. `CARRY_CHAIN`) into
     /// the compile-time widths of `+:` / `-:` range selects.
     params: Option<&'a HashMap<String, Value>>,
+    /// Leaf-segment index over `params` (last dotted segment -> full keys).
+    /// The suffix-match fallback in `lookup_param_value` otherwise scans the
+    /// WHOLE param map with memcmp per entry on every miss — 94% of the
+    /// C910 SoC's 410s compile phase.
+    param_leaf_idx: Option<&'a HashMap<String, Vec<String>>>,
     /// Typedef name -> total width (module + package scope), for local
     /// declarations of typedef'd packed types inside inlined functions.
     typedefs: Option<&'a HashMap<String, u32>>,
@@ -1021,6 +1053,7 @@ impl<'a> BytecodeCompiler<'a> {
             inlining_stack: Vec::new(),
             tasks_inlined: 0,
             params: None,
+            param_leaf_idx: None,
             typedefs: None,
             typedef_elems: None,
             local_var_elem: std::collections::HashMap::new(),
@@ -1085,26 +1118,38 @@ impl<'a> BytecodeCompiler<'a> {
         if hier.path.len() < 2 || hier.path.iter().any(|s| !s.selects.is_empty()) {
             return None;
         }
-        let member = hier.path.last()?.name.name.as_str();
-        let base: String = hier.path[..hier.path.len() - 1]
-            .iter()
-            .map(|s| s.name.name.as_str())
-            .collect::<Vec<_>>()
-            .join(".");
-        // Resolve the container signal id, honoring scope_hint for a bare base.
-        let base_id = self.lookup_signal_id_by_name(&base).or_else(|| {
-            self.scope_hint
-                .as_ref()
-                .and_then(|sc| self.lookup_signal_id_by_name(&format!("{}.{}", sc, base)))
-        })?;
-        // Field layout is keyed by both the bare and scope-qualified base name.
-        let fields = fields_map.get(base.as_str()).or_else(|| {
-            self.scope_hint
-                .as_ref()
-                .and_then(|sc| fields_map.get(&format!("{}.{}", sc, base)))
-        })?;
-        let (_, off, w) = fields.iter().find(|(m, _, _)| m == member)?;
-        Some((base_id, *off, *w))
+        let seg = |i: usize| hier.path[i].name.name.as_str();
+        // A NESTED member (`s.p.hi`, and every `union`-in-struct shape) is
+        // flattened by elaboration into one dotted key — "p.hi" — stored under
+        // the ROOT signal. Splitting only the last segment therefore missed
+        // every member at depth >= 2 and sent it to the AST path. Walk the
+        // split point from the longest base down, so a genuinely hierarchical
+        // base that IS a signal (`top.dut.sig.field`) still wins over
+        // reinterpreting part of it as a member path.
+        for k in (1..hier.path.len()).rev() {
+            let base: String = (0..k).map(seg).collect::<Vec<_>>().join(".");
+            let member: String = (k..hier.path.len()).map(seg).collect::<Vec<_>>().join(".");
+            // Resolve the container signal id, honoring scope_hint for a bare base.
+            let Some(base_id) = self.lookup_signal_id_by_name(&base).or_else(|| {
+                self.scope_hint
+                    .as_ref()
+                    .and_then(|sc| self.lookup_signal_id_by_name(&format!("{}.{}", sc, base)))
+            }) else {
+                continue;
+            };
+            // Field layout is keyed by both the bare and scope-qualified base name.
+            let Some(fields) = fields_map.get(base.as_str()).or_else(|| {
+                self.scope_hint
+                    .as_ref()
+                    .and_then(|sc| fields_map.get(&format!("{}.{}", sc, base)))
+            }) else {
+                continue;
+            };
+            if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| *m == member) {
+                return Some((base_id, *off, *w));
+            }
+        }
+        None
     }
 
     /// Resolve a packed-struct container and clone its flattened field layout.
@@ -1255,6 +1300,24 @@ impl<'a> BytecodeCompiler<'a> {
         let ExprKind::MemberAccess { expr: root, member } = &base.kind else {
             return None;
         };
+        // `a.m1[i].m2[j]`: the container is itself an element of an
+        // array-of-struct member. Slice that element out first, then the
+        // member lane within it (offsets inside the element are relative to
+        // the element-0 layout). Without this the inner member read compiled
+        // to a value and the outer index took ONE BIT of it.
+        if let ExprKind::Index { expr: mid, index: idx1 } = &root.kind
+            && let ExprKind::MemberAccess { expr: r2, member: m1 } = &mid.kind
+        {
+            let (v, key, hier, fields) = self.compile_packed_struct_value(r2)?;
+            let &(_, m1_off, _) = fields.iter().find(|(n, _, _)| n == &m1.name)?;
+            let (stride1, dim1) = self.packed_member_array_shape(&key, &hier, &m1.name)?;
+            let elem = self.emit_packed_member_slice(v, idx1, dim1, stride1, m1_off, stride1)?;
+            let (_, mem_off, _) = Self::elem_zero_field(&fields, &m1.name, &member.name)?;
+            let rel = mem_off.checked_sub(m1_off)?;
+            let nested = format!("{}.{}", m1.name, member.name);
+            let (elem_w, dim2) = self.packed_member_array_shape(&key, &hier, &nested)?;
+            return self.emit_packed_member_slice(elem, index, dim2, elem_w, rel, elem_w);
+        }
         let (root_value, root_key, hier, fields) =
             self.compile_packed_struct_value(root)?;
         let (_, field_offset, _) = fields.iter().find(|(name, _, _)| name == &member.name)?;
@@ -1279,23 +1342,90 @@ impl<'a> BytecodeCompiler<'a> {
         let ExprKind::Index { expr: base, index } = &indexed.kind else {
             return None;
         };
+        // Inside an inlined instance the member access is folded into the
+        // identifier (`cw.loc.descriptors[i].region` arrives as the single
+        // path `cw.loc.descriptors`), so the shape below never matched and
+        // every such read ran interpreted.
+        if let ExprKind::Ident(hier) = &base.kind {
+            if hier.root.is_some()
+                || hier.path.len() < 2
+                || hier.path.iter().any(|s| !s.selects.is_empty())
+            {
+                return None;
+            }
+            let mut root_hier = hier.clone();
+            let member = root_hier.path.pop()?.name.name;
+            return self.compile_indexed_folded_member(&root_hier, &member, index, leaf);
+        }
         let ExprKind::MemberAccess { expr: root, member } = &base.kind else {
             return None;
         };
         let (root_value, root_key, hier, fields) =
             self.compile_packed_struct_value(root)?;
-        let field_path = format!("{}.{}", member.name, leaf);
         let (_, field_offset, field_width) =
-            fields.iter().find(|(name, _, _)| name == &field_path)?;
+            Self::elem_zero_field(&fields, &member.name, leaf)?;
         let (elem_w, dim) = self.packed_member_array_shape(&root_key, &hier, &member.name)?;
         self.emit_packed_member_slice(
             root_value,
             index,
             dim,
             elem_w,
-            *field_offset,
-            *field_width,
+            field_offset,
+            field_width,
         )
+    }
+
+    /// Element-0 layout of `<member>[i].<leaf>`. Elaboration registers an
+    /// array-of-struct member under two conventions: element-relative
+    /// (`descriptors.region`, plain struct nets) or expanded per element
+    /// (`descriptors[0].region`, packed arrays of structs). Both put element
+    /// 0 at the member's base, so either key gives the stride origin.
+    fn elem_zero_field(
+        fields: &[(String, u32, u32)],
+        member: &str,
+        leaf: &str,
+    ) -> Option<(String, u32, u32)> {
+        let rel = format!("{}.{}", member, leaf);
+        let per_elem = format!("{}[0].{}", member, leaf);
+        fields
+            .iter()
+            .find(|(name, _, _)| name == &rel || name == &per_elem)
+            .cloned()
+    }
+
+    /// `<path>.<member>[i].<leaf>` where the container and member arrive as
+    /// one folded identifier: split the member off the path, resolve the
+    /// container's layout under the remaining name, and slice like the
+    /// member-access shape.
+    fn compile_indexed_folded_member(
+        &mut self,
+        root_hier: &HierarchicalIdentifier,
+        member: &str,
+        index: &Expression,
+        leaf: &str,
+    ) -> Option<RegId> {
+        if root_hier.root.is_some() || root_hier.path.is_empty() {
+            return None;
+        }
+        // The container may itself be an element select (`grid[1]`): the
+        // layout is keyed by the bare name, the value is the element.
+        let mut bare = root_hier.clone();
+        for seg in &mut bare.path {
+            seg.selects.clear();
+        }
+        let (root_key, fields) = self.packed_struct_layout_for_hier(&bare)?;
+        let (_, field_offset, field_width) = Self::elem_zero_field(&fields, member, leaf)?;
+        let (elem_w, dim) = self.packed_member_array_shape(&root_key, &bare, member)?;
+        let root = if root_hier.path.iter().any(|s| !s.selects.is_empty()) {
+            let e = Expression::new(ExprKind::Ident(root_hier.clone()), root_hier.span);
+            self.compile_expr(&e, 0)?
+        } else {
+            let base_id = self.lookup_signal_id_by_name(&root_key)?;
+            let root = self.alloc_reg();
+            self.emit(Insn::LoadSignal(root, as_sig_id(base_id)));
+            root
+        };
+        self.emit_packed_member_slice(root, index, dim, elem_w, field_offset, field_width)
     }
 
     pub fn set_string_signals(&mut self, s: &'a HashSet<String>) {
@@ -1377,6 +1507,10 @@ impl<'a> BytecodeCompiler<'a> {
         self.params = Some(params);
     }
 
+    pub fn set_param_leaf_idx(&mut self, idx: &'a HashMap<String, Vec<String>>) {
+        self.param_leaf_idx = Some(idx);
+    }
+
     pub fn set_packed_elem_widths(&mut self, w: &'a HashMap<String, u32>) {
         self.packed_elem_widths = Some(w);
     }
@@ -1426,13 +1560,29 @@ impl<'a> BytecodeCompiler<'a> {
     /// named by `hier`, if recorded. Same raw / last-segment lookup the
     /// `packed_elem_widths` sites use.
     fn packed_outer_dim(&self, hier: &HierarchicalIdentifier) -> Option<(i64, i64)> {
+        self.packed_full_dims_of(hier).and_then(|d| d.first().copied())
+    }
+
+    /// Declared packed dimensions of `hier`: exact name, then the name under
+    /// the current instance scope, then — for a SINGLE-segment name only —
+    /// the bare leaf. A multi-segment name (a struct member, a hierarchical
+    /// reference) must never match an unrelated same-named declaration
+    /// elsewhere in the design (see `packed_elem_width_of`).
+    fn packed_full_dims_of(&self, hier: &HierarchicalIdentifier) -> Option<&'a Vec<(i64, i64)>> {
         let raw = Self::hier_raw_name(hier);
-        self.packed_full_dims.and_then(|m| {
-            m.get(raw.as_str())
-                .or_else(|| hier.path.last().and_then(|s| m.get(s.name.name.as_str())))
-                .and_then(|d| d.first())
-                .copied()
-        })
+        let m = self.packed_full_dims?;
+        m.get(raw.as_str())
+            .or_else(|| {
+                self.scope_hint
+                    .as_ref()
+                    .and_then(|sc| m.get(format!("{}.{}", sc, raw).as_str()))
+            })
+            .or_else(|| {
+                if hier.path.len() != 1 {
+                    return None;
+                }
+                hier.path.last().and_then(|s| m.get(s.name.name.as_str()))
+            })
     }
 
     /// LSB bit offset of packed element `idx` given the declared outer
@@ -2338,10 +2488,29 @@ impl<'a> BytecodeCompiler<'a> {
             match &e.kind {
                 ExprKind::Ident(h) => h.path.iter().all(|s| s.selects.is_empty()),
                 ExprKind::Index { expr, index } => {
-                    matches!(&expr.kind, ExprKind::Ident(h)
+                    (matches!(&expr.kind, ExprKind::Ident(h)
                         if h.path.iter().all(|s| s.selects.is_empty()))
+                        // `a[i][j]` on a 2-D unpacked array — the store arm
+                        // lowers it to the same row-major flat index the read
+                        // uses.
+                        || matches!(&expr.kind, ExprKind::Index { expr: b, index: bi }
+                            if matches!(&b.kind, ExprKind::Ident(h)
+                                if h.path.iter().all(|s| s.selects.is_empty()))
+                                && expr_simple(bi)))
                         && expr_simple(index)
                 }
+                // `arr[i].m` / `s.m` on a packed struct: the assign arms
+                // splice the member's static bit range, so the same two base
+                // shapes above are what they can resolve.
+                ExprKind::MemberAccess { expr, .. } => match &expr.kind {
+                    ExprKind::Ident(h) => h.path.iter().all(|s| s.selects.is_empty()),
+                    ExprKind::Index { expr: base, index } => {
+                        matches!(&base.kind, ExprKind::Ident(h)
+                            if h.path.iter().all(|s| s.selects.is_empty()))
+                            && expr_simple(index)
+                    }
+                    _ => false,
+                },
                 _ => false,
             }
         };
@@ -2349,8 +2518,16 @@ impl<'a> BytecodeCompiler<'a> {
             match &e.kind {
                 ExprKind::Index { expr, .. } => match &expr.kind {
                     ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+                    // 2-D: peel the outer index and ask again, or widening
+                    // lv_simple above smuggles `m[i][j] <= m[i][j]+1` past the
+                    // alias guard.
+                    ExprKind::Index { .. } => lv_base_name(expr),
                     _ => None,
                 },
+                // See through `.m` so `arr[i].m <= arr[i].m + 1` still reaches
+                // the self-read audit below — widening lv_simple without this
+                // would let exactly the aliasing case it guards slip through.
+                ExprKind::MemberAccess { expr, .. } => lv_base_name(expr),
                 _ => None,
             }
         }
@@ -2365,8 +2542,10 @@ impl<'a> BytecodeCompiler<'a> {
                             .collect::<Vec<_>>()
                             .join("."),
                     ),
+                    ExprKind::Index { .. } => lv_base_full(expr),
                     _ => None,
                 },
+                ExprKind::MemberAccess { expr, .. } => lv_base_full(expr),
                 _ => None,
             }
         }
@@ -2790,6 +2969,23 @@ impl<'a> BytecodeCompiler<'a> {
         i_expr: &Expression,
         j_expr: &Expression,
     ) -> Option<RegId> {
+        let (array, flat) = self.compile_2d_flat_index(hier, i_expr, j_expr)?;
+        let dest = self.alloc_reg();
+        self.emit(Insn::LoadArrayElem(dest, array, flat));
+        Some(dest)
+    }
+
+    /// Shared row-major addressing for a DYNAMIC 2-D unpacked element
+    /// (`a[i][j]`): returns the Dense operand and the register holding
+    /// `flat = (i-lo1)*ncols + (j-lo2)`, with an out-of-range index in EITHER
+    /// dimension forced one past the operand's range so the element access
+    /// itself reports it (§7.4.6: read yields x, write is discarded).
+    fn compile_2d_flat_index(
+        &mut self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+        i_expr: &Expression,
+        j_expr: &Expression,
+    ) -> Option<(Box<ArrayOperand>, RegId)> {
         let raw = Self::hier_raw_name(hier);
         let arrays_2d = self.arrays_2d?;
         let (key, ((lo1, hi1), (lo2, hi2), _w)) = arrays_2d
@@ -2848,9 +3044,7 @@ impl<'a> BytecodeCompiler<'a> {
         let oob = self.insns.len() as u32;
         self.emit(Insn::LoadConst(flat, Box::new(Value::from_u64(count as u64, 32))));
         self.insns[br] = Insn::BranchIfFalse(ok, oob);
-        let dest = self.alloc_reg();
-        self.emit(Insn::LoadArrayElem(
-            dest,
+        Some((
             Box::new(ArrayOperand::Dense {
                 name: key,
                 first_id,
@@ -2858,8 +3052,7 @@ impl<'a> BytecodeCompiler<'a> {
                 hi: count - 1,
             }),
             flat,
-        ));
-        Some(dest)
+        ))
     }
 
     /// §13.3.1 numeric conversion to real, in place. Emitted as
@@ -2938,7 +3131,14 @@ impl<'a> BytecodeCompiler<'a> {
             match &e.kind {
                 ExprKind::Ident(h) => {
                     if h.path.len() != 1 {
-                        return false;
+                        // `fname.member` may arrive as TWO segments; it is
+                        // function-local when the head is bound (the return
+                        // variable or a formal).
+                        return h.path.len() == 2
+                            && bound.contains(&h.path[0].name.name)
+                            && h.path.iter().all(|seg| {
+                                seg.selects.iter().all(|x| expr_ok(x, bound, me, ext))
+                            });
                     }
                     let n = &h.path[0].name.name;
                     // A dotted name is only acceptable when it is one of the
@@ -2947,10 +3147,14 @@ impl<'a> BytecodeCompiler<'a> {
                     // caller allows module-state READS (`ext`), in which case
                     // a free name (dotted or bare) is a signal read the body
                     // compiler resolves (or bails on) itself.
-                    if n.contains('.') && !bound.contains(n) && !ext {
+                    let head_bound = n
+                        .split_once('.')
+                        .is_some_and(|(head, _)| bound.contains(head));
+                    if n.contains('.') && !bound.contains(n) && !head_bound && !ext {
                         return false;
                     }
                     let known = ext
+                        || head_bound
                         || bound.contains(n)
                         || me.params.is_some_and(|p| p.contains_key(n));
                     known && h.path[0].selects.iter().all(|sel| expr_ok(sel, bound, me, ext))
@@ -3030,6 +3234,25 @@ impl<'a> BytecodeCompiler<'a> {
                         && args.iter().all(|a| expr_ok(a, bound, me, ext))
                         && me.fn_is_pure(fd2)
                 }
+                // §10.9.2: a pattern builds its value from nothing but the
+                // expressions inside it, so it is exactly as pure as they are.
+                // Falling through to `false` here made every function whose
+                // body was `return '{...}` — the ordinary way to build a
+                // struct result — impure, and so never inlined.
+                // `fname.member` / `formal.member`: as pure as its base, which
+                // is the function's own return variable or a formal -- both
+                // bound, so this stays function-local. Inside a function body
+                // the member access is NOT collapsed to a dotted Ident.
+                ExprKind::MemberAccess { expr, .. } => expr_ok(expr, bound, me, ext),
+                ExprKind::AssignmentPattern(items) => {
+                    use crate::ast::expr::AssignmentPatternItem as It;
+                    items.iter().all(|it| match it {
+                        It::Named(_, e) | It::Ordered(e) | It::Default(e) => {
+                            expr_ok(e, bound, me, ext)
+                        }
+                        _ => false,
+                    })
+                }
                 _ => false,
             }
         }
@@ -3059,6 +3282,23 @@ impl<'a> BytecodeCompiler<'a> {
                     expr_ok(lvalue, bound, me, false) && expr_ok(rvalue, bound, me, ext)
                 }
                 StatementKind::Return(e) => e.as_ref().is_none_or(|e| expr_ok(e, bound, me, ext)),
+                StatementKind::While { condition, body } => {
+                    // Same gap as the Foreach arm (issue #146): no arm meant
+                    // `_ => false`, branding a pure while-loop helper
+                    // (popcnt-style) impure.
+                    expr_ok(condition, bound, me, ext)
+                        && stmt_ok(body, &mut bound.clone(), me, ext)
+                }
+                StatementKind::DoWhile { body, condition } => {
+                    expr_ok(condition, bound, me, ext)
+                        && stmt_ok(body, &mut bound.clone(), me, ext)
+                }
+                StatementKind::Repeat { count, body } => {
+                    expr_ok(count, bound, me, ext)
+                        && stmt_ok(body, &mut bound.clone(), me, ext)
+                }
+                // §12.7: control flow only; reads nothing, writes nothing.
+                StatementKind::Break | StatementKind::Continue => true,
                 StatementKind::Foreach { array, vars, body } => {
                     // §12.7.3: the loop variables are implicitly DECLARED by
                     // the foreach for its body — without this arm they read
@@ -3507,7 +3747,18 @@ impl<'a> BytecodeCompiler<'a> {
     /// Field layout of `lv` when it names a packed-struct SIGNAL directly.
     fn lvalue_struct_layout(&self, lv: &Expression) -> Option<Vec<(String, u32, u32)>> {
         let fields_tbl = self.packed_struct_fields?;
-        let ExprKind::Ident(h) = &lv.kind else { return None };
+        // `arr[i] <= '{...}`: an ELEMENT of an array of packed structs carries
+        // the element layout, which is keyed by the array name — same keying
+        // the `arr[i].m` member store uses. Without this the pattern had no
+        // layout and the whole statement fell to the AST path.
+        let h = match &lv.kind {
+            ExprKind::Ident(h) => h,
+            ExprKind::Index { expr, .. } => match &expr.kind {
+                ExprKind::Ident(h) => h,
+                _ => return None,
+            },
+            _ => return None,
+        };
         if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
             return None;
         }
@@ -4485,19 +4736,37 @@ impl<'a> BytecodeCompiler<'a> {
         // Suffix-match: bare `CARRY_CHAIN` may be stored as
         // `top.uut.picorv32_core.pcpi_mul.CARRY_CHAIN`. Only accept if a
         // single param key matches — multiple matches are ambiguous.
-        let mut found: Option<&Value> = None;
-        for (name, value) in params {
+        //
+        // Any match in either direction shares the LAST dotted segment with
+        // `raw`, so the leaf index narrows the scan to same-leaf keys.
+        let is_match = |name: &str| -> bool {
             let raw_has_key_suffix = raw.len() >= name.len()
-                && raw.ends_with(name.as_str())
+                && raw.ends_with(name)
                 && (raw.len() == name.len() || raw.as_bytes()[raw.len() - name.len() - 1] == b'.');
             let key_has_raw_suffix = name.len() >= raw.len()
                 && name.ends_with(raw.as_str())
                 && (name.len() == raw.len() || name.as_bytes()[name.len() - raw.len() - 1] == b'.');
-            if raw_has_key_suffix || key_has_raw_suffix {
-                if found.is_some() {
-                    return None;
+            raw_has_key_suffix || key_has_raw_suffix
+        };
+        let mut found: Option<&Value> = None;
+        if let Some(idx) = self.param_leaf_idx {
+            let leaf = raw.rsplit('.').next().unwrap_or(raw.as_str());
+            for name in idx.get(leaf).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if is_match(name) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = params.get(name);
                 }
-                found = Some(value);
+            }
+        } else {
+            for (name, value) in params {
+                if is_match(name) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(value);
+                }
             }
         }
         found.cloned()
@@ -4595,7 +4864,17 @@ impl<'a> BytecodeCompiler<'a> {
         // A multi-D PACKED base (`logic [1:0][3:0][7:0] foo`) is NOT a
         // flattening no-op: `foo[0]` selects a slice, so `foo[0][j]` must
         // not degrade to a bit-select of the whole vector (§7.4.1).
-        if self.packed_elem_width_of(hier).is_some() {
+        //
+        // Ask the SHAPE question, not the width question. `packed_elem_width_of`
+        // filters out elem_w == 1, which is right for a single-index select
+        // (element `i` of `[N-1:0][0:0]` IS physically bit `i`, so `foo[i]`
+        // may fuse as a bit-select) but wrong here: `foo[i][0]` still selects
+        // WITHIN element `i`. With the unit-width element filtered away this
+        // guard never fired, the whole-vector signal id was returned, and the
+        // caller emitted `BlockingAssignBitDyn(foo, 0)` — every `foo[i][0]`
+        // wrote bit 0 regardless of `i`. `[N-1:0][1:0]` was correct precisely
+        // because the filter let its width through and this guard bailed.
+        if self.is_packed_multi_dim(hier) {
             return None;
         }
         // A genuine 2D/ND UNPACKED array (`logic [7:0] m [2][2]`) also carries
@@ -4679,12 +4958,7 @@ impl<'a> BytecodeCompiler<'a> {
 
     /// Declared dimensions of a chain's root, if registered.
     fn chain_root_dims(&self, hier: &HierarchicalIdentifier) -> Option<Vec<(i64, i64)>> {
-        let raw = Self::hier_raw_name(hier);
-        self.packed_full_dims.and_then(|m| {
-            m.get(raw.as_str())
-                .or_else(|| hier.path.last().and_then(|s| m.get(s.name.name.as_str())))
-                .cloned()
-        })
+        self.packed_full_dims_of(hier).cloned()
     }
 
     /// Emit a chained packed element select whose indices are NOT all
@@ -4822,7 +5096,12 @@ impl<'a> BytecodeCompiler<'a> {
 
     /// The base's registered packed ELEMENT width (>1), if it is a
     /// multi-dimensional packed vector (`logic [3:0][7:0] x`).
-    fn packed_elem_width_of(&self, hier: &HierarchicalIdentifier) -> Option<u32> {
+    /// True when `hier` names a packed MULTI-DIMENSIONAL signal, regardless of
+    /// its element width. `packed_elem_width_of` answers "how wide is an
+    /// element, if that width changes codegen" and so drops unit-width
+    /// elements; callers that need "is this a packed array at all" — where a
+    /// further select indexes INSIDE an element — must use this instead.
+    fn is_packed_multi_dim(&self, hier: &HierarchicalIdentifier) -> bool {
         let raw = Self::hier_raw_name(hier);
         self.packed_elem_widths
             .and_then(|m| {
@@ -4831,6 +5110,36 @@ impl<'a> BytecodeCompiler<'a> {
                         .last()
                         .and_then(|s| m.get(s.name.name.as_str()).copied())
                 })
+            })
+            .is_some()
+    }
+
+    fn packed_elem_width_of(&self, hier: &HierarchicalIdentifier) -> Option<u32> {
+        let raw = Self::hier_raw_name(hier);
+        self.packed_elem_widths
+            .and_then(|m| {
+                m.get(raw.as_str()).copied()
+                    // Inside an inlined instance the name is spelled bare
+                    // while the table holds it under the instance path.
+                    .or_else(|| {
+                        self.scope_hint
+                            .as_ref()
+                            .and_then(|sc| m.get(format!("{}.{}", sc, raw).as_str()).copied())
+                    })
+                    // The bare-leaf fallback is for a SINGLE-segment name only.
+                    // Applying it to `inp.sram_renA` (a packed-struct member
+                    // of a port) matched an unrelated `logic [3:0][1:0]
+                    // sram_renA` declared in another module, and the
+                    // member's bit-select compiled as that array's two-bit
+                    // element select: bits 2 and 3 read x.
+                    .or_else(|| {
+                        if hier.path.len() != 1 {
+                            return None;
+                        }
+                        hier.path
+                            .last()
+                            .and_then(|s| m.get(s.name.name.as_str()).copied())
+                    })
             })
             .filter(|&w| w > 1)
     }
@@ -5044,19 +5353,36 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         let raw = Self::hier_raw_name(hier);
+        let dense = |name: &str| -> bool {
+            // An ARRAY OF COLLECTIONS registers its outer shape in `arrays`
+            // but each element is its own queue/dynamic/associative container
+            // (`int a[2][u8_t]`), living OUTSIDE the dense cells this name
+            // resolves to — a compiled LoadArrayElem read the fake backing
+            // and `mem[h][addr]` compared against garbage the moment the
+            // enclosing loop compiled (found when the new do-while arm
+            // compiled a block the old bail had kept on the AST path). The
+            // element registrations are keyed `name[lo]`, so probe that.
+            let Some((lo, _, _)) = self.arrays.get(name) else {
+                return false;
+            };
+            let elem = format!("{}[{}]", name, lo);
+            !(self.assoc_arrays.is_some_and(|m| m.contains_key(&elem))
+                || self.queue_vars.is_some_and(|m| m.contains(&elem))
+                || self.dynamic_arrays.is_some_and(|m| m.contains(&elem)))
+        };
         if self.arrays.contains_key(&raw) {
-            return Some(raw);
+            return dense(&raw).then_some(raw);
         }
         if let Some(scope) = &self.scope_hint {
             let qualified = format!("{}.{}", scope, raw);
             if self.arrays.contains_key(&qualified) {
-                return Some(qualified);
+                return dense(&qualified).then_some(qualified);
             }
         }
         if hier.path.len() == 1 {
             let leaf = &hier.path[0].name.name;
             if self.arrays.contains_key(leaf) {
-                return Some(leaf.clone());
+                return dense(leaf).then_some(leaf.clone());
             }
         }
         None
@@ -6346,6 +6672,78 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit_fallback(stmt)
                 }
             }
+            StatementKind::While { condition, body } => {
+                // §12.7.2: a while is a For with no init and no step. The
+                // condition is re-evaluated at the loop head each iteration;
+                // `continue` jumps back to the head, `break` to the end.
+                // Compiling it (rather than bailing "Stmt_While") is what
+                // lets a pure while-loop helper inline (issue #146) — the
+                // purity arm alone would only have moved the bail here.
+                self.loop_break_patches.push(Vec::new());
+                self.loop_continue_patches.push(Vec::new());
+                let top = self.insns.len() as u32;
+                let Some(c) = self.compile_expr(condition, 0) else {
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    self.bail("While_cond");
+                    return false;
+                };
+                let br = self.insns.len();
+                self.emit(Insn::BranchIfFalse(c, 0));
+                if !self.compile_stmt(body) {
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    return false;
+                }
+                self.emit(Insn::Jump(top));
+                let end = self.insns.len() as u32;
+                if let Insn::BranchIfFalse(reg, _) = self.insns[br] {
+                    self.insns[br] = Insn::BranchIfFalse(reg, end);
+                }
+                if let Some(patches) = self.loop_continue_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(top);
+                    }
+                }
+                if let Some(patches) = self.loop_break_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(end);
+                    }
+                }
+                true
+            }
+            StatementKind::DoWhile { body, condition } => {
+                // Body first, then the condition; `continue` re-tests the
+                // condition (§12.7.4), `break` exits.
+                self.loop_break_patches.push(Vec::new());
+                self.loop_continue_patches.push(Vec::new());
+                let top = self.insns.len() as u32;
+                if !self.compile_stmt(body) {
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    return false;
+                }
+                let cond_at = self.insns.len() as u32;
+                let Some(c) = self.compile_expr(condition, 0) else {
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    self.bail("DoWhile_cond");
+                    return false;
+                };
+                self.emit(Insn::BranchUnlessZero(c, top));
+                let end = self.insns.len() as u32;
+                if let Some(patches) = self.loop_continue_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(cond_at);
+                    }
+                }
+                if let Some(patches) = self.loop_break_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(end);
+                    }
+                }
+                true
+            }
             StatementKind::Foreach { array, vars, body } => {
                 // §12.7.3 foreach over a register-bound local array — an
                 // inlined resolver's dynamic-array formal or a #129 local
@@ -7134,17 +7532,7 @@ impl<'a> BytecodeCompiler<'a> {
                     // must extract a W-bit slice at `i*W +: W`, not a single
                     // bit. Mirror the LHS variable-index slice path so reads
                     // and writes stay symmetric.
-                    let raw = Self::hier_raw_name(hier);
-                    let elem_w = self
-                        .packed_elem_widths
-                        .and_then(|m| {
-                            m.get(raw.as_str()).copied().or_else(|| {
-                                hier.path
-                                    .last()
-                                    .and_then(|s| m.get(s.name.name.as_str()).copied())
-                            })
-                        })
-                        .filter(|&w| w > 1);
+                    let elem_w = self.packed_elem_width_of(hier);
                     if let Some(elem_w) = elem_w {
                         let base = self.compile_expr(expr, 0)?;
                         // Constant index (the common case — genvar-unrolled
@@ -7472,6 +7860,117 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit(Insn::Concat(dest, Box::new(regs)));
                 Some(dest)
             }
+            // §11.4.14 streaming concatenation. `{>>{…}}` is exactly the
+            // concatenation; `{<<N{…}}` additionally reverses the order of
+            // N-bit slices, which with a constant N and a known total width is
+            // a FIXED bit permutation — a concat of constant range selects.
+            // Previously the whole expression fell to the AST interpreter,
+            // measured at ~0.45us per evaluation (a byte-swap written as
+            // `{<<8{x}}` ran ~32% slower than the same swap written out by
+            // hand).
+            ExprKind::StreamOp {
+                left_to_right,
+                slice_size,
+                exprs,
+            } => {
+                // Widths must be known to place the slices; a part whose width
+                // the compiler cannot size keeps the AST path.
+                // The LRM self-determined width, cross-checked against
+                // `expr_max_width`: the latter is unreliable for an index
+                // select (it reports 1 for an element of a packed-struct
+                // typedef array), and a wrong total silently permutes the
+                // wrong bits. Disagreement means the width is not established
+                // well enough to place slices — keep the AST path.
+                // Placing the slices needs each part's width to be exactly
+                // right — a wrong total silently permutes the wrong bits, and
+                // the general width oracles are not trustworthy enough here:
+                // BOTH `lrm_self_width` and `expr_max_width` report 1 for an
+                // element of a packed-struct typedef array in a submodule, so
+                // cross-checking them does not catch it. Accept only shapes
+                // whose width is unambiguous here and leave every other
+                // spelling on the (correct) AST path.
+                let mut widths: Vec<u32> = Vec::with_capacity(exprs.len());
+                for e in exprs {
+                    let mut inner = e;
+                    while let ExprKind::Paren(i) = &inner.kind {
+                        inner = i;
+                    }
+                    let w = match &inner.kind {
+                        // A whole signal: the signal table is authoritative.
+                        ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => self
+                            .lookup_signal_id(h)
+                            .and_then(|id| self.signal_widths.get(id).copied())
+                            .unwrap_or(0),
+                        // `x[hi:lo]` with constant bounds: hi - lo + 1.
+                        ExprKind::RangeSelect {
+                            left,
+                            right,
+                            kind: RangeKind::Constant,
+                            ..
+                        } => match (self.eval_const_expr(left), self.eval_const_expr(right)) {
+                            (Some(hi), Some(lo)) if hi >= lo => hi - lo + 1,
+                            (Some(hi), Some(lo)) => lo - hi + 1,
+                            _ => 0,
+                        },
+                        _ => 0,
+                    };
+                    if w == 0 {
+                        self.bail("Stream_operand_shape");
+                        return None;
+                    }
+                    widths.push(w);
+                }
+                let total_w: u32 = widths.iter().sum();
+                let mut regs = Vec::with_capacity(exprs.len());
+                for e in exprs {
+                    regs.push(self.compile_expr(e, 0)?);
+                }
+                let src = self.alloc_reg();
+                self.emit(Insn::Concat(src, Box::new(regs)));
+                if !*left_to_right {
+                    return Some(src);
+                }
+                // `{<<N{…}}`: N must be a constant to know the chunking.
+                let slice = match slice_size {
+                    None => 1u32,
+                    Some(e) => match self.fold_const(e).and_then(|v| v.to_u64()) {
+                        Some(n) if n > 0 && n <= u32::MAX as u64 => n as u32,
+                        _ => {
+                            self.bail("Stream_slice_nonconst");
+                            return None;
+                        }
+                    },
+                };
+                if slice >= total_w {
+                    // One chunk (plus nothing to reverse): identity.
+                    return Some(src);
+                }
+                let full = total_w / slice;
+                let rem = total_w - full * slice;
+                // Output MSB-first is chunk0, chunk1, … chunk(full-1), then the
+                // leftover high bits of the source. Chunk k occupies source
+                // bits [k*slice + slice-1 : k*slice].
+                let mut parts: Vec<RegId> = Vec::with_capacity(full as usize + 1);
+                let mut range = |me: &mut Self, hi: u32, lo: u32| -> RegId {
+                    let hr = me.alloc_reg();
+                    me.emit(Insn::LoadConst(hr, Box::new(Value::from_u64(hi as u64, 32))));
+                    let lr = me.alloc_reg();
+                    me.emit(Insn::LoadConst(lr, Box::new(Value::from_u64(lo as u64, 32))));
+                    let d = me.alloc_reg();
+                    me.emit(Insn::RangeSelect(d, src, hr, lr));
+                    d
+                };
+                for k in 0..full {
+                    let lo = k * slice;
+                    parts.push(range(self, lo + slice - 1, lo));
+                }
+                if rem > 0 {
+                    parts.push(range(self, total_w - 1, full * slice));
+                }
+                let dst = self.alloc_reg();
+                self.emit(Insn::Concat(dst, Box::new(parts)));
+                Some(dst)
+            }
             ExprKind::SystemCall { name, args } => match name.as_str() {
                     // §21.3.3 `$sformatf` with a LITERAL template and specs the
                     // native filler covers exactly — parsed once here, filled
@@ -7758,6 +8257,27 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 self.insns.truncate(member_start);
                 self.next_reg = member_reg;
+                // `b.descriptors[0].region` parses with the element select on
+                // the LAST path segment (`b.descriptors[0]` is one identifier):
+                // peel that segment into member + index.
+                if let ExprKind::Ident(h) = &base.kind
+                    && h.root.is_none()
+                    && h.path.len() >= 2
+                    && h.path.last().is_some_and(|s| s.selects.len() == 1)
+                    && h.path[..h.path.len() - 1].iter().all(|s| s.selects.len() <= 1)
+                {
+                    let mut root_hier = h.clone();
+                    let last = root_hier.path.pop().unwrap();
+                    let mname = last.name.name.clone();
+                    let index = last.selects[0].clone();
+                    if let Some(dest) =
+                        self.compile_indexed_folded_member(&root_hier, &mname, &index, &member.name)
+                    {
+                        return Some(dest);
+                    }
+                }
+                self.insns.truncate(member_start);
+                self.next_reg = member_reg;
 
                 // Direct packed member (`container.field`). Nested field paths
                 // are already flattened in the layout table.
@@ -7902,11 +8422,76 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Resolve `arr[i].m` into the operands an array-range store needs:
+    /// (array, index reg, hi reg, lo reg, value resized to the member width).
+    /// An indexed base keeps the lvalue a `MemberAccess` node — only the bare
+    /// `s.m` form collapses to a dotted `Ident` — so both the NBA and the
+    /// blocking arm land here. Shared so the two cannot drift apart, which
+    /// this member/container pair has done twice.
+    ///
+    /// Emits the index and constant loads, so a `None` after that point would
+    /// leave dead insns behind; every caller bails the whole block on `None`,
+    /// which discards them.
+    fn packed_array_member_store(
+        &mut self,
+        base: &Expression,
+        member: &str,
+        val_reg: RegId,
+    ) -> Option<(Box<ArrayOperand>, RegId, RegId, RegId, RegId)> {
+        let ExprKind::Index {
+            expr: arr_expr,
+            index,
+        } = &base.kind
+        else {
+            return None;
+        };
+        let ExprKind::Ident(hier) = &arr_expr.kind else {
+            return None;
+        };
+        let (_, fields) = self.packed_struct_layout_for_hier(hier)?;
+        let &(_, off, mw) = fields.iter().find(|(m, _, _)| m == member)?;
+        if mw == 0 {
+            return None;
+        }
+        let name = self.lookup_array_name(hier)?;
+        let idx_reg = self.compile_expr(index, 0)?;
+        let resized = self.alloc_reg();
+        self.emit(Insn::Move(resized, val_reg));
+        self.emit(Insn::Resize(resized, mw));
+        let hi_reg = self.alloc_reg();
+        self.emit(Insn::LoadConst(
+            hi_reg,
+            Box::new(Value::from_u64((off + mw - 1) as u64, 32)),
+        ));
+        let lo_reg = self.alloc_reg();
+        self.emit(Insn::LoadConst(
+            lo_reg,
+            Box::new(Value::from_u64(off as u64, 32)),
+        ));
+        Some((self.array_operand(name), idx_reg, hi_reg, lo_reg, resized))
+    }
+
     fn compile_nba_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 if let Some(id) = self.lookup_signal_id(hier) {
                     self.emit(Insn::NbaAssign(as_sig_id(id), val_reg, width));
+                    true
+                } else if let Some((base_id, off, mw)) = self.packed_struct_member_target(hier) {
+                    // Packed-struct member NBA (`s.m0 <= …`): mirror of the
+                    // blocking arm — splice into `[off + mw - 1 : off]` of the
+                    // container. Range NBAs compose onto a pending nba_fast
+                    // entry, so several members of one container written in the
+                    // same cycle each keep their own slice.
+                    let resized = self.alloc_reg();
+                    self.emit(Insn::Move(resized, val_reg));
+                    self.emit(Insn::Resize(resized, mw));
+                    self.emit(Insn::NbaAssignRange(
+                        as_sig_id(base_id),
+                        off + mw - 1,
+                        off,
+                        resized,
+                    ));
                     true
                 } else {
                     self.bail("nba_ident_unresolved");
@@ -7943,17 +8528,7 @@ impl<'a> BytecodeCompiler<'a> {
                     if let Some(id) = self.lookup_signal_id(hier) {
                         // Packed multi-D NBA: `mem[i] <= data` must write the
                         // W-bit slice at `i*W +: W`. Mirrors compile_blocking_target.
-                        let raw = Self::hier_raw_name(hier);
-                        let elem_w = self
-                            .packed_elem_widths
-                            .and_then(|m| {
-                                m.get(raw.as_str()).copied().or_else(|| {
-                                    hier.path
-                                        .last()
-                                        .and_then(|s| m.get(s.name.name.as_str()).copied())
-                                })
-                            })
-                            .filter(|&w| w > 1);
+                        let elem_w = self.packed_elem_width_of(hier);
                         if let Some(elem_w) = elem_w {
                             if let Some(idx_reg) = self.compile_expr(index, 0) {
                                 // Normalize the index to a 0-based, LSB-first
@@ -7991,6 +8566,28 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit(Insn::NbaAssignBitDyn(as_sig_id(id), idx_reg, val_reg));
                         return true;
                     }
+                }
+                // `a[i][j] <= v` on a 2-D unpacked array: same row-major
+                // addressing the READ path already uses, then an ordinary
+                // array store. Elements are materialized contiguously, so the
+                // flat index and its out-of-range guard are shared with
+                // `compile_2d_array_read`. Without this the whole statement —
+                // and any loop containing it — stayed on the AST path, which
+                // measured ~24x slower than the 1-D equivalent.
+                if let ExprKind::Index {
+                    expr: outer,
+                    index: j_expr,
+                } = &lhs.kind
+                    && let ExprKind::Index {
+                        expr: base,
+                        index: i_expr,
+                    } = &outer.kind
+                    && let ExprKind::Ident(hier) = &base.kind
+                    && let Some((array, flat)) =
+                        self.compile_2d_flat_index(hier, i_expr, j_expr)
+                {
+                    self.emit(Insn::NbaAssignArray(array, flat, val_reg, width));
+                    return true;
                 }
                 self.bail("nba_index_other");
                 false
@@ -8229,7 +8826,18 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 true
             }
-            ExprKind::MemberAccess { .. } => {
+            ExprKind::MemberAccess { expr, member } => {
+                // `arr[i].m <= v`: splice the member's static bit range into
+                // the selected ELEMENT, via the same NbaAssignArrayRange the
+                // `arr[i][hi:lo]` form uses.
+                if let Some((array, idx_reg, hi_reg, lo_reg, resized)) =
+                    self.packed_array_member_store(expr, &member.name, val_reg)
+                {
+                    self.emit(Insn::NbaAssignArrayRange(
+                        array, idx_reg, hi_reg, lo_reg, resized,
+                    ));
+                    return true;
+                }
                 self.bail("nba_member_access");
                 false
             }
@@ -8399,6 +9007,64 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
+                // `arr[i].m = v` — same operands as the NBA arm.
+                if let Some((array, idx_reg, hi_reg, lo_reg, resized)) =
+                    self.packed_array_member_store(expr, &member.name, val_reg)
+                {
+                    self.emit(Insn::BlockingAssignArrayRange(
+                        array, idx_reg, hi_reg, lo_reg, resized,
+                    ));
+                    return true;
+                }
+                // §13.4.1 `fname.member = …`: a write to a member of the
+                // function's own RETURN VARIABLE, which an inlined body holds
+                // in a register rather than a signal — so neither the signal
+                // splice above nor the array path applies. Mask-splice the
+                // member's static bit range into that register:
+                //   r = (r & ~(mask << off)) | ((v & mask) << off)
+                // The layout is registered per function at compile start
+                // ("fn ret:<name>"), since the return variable is not a signal
+                // and nothing else records one for it.
+                if let ExprKind::Ident(bh) = &expr.kind
+                    && let Some((slot, rw)) = self.local_var_reg_of(bh)
+                    && let Some(fields) = self.packed_struct_fields.and_then(|m| {
+                        m.get(format!("fn ret:{}", Self::hier_raw_name(bh)).as_str())
+                    })
+                    && let Some(&(_, off, mw)) =
+                        fields.iter().find(|(n, _, _)| *n == member.name)
+                    && mw > 0
+                    && rw > 0
+                {
+                    let fields_w = rw;
+                    // value & mask, widened, shifted into place
+                    let vex = self.alloc_reg();
+                    self.emit(Insn::Move(vex, val_reg));
+                    self.emit(Insn::Resize(vex, mw));
+                    self.emit(Insn::Resize(vex, fields_w));
+                    let sh = self.alloc_reg();
+                    self.emit(Insn::LoadConst(
+                        sh,
+                        Box::new(Value::from_u64(off as u64, 32)),
+                    ));
+                    let vsh = self.alloc_reg();
+                    self.emit(Insn::Shl(vsh, vex, sh));
+                    // clear the destination window
+                    let mut mask = Value::from_u64(0, fields_w);
+                    for b in 0..mw {
+                        mask.set_bit((off + b) as usize, xezim_core::value::LogicBit::One);
+                    }
+                    let mreg = self.alloc_reg();
+                    self.emit(Insn::LoadConst(mreg, Box::new(mask)));
+                    let inv = self.alloc_reg();
+                    self.emit(Insn::BitNot(inv, mreg));
+                    let cleared = self.alloc_reg();
+                    self.emit(Insn::BitAnd(cleared, slot, inv));
+                    let merged = self.alloc_reg();
+                    self.emit(Insn::BitOr(merged, cleared, vsh));
+                    self.emit(Insn::Move(slot, merged));
+                    self.emit(Insn::Resize(slot, fields_w));
+                    return true;
+                }
                 self.bail("blocking_target_member_access");
                 false
             }
@@ -8454,17 +9120,7 @@ impl<'a> BytecodeCompiler<'a> {
                         // `logic [N-1:0][W-1:0] mem_n` must write a W-bit
                         // slice at `i*W +: W`, not a single bit. Emit a
                         // RangeDyn write of `(i*W+W-1):(i*W)` instead.
-                        let raw = Self::hier_raw_name(hier);
-                        let elem_w = self
-                            .packed_elem_widths
-                            .and_then(|m| {
-                                m.get(raw.as_str()).copied().or_else(|| {
-                                    hier.path
-                                        .last()
-                                        .and_then(|s| m.get(s.name.name.as_str()).copied())
-                                })
-                            })
-                            .filter(|&w| w > 1);
+                        let elem_w = self.packed_elem_width_of(hier);
                         if let Some(elem_w) = elem_w {
                             if let Some(idx_reg) = self.compile_expr(index, 0) {
                                 // lo = slot * elem_w, where `slot` normalizes
@@ -9365,6 +10021,18 @@ impl<'a> BytecodeCompiler<'a> {
         match &e.kind {
             ExprKind::Number(NumberLiteral::Integer { signed, .. }) => Some(*signed),
             ExprKind::Paren(i) => self.expr_signedness(i),
+            // §20/§21: an `int`/`integer`-valued system function is SIGNED
+            // (`$countones(x) - 8 < 0` is a signed compare); `bit`, `time`
+            // and the unsigned-int ones are not; `$past`/`$sampled` carry
+            // their operand's signedness.
+            ExprKind::SystemCall { name, args }
+                if matches!(name.as_str(), "$past" | "$sampled") =>
+            {
+                args.first().and_then(|a| self.expr_signedness(a))
+            }
+            ExprKind::SystemCall { name, .. } if system_function_result(name).is_some() => {
+                system_function_result(name).map(|(_, signed)| signed)
+            }
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
                 let id = self.lookup_signal_id(h)?;
                 Some(self.signal_signed[id])
@@ -9423,6 +10091,18 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+
+    /// Self-determined width of a system function's RESULT (IEEE 1800-2017
+    /// §20/§21) — see `system_function_result`; `$signed`/`$unsigned`/
+    /// `$past`/`$sampled` carry their argument's width. Real- and
+    /// string-valued functions report None (no integral width to contribute
+    /// to a context).
+    fn system_function_width(&self, name: &str, args: &[Expression]) -> Option<u32> {
+        if system_function_carries_arg(name) {
+            return args.first().map(|a| self.expr_max_width(a));
+        }
+        system_function_result(name).map(|(w, _)| w)
+    }
 
     fn expr_max_width(&self, expr: &Expression) -> u32 {
         match &expr.kind {
@@ -9502,6 +10182,14 @@ impl<'a> BytecodeCompiler<'a> {
                 .map(|a| self.expr_max_width(a))
                 .max()
                 .unwrap_or(0),
+            // A system FUNCTION has the result type the LRM gives it, not the
+            // width of its arguments — and certainly not 0, which the old
+            // catch-all returned: `out_step <= $countones(be) >> 3` with a
+            // 4-bit target then compiled the shift at the target's width and
+            // truncated a count of 24 to 8 before shifting.
+            ExprKind::SystemCall { name, args } => {
+                self.system_function_width(name, args).unwrap_or(0)
+            }
             ExprKind::Conditional {
                 then_expr,
                 else_expr,
@@ -13265,4 +13953,33 @@ pub fn lower_two_state(
         writes: writes.into_boxed_slice(),
         writes_span: writes_span.into_boxed_slice(),
     })
+}
+
+/// IEEE 1800-2017 §20/§21 result type of a system FUNCTION as (width,
+/// signed): `int`/`integer` → (32, true); unsigned int → (32, false);
+/// `bit` → (1, false); `time` / `$realtobits` → (64, false). Real- and
+/// string-valued functions, and the ones that carry their argument's type
+/// (`system_function_carries_arg`), are None. Shared by the compiler's width
+/// and signedness inference and by the interpreter, so every path agrees.
+pub(crate) fn system_function_result(name: &str) -> Option<(u32, bool)> {
+    Some(match name {
+        "$countones" | "$countbits" | "$clog2" | "$bits" | "$size" | "$dimensions"
+        | "$unpacked_dimensions" | "$left" | "$right" | "$low" | "$high" | "$increment"
+        | "$rtoi" | "$random" | "$cast" | "$fopen" | "$fgetc" | "$fgets" | "$fscanf"
+        | "$sscanf" | "$fread" | "$ftell" | "$feof" | "$ferror" | "$ungetc" | "$fseek"
+        | "$rewind" | "$test$plusargs" | "$value$plusargs" | "$dist_uniform"
+        | "$dist_normal" | "$dist_exponential" | "$dist_poisson" | "$dist_chi_square"
+        | "$dist_t" | "$dist_erlang" | "$coverage_control" | "$coverage_get_max"
+        | "$coverage_get" | "$coverage_merge" | "$coverage_save" => (32, true),
+        "$urandom" | "$urandom_range" | "$stime" | "$shortrealtobits" => (32, false),
+        "$onehot" | "$onehot0" | "$isunknown" | "$isunbounded" | "$rose" | "$fell"
+        | "$stable" | "$changed" => (1, false),
+        "$time" | "$realtobits" => (64, false),
+        _ => return None,
+    })
+}
+
+/// System functions whose result has the TYPE of their first argument.
+pub(crate) fn system_function_carries_arg(name: &str) -> bool {
+    matches!(name, "$signed" | "$unsigned" | "$past" | "$sampled")
 }

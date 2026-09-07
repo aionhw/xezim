@@ -66,7 +66,6 @@ fn uvm_dpi_builtins_regex_hdl_and_argv() {
         None,
         &[],
         &["+UVM_CONFIG_DB_TRACE".to_string()],
-        1,
         None,
         &[],
         0,

@@ -61,7 +61,6 @@ fn run_in_process(src: &str) -> Option<String> {
         None,
         &[],
         &[],
-        1,
         None,
         &[],
         0,
@@ -228,4 +227,63 @@ endmodule
     assert!(out.contains("T1_FAIL"), "cross-scope get must miss: {}", out);
     assert!(out.contains("T2_GET: 77"), "wildcard get: {}", out);
     assert!(out.contains("T3_OK"), "unset field should miss: {}", out);
+}
+
+/// A value set via `uvm_config_db::set` is visible to `uvm_config_db::exists`
+/// at the same scope and through a `*` wildcard; a never-set field reports
+/// missing.
+/// Regression: the static `uvm_config_db#(T)::exists` (whose name collides
+/// with the collection `exists` builtin) was routed to the associative-array
+/// query and answered 0 without ever running the class method, so every
+/// `exists` reported false even when the matching resource was present.
+#[test]
+fn test_config_db_exists_after_set() {
+    const TEST_NAME: &str = "test_config_db_exists_after_set";
+    let src = r#"
+`include "uvm_macros.svh"
+module top;
+  import uvm_pkg::*;
+  initial begin
+    #1;
+    // Same scope: set scope "uut" and look it up with a matching concrete
+    // scope that the resource's stored scope must satisfy.
+    #1;
+    uvm_config_db#(int)::set(null, "uut", "spec_int", 1);
+    #1;
+    if (uvm_config_db#(int)::exists(null, "uut", "spec_int"))
+      $display("E1_OK: specific exists");
+    else
+      $display("E1_FAIL: specific exists returned 0");
+
+    // Wildcard: a set with `*` inst_name is visible to exists at a deeper,
+    // concretely-named scope.
+    #1;
+    uvm_config_db#(int)::set(null, "*", "wild_int", 2);
+    #1;
+    if (uvm_config_db#(int)::exists(null, "deep/path", "wild_int"))
+      $display("E2_OK: wildcard exists");
+    else
+      $display("E2_FAIL: wildcard exists returned 0");
+
+    // A field never set must miss even against the wildcard.
+    #1;
+    if (uvm_config_db#(int)::exists(null, "any", "never_set"))
+      $display("E3_FAIL: unset field reported present");
+    else
+      $display("E3_OK: unset field missing");
+    $finish;
+  end
+endmodule
+"#;
+    let Some(out) = run_in_process(src) else {
+        skip_no_uvm(TEST_NAME);
+        return;
+    };
+    println!("{}", out);
+    // Reference-verified (2026-08-28, UVM 2020 src): a set visible to get is
+    // also visible to exists at the same scope and through a `*` wildcard,
+    // while a never-set field reports missing.
+    assert!(out.contains("E1_OK"), "specific exists: {}", out);
+    assert!(out.contains("E2_OK"), "wildcard exists: {}", out);
+    assert!(out.contains("E3_OK"), "unset field must miss: {}", out);
 }

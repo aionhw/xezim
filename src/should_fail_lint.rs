@@ -957,6 +957,46 @@ fn stream_width(exprs: &[Expression], vw: &std::collections::HashMap<String, u32
     Some(total)
 }
 
+/// True when every name in this type's packed dimensions resolves in the flat
+/// parameter map, so its width is genuinely known.
+///
+/// `resolve_type_width` SKIPS a dimension it cannot evaluate and returns the
+/// width the type would have had WITHOUT it — an unresolvable base therefore
+/// looks like a 1-bit one. This lint walks the raw AST, where a submodule's
+/// parameter is still spelled bare (`DW`) while the map holds only the
+/// instance-qualified key (`u_fifo.DW`), so `enum logic [DW-1:0] { A = 96'h0 }`
+/// measured 1 bit and §6.19 REJECTED a perfectly legal design. A lint must not
+/// fire on a width it could not determine.
+fn dim_names_resolve(dt: &DataType, elab: &ElaboratedModule) -> bool {
+    fn expr_known(e: &Expression, elab: &ElaboratedModule) -> bool {
+        match &e.kind {
+            ExprKind::Number(_) => true,
+            ExprKind::Paren(x) => expr_known(x, elab),
+            ExprKind::Unary { operand, .. } => expr_known(operand, elab),
+            ExprKind::Binary { left, right, .. } => {
+                expr_known(left, elab) && expr_known(right, elab)
+            }
+            ExprKind::Ident(h) => h
+                .path
+                .last()
+                .is_some_and(|s| elab.parameters.contains_key(&s.name.name)),
+            // Anything else is not something this lint should judge.
+            _ => false,
+        }
+    }
+    let dims = match dt {
+        DataType::IntegerVector { dimensions, .. } => dimensions,
+        // A non-vector base carries no dimension to be unsure about.
+        _ => return true,
+    };
+    dims.iter().all(|d| match d {
+        PackedDimension::Range { left, right, .. } => {
+            expr_known(left, elab) && expr_known(right, elab)
+        }
+        _ => false,
+    })
+}
+
 /// §6.19: in an enum with an explicit base type, a member whose value is a
 /// *sized* literal constant must match the base-type width.
 fn check_enum_type(dt: &DataType, elab: &ElaboratedModule, errs: &mut Vec<String>) {
@@ -968,7 +1008,7 @@ fn check_enum_type(dt: &DataType, elab: &ElaboratedModule, errs: &mut Vec<String
             Some(&elab.parameters),
             Some(&elab.typedefs),
         );
-        if w != 0 {
+        if w != 0 && dim_names_resolve(base, elab) {
             for m in &et.members {
                 if let Some(init) = &m.init {
                     if let ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) = &init.kind {
@@ -1060,6 +1100,12 @@ fn check_enum_values(et: &EnumType, elab: &ElaboratedModule, errs: &mut Vec<Stri
         | Some(DataType::IntegerAtom { .. })
         | Some(DataType::Implicit { .. }) => {}
         _ => return,
+    }
+    // Same trap as the sized-literal check above: a base whose width names a
+    // parameter this map cannot resolve measures 1 bit, and every member then
+    // looks out of range (and every one of them looks equal to every other).
+    if base.is_some_and(|b| !dim_names_resolve(b, elab)) {
+        return;
     }
     let width = base
         .map(|b| xezim_core::elaborate::resolve_type_width(b, Some(&elab.parameters), Some(&elab.typedefs)))

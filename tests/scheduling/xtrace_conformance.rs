@@ -74,7 +74,6 @@ fn dump_scoped(tag: &str, src: &str, scopes: &[String]) -> String {
         None,
         &[],
         &[],
-        1,
         Some(path.to_str().unwrap()),
         scopes,
         0,

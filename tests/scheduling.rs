@@ -137,6 +137,8 @@ mod preprocessor_diagnostic_location;
 mod preprocessor_github_issues;
 #[path = "scheduling/process_block_local_shadowing.rs"]
 mod process_block_local_shadowing;
+#[path = "scheduling/wait_satisfaction_order.rs"]
+mod wait_satisfaction_order;
 #[path = "scheduling/procedural_loop_stall.rs"]
 mod procedural_loop_stall;
 #[path = "scheduling/pure_inline_loop_body.rs"]
@@ -199,3 +201,17 @@ mod nested_delay_slot_servicing;
 mod finish_with_live_fork_child;
 #[path = "scheduling/nba_array_elem_last_write_wins.rs"]
 mod nba_array_elem_last_write_wins;
+#[path = "scheduling/delayed_write_pending_semantics.rs"]
+mod delayed_write_pending_semantics;
+#[path = "scheduling/labeled_block_local_hier_ref.rs"]
+mod labeled_block_local_hier_ref;
+#[path = "scheduling/nba_wait_for_region_yield.rs"]
+mod nba_wait_for_region_yield;
+#[path = "scheduling/release_from_level_sensitive_block.rs"]
+mod release_from_level_sensitive_block;
+#[path = "scheduling/sva_instances_and_sequences.rs"]
+mod sva_instances_and_sequences;
+#[path = "scheduling/always_value_change_after_edge_continuation.rs"]
+mod always_value_change_after_edge_continuation;
+#[path = "scheduling/package_and_unit_delays_scale_by_timescale.rs"]
+mod package_and_unit_delays_scale_by_timescale;

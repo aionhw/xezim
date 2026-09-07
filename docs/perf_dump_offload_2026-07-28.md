@@ -44,8 +44,9 @@ Two independent causes, both on the simulation thread:
   `FstBodyWriter` lives on the worker; the simulation thread posts
   `FstTimestep`s. `finish()` is a rendezvous, so the trailer is on disk when it
   returns. `XEZIM_DUMP_INLINE=1` keeps it inline.
-* **`$display`/log writing is threaded by default**, decoupled from `--threads`
-  (it used to need `--threads >= 2`). Three fixes were needed to make that a win
+* **`$display`/log writing is threaded by default**, decoupled from the old
+  `--threads` flag (since removed; it used to need `--threads >= 2`). Three
+  fixes were needed to make that a win
   rather than a loss — see §4.
 
 ## 3. Result

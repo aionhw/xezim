@@ -664,7 +664,6 @@ pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, Stri
         None,
         &[],
         &[],
-        1,
         None,
         &[],
         0,
@@ -700,7 +699,6 @@ pub fn simulate_multi(
     sdf_select: Option<xezim_core::sdf::DelaySelect>,
     defines: &[(String, Option<String>)],
     plusargs: &[String],
-    threads: usize,
     xtrace_file: Option<&str>,
     xtrace_scopes: &[String],
     xtrace_from_ns: u64,
@@ -722,7 +720,7 @@ pub fn simulate_multi(
         return simulate_multi_inner(
             sources, max_time, top_module_name, include_dirs, source_paths,
             settle_limit, activity_mon, sdf_file, sdf_select, defines, plusargs,
-            threads, xtrace_file, xtrace_scopes, xtrace_from_ns, xtrace_to_ns,
+            xtrace_file, xtrace_scopes, xtrace_from_ns, xtrace_to_ns,
             fst_file, fst_scopes, emit_hypergraph, load_partition, write_profile,
             profile_input, collapse_islands, multikernel_scope,
         );
@@ -744,7 +742,7 @@ pub fn simulate_multi(
                 SendResult(simulate_multi_inner(
                     sources, max_time, top_module_name, include_dirs, source_paths,
                     settle_limit, activity_mon, sdf_file, sdf_select, defines,
-                    plusargs, threads, xtrace_file, xtrace_scopes, xtrace_from_ns,
+                    plusargs, xtrace_file, xtrace_scopes, xtrace_from_ns,
                     xtrace_to_ns, fst_file, fst_scopes, emit_hypergraph,
                     load_partition, write_profile, profile_input, collapse_islands,
                     multikernel_scope,
@@ -770,7 +768,6 @@ fn simulate_multi_inner(
     sdf_select: Option<xezim_core::sdf::DelaySelect>,
     defines: &[(String, Option<String>)],
     plusargs: &[String],
-    threads: usize,
     xtrace_file: Option<&str>,
     xtrace_scopes: &[String],
     xtrace_from_ns: u64,
@@ -892,7 +889,6 @@ fn simulate_multi_inner(
     sim.fst_file = fst_file.map(|s| s.to_string());
     sim.fst_scopes = fst_scopes.to_vec();
     sim.set_plusargs(plusargs);
-    sim.set_threads(threads);
     // Default argv for vpi_get_vlog_info — the real CLI passes the
     // full tokenized list via set_args() in main.rs. Here we hand
     // back just "xezim" + plusargs so UVM's tool banner works for
@@ -916,6 +912,12 @@ fn simulate_multi_inner(
         sim.sdf_annotation = Some(annotation);
     }
     sim.compile();
+    // A compile-time failure (e.g. §6.18 illegal non-class to class-handle
+    // assignment) aborts before any block is scheduled; surface it as `Err` so
+    // library callers see the compile error instead of a bogus run.
+    if !sim.compile_errors.is_empty() {
+        return Err(sim.compile_errors.join("; "));
+    }
     eprintln!(
         "[PHASE] compilation: {:.1}ms",
         compilation_start.elapsed().as_secs_f64() * 1000.0

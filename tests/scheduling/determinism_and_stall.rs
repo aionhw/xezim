@@ -29,7 +29,6 @@ fn run(src: &str, plusargs: &[String]) -> xezim::compiler::Simulator {
         None,
         &[],
         plusargs,
-        1,
         None,
         &[],
         0,

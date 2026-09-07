@@ -11,6 +11,10 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "types/packed_struct_array_local.rs"]
+mod packed_struct_array_local;
+#[path = "types/packed_struct_member_width.rs"]
+mod packed_struct_member_width;
 #[path = "types/packed_struct_formal_member.rs"]
 mod packed_struct_formal_member;
 #[path = "types/block_local_width_in_index_shift.rs"]
@@ -27,12 +31,16 @@ mod array_parameter;
 mod array_query_multidim_packed;
 #[path = "types/assoc_of_queue_enumeration.rs"]
 mod assoc_of_queue_enumeration;
+#[path = "types/bits_of_type_param_expr.rs"]
+mod bits_of_type_param_expr;
 #[path = "types/bits_of_signal_in_const_expr.rs"]
 mod bits_of_signal_in_const_expr;
 #[path = "types/bits_package_scoped_type_width.rs"]
 mod bits_package_scoped_type_width;
 #[path = "types/callback_typedef_static.rs"]
 mod callback_typedef_static;
+#[path = "types/cast_class_member_enum_range.rs"]
+mod cast_class_member_enum_range;
 #[path = "types/cast_typeparam.rs"]
 mod cast_typeparam;
 #[path = "types/cast_valparam_typeparam_static.rs"]
@@ -65,12 +73,26 @@ mod defparam_override;
 mod dollar_lvalue_and_assoc_width;
 #[path = "types/enum_name_formal_param.rs"]
 mod enum_name_formal_param;
+#[path = "types/wide_enum_values.rs"]
+mod wide_enum_values;
+#[path = "types/enum_member_per_instance.rs"]
+mod enum_member_per_instance;
+#[path = "types/enum_reflection_in_submodules.rs"]
+mod enum_reflection_in_submodules;
 #[path = "types/enum_next_prev_count.rs"]
 mod enum_next_prev_count;
+#[path = "types/enum_name_cross_method_local.rs"]
+mod enum_name_cross_method_local;
 #[path = "types/enum_signedness_and_pkg_scope.rs"]
 mod enum_signedness_and_pkg_scope;
+#[path = "types/enum_typeparam_wrapper_from_name.rs"]
+mod enum_typeparam_wrapper_from_name;
 #[path = "types/enum_xz_and_package_shapes.rs"]
 mod enum_xz_and_package_shapes;
+#[path = "types/package_base_constraint_inherited.rs"]
+mod package_base_constraint_inherited;
+#[path = "types/param_registry_typeid_identity.rs"]
+mod param_registry_typeid_identity;
 #[path = "types/formal_type_metadata_and_typedef_packed_array.rs"]
 mod formal_type_metadata_and_typedef_packed_array;
 #[path = "types/forward_referenced_parameter.rs"]
@@ -169,6 +191,10 @@ mod task_formal_param_width;
 mod type_param_bound_to_specialization;
 #[path = "types/type_param_static_property.rs"]
 mod type_param_static_property;
+#[path = "types/stmt_local_scoped_decls.rs"]
+mod stmt_local_scoped_decls;
+#[path = "types/type_param_struct_per_instance.rs"]
+mod type_param_struct_per_instance;
 #[path = "types/typedef_declaring_scope.rs"]
 mod typedef_declaring_scope;
 #[path = "types/typedef_specialization_dispatch.rs"]
@@ -314,3 +340,29 @@ mod package_data_members_in_subroutine;
 mod per_spec_static_singletons;
 #[path = "types/signed_unsigned_compare_extension.rs"]
 mod signed_unsigned_compare_extension;
+#[path = "types/field_init_call_singletons.rs"]
+mod field_init_call_singletons;
+#[path = "types/data_decl_param_spec_type_arg.rs"]
+mod data_decl_param_spec_type_arg;
+#[path = "types/type_id_create_applies_override.rs"]
+mod type_id_create_applies_override;
+#[path = "types/queue_literal_function_return.rs"]
+mod queue_literal_function_return;
+#[path = "types/class_handle_nonclass_assign_compile_err.rs"]
+mod class_handle_nonclass_assign_compile_err;
+#[path = "types/vector_type_arg_spec.rs"]
+mod vector_type_arg_spec;
+#[path = "types/self_named_typedef_alias.rs"]
+mod self_named_typedef_alias;
+#[path = "types/tf_port_typedef_packed_dims.rs"]
+mod tf_port_typedef_packed_dims;
+#[path = "types/ref_formal_element_write.rs"]
+mod ref_formal_element_write;
+#[path = "types/multi_dim_unpacked_arrays.rs"]
+mod multi_dim_unpacked_arrays;
+#[path = "types/real_to_integral_local.rs"]
+mod real_to_integral_local;
+#[path = "types/system_function_result_width.rs"]
+mod system_function_result_width;
+#[path = "types/packed_member_select_name_collision.rs"]
+mod packed_member_select_name_collision;

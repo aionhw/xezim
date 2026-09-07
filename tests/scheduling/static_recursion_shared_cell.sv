@@ -4,9 +4,9 @@
 // copy restored at entry and written back on return, so an inner recursion
 // level's mutation of the shared cell was invisible to the caller frames and
 // the static was effectively reset to its initializer on each re-entry
-// ("fresh frame"). This caused UVM `phase.jump` re-entry (40phasing
-// /06started_ended) to re-run `main_phase` with its `static bit first`
-// re-initialised to 1, livelocking the phase scheduler.
+// ("fresh frame"). This caused UVM `phase.jump` re-entry to re-run
+// `main_phase` with its `static bit first` re-initialised to 1,
+// livelocking the phase scheduler.
 //
 // A recursive method that accumulates into a `static int` must see the whole
 // sequence (depth 4,3,2,1 -> 4 increments -> shared counter == 4), matching the

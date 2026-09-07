@@ -41,7 +41,6 @@ fn run_seed(src: &str, seed: u64) -> xezim::compiler::Simulator {
         None,
         &[],
         &plus,
-        1,
         None,
         &[],
         0,

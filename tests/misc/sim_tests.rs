@@ -28,7 +28,6 @@ fn sim_ok_plusargs(src: &str, plusargs: &[&str]) -> xezim::compiler::Simulator {
         None,
         &[],
         &plusargs_vec,
-        1,
         None,
         &[],
         0,

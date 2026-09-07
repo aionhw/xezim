@@ -161,3 +161,153 @@ endmodule
     assert_eq!(read("u_dut.ctrl"), 123, "upward write by module name");
     assert_eq!(read("u_dut.u_sub.sctrl"), 55, "upward write by instance name");
 }
+
+/// `assert ... else` inside a bound monitor reading an UPWARD
+/// instance-anchored reference (`subsys.int_req_addr`, §23.8/§23.10.1).
+/// The elaborator's final rewrite pass had no `Assertion` arm, so the whole
+/// statement fell through un-rewritten: the condition's dotted reference
+/// stayed a raw `MemberAccess` node (never collapsed to a hierarchical
+/// Ident) and the interpreter read it as a nonexistent object property — 0.
+/// The assert falsely fired and ran its else-action, while the very same
+/// reference in a plain `if` (which IS rewritten) resolved fine.
+/// Reference-verified: seen=1 bad=0.
+#[test]
+fn assert_else_in_bound_module_resolves_upward_ref() {
+    const SRC: &str = r#"
+module producer(input wire clk, input wire rst_l, output logic [31:0] addr, output logic vld);
+  always @(posedge clk) begin
+    if (!rst_l) begin addr <= 32'h8000; vld <= 1'b0; end
+    else begin addr <= addr + 32'h100; vld <= 1'b1; end
+  end
+endmodule
+
+module subsys(input wire clk, input wire rst_l);
+  wire [31:0] int_req_addr; wire int_req_vld;
+  producer p(.clk(clk), .rst_l(rst_l), .addr(int_req_addr), .vld(int_req_vld));
+endmodule
+
+module mon_unit(input wire clk, input wire rst_l);
+  logic [31:0] lo_lim, hi_lim; logic vld_r; int bad_count; int seen_count;
+  always @(posedge clk) begin
+    if (!rst_l) begin
+      vld_r <= 1'b0; bad_count <= 0; seen_count <= 0;
+      lo_lim <= 32'h8000; hi_lim <= 32'h9000;
+    end else begin
+      vld_r <= subsys.int_req_vld;
+      if (vld_r) begin
+        seen_count <= seen_count + 1;
+        assert (subsys.int_req_addr >= lo_lim && subsys.int_req_addr < hi_lim)
+        else begin
+          bad_count <= bad_count + 1;
+          $error("illegal addr 0x%0x", subsys.int_req_addr);
+        end
+      end
+    end
+  end
+endmodule
+
+module mon_harness(input wire clk, input wire rst_l);
+  mon_unit mon(.clk(clk), .rst_l(rst_l));
+endmodule
+
+bind subsys mon_harness h (.*);
+
+module tb;
+  logic clk, rst_l;
+  initial begin clk = 1'b0; repeat (8) #5 clk = ~clk; end
+  initial begin rst_l = 1'b0; #10 rst_l = 1'b1; end
+  subsys subsys(.clk(clk), .rst_l(rst_l));
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let read = |name: &str| -> i64 {
+        sim.get_signal(name)
+            .unwrap_or_else(|| panic!("signal {name} not found"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("signal {name} is X/Z")) as i64
+    };
+    assert_eq!(read("subsys.h.mon.seen_count"), 1, "monitor sampled");
+    assert_eq!(
+        read("subsys.h.mon.bad_count"),
+        0,
+        "assert falsely fired: upward ref in the condition read 0"
+    );
+}
+
+/// Sibling sweep of the missing-Assertion-arm bug: `do-while`, `wait`,
+/// block-local decl initializers, `randcase`, and `force` also had no
+/// `rewrite_stmt` arm, so their dotted upward references stayed raw
+/// `MemberAccess` nodes. Most shapes were rescued by interpreter fallbacks;
+/// `force tgt = host.wire` observably broke — and exposed a second gap:
+/// `refresh_active_forces` ran only at settle START, so a tracked operand
+/// that is itself comb-driven (a wire copying a child port) bumped its
+/// epoch after the refresh and the override went stale. Reference-verified:
+/// wait=0x8100 dw=0x8100 decl=0x8200 rc=0x8200 force=0x8300.
+#[test]
+fn bound_module_sibling_stmt_kinds_resolve_upward_refs() {
+    const SRC: &str = r#"
+module producer(input wire clk, input wire rst_l, output logic [31:0] addr, output logic vld);
+  always @(posedge clk) begin
+    if (!rst_l) begin addr <= 32'h8000; vld <= 1'b0; end
+    else begin addr <= addr + 32'h100; vld <= 1'b1; end
+  end
+endmodule
+
+module subsys(input wire clk, input wire rst_l);
+  wire [31:0] int_req_addr; wire int_req_vld;
+  producer p(.clk(clk), .rst_l(rst_l), .addr(int_req_addr), .vld(int_req_vld));
+endmodule
+
+module mon_unit(input wire clk, input wire rst_l);
+  logic [31:0] dw_got, wait_got, decl_got, rc_got, force_tgt;
+  initial begin
+    dw_got = 0; wait_got = 0; decl_got = 0; rc_got = 0; force_tgt = 0;
+    wait (subsys.int_req_vld === 1'b1);
+    wait_got = subsys.int_req_addr;
+    do begin
+      dw_got = subsys.int_req_addr;
+      @(posedge clk);
+    end while (subsys.int_req_addr < 32'h8200);
+    begin
+      automatic logic [31:0] snap = subsys.int_req_addr;
+      decl_got = snap;
+    end
+    randcase
+      subsys.int_req_vld : rc_got = subsys.int_req_addr;
+      0 : rc_got = 32'hdead;
+    endcase
+    force force_tgt = subsys.int_req_addr;
+    #1 release force_tgt;
+  end
+endmodule
+
+module mon_harness(input wire clk, input wire rst_l);
+  mon_unit mon(.clk(clk), .rst_l(rst_l));
+endmodule
+
+bind subsys mon_harness h (.*);
+
+module tb;
+  logic clk, rst_l;
+  initial begin clk = 1'b0; repeat (12) #5 clk = ~clk; end
+  initial begin rst_l = 1'b0; #10 rst_l = 1'b1; end
+  subsys subsys(.clk(clk), .rst_l(rst_l));
+endmodule
+"#;
+    let sim = simulate(SRC, 200).expect("simulate failed");
+    let read = |name: &str| -> u64 {
+        sim.get_signal(&format!("subsys.h.mon.{name}"))
+            .unwrap_or_else(|| panic!("signal {name} not found"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("signal {name} is X/Z"))
+    };
+    assert_eq!(read("wait_got"), 0x8100, "wait condition/body");
+    assert_eq!(read("dw_got"), 0x8100, "do-while condition/body");
+    assert_eq!(read("decl_got"), 0x8200, "block-local decl initializer");
+    assert_eq!(read("rc_got"), 0x8200, "randcase weight/body");
+    assert_eq!(
+        read("force_tgt"),
+        0x8300,
+        "continuous force must track a comb-driven upward operand"
+    );
+}

@@ -30,6 +30,8 @@ use xezim::simulate;
 
 /// Run `src` (with `{VCD}` replaced by a unique temp path) and return the VCD text.
 fn dump(tag: &str, src: &str) -> String {
+    // Waveform dumping is opt-in (`--wave` on the CLI); these tests exercise it.
+    xezim::compiler::simulator::set_wave_enabled(true);
     let mut path: PathBuf = std::env::temp_dir();
     path.push(format!("xezim_vcd_lrm_{}_{}.vcd", tag, std::process::id()));
     let _ = std::fs::remove_file(&path);
