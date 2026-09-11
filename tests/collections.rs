@@ -13,6 +13,8 @@
 
 #[path = "collections/queue_eq_unknown_elems.rs"]
 mod queue_eq_unknown_elems;
+#[path = "collections/queue_dynarray_eq_inplace_overwrite.rs"]
+mod queue_dynarray_eq_inplace_overwrite;
 #[path = "collections/array_element_collection.rs"]
 mod array_element_collection;
 #[path = "collections/dyn_array_loop_write_notifies.rs"]

@@ -91277,7 +91277,18 @@ impl Simulator {
                 // both print 0 there; returning x instead rendered `%b` as x).
                 return Some(Value::from_u64(0, 1));
             }
-            if lv != rv {
+            // §11.4.5 / §7.12: dynamic-array / queue element `==` compares the
+            // element VALUES, widened to a common width (§6.24.3/§11.6.1:
+            // zero-extend the narrower operand when unsigned). Comparing the
+            // Value STRUCTS (`lv != rv`) made two equal-valued elements with
+            // different storage widths compare unequal — e.g. an in-place
+            // `q[i] = v` overwrite stores an 8-bit element while an
+            // initializer/whole-copy rounds up to 32-bit. Use `is_equal`,
+            // which zero-extends the narrower operand before comparing.
+            // `is_equal` returns a 1-bit Value (possibly X), but the elements
+            // are fully known here (all X/Z was rejected above), so bit 0 is
+            // a definitive 0/1.
+            if lv.is_equal(&rv).get_bit(0) != LogicBit::One {
                 equal = false;
             }
         }
@@ -100852,6 +100863,37 @@ impl Simulator {
                 self.exec_task_call(&td, args);
                 return Value::zero(32);
             }
+            // An unqualified call inside a class method that resolved to NO
+            // method of the class (or its ancestors), NO package or module
+            // subroutine, and NO let — i.e. the call is a genuine undefined
+            // subroutine reference. Per IEEE 1800-2017 §13.3, a call to an
+            // undeclared task/function is an error; the reference simulator
+            // rejects it at elaboration ("Failed to find 'X' in hierarchical
+            // name"). xezim used to silently drop these as a no-op returning
+            // zero, so stale UVM-1.x calls like `kill_child_sequences()`/
+            // `kill_sequence_activity()` (removed from the 1800.2 library)
+            // ran without complaint and the surrounding logic kept executing
+            // on garbage — e.g. a sequence-abort regression no longer registered the
+            // still-pending child process, masking the real failure. Now we
+            // report it and halt, matching the reference's stance.
+            //
+            // Guard: only in a class-method context (`class_context_stack`
+            // top is `Some(Some(class))`). Top-level global function calls
+            // (e.g. `get_finish_on_completion()` at module scope) also reach
+            // this fall-through for UVM global helpers with no body in scope;
+            // the reference tolerates those too (they bind to uvm_root), so
+            // we must NOT error there — a full-suite run confirmed that
+            // restricting the error to class-method context flags exactly one
+            // test and no currently-passing one.
+            if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                eprintln!(
+                    "[xezim][error] call to undefined subroutine '{}' inside class '{}' \
+                     (no such method or in-scope task/function); reference simulators reject \
+                     this at elaboration",
+                    name, ctx
+                );
+                std::process::exit(1);
+            }
         }
         Value::zero(32)
     }
@@ -107117,8 +107159,8 @@ impl Simulator {
                     let owner = self.heap.get(handle).and_then(|o| o.as_ref());
                     let resolved = owner
                         .and_then(|i| i.type_bindings.get(raw).cloned())
-                        .or_else(|| self.resolve_type_param_binding(raw))
-                        .or_else(|| self.ancestor_type_param_binding(handle, &cn, raw));
+                        .or_else(|| self.ancestor_type_param_binding(handle, &cn, raw))
+                        .or_else(|| self.resolve_type_param_binding(raw));
                     if let Some(r) = resolved {
                         tn = Some(r);
                     }

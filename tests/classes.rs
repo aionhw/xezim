@@ -39,6 +39,8 @@ mod param_type_binding_resolves_enclosing_value_param;
 mod virtual_method_in_binary_is_evaluated_once;
 #[path = "classes/typename_type_param_resolves_concrete.rs"]
 mod typename_type_param_resolves_concrete;
+#[path = "classes/param_instance_field_uses_owner_binding.rs"]
+mod param_instance_field_uses_owner_binding;
 #[path = "classes/static_param_class_collection_reuse.rs"]
 mod static_param_class_collection_reuse;
 #[path = "classes/explicit_param_static_coll_read.rs"]
@@ -289,3 +291,5 @@ mod handle_chain_read_in_instance_task;
 mod implication_joint_distribution;
 #[path = "classes/array_of_collections_property.rs"]
 mod array_of_collections_property;
+#[path = "classes/undef_method_call_reported.rs"]
+mod undef_method_call_reported;
