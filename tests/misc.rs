@@ -343,3 +343,5 @@ mod while_continue_final_iter;
 mod stdout_flush_at_sim_finish;
 #[path = "misc/elaboration_shape_fixes.rs"]
 mod elaboration_shape_fixes;
+#[path = "misc/nettype_net_in_submodule.rs"]
+mod nettype_net_in_submodule;
