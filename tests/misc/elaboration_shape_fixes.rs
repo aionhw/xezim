@@ -46,7 +46,7 @@ fn struct_pattern_elements_with_module_scope_typedef() {
   localparam p_t LL [2] = '{ 34'h13, 34'h15 };
   localparam u_t LU [2] = '{ '{9,2'd1}, '{10,2'd2} };
   initial begin
-    $display(\"LP=%0d %0d %0d LL=%0d %0d LU=%0d %0d\", LP[0].s, LP[1].s, LP[2].s, LL[0].s, LL[1].s, LU[0].s, LU[1].s);
+    $display("LP=%0d %0d %0d LL=%0d %0d LU=%0d %0d", LP[0].s, LP[1].s, LP[2].s, LL[0].s, LL[1].s, LU[0].s, LU[1].s);
     $finish;
   end
 endmodule"#,
