@@ -9,6 +9,7 @@
 pub mod benchw;
 pub mod compiler;
 pub mod env_vars;
+pub mod ffi;
 pub mod intra_delay;
 pub mod multikernel;
 pub mod should_fail_lint;

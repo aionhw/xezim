@@ -10,6 +10,8 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_A1_DBG", "Debug: trace always@(posedge) single-block compilation decisions"),
     ("XEZIM_AB_DBG", "Debug: trace always-block classification during elaboration"),
     ("XEZIM_ACTIVE_REGION", "Scheduling: force active-region semantics for edge continuations (0/1)"),
+    ("XEZIM_ACT_TRACE_CENSUS", "Activity census: write a per-signal change-count JSON sidecar at finalize (1 enables)"),
+    ("XEZIM_ACT_TRACE_CENSUS_FILE", "Activity census: output path for the sidecar JSON (default: trace_census.json)"),
     ("XEZIM_ALLOW_IMPLICIT_STATIC", "Elab: accept static-lifetime locals with initializers without warning"),
     ("XEZIM_AOT", "AOT: compile eligible blocks to native code via generated Rust + rustc (needs --features jit build)"),
     ("XEZIM_AOT_OPT", "AOT: rustc opt-level for the generated crate (0-3, default 2)"),

@@ -217,6 +217,56 @@ fn print_usage() {
     eprintln!("  --fst <file>     Emit an FST (GTKWave binary) waveform dump to <file>.");
     eprintln!("  --fst-scope <hier>  Restrict the FST dump to signals under <hier>");
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
+    eprintln!("  --debug-access=+r  Census + graph + FST, default names in the run dir.");
+    eprintln!("                   Env XEZIM_ACT_TRACE_CENSUS=1; XEZIM_ACT_TRACE_CENSUS_FILE=<f>");
+    eprintln!("                   Write a per-signal change-count JSON after the run:");
+    eprintln!("                   every signal's change count + first/last change time.");
+    eprintln!("                   Identifies which DUT/tb signals are actually active.");
+    eprintln!("  --debug+all       Everything: activity census + driver/load graph + FST");
+    eprintln!("                   dump (default names in the run directory), whole-hierarchy");
+    eprintln!("                   depth, memory/array coverage, and a graph for every signal.");
+    eprintln!("  --debug-signals <sig[,sig...]>");
+    eprintln!("                   Query signals for the driver/load graph.");
+    eprintln!("                   Comma-separated, repeatable. With --debug+all the");
+    eprintln!("                   graph covers every signal instead.");
+    eprintln!("  --debug-graph-file <f>");
+    eprintln!("                   Write the driver/load graph JSON sidecar to <f>.");
+    eprintln!("  --debug-scope-file <f>");
+    eprintln!("                   Read scope selection from a text file. Each line:");
+    eprintln!("                   mode,path,access  (mode = flat|deep|all|N).");
+    eprintln!("                   flat  = the scope's own level only (depth 1)");
+    eprintln!("                   deep/all  = whole subtree (depth 0)");
+    eprintln!("                   N     = N levels deep (N >= 1)");
+    eprintln!("                   access = A|M|R|W|X (advisory: any/mem/read/write/x-trace)");
+    eprintln!("  --debug-no-auto-output");
+    eprintln!("                   Disable automatic default output file names.");
+    eprintln!("");
+    eprintln!("Debug (tracing) flag sets:");
+    eprintln!("  Every flag below stands alone; there is no separate --debug prefix.");
+    eprintln!("  A flag that enables tracing (--debug+all, --debug-access, or");
+    eprintln!("  --debug-scope-file) turns on the census + graph + FST pipeline with");
+    eprintln!("  default names in the run directory (xezim.fst, trace_census.json,");
+    eprintln!("  trace_graph.json). Valid combinations:");
+    eprintln!("");
+    eprintln!("  --debug+all                                       everything: census + FST +");
+    eprintln!("                                                   whole-hierarchy graph");
+    eprintln!("  --debug+all --debug-access=+mem                   plus memory access");
+    eprintln!("  --debug+all --debug-no-auto-output --fst f.fst    only user-named outputs");
+    eprintln!("                   --debug-graph-file g.json (graph) and");
+    eprintln!("                   XEZIM_ACT_TRACE_CENSUS_FILE=c.json (census)");
+    eprintln!("  --debug-access=+r                                 census + FST + graph,");
+    eprintln!("                                                   default names");
+    eprintln!("  --debug-access=+rw                                plus read/write access");
+    eprintln!("  --debug-scope-file <f>                            census + graph + FST,");
+    eprintln!("                                                   dump scopes from the file");
+    eprintln!("  --debug-signals a,b --debug-graph-file g.json     graph only, no dump");
+    eprintln!("");
+    eprintln!("  XEZIM_ACT_TRACE_CENSUS=1 (env var)                census only, no dump");
+    eprintln!("");
+    eprintln!("  Rejected combinations (each error names the fix):");
+    eprintln!("  * --debug+all with --debug-scope-file or --debug-signals (all vs subset)");
+    eprintln!("  * --debug-no-auto-output with no dump-enabling --debug* flag");
+    eprintln!("  * a --debug-access value outside r/w/mem/pp (+-joined) or all");
     eprintln!("  --sv2017         Parse as IEEE 1800-2017 (default is 1800-2023)");
     eprintln!("  --sv2023         Parse as IEEE 1800-2023 (default; kept for back-compat)");
     eprintln!("  --no-strict      Disable strict negative-test diagnostics (accept LRM-illegal");
@@ -1525,6 +1575,14 @@ fn run_main() -> i32 {
     let mut xtrace_profile: Option<String> = None;
     let mut xtrace_compress: Option<String> = None;
     let mut wave = false;
+    let trace_census_file: Option<String> = None;
+    let mut trace_cone_queries: Vec<String> = Vec::new();
+    let mut debug_graph_file: Option<String> = None;
+    // The --debug* flag family (census + graph, optional FST dump)
+    let mut debug_all = false;
+    let mut debug_access: Option<String> = None; // "+r", "+rw", "+all", "+mem", "+pp"
+    let mut debug_scope_file: Option<String> = None; // text file with mode,path,access lines
+    let mut debug_auto_output = true; // auto-route outputs to run dir
     let mut fst_file: Option<String> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
@@ -2026,6 +2084,110 @@ fn run_main() -> i32 {
             _ if arg.starts_with("--fst-scope=") => {
                 fst_scopes.push(arg["--fst-scope=".len()..].to_string());
             }
+            // The --debug* flag family
+            // Bare --debug was an extra flag on top of the --debug* family; the
+            // members are the enablers now. Point users at the ready-made ones.
+            "--debug" => {
+                eprintln!("Error: '--debug' is implicit; tracing turns on with a --debug* flag.");
+                eprintln!(
+                    "Valid: --debug+all (everything), --debug-access=+r, or \n       --debug-scope-file <file>"
+                );
+                std::process::exit(1);
+            }
+            "--debug+all" => {
+                debug_all = true;
+            }
+            "--debug_access" => {
+                i += 1;
+                if i < args.len() {
+                    debug_access = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--debug_access=") => {
+                debug_access = Some(arg["--debug_access=".len()..].to_string());
+            }
+            "--debug-access" => {
+                i += 1;
+                if i < args.len() {
+                    debug_access = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--debug-access=") => {
+                debug_access = Some(arg["--debug-access=".len()..].to_string());
+            }
+            "--debug-scope-file" => {
+                i += 1;
+                if i < args.len() {
+                    debug_scope_file = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--debug-scope-file=") => {
+                debug_scope_file = Some(arg["--debug-scope-file=".len()..].to_string());
+            }
+            "--debug-no-auto-output" => {
+                debug_auto_output = false;
+            }
+            "--debug-signals" => {
+                i += 1;
+                if i < args.len() {
+                    for name in args[i].split(',') {
+                        if !name.is_empty() {
+                            trace_cone_queries.push(name.to_string());
+                        }
+                    }
+                }
+            }
+            _ if arg.starts_with("--debug-signals=") => {
+                for name in arg["--debug-signals=".len()..].split(',') {
+                    if !name.is_empty() {
+                        trace_cone_queries.push(name.to_string());
+                    }
+                }
+            }
+            "--debug-graph-file" => {
+                i += 1;
+                if i < args.len() {
+                    debug_graph_file = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--debug-graph-file=") => {
+                debug_graph_file = Some(arg["--debug-graph-file=".len()..].to_string());
+            }
+            // Retired names: this project exposes tracing through the --debug
+            // family only, so point anyone reaching for the old spellings at it.
+            "--trace-census" => {
+                eprintln!(
+                    "Error: '--trace-census' is retired; use --debug-access=+r --debug-no-auto-output for census-only runs."
+                );
+                eprintln!("Env var XEZIM_ACT_TRACE_CENSUS=1 remains supported.");
+                std::process::exit(1);
+            }
+            "--trace-census-file" => {
+                eprintln!(
+                    "Error: '--trace-census-file' is retired; use --debug-graph-file for graph output and XEZIM_ACT_TRACE_CENSUS_FILE for census output path."
+                );
+                std::process::exit(1);
+            }
+            _ if arg.starts_with("--trace-census-file=") => {
+                eprintln!(
+                    "Error: '--trace-census-file' is retired; use --debug-graph-file for graph output and XEZIM_ACT_TRACE_CENSUS_FILE for census output path."
+                );
+                std::process::exit(1);
+            }
+            // Retired names: this project exposes tracing through the --debug
+            // family only, so point anyone reaching for the old spellings at it.
+            _ if arg == "--trace-cone"
+                || arg.starts_with("--trace-cone=")
+                || arg == "--cone-file"
+                || arg.starts_with("--cone-file=") =>
+            {
+                eprintln!(
+                    "Error: '{}' was retired; use the --debug family for tracing.",
+                    arg
+                );
+                eprintln!("Valid: --debug-signals <sig[,sig...]> --debug-graph-file <file>");
+                std::process::exit(1);
+            }
             // `--sim_debug` kept as a compatibility alias for existing scripts.
             "--sim-debug" | "--sim_debug" => {
                 sim_debug = true;
@@ -2444,6 +2606,94 @@ suppressed but the explicit SDF annotation still applies."
         xezim::set_design_cache(None);
     }
 
+    // The --debug* flag family. `--debug-scope-file` is parsed first (the
+    // resolver needs the resulting depth list), then the whole flag family is
+    // validated as a set by `resolve_debug_flags`, the single source of truth
+    // also exercised by tests/act_trace_flags.rs. A contradictory or
+    // meaningless combination exits here with the conflict and a valid use.
+    let mut fst_scope_depths: Vec<(String, u32)> = Vec::new();
+    if let Some(ref sc_file) = debug_scope_file {
+        // Scope-file DSL: one `mode,path,access` tuple per line. Comments
+        // begin with `#` or `//`; `access` is currently advisory for dump
+        // selection (the FST/census include the scope's signals), reserved
+        // for backdoor read/write and x-trace access hooks.
+        let body = match std::fs::read_to_string(sc_file) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Error: cannot read --debug-scope-file '{}': {}", sc_file, e);
+                std::process::exit(1);
+            }
+        };
+        for (ln, line) in body.lines().enumerate() {
+            let line = line.split('#').next().unwrap_or("");
+            let line = line.split("//").next().unwrap_or("");
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split(',');
+            let mode = parts.next().unwrap_or("").trim();
+            let path = parts.next().unwrap_or("").trim();
+            let _access = parts.next().unwrap_or("").trim();
+            if path.is_empty() {
+                eprintln!(
+                    "Error: {}:{}: scope line must be `mode,path[,access]` (got: {})",
+                    sc_file,
+                    ln + 1,
+                    line
+                );
+                std::process::exit(1);
+            }
+            let depth = match mode {
+                "flat" | "level" => 1u32,
+                "deep" | "all" | "recursive" | "0" => 0u32,
+                m => match m.parse::<u32>() {
+                    Ok(d) if d > 0 => d,
+                    _ => {
+                        eprintln!(
+                            "Error: {}:{}: mode '{}' is not flat/deep/all or a depth >= 1",
+                            sc_file,
+                            ln + 1,
+                            m
+                        );
+                        std::process::exit(1);
+                    }
+                },
+            };
+            fst_scope_depths.push((path.to_string(), depth));
+        }
+    }
+    let debug_cfg = match xezim::compiler::act_trace::resolve_debug_flags(
+        xezim::compiler::act_trace::DebugFlagsInput {
+            all: debug_all,
+            access_raw: debug_access,
+            query_signals: trace_cone_queries,
+            graph_file: debug_graph_file,
+            scope_depths: fst_scope_depths,
+            auto_output: debug_auto_output,
+            census_requested: false,
+            fst_requested: fst_file.clone(),
+            default_top: top_module.clone(),
+            default_graph: "trace_graph.json".to_string(),
+            default_fst: "xezim.fst".to_string(),
+        },
+    ) {
+        Ok(cfg) => cfg,
+        Err(message) => {
+            eprintln!("Error: {}", message);
+            std::process::exit(1);
+        }
+    };
+    // Apply the validated configuration so both execution paths below see the
+    // same picture: census on, FST + graph at their chosen (or default) paths,
+    // and `--debug+all` flagged for the report-time all-signal expansion.
+    fst_file = debug_cfg.fst_file;
+    let trace_cone_queries = debug_cfg.query_signals;
+    let graph_file = debug_cfg.graph_file;
+    let fst_scope_depths = debug_cfg.scope_depths;
+    xezim::compiler::simulator::set_fst_scope_depths(&fst_scope_depths);
+    xezim::compiler::simulator::set_trace_all(debug_cfg.trace_all_signals);
+
     // Fast path: if the only source file is a xezim compiled artifact, load
     // it and jump straight to simulation (skip parse + elaborate).
     if source_files.len() == 1 && mode == Mode::Simulate {
@@ -2465,6 +2715,16 @@ suppressed but the explicit SDF annotation still applies."
                         xezim::compiler::simulator::set_dump_timescales(dump_timescales);
                         xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
                         xezim::compiler::simulator::set_vpi_libs(&vpi_libs);
+                        xezim::compiler::simulator::set_act_trace_cli(
+                            debug_cfg.census,
+                            trace_census_file.clone(),
+                        );
+                        xezim::compiler::simulator::set_cone_cli(
+                            trace_cone_queries.clone(),
+                            graph_file.clone(),
+                        );
+                        xezim::compiler::simulator::set_fst_scope_depths(&fst_scope_depths);
+                        xezim::compiler::simulator::set_trace_all(debug_cfg.trace_all_signals);
                         let mut sim = xezim::compiler::Simulator::new(elab, max_time);
                         if let Some(limit) = settle_limit {
                             sim.settle_limit = limit;
@@ -2889,6 +3149,10 @@ suppressed but the explicit SDF annotation still applies."
     xezim::compiler::simulator::set_dump_timescales(dump_timescales);
     xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
     xezim::compiler::simulator::set_vpi_libs(&vpi_libs);
+    xezim::compiler::simulator::set_act_trace_cli(debug_cfg.census, trace_census_file.clone());
+    xezim::compiler::simulator::set_cone_cli(trace_cone_queries.clone(), graph_file.clone());
+    xezim::compiler::simulator::set_fst_scope_depths(&fst_scope_depths);
+    xezim::compiler::simulator::set_trace_all(debug_cfg.trace_all_signals);
 
     // PDES c910 stub mode: parse + elaborate + compile, then run the
     // PdesCoordinator with stub blocks for `pdes_c910_ticks` ticks.

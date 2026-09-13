@@ -4,6 +4,7 @@
 //! here for backwards compatibility so existing `xezim::compiler::...`
 //! paths keep resolving.
 
+pub mod act_trace;
 pub mod arena;
 pub mod bytecode;
 pub mod dispatch;
@@ -11,6 +12,7 @@ pub mod fst_sink;
 pub mod jit;
 #[cfg(feature = "jit")]
 pub mod aot;
+pub mod mini_json;
 pub mod simulator;
 pub mod soa;
 

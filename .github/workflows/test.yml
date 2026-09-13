@@ -49,6 +49,12 @@ jobs:
           path: target
           key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}-${{ env.CORE_SHA }}
 
+      # The act_trace_ffi test links a C probe against the cdylib, which
+      # `cargo test` does not build (only `cargo build` produces the .so).
+      # Build the lib once so the FFI test runs in both configurations below.
+      - name: cargo build --lib (cdylib for the FFI test)
+        run: cargo build --lib
+
       - name: cargo test (no features)
         run: cargo test --no-fail-fast
 

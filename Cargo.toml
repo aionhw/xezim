@@ -83,6 +83,10 @@ path = "src/bin/bench.rs"
 [lib]
 name = "xezim"
 path = "src/lib.rs"
+# `cdylib` exports the `xezim_trace_*` C ABI from `src/ffi.rs` for other
+# languages (C via the header in `c-api/`, Python via ctypes); `rlib` keeps
+# the Rust integration tests and the `xezim` binary working unchanged.
+crate-type = ["rlib", "cdylib"]
 
 [profile.release]
 # Thin-LTO: the LLVM-JIT miscompile that forced lto=false is gone with
