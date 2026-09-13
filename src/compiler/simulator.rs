@@ -47,6 +47,17 @@ const COND_AUDIT_EVALS: u8 = 4;
 /// `--dump-timescales`: print every module's timescale before the run starts.
 static DUMP_TIMESCALES: AtomicBool = AtomicBool::new(false);
 static DPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+/// Process-global act-trace CLI config (census opt-in + sidecar path).
+/// Process-global, like `set_dpi_libs`, because `simulate_multi` constructs the
+/// `Simulator` inside lib.rs, out of the CLI's reach. Merged with `XEZIM_ACT_TRACE_*`
+/// at `Simulator::new`; the CLI value wins on the output path.
+static ACT_TRACE_CLI: OnceLock<Mutex<(bool, Option<String>)>> = OnceLock::new();
+/// Process-global driver/load graph CLI config (`--debug-signals` +
+/// `--debug-graph-file`). Same process-global rationale as `ACT_TRACE_CLI`.
+static CONE_CLI: OnceLock<Mutex<(Vec<String>, Option<String>)>> = OnceLock::new();
+/// Process-global "graph every signal" flag (`--debug+all`).
+static TRACE_ALL_CLI: OnceLock<Mutex<bool>> = OnceLock::new();
+static FST_SCOPE_DEPTHS_CLI: OnceLock<Mutex<Vec<(String, u32)>>> = OnceLock::new();
 
 /// Opaque handle base for `process::self()` (IEEE 1800-2023 §9.7). The token is
 /// `PROCESS_HANDLE_BASE + pid`, chosen far above any real heap index so a
@@ -337,6 +348,50 @@ fn vpi_lib_paths() -> &'static Mutex<Vec<String>> {
 pub fn set_vpi_libs(paths: &[String]) {
     if let Ok(mut guard) = vpi_lib_paths().lock() {
         *guard = paths.to_vec();
+    }
+}
+
+/// Enable the activity-trace census
+/// and set its JSON sidecar path from the CLI. Process-global, like
+/// `set_dpi_libs`, because `simulate_multi` (lib.rs) constructs the simulator.
+pub fn set_act_trace_cli(enabled: bool, output: Option<String>) {
+    if let Ok(mut guard) = ACT_TRACE_CLI
+        .get_or_init(|| Mutex::new((false, None)))
+        .lock()
+    {
+        *guard = (enabled, output);
+    }
+}
+
+/// `--debug-signals` / `--debug-graph-file`: set the driver/load graph query
+/// signals and their JSON sidecar path from the CLI. Process-global, like
+/// `set_act_trace_cli`, because `simulate_multi` (lib.rs) constructs the simulator.
+pub fn set_cone_cli(queries: Vec<String>, file: Option<String>) {
+    if let Ok(mut guard) = CONE_CLI
+        .get_or_init(|| Mutex::new((Vec::new(), None)))
+        .lock()
+    {
+        *guard = (queries, file);
+    }
+}
+
+/// `--debug+all`: expand the driver/load graph to every signal. Process-global
+/// like `set_cone_cli`; together they cover the two `--debug` graph modes.
+/// An empty query list plus this flag means "every signal".
+pub fn set_trace_all(v: bool) {
+    if let Ok(mut guard) = TRACE_ALL_CLI.get_or_init(|| Mutex::new(false)).lock() {
+        *guard = v;
+    }
+}
+
+/// `--debug-scope-file`: per-scope dump depths (scope, depth)
+/// from the CLI. Process-global, like `set_cone_cli`.
+pub fn set_fst_scope_depths(specs: &[(String, u32)]) {
+    if let Ok(mut guard) = FST_SCOPE_DEPTHS_CLI
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+    {
+        *guard = specs.to_vec();
     }
 }
 
@@ -3684,6 +3739,13 @@ pub struct Simulator {
     /// Set of signal IDs that are signed.
     signal_signed: Vec<bool>,
     signal_real: Vec<bool>,
+    /// One bool per signal-table slot: true for enum-member constants that
+    /// elaboration mints as bare signals. They are VALUES — nothing in the
+    /// design can drive them and they never change — so the census sidecar
+    /// and the driver/load cones skip them (an enum member name like `RUN`
+    /// must not appear as a "driver"). Computed once in the constructor
+    /// while `module.signals` still exists and stored unchanged.
+    signal_is_enum_literal: Vec<bool>,
     /// Signal ids whose declared type is 2-state (`bit`/`byte`/`int`/…). Per
     /// §6.11.1/§10.7 an implicit conversion of a 4-state RHS into such a target
     /// maps X/Z to 0 — enforced in `fit_value_to_signal`.
@@ -5054,6 +5116,22 @@ pub struct Simulator {
     vcd_id_to_trace: Vec<Vec<u32>>,
     vcd_event_indices: Vec<usize>,
     dump_dirty_active: bool,
+    /// Activity-trace census (XEZIM_ACT_TRACE_CENSUS=1 or a `--debug*` tracing flag).
+    /// A per-signal change counter updated once per tick in
+    /// `dump_write_changes` from the shared dirty set, so the per-write
+    /// hot path pays only the `act_trace_active` flag branch. Written as
+    /// a deterministic JSON sidecar at finalize by `write_census_sidecar`.
+    pub act_trace_active: bool,
+    act_trace_census: Option<super::act_trace::ActTraceCensus>,
+    /// Output path for the census JSON sidecar (XEZIM_ACT_TRACE_CENSUS_FILE; default `trace_census.json`).
+    pub act_trace_output: Option<std::path::PathBuf>,
+    /// CLI-provided signal names for the driver/load graph (`--debug-signals`).
+    /// Empty when no graph query flag is used.
+    pub cone_queries: Vec<String>,
+    /// `--debug+all`: expand the graph to every signal.
+    pub trace_all_signals: bool,
+    /// Output path for the driver/load graph JSON sidecar (`--debug-graph-file`).
+    pub cone_file: Option<std::path::PathBuf>,
     /// §21.7.1.8 `$dumplimit`: byte budget for the dump, and the running
     /// (approximate) count of bytes handed to the sink. `vcd_limit_hit` latches
     /// once the budget is spent and permanently stops the dump.
@@ -5148,6 +5226,12 @@ pub struct Simulator {
     /// Optional hierarchical scope filters for FST (same semantics as
     /// `--xtrace-scope`): keep signals whose name equals or sits under a scope.
     pub fst_scopes: Vec<String>,
+    /// Per-scope dump depth for `--debug-scope-file` (scope,
+    /// depth): depth 0 = the whole subtree, depth 1 = the scope's own level
+    /// only, depth N = N levels. Empty means every scope in `fst_scopes` dumps
+    /// the whole subtree. A scope here may equal one in `fst_scopes`; the more
+    /// specific (deeper) selection wins.
+    pub fst_scope_depths: Vec<(String, u32)>,
     /// The FST body writer (post-header phase). `None` until `fst_start_dump`.
     /// Value packing, block compression and I/O run on a background thread
     /// (`XEZIM_DUMP_INLINE=1` keeps them here); see `fst_sink::FstSink`.
@@ -5336,6 +5420,11 @@ pub struct Simulator {
     /// Per-comb-entry accumulated eval time (profile_report only).
     prof_entry_ns: Vec<u64>,
     comb_dep_entries: Vec<u32>,
+    /// Reverse DRIVER index: signal_id → list of comb_entry indices that write
+    /// this signal. Same CSR layout as `comb_dep_offsets/entries` but keyed on
+    /// `write_signal_ids`. Enables O(1) fan-in (driver) lookups for cone queries.
+    comb_drv_offsets: Vec<u32>,
+    comb_drv_entries: Vec<u32>,
     /// Bitvec: dirty_signals[signal_id] = true if signal changed since last settle.
     dirty_signals: Vec<bool>,
     /// Explicit list of dirty signal IDs (maintained alongside dirty_signals bitvec)
@@ -6907,6 +6996,20 @@ impl Simulator {
             })
             .unwrap_or_default();
 
+        // Activity-trace census: merge the CLI opt-in (a `--debug*` tracing flag) with
+        // the env-var opt-in; CLI overrides the sidecar path. The CLI value is
+        // process-global because `simulate_multi` (lib.rs) builds the sim.
+        let (act_trace_cli_active, act_trace_cli_output) = match ACT_TRACE_CLI
+            .get_or_init(|| Mutex::new((false, None)))
+            .lock()
+        {
+            Ok(guard) => (guard.0, guard.1.clone()),
+            Err(_) => (false, None),
+        };
+        let act_trace_env_active =
+            std::env::var("XEZIM_ACT_TRACE_CENSUS").ok().as_deref() == Some("1");
+        let act_trace_on = act_trace_cli_active || act_trace_env_active;
+
         // Static signals + parameters live exclusively in the indexed
         // signal_table / signal_name_to_id / parallel Vecs below. The
         // legacy `signals`/`widths`/`signed_signals`/`real_signals`
@@ -8176,6 +8279,46 @@ impl Simulator {
         // plus their HashMap overhead. `module.parameters` is kept
         // because `resolve_type_width` still resolves dimension
         // expressions against it at runtime (per step-2's caller fix).
+        // Enum-member mask (one bool per signal-table slot). The declarations
+        // for a net and a variable take the same data_type, so per
+        // IEEE 1800-2023 a signal can carry an enum, a struct, or any other
+        // user-defined type (§6.7, §6.8, §6.18, §6.19, §7.2). Elaboration
+        // therefore mints each enum member name as a bare signal-table entry
+        // so expressions can reference it as a constant. Those are constants,
+        // not signals: nothing can drive them and they never change, so the
+        // trace, the cone graph, and the census must all skip them. Every
+        // registration path lands a member name either in
+        // `enum_members` / `package_enum_members` (a typedef'd or package
+        // enum) or in BOTH `parameters` and `signals` (an anonymous inline
+        // enum on a declaration). Collect the union while both module tables
+        // still exist, then mark the matching signal ids.
+        let signal_is_enum_literal: Vec<bool> = {
+            let nsig = signal_table.len();
+            let mut member_names: std::collections::HashSet<&str> =
+                std::collections::HashSet::new();
+            for ms in module.enum_members.values() {
+                for (n, _) in ms {
+                    member_names.insert(n.as_str());
+                }
+            }
+            for m in module.package_enum_members.values() {
+                member_names.extend(m.keys().map(|s| s.as_str()));
+            }
+            for n in module.parameters.keys() {
+                if module.signals.contains_key(n.as_str()) {
+                    member_names.insert(n.as_str());
+                }
+            }
+            let mut mask = vec![false; nsig];
+            for k in member_names {
+                if let Some(&id) = signal_name_to_id.get(k)
+                    && id < nsig
+                {
+                    mask[id] = true;
+                }
+            }
+            mask
+        };
         let phase_drop = std::time::Instant::now();
         module.signals = HashMap::default();
         let drop_ms = phase_drop.elapsed().as_secs_f64() * 1000.0;
@@ -8329,6 +8472,7 @@ impl Simulator {
             signal_widths: signal_widths_vec,
             signal_signed: signal_signed_vec,
             signal_real: signal_real_vec,
+            signal_is_enum_literal,
             signal_two_state,
             signal_gate_driven,
             signal_is_string,
@@ -8761,6 +8905,8 @@ impl Simulator {
             comb_time0_deferred: Vec::new(),
             comb_time0_deferred_done: false,
             comb_dep_offsets: Vec::new(),
+            comb_drv_offsets: Vec::new(),
+            comb_drv_entries: Vec::new(),
             ts_comb: Vec::new(),
             comb_plan: Vec::new(),
             ts_edge: Vec::new(),
@@ -8863,6 +9009,42 @@ impl Simulator {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(20_000),
+            act_trace_active: act_trace_on,
+            act_trace_census: if act_trace_on {
+                // Sized lazily: the signal table reaches its final length
+                // during elaboration/compile, after this constructor runs.
+                Some(super::act_trace::ActTraceCensus::new(0))
+            } else {
+                None
+            },
+            act_trace_output: act_trace_cli_output
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var("XEZIM_ACT_TRACE_CENSUS_FILE")
+                        .ok()
+                        .map(std::path::PathBuf::from)
+                }),
+            cone_queries: CONE_CLI
+                .get_or_init(|| Mutex::new((Vec::new(), None)))
+                .lock()
+                .map(|g| g.0.clone())
+                .unwrap_or_default(),
+            trace_all_signals: TRACE_ALL_CLI
+                .get_or_init(|| Mutex::new(false))
+                .lock()
+                .map(|g| *g)
+                .unwrap_or(false),
+            cone_file: CONE_CLI
+                .get_or_init(|| Mutex::new((Vec::new(), None)))
+                .lock()
+                .map(|g| g.1.clone().map(std::path::PathBuf::from))
+                .ok()
+                .flatten(),
+            fst_scope_depths: FST_SCOPE_DEPTHS_CLI
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default(),
             armed_input_bitmap: Vec::new(),
             armed_input_ranges: Vec::new(),
             armed_input_blocks: Vec::new(),
@@ -17017,6 +17199,23 @@ impl Simulator {
         if !self.compile_errors.is_empty() {
             return;
         }
+        // Activity census needs its own dirty tracking when no waveform dump
+        // is present to enable it, and even when XEZIM_DUMP_FULL=1 relaxes
+        // the dump writers' bookkeeping -- the census is not a dump and must
+        // not depend on one. Arm the shared dirty set directly: setting the
+        // `dump_dirty_active` flag before calling `enable_dump_dirty_tracking`
+        // would make that helper early-return and skip allocating the mark
+        // vec, so the `vcd_mark!` write hook (`0 < 0` bounds check) would
+        // never feed the set and every census count would stay 0. Runs after
+        // compile(): the signal table is final here, so the marks cover every
+        // signal.
+        if self.act_trace_active && !self.dump_dirty_active {
+            let act_nsig = self.signal_table.len();
+            self.dump_dirty_mark = vec![0u64; act_nsig];
+            self.dump_dirty.clear();
+            self.dump_dirty_epoch = 1;
+            self.dump_dirty_active = true;
+        }
         // Back the big, stable, randomly-accessed arrays with 2 MiB transparent
         // huge pages. On c910 the per-signal arrays span ~1.3 GiB / ~340k 4 KiB
         // pages accessed with no spatial locality, so page-table walks burned
@@ -17107,6 +17306,8 @@ impl Simulator {
         self.vcd_finish();
         self.xtrace_finish();
         self.fst_finish();
+        self.write_census_sidecar();
+        self.cone_report();
         // Barrier before the caller prints its own summary. `$display` output
         // is on a writer thread; the `[PROF]`/`[PHASE]` lines and the trailing
         // "Simulation finished at time N" are not, and under `--log` all of them
@@ -30955,6 +31156,36 @@ impl Simulator {
         }
         self.comb_dep_offsets = dep_offsets;
         self.comb_dep_entries = dep_entries;
+        // Reverse DRIVER index (concise reverse of the dep CSR): signal → the
+        // comb entries that WRITE it. Same CSR recipe, keyed on write sets.
+        // Powers backward (fan-in) cone queries: O(drivers) lookups instead
+        // of a full-entry scan.
+        let mut drv_counts: Vec<u32> = vec![0u32; num_signals + 1];
+        for entry in entries.iter() {
+            for &sig_id in &entry.cold.write_signal_ids {
+                if sig_id < num_signals {
+                    drv_counts[sig_id + 1] += 1;
+                }
+            }
+        }
+        let mut drv_offsets = drv_counts;
+        for i in 1..drv_offsets.len() {
+            drv_offsets[i] += drv_offsets[i - 1];
+        }
+        let drv_total = drv_offsets[num_signals] as usize;
+        let mut drv_entries: Vec<u32> = vec![0u32; drv_total];
+        let mut drv_cursor: Vec<u32> = drv_offsets[..num_signals].to_vec();
+        for (idx, entry) in entries.iter().enumerate() {
+            for &sig_id in &entry.cold.write_signal_ids {
+                if sig_id < num_signals {
+                    let pos = drv_cursor[sig_id] as usize;
+                    drv_entries[pos] = idx as u32;
+                    drv_cursor[sig_id] += 1;
+                }
+            }
+        }
+        self.comb_drv_offsets = drv_offsets;
+        self.comb_drv_entries = drv_entries;
         // Co-activation census setup: predecessor CSR (entry -> writer
         // entries of its read signals, capped at 16 preds/entry). Built here
         // so it reflects the FINAL entry order, learning from the topo-
@@ -77981,7 +78212,30 @@ impl Simulator {
     /// `elaborate` registers as signals), and the base name of an unpacked array
     /// whose elements are dumped individually.
     fn dump_signal_names(&self, scopes: &[String], depth: u32) -> Vec<String> {
-        let filters = Self::dump_filter_prefixes(&self.module.name, scopes);
+        let groups: Vec<(String, u32)> = scopes.iter().map(|s| (s.clone(), depth)).collect();
+        self.dump_signal_names_depths(&groups)
+    }
+
+    /// Multi-depth selection used by the flat/deep `--debug-access` layer.
+    /// Each group carries its own (scope-or-empty, depth); depth 0 = whole
+    /// subtree, depth 1 = the scope's own level only, depth N = N levels.
+    /// A signal is selected if ANY group selects it (cross-group OR), so a
+    /// flat scope and a deep scope coexist in one dump.
+    fn dump_signal_names_depths(&self, groups: &[(String, u32)]) -> Vec<String> {
+        // Normalize each (scope, depth) tuple to the top-relative filter form.
+        // A tuple whose scope is empty / equals the top module selects with no
+        // filter, so `--debug-scope-file` can name the whole design explicitly.
+        let per_group: Vec<(Option<String>, u32)> = groups
+            .iter()
+            .map(|(scope, depth)| {
+                let f = Self::dump_filter_prefixes(&self.module.name, std::slice::from_ref(scope));
+                (f.map(|v| v.into_iter().next().unwrap_or_default()), *depth)
+            })
+            .collect();
+        // Empty groups = no scope restriction = whole table. Also true if every
+        // group is unfiltered depth 0 (explicit whole-design request).
+        let all_deep_nofilter =
+            groups.is_empty() || per_group.iter().all(|(f, d)| f.is_none() && *d == 0);
 
         // Enum literals (`RED`/`GRN`/`BLU`) are registered as signals by
         // `elaborate::register_*_enum_members` — they are constants, not objects.
@@ -78036,7 +78290,15 @@ impl Simulator {
             {
                 continue;
             }
-            if !Self::dump_name_selected(name, filters.as_deref(), depth) {
+            let selected = if all_deep_nofilter {
+                true
+            } else {
+                per_group.iter().any(|(filter, depth)| match filter {
+                    None => Self::dump_name_selected(name, None, *depth),
+                    Some(f) => Self::dump_name_selected(name, Some(&[f.clone()]), *depth),
+                })
+            };
+            if !selected {
                 continue;
             }
             out.push(name.to_string());
@@ -78626,12 +78888,325 @@ impl Simulator {
         if self.fst_writer.is_some() {
             self.fst_write_changes();
         }
+        if self.act_trace_active {
+            self.act_trace_count_changes();
+        }
         if self.dump_dirty_active {
             self.dump_dirty.clear();
             self.dump_dirty_epoch = self.dump_dirty_epoch.wrapping_add(1);
         }
     }
 
+
+    /// One per-tick activity-census pass: count every signal touched since
+    /// the last flush, using the SAME shared dirty set the dump writers
+    /// consume. This is intentionally per-tick (a tight loop over the dirty
+    /// list), not per-write — the `write_sig!` hot path pays only the
+    /// `act_trace_active` branch, and the counting cost is amortized into
+    /// the flush that already walks the dirty set.
+    fn act_trace_count_changes(&mut self) {
+        if self.act_trace_census.is_none() {
+            // Activation can come from the CLI (a `--debug*` tracing flag) after the
+            // constructor ran, so size the census on first use instead of
+            // demanding the env var at construction.
+            self.act_trace_census = Some(super::act_trace::ActTraceCensus::new(
+                self.signal_table.len(),
+            ));
+        }
+        let census = self.act_trace_census.as_mut().unwrap();
+        // Size to the (now-final) signal table if it ever changed shape.
+        if census.counters.len() != self.signal_table.len() {
+            *census = super::act_trace::ActTraceCensus::new(self.signal_table.len());
+        }
+        let t = self.time;
+        // The census feeds on the shared dirty set. When `XEZIM_DUMP_FULL=1`
+        // disables it, `simulate()` still forces it on for the census alone
+        // (see the activation gate), so this list is populated even without a
+        // waveform dump. If it is somehow empty, there is nothing to record.
+        for &sid in &self.dump_dirty {
+            census.record(sid as usize, t);
+        }
+    }
+
+    /// Write the activity-census sidecar (XEZIM_ACT_TRACE_CENSUS_FILE; default `trace_census.json`).
+    /// Deterministic: signals are emitted sorted by hierarchical path. Called
+    /// at finalize after the FST writer has finished, so a census+FST pair
+    /// share the same signal population.
+    fn write_census_sidecar(&mut self) {
+        let Some(census) = &self.act_trace_census else {
+            return;
+        };
+        let out = match &self.act_trace_output {
+            Some(p) => p.clone(),
+            None => "trace_census.json".into(),
+        };
+        let tick_s = self.tick_s;
+        let nsig = self.signal_table.len();
+        // The sidecar lists every real signal. Enum-literal constants are
+        // minted as bare signal-table entries too, but they are VALUES, never
+        // driven, so they cannot change and must not clutter the census. Skip
+        // them and the synthesized empty-name slots of huge unnamed arrays.
+        // Each kept row carries its ORIGINAL signal id — list position no
+        // longer equals id once entries are dropped — so the writer must read
+        // counters through that id.
+        let enum_mask = self.enum_literal_mask();
+        let mut signals: Vec<(usize, &str, u32)> = Vec::with_capacity(nsig);
+        for i in 0..nsig {
+            if enum_mask.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            let n = self.name_for_id(i);
+            if n.is_empty() {
+                continue;
+            }
+            signals.push((i, n, self.signal_widths.get(i).copied().unwrap_or(0)));
+        }
+        match std::fs::File::create(&out) {
+            Ok(mut f) => {
+                if let Err(e) = census.write_sidecar(&mut f, &signals, tick_s) {
+                    eprintln!("[trace-census] failed to write {}: {}", out.display(), e);
+                }
+            }
+            Err(e) => eprintln!("[trace-census] cannot open {}: {}", out.display(), e),
+        }
+    }
+
+    /// The enum-member mask computed at construction (stored in the
+    /// `signal_is_enum_literal` field). One bool per signal-table slot,
+    /// true for a constant minted by an enum member.
+    fn enum_literal_mask(&self) -> &[bool] {
+        &self.signal_is_enum_literal
+    }
+
+    /// Driver/load graph: transitive fan-in (drivers) and fan-out (loads)
+    /// expansion for named signals, annotated with the census change count.
+    /// Console report to stderr; `--debug-graph-file` also emits a
+    /// deterministic JSON sidecar with full driver/load signal lists per
+    /// queried signal. `--debug+all` expands to every signal.
+    pub(crate) fn cone_report(&mut self) {
+        // What was asked for: named queries, the --debug+all expansion, or a
+        // graph sidecar path. An empty query set with a requested sidecar
+        // still yields a valid empty JSON, so the file is written in every
+        // case where it was requested.
+        // Two modes share one expansion body. `--debug+all` walks every signal
+        // id directly: no id->name->id round-trip through the hash map and no
+        // materialized name vector, so the cost is the per-signal output and
+        // nothing else. Named queries resolve through signal_name_to_id.
+        let all_mode = self.trace_all_signals && self.cone_queries.is_empty();
+        if !all_mode && self.cone_queries.is_empty() && self.cone_file.is_none() {
+            return;
+        }
+        if !self.cone_queries.is_empty() && self.comb_drv_offsets.is_empty() {
+            eprintln!("[trace] driver index empty (no comb entries) — skipping");
+        }
+        let census = &self.act_trace_census;
+        // Collect deterministic plain rows for --debug-graph-file (sorted by path).
+        let mut json_rows: Vec<(String, usize, usize, Vec<String>, Vec<String>)> = Vec::new();
+        // Dense epoch-scanned seen marks: one allocation covers every query and
+        // both directions; `epoch` bumps instead of re-zeroing `seen` between
+        // BFS runs, so the walk pays Vec-index work, not hashing.
+        let nsig = self.signal_table.len();
+        let mut seen: Vec<u32> = vec![0u32; nsig];
+        let mut epoch: u32 = 0;
+        let mut frontier: Vec<usize> = Vec::new();
+        let mut next: Vec<usize> = Vec::new();
+        let mut cones: Vec<usize> = Vec::new();
+        if !self.comb_drv_offsets.is_empty() {
+            // Enum members are values, not driven signals: drop them from every
+            // cone so the graph reports real drivers/loads only.
+            let enum_mask = self.enum_literal_mask();
+            let mut graph_one = |sids: usize, query_name: &str| {
+                // Guard against an id outside the CSR / signal-table span. Rows are
+                // sized nsig+1, so in the id-walk this never trips; keep the check
+                // for named queries, which can outlive the signal table.
+                if sids >= nsig
+                    || sids + 1 >= self.comb_drv_offsets.len()
+                    || sids + 1 >= self.comb_dep_offsets.len()
+                {
+                    if !all_mode {
+                        eprintln!(
+                            "[trace] signal '{}' (id={}) out of trace-index range",
+                            query_name, sids
+                        );
+                    }
+                    return;
+                }
+                let count = census
+                    .as_ref()
+                    .and_then(|c| c.counters.get(sids).copied())
+                    .unwrap_or(0);
+                eprintln!(
+                    "[trace] === {} (id={}, changes={}) ===",
+                    query_name, sids, count
+                );
+                // Shared directional BFS: walk `reader_entries[sig]` (drivers) or
+                // `writer_entries[sig]` (loads), expanding each entry's opposite
+                // side. Painter's order keeps `out` sorted by nothing, so it is
+                // sorted once at the end for both console and JSON.
+                let mut walk = |root: usize,
+                                entries: &[u32],
+                                offsets: &[u32],
+                                expand: fn(&CombEntry) -> &[usize],
+                                out: &mut Vec<usize>| {
+                    epoch = epoch.wrapping_add(1);
+                    if epoch == 0 {
+                        seen = vec![0u32; nsig];
+                        epoch = 1;
+                    } // epoch rollover
+                    frontier.clear();
+                    next.clear();
+                    frontier.push(root);
+                    seen[root] = epoch;
+                    while !frontier.is_empty() {
+                        // Standard two-queue BFS: drain the current frontier into
+                        // `next` (reusing both allocations), then swap so the next
+                        // generation owns `frontier`.
+                        next.clear();
+                        for &sig in &frontier {
+                            out.push(sig);
+                            let lo = offsets[sig] as usize;
+                            let hi = offsets[sig + 1] as usize;
+                            for &eidx in &entries[lo..hi] {
+                                for &other in expand(&self.comb_entries[eidx as usize]) {
+                                    if seen[other] != epoch {
+                                        seen[other] = epoch;
+                                        next.push(other);
+                                    }
+                                }
+                            }
+                        }
+                        std::mem::swap(&mut frontier, &mut next);
+                    }
+                };
+                // Fan-in (transitive drivers): writer entries, expand their reads.
+                cones.clear();
+                walk(
+                    sids,
+                    &self.comb_drv_entries,
+                    &self.comb_drv_offsets,
+                    |e| e.cold.read_signal_ids.as_slice(),
+                    &mut cones,
+                );
+                let mut fanin_ids: Vec<usize> = std::mem::take(&mut cones);
+                // Fan-out (transitive loads): reader entries, expand their writes.
+                walk(
+                    sids,
+                    &self.comb_dep_entries,
+                    &self.comb_dep_offsets,
+                    |e| e.cold.write_signal_ids.as_slice(),
+                    &mut cones,
+                );
+                let mut fanout_ids: Vec<usize> = std::mem::take(&mut cones);
+                fanout_ids.sort_unstable();
+                // Drop enum-literal constants from both cones (see
+                // `enum_literal_mask`): a member name like `RUN` is a value,
+                // not a signal that drives or loads anything.
+                let is_real_signal = |sid: usize| !enum_mask.get(sid).copied().unwrap_or(true);
+                fanin_ids.retain(|&sid| is_real_signal(sid));
+                fanout_ids.retain(|&sid| is_real_signal(sid));
+                // Console report (bounded at 30 for readability).
+                eprintln!("  drivers (fan-in, {}):", fanin_ids.len());
+                for &sid in fanin_ids.iter().take(30) {
+                    let c = census
+                        .as_ref()
+                        .map_or(0, |c| c.counters.get(sid).copied().unwrap_or(0));
+                    eprintln!("    {} (changes={})", self.name_for_id(sid), c);
+                }
+                if fanin_ids.len() > 30 {
+                    eprintln!("    ... ({} more)", fanin_ids.len() - 30);
+                }
+                eprintln!("  loads (fan-out, {}):", fanout_ids.len());
+                for &sid in fanout_ids.iter().take(30) {
+                    let c = census
+                        .as_ref()
+                        .map_or(0, |c| c.counters.get(sid).copied().unwrap_or(0));
+                    eprintln!("    {} (changes={})", self.name_for_id(sid), c);
+                }
+                if fanout_ids.len() > 30 {
+                    eprintln!("    ... ({} more)", fanout_ids.len() - 30);
+                }
+                // JSON row: deterministic sorted path lists.
+                let mut driver_names: Vec<String> = fanin_ids
+                    .iter()
+                    .map(|&sid| self.name_for_id(sid).to_string())
+                    .collect();
+                driver_names.sort_unstable();
+                let mut load_names: Vec<String> = fanout_ids
+                    .iter()
+                    .map(|&sid| self.name_for_id(sid).to_string())
+                    .collect();
+                load_names.sort_unstable();
+                json_rows.push((
+                    query_name.to_string(),
+                    fanin_ids.len(),
+                    fanout_ids.len(),
+                    driver_names,
+                    load_names,
+                ));
+            };
+            // Fan out to either query mode. The closure captures only immutable
+            // `self` borrows plus its own locals, so the named path can hold
+            // `&self.cone_queries` while `graph_one` runs.
+            if all_mode {
+                for sids in 0..nsig {
+                    // Enum-member constants are values, not signals — they never
+                    // get a row of their own in the all-signal expansion.
+                    if enum_mask.get(sids).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    let name = self.name_for_id(sids);
+                    graph_one(sids, &name);
+                }
+            } else {
+                for query_name in &self.cone_queries {
+                    let Some(sids) = self.signal_name_to_id.get(query_name.as_str()).copied()
+                    else {
+                        eprintln!("[trace] signal '{}' not found", query_name);
+                        continue;
+                    };
+                    graph_one(sids, query_name);
+                }
+            }
+        }
+        // Optional JSON sidecar: write alongside census or standalone.
+        // Manually formatted (like the census sidecar) so no serde_json dep
+        // is needed and the bytes are byte-stable across runs.
+        if let Some(ref cone_out) = self.cone_file {
+            json_rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            match std::fs::File::create(cone_out) {
+                Ok(mut f) => {
+                    use std::io::Write as _;
+                    let mut w = f;
+                    writeln!(&mut w, "{{").unwrap();
+                    writeln!(&mut w, "  \"version\": 1,").unwrap();
+                    writeln!(&mut w, "  \"signals\": [").unwrap();
+                    let total = json_rows.len();
+                    for (idx, (path, dc, lc, drivers, loads)) in json_rows.iter().enumerate() {
+                        let comma = if idx + 1 < total { "," } else { "" };
+                        writeln!(&mut w, "    {{").unwrap();
+                        writeln!(&mut w, "      \"path\": \"{}\",", path).unwrap();
+                        writeln!(&mut w, "      \"driver_count\": {},", dc).unwrap();
+                        writeln!(&mut w, "      \"load_count\": {},", lc).unwrap();
+                        let fmt_list = |v: &Vec<String>| {
+                            let items: Vec<String> =
+                                v.iter().map(|s| format!("\"{}\"", s)).collect();
+                            items.join(", ")
+                        };
+                        writeln!(&mut w, "      \"drivers\": [{}],", fmt_list(drivers)).unwrap();
+                        writeln!(&mut w, "      \"loads\": [{}]", fmt_list(loads)).unwrap();
+                        writeln!(&mut w, "    }}{}", comma).unwrap();
+                    }
+                    writeln!(&mut w, "  ]").unwrap();
+                    writeln!(&mut w, "}}").unwrap();
+                    eprintln!(
+                        "[trace] wrote trace graph sidecar to {}",
+                        cone_out.display()
+                    );
+                }
+                Err(e) => eprintln!("[trace] cannot open {}: {}", cone_out.display(), e),
+            }
+        }
+    }
 
     // NOTE: `Simulator::vcd_write_value` is GONE. It was a second, divergent
     // copy of `vcd_sink::write_vcd_value` (the two disagreed about `real` and
@@ -80223,7 +80798,13 @@ impl Simulator {
         // Same enumeration + top-relative scope normalization as `$dumpvars`
         // (see `dump_signal_names`): the old copy read the empty `self.signals`
         // mirror and compared absolute filter paths against relative names.
-        let sig_names: Vec<String> = self.dump_signal_names(&self.fst_scopes, 0);
+        // `--debug-scope-file` carries per-scope depths (flat/deep);
+        // plain `--fst-scope` stays whole-subtree (depth 0).
+        let sig_names: Vec<String> = if !self.fst_scope_depths.is_empty() {
+            self.dump_signal_names_depths(&self.fst_scope_depths)
+        } else {
+            self.dump_signal_names(&self.fst_scopes, 0)
+        };
         eprintln!(
             "[FST] dumping {} signals (scopes={})",
             sig_names.len(),
@@ -80255,6 +80836,35 @@ impl Simulator {
                 } else {
                     eprintln!("Warning: --fst-scope '{}' matched no signals", sc);
                 }
+            }
+        }
+
+        // A `--debug-scope-file` scope path that selects
+        // nothing is a user error, not a warning: it means a typo or a path
+        // to a name that does not exist. `flat`/`deep` semantics come from
+        // the depth, so validation uses the same whole-subtree emptiness test
+        // regardless of the requested level.
+        if !self.fst_scope_depths.is_empty() && sig_names.is_empty() {
+            let mut matches_any = false;
+            for (scope, _depth) in &self.fst_scope_depths {
+                if !self
+                    .dump_signal_names(std::slice::from_ref(scope), 0)
+                    .is_empty()
+                {
+                    matches_any = true;
+                    break;
+                }
+            }
+            if !matches_any {
+                eprintln!(
+                    "Error: --debug-scope-file scopes matched no signals: {}",
+                    self.fst_scope_depths
+                        .iter()
+                        .map(|(s, d)| format!("{} (depth {})", s, d))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                std::process::exit(1);
             }
         }
 

@@ -60,6 +60,199 @@ Facts worth knowing before the first run:
   even where IEEE 1800 would allow them as identifiers.
 - `-l/--log file` redirects *everything*, including DPI/VPI C-side prints.
 
+## Debug: signal tracing with --debug*
+
+The `--debug*` flags turn on activity tracing with default output names in the run directory: the per-signal activity census (`trace_census.json`), the driver/load graph (`trace_graph.json`), and an FST dump (`xezim.fst`). There is no separate `--debug` prefix flag — each `--debug*` member stands alone and enables tracing directly.
+
+`--debug+all` enables everything: whole-hierarchy dump depth, memory/array coverage, and a driver/load graph expanded to every signal, plus census and FST with default names.
+
+The tracing is data-type agnostic. A signal is a net or a variable (§6.5), and the declarations for both take the same `data_type`, which per IEEE Std 1800-2023 spans `logic`, `reg`, `bit`, a `wire` with an explicit data type, an `enum`, a `struct`, and any user-defined `typedef` (§6.7 net declarations, §6.8 variable declarations, §6.18 user-defined types, §6.19 enumerations, §7.2 structures). The census, the cones, and the graph treat every one of those the same: a signal's width is its declared type width, and its value changes are what it holds. Enum member names (`IDLE`, `RUN`, ...) are elaboration-time constants that elaboration also registers as signal-table entries so expressions can reference them; they are not signals — nothing can drive one and none ever changes value — so the census and the graph filter them out of rows, driver lists, and load lists.
+
+The individual controls:
+
+- `--debug-access=+r+w` takes access tokens `r`, `w`, `mem`, `pp` (or `all`), plus-joined. It enables the census, graph, and FST pipeline and records read/write access for backdoor tools.
+- `--debug-signals <sig[,sig...]>` names the signals whose driver (fan-in) and load (fan-out) cones appear in the graph. Comma-separated, repeatable.
+- `--debug-graph-file <f>` writes the graph JSON sidecar to `<f>`. `trace_graph.json` is the default when tracing is enabled.
+- `--debug-scope-file <f>` reads dump scope selection from a text file, one `mode,path,access` line per scope. Modes: `flat` (the scope's own level only), `deep`/`all` (whole subtree), or a depth `N`. `access` is `A|M|R|W|X` and is advisory today. Lines starting with `#` or `//` are comments.
+- `--debug-no-auto-output` disables the automatic default output names, so every output path you care about must be named.
+
+Census-only (no dump, no graph): set `XEZIM_ACT_TRACE_CENSUS=1` in the environment.
+
+Valid combinations:
+
+- `--debug+all` — everything: census + graph + FST + whole-hierarchy graph.
+- `--debug+all --debug-access=+mem` — plus memory access recording.
+- `--debug+all --debug-no-auto-output --fst f.fst --debug-graph-file g.json` — user-named outputs only.
+- `--debug-access=+r` — census + graph + FST, default names in the run directory.
+- `--debug-access=+rw` — plus read/write access recording.
+- `--debug-scope-file <f>` — census + graph + FST, with the dump scopes read from the text file.
+- `--debug-signals a,b --debug-graph-file g.json` — graph only, no dump.
+
+Rejected combinations exit with status 1 and an error that names the conflict plus a valid command using the same flags:
+
+- `--debug+all` with `--debug-scope-file` or `--debug-signals` — whole-hierarchy dump/all signals vs a restricted selection.
+- `--debug-no-auto-output` with no dump-enabling `--debug*` flag (`--debug+all`, `--debug-access`, or `--debug-scope-file`).
+- a `--debug-access` value outside the allowed tokens.
+- bare `--debug` — no such flag exists; use `--debug+all`, `--debug-access=+r`, or `--debug-scope-file <file>`.
+
+The older `--trace-cone`, `--cone-file`, `--trace-census`, and `--trace-census-file` names were retired while this feature was still in development; `--debug-signals`, `--debug-graph-file`, and the env vars `XEZIM_ACT_TRACE_CENSUS` / `XEZIM_ACT_TRACE_CENSUS_FILE` replace them. Running a retired name prints a hint pointing at the replacements.
+
+## Cross-platform trace API (C, Python, Rust)
+
+The trace sidecars are plain JSON, so any tool can read them. For
+languages that benefit from a typed, buffer-oriented surface without
+parsing JSON on the hot path, xezim ships a C ABI (`libxezim.so`,
+`c-api/xezim_trace.h`) plus the Rust loaders it wraps and a Python
+ctypes module.
+
+### C / Rust
+
+The library builds as a `cdylib` (`libxezim.so` on Linux, `libxezim.dylib`
+on macOS, `xezim.dll` on Windows) exporting:
+
+```c
+/* Graph sidecar */
+xezim_trace_graph *xezim_trace_graph_load(const char *path);
+void xezim_trace_graph_free(xezim_trace_graph *g);
+int xezim_trace_graph_signal_count(const xezim_trace_graph *g, size_t *out);
+int xezim_trace_graph_signal(const xezim_trace_graph *g, size_t index,
+                             char *buf, size_t *cap);
+int xezim_trace_graph_driver_count(const xezim_trace_graph *g,
+                                   size_t signal_index, size_t *out);
+int xezim_trace_graph_driver_at(const xezim_trace_graph *g,
+                                size_t signal_index, size_t driver_index,
+                                char *buf, size_t *cap);
+int xezim_trace_graph_load_count(const xezim_trace_graph *g,
+                                 size_t signal_index, size_t *out);
+int xezim_trace_graph_load_at(const xezim_trace_graph *g,
+                              size_t signal_index, size_t load_index,
+                              char *buf, size_t *cap);
+
+/* Census sidecar */
+xezim_trace_census *xezim_trace_census_load(const char *path);
+void xezim_trace_census_free(xezim_trace_census *c);
+int xezim_trace_census_signal_count(const xezim_trace_census *c, size_t *out);
+int xezim_trace_census_signal_at(const xezim_trace_census *c, size_t index,
+                                 char *path_buf, size_t *path_cap,
+                                 unsigned long long *width_out,
+                                 unsigned long long *change_count_out,
+                                 double *first_change_ns_out,
+                                 double *last_change_ns_out,
+                                 int *has_changed_out);
+
+/* Diagnostics */
+const char *xezim_trace_last_error(void);
+```
+
+All functions return `0` on success, `-1` on error (null handle, null
+output pointer, out-of-range index, too-small buffer). On failure,
+`xezim_trace_last_error()` returns a thread-local message (NULL if the
+last call succeeded).
+
+Strings use the standard two-call protocol:
+
+```c
+size_t need = 0;
+xezim_trace_graph_signal(g, 0, NULL, &need);   // ask how big
+char *buf = malloc(need);
+xezim_trace_graph_signal(g, 0, buf, &need);    // fill it
+```
+
+Build:
+```sh
+cc -I c-api c-api/xezim_trace_probe.c -L target/debug -lxezim \
+   -o /tmp/xezim_trace_probe
+LD_LIBRARY_PATH=target/debug /tmp/xezim_trace_probe \
+   graph.json census.json d a e 6 2
+```
+
+Rust loaders live in `xezim::compiler::act_trace::{TraceGraph, TraceCensus}`
+and are the same functions the C ABI calls:
+
+```rust
+use xezim::compiler::act_trace::{TraceGraph, TraceCensus};
+
+let graph = TraceGraph::read("graph.json")?;
+let row = graph.row("d").expect("d present");
+assert_eq!(row.drivers, vec!["a", "b", "d"]);
+assert_eq!(row.loads, vec!["d", "e", "w"]);
+
+let census = TraceCensus::read("census.json")?;
+let row = census.row("d").expect("d present");
+assert_eq!(row.change_count, 2);
+```
+
+### Python
+
+`c-api/xezim_trace_probe.py` is a ready-to-use ctypes wrapper:
+
+```python
+import ctypes
+import xezim_trace_probe as xtr   # c-api/xezim_trace_probe.py
+
+g = xtr.xezim_trace_graph_load(b"graph.json")
+rows = ctypes.c_size_t()
+xtr.xezim_trace_graph_signal_count(g, ctypes.byref(rows))
+print(f"graph rows: {rows.value}")
+
+# Two-call string protocol: NULL buffer to size, then fill.
+need = ctypes.c_size_t()
+xtr.xezim_trace_graph_signal(g, 0, None, ctypes.byref(need))
+path = ctypes.create_string_buffer(need.value)
+xtr.xezim_trace_graph_signal(g, 0, path, ctypes.byref(need))
+print("signal 0:", path.value.decode())
+
+# Census row: all outputs NULL to size-check, or real pointers to query.
+c = xtr.xezim_trace_census_load(b"census.json")
+seg = ctypes.create_string_buffer(256)
+cap = ctypes.c_size_t(256)
+w, cc = ctypes.c_ulonglong(0), ctypes.c_ulonglong(0)
+first, last = ctypes.c_double(0.0), ctypes.c_double(0.0)
+changed = ctypes.c_int(0)
+xtr.xezim_trace_census_signal_at(
+    c, 0, seg, ctypes.byref(cap), ctypes.byref(w), ctypes.byref(cc),
+    ctypes.byref(first), ctypes.byref(last), ctypes.byref(changed))
+print("row 0:", seg.value.decode(), "changes:", cc.value,
+      "has_changed:", changed.value)
+```
+
+Run:
+```sh
+python3 c-api/xezim_trace_probe.py graph.json census.json d a e 6 2
+```
+
+### File locations
+
+- Header: `c-api/xezim_trace.h`
+- C probe: `c-api/xezim_trace_probe.c`
+- Python probe: `c-api/xezim_trace_probe.py`
+- Rust: `src/compiler/act_trace.rs` (types + loaders), `src/ffi.rs` (C ABI)
+
+### Where this plugs into waveform viewers
+
+The three artifacts a tracing run leaves behind are the three surfaces a
+viewer consumes:
+
+- The FST dump (`xezim.fst`) is the file GTKWave reads directly, and Surfer
+  opens FST/VCD as well. Nothing new is needed to see the traced signals
+  there.
+- The graph sidecar (`trace_graph.json`) is a static connectivity answer —
+  which signals drive and load which — that GTKWave and Surfer normally
+  cannot show, because neither receives the elaborated netlist. A viewer or
+  LSP plugin can read it through the C ABI above and render fan-in/fan-out
+  without parsing the design's source.
+- The census sidecar (`trace_census.json`) is an activity heatmap. Combined
+  with the graph, a viewer can rank signals by change count, then focus the
+  waveform window on the scope that actually toggles.
+
+The Waveform Control Protocol (WCP, still in draft with the waveform-tooling
+ecosystem) is the reverse direction: instead of reading results after a run,
+a viewer drives or queries signal values on a live simulator. xezim does not
+speak WCP yet, but the plumbing matters: the per-signal traced index and the
+C ABI are the same data surfaces a WCP session would address ([gtkwave PR
+#519](https://github.com/gtkwave/gtkwave/pull/519) tracks one such
+integration). The sidecars are the offline complement until then.
+
 ## UVM
 
 See `docs/uvm-guide.md` for depth. The invocation that runs the public AVIP
