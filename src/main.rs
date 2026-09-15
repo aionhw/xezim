@@ -205,6 +205,10 @@ fn print_usage() {
     eprintln!("  --fst <file>     Emit an FST (GTKWave binary) waveform dump to <file>.");
     eprintln!("  --fst-scope <hier>  Restrict the FST dump to signals under <hier>");
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
+    eprintln!("  --stems <file>    Write an RTLBrowse '.stems' source-annotation sidecar");
+    eprintln!("                   naming each module's source file + the instance tree.");
+    eprintln!("                   Pair with an FST dump; open in GTKWave as");
+    eprintln!("                   `gtkwave -t <file> <dump>` to trace from waves to source.");
     eprintln!("  --sv2017         Parse as IEEE 1800-2017 (default is 1800-2023)");
     eprintln!("  --sv2023         Parse as IEEE 1800-2023 (default; kept for back-compat)");
     eprintln!("  --no-strict      Disable strict negative-test diagnostics (accept LRM-illegal");
@@ -1438,6 +1442,7 @@ fn run_main() -> i32 {
     let mut xtrace_compress: Option<String> = None;
     let mut fst_file: Option<String> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
+    let mut stems_file: Option<String> = None;
     let mut sim_debug = false;
     let mut dump_files_list = false;
     let mut dump_merged_sv: Option<String> = None;
@@ -1922,6 +1927,15 @@ fn run_main() -> i32 {
             _ if arg.starts_with("--fst-scope=") => {
                 fst_scopes.push(arg["--fst-scope=".len()..].to_string());
             }
+            "--stems" => {
+                i += 1;
+                if i < args.len() {
+                    stems_file = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--stems=") => {
+                stems_file = Some(arg["--stems=".len()..].to_string());
+            }
             // `--sim_debug` kept as a compatibility alias for existing scripts.
             "--sim-debug" | "--sim_debug" => {
                 sim_debug = true;
@@ -2354,6 +2368,7 @@ suppressed but the explicit SDF annotation still applies."
                         xezim::compiler::simulator::set_dump_timescales(dump_timescales);
                         xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
                         xezim::compiler::simulator::set_vpi_libs(&vpi_libs);
+                        xezim::compiler::simulator::set_stems_cli(stems_file.clone());
                         let mut sim = xezim::compiler::Simulator::new(elab, max_time);
                         if let Some(limit) = settle_limit {
                             sim.settle_limit = limit;
@@ -2772,6 +2787,7 @@ suppressed but the explicit SDF annotation still applies."
     xezim::compiler::simulator::set_dump_timescales(dump_timescales);
     xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
     xezim::compiler::simulator::set_vpi_libs(&vpi_libs);
+    xezim::compiler::simulator::set_stems_cli(stems_file.clone());
 
     // PDES c910 stub mode: parse + elaborate + compile, then run the
     // PdesCoordinator with stub blocks for `pdes_c910_ticks` ticks.

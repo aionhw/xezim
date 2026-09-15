@@ -4,6 +4,7 @@
 //! here for backwards compatibility so existing `xezim::compiler::...`
 //! paths keep resolving.
 
+pub mod act_stems;
 pub mod arena;
 pub mod bytecode;
 pub mod dispatch;

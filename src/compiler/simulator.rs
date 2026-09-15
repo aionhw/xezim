@@ -48,6 +48,11 @@ const COND_AUDIT_EVALS: u8 = 4;
 static DUMP_TIMESCALES: AtomicBool = AtomicBool::new(false);
 static DPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
+/// `--stems <file>`: RTLBrowse `.stems` source-annotation sidecar path. Set
+/// from the command line before `Simulator::new`, read there to seed
+/// `Simulator::stems_file`.
+static STEMS_CLI: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
 /// Opaque handle base for `process::self()` (IEEE 1800-2023 §9.7). The token is
 /// `PROCESS_HANDLE_BASE + pid`, chosen far above any real heap index so a
 /// process handle can never be mistaken for a class-object handle.
@@ -301,6 +306,14 @@ fn dpi_lib_paths() -> &'static Mutex<Vec<String>> {
 pub fn set_dpi_libs(paths: &[String]) {
     if let Ok(mut guard) = dpi_lib_paths().lock() {
         *guard = paths.to_vec();
+    }
+}
+
+/// `--stems <file>`: write the RTLBrowse `.stems` source-annotation sidecar
+/// to `file` at dump setup. Process-global, consumed by `Simulator::new`.
+pub fn set_stems_cli(path: Option<String>) {
+    if let Ok(mut guard) = STEMS_CLI.get_or_init(|| Mutex::new(None)).lock() {
+        *guard = path;
     }
 }
 
@@ -4527,6 +4540,9 @@ pub struct Simulator {
     /// FST dump state (GTKWave binary format via the `fst-writer` crate).
     /// Independent of VCD/XTrace — enabled by `--fst <file>`.
     pub fst_file: Option<String>,
+    /// RTLBrowse `.stems` sidecar path from `--stems <file>`, or None to
+    /// write no sidecar.
+    pub stems_file: Option<String>,
     /// Optional hierarchical scope filters for FST (same semantics as
     /// `--xtrace-scope`): keep signals whose name equals or sits under a scope.
     pub fst_scopes: Vec<String>,
@@ -7872,6 +7888,11 @@ impl Simulator {
             xtrace_from_t: 0,
             xtrace_to_t: u64::MAX,
             fst_file: None,
+            stems_file: STEMS_CLI
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or(None),
             fst_scopes: Vec::new(),
             fst_writer: None,
             fst_path: None,
@@ -12794,6 +12815,7 @@ impl Simulator {
         if self.fst_file.is_some() {
             self.fst_start_dump();
         }
+        self.stems_start_dump();
         self.auto_partition_by_clock();
         self.auto_partition_by_scope();
         mark_compile_phase("schedule initial blocks", &mut compile_phase_start);
@@ -71390,6 +71412,17 @@ impl Simulator {
     /// the body writer, and emit the t=0 snapshot. Mirrors `vcd_start_dump`:
     /// same scope-filter semantics, tick_s-derived timescale, and net dedup
     /// (aliased signal_table ids share one FST id via the `alias` parameter).
+    /// Write the `.stems` sidecar when `--stems <file>` was given. Warns on
+    /// failure without disturbing the simulation, matching `fst_start_dump`.
+    fn stems_start_dump(&mut self) {
+        let Some(path) = self.stems_file.clone() else {
+            return;
+        };
+        if let Err(e) = super::act_stems::write_stems_file(&self.module, &path) {
+            eprintln!("Warning: cannot write stems file '{}': {}", path, e);
+        }
+    }
+
     fn fst_start_dump(&mut self) {
         let filename = match self.fst_file.clone() {
             Some(f) => f,
