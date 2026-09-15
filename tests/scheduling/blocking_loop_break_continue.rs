@@ -117,3 +117,85 @@ endmodule
     let out = run(src, "repcon");
     assert!(out.contains("RESULT PASS"), "expected repeat-continue honoured\n{out}");
 }
+
+// The cases above all place the blocking control (`#delay`) BEFORE the
+// `break`/`continue`, with only NON-blocking statements after it — so they
+// exercise "flag set, then skip non-blocking statements", which the
+// synchronous `exec_statement` guard already handled. They do NOT cover a
+// `break`/`continue` FOLLOWED BY a call to a subroutine that itself blocks.
+//
+// That shape was the real gap (FlooNOC-verif "bug 28"): a blocking call is
+// intercepted in `run_process_stmts` AHEAD of `exec_statement`, and inlining
+// it SAVES AND CLEARS the caller's break/continue flags for the callee body —
+// so the guarded iterations ran the call anyway. `continue` was dropped
+// entirely; `break` fired one iteration late. An inline `#delay` in the same
+// spot escaped the bug only because the flag persists across suspend/resume.
+//
+// Reference (Verilator 5.052 + commercial): `continue` runs `work()` for odd
+// i only; `break` runs it for i<4 only.
+
+#[test]
+fn blocking_for_continue_skips_call_to_blocking_task() {
+    let src = r#"module top;
+  bit sent[8];
+  task automatic work(int unsigned i);
+    #10;                       // the called subroutine consumes time
+    sent[i] = 1'b1;
+  endtask
+  task automatic run();
+    for (int unsigned i = 0; i < 8; i++) begin
+      if ((i % 2) == 0) continue;   // skip even i
+      work(i);                      // <-- blocking CALL after the guard
+    end
+  endtask
+  initial begin
+    int unsigned fails = 0;
+    run();
+    // work() must have run for ODD i only.
+    for (int unsigned i = 0; i < 8; i++)
+      if (sent[i] !== ((i % 2) != 0)) fails++;
+    if (fails == 0) $display("RESULT PASS");
+    else            $display("RESULT FAIL sent=%p", sent);
+    $finish;
+  end
+endmodule
+"#;
+    let out = run(src, "for_continue_call");
+    assert!(
+        out.contains("RESULT PASS"),
+        "continue must skip a following call to a blocking task\n{out}"
+    );
+}
+
+#[test]
+fn blocking_for_break_skips_call_to_blocking_task() {
+    let src = r#"module top;
+  bit sent[8];
+  task automatic work(int unsigned i);
+    #10;
+    sent[i] = 1'b1;
+  endtask
+  task automatic run();
+    for (int unsigned i = 0; i < 8; i++) begin
+      if (i >= 4) break;            // stop at i==4
+      work(i);                      // <-- blocking CALL after the guard
+    end
+  endtask
+  initial begin
+    int unsigned fails = 0;
+    run();
+    // work() must have run for i < 4 only.
+    for (int unsigned i = 0; i < 8; i++)
+      if (sent[i] !== (i < 4)) fails++;
+    if (fails == 0) $display("RESULT PASS");
+    else            $display("RESULT FAIL sent=%p", sent);
+    $finish;
+  end
+endmodule
+"#;
+    let out = run(src, "for_break_call");
+    assert!(
+        out.contains("RESULT PASS"),
+        "break must skip a following call to a blocking task\n{out}"
+    );
+}

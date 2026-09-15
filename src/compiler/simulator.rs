@@ -40224,6 +40224,51 @@ impl Simulator {
                 continue;
             }
 
+            // §12.7 / §9.3.3: while a `break`/`continue` is pending, the REST of
+            // the loop body must be skipped — INCLUDING blocking statements. The
+            // synchronous `exec_statement` already no-ops every statement while
+            // these flags are set (its top guard), and `blocking_loop_flag_gate`
+            // relies on that: it assumes "the body statements after the `continue`
+            // were already skipped". But a BLOCKING statement — a call to a
+            // time-consuming task/method, a `#delay`, an `@event`, a `fork`, or a
+            // blocking begin/end — is intercepted in THIS function AHEAD of
+            // `exec_statement`, and inlining a blocking task even SAVES AND CLEARS
+            // these flags for the callee's body (`bind_task_frame`). So without
+            // this guard a `continue`/`break` guarding a call to a blocking
+            // subroutine was ignored and the call ran for the skipped iterations
+            // — bug 28: the mesh smoke seq's
+            // `if (!has_neighbor(r,dir)) continue; send_directed(...);` leaked
+            // off-mesh flits because `send_directed` blocks in
+            // `start_item`/`finish_item`. Inline `#delay`s escaped the bug only
+            // because the flag PERSISTS across suspend/resume, so the post-delay
+            // assignment was still skipped; a called task clears it.
+            //
+            // Do NOT skip the statements that CONSUME the flag: `LoopStep`
+            // (continue's barrier, handled just above) and the lowered loop
+            // re-entry tails (While/For/Repeat/Foreach/DoWhile/Forever + the
+            // Foreach/Forever Tail sentinels), which run `blocking_loop_flag_gate`
+            // (or an equivalent) to consume `break`/`continue`; `ScopePop` runs
+            // too (task-frame cleanup). A `disable` (disable_target set) drives
+            // its own unwind through `break_flag` — leave that path untouched.
+            if (self.break_flag || self.continue_flag) && self.disable_target.is_none() {
+                let is_flag_consumer = matches!(
+                    &stmt.kind,
+                    StatementKind::While { .. }
+                        | StatementKind::For { .. }
+                        | StatementKind::Repeat { .. }
+                        | StatementKind::Foreach { .. }
+                        | StatementKind::DoWhile { .. }
+                        | StatementKind::Forever { .. }
+                        | StatementKind::ForeachTail { .. }
+                        | StatementKind::ForeverTail { .. }
+                        | StatementKind::ScopePop
+                );
+                if !is_flag_consumer {
+                    i += 1;
+                    continue;
+                }
+            }
+
             // Expand SeqBlocks: flatten begin/end so that timing controls and waits
             // inside them are properly handled with process suspension.
             if let StatementKind::SeqBlock { stmts: inner, .. } = &stmt.kind {
