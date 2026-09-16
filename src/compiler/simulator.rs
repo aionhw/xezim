@@ -10608,32 +10608,50 @@ impl Simulator {
         Some((prefix, spec.to_ascii_lowercase()))
     }
 
-    fn parse_plusarg_value(raw: &str, spec: char) -> Option<Value> {
+    fn parse_plusarg_value(raw: &str, spec: char, width: u32) -> Option<Value> {
         let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
+        let w = width.max(1);
         match spec {
             'd' => {
-                if let Ok(v) = cleaned.parse::<i64>() {
-                    let mut out = Value::from_u64(v as u64, 64);
-                    out.is_signed = true;
-                    Some(out)
-                } else {
-                    None
+                // Parse decimal with arbitrary precision (handles values >= 2^63)
+                let mut acc: u128 = 0;
+                let mut overflow = false;
+                for ch in cleaned.chars() {
+                    if let Some(digit) = ch.to_digit(10) {
+                        // Check for overflow beyond u128
+                        if acc > (u128::MAX - digit as u128) / 10 {
+                            overflow = true;
+                            break;
+                        }
+                        acc = acc * 10 + digit as u128;
+                    }
                 }
+                let mut v = if overflow || w > 128 {
+                    // For very wide values, use limb-based parsing
+                    // Fall back to from_str_radix which now handles decimal wide
+                    Value::from_str_radix(&cleaned, 10, w)
+                } else if w <= 64 {
+                    Value::from_u64(acc as u64, w)
+                } else {
+                    Value::from_u128(acc, w)
+                };
+                v.is_signed = true;
+                Some(v)
             }
             'h' | 'x' => {
                 let s = cleaned
                     .strip_prefix("0x")
                     .or_else(|| cleaned.strip_prefix("0X"))
                     .unwrap_or(&cleaned);
-                Some(Value::from_str_radix(s, 16, 64))
+                Some(Value::from_str_radix(s, 16, w))
             }
-            'o' => Some(Value::from_str_radix(&cleaned, 8, 64)),
-            'b' => Some(Value::from_str_radix(&cleaned, 2, 64)),
+            'o' => Some(Value::from_str_radix(&cleaned, 8, w)),
+            'b' => Some(Value::from_str_radix(&cleaned, 2, w)),
             's' => Some(Value::from_string(raw)),
             'f' | 'e' | 'g' => cleaned.parse::<f64>().ok().map(Value::from_f64),
             _ => None,
         }
-    }
+    } 
 
     fn eval_value_plusargs(&mut self, args: &[Expression]) -> Value {
         if args.len() < 2 {
@@ -10646,6 +10664,8 @@ impl Simulator {
         let Some((prefix, spec)) = Self::parse_plusarg_format(&fmt) else {
             return Value::zero(32);
         };
+        // Get destination width for proper wide-value parsing
+        let dest_width = self.infer_lhs_width(&args[1]).max(1);        
 
         for arg in &self.plusargs {
             let payload = Self::plusarg_payload(arg);
@@ -10653,7 +10673,7 @@ impl Simulator {
                 continue;
             }
             let suffix = &payload[prefix.len()..];
-            if let Some(v) = Self::parse_plusarg_value(suffix, spec) {
+            if let Some(v) = Self::parse_plusarg_value(suffix, spec, dest_width) {
                 self.assign_value(&args[1], &v);
                 return Value::from_u64(1, 32);
             }
@@ -10826,19 +10846,24 @@ impl Simulator {
                             break;
                         }
                         let text: String = s[dstart..si2].iter().filter(|c| **c != '_').collect();
-                        match i64::from_str_radix(&text, radix) {
-                            Ok(mut n) => {
-                                if neg {
-                                    n = -n;
-                                }
-                                si = si2;
-                                if oi < outs.len() {
-                                    self.assign_value(&outs[oi], &Value::from_u64(n as u64, 32));
-                                    oi += 1;
-                                    assigned += 1;
-                                }
-                            }
-                            Err(_) => break,
+                        // Get destination width for proper wide-value parsing
+                        let dest_width = if oi < outs.len() {
+                            self.infer_lhs_width(&outs[oi]).max(1)
+                        } else {
+                            32
+                        };
+                        // Parse using width-aware from_str_radix (now supports decimal wide)
+                        let mut v = Value::from_str_radix(&text, radix, dest_width);
+                        if neg {
+                            // Two's complement negation: invert bits and add 1
+                            v = v.bitwise_not().add(&Value::from_u64(1, dest_width));
+                            v.is_signed = true;
+                        }
+                        si = si2;
+                        if oi < outs.len() {
+                            self.assign_value(&outs[oi], &v);
+                            oi += 1;
+                            assigned += 1;
                         }
                     }
                     _ => break,

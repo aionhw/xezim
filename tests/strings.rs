@@ -79,3 +79,5 @@ mod native_string_ops;
 mod string_returning_fn_inline;
 #[path = "strings/dpi_unit_scope.rs"]
 mod dpi_unit_scope;
+#[path = "strings/wide_string2num.rs"]
+mod wide_string2num;
