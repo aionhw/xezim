@@ -28,7 +28,9 @@ module top;
     else                   $display("INT_FAIL got=%0d", v);
 
     // Negative-space: default values when NOT specialized.
-    s = Wrapper::type_name();
+    // LRM §8.25: unadorned parameterized class scope resolution is illegal;
+    // must use explicit empty specialization `Wrapper#()`.
+    s = Wrapper#()::type_name();
     if (s == "<unknown>")  $display("DEF_PASS '%s'", s);
     else                   $display("DEF_FAIL got='%s'", s);
   end
