@@ -4193,6 +4193,17 @@ pub struct Simulator {
     /// compiler's suffix-match fallback (see `lookup_param_value`). Built
     /// once — parameters are final before any bytecode compilation runs.
     param_leaf_index_cell: std::cell::OnceCell<HashMap<String, Vec<String>>>,
+    /// Lazily-built leaf (`::`-suffix) index over `module.var_decl_types`
+    /// for `declared_collection_elem_class`'s package-qualified fallback.
+    /// The id-collision-in-heap gates consult that fallback on EVERY
+    /// member/indexed access, and the old whole-map `rsplit(':')`-per-key
+    /// scan was ~5.5ms per access on a 370K-signal SoC — 96% of a
+    /// production run's CPU (a 152s TB ballooned past 26 minutes). Index
+    /// entries are CANDIDATE KEYS only; lookups stay authoritative against
+    /// the live map, so runtime insertions (formal/foreach metadata,
+    /// always keyed by the exact bare name the direct probe already
+    /// covers) can neither be missed nor stale-hit.
+    var_decl_leaf_index_cell: std::cell::OnceCell<HashMap<String, Vec<String>>>,
     /// Flattened names currently under an active `force` (§10.6) or
     /// procedural continuous `assign` (§10.6.1) whose storage lives only
     /// in the runtime `signals` map (no compact signal-table id). Mirrors
@@ -9058,6 +9069,7 @@ impl Simulator {
             name_stats_on: std::env::var("XEZIM_NAME_STATS").is_ok(),
             frame_pool: Vec::new(),
             param_leaf_index_cell: std::cell::OnceCell::new(),
+            var_decl_leaf_index_cell: std::cell::OnceCell::new(),
             forced_names: HashSet::default(),
             static_fn_ret: HashMap::default(),
             active_force_exprs: Vec::new(),
@@ -54704,6 +54716,36 @@ if self.profile_report {
                     )
                 })
             }
+            // §13.5.2: `r.f = v` on a `ref` formal — the MemberAccess shape
+            // (how a member write parses inside a subroutine body) missed
+            // the redirect, so the write fell to the member-write
+            // fall-throughs, which read the formal's integral value back as
+            // a heap handle (id-collision-in-heap) or vanished on a phantom
+            // name. Redirect the RECEIVER to the caller's actual and rebuild
+            // the access. An UNPACKED-struct formal is exempt: it binds
+            // member-wise (frame keys `<formal>.<member>`) and the return
+            // copy-back delivers the frame copy to the caller's actual —
+            // redirecting here would bypass that copy and let the stale
+            // call-time value clobber the write at return.
+            ExprKind::MemberAccess { expr, member } => {
+                if let ExprKind::Ident(rh) = &expr.kind {
+                    if rh.path.len() == 1 && rh.path[0].selects.is_empty() {
+                        let key = format!("{}.{}", rh.path[0].name.name, member.name);
+                        if self.local_stack.last().is_some_and(|f| f.contains_key(&key)) {
+                            return None;
+                        }
+                    }
+                }
+                self.ref_formal_redirect_inner(expr, true).map(|ne| {
+                    Expression::new(
+                        ExprKind::MemberAccess {
+                            expr: Box::new(ne),
+                            member: member.clone(),
+                        },
+                        e.span,
+                    )
+                })
+            }
             _ => None,
         }
     }
@@ -56253,18 +56295,32 @@ if self.profile_report {
                         self.set_signal_value_by_name(&dotted, val.clone());
                         return true;
                     }
-                    if let Some(h) = self.eval_ident_handle(&head) {
-                        if h != 0 {
-                            let holds = self
-                                .heap
-                                .get(h)
-                                .and_then(|o| o.as_ref())
-                                .is_some_and(|inst| inst.properties.contains_key(&field));
-                            if holds {
-                                let fitted = self.fit_class_prop(h, &field, val);
-                                if let Some(Some(inst)) = self.heap.get_mut(h) {
-                                    inst.properties.insert(field, fitted);
-                                    return true;
+                    // only a head that STATICALLY denotes a class-object lvalue 
+                    // may reinterpret its stored value as a heap handle here. 
+                    // A packed-struct variable splices its members into one 
+                    // integral value (§7.8), so `sv.delay_counter` with 
+                    // `sv == 32'd1` diverted the field write into 
+                    // `heap[1].delay_counter` — the write vanished from the 
+                    // struct and clobbered an unrelated object. The gate mirrors
+                    // `bare_receiver_is_class_handle`'s static conjunct (enum 
+                    // locals shadow the flat class map) without its 
+                    // runtime-liveness conjunct: the colliding value is live by 
+                    // construction, so only the declared shape of the name 
+                    // discriminates.
+                    if self.bare_name_is_class_channel(&head) {
+                        if let Some(h) = self.eval_ident_handle(&head) {
+                            if h != 0 {
+                                let holds = self
+                                    .heap
+                                    .get(h)
+                                    .and_then(|o| o.as_ref())
+                                    .is_some_and(|inst| inst.properties.contains_key(&field));
+                                if holds {
+                                    let fitted = self.fit_class_prop(h, &field, val);
+                                    if let Some(Some(inst)) = self.heap.get_mut(h) {
+                                        inst.properties.insert(field, fitted);
+                                        return true;
+                                    }
                                 }
                             }
                         }
@@ -56273,19 +56329,40 @@ if self.profile_report {
             }
         }
         if let ExprKind::MemberAccess { expr: recv, member } = &lhs.kind {
-            if matches!(recv.kind, ExprKind::Index { .. }) {
-                let h = self.eval_expr(recv).to_u64().unwrap_or(0) as usize;
-                if h != 0 && h < self.heap.len() {
-                    let holds = self
-                        .heap
-                        .get(h)
-                        .and_then(|o| o.as_ref())
-                        .is_some_and(|inst| inst.properties.contains_key(&member.name));
-                    if holds {
-                        let fitted = self.fit_class_prop(h, &member.name, val);
-                        if let Some(Some(inst)) = self.heap.get_mut(h) {
-                            inst.properties.insert(member.name.clone(), fitted);
-                            return true;
+            if let ExprKind::Index { expr: base, .. } = &recv.kind {
+                // an indexed receiver's VALUE is a heap handle only when 
+                // the collection's ELEMENT type is a class
+                // (`ch[i].prop = v`). A struct element's packed payload is
+                // data, not a handle — rerouting it into the heap stole the
+                // write from the element. Non-ident bases (method results,
+                // nested selects) keep the legacy value-based check.
+                let base_is_handle_container = match &base.kind {
+                    ExprKind::Ident(bh)
+                        if bh.path.len() == 1 && bh.path[0].selects.is_empty() =>
+                    {
+                        // The element-class map also records STRUCT typedef
+                        // names (elaboration keys every collection), so verify
+                        // the resolved element type really is a class before
+                        // treating the element's value as a heap handle.
+                        self.elem_class_of_arr(&bh.path[0].name.name)
+                            .is_some_and(|c| self.module.classes.contains_key(&c))
+                    }
+                    _ => true,
+                };
+                if base_is_handle_container {
+                    let h = self.eval_expr(recv).to_u64().unwrap_or(0) as usize;
+                    if h != 0 && h < self.heap.len() {
+                        let holds = self
+                            .heap
+                            .get(h)
+                            .and_then(|o| o.as_ref())
+                            .is_some_and(|inst| inst.properties.contains_key(&member.name));
+                        if holds {
+                            let fitted = self.fit_class_prop(h, &member.name, val);
+                            if let Some(Some(inst)) = self.heap.get_mut(h) {
+                                inst.properties.insert(member.name.clone(), fitted);
+                                return true;
+                            }
                         }
                     }
                 }
@@ -56618,12 +56695,27 @@ if self.profile_report {
                         let prop_name = &hier.path.last().unwrap().name.name;
                         let mut head_hier = hier.clone();
                         head_hier.path.pop();
-                        let head_expr = Expression::new(ExprKind::Ident(head_hier), lhs.span);
-                        let base_val = self.eval_expr(&head_expr);
-                        let handle = base_val.to_u64().unwrap_or(0) as usize;
-                        if handle != 0 && handle < self.heap.len() && self.heap[handle].is_some() {
-                            let fitted = self.fit_class_prop(handle, prop_name, val);
-                            return self.set_prop_if_changed(handle, prop_name, fitted);
+                        // the head's VALUE is a heap handle only when the head 
+                        // statically names one — a class-typed root (`h.direct`), 
+                        // a frame-dotted local member holding a handle 
+                        // (`stor.handle`), a class-typed composed signal 
+                        // (`mod.h`), or a handle-collection element (`ch[0]`). 
+                        // Struct or hierarchical heads (`ov.inner`, `u.sv`, `u_if.iv`,
+                        // `q[0]` of struct elements) splice their members into
+                        // integral values that must never be read back as
+                        // handles.
+                        if self.head_denotes_class_object(&head_hier) {
+                            let head_expr =
+                                Expression::new(ExprKind::Ident(head_hier), lhs.span);
+                            let base_val = self.eval_expr(&head_expr);
+                            let handle = base_val.to_u64().unwrap_or(0) as usize;
+                            if handle != 0
+                                && handle < self.heap.len()
+                                && self.heap[handle].is_some()
+                            {
+                                let fitted = self.fit_class_prop(handle, prop_name, val);
+                                return self.set_prop_if_changed(handle, prop_name, fitted);
+                            }
                         }
                     }
                     // `ClassName::static_prop` — explicit static property write.
@@ -56793,7 +56885,12 @@ if self.profile_report {
                                     .get(cur_handle)
                                     .and_then(|o| o.as_ref())
                                     .is_some_and(|inst| inst.properties.contains_key(member_name));
-                                if holds {
+                                // the walk may reinterpret the head's integral value as a 
+                                // heap handle only when the head statically names a
+                                // class-object lvalue — a struct variable or a
+                                // struct-element collection splices its members into plain 
+                                // data (§7.8) that must stay out of the heap.
+                                if holds && self.bare_name_is_class_channel(obj_name) {
                                     let fitted = self.fit_class_prop(cur_handle, member_name, val);
                                     if let Some(Some(inst)) = self.heap.get_mut(cur_handle) {
                                         inst.properties.insert(member_name.clone(), fitted);
@@ -57612,23 +57709,30 @@ if self.profile_report {
                         }
                     };
                     if let Some(handle) = handle_opt {
-                        let pname = member.name.clone();
-                        if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                            if let Some(cur) = inst.properties.get(&pname).cloned() {
-                                let width = cur.width as usize;
-                                let mut nv = cur.clone();
-                                let mut changed = false;
-                                for i in lsb..=msb.min(width.saturating_sub(1)) {
-                                    let nb = val.get_bit(i - lsb);
-                                    if nv.get_bit(i) != nb {
-                                        nv.set_bit(i, nb);
-                                        changed = true;
+                        // the receiver's VALUE is a heap handle only when 
+                        // it statically names a class object.
+                        // A part-selected member write on a struct-element
+                        // collection (`q[0].f[3:0] = v`) splices plain data
+                        // (§7.8) and must not be rerouted into the heap.
+                        if self.receiver_may_be_handle(base) {
+                            let pname = member.name.clone();
+                            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                                if let Some(cur) = inst.properties.get(&pname).cloned() {
+                                    let width = cur.width as usize;
+                                    let mut nv = cur.clone();
+                                    let mut changed = false;
+                                    for i in lsb..=msb.min(width.saturating_sub(1)) {
+                                        let nb = val.get_bit(i - lsb);
+                                        if nv.get_bit(i) != nb {
+                                            nv.set_bit(i, nb);
+                                            changed = true;
+                                        }
                                     }
+                                    if changed {
+                                        inst.properties.insert(pname, nv);
+                                    }
+                                    return changed;
                                 }
-                                if changed {
-                                    inst.properties.insert(pname, nv);
-                                }
-                                return changed;
                             }
                         }
                     }
@@ -57692,6 +57796,29 @@ if self.profile_report {
                                 }
                             }
                         }
+                    }
+                    // (c) any other member receiver — notably a struct
+                    // variable or a struct-element collection whose VALUE
+                    // must not be read back as a heap handle (the (a) gate
+                    // above): read-modify-write the FIELD through the generic
+                    // member paths — read `s.f` / `q[0].f`, splice the
+                    // selected bits, write the whole field back.
+                    {
+                        let cur = self.eval_expr(expr);
+                        let width = cur.width as usize;
+                        let mut nv = cur.clone();
+                        let mut changed = false;
+                        for i in lsb..=msb.min(width.saturating_sub(1)) {
+                            let nb = val.get_bit(i - lsb);
+                            if nv.get_bit(i) != nb {
+                                nv.set_bit(i, nb);
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            return self.assign_value(expr, &nv);
+                        }
+                        return changed;
                     }
                 }
                 // Index base: `mat[i][msb:lsb]` for a packed multi-D vector
@@ -58500,8 +58627,6 @@ if self.profile_report {
                         }
                     }
                 }
-                let base = self.eval_expr(expr);
-                let handle = base.to_u64().unwrap_or(0) as usize;
                 // Mirror writes to the unpacked-struct member signal
                 // (e.g. `t_unpacked_struct.val_i`) so VPI-forced values
                 // and SV reads stay in sync. Both the heap property and the
@@ -58532,16 +58657,29 @@ if self.profile_report {
                         }
                     }
                 }
-                if handle != 0 && handle < self.heap.len()
-                    && self.heap[handle].is_some() {
-                        // §8.x: a class property assignment truncates/sign-
-                        // extends the rvalue to the property's declared type
-                        // (`byte a; a = 'hfff;` ⇒ 8-bit 0xff, read -1 when
-                        // signed). fit_class_prop clamps the width;
-                        // set_prop_if_changed stamps the declared signedness.
-                        let fitted = self.fit_class_prop(handle, &member.name, val);
-                        return self.set_prop_if_changed(handle, &member.name, fitted);
-                    }
+                // this last-resort dereference may reinterpret the receiver's 
+                // integral VALUE as a handle only when the receiver statically 
+                // names a class-object lvalue (`obj.prop`, `trk.cfg.mode`, 
+                // `ch[i].prop`). A struct variable, a struct-element collection, 
+                // a hierarchical ref, or a `ref` formal of struct type splices 
+                // plain data (§7.8) — `r.delay_counter = v` on such a receiver 
+                // used to land in `heap[1].delay_counter` instead. Exotic 
+                // receivers (method results) keep the legacy value-based attempt, 
+                // which still requires a live object declaring the property.
+                if self.receiver_may_be_handle(expr) {
+                    let base = self.eval_expr(expr);
+                    let handle = base.to_u64().unwrap_or(0) as usize;
+                    if handle != 0 && handle < self.heap.len()
+                        && self.heap[handle].is_some() {
+                            // §8.x: a class property assignment truncates/sign-
+                            // extends the rvalue to the property's declared type
+                            // (`byte a; a = 'hfff;` ⇒ 8-bit 0xff, read -1 when
+                            // signed). fit_class_prop clamps the width;
+                            // set_prop_if_changed stamps the declared signedness.
+                            let fitted = self.fit_class_prop(handle, &member.name, val);
+                            return self.set_prop_if_changed(handle, &member.name, fitted);
+                        }
+                }
                 false
             }
             _ => false,
@@ -62339,6 +62477,7 @@ if self.profile_report {
                 if hier.path.len() == 2
                     && hier.path[1].selects.is_empty()
                     && hier.path[0].selects.is_empty()
+                    && self.bare_name_is_class_channel(&hier.path[0].name.name)
                 {
                     let base_name = hier.path[0].name.name.as_str();
                     let member = hier.path[1].name.name.clone();
@@ -62438,6 +62577,7 @@ if self.profile_report {
                     if hier.path[0].selects.is_empty()
                         && hier.path[1].selects.is_empty()
                         && !self.no_class_objects()
+                        && self.bare_name_is_class_channel(&hier.path[0].name.name)
                     {
                         if let Some(hval) = self.eval_ident_handle(&hier.path[0].name.name) {
                             if hval != 0 {
@@ -62461,7 +62601,10 @@ if self.profile_report {
                     // for real instance paths), so resolve the head to its
                     // heap object and read the property — previously this
                     // fell through and returned x.
-                    if hier.path[0].selects.is_empty() && hier.path[1].selects.is_empty() {
+                    if hier.path[0].selects.is_empty()
+                        && hier.path[1].selects.is_empty()
+                        && self.bare_name_is_class_channel(hier.path[0].name.name.as_str())
+                    {
                         let head = hier.path[0].name.name.as_str();
                         let field = hier.path[1].name.name.as_str();
                         if let Some(hval) = self.eval_ident_handle(head) {
@@ -62491,6 +62634,7 @@ if self.profile_report {
                 if hier.path.len() >= 3
                     && hier.path.iter().all(|s| s.selects.is_empty())
                     && !self.no_class_objects()
+                    && self.bare_name_is_class_channel(hier.path[0].name.name.as_str())
                 {
                     let head = hier.path[0].name.name.as_str();
                     let head_handle = if head == "this" {
@@ -62898,10 +63042,19 @@ if self.profile_report {
                                 candidates.push(bare);
                             }
                             let mut handle_value: Option<Value> = None;
-                            for c in &candidates {
-                                if let Some(v) = self.get_signal_value_by_name(c) {
-                                    handle_value = Some(v);
-                                    break;
+                            // a leading dotted prefix may steer the read into the 
+                            // heap only when it statically names a class object 
+                            // (class-typed root, frame-dotted handle member, 
+                            // class-typed composed signal, or handle-collection 
+                            // element). A struct/hierarchical prefix (`ov_r.inner`,
+                            // `u2.sv_sub`, `q[0]`) holds integral data, not a
+                            // handle — its value must not be read back as one.
+                            if self.dotted_prefix_is_class_channel(&segs[..split]) {
+                                for c in &candidates {
+                                    if let Some(v) = self.get_signal_value_by_name(c) {
+                                        handle_value = Some(v);
+                                        break;
+                                    }
                                 }
                             }
                             // `Class::static_prop` prefix — the leading
@@ -68962,6 +69115,23 @@ if self.profile_report {
             Some(v)
         })();
         let _fe_key_guard = &fe_key_type_var;
+        // §12.7.3: a foreach loop variable over a CLASS-handle collection has
+        // the collection's element class as its declared type
+        // (`foreach (m_successors[succ])` — `succ` is a uvm_phase). Record it
+        // in the frame overlay so member accesses through the loop variable
+        // classify as class-object accesses (id-collision-in-heap receiver
+        // gating); the overlay pops with the frame, so no cleanup is needed.
+        if vars.len() == 1 {
+            if let Some(v) = vars[0].as_ref() {
+                if let Some(arr_name) = Self::foreach_array_root_name(array) {
+                    if let Some(cls) = self.elem_class_of_arr(&arr_name) {
+                        if self.module.classes.contains_key(&cls) {
+                            self.record_local_class_type(&v.name, &cls);
+                        }
+                    }
+                }
+            }
+        }
         // foreach index vars are automatic (§12.7.3); like for-init
         // vars, record them so a `fork … join_none/join_any` in the
         // body captures the per-iteration value by value (§9.3.2).
@@ -82531,8 +82701,17 @@ if self.profile_report {
         if h.path.len() != 1 {
             return None;
         }
-        let name = &h.path[0].name.name;
-        if let Some(cls) = self.module.array_elem_class.get(name.as_str()) {
+        self.collection_element_class_named(&h.path[0].name.name)
+    }
+
+    /// Name-based core of `collection_element_class` (see that fn for the
+    /// resolution ladder). Split out so the id-collision gates can ask by
+    /// bare name (`elem_class_of_arr`) without synthesizing an
+    /// `Expression` per call — the gate path runs on every member/indexed
+    /// access, and the old synthetic-identifier build cost several
+    /// allocations each.
+    fn collection_element_class_named(&self, name: &str) -> Option<String> {
+        if let Some(cls) = self.module.array_elem_class.get(name) {
             return Some(cls.clone());
         }
         if let Some(cls) = self.declared_collection_elem_class(name) {
@@ -92745,6 +92924,19 @@ if self.profile_report {
         })
     }
 
+    /// Leaf-segment (`::`-suffix) index over `module.var_decl_types`
+    /// (built once) — see `var_decl_leaf_index_cell`.
+    fn var_decl_leaf_index(&self) -> &HashMap<String, Vec<String>> {
+        self.var_decl_leaf_index_cell.get_or_init(|| {
+            let mut idx: HashMap<String, Vec<String>> = HashMap::default();
+            for name in self.module.var_decl_types.keys() {
+                let leaf = name.rsplit(':').next().unwrap_or(name.as_str());
+                idx.entry(leaf.to_string()).or_default().push(name.clone());
+            }
+            idx
+        })
+    }
+
     fn class_of_var(&self, vname: &str) -> Option<String> {
         // A class name IS its own class — `ClassName::static_prop` writes
         // and reads route here with vname = the class name. Without this,
@@ -92859,6 +93051,259 @@ if self.profile_report {
             }
         }
         None
+    }
+
+    /// heap collision guard, bare-name form: can this single,
+    /// select-free identifier denote a class-object lvalue in the current
+    /// scope? The heap-divert arms in `assign_value` and the ident read path
+    /// reinterpreted the VALUE stored under a head as a heap handle whenever
+    /// it happened to be a small live index — but a packed-struct variable
+    /// splices its members into one integral value (IEEE 1800-2017 §7.8), so
+    /// `sv.delay_counter` with `sv == 32'd1` diverted a plain struct-field
+    /// write into `heap[1].delay_counter`. Mirrors
+    /// `bare_receiver_is_class_handle`'s static conjunct (an enum local
+    /// shadows the flat class map) WITHOUT its runtime-liveness conjunct —
+    /// the colliding value is live by construction, so only the declared
+    /// shape of the name discriminates (§8.4 class-handle dereference).
+    fn bare_name_is_class_channel(&self, name: &str) -> bool {
+        if name == "this" || name == "super" {
+            return true;
+        }
+        if self
+            .var_typedef_types
+            .get(name)
+            .is_some_and(|tn| self.module.enum_members.contains_key(tn))
+        {
+            return false;
+        }
+        self.class_of_var(name).is_some()
+    }
+
+    /// heap collision guard, multi-segment head form (selects
+    /// preserved) — used by the write-side prefix-eval arm. The head denotes
+    /// a class object through any of:
+    ///   1. a `this`/`super` root,
+    ///   2. a class-typed ROOT variable — the head names a property chain
+    ///      of class handles (`h.direct.tag`),
+    ///   3. a frame-dotted local member holding a handle (`stor.handle`,
+    ///      the §4c automatic-struct precedent),
+    ///   4. a registered class-typed composed signal (module-scope unpacked
+    ///      struct member holding a handle, `mod.h`),
+    ///   5. a class-typed LEAF — a handle-collection element (`ch[0]`) or a
+    ///      bare class-typed leaf (`mod.h`).
+    /// Anything else (`ov.inner`, `u.sv`, `u_if.iv`, `q[0]` of struct
+    /// elements) names struct/hierarchical storage whose spliced member
+    /// value must NOT be read back as a heap handle.
+    fn head_denotes_class_object(&self, head: &HierarchicalIdentifier) -> bool {
+        if head.path.is_empty() {
+            return false;
+        }
+        let first = head.path[0].name.name.as_str();
+        if first == "this" || first == "super" {
+            return true;
+        }
+        if head.path.len() == 1 {
+            let seg = &head.path[0];
+            if seg.selects.is_empty() {
+                return self.bare_name_is_class_channel(first);
+            }
+            return self.elem_class_of_arr(&seg.name.name)
+                .is_some_and(|c| self.module.classes.contains_key(&c));
+        }
+        if self.bare_name_is_class_channel(first) {
+            return true;
+        }
+        let head_segs: Vec<&str> = head
+            .path
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect();
+        let dotted = head_segs.join(".");
+        if self.local_stack.last().is_some_and(|l| l.contains_key(&dotted)) {
+            return true;
+        }
+        if let Some(&id) = self.signal_name_to_id.get(dotted.as_str()) {
+            if let Some(tn) = self.signal_type_names.get(&id) {
+                if self.module.classes.contains_key(tn) {
+                    return true;
+                }
+            }
+        }
+        if let Some(sig) = self.module.signals.get(dotted.as_str()) {
+            if let Some(tn) = &sig.type_name {
+                if self.module.classes.contains_key(tn) {
+                    return true;
+                }
+            }
+        }
+        // A struct member whose DECLARED type is a class (`stor.handle` —
+        // an unpacked-struct member holding a handle).
+        if self.dotted_name_declared_class(&head_segs).is_some() {
+            return true;
+        }
+        let leaf = head.path.last().unwrap();
+        if !leaf.selects.is_empty() {
+            return self.elem_class_of_arr(&leaf.name.name)
+                .is_some_and(|c| self.module.classes.contains_key(&c));
+        }
+        self.bare_name_is_class_channel(&leaf.name.name)
+    }
+
+    /// heap collision guard, receiver-expression form: may this
+    /// receiver's VALUE legitimately be read back as a heap handle? Used by
+    /// the late write-side fall-throughs (the MemberAccess tail divert and
+    /// the part-select member base) whose only liveness evidence was the
+    /// receiver's integral value — the exact misread this bug fixes. Static
+    /// name shapes are discriminated (`this`, a class-channel identifier, a
+    /// handle-collection element, a chained class receiver); exotic receivers
+    /// (method results, concatenations) keep the legacy value-based attempt,
+    /// which still requires a live object declaring the property.
+    fn receiver_may_be_handle(&mut self, recv: &Expression) -> bool {
+        match &recv.kind {
+            ExprKind::This => true,
+            ExprKind::Ident(h) => self.head_denotes_class_object(h),
+            ExprKind::Index { expr: base, .. } => match &base.kind {
+                ExprKind::Ident(bh)
+                    if bh.path.len() == 1 && bh.path[0].selects.is_empty() =>
+                {
+                    self.elem_class_of_arr(&bh.path[0].name.name)
+                        .is_some_and(|c| self.module.classes.contains_key(&c))
+                }
+                _ => true,
+            },
+            ExprKind::MemberAccess { expr, .. } => {
+                // A frame-dotted local member holding a handle
+                // (`stor.handle`, the §4c automatic-struct precedent) or a
+                // registered class-typed composed signal (`mod.h`) — the
+                // flattened head forms are classified by
+                // `head_denotes_class_object` cases 3/4; mirror them for
+                // the MemberAccess parse shape before the structural
+                // recursion.
+                if let Some(flat) = self.flat_member_name(recv) {
+                    if flat.contains('.')
+                        && self.local_stack.last().is_some_and(|l| l.contains_key(&flat))
+                    {
+                        return true;
+                    }
+                    if let Some(&id) = self.signal_name_to_id.get(flat.as_str()) {
+                        if let Some(tn) = self.signal_type_names.get(&id) {
+                            if self.module.classes.contains_key(tn) {
+                                return true;
+                            }
+                        }
+                    }
+                    if let Some(sig) = self.module.signals.get(flat.as_str()) {
+                        if let Some(tn) = &sig.type_name {
+                            if self.module.classes.contains_key(tn) {
+                                return true;
+                            }
+                        }
+                    }
+                    // A struct member whose DECLARED type is a class
+                    // (`stor.handle`) — the flattened head forms are
+                    // classified by `head_denotes_class_object` cases 3/4/6.
+                    if flat.contains('.') {
+                        let segs: Vec<&str> = flat.split('.').collect();
+                        if self.dotted_name_declared_class(&segs).is_some() {
+                            return true;
+                        }
+                    }
+                }
+                self.receiver_may_be_handle(expr)
+            }
+            _ => true,
+        }
+    }
+
+    /// heap collision guard supplement: the declared CLASS type of a
+    /// dotted name chain, resolved from the root's declaration through
+    /// `lookup_type_member` (the same walk `get_expr_type_name` uses for
+    /// `stor.handle`-style paths). An unpacked-struct MEMBER holding a class
+    /// handle resolves to its class, while a packed-struct field chain
+    /// (`ov_r.inner`), a hierarchical prefix (`u2.sv_sub`) or a struct
+    /// typedef leaf resolves to a non-class or nothing — exactly the
+    /// discrimination the value-based heap diverts need.
+    fn dotted_name_declared_class(&self, segs: &[&str]) -> Option<String> {
+        if segs.len() < 2 {
+            return None;
+        }
+        let root = segs[0];
+        let mut tn = if let Some(t) = self.var_class_types.get(root) {
+            t.clone()
+        } else if let Some(t) = self.var_typedef_types.get(root) {
+            t.clone()
+        } else if self.module.classes.contains_key(root) {
+            root.to_string()
+        } else if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            self.class_prop_type_named(&ctx, root)?
+        } else {
+            return None;
+        };
+        for seg in &segs[1..] {
+            tn = self.lookup_type_member(&tn, seg)?;
+        }
+        if self.module.classes.contains_key(&tn) {
+            Some(tn)
+        } else if tn.contains('#') {
+            let base = tn.split('#').next().unwrap_or(&tn);
+            if self.module.classes.contains_key(base) {
+                Some(tn)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// heap collision guard, name-only form for the read-side prefix
+    /// walk, which collapses selects when it builds candidate names: a
+    /// one-segment prefix may have been selected (`ch[0].x`), so handle-
+    /// collection element channels are accepted alongside bare class
+    /// channels. Struct collections still fail (their element typedef is
+    /// not a class).
+    fn dotted_prefix_is_class_channel(&self, segs: &[&str]) -> bool {
+        if segs.is_empty() {
+            return false;
+        }
+        let first = segs[0];
+        if first == "this" || first == "super" {
+            return true;
+        }
+        if segs.len() == 1 {
+            return self.bare_name_is_class_channel(first)
+                || self
+                    .elem_class_of_arr(first)
+                    .is_some_and(|c| self.module.classes.contains_key(&c));
+        }
+        if self.bare_name_is_class_channel(first) {
+            return true;
+        }
+        let dotted = segs.join(".");
+        if self.local_stack.last().is_some_and(|l| l.contains_key(&dotted)) {
+            return true;
+        }
+        if let Some(&id) = self.signal_name_to_id.get(dotted.as_str()) {
+            if let Some(tn) = self.signal_type_names.get(&id) {
+                if self.module.classes.contains_key(tn) {
+                    return true;
+                }
+            }
+        }
+        if let Some(sig) = self.module.signals.get(dotted.as_str()) {
+            if let Some(tn) = &sig.type_name {
+                if self.module.classes.contains_key(tn) {
+                    return true;
+                }
+            }
+        }
+        // A struct member whose DECLARED type is a class (`stor.handle` —
+        // an unpacked-struct member holding a handle, stored as a runtime
+        // signal with no type in the tables above).
+        if self.dotted_name_declared_class(segs).is_some() {
+            return true;
+        }
+        self.bare_name_is_class_channel(segs[segs.len() - 1])
     }
 
     /// Follow a typedef chain to the underlying type.
@@ -97636,29 +98081,13 @@ if self.profile_report {
         false
     }
 
-    /// Resolve the DECLARED ELEMENT CLASS of a collection by its (leaf) name,
-    /// reusing the expression-based `collection_element_class` by wrapping the
-    /// leaf in a synthetic one-segment identifier.
+    /// Resolve the DECLARED ELEMENT CLASS of a collection by its (leaf)
+    /// name — the name-based `collection_element_class_named` core, so the
+    /// gate path costs two str slices and no synthetic `Expression`.
     fn elem_class_of_arr(&self, arr: &str) -> Option<String> {
         let leaf = arr.rsplit('.').next().unwrap_or(arr);
         let leaf = leaf.split('[').next().unwrap_or(leaf);
-        let elem_expr = Expression::new(
-            ExprKind::Ident(HierarchicalIdentifier {
-                root: None,
-                path: vec![HierPathSegment {
-                    name: crate::ast::Identifier {
-                        name: leaf.to_string(),
-                        span: crate::ast::Span::dummy(),
-                    },
-                    selects: Vec::new(),
-                }],
-                span: crate::ast::Span::dummy(),
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
-            }),
-            crate::ast::Span::dummy(),
-        );
-        self.collection_element_class(&elem_expr)
+        self.collection_element_class_named(leaf)
     }
 
     /// LRM §7.12.2: `q.sort()/.rsort()/.unique() with (item.field)`.
@@ -108488,14 +108917,18 @@ if self.profile_report {
             }
             if let DataType::TypeReference { name: tn, .. } = &port.data_type {
                 let type_name = tn.name.name.clone();
-                if self.module.enum_members.contains_key(&type_name)
+                // A class name can also key the typedef WIDTH table, so the
+                // class check must run FIRST — otherwise a class-typed formal
+                // lands in the typedef maps and `class_of_var` misses it
+                // (heap collision receiver gating).
+                if self.module.classes.contains_key(&type_name) {
+                    self.record_local_class_type(&port.name.name, &type_name);
+                    self.var_class_types.insert(port.name.name.clone(), type_name);
+                } else if self.module.enum_members.contains_key(&type_name)
                     || self.module.typedefs.contains_key(&type_name)
                 {
                     self.record_local_typedef_type(&port.name.name, &type_name);
                     self.var_typedef_types.insert(port.name.name.clone(), type_name);
-                } else if self.module.classes.contains_key(&type_name) {
-                    self.record_local_class_type(&port.name.name, &type_name);
-                    self.var_class_types.insert(port.name.name.clone(), type_name);
                 } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
                     // The formal is typed with a class TYPE PARAMETER
                     // (`IMP imp` inside a parameterized class, e.g. the
@@ -108615,14 +109048,16 @@ if self.profile_report {
         // the `new` falls through to a context-free eval that yields 0.
         if let DataType::TypeReference { name: tn, .. } = &fd.return_type {
             let type_name = tn.name.name.clone();
-            if self.module.enum_members.contains_key(&type_name)
+            // Class check first — see the port loop above (a class name can
+            // also key the typedef width table).
+            if self.module.classes.contains_key(&type_name) {
+                self.record_local_class_type(&ret_name, &type_name);
+                self.var_class_types.insert(ret_name.clone(), type_name);
+            } else if self.module.enum_members.contains_key(&type_name)
                 || self.module.typedefs.contains_key(&type_name)
             {
                 self.record_local_typedef_type(&ret_name, &type_name);
                 self.var_typedef_types.insert(ret_name.clone(), type_name);
-            } else if self.module.classes.contains_key(&type_name) {
-                self.record_local_class_type(&ret_name, &type_name);
-                self.var_class_types.insert(ret_name.clone(), type_name);
             }
         }
         // Mark string-typed return var / params for character indexing.
@@ -109204,12 +109639,15 @@ if self.profile_report {
         self.module.var_decl_types.insert(name.to_string(), dt.clone());
         if let DataType::TypeReference { name: type_name, .. } = dt {
             let type_name = type_name.name.name.clone();
-            if self.module.enum_members.contains_key(&type_name)
+            // Class check first — a class name can also key the typedef
+            // WIDTH table, which misfiled class-typed formals into the
+            // typedef maps (`class_of_var` missed them).
+            if self.module.classes.contains_key(&type_name) {
+                self.var_class_types.insert(name.to_string(), type_name);
+            } else if self.module.enum_members.contains_key(&type_name)
                 || self.module.typedefs.contains_key(&type_name)
             {
                 self.var_typedef_types.insert(name.to_string(), type_name);
-            } else if self.module.classes.contains_key(&type_name) {
-                self.var_class_types.insert(name.to_string(), type_name);
             }
         }
         if !no_unpacked_dims {
@@ -120662,14 +121100,18 @@ if self.profile_report {
                     }
                     if let DataType::TypeReference { name: tn, .. } = &port.data_type {
                         let type_name = tn.name.name.clone();
-                        if self.module.enum_members.contains_key(&type_name)
+                        // Class check first — see the exec_function_call port
+                        // loop (a class name can also key the typedef width
+                        // table, which misfiled class-typed formals into the
+                        // typedef maps).
+                        if self.module.classes.contains_key(&type_name) {
+                            self.record_local_class_type(&port.name.name, &type_name);
+                            self.var_class_types.insert(port.name.name.clone(), type_name.clone());
+                        } else if self.module.enum_members.contains_key(&type_name)
                             || self.module.typedefs.contains_key(&type_name)
                         {
                             self.record_local_typedef_type(&port.name.name, &type_name);
                             self.var_typedef_types.insert(port.name.name.clone(), type_name);
-                        } else if self.module.classes.contains_key(&type_name) {
-                            self.record_local_class_type(&port.name.name, &type_name);
-                            self.var_class_types.insert(port.name.name.clone(), type_name.clone());
                         } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
                             // See the identical branch in exec_function_call's
                             // port loop: the formal is typed with a class TYPE
@@ -121741,19 +122183,38 @@ if self.profile_report {
         // (`uvm_pkg::uvm_random_seed_table_lookup`). Try the bare name
         // first, then a leaf-name match so a bare in-scope reference finds
         // its declared type either way.
-        let dt = self.module.var_decl_types.get(name).cloned();
-        let dt = dt.or_else(|| {
-            let leaf = name.rsplit(':').next().unwrap_or(name);
-            self.module.var_decl_types.iter().find_map(|(k, v)| {
-                if k.rsplit(':').next().unwrap_or(k) == leaf {
-                    Some(v.clone())
-                } else {
-                    None
-                }
-            })
-        })?;
-        let cn = match &dt {
-            crate::ast::types::DataType::TypeReference { name, .. } => name.name.name.clone(),
+        //
+        // The leaf-name match goes through a ONE-TIME index
+        // (`var_decl_leaf_index`): the id-collision-in-heap gates call
+        // here on every member/indexed access, and scanning the whole
+        // `var_decl_types` map with an `rsplit(':')` per key was ~5.5ms
+        // per access on a 370K-signal SoC — 96% of the run's CPU. The
+        // index only PROPOSES candidate keys; the live map stays
+        // authoritative, so runtime insertions (formal / foreach
+        // metadata, always keyed by the exact bare name the direct probe
+        // above already covers) cannot be missed, and a key removed since
+        // the index was built (`clear_formal_metadata`) simply fails the
+        // live get and is skipped, exactly like a key the old scan never
+        // saw. The first candidate still present decides the answer, as
+        // the old scan's first leaf match did.
+        if let Some(dt) = self.module.var_decl_types.get(name) {
+            return self.declared_elem_class_of_dt(dt);
+        }
+        let leaf = name.rsplit(':').next().unwrap_or(name);
+        let candidates = self.var_decl_leaf_index().get(leaf)?;
+        for key in candidates {
+            if let Some(dt) = self.module.var_decl_types.get(key) {
+                return self.declared_elem_class_of_dt(dt);
+            }
+        }
+        None
+    }
+
+    /// Resolution half of `declared_collection_elem_class`: a
+    /// `TypeReference` DataType naming a registered class or covergroup.
+    fn declared_elem_class_of_dt(&self, dt: &DataType) -> Option<String> {
+        let cn = match dt {
+            DataType::TypeReference { name, .. } => name.name.name.clone(),
             _ => return None,
         };
         if self.module.classes.contains_key(&cn)

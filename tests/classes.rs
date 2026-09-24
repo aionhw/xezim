@@ -293,3 +293,7 @@ mod implication_joint_distribution;
 mod array_of_collections_property;
 #[path = "classes/class_array_property_select.rs"]
 mod class_array_property_select;
+#[path = "classes/heap_id_collision_member_access.rs"]
+mod heap_id_collision_member_access;
+#[path = "classes/id_collision_in_heap.rs"]
+mod id_collision_in_heap;
