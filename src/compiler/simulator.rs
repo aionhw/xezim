@@ -6603,6 +6603,22 @@ pub struct Simulator {
     current_static_task: Option<String>,
     /// Best-effort hierarchical context for resolving ambiguous leaf identifiers.
     name_resolve_hint: RefCell<Option<String>>,
+    /// The scope of the code CURRENTLY executing as a process/block
+    /// activation: `Some(scope)` for an instance-scoped activation,
+    /// `Some("")` for a top-scope one (its own names are the bare keys),
+    /// `None` outside any activation (build/detection evals). Installed
+    /// at activation entry (§ run_process_stmts for process
+    /// activations, the edge-block AST-fallback branch for edge blocks)
+    /// and restored on exit. Unlike `name_resolve_hint` it is NEVER
+    /// advanced by the resolution ratchet, so a bare name the
+    /// activation's own scope declares always wins over a mid-block
+    /// hierarchical reference's ratcheted hint (§ 23.6: an
+    /// unqualified name never resolves DOWNWARD into an instance).
+    /// Outside activations it stays None so compile-time evals keep
+    /// their deliberate hint-first order (clock-gen detection installs
+    /// the block's own scope; a `rhs_parent_scoped` port connect
+    /// installs the parent's).
+    activation_scope: RefCell<Option<String>>,
     /// Memoized `signal_name_to_id` keys under an assoc-array prefix.
     /// That map is populated only while the signal table is built and
     /// during `collapse_identity_port_nets` — both elaboration-time —
@@ -9796,6 +9812,7 @@ impl Simulator {
             static_task_init: HashSet::default(),
             current_static_task: None,
             name_resolve_hint: RefCell::new(None),
+            activation_scope: RefCell::new(None),
             assoc_static_keys_cache: RefCell::new(HashMap::default()),
             sampled_watches: Vec::new(),
             sampled_watch_site: HashMap::default(),
@@ -27749,6 +27766,41 @@ impl Simulator {
     }
 
     fn exec_bytecode(&mut self, block_idx: usize) -> bool {
+        // Install THIS block's activation scope (see `activation_scope`) §
+        // the same contract as run_process_stmts. exec_bytecode is the edge
+        // block's activation entry from every caller (sequential dispatch,
+        // the needs_hint AST-fallback branch, parallel), and its interpreter
+        // can execute StmtFallback insns § raw AST statements whose
+        // bare names must resolve in this block's scope even after an
+        // earlier statement's hierarchical reference ratcheted the resolve
+        // hint into an instance (a `u_child.x = 1` write must not redirect
+        // the block's own bare names into u_child). The needs_hint branch
+        // re-installs the same value around its post-return AST fallback.
+        // Fast path: re-firing with the same scope already installed skips
+        // the clone and RefCell churn on this hottest path.
+        let already = {
+            let scope = self
+                .edge_blocks
+                .get(block_idx)
+                .map(|b| b.scope.as_str())
+                .unwrap_or("");
+            self.activation_scope.borrow().as_deref() == Some(scope)
+        };
+        if already {
+            return self.exec_bytecode_inner(block_idx);
+        }
+        let saved_activation_scope = self.activation_scope.replace(Some(
+            self.edge_blocks
+                .get(block_idx)
+                .map(|b| b.scope.clone())
+                .unwrap_or_default(),
+        ));
+        let ran = self.exec_bytecode_inner(block_idx);
+        *self.activation_scope.borrow_mut() = saved_activation_scope;
+        ran
+    }
+
+    fn exec_bytecode_inner(&mut self, block_idx: usize) -> bool {
         if self.trace_always.is_some() {
             self.exec_bytecode_trace(block_idx);
         }
@@ -43449,6 +43501,36 @@ impl Simulator {
     }
 
     fn run_process_stmts(&mut self, pid: usize, pc: &ProcCont) {
+        // Install this activation's own scope (see `activation_scope`) §
+        // the ratchet-proof twin of the hint reset performed inside. A
+        // mid-block hierarchical reference (`u_child.x = 1` right before
+        // a loop) ratchets the hint away, but a bare name this process's
+        // own scope declares must still resolve there, never downward
+        // into the instance. Saved and restored around the activation so
+        // a re-entrant call (synchronous task re-entry) restores its
+        // caller's scope, and compile-time evals after this activation
+        // see None, not a stale scope. The body lives in
+        // run_process_stmts_inner because a Drop guard holding
+        // &self.activation_scope would block every &mut self call in it.
+        let same_scope = match (
+            self.process_scope_hint.get(&pid),
+            self.activation_scope.borrow().as_deref(),
+        ) {
+            (Some(s), Some(a)) => s.as_str() == a,
+            (None, Some("")) => true,
+            _ => false,
+        };
+        if same_scope {
+            return self.run_process_stmts_inner(pid, pc);
+        }
+        let saved_activation_scope = self.activation_scope.replace(Some(
+            self.process_scope_hint.get(&pid).cloned().unwrap_or_default(),
+        ));
+        self.run_process_stmts_inner(pid, pc);
+        *self.activation_scope.borrow_mut() = saved_activation_scope;
+    }
+
+    fn run_process_stmts_inner(&mut self, pid: usize, pc: &ProcCont) {
         let stmts: &[Statement] = pc.frame();
         self.current_pid = pid;
         // Install THIS process's own instance scope as the resolution hint.
@@ -50336,6 +50418,19 @@ impl Simulator {
                 }
                 if needs_hint {
                     let saved_hint = self.name_resolve_hint.borrow().clone();
+                    // Same activation-scope install as run_process_stmts:
+                    // the fallback stmts execute as THIS block's activation
+                    // ("" for a top block § its own names are the
+                    // bare keys), ratchet-proof against a mid-block
+                    // hierarchical reference redirecting the block's bare
+                    // names downward into an instance.
+                    let saved_activation_scope = self.activation_scope.replace(Some(
+                        self.edge_block_scope
+                            .get(bi)
+                            .cloned()
+                            .flatten()
+                            .unwrap_or_default(),
+                    ));
                     if let Some(scope) = self.edge_block_scope.get(bi).and_then(|s| s.as_ref()) {
                         *self.name_resolve_hint.borrow_mut() = Some(scope.clone());
                         // $time/%t in the fallback body must scale to THIS
@@ -50347,6 +50442,7 @@ impl Simulator {
                     }
                     self.timescale_scope_override = None;
                     *self.name_resolve_hint.borrow_mut() = saved_hint;
+                    *self.activation_scope.borrow_mut() = saved_activation_scope;
                 } else {
                     self.exec_bytecode(bi);
                 }
@@ -71773,28 +71869,30 @@ if self.profile_report {
                     })
                     .collect();
                 let fv_saved = self.snapshot_loop_vars(&fv_names);
-                // A loop variable that shadows a module-scope variable needs
-                // its own frame. The module variable of an INLINED instance
-                // is keyed under the process scope (`u.i`), so test the
-                // scope-hinted names too: without this the first run wrote a
-                // bare `i` signal while the reads resolved through the hint
-                // to the x-valued `u.i`, and the loop never entered.
+                // An init-declared loop variable is automatic and loop-scoped
+                // (§12.7/§6.21): it always gets its own frame when the
+                // process has none. Probing for same-named outer signals only
+                // caught the module-scope / process-scope shapes (u.i) — an
+                // INLINED child instance's same-named leaf is invisible to the
+                // probe, and the leaf-name fallback in name resolution then
+                // bound the bare reads to the child's storage while the writes
+                // landed on a bare signal: two different cells (IEEE 1800
+                // §23.6 — an unqualified name must not resolve downward
+                // into an instance). Pushing unconditionally is cheap and
+                // closes every downward-collision shape.
                 let shadow_frame = self.local_stack.last().is_none()
-                    && init.iter().any(|fi| match fi {
-                        ForInit::VarDecl { name, .. } => {
-                            self.signal_name_to_id.contains_key(name.name.as_str())
-                                || self.signals.contains_key(&name.name)
-                                || self.scoped_signal_exists(&name.name)
-                        }
-                        _ => false,
-                    });
+                    && init.iter().any(|fi| matches!(fi, ForInit::VarDecl { .. }));
                 if shadow_frame {
                     self.push_local_frame(HashMap::default());
                 }
-                // Init-declared loop vars are automatic. When the process has no
-                // local frame they land in the signal table; record them so a
-                // `fork` in the body captures the per-iteration value by value
-                // (LRM §9.3.2). Popped on every exit path below.
+                // Init-declared loop vars are automatic. The unconditional
+                // frame push above means they never land in the bare signal
+                // table from this arm, so the auto_loop_vars recording
+                // below cannot fire (a fork in the body instead captures
+                // the per-iteration value from the frame copy that
+                // inherit_fork_child_context gives each child, LRM
+                // §9.3.2). Kept for the day the frame push regains a
+                // condition. Popped on every exit path below.
                 let auto_pushed: usize = if self.local_stack.last().is_none() {
                     let mut n = 0;
                     for fi in init {
@@ -71922,20 +72020,19 @@ if self.profile_report {
                 }
                 self.restore_loop_vars(&fv_saved);
             }
-            // A foreach variable that shadows a module-scope variable (bare or
-            // under the process's instance scope, `u.i`) gets its own frame,
-            // like a for-init variable: without one the loop variable was
-            // written by name, resolved through the scope hint to the module
-            // variable, and the block re-triggered itself on that write.
-            // The re-dispatch below sees a local frame and takes the normal
-            // path, so every exit of that path pops nothing extra.
+            // A foreach index variable is automatic and loop-scoped (§12.7.3):
+            // like a for-init declaration it always gets its own frame when
+            // the process has none. The old same-named-signal probe only
+            // caught module-scope / process-scope shapes (u.i); an INLINED
+            // child instance's same-named leaf was invisible to it, and the
+            // leaf-name fallback then bound the bare index reads to the
+            // child's storage while set_loop_var wrote a bare signal — two
+            // different cells (IEEE 1800 §23.6). The re-dispatch below
+            // sees a local frame and takes the normal path, so every exit of
+            // that path pops nothing extra.
             StatementKind::Foreach { vars, .. }
                 if self.local_stack.last().is_none()
-                    && vars.iter().flatten().any(|v| {
-                        self.signal_name_to_id.contains_key(v.name.as_str())
-                            || self.signals.contains_key(&v.name)
-                            || self.scoped_signal_exists(&v.name)
-                    }) =>
+                    && vars.iter().any(|v| v.is_some()) =>
             {
                 self.push_local_frame(HashMap::default());
                 self.exec_statement(stmt);
@@ -78566,14 +78663,59 @@ if self.profile_report {
         }
         // Scope-qualified shadowing for SINGLE-SEGMENT bare names — LRM
         // §22.4 / §23.6: a local declaration in the enclosing scope
-        // shadows a same-named member brought in via wildcard package
-        // import. If `hint.name` resolves, prefer it over the global
-        // bare name. Without this, two modules' anon-enum members
+        // shadows a same-named member brought in via wildcard packag
+        // import. Without this, two modules' anon-enum members
         // (e.g. cv32e40p_alu_div::FINISH=2 vs
         // cv32e40p_pkg::mult_state_e::FINISH=4) share one global slot;
         // whichever was registered last wins and the divider's FSM
         // truncates State_SN into a 2-bit register, losing FINISH.
+        // §23.6 ordering: the current activation's own scope wins first
+        // — the scope-qualified key for a scoped process, the bare
+        // key for a top-scope process (its own module declares the name).
+        // The resolve hint guides only names that scope does NOT declare:
+        // the hint is routinely set by an unrelated hierarchical reference
+        // earlier in the same block (a u_child.x = 1 write right before a
+        // loop), and letting it win over the current scope's own
+        // declaration resolves a simple name DOWNWARD into the instance
+        // — illegal per §23.6 — which the per-hier cache then
+        // froze, silently retargeting the parent's NBAs into the child.
+        // Mirrors the bytecode compiler's lookup_signal_id scope-first
+        // order, gated on `activation_scope`: the own-scope lookup uses
+        // the ACTIVATION's scope (never the ratcheted hint, never a stale
+        // current_pid), and compile-time evals § which leave
+        // activation_scope None and deliberately install the correct
+        // scope through the resolve hint § keep their hint-first
+        // order.
         if !raw.contains('.') {
+            let activation = self.activation_scope.borrow().clone();
+            match activation.as_deref() {
+                // Top-scope activation: its own module's names are the
+                // bare keys.
+                Some("") => {
+                    if self.signal_name_to_id.contains_key(raw.as_str()) {
+                        return raw;
+                    }
+                }
+                // Instance-scoped activation: the scope-qualified key.
+                // When the scope does not declare the name, fall through
+                // § the bare key may be another module's hoisted
+                // name or a shared enum-member slot, and the hint (the
+                // own scope at activation entry) plus the pre-existing
+                // fallbacks own that decision.
+                Some(scope) => {
+                    let scoped = format!("{}.{}", scope, raw);
+                    if self.signal_name_to_id.contains_key(scoped.as_str()) {
+                        return scoped;
+                    }
+                }
+                // No activation (build/detection eval): hint-first, the
+                // order those contexts are built around. A stale
+                // current_pid's scope bound `user`'s bare enum member `C`
+                // to the sibling shadower's local `int C`, and a
+                // testbench's bare `d` to the child formal `u1.d`
+                // (self-loop, x forever).
+                None => {}
+            }
             if let Some(hint) = self.name_resolve_hint.borrow().as_ref() {
                 let scoped = format!("{}.{}", hint, raw);
                 if self.signal_name_to_id.contains_key(scoped.as_str()) {

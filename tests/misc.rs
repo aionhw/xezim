@@ -305,6 +305,8 @@ mod hier_port_drive_and_collision;
 mod indexed_event_roundtrip;
 #[path = "misc/loop_body_inlines_pure_call.rs"]
 mod loop_body_inlines_pure_call;
+#[path = "misc/loopvar_collision_child_leaf.rs"]
+mod loopvar_collision_child_leaf;
 #[path = "misc/macro_directive_prefix_names.rs"]
 mod macro_directive_prefix_names;
 #[path = "misc/nested_struct_string_member_display.rs"]
