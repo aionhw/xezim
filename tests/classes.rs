@@ -357,6 +357,10 @@ mod enum_local_shadows_flat_maps;
 mod field_init_once_in_order;
 #[path = "classes/handle_chain_read_in_instance_task.rs"]
 mod handle_chain_read_in_instance_task;
+#[path = "classes/heap_id_collision_member_access.rs"]
+mod heap_id_collision_member_access;
+#[path = "classes/id_collision_in_heap.rs"]
+mod id_collision_in_heap;
 #[path = "classes/implication_joint_distribution.rs"]
 mod implication_joint_distribution;
 #[path = "classes/member_collection_runtime_class.rs"]
