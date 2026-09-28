@@ -4320,6 +4320,52 @@ enum ClassAggRef {
     },
     /// Member of an UNPACKED struct — its own cell, keyed `<prop>.<member>`.
     Unpacked { handle: usize, key: String, w: u32 },
+    /// A bit SLICE of one per-instance cell of an unpacked-struct property
+    /// member: `[off +: w]` of the cell's `cell_w` bits. This is how a
+    /// PACKED-ARRAY member of an unpacked struct is addressed (the whole
+    /// array is one cell, §7.4.1 slot math picks the element) and how a
+    /// part-select slices an element of an unpacked-array member.
+    UnpackedSlice {
+        handle: usize,
+        key: String,
+        off: u32,
+        w: u32,
+        cell_w: u32,
+    },
+}
+
+/// One step of a member/select chain being resolved into class aggregate
+/// storage: a named member, a constant index, or a part-select.
+#[derive(Debug, Clone)]
+enum MemberSel {
+    Member(String),
+    Index(i64),
+    Range { kind: RangeKind, l: i64, r: i64 },
+}
+
+/// One step of a member/select chain, UNEVALUATED — [`class_member_select_ref`]
+/// resolves the receiver/property boundary before any index expression is
+/// evaluated, so a chain rooted at no struct-valued class property never
+/// pays for its selects.
+enum PendingSel<'a> {
+    Member(&'a str),
+    Index(&'a Expression),
+    Range {
+        kind: RangeKind,
+        left: &'a Expression,
+        right: &'a Expression,
+    },
+}
+
+/// The §7.8 collection kind of an unpacked-struct member whose declarator
+/// carries an unsized `[]`, queue `[$]` or associative `[k]` dimension.
+/// (Distinct from the rand-collection [`CollKind`]: this one separates the
+/// queue and dynamic registrations.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructCollKind {
+    Dynamic,
+    Queue,
+    Assoc,
 }
 
 /// IEEE 1800-2017 §18.4: a constraint target that is not a bare rand property
@@ -6034,6 +6080,11 @@ pub struct Simulator {
     unpacked_struct_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// See `struct_prop_name_possible`.
     struct_capable_prop_names: std::cell::OnceCell<HashSet<String>>,
+    /// Member names that appear as dynamic/queue/associative members of a
+    /// struct type a class property (or a type-parameter binding, which can
+    /// only name a typedef) can resolve to — the cheap gate in front of
+    /// `class_struct_coll_name`'s receiver walk.
+    struct_coll_member_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// See `class_member_names`.
     class_member_names_cell: std::cell::OnceCell<ClassMemberNames>,
     /// Every bare name a `__vif_local__` key was ever created for (never
@@ -10111,6 +10162,7 @@ impl Simulator {
             marker_key_scratch: String::new(),
             unpacked_struct_prop_names: std::cell::OnceCell::new(),
             struct_capable_prop_names: std::cell::OnceCell::new(),
+            struct_coll_member_prop_names: std::cell::OnceCell::new(),
             class_member_names_cell: std::cell::OnceCell::new(),
             vif_local_names: HashSet::default(),
             method_def_cache: std::cell::RefCell::new(HashMap::default()),
@@ -60477,10 +60529,16 @@ impl Simulator {
         // splicing the member's bits into the property's raw integral value, so
         // the whole/field views (and a union's overlaid members) stay coherent.
         // Both parse shapes (`MemberAccess` and a flattened `Ident([a, b])`)
-        // route here, so this sits ahead of the per-kind arms.
+        // route here, so this sits ahead of the per-kind arms. A member with
+        // an index or part-select below it (`obj.pkt.mem[i] = v`,
+        // `obj.pkt.mem[1][255:248] = v`) resolves through the same call — the
+        // select-aware walk in `class_agg_member` splices the element's bits.
         if matches!(
             lhs.kind,
-            ExprKind::MemberAccess { .. } | ExprKind::Ident(_) | ExprKind::Index { .. }
+            ExprKind::MemberAccess { .. }
+                | ExprKind::Ident(_)
+                | ExprKind::Index { .. }
+                | ExprKind::RangeSelect { .. }
         ) {
             if let Some(r) = self.class_agg_member(lhs) {
                 return self.write_class_agg(&r, val);
@@ -66974,10 +67032,12 @@ impl Simulator {
         // depth — `o.n.inner.a`, `o.s.arr[1]`, `o.arr[0].a`. The member-access
         // read arm resolves only ONE level below the property, and the ident
         // arm sees just the base of an index, so anything deeper fell through
-        // to a bit-select or a stale module-scope leaf.
+        // to a bit-select or a stale module-scope leaf. A part-select
+        // (`o.pkt.mem[1][255:248]`) rides along: the same select-aware walk
+        // resolves the element first.
         if matches!(
             expr.kind,
-            ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
+            ExprKind::Index { .. } | ExprKind::MemberAccess { .. } | ExprKind::RangeSelect { .. }
         ) && !self.no_class_objects()
             && Self::chain_maybe_class_agg(
                 expr,
@@ -75354,18 +75414,57 @@ impl Simulator {
                 }
                 // Per-field element widths (`u.n[i]` where the member
                 // is itself a packed array) — mirrors the module-scope
-                // registration keyed "var.field".
+                // registration keyed "var.field". A member whose own type
+                // is a struct carries aggregate members of its own:
+                // `u.inner.arr[i]` needs `inner.arr`'s element stride to
+                // place the trailing select, so the walk recurses (bounded)
+                // exactly like `register_struct_member_packed_dims` does
+                // for signals. Depth-1-only registration left that stride
+                // unknown and the depth-2 select degraded to a 1-BIT read.
                 if let crate::ast::types::DataType::Struct(su) = self.resolve_dt(data_type) {
-                    for m in &su.members {
-                        if let Some(ew) = super::elaborate::packed_inner_elem_width(
-                            &m.data_type,
-                            &self.module.parameters,
-                            &self.module.typedefs,
-                        ) {
+                    let mut pending: Vec<(String, crate::ast::types::StructUnionType)> =
+                        vec![(d.name.name.clone(), su)];
+                    let mut budget = 4096usize;
+                    while let Some((prefix, su)) = pending.pop() {
+                        if budget == 0 {
+                            break;
+                        }
+                        budget -= 1;
+                        for m in &su.members {
+                            let ew = super::elaborate::packed_inner_elem_width(
+                                &m.data_type,
+                                &self.module.parameters,
+                                &self.module.typedefs,
+                            );
+                            let fd = super::elaborate::packed_full_dims_of(
+                                &m.data_type,
+                                &self.module.parameters,
+                            );
                             for mdecl in &m.declarators {
-                                let key = format!("{}.{}", d.name.name, mdecl.name.name);
-                                self.note_elem_width_key(&key);
-                                self.module.packed_signal_elem_widths.insert(key, ew);
+                                let key = format!("{}.{}", prefix, mdecl.name.name);
+                                // Re-registration REPLACES: a later local
+                                // reusing the same `var.field` name must not
+                                // keep the earlier declaration's geometry
+                                // (two block-local structs whose same-named
+                                // member has different packed dims).
+                                if let Some(ew) = ew {
+                                    self.note_elem_width_key(&key);
+                                    self.module
+                                        .packed_signal_elem_widths
+                                        .insert(key.clone(), ew);
+                                } else {
+                                    self.module.packed_signal_elem_widths.remove(&key);
+                                }
+                                if let Some(fd) = &fd {
+                                    self.module.packed_full_dims.insert(key.clone(), fd.clone());
+                                } else {
+                                    self.module.packed_full_dims.remove(&key);
+                                }
+                                if let crate::ast::types::DataType::Struct(nested) =
+                                    self.resolve_dt(&m.data_type)
+                                {
+                                    pending.push((key, nested));
+                                }
                             }
                         }
                     }
@@ -88929,6 +89028,23 @@ impl Simulator {
                         return pw;
                     }
                 }
+                // §18.4/§7.2: a class aggregate-property member at any depth
+                // — its width is the resolved storage's. Gated on classes
+                // existing so class-free designs pay nothing, and placed
+                // before the bare-leaf fallback so an unrelated module
+                // signal of the same leaf name cannot win.
+                if !self.no_class_objects() {
+                    if let Some(r) = self.class_agg_member(expr) {
+                        let w = match r {
+                            ClassAggRef::Packed { w, .. }
+                            | ClassAggRef::Unpacked { w, .. }
+                            | ClassAggRef::UnpackedSlice { w, .. } => w,
+                        };
+                        if w > 0 {
+                            return w;
+                        }
+                    }
+                }
                 let leaf = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                 if let Some(&id) = self.signal_name_to_id.get(leaf) {
                     h.cached_signal_id.set(Some(id));
@@ -88977,6 +89093,22 @@ impl Simulator {
                         .filter(|&&w| w > 1)
                     {
                         return count * ew;
+                    }
+                }
+                // §18.4/§7.2: a part-select of a class aggregate member —
+                // the resolved slice's width (an indexed `+:`/`-:` on a
+                // multi-dimension member is elem_w bits per element, not
+                // the raw label count).
+                if !self.no_class_objects() {
+                    if let Some(r) = self.class_agg_member(expr) {
+                        let w = match r {
+                            ClassAggRef::Packed { w, .. }
+                            | ClassAggRef::Unpacked { w, .. }
+                            | ClassAggRef::UnpackedSlice { w, .. } => w,
+                        };
+                        if w > 0 {
+                            return w;
+                        }
                     }
                 }
                 count
@@ -89058,6 +89190,22 @@ impl Simulator {
                             if ew > 1 {
                                 return ew;
                             }
+                        }
+                    }
+                }
+                // §18.4/§7.2: an element of a class aggregate member —
+                // width from the resolved storage (a packed-dimension slot
+                // of a struct member fell through to 1 here, resizing an
+                // NBA's RHS to one bit before queueing it).
+                if !self.no_class_objects() {
+                    if let Some(r) = self.class_agg_member(expr) {
+                        let w = match r {
+                            ClassAggRef::Packed { w, .. }
+                            | ClassAggRef::Unpacked { w, .. }
+                            | ClassAggRef::UnpackedSlice { w, .. } => w,
+                        };
+                        if w > 0 {
+                            return w;
                         }
                     }
                 }
@@ -99684,6 +99832,28 @@ impl Simulator {
         }
     }
 
+    /// Constant indices of EVERY unpacked dimension of a member, as one list
+    /// per dimension — the cartesian product of the lists addresses the
+    /// member's elements (`bit [255:0] mem [2][2]` → keys `mem[i][j]`).
+    /// A member with a single dimension yields exactly the list
+    /// `member_dim_indices` produced, so 1-D leaf keys are unchanged.
+    /// `None` when any dimension is not a fixed range, or the product would
+    /// explode.
+    fn member_dim_indices_multi(
+        &self,
+        dims: &[crate::ast::types::UnpackedDimension],
+    ) -> Option<Vec<Vec<i64>>> {
+        let mut out: Vec<Vec<i64>> = Vec::with_capacity(dims.len());
+        for d in dims {
+            out.push(self.member_dim_indices(std::slice::from_ref(d))?);
+        }
+        let total: u64 = out.iter().map(|l| l.len() as u64).product();
+        if total == 0 || total > (1 << 20) {
+            return None;
+        }
+        Some(out)
+    }
+
     /// Write one flattened leaf, honouring the declared width / signedness /
     /// real-ness when the signal is registered. An associative-array element
     /// has no pre-registered signal, so it is created at its natural width.
@@ -99822,6 +99992,49 @@ impl Simulator {
         })
     }
 
+    /// Could `member` be a dynamic/queue/associative member of a struct some
+    /// class property resolves to? The class/typedef tables are fixed at run
+    /// time, so the answer is computed once.
+    fn struct_coll_member_possible(&self, member: &str) -> bool {
+        self.struct_coll_member_names().contains(member)
+    }
+
+    /// The set [`struct_coll_member_possible`] consults: member names that
+    /// some reachable struct type declares with a dynamic/queue/associative
+    /// dimension, nested structs included. The walk seeds from every class
+    /// property's declared type and every named typedef — a type-parameter
+    /// binding can only name a typedef (inline struct type arguments are not
+    /// resolvable), and `resolve_dt_ref` resolves through exactly these
+    /// tables, so the set is a sound superset of what the probe can match.
+    fn struct_coll_member_names(&self) -> &HashSet<String> {
+        self.struct_coll_member_prop_names.get_or_init(|| {
+            let mut set: HashSet<String> = HashSet::default();
+            let mut work: Vec<DataType> = Vec::new();
+            for cd in self.module.classes.values() {
+                work.extend(cd.property_types.values().cloned());
+            }
+            work.extend(self.module.typedef_types.values().cloned());
+            let mut budget = 65536usize;
+            while let Some(dt) = work.pop() {
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
+                if let Some(su) = self.unpacked_struct_of(&dt) {
+                    for m in &su.members {
+                        for d in &m.declarators {
+                            if Self::coll_kind_of(&d.dimensions).is_some() {
+                                set.insert(d.name.name.clone());
+                            }
+                        }
+                        work.push(m.data_type.clone());
+                    }
+                }
+            }
+            set
+        })
+    }
+
     /// The property name `class_prop_receiver` would resolve `e` to.
     fn receiver_prop_name(e: &Expression) -> Option<&str> {
         match &e.kind {
@@ -99835,14 +100048,17 @@ impl Simulator {
 
     /// Could any receiver/property split of the member/index chain `e` name
     /// a struct property? Every candidate property is a member or segment
-    /// name of the chain.
+    /// name of the chain. A part-select (`obj.mem[hi:lo]`) peels like an
+    /// index: the property sits below the trailing select.
     fn chain_may_name_struct_prop(&self, e: &Expression) -> bool {
         match &e.kind {
             ExprKind::MemberAccess { expr, member } => {
                 self.struct_prop_name_possible(&member.name)
                     || self.chain_may_name_struct_prop(expr)
             }
-            ExprKind::Index { expr, .. } => self.chain_may_name_struct_prop(expr),
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                self.chain_may_name_struct_prop(expr)
+            }
             ExprKind::Ident(h) => h
                 .path
                 .iter()
@@ -100245,7 +100461,9 @@ impl Simulator {
     fn chain_maybe_class_agg(e: &Expression, has_this: bool) -> bool {
         match &e.kind {
             ExprKind::MemberAccess { .. } => true,
-            ExprKind::Index { expr, .. } => Self::chain_maybe_class_agg(expr, has_this),
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                Self::chain_maybe_class_agg(expr, has_this)
+            }
             ExprKind::Ident(h) => h.path.len() >= 2 || has_this,
             _ => false,
         }
@@ -100427,35 +100645,152 @@ impl Simulator {
         }
     }
 
+    /// Append a literal index select `[i]` to `expr` — the per-element
+    /// counterpart of `append_member_expr`, used to decompose an aggregate
+    /// member that carries unpacked dimensions into per-element assignments.
+    /// Always wraps in `ExprKind::Index` (the parse shape of a TRAILING
+    /// `[i]`): an index parked in a path segment's `selects` is the parse
+    /// shape of an INTERIOR select and is not resolved by the class-leaf /
+    /// frame-leaf paths these assignments rely on.
+    fn append_index_expr(expr: &Expression, index: i64) -> Expression {
+        let span = expr.span;
+        let num = Expression::new(
+            ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                size: None,
+                signed: false,
+                base: crate::ast::expr::NumberBase::Decimal,
+                value: index.to_string(),
+                cached_val: std::cell::Cell::new(None),
+            }),
+            span,
+        );
+        Expression::new(
+            ExprKind::Index {
+                expr: Box::new(expr.clone()),
+                index: Box::new(num),
+            },
+            span,
+        )
+    }
+
+    /// Cartesian expansion of per-dimension index lists, last dimension
+    /// varying fastest — the element enumeration order of
+    /// `unpacked_struct_leaves` / `member_dim_indices_multi`.
+    fn cartesian_indices(lists: &[Vec<i64>]) -> Vec<Vec<i64>> {
+        let mut tuples: Vec<Vec<i64>> = vec![Vec::new()];
+        for list in lists {
+            let mut next = Vec::with_capacity(tuples.len() * list.len());
+            for t in &tuples {
+                for &i in list {
+                    let mut t2 = t.clone();
+                    t2.push(i);
+                    next.push(t2);
+                }
+            }
+            tuples = next;
+        }
+        tuples
+    }
+
+    /// `append_member_expr` followed by one literal `[i]` select per index:
+    /// `expr.m[i][j]` for member `m` and indices `[i, j]`.
+    fn append_elem_path(expr: &Expression, member: &str, indices: &[i64]) -> Expression {
+        let mut out = Self::append_member_expr(expr, member);
+        for &i in indices {
+            out = Self::append_index_expr(&out, i);
+        }
+        out
+    }
+
     /// Whole-value read of an UNPACKED-STRUCT class property: assemble the
-    /// member cells (`<prop>.<member>`) into one packed integral blob, first
-    /// member at the MSB (matching SV packed layout). Field reads/writes
-    /// already work member-wise; this bridges the whole-value view needed for
-    /// `==`, `%p`/`convert2string`, and passing the struct by value. Returns
-    /// `None` unless `prop` is an unpacked struct on the instance's class
-    /// chain. (IEEE 1800-2023 §7.3.1, §18.4, §10.6)
+    /// member cells into one packed integral blob, laid out like
+    /// `pack_unpacked_struct`/`struct_leaf_layout` (reverse declaration
+    /// order, ascending offsets). The old body walked only the flat
+    /// `struct_field_layout`, so a member with unpacked dimensions — whose
+    /// cells are per-element (`pkt.mem[0]`, `pkt.mem[1]`, ...) — contributed
+    /// nothing: a whole-property copy-out (`t = obj.pkt`) lost every array
+    /// element while the by-value RETURN path (which packs through
+    /// `pack_class_unpacked`) kept them. (IEEE 1800-2023 §7.2, §18.4)
     fn read_whole_struct_class_prop(&self, handle: usize, prop: &str) -> Option<Value> {
         let su = self.class_prop_struct(handle, prop)?;
         if !Self::spreads_member_wise(&su) {
             return None;
         }
-        let fields = Self::struct_field_layout(&DataType::Struct(su))?;
-        let total_w: u32 = fields.iter().map(|(_, _, w, _)| *w).sum();
-        if total_w == 0 {
+        let mut cells: Vec<(String, u32)> = Vec::new();
+        self.unpacked_pack_cells(&su, "", &mut cells);
+        let inst = self.heap.get(handle)?.as_ref()?;
+        let mut total = 0u32;
+        for (_, w) in &cells {
+            total += *w;
+        }
+        if total == 0 {
             return None;
         }
-        let inst = self.heap.get(handle)?.as_ref()?;
-        let mut res = Value::zero(total_w);
-        for (fname, off, w, _fr) in &fields {
-            let key = format!("{}.{}", prop, fname);
+        let mut any = false;
+        let mut res = Value::zero(total);
+        let mut off = 0u32;
+        // Reverse declaration order: the LAST leaf sits at the LSB end.
+        for (suffix, w) in cells.iter().rev() {
+            let key = format!("{}{}", prop, suffix);
             if let Some(fv) = inst.properties.get(&key) {
-                let fw = (*w).max(1);
-                for b in 0..fw {
+                any = true;
+                for b in 0..*w {
                     res.set_bit((off + b) as usize, fv.get_bit(b as usize));
                 }
             }
+            off += *w;
         }
-        Some(res)
+        any.then_some(res)
+    }
+
+    /// §7.2: the LEAF CELLS of an unpacked struct for whole-value assembly,
+    /// as `(key suffix, width)` in declaration order — a `&self` mirror of
+    /// `struct_leaf_layout`'s traversal (which seeds frame markers and so
+    /// needs `&mut`), matching the per-element cells the leaf enumeration
+    /// produces for fixed member dimensions.
+    fn unpacked_pack_cells(
+        &self,
+        su: &crate::ast::types::StructUnionType,
+        prefix: &str,
+        out: &mut Vec<(String, u32)>,
+    ) {
+        for m in &su.members {
+            let nested = self.unpacked_struct_of(&m.data_type);
+            for md in &m.declarators {
+                let mkey = format!("{}.{}", prefix, md.name.name);
+                let mw = resolve_type_width(
+                    &m.data_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+                .max(1);
+                let lists = if md.dimensions.is_empty() {
+                    None
+                } else {
+                    self.member_dim_indices_multi(&md.dimensions)
+                };
+                match lists {
+                    Some(lists) => {
+                        // Cartesian expansion, last dimension varying fastest
+                        // — the enumeration order of `unpacked_struct_leaves`.
+                        for tup in Self::cartesian_indices(&lists) {
+                            let mut ekey = mkey.clone();
+                            for i in tup {
+                                ekey.push_str(&format!("[{}]", i));
+                            }
+                            match &nested {
+                                Some(inner) => self.unpacked_pack_cells(inner, &ekey, out),
+                                None => out.push((ekey, mw)),
+                            }
+                        }
+                    }
+                    None => match &nested {
+                        Some(inner) => self.unpacked_pack_cells(inner, &mkey, out),
+                        None => out.push((mkey, mw)),
+                    },
+                }
+            }
+        }
     }
 
     /// Resolve `expr` (an `obj.prop` or implicit-`this` `prop`) to its instance
@@ -100493,10 +100828,25 @@ impl Simulator {
         }
         // Member-wise assign. Nested struct/array members recurse naturally:
         // `lhs.m = eval(rhs.m)` re-enters this path (for a nested struct
-        // class-property target) or the existing signal paths.
+        // class-property target) or the existing signal paths. A member with
+        // FIXED unpacked dimensions has no single cell — its elements are
+        // the storage — so it is decomposed per element (`lhs.m[i] =
+        // eval(rhs.m[i])`); a dynamic/queue/associative member keeps the
+        // whole-member copy. (IEEE 1800-2023 §7.2)
         for m in &su.members {
             for md in &m.declarators {
                 let mname = md.name.name.as_str();
+                if !md.dimensions.is_empty() {
+                    if let Some(lists) = self.member_dim_indices_multi(&md.dimensions) {
+                        for tup in Self::cartesian_indices(&lists) {
+                            let lhs_f = Self::append_elem_path(lvalue, mname, &tup);
+                            let rhs_f = Self::append_elem_path(rvalue, mname, &tup);
+                            let v = self.eval_expr(&rhs_f);
+                            self.assign_value(&lhs_f, &v);
+                        }
+                        continue;
+                    }
+                }
                 let lhs_f = Self::append_member_expr(lvalue, mname);
                 let rhs_f = Self::append_member_expr(rvalue, mname);
                 let v = self.eval_expr(&rhs_f);
@@ -100552,9 +100902,24 @@ impl Simulator {
         if !Self::spreads_member_wise(&su) {
             return None;
         }
+        // Same per-element decomposition of members with FIXED unpacked
+        // dimensions as the write twin: `t2.mem = eval(o.pkt.mem)` copied a
+        // single cell the element reads (`t2.mem[p]`) never consult, so
+        // every element of a copied-out array member read back 0.
         for m in &su.members {
             for md in &m.declarators {
                 let mname = md.name.name.as_str();
+                if !md.dimensions.is_empty() {
+                    if let Some(lists) = self.member_dim_indices_multi(&md.dimensions) {
+                        for tup in Self::cartesian_indices(&lists) {
+                            let lhs_f = Self::append_elem_path(lvalue, mname, &tup);
+                            let rhs_f = Self::append_elem_path(rvalue, mname, &tup);
+                            let v = self.eval_expr(&rhs_f);
+                            self.assign_value(&lhs_f, &v);
+                        }
+                        continue;
+                    }
+                }
                 let lhs_f = Self::append_member_expr(lvalue, mname);
                 let rhs_f = Self::append_member_expr(rvalue, mname);
                 let v = self.eval_expr(&rhs_f);
@@ -100576,6 +100941,13 @@ impl Simulator {
         // which left every deeper leaf sharing one cell BETWEEN OBJECTS: two
         // instances read each other's `n.inner.a`.
         if let Some(r) = self.class_unpacked_leaf(e) {
+            return Some(r);
+        }
+        // §7.4.1: a member with an index or part-select below it. The whole
+        // chain resolves through one walk, so both parse shapes — the
+        // flattened ident with segment selects and the method-scope
+        // MemberAccess/Index chain — get the element's bits.
+        if let Some(r) = self.class_member_select_ref(e) {
             return Some(r);
         }
         let (base, field) = Self::split_trailing_member(e)?;
@@ -100730,6 +101102,676 @@ impl Simulator {
             key: format!("{}{}", prop, suffix),
             w: w.max(1),
         })
+    }
+
+    /// §18.4/§7.4.1: resolve an INDEXED or PART-SELECTED member of a class
+    /// property's struct — `<obj>.<prop>.<mem>[i]`, `...[i][h:l]`, any member
+    /// nesting depth — to the storage it aliases. `class_packed_elem_ref`
+    /// resolves only a DIRECTLY-DECLARED packed-array property and
+    /// `class_agg_member_parts` only a whole member with no selects, so an
+    /// index below the member fell through to a plain BIT-select: the read
+    /// came back as one bit and the indexed WRITE was dropped entirely (a
+    /// driver class filling a packet struct element-by-element then drove
+    /// all-zero data beats). Both parse shapes route here: the method-scope
+    /// `MemberAccess`/`Index` chain and the module-scope flattened ident
+    /// with segment selects. `None` when the chain names no struct property,
+    /// the member is a COLLECTION (the collection machinery owns it), or an
+    /// index is out of range or unknown.
+    fn class_member_select_ref(&mut self, e: &Expression) -> Option<ClassAggRef> {
+        if self.no_class_objects() {
+            return None;
+        }
+        // Phase 1 — STRUCTURE ONLY: peel selects and member accesses off the
+        // outside WITHOUT evaluating anything; the rooted identifier below
+        // contributes its segments and their selects. Nothing is evaluated
+        // until a receiver/property boundary is known to resolve, so a chain
+        // rooted at a plain signal or a non-struct property never pays for
+        // its index expressions.
+        let mut peeled: Vec<PendingSel> = Vec::new();
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, index } => {
+                    peeled.push(PendingSel::Index(index));
+                    cur = expr;
+                }
+                ExprKind::RangeSelect {
+                    expr,
+                    kind,
+                    left,
+                    right,
+                } => {
+                    peeled.push(PendingSel::Range {
+                        kind: *kind,
+                        left,
+                        right,
+                    });
+                    cur = expr;
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    peeled.push(PendingSel::Member(member.name.as_str()));
+                    cur = expr;
+                }
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        if peeled.is_empty() && h.path.iter().all(|s| s.selects.is_empty()) {
+            // A whole member with no selects is `class_agg_member_parts`' case
+            // (via `split_trailing_member`) — do not pay the walk for it.
+            return None;
+        }
+        // Root-first pending steps: every segment, then that segment's
+        // selects.
+        let mut pending: Vec<PendingSel> = Vec::with_capacity(h.path.len() + peeled.len());
+        for seg in &h.path {
+            pending.push(PendingSel::Member(seg.name.name.as_str()));
+            for sel in &seg.selects {
+                match &sel.kind {
+                    ExprKind::RangeSelect {
+                        kind, left, right, ..
+                    } => {
+                        pending.push(PendingSel::Range {
+                            kind: *kind,
+                            left,
+                            right,
+                        });
+                    }
+                    _ => {
+                        pending.push(PendingSel::Index(sel));
+                    }
+                }
+            }
+        }
+        pending.extend(peeled.into_iter().rev());
+        // Phase 2 — RECEIVER FIRST: resolve some boundary of the leading
+        // member run to a struct-valued property before any select is
+        // evaluated. `class_member_select_split` re-runs this resolution
+        // below — ident-handle lookups, cheap next to evaluating the index
+        // expressions Phase 3 would otherwise have paid for up front.
+        let mut lead = 0usize;
+        while lead < pending.len() && matches!(pending[lead], PendingSel::Member(_)) {
+            lead += 1;
+        }
+        let mut rooted = false;
+        for k in 0..lead {
+            if k + 1 >= pending.len() {
+                break; // nothing may hang below the base
+            }
+            let mut bh = h.clone();
+            bh.path.truncate(k + 1);
+            if let Some(seg) = bh.path.last_mut() {
+                seg.selects.clear();
+            }
+            bh.cached_signal_id = std::cell::Cell::new(None);
+            bh.cached_resolved_name = std::cell::OnceCell::new();
+            let base = Expression::new(ExprKind::Ident(bh), cur.span);
+            let Some((handle, prop)) = self.class_prop_receiver(&base) else {
+                continue;
+            };
+            if self.class_prop_struct(handle, &prop).is_some() {
+                rooted = true;
+                break;
+            }
+        }
+        if !rooted {
+            return None;
+        }
+        // Phase 3 — evaluate the selects (§11.5.1: an unknown index selects
+        // nothing) and walk.
+        let mut steps: Vec<MemberSel> = Vec::with_capacity(pending.len());
+        for p in pending {
+            match p {
+                PendingSel::Member(m) => steps.push(MemberSel::Member(m.to_string())),
+                PendingSel::Index(ix) => {
+                    let iv = self.eval_expr(ix);
+                    if iv.is_real || iv.has_xz() {
+                        return None;
+                    }
+                    steps.push(MemberSel::Index(iv.to_i64()?));
+                }
+                PendingSel::Range { kind, left, right } => {
+                    let lv = self.eval_expr(left);
+                    let rv = self.eval_expr(right);
+                    if lv.is_real || rv.is_real || lv.has_xz() || rv.has_xz() {
+                        return None;
+                    }
+                    steps.push(MemberSel::Range {
+                        kind,
+                        l: lv.to_i64()?,
+                        r: rv.to_i64()?,
+                    });
+                }
+            }
+        }
+        self.class_member_select_split(h, cur.span, &steps)
+    }
+
+    /// Split the root-first `steps` built by [`class_member_select_ref`] into
+    /// a receiver base — a flat ident naming `obj.prop`, or a bare `prop`
+    /// under an implicit `this` — and the member path hanging below it, then
+    /// resolve that path into aggregate storage. Every boundary inside the
+    /// leading run of member names is a candidate: `bd.pkt.mem[i]` roots at
+    /// `bd.pkt`, `pkt.mem[i]` at `this.pkt`. Boundaries are tried innermost
+    /// first (matching [`class_unpacked_leaf`]'s chain order), so a bare
+    /// first segment that is a local variable or a non-struct property is
+    /// rejected cheaply before any receiver evaluation happens.
+    fn class_member_select_split(
+        &mut self,
+        h: &crate::ast::expr::HierarchicalIdentifier,
+        span: crate::ast::Span,
+        steps: &[MemberSel],
+    ) -> Option<ClassAggRef> {
+        // A boundary past the leading `Member` run would leave a select on
+        // the base ident, which `class_prop_receiver` never accepts.
+        let mut lead = 0usize;
+        while lead < steps.len() && matches!(steps[lead], MemberSel::Member(_)) {
+            lead += 1;
+        }
+        for k in 0..lead {
+            if k + 1 >= steps.len() {
+                break; // nothing may hang below the base
+            }
+            let mut bh = h.clone();
+            bh.path.truncate(k + 1);
+            if let Some(seg) = bh.path.last_mut() {
+                seg.selects.clear();
+            }
+            bh.cached_signal_id = std::cell::Cell::new(None);
+            bh.cached_resolved_name = std::cell::OnceCell::new();
+            let base = Expression::new(ExprKind::Ident(bh), span);
+            let Some((handle, prop)) = self.class_prop_receiver(&base) else {
+                continue;
+            };
+            let Some(su) = self.class_prop_struct(handle, &prop) else {
+                continue;
+            };
+            let rest = &steps[k + 1..];
+            // §7.2: an unpacked struct — one cell per leaf, walked below.
+            if Self::spreads_member_wise(&su) {
+                if let Some(r) = self.unpacked_member_select(handle, &prop, &su, rest) {
+                    return Some(r);
+                }
+                continue;
+            }
+            // §18.4: a packed struct/union — members are bit slices of the
+            // property's one integral value.
+            if let Some(r) = self.packed_member_select(handle, &prop, &su, rest) {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    /// Walk the member path below an UNPACKED-struct class property, where
+    /// every leaf is its own per-instance cell keyed `<prop>.<m>...` — the
+    /// same keys [`unpacked_struct_leaves`] enumerates. Index steps over a
+    /// member's fixed unpacked dimensions step from cell to cell; once those
+    /// are consumed (and on a packed-array or vector member, which is ONE
+    /// cell, §7.4.1) they address packed-dimension slots inside the cell,
+    /// and a part-select ends the walk with a bit slice of it. `None` when
+    /// the path leaves that model: a member whose declarator carries a
+    /// dynamic/queue/associative dimension (the collection machinery owns
+    /// it), a select at struct level (an array-of-structs property — the
+    /// suffix resolver owns it), a sub-array reference, or an index out of
+    /// range.
+    fn unpacked_member_select(
+        &mut self,
+        handle: usize,
+        prop: &str,
+        su: &crate::ast::types::StructUnionType,
+        rest: &[MemberSel],
+    ) -> Option<ClassAggRef> {
+        let inst_params = self.instance_param_scope(handle);
+        let mut key = prop.to_string();
+        let mut level = su.clone();
+        let mut i = 0usize;
+        loop {
+            let MemberSel::Member(mname) = rest.get(i)? else {
+                return None;
+            };
+            let mname = mname.as_str();
+            let (dt, dims) = Self::struct_member_decl(&level, mname)?;
+            if Self::coll_kind_of(&dims).is_some() {
+                return None;
+            }
+            key.push('.');
+            key.push_str(mname);
+            let nested = self.unpacked_struct_of(&dt);
+            // Fixed unpacked dimensions of the member: one Index step per
+            // dimension, each stepping to that element's own cell. When the
+            // bounds do not const-resolve, the leaf enumeration stores the
+            // member as ONE cell — leave the indices to the packed-slot
+            // math below instead.
+            let mut consumed = 0usize;
+            if !dims.is_empty() {
+                if let Some(lists) = self.member_dim_indices_multi(&dims) {
+                    while consumed < dims.len() {
+                        let Some(MemberSel::Index(idx)) = rest.get(i + 1 + consumed) else {
+                            break;
+                        };
+                        if !lists.get(consumed)?.contains(idx) {
+                            return None; // out of range
+                        }
+                        key.push_str(&format!("[{}]", idx));
+                        consumed += 1;
+                    }
+                    if consumed < dims.len() {
+                        return None; // a sub-array of the member, not one cell
+                    }
+                }
+            }
+            i += 1 + consumed;
+            if let Some(inner) = nested {
+                level = inner;
+                continue;
+            }
+            // Leaf: the cell width is the member's PACKED width — its
+            // declarator dimensions became `[i]` key parts above.
+            let mw = resolve_type_width(
+                &dt,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            )
+            .max(1);
+            let tail = &rest[i..];
+            if tail.is_empty() {
+                return Some(ClassAggRef::Unpacked { handle, key, w: mw });
+            }
+            let (off, w) = self.packed_array_slice(&dt, &inst_params, mw, tail)?;
+            return Some(ClassAggRef::UnpackedSlice {
+                handle,
+                key,
+                off,
+                w,
+                cell_w: mw,
+            });
+        }
+    }
+
+    /// Walk the member path below a PACKED-struct/union class property,
+    /// whose members are bit slices of the property's one integral value.
+    /// Each member step descends at its field offset (every member of a
+    /// union aliases offset 0, §7.3.1); index and part-select steps below
+    /// the member address packed-dimension slots of its slice. `None` when
+    /// the path leaves the layout: an unknown member, an unpacked dimension
+    /// on a member (not a packed aggregate), a select at struct level, or a
+    /// slot out of range.
+    fn packed_member_select(
+        &mut self,
+        handle: usize,
+        prop: &str,
+        su: &crate::ast::types::StructUnionType,
+        rest: &[MemberSel],
+    ) -> Option<ClassAggRef> {
+        let inst_params = self.instance_param_scope(handle);
+        let mut level = su.clone();
+        let (mut fields, total) = self.packed_agg_layout_with(&level, &inst_params);
+        let total = total.max(1);
+        let mut off = 0u32;
+        let mut w = total;
+        let mut i = 0usize;
+        while i < rest.len() {
+            let MemberSel::Member(mname) = &rest[i] else {
+                return None;
+            };
+            let (dt, dims) = Self::struct_member_decl(&level, mname)?;
+            if !dims.is_empty() {
+                return None; // an unpacked dimension: not a packed aggregate
+            }
+            let (_, moff, mw) = fields.iter().find(|(n, ..)| n == mname).cloned()?;
+            off += moff;
+            w = mw.max(1);
+            match self.resolve_dt(&dt) {
+                crate::ast::types::DataType::Struct(inner)
+                    if !Self::spreads_member_wise(&inner) =>
+                {
+                    level = inner;
+                    fields = self.packed_agg_layout_with(&level, &inst_params).0;
+                    i += 1;
+                }
+                _ => {
+                    // Leaf: the remaining selects address packed slots / a
+                    // bit range of the member's slice.
+                    let (o, sw) = self.packed_array_slice(&dt, &inst_params, w, &rest[i + 1..])?;
+                    return Some(ClassAggRef::Packed {
+                        handle,
+                        prop: prop.to_string(),
+                        off: off + o,
+                        w: sw,
+                        total,
+                    });
+                }
+            }
+        }
+        Some(ClassAggRef::Packed {
+            handle,
+            prop: prop.to_string(),
+            off,
+            w,
+            total,
+        })
+    }
+
+    /// Offset and width — within a `total_w`-bit value whose packed
+    /// dimensions come from `dt` — of the element or range the remaining
+    /// select steps address: `mem[1]`, `mem[1][7:4]`, `v[3:0]`, `v[2]`.
+    /// `rest` may hold `Index` steps followed by at most one `Range`; a
+    /// `Member` below a leaf is not a select this resolves. Slot order
+    /// matches `class_packed_elem_ref`: a descending `[1:0]` puts index 1
+    /// at the MS end, an ascending `[0:1]` puts index 0 there (§7.4.1).
+    fn packed_array_slice(
+        &self,
+        dt: &DataType,
+        params: &HashMap<String, Value>,
+        total_w: u32,
+        rest: &[MemberSel],
+    ) -> Option<(u32, u32)> {
+        let dims = Self::packed_dim_bounds(dt, params)?;
+        let counts: Vec<u32> = dims
+            .iter()
+            .map(|&(l, r)| u32::try_from((l - r).unsigned_abs() + 1).ok().unwrap_or(0))
+            .collect();
+        let mut off = 0u32;
+        let mut span = total_w; // width the next step selects within
+        let mut d = 0usize;
+        let mut i = 0usize;
+        while i < rest.len() {
+            match &rest[i] {
+                MemberSel::Index(idx) => {
+                    let &(l, r) = dims.get(d)?;
+                    if *idx < l.min(r) || *idx > l.max(r) {
+                        return None;
+                    }
+                    let slot = if l >= r { idx - r } else { r - idx };
+                    span = span.checked_div(counts.get(d).copied().unwrap_or(1).max(1))?;
+                    off = off.checked_add((slot as u32).checked_mul(span)?)?;
+                    d += 1;
+                    i += 1;
+                }
+                MemberSel::Range { kind, l, r } => {
+                    let (o, w) = Self::range_within(span, *kind, *l, *r)?;
+                    return Some((off.checked_add(o)?, w));
+                }
+                MemberSel::Member(_) => return None,
+            }
+        }
+        Some((off, span))
+    }
+
+    /// Const-resolved `(left, right)` of every PACKED dimension of `dt`,
+    /// outermost first — `bit [1:0][7:0]` → `[(1, 0), (7, 0)]`. `None` for
+    /// a dimension that does not const-evaluate under `params`, an unsized
+    /// one, or a type with no packed dimensions (an integer atom
+    /// contributes its own width as one range so bit-selects on it still
+    /// resolve; a `real` never does).
+    fn packed_dim_bounds(
+        dt: &DataType,
+        params: &HashMap<String, Value>,
+    ) -> Option<Vec<(i64, i64)>> {
+        use crate::ast::types::{DataType as DT, PackedDimension};
+        let dims: Vec<PackedDimension> = match dt {
+            DT::IntegerVector { dimensions, .. } | DT::Implicit { dimensions, .. } => {
+                dimensions.clone()
+            }
+            DT::IntegerAtom { kind, .. } => {
+                let w = match kind {
+                    crate::ast::types::IntegerAtomType::Byte => 8,
+                    crate::ast::types::IntegerAtomType::ShortInt => 16,
+                    crate::ast::types::IntegerAtomType::Int
+                    | crate::ast::types::IntegerAtomType::Integer => 32,
+                    crate::ast::types::IntegerAtomType::LongInt
+                    | crate::ast::types::IntegerAtomType::Time => 64,
+                };
+                return Some(vec![(w as i64 - 1, 0)]);
+            }
+            DT::Struct(su) if !su.dimensions.is_empty() => su.dimensions.clone(),
+            _ => return None,
+        };
+        if dims.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(dims.len());
+        for d in &dims {
+            let PackedDimension::Range { left, right, .. } = d else {
+                return None;
+            };
+            let l = super::elaborate::const_eval_i64_with_params(left, Some(params))?;
+            let r = super::elaborate::const_eval_i64_with_params(right, Some(params))?;
+            out.push((l, r));
+        }
+        Some(out)
+    }
+
+    /// `(offset, width)` of a part-select — `[l:r]`, `[l +: r]`, `[l -: r]` —
+    /// within a `width`-bit value; `None` when it is empty or leaves the
+    /// value. Bound semantics match the elaborator's part-select fold.
+    fn range_within(width: u32, kind: RangeKind, l: i64, r: i64) -> Option<(u32, u32)> {
+        let (hi, lo) = match kind {
+            RangeKind::Constant => (l.max(r), l.min(r)),
+            RangeKind::IndexedUp => (l + r - 1, l),
+            RangeKind::IndexedDown => (l, l - r + 1),
+        };
+        if hi < lo || lo < 0 {
+            return None;
+        }
+        let w = (hi - lo + 1) as u32;
+        let lo = lo as u32;
+        let end = lo.checked_add(w)?;
+        (end <= width).then_some((lo, w))
+    }
+
+    /// The declared type and declarator dimensions of member `name` in `su`:
+    /// one `StructMember` covers every declarator of `bit a, b;`, so members
+    /// are matched by declarator name.
+    fn struct_member_decl(
+        su: &crate::ast::types::StructUnionType,
+        name: &str,
+    ) -> Option<(DataType, Vec<crate::ast::types::UnpackedDimension>)> {
+        for m in &su.members {
+            for d in &m.declarators {
+                if d.name.name == name {
+                    return Some((m.data_type.clone(), d.dimensions.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// The §7.8 collection kind of a member's FIRST declarator dimension:
+    /// unsized `[]` (dynamic), `[$]`/`[$:N]` (queue) or `[key]`
+    /// (associative). Fixed ranges and expression sizes are NOT collections
+    /// — their element cells belong to the struct machinery.
+    fn coll_kind_of(dims: &[crate::ast::types::UnpackedDimension]) -> Option<StructCollKind> {
+        use crate::ast::types::UnpackedDimension as UD;
+        match dims.first()? {
+            UD::Unsized(_) => Some(StructCollKind::Dynamic),
+            UD::Queue { .. } => Some(StructCollKind::Queue),
+            UD::Associative { .. } => Some(StructCollKind::Assoc),
+            _ => None,
+        }
+    }
+
+    /// Instance-scoped storage name of a COLLECTION member of a struct
+    /// class property — `<handle>#<prop>.<member>` — registering the
+    /// collection on first sight so the §7.8 machinery (element cells at
+    /// `<name>[k]`, the `.size` shadow, queue append-on-write, `new[n]`)
+    /// treats it exactly like a directly-declared collection property.
+    /// All receiver shapes resolve: `bd.pkt.qmem`, `pkt.qmem` (implicit
+    /// `this`) and `this.pkt.qmem`; the trailing `[k]` of an element access
+    /// is the caller's to append. `None` when the expression names no
+    /// struct member whose declarator carries a dynamic/queue/associative
+    /// dimension (a collection mid-path belongs to the nested-collection
+    /// machinery, and a packed struct cannot hold one, §7.2.4).
+    fn class_struct_coll_name(&mut self, e: &Expression) -> Option<String> {
+        if self.no_class_objects() {
+            return None;
+        }
+        // Perf gate, BEFORE any allocation: the chain's trailing member name
+        // must be one of the (few) names some reachable struct declares as a
+        // dynamic/queue/associative member. The boundary walk below evaluates
+        // a handle per candidate receiver, and this probe runs on every
+        // collection-shaped name resolution.
+        let trailing = match &e.kind {
+            ExprKind::MemberAccess { member, .. } => member.name.as_str(),
+            ExprKind::Ident(h) => h.path.last()?.name.name.as_str(),
+            _ => return None,
+        };
+        if !self.struct_coll_member_possible(trailing) {
+            return None;
+        }
+        // Member names, root-first: `bd.pkt.qmem` → [bd, pkt, qmem];
+        // `this.pkt.qmem` and `pkt.qmem` → [pkt, qmem].
+        let mut segs: Vec<String> = Vec::new();
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    segs.push(member.name.clone());
+                    cur = expr;
+                }
+                ExprKind::Ident(h) => {
+                    if h.path.iter().any(|s| !s.selects.is_empty()) {
+                        return None;
+                    }
+                    for seg in h.path.iter().rev() {
+                        segs.push(seg.name.name.clone());
+                    }
+                    break;
+                }
+                ExprKind::This => break,
+                _ => return None,
+            }
+        }
+        segs.reverse();
+        if segs.len() < 2 {
+            return None;
+        }
+        // Candidate receiver boundaries, innermost first — the same order
+        // `class_member_select_split` tries them.
+        for k in 0..segs.len() - 1 {
+            let bh = crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: segs[0..=k]
+                    .iter()
+                    .map(|n| crate::ast::expr::HierPathSegment {
+                        name: crate::ast::Identifier {
+                            name: n.clone(),
+                            span: e.span,
+                        },
+                        selects: Vec::new(),
+                    })
+                    .collect(),
+                span: e.span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            };
+            let base = Expression::new(ExprKind::Ident(bh), e.span);
+            let Some((handle, prop)) = self.class_prop_receiver(&base) else {
+                continue;
+            };
+            let Some(su) = self.class_prop_struct(handle, &prop) else {
+                continue;
+            };
+            if !Self::spreads_member_wise(&su) {
+                continue;
+            }
+            let r = self.class_struct_coll_descend(handle, &prop, &su, &segs[k + 1..]);
+            if let Some(n) = r {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    /// Member descent for [`class_struct_coll_name`]: intermediates must be
+    /// nested unpacked structs, the LAST segment the collection member.
+    fn class_struct_coll_descend(
+        &mut self,
+        handle: usize,
+        prop: &str,
+        su: &crate::ast::types::StructUnionType,
+        tail: &[String],
+    ) -> Option<String> {
+        let mut level = su.clone();
+        let mut key = prop.to_string();
+        let mut found: Option<(DataType, StructCollKind)> = None;
+        for (j, mname) in tail.iter().enumerate() {
+            let (dt, dims) = Self::struct_member_decl(&level, mname)?;
+            let last = j + 1 == tail.len();
+            match Self::coll_kind_of(&dims) {
+                Some(kind) if last => {
+                    key.push('.');
+                    key.push_str(mname);
+                    found = Some((dt, kind));
+                    break;
+                }
+                Some(_) => return None, // collection mid-path: nested machinery
+                None => {
+                    if last {
+                        break; // the final member is not a collection
+                    }
+                    level = self.unpacked_struct_of(&dt)?;
+                    key.push('.');
+                    key.push_str(mname);
+                }
+            }
+        }
+        let (dt, kind) = found?;
+        let elem_w = resolve_type_width(
+            &dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        )
+        .max(1);
+        self.register_struct_coll(handle, &key, kind, elem_w);
+        Some(format!("{}#{}", handle, key))
+    }
+
+    /// Put a struct-member collection on the §7.8 collection registries
+    /// under its instance-scoped `<handle>#<prop>.<member>` name, mirroring
+    /// what a directly-declared collection property gets: element cells at
+    /// `<name>[k]`, the size shadow at `<name>.size`, queue append-on-write
+    /// for the dynamic/queue kinds, key-stringified reads and default
+    /// element widths for associative ones. Idempotent — the repeat access
+    /// path is one set lookup.
+    fn register_struct_coll(
+        &mut self,
+        handle: usize,
+        key: &str,
+        kind: StructCollKind,
+        elem_w: u32,
+    ) {
+        let name = format!("{}#{}", handle, key);
+        let known = match kind {
+            StructCollKind::Dynamic => self.module.dynamic_arrays.contains(&name),
+            StructCollKind::Queue => self.module.queue_vars.contains(&name),
+            StructCollKind::Assoc => self.module.associative_arrays.contains_key(&name),
+        };
+        if known {
+            return;
+        }
+        match kind {
+            StructCollKind::Dynamic | StructCollKind::Queue => {
+                self.module.arrays.insert(name.clone(), (0, -1, elem_w));
+                self.module.dynamic_arrays.insert(name.clone());
+                if kind == StructCollKind::Queue {
+                    self.module.queue_vars.insert(name.clone());
+                }
+                if elem_w > 0 {
+                    self.module.assoc_elem_widths.insert(name.clone(), elem_w);
+                }
+                self.set_queue_size(&name, 0);
+            }
+            StructCollKind::Assoc => {
+                self.module.associative_arrays.insert(name.clone(), false);
+                if elem_w > 0 {
+                    self.module.assoc_elem_widths.insert(name, elem_w);
+                }
+            }
+        }
     }
 
     /// `<obj>.<prop>[i]` where `prop` is a MULTI-DIMENSIONAL packed array
@@ -101369,6 +102411,26 @@ impl Simulator {
                 .and_then(|i| i.properties.get(key))
                 .cloned()
                 .unwrap_or_else(|| Value::zero((*w).max(1))),
+            ClassAggRef::UnpackedSlice {
+                handle,
+                key,
+                off,
+                w,
+                cell_w,
+            } => {
+                let cell = self
+                    .heap
+                    .get(*handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.properties.get(key))
+                    .cloned()
+                    .unwrap_or_else(|| Value::zero((*cell_w).max(1)));
+                let mut out = Value::zero((*w).max(1));
+                for i in 0..*w {
+                    out.set_bit(i as usize, cell.get_bit((off + i) as usize));
+                }
+                out
+            }
         }
     }
 
@@ -101414,6 +102476,35 @@ impl Simulator {
                     return changed;
                 }
                 false
+            }
+            ClassAggRef::UnpackedSlice {
+                handle,
+                key,
+                off,
+                w,
+                cell_w,
+            } => {
+                // Read-modify-write the one cell: the packed-array member (or
+                // the part-selected element) is a bit field of it.
+                let mut cell = self
+                    .heap
+                    .get(*handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.properties.get(key))
+                    .cloned()
+                    .unwrap_or_else(|| Value::zero((*cell_w).max(1)));
+                if cell.width < *cell_w {
+                    cell = cell.resize(*cell_w);
+                }
+                let before = cell.clone();
+                for i in 0..*w {
+                    cell.set_bit((off + i) as usize, val.get_bit(i as usize));
+                }
+                let changed = cell != before;
+                if let Some(Some(inst)) = self.heap.get_mut(*handle) {
+                    inst.properties.insert(key.clone(), cell);
+                }
+                changed
             }
         }
     }
@@ -110257,6 +111348,14 @@ impl Simulator {
     /// base expression is either a bare member (`m` — uses `this`) or a
     /// member of another object (`obj.m`). Returns `<handle>#<member>`.
     fn expr_assoc_name(&mut self, expr: &Expression) -> Option<String> {
+        // §7.8: a collection MEMBER OF A STRUCT property (`obj.pkt.qmem[k]`,
+        // `pkt.qmem.push_back(v)`, `pkt.dmem = new[n]`) stores under the
+        // instance-scoped `<handle>#<prop>.<member>`, registered on first
+        // sight — before the direct-property arms below, which cannot see
+        // through the struct member path.
+        if let Some(n) = self.class_struct_coll_name(expr) {
+            return Some(n);
+        }
         // `this.m` / `obj.m` (either parse shape) on an object resolves to a
         // store only for a member some class can hold as a collection.
         let obj_member_name = match &expr.kind {
@@ -115328,28 +116427,37 @@ impl Simulator {
                 let idxs = if md.dimensions.is_empty() {
                     None
                 } else {
-                    self.member_dim_indices(&md.dimensions)
+                    self.member_dim_indices_multi(&md.dimensions)
                 };
                 match idxs {
-                    Some(list) => {
-                        for i in list {
-                            let ekey = format!("{}[{}]", mkey, i);
-                            let eexpr = Expression::new(
-                                ExprKind::Index {
-                                    expr: Box::new(mexpr.clone()),
-                                    index: Box::new(Expression::new(
-                                        ExprKind::Number(NumberLiteral::Integer {
-                                            size: None,
-                                            signed: true,
-                                            base: NumberBase::Decimal,
-                                            value: i.to_string(),
-                                            cached_val: std::cell::Cell::new(None),
-                                        }),
-                                        base.span,
-                                    )),
-                                },
-                                base.span,
-                            );
+                    Some(lists) => {
+                        // Cartesian expansion, last dimension varying
+                        // fastest — `m[2][3]` addresses elements `m[i][j]`.
+                        // A single dimension yields exactly the list the
+                        // one-dimension form produced, so 1-D leaf keys are
+                        // unchanged.
+                        for tup in Self::cartesian_indices(&lists) {
+                            let mut ekey = mkey.clone();
+                            let mut eexpr = mexpr.clone();
+                            for i in tup {
+                                ekey.push_str(&format!("[{}]", i));
+                                eexpr = Expression::new(
+                                    ExprKind::Index {
+                                        expr: Box::new(eexpr),
+                                        index: Box::new(Expression::new(
+                                            ExprKind::Number(NumberLiteral::Integer {
+                                                size: None,
+                                                signed: true,
+                                                base: NumberBase::Decimal,
+                                                value: i.to_string(),
+                                                cached_val: std::cell::Cell::new(None),
+                                            }),
+                                            base.span,
+                                        )),
+                                    },
+                                    base.span,
+                                );
+                            }
                             match &nested {
                                 Some(inner) => self.unpacked_struct_leaves(
                                     &ekey,

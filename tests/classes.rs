@@ -347,6 +347,10 @@ mod class_localparam_array;
 mod class_method_sibling_instance_oomr;
 #[path = "classes/class_randomize_multidim.rs"]
 mod class_randomize_multidim;
+#[path = "classes/cls_agg_members_in_struct.rs"]
+mod cls_agg_members_in_struct;
+#[path = "classes/cls_agg_members_matrix.rs"]
+mod cls_agg_members_matrix;
 #[path = "classes/condition_waiter_yields_to_inactive.rs"]
 mod condition_waiter_yields_to_inactive;
 #[path = "classes/covergroup_bin_arithmetic.rs"]
