@@ -107151,6 +107151,24 @@ impl Simulator {
                         let a = arg.trim();
                         let resolved = carried.get(a).cloned().unwrap_or_else(|| a.to_string());
                         next.insert(pname.clone(), resolved);
+                    } else if let Some((_, frag)) =
+                        pcd.type_param_defaults.iter().find(|(n, _)| n == pname)
+                    {
+                        // IEEE 1800-2023 §6.20.2: an extends clause that omits a
+                        // parameter leaves it at its DECLARED DEFAULT. Without
+                        // this the parameter's bare NAME leaked into the
+                        // specialization signature (`pbase#(T)`), and resolving
+                        // `T` in that spec failed — a type parameter read as
+                        // `logic`. That is the `class d extends pbase;` shape
+                        // (`class base_test extends base_test_param;`), where the
+                        // derived class silently lost every defaulted parameter.
+                        next.insert(pname.clone(), frag.trim().to_string());
+                    } else if let Some((_, Some(init))) =
+                        pcd.param_defaults.iter().find(|(n, _)| n == pname)
+                    {
+                        if let Some(frag) = self.expr_to_spec_fragment(init) {
+                            next.insert(pname.clone(), frag);
+                        }
                     }
                 }
                 carried = next;
@@ -107172,11 +107190,33 @@ impl Simulator {
         } else {
             cd.param_order.clone()
         };
-        order
-            .iter()
-            .map(|p| carried.get(p).cloned().unwrap_or_else(|| p.clone()))
-            .collect::<Vec<_>>()
-            .join(",")
+        let mut out: Vec<String> = Vec::with_capacity(order.len());
+        for p in order.iter() {
+            if let Some(v) = carried.get(p) {
+                out.push(v.clone());
+                continue;
+            }
+            // A parameter the extends chain never supplied is using its
+            // DECLARED DEFAULT (§6.20.2) — use the default fragment, not the
+            // parameter's own bare name. The bare name produced a spec key
+            // like `pbase#(T)` that no resolution could bind, so a type
+            // parameter in the method body fell back to `logic`.
+            if let Some((_, frag)) = cd.type_param_defaults.iter().find(|(n, _)| n == p) {
+                let frag = frag.trim();
+                if !frag.is_empty() {
+                    out.push(frag.to_string());
+                    continue;
+                }
+            }
+            if let Some((_, Some(init))) = cd.param_defaults.iter().find(|(n, _)| n == p) {
+                if let Some(frag) = self.expr_to_spec_fragment(init) {
+                    out.push(frag);
+                    continue;
+                }
+            }
+            out.push(p.clone());
+        }
+        out.join(",")
     }
 
     /// §8.25 generic spec derivation for a member accessed from subclass
@@ -118557,6 +118597,29 @@ impl Simulator {
                                 self.current_spec = Some((cn, sig_frags.join(",")));
                             }
                         }
+                    }
+                }
+            }
+        }
+        // §8.25 (generic receiver specialization). The synchronous method path
+        // (`exec_method_in_class_hierarchy`) seeds `current_spec` from the
+        // CONCRETE receiver's extends chain when the method is DECLARED in a
+        // PARAMETERIZED ancestor. The task path had only the instance's own
+        // bindings, which for a non-parameterized leaf carry nothing — so a
+        // virtual TASK inherited from a parameterized base (`class d extends
+        // pbase;` with an inherited `task body()` that uses `T`, e.g.
+        // `T::type_id::create`) resolved `T` to the unknown-type fallback,
+        // `logic`, and every create returned null: the run reported UVM_ERROR 0
+        // while driving no transactions at all. Mirror the function path here.
+        if let Some(h) = handle_opt {
+            if let Some(inst) = self.heap.get(h).and_then(|o| o.as_ref()) {
+                let leaf = inst.class_name.clone();
+                if !self.class_is_parameterized(&leaf)
+                    && self.class_is_parameterized(&mclass)
+                    && self.class_extends(&leaf, &mclass)
+                {
+                    if let Some(spec) = self.static_receiver_spec(&leaf, &mclass) {
+                        self.current_spec = Some(spec);
                     }
                 }
             }
