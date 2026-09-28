@@ -10,12 +10,12 @@
 //! and called on such an instance must therefore see `T` = `int` and `W` = 8.
 //!
 //! Before the fix the omitted arguments leaked their own bare NAMES into the
-//! specialization signature (`pbase#(T,W)`), which binds to nothing: `$bits(T)`
-//! was 1 and `W` read 0 on both paths, and a virtual TASK inherited from a
-//! parameterized base lost the type parameters entirely — `$typename(T)`
-//! reported `logic` where the function path reported `int`. In a UVM testbench
-//! that made `T::type_id::create` return null, so the run reported zero errors
-//! while driving no transactions at all.
+//! specialization signature (`pbase#(T,W)`), a key no resolution can bind, so a
+//! reference to `T` landed on the unknown-type fallback. Measured without the
+//! fix — `["TP|f 1 8", "TP|t 1 8", "TP|name logic 1", ...]` — i.e. `$bits(T)`
+//! was 1 and the parameter named `logic` on BOTH paths. In a UVM testbench that
+//! made `T::type_id::create` return null, so the run completed reporting
+//! `UVM_ERROR: 0` while driving no transactions at all.
 //! Cross-checked against the reference simulator.
 
 #[test]
