@@ -63,5 +63,6 @@ module test_clocking_skew_vif;
     end
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

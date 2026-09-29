@@ -26,5 +26,6 @@ module test_strings_typedef_casts;
     `SVTEST_CHECK($bits(state_e) == 2, "$bits on typedef enum failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

@@ -24,5 +24,6 @@ module test_randomization_constraints;
     end
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

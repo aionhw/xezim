@@ -32,5 +32,6 @@ module test_covergroups_basic;
     `SVTEST_CHECK(cov > 0.0, "covergroup coverage did not accumulate")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

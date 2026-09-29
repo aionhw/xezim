@@ -124,5 +124,6 @@ module top;
                   "G: three drivers sum (1.5 + 2.25 - 0.75 = 3.0)")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

@@ -19,5 +19,6 @@ module test_tagged_union_patterns;
     `SVTEST_CHECK(u_half.h == 16'h1234, "tagged union halfword variant failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

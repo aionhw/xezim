@@ -99,5 +99,6 @@ module test_40_tier2_struct_nettype_resolution;
                   "neg+frac: [-1.5,1] + [2.25,1] -> field1=0.75 field2=1")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

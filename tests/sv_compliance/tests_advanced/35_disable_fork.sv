@@ -29,5 +29,6 @@ module test_disable_fork;
     `SVTEST_CHECK(seen_slow == 0, "disable fork failed to terminate slower branch")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

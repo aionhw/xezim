@@ -23,5 +23,6 @@ module test_lexical_identifiers;
     `SVTEST_CHECK(s.len() == 13, "string literal length failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

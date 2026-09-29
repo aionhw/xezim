@@ -104,5 +104,6 @@ module top;
                   "A: node must not collapse to an integer 0")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

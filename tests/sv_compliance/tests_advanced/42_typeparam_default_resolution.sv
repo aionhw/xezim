@@ -13,6 +13,7 @@ module sub #(parameter int unsigned W = 4, parameter type T = logic[W-1:0]) ();
     #1;
     if ($bits(val) == 8) $display("TEST_PASS typeparam default W=%0d bits=%0d", W, $bits(val));
     else                 $display("TEST_FAIL typeparam default W=%0d bits=%0d (expected 8)", W, $bits(val));
+    $finish;
   end
 endmodule
 

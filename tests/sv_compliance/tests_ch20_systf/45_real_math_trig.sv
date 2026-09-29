@@ -138,5 +138,6 @@ module test_real_math_trig;
     `SVTEST_CHECK(approx(r, 0.5493061443340548), "$atanh(0.5)")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

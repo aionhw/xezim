@@ -42,5 +42,6 @@ module test_processes_events;
     `SVTEST_CHECK(protected_counter == 2, "semaphore synchronization failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

@@ -34,6 +34,7 @@ module top;
     end else begin
       $display("TEST_PASS");
     end
+    $finish;
   end
 
 endmodule

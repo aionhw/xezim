@@ -37,5 +37,6 @@ module test_generate;
     `SVTEST_CHECK(y1 == 4'b0101, "if-generate invert failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

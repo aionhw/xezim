@@ -35,5 +35,6 @@ module test_events_mailboxes_semaphores;
     `SVTEST_CHECK(got == 32'h1234, "mailbox put/get failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

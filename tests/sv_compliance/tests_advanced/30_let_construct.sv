@@ -14,5 +14,6 @@ module test_let_construct;
     `SVTEST_CHECK(!in_range(v, 6, 9), "let construct negative case failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

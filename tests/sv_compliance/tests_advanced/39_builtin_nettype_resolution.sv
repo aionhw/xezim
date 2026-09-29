@@ -98,5 +98,6 @@ module test_39_tier1_builtin_nettype_resolution;
     `SVTEST_CHECK(t_solo_1 === 1'b1, "T1: tri [1] -> 1")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

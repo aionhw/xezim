@@ -25,6 +25,7 @@ module inner #(parameter int unsigned NumIn = 5) ();
       #1;
       if (vec === 7'b1111111) $display("TEST_PASS genfor localparam idx vec=%b", vec);
       else                    $display("TEST_FAIL genfor localparam idx vec=%b (expected 1111111)", vec);
+      $finish;
     end
   end
 endmodule

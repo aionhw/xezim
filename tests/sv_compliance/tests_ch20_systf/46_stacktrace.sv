@@ -69,5 +69,6 @@ module test_stacktrace;
     if (tr_nested.len() > 0) $display("INFO: nst stacktrace sample: %s ...", tr_nested.substr(0, 39));
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

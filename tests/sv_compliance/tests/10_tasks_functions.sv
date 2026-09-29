@@ -33,5 +33,6 @@ module test_tasks_functions;
     `SVTEST_CHECK(s == 15, "task output argument failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

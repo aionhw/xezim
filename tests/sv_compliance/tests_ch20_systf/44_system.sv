@@ -63,5 +63,6 @@ module test_system;
     cleanup();                              // remove scratch file
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

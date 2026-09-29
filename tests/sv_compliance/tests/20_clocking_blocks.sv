@@ -32,5 +32,6 @@ module test_clocking_blocks;
     `SVTEST_CHECK(cb.ack == 1'b0, "clocking block driven output failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

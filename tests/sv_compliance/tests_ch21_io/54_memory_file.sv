@@ -63,5 +63,6 @@ module test_memory_file;
 
     $system("rm -f ch21_memdump.hex ch21_memdump.bin ch21_memdump.dec");
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

@@ -43,5 +43,6 @@ module test_control_flow;
     end
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

@@ -91,5 +91,6 @@ module top;
     `SVTEST_CHECK(gen_child[2].u_gen_child.LOCAL_DELAY == 5, "gen_child[2].LOCAL_DELAY = 5 (4+1)")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

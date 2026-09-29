@@ -65,5 +65,6 @@ module test_file_read;
 
     $system("rm -f ch21_read_test.txt");
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

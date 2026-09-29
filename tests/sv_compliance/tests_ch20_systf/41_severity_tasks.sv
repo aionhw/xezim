@@ -62,5 +62,6 @@ module test_severity_tasks;
     `SVTEST_CHECK(counter       == 4,    "counter not incremented past $error")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

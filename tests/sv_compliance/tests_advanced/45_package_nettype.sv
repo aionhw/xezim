@@ -79,5 +79,6 @@ module test_45_package_nettype;
                   "second package nettype (scalar real max) = 9.25")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

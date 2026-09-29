@@ -18,5 +18,6 @@ module test_packages_imports;
     `SVTEST_CHECK(r == 19, "package import or package function failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

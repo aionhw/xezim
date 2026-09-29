@@ -27,5 +27,6 @@ module test_operators_expressions;
     `SVTEST_CHECK(tern == 1, "ternary operator failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

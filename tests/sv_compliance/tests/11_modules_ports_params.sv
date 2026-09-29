@@ -28,5 +28,6 @@ module test_modules_ports_params;
     `SVTEST_CHECK(y == 8'd22, "parameterized module port connection failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

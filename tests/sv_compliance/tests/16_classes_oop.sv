@@ -33,5 +33,6 @@ module test_classes_oop;
     `SVTEST_CHECK(d.f() == 15, "derived class method failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

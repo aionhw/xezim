@@ -33,5 +33,6 @@ module test_aggregate_types;
     `SVTEST_CHECK(u.s.a == 4'h3 && u.s.b == 4'hC, "packed union reinterpretation failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

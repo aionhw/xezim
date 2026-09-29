@@ -29,5 +29,6 @@ module test_fork_join_wait;
     `SVTEST_CHECK(finished == 2, "join_none/wait fork failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

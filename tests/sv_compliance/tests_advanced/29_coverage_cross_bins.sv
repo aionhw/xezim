@@ -33,5 +33,6 @@ module test_coverage_cross_bins;
     `SVTEST_CHECK(cov > 0.0, "cross coverage collection failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

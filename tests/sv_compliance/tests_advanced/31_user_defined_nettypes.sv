@@ -24,5 +24,6 @@ module test_user_defined_nettypes;
     #0;
     `SVTEST_CHECK(y === 1'b1, "user-defined nettype resolution failed")
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

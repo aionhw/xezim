@@ -23,5 +23,6 @@ module test_literal_values;
     `SVTEST_CHECK($isunknown(with_x), "x/z state literal failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

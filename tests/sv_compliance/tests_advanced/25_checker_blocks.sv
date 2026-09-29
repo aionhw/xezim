@@ -34,5 +34,6 @@ module test_checker_blocks;
 
     #0;
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

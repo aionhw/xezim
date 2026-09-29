@@ -55,5 +55,6 @@ module test_47_nettype_coercion;
     `SVTEST_CHECK(seen_b > 3.9999 && seen_b < 4.0001,
                   "control: explicitly declared nettype net -> 4.0")
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

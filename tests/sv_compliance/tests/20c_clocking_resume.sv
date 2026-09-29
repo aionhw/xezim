@@ -27,5 +27,6 @@ module test_clocking_resume;
     `SVTEST_CHECK(c == 4, "##3 did not advance to post-edge state")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

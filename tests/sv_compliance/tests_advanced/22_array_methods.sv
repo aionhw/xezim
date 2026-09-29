@@ -34,5 +34,6 @@ module test_array_methods;
     `SVTEST_CHECK(aa["bob"] == 20, "associative array indexing failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

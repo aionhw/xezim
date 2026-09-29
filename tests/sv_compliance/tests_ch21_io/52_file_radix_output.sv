@@ -66,5 +66,6 @@ module test_file_radix_output;
     `SVTEST_CHECK(lines[3] == "aa",       "fwriteh")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

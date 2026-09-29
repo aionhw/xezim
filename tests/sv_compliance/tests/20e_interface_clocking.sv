@@ -33,5 +33,6 @@ module test_interface_clocking;
     t1 = $time;
     `SVTEST_CHECK((t1 - t0) == 30, "interface cycle delay (repeat @(cb)) wrong")
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

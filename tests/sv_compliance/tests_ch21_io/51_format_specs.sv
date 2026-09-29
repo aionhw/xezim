@@ -75,5 +75,6 @@ module test_format_specs;
     s = $sformatf("100%%");               check(s, "100%", "%%");
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

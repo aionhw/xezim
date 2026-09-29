@@ -31,5 +31,6 @@ module test_case_inside_ranges;
     `SVTEST_CHECK(out == 4, "case inside default failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

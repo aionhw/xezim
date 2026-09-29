@@ -24,5 +24,6 @@ module test_constraints_advanced;
     end
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

@@ -25,5 +25,6 @@ module test_preprocessor;
     `SVTEST_CHECK(`INCLUDED_CONSTANT == 99, "include file macro failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

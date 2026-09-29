@@ -25,5 +25,6 @@ module test_assignment_patterns;
     `SVTEST_CHECK(pkt_ordered.valid == 1'b0,    "ordered assignment pattern valid bit failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

@@ -29,5 +29,6 @@ module test_interfaces_modports;
     `SVTEST_CHECK(bus.gnt == 1'b1, "interface slave observe/respond failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

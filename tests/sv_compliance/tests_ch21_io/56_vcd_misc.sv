@@ -43,5 +43,6 @@ module test_vcd_misc;
 
     #1;
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

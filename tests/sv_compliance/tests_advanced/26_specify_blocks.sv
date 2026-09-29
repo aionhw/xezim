@@ -28,5 +28,6 @@ module test_specify_blocks;
 
     `SVTEST_CHECK(t_seen > t_drive, "specify path delay was not observed")
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

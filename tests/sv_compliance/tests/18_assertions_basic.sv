@@ -43,5 +43,6 @@ module test_assertions_basic;
 
     #0;
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

@@ -57,5 +57,6 @@ module test_clocking_audit;
     `SVTEST_CHECK(ev_hits >= 3 && last_seen >= 0, "@(cb.sig) event did not fire on samples")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

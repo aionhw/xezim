@@ -35,5 +35,6 @@ module test_assignments;
     `SVTEST_CHECK(q == 1'b1, "blocking assignment failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

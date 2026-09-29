@@ -17,5 +17,6 @@ module test_streaming_operators;
     `SVTEST_CHECK(right_stream == 32'h11223344, "right streaming operator failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

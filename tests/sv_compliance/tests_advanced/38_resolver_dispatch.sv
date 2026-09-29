@@ -155,5 +155,6 @@ module test_38_tier2_resolver_dispatch;
     `SVTEST_CHECK(dync === 1'b0,         "DYN t=5: [0,0] -> 0")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

@@ -96,5 +96,6 @@ module test_37_tier0_z_skip_resolution;
     `SVTEST_CHECK(drv_hi === 1'bz, "EN: drv_hi (enable=0) -> z")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

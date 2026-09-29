@@ -25,5 +25,6 @@ module test_clocking_negedge;
     `SVTEST_CHECK(s1 == 8'd0 && d1 == 8'd1, "negedge clocking wrong at first negedge")
     `SVTEST_CHECK(s2 == 8'd1 && d2 == 8'd2, "negedge clocking did not advance on negedge")
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

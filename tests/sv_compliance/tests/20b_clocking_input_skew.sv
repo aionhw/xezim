@@ -29,5 +29,6 @@ module test_clocking_input_skew;
     `SVTEST_CHECK(cb.data == 8'd3, "clocking input did not sample preponed (#1step) value")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

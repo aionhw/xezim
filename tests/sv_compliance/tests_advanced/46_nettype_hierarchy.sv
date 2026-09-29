@@ -137,5 +137,6 @@ module test_46_nettype_hierarchy;
                   "C: current-source contribution survives the port hops -> 0.01")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

@@ -38,6 +38,7 @@ module test_monitor;
 
     // Verify by checking the captured output
     `SVTEST_PASSFAIL
+    $finish;
   end
 
   // Collect stdout to verify monitor output

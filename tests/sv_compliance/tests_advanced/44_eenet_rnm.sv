@@ -119,5 +119,6 @@ module test_44_eenet_rnm;
                   "D: KCL over 3 loads -> total current = -40mA")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

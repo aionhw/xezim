@@ -36,5 +36,6 @@ module test_arrays;
     `SVTEST_CHECK(aa.exists("alpha") && aa["beta"] == 37, "associative array failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

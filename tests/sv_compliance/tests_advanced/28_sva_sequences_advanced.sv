@@ -53,5 +53,6 @@ module test_sva_sequences_advanced;
 
     #0;
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

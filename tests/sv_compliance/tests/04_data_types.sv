@@ -35,5 +35,6 @@ module test_data_types;
     `SVTEST_CHECK(rt > 3.0 && rt < 3.5, "realtime assignment failed")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule

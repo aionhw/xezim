@@ -168,5 +168,6 @@ module test_stochastic_queue;
     `SVTEST_CHECK(status == 2,            "undefined q_id -> status 2")
 
     `SVTEST_PASSFAIL
+    $finish;
   end
 endmodule
