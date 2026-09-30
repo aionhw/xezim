@@ -407,6 +407,8 @@ mod struct_prop_whole_copy;
 mod type_param_replication_localparam;
 #[path = "classes/typedef_receiver_static_task.rs"]
 mod typedef_receiver_static_task;
+#[path = "classes/vif_member_read_nested_receiver.rs"]
+mod vif_member_read_nested_receiver;
 #[path = "classes/vif_property_named_like_instance.rs"]
 mod vif_property_named_like_instance;
 #[path = "classes/vif_resource_db_shape.rs"]

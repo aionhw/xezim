@@ -67587,6 +67587,55 @@ impl Simulator {
                 return v.range_select((lsb + w - 1) as usize, lsb as usize);
             }
         }
+        // LRM §25.8: `<recv>.<vifprop>.<member>` VALUE read where `<recv>` is
+        // not a plain hierarchical name — a class handle held in a subroutine
+        // LOCAL, an instance property, or a nested chain. The name-based
+        // rewrites above only fire for receivers the parser kept as a single
+        // hierarchical identifier (module-scope dotted names); anything rooted
+        // at a local class handle parses as MemberAccess, fell through to the
+        // generic property read, and returned the binding-EXISTENCE sentinel
+        // instead of the interface. Consequence: a driver that received its
+        // `vif` through config_db/resource_db read x from every `vif.<sig>`
+        // access, so its handshake never completed and the testbench ran
+        // silently empty. Resolve the owning handle generally, then follow the
+        // binding recorded by the write path.
+        // Gate on the design declaring ANY virtual-interface property: without
+        // one there is nothing to resolve, and every member access would
+        // otherwise pay a receiver split (an Expression clone) plus a name
+        // lookup. Designs with no virtual interfaces skip the block outright.
+        if !self.class_member_names().vif_props.is_empty() {
+            let mut vif_pair: Option<(usize, String)> = None;
+            // Split WITHOUT evaluating: the receiver evaluation is only worth
+            // doing when the trailing member is a known vif property name.
+            if let Some((obj_expr, prop)) = Self::split_trailing_member(expr) {
+                let prop_is_vif = self.class_member_names().vif_props.contains(&prop);
+                if prop_is_vif {
+                    if let Some(h) = self.eval_expr(&obj_expr).to_u64() {
+                        vif_pair = Some((h as usize, prop));
+                    }
+                }
+            }
+            if let Some((recv_h, prop)) = vif_pair {
+                let is_vif = recv_h != 0
+                    && self
+                        .heap
+                        .get(recv_h)
+                        .and_then(|o| o.as_ref())
+                        .and_then(|i| self.module.classes.get(&i.class_name))
+                        .map(|c| c.virtual_iface_properties.contains_key(&prop))
+                        .unwrap_or(false);
+                if is_vif {
+                    if let Some((bound, _mp)) =
+                        self.virtual_iface_bindings.get(&(recv_h, prop)).cloned()
+                    {
+                        let resolved = format!("{}.{}", bound, member.name);
+                        if let Some(v) = self.lookup_signal_value(&resolved) {
+                            return v;
+                        }
+                    }
+                }
+            }
+        }
         let base = self.eval_expr(expr);
         let handle = base.to_u64().unwrap_or(0) as usize;
         // §8.9: a STATIC property is shared and instance-independent —
