@@ -102748,10 +102748,46 @@ impl Simulator {
                     _ => None,
                 })
         });
-        declared_tn
+        if declared_tn
             .as_deref()
             .and_then(|tn| self.resolve_typeref_class_name_str(tn))
             .is_some()
+        {
+            return true;
+        }
+        // Class-PROPERTY rung (§6.20.2/§8.25): a bare name that is a property
+        // of the enclosing class context is a class-object channel when the
+        // property's CONCRETE type is a class. `class_prop_type_named` passes
+        // a type-parameter name through (§6.20.3), so resolve it against the
+        // running method's instance bindings first: a property declared with a
+        // class TYPE PARAMETER (`class p #(type CFG = cfg_c); CFG a;`) named no
+        // class, so `a.member = v` failed this receiver gate, fell out of the
+        // MemberAccess lvalue arm, and the write was silently dropped.
+        if let Some(ctx) = self.class_context_stack.last().cloned().flatten()
+            && let Some(tn) = self.class_prop_type_named(&ctx, name)
+        {
+            let mut concrete = tn;
+            if let Some(h) = self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .filter(|&h| h != 0)
+            {
+                if let Some(bound) = self
+                    .heap
+                    .get(h)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|inst| inst.type_bindings.get(&concrete))
+                {
+                    concrete = bound.clone();
+                }
+            }
+            if self.resolve_typeref_class_name_str(&concrete).is_some() {
+                return true;
+            }
+        }
+        false
     }
 
     /// id-collision-in-heap guard, shared name-only segment ladder: do
