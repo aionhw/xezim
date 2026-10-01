@@ -112855,11 +112855,35 @@ impl Simulator {
                 let cd = self.module.classes.get(cname);
                 resolved_extends = cd.and_then(|cd| cd.extends.clone()).and_then(|e| {
                     if self.module.classes.contains_key(&e) {
-                        Some(e)
-                    } else {
-                        self.resolve_typeref_class_name_str(&e)
-                            .filter(|r| self.module.classes.contains_key(r))
+                        return Some(e);
                     }
+                    if let Some(r) = self
+                        .resolve_typeref_class_name_str(&e)
+                        .filter(|r| self.module.classes.contains_key(r))
+                    {
+                        return Some(r);
+                    }
+                    // §8.25: a base class given by a TYPE PARAMETER
+                    // (`class C #(type BASE = base_c) extends BASE;`). The
+                    // extends clause stores the parameter's NAME, which is no
+                    // class key, so every hierarchy walk — method lookup,
+                    // inherited property initialization, `super`, `$cast` —
+                    // stopped one hop early and the base was invisible. The
+                    // declaration's own specialization uses the parameter's
+                    // declared default (§6.20.2); a non-default binding is
+                    // resolved per instance from the object's `type_bindings`.
+                    let cdref = cd.as_ref()?;
+                    if !cdref.type_param_names.iter().any(|p| p == &e) {
+                        return None;
+                    }
+                    let default = cdref
+                        .type_param_defaults
+                        .iter()
+                        .find(|(n, _)| n == &e)
+                        .map(|(_, d)| d.trim().to_string())
+                        .filter(|d| !d.is_empty())?;
+                    self.resolve_typeref_class_name_str(&default)
+                        .filter(|r| self.module.classes.contains_key(r))
                 });
                 // When the `extends` alias is a TYPEDEF of a PARAMETERIZED
                 // class (`class D extends simple_lib` where
@@ -118146,6 +118170,72 @@ impl Simulator {
         false
     }
 
+    /// The parent class of `class_name`, resolving an `extends` clause that
+    /// names a TYPE PARAMETER (§8.25) through `bindings` when the caller has
+    /// a live specialization at hand.
+    fn class_parent_resolved(
+        &self,
+        class_name: &str,
+        bindings: Option<&HashMap<String, String>>,
+    ) -> Option<String> {
+        let bare = class_name.split('#').next().unwrap_or(class_name);
+        let cd = self
+            .module
+            .classes
+            .get(class_name)
+            .or_else(|| self.module.classes.get(bare))?;
+        let e = cd.extends.clone()?;
+        if self.module.classes.contains_key(&e) {
+            return Some(e);
+        }
+        let known = |n: &str| {
+            self.resolve_typeref_class_name_str(n)
+                .filter(|r| self.module.classes.contains_key(r))
+        };
+        if cd.type_param_names.iter().any(|p| p == &e) {
+            // The instance's own binding first (`wrap_c #(other_c)`), then the
+            // parameter's declared default (`class wrap_c #(type BASE = base_c)`).
+            if let Some(bound) = bindings.and_then(|b| b.get(&e)) {
+                if let Some(r) = known(bound) {
+                    return Some(r);
+                }
+            }
+            let default = cd
+                .type_param_defaults
+                .iter()
+                .find(|(n, _)| n == &e)
+                .map(|(_, d)| d.trim().to_string())
+                .filter(|d| !d.is_empty())?;
+            return known(&default);
+        }
+        known(&e)
+    }
+
+    /// `class_is_a` for a LIVE object: the hierarchy walk resolves a
+    /// type-parameter `extends` name through the object's own `type_bindings`
+    /// (§8.25) rather than only the declaration's default binding.
+    fn class_is_a_instance(&self, derived: &str, base: &str, handle: usize) -> bool {
+        let strip = |s: &str| s.split('#').next().unwrap_or(s).to_string();
+        let base = strip(base);
+        let inst = self.heap.get(handle).and_then(|o| o.as_ref());
+        let bindings = inst.map(|i| &i.type_bindings);
+        let mut cur = Some(self.typedef_unroll(derived));
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            if guard > 128 {
+                break;
+            }
+            if strip(&c) == base {
+                return true;
+            }
+            cur = self
+                .class_parent_resolved(&c, bindings)
+                .map(|e| self.typedef_unroll(&e));
+        }
+        false
+    }
+
     /// `$cast(dest, src)` dynamic type check: succeeds if `src`'s object class
     /// is assignment-compatible with `dest`'s declared class type. Permissive
     /// when types are unknown (null src, non-class handle, untracked dest type)
@@ -118230,7 +118320,7 @@ impl Simulator {
                 let resolved = base;
                 // Hierarchy check: the src instance must be `resolved` or a
                 // subclass of it, else the downcast must fail.
-                let is_a = self.class_is_a(&src_class, &resolved);
+                let is_a = self.class_is_a_instance(&src_class, &resolved, h);
                 if !is_a {
                     return false;
                 }
