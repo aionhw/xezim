@@ -134608,7 +134608,18 @@ impl Simulator {
     /// (`m[i]`, for an array that was also materialised there) is kept in step.
     /// A missing alias is never created — that would shadow an unrelated
     /// module-scope array of the same name.
-    fn write_coll_elem(&mut self, key: &str, val: Value) {
+    ///
+    /// §6.11: the element takes its declared type's signedness. The solvers
+    /// draw and repair values as bit patterns, so a negative pick of a signed
+    /// element (`rand int d[]`) otherwise read back as a large positive number.
+    fn write_coll_elem(&mut self, key: &str, mut val: Value) {
+        if let Some((h, bare)) = key.split_once('#')
+            && !val.is_real
+            && let Ok(handle) = h.parse::<usize>()
+        {
+            let prop = bare.split('[').next().unwrap_or(bare);
+            val.is_signed = self.class_prop_signed_of(handle, prop);
+        }
         self.signals.insert(key.to_string(), val.clone());
         if let Some((_h, bare)) = key.split_once('#') {
             if self.signal_name_to_id.contains_key(bare) {
@@ -138406,6 +138417,11 @@ impl Simulator {
             // (best-effort `unique{}`).
             for (prop, scoped, lo, hi, width, enum_t) in &rand_arrays {
                 let excluded = self.collect_array_exclusions(prop, &constraints);
+                // §6.11: the baseline carries the element type's signedness;
+                // every repair below keeps the drawn value's, so an unsigned
+                // baseline made a negative pick of a signed element read
+                // back as a large positive number.
+                let signed = self.class_prop_signed_of(handle, prop);
                 let pool: Vec<u64> = if let Some(et) = enum_t {
                     self.module
                         .enum_members
@@ -138440,11 +138456,12 @@ impl Simulator {
                     } else {
                         0
                     };
-                    let val = if !pool.is_empty() || *width <= 64 {
+                    let mut val = if !pool.is_empty() || *width <= 64 {
                         Value::from_u64(v, *width)
                     } else {
                         self.random_value_of_width(*width)
                     };
+                    val.is_signed = signed;
                     self.signals.insert(format!("{}[{}]", scoped, i), val);
                 }
             }
@@ -138456,6 +138473,7 @@ impl Simulator {
                 if shape.iter().any(|&(lo, hi)| hi < lo) {
                     continue;
                 }
+                let signed = self.class_prop_signed_of(handle, prop);
                 let mut idx: Vec<i64> = shape.iter().map(|d| d.0).collect();
                 loop {
                     let suffix: String = idx.iter().map(|i| format!("[{}]", i)).collect();
@@ -138470,11 +138488,12 @@ impl Simulator {
                         0
                     };
                     // Elements wider than 64 bits were left at zero.
-                    let val = if *width <= 64 {
+                    let mut val = if *width <= 64 {
                         Value::from_u64(v, *width)
                     } else {
                         self.random_value_of_width(*width)
                     };
+                    val.is_signed = signed;
                     self.signals.insert(format!("{}{}", scoped, suffix), val);
                     let mut k = shape.len();
                     loop {
@@ -141226,13 +141245,14 @@ impl Simulator {
                         let scoped_key = format!("{}#{}{}", handle, arr_name, suffix);
                         let elem_name = format!("{}{}", arr_name, suffix);
                         let saved = self.signals.get(&scoped_key).cloned();
+                        let signed = self.class_prop_signed_of(handle, &arr_name);
                         let mut ok = false;
                         // 24 draws: a satisfiable body (parity, bit tests)
                         // lands in a handful; an impossible one burns every
                         // draw for every pass of every trial, so the cap is
                         // what bounds the UNSAT give-up time.
                         for _ in 0..24 {
-                            let cand = if ranges.is_empty() {
+                            let mut cand = if ranges.is_empty() {
                                 let mask = if elem_w >= 64 {
                                     u64::MAX
                                 } else {
@@ -141248,6 +141268,7 @@ impl Simulator {
                                 };
                                 Value::from_u64(v as u64, elem_w)
                             };
+                            cand.is_signed = signed;
                             self.signals.insert(scoped_key.clone(), cand.clone());
                             self.set_signal_value_by_name(&elem_name, cand);
                             if self.item_holds(handle, body) {

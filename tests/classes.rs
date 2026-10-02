@@ -63,6 +63,8 @@ mod param_type_binding_resolves_enclosing_value_param;
 mod parameterized_class_scope;
 #[path = "classes/pure_constraint_implemented.rs"]
 mod pure_constraint_implemented;
+#[path = "classes/rand_array_elem_signedness.rs"]
+mod rand_array_elem_signedness;
 #[path = "classes/rand_obj_array_elem_constraints.rs"]
 mod rand_obj_array_elem_constraints;
 #[path = "classes/randomize_args_name_object_members.rs"]
