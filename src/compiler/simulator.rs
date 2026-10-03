@@ -6019,6 +6019,11 @@ pub struct Simulator {
     /// item in hand (an `unique {a, arr[0]}` re-pick used to blow `a inside
     /// {[1:10]}` wide open). Rebuilt at the top of every solver trial.
     rand_ranges: HashMap<String, Vec<(i128, i128)>>,
+    /// The same for the ELEMENTS of each rand array / collection property:
+    /// the hard `inside` domain its elements are constrained to (signed,
+    /// exact). Refreshed at the top of every repair pass, so a conditional
+    /// domain follows the current values of its condition.
+    rand_elem_ranges: HashMap<String, Vec<(i128, i128)>>,
     /// Static class properties — one shared cell per `Class::prop`,
     /// keyed `"ClassName::propname"` where ClassName is the class that
     /// declared the static property.
@@ -11395,6 +11400,7 @@ impl Simulator {
             locator_iter: "item".to_string(),
             dist_picked_once: HashSet::default(),
             rand_ranges: HashMap::default(),
+            rand_elem_ranges: HashMap::default(),
             class_statics: StaticMap::default(),
             local_type_stack: Vec::new(),
             current_spec: None,
@@ -137460,6 +137466,18 @@ impl Simulator {
         self.rand_tight_mode = false;
         // Per rand sub-object member: the items pushed into its solve.
         let mut pushdown: HashMap<String, Vec<ConstraintItem>> = HashMap::default();
+        // §18.5.14: a soft item that kept rewriting a value another item set
+        // back, in a trial that then failed, conflicts with a hard item; it is
+        // discarded for the remaining trials (keyed by the item's address).
+        let mut soft_dropped: HashSet<usize> = HashSet::default();
+        // The rand array / collection members whose element domain a `!=`
+        // re-pick must respect (see `rand_elem_ranges`).
+        let elem_range_props: Vec<String> = rand_arrays
+            .iter()
+            .map(|a| a.0.clone())
+            .chain(rand_nd_arrays.iter().map(|a| a.0.clone()))
+            .chain(rand_colls.iter().map(|c| c.prop.clone()))
+            .collect();
         for _trial in 0..trials {
             // Ctrl-C / SIGTERM: stop searching and let the run shut down.
             if interrupt_requested() {
@@ -138281,21 +138299,6 @@ impl Simulator {
                 .chain(rand_obj_props.iter().cloned())
                 .chain(unpacked_agg_props.iter().map(|(p, _)| p.clone()))
                 .collect();
-            // LRM §18.5.14: a `soft` constraint is overridden by any
-            // hard constraint on the same variable. Collect the set of
-            // variables targeted by HARD (non-soft) constraint items so
-            // soft items on those variables can be skipped during the
-            // fixpoint pass.
-            let mut hard_target_vars: HashSet<String> = HashSet::default();
-            for con in &constraints {
-                for item in &con.items {
-                    if !matches!(item, ConstraintItem::Soft(_)) {
-                        if let Some(v) = Self::constraint_item_target(item) {
-                            hard_target_vars.insert(v);
-                        }
-                    }
-                }
-            }
             // LRM §18.5.14.2/§18.5.14.3: soft constraints have a PRIORITY
             // order, and a higher-priority soft constraint DISCARDS a
             // conflicting lower-priority one instead of failing the solve.
@@ -138313,7 +138316,9 @@ impl Simulator {
             let mut soft_rank: HashMap<String, (usize, usize, usize)> = HashMap::default();
             for (bi, con) in constraints.iter().enumerate() {
                 for (ii, item) in con.items.iter().enumerate() {
-                    if !matches!(item, ConstraintItem::Soft(_)) {
+                    if !matches!(item, ConstraintItem::Soft(_))
+                        || soft_dropped.contains(&(item as *const ConstraintItem as usize))
+                    {
                         continue;
                     }
                     let v = match Self::constraint_item_target(item) {
@@ -138334,18 +138339,24 @@ impl Simulator {
                     }
                 }
             }
+            // Passes in which each soft item changed a value, per repair loop.
+            let mut soft_fights: HashMap<usize, u32> = HashMap::default();
             for _pass in 0..16 {
+                self.refresh_elem_ranges(&elem_range_props, &constraints);
                 let mut changed = false;
                 for (bi, con) in constraints.iter().enumerate() {
                     for (ii, item) in con.items.iter().enumerate() {
-                        // Skip a soft constraint whose target variable is
-                        // pinned by a hard constraint (the hard one wins),
-                        // or that lost the soft-priority contest above.
+                        let key = item as *const ConstraintItem as usize;
+                        let is_soft = Self::soft_only(item);
+                        if is_soft && soft_dropped.contains(&key) {
+                            continue;
+                        }
+                        // Skip a soft constraint that lost the soft-priority
+                        // contest above. One that conflicts with a hard item
+                        // is found by the repair itself and discarded
+                        // (`soft_dropped`); a compatible one must hold.
                         if let ConstraintItem::Soft(_) = item {
                             if let Some(v) = Self::constraint_item_target(item) {
-                                if hard_target_vars.contains(&v) {
-                                    continue;
-                                }
                                 if soft_winner
                                     .get(&v)
                                     .is_some_and(|&(wb, wi)| wb != bi || wi != ii)
@@ -138356,6 +138367,9 @@ impl Simulator {
                         }
                         if self.solve_forced(handle, item, &rand_set) {
                             changed = true;
+                            if is_soft {
+                                *soft_fights.entry(key).or_default() += 1;
+                            }
                         }
                     }
                 }
@@ -138552,7 +138566,9 @@ impl Simulator {
                         _ => false,
                     }
                 }
+                let mut fights: HashMap<usize, u32> = HashMap::default();
                 for _pass in 0..4 {
+                    self.refresh_elem_ranges(&elem_range_props, &constraints);
                     let mut changed = false;
                     for item in constraints
                         .iter()
@@ -138560,13 +138576,25 @@ impl Simulator {
                         .chain(inline.iter())
                         .filter(|it| !matches!(it, ConstraintItem::Soft(_)) || has_foreach(it))
                     {
+                        let key = item as *const ConstraintItem as usize;
+                        let is_soft = Self::soft_only(item);
+                        if is_soft && soft_dropped.contains(&key) {
+                            continue;
+                        }
                         if self.solve_forced(handle, item, &rand_set) {
                             changed = true;
+                            if is_soft {
+                                *fights.entry(key).or_default() += 1;
+                            }
                         }
                     }
                     if !changed {
                         break;
                     }
+                }
+                for (k, n) in fights {
+                    let e = soft_fights.entry(k).or_default();
+                    *e = (*e).max(n);
                 }
             }
             let mut pinned_elems: HashSet<String> = HashSet::default();
@@ -138669,6 +138697,19 @@ impl Simulator {
                 self.rand_items_accept(handle, &constraints, &rand_colls, &mut fe_failed);
             if fe_failed {
                 fixed_fe_fail_streak += 1;
+            }
+            // A soft item that changed a value in two passes of one repair
+            // loop was undone in between: it fights a hard item (§18.5.14).
+            // Discard it and retry even an accepted trial, so a lower-priority
+            // soft item on the same variable gets its turn.
+            let fought: Vec<usize> = soft_fights
+                .iter()
+                .filter(|&(k, &n)| n >= 2 && !soft_dropped.contains(k))
+                .map(|(&k, _)| k)
+                .collect();
+            if !fought.is_empty() {
+                soft_dropped.extend(fought);
+                all_ok = false;
             }
 
             // §18.4 concurrent solve: a `rand` object handle's OWN constraints
@@ -138867,8 +138908,12 @@ impl Simulator {
         rand_colls: &[RandColl],
         fe_failed: &mut bool,
     ) -> bool {
+        // §18.5.14: a soft item (or a foreach / block of them) is a
+        // preference, never a reason to reject a trial.
+        if Self::soft_only(item) {
+            return true;
+        }
         match item {
-            ConstraintItem::Soft(_) => return true,
             ConstraintItem::Block(items) => {
                 return items
                     .iter()
@@ -141003,6 +141048,31 @@ impl Simulator {
                             .unwrap_or(8)
                             .max(1);
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                        // §18.5.12: re-pick inside the element's hard domain,
+                        // or the `inside` item and this one undo each other.
+                        let prop = key
+                            .split_once('#')
+                            .map_or(key.as_str(), |(_, b)| b)
+                            .split('[')
+                            .next()
+                            .unwrap_or("");
+                        let domain = self.rand_elem_ranges.get(prop).cloned().unwrap_or_default();
+                        if !domain.is_empty() {
+                            for _try in 0..32 {
+                                let (lo, hi) = domain[self.cur_rng().gen_range(0..domain.len())];
+                                let v = if hi > lo {
+                                    self.cur_rng().gen_range(lo..=hi)
+                                } else {
+                                    lo
+                                };
+                                let cand = (v as u64) & mask;
+                                if cand != avoid & mask {
+                                    self.write_coll_elem(&key, Value::from_u64(cand, w));
+                                    return true;
+                                }
+                            }
+                            continue;
+                        }
                         for _try in 0..32 {
                             let cand = self.cur_rng().r#gen::<u64>() & mask;
                             if cand != avoid {
@@ -141203,6 +141273,13 @@ impl Simulator {
                 item: body,
                 ..
             } => {
+                // `foreach (arr[i]) soft …`: the caller already decided this
+                // soft item applies (`soft_dropped`, §18.5.14), so repair its
+                // body like a hard one.
+                let body = match body.as_ref() {
+                    ConstraintItem::Soft(inner) => inner,
+                    _ => body,
+                };
                 // Resolve the array's bare property name (`arr[i]` → "arr").
                 let arr_name = match &array.kind {
                     ExprKind::Index { expr: b, .. } => {
@@ -141639,9 +141716,20 @@ impl Simulator {
                             use rand::Rng;
                             let b = self.eval_expr(bound_side).to_i64().unwrap_or(0);
                             let cur_i = cur.and_then(|v| v.to_i64()).unwrap_or(0);
-                            // Unsigned element domain [0, 2^w - 1].
-                            let (mut lo, mut hi) =
-                                (0i64, if w >= 63 { i64::MAX } else { (1i64 << w) - 1 });
+                            // The element type's domain (§6.11): [0, 2^w - 1],
+                            // or [-2^(w-1), 2^(w-1) - 1] for a signed element —
+                            // an unsigned one rejected every negative value
+                            // (`q[i] >= -1` re-picked a legal -1 to >= 0).
+                            let signed = self.class_prop_signed_of(handle, arr_name);
+                            let (mut lo, mut hi) = if signed {
+                                if w >= 64 {
+                                    (i64::MIN, i64::MAX)
+                                } else {
+                                    (-(1i64 << (w - 1)), (1i64 << (w - 1)) - 1)
+                                }
+                            } else {
+                                (0i64, if w >= 63 { i64::MAX } else { (1i64 << w) - 1 })
+                            };
                             match eff {
                                 BinaryOp::Lt => hi = hi.min(b.saturating_sub(1)),
                                 BinaryOp::Leq => hi = hi.min(b),
@@ -141696,7 +141784,9 @@ impl Simulator {
                             if p == cur_i {
                                 return false;
                             }
-                            write_elem(self, Value::from_u64(p as u64, w));
+                            let mut v = Value::from_u64(p as u64, w);
+                            v.is_signed = signed;
+                            write_elem(self, v);
                             true
                         }
                         _ => false,
@@ -141988,6 +142078,126 @@ impl Simulator {
     /// whether a `soft` constraint is overridden by a hard
     /// constraint on the same variable. Returns None for
     /// multi-variable / structural items.
+    /// Rebuild `rand_elem_ranges` for `props` against the current values.
+    fn refresh_elem_ranges(&mut self, props: &[String], constraints: &[ClassConstraint]) {
+        self.rand_elem_ranges.clear();
+        for p in props {
+            let mut out = Vec::new();
+            for con in constraints {
+                for it in &con.items {
+                    self.collect_elem_domain(it, p, &mut out);
+                }
+            }
+            if !out.is_empty() {
+                self.rand_elem_ranges.insert(p.clone(), out);
+            }
+        }
+    }
+
+    /// The hard `inside` ranges `item` puts on the elements of `prop`
+    /// (`prop[i] inside {…}`, under a `foreach` over it, a block, or the
+    /// branch of a conditional that holds now). Soft items set no domain.
+    fn collect_elem_domain(
+        &mut self,
+        item: &ConstraintItem,
+        prop: &str,
+        out: &mut Vec<(i128, i128)>,
+    ) {
+        let on_elem = |e: &Expression| {
+            matches!(&e.kind, ExprKind::Index { expr: b, .. }
+                if matches!(&b.kind, ExprKind::Ident(h)
+                    if h.path.len() == 1 && h.path[0].name.name == prop))
+        };
+        let mut ranges = |me: &mut Self, rs: &[ConstraintRange]| {
+            for r in rs {
+                let (lo, hi) = match r {
+                    ConstraintRange::Value(e) => (e, e),
+                    ConstraintRange::Range { lo, hi } => (lo, hi),
+                };
+                let to_i = |v: Value| {
+                    if v.is_signed {
+                        v.to_i64().map(i128::from)
+                    } else {
+                        v.to_u64().map(i128::from)
+                    }
+                };
+                if let (Some(l), Some(h)) = (to_i(me.eval_expr(lo)), to_i(me.eval_expr(hi))) {
+                    out.push((l.min(h), l.max(h)));
+                }
+            }
+        };
+        match item {
+            ConstraintItem::Expr(e) => {
+                if let ExprKind::Inside {
+                    expr: inner,
+                    ranges: rs,
+                } = &e.kind
+                    && on_elem(inner)
+                {
+                    let cr: Vec<ConstraintRange> = rs
+                        .iter()
+                        .map(|r| match &r.kind {
+                            ExprKind::Range(lo, hi) => ConstraintRange::Range {
+                                lo: (**lo).clone(),
+                                hi: (**hi).clone(),
+                            },
+                            _ => ConstraintRange::Value(r.clone()),
+                        })
+                        .collect();
+                    ranges(self, &cr);
+                }
+            }
+            ConstraintItem::Inside {
+                expr,
+                range,
+                is_dist,
+                ..
+            } if !*is_dist && on_elem(expr) => ranges(self, range),
+            ConstraintItem::Block(items) => {
+                for i in items {
+                    self.collect_elem_domain(i, prop, out);
+                }
+            }
+            ConstraintItem::Foreach {
+                array, item: body, ..
+            } if Self::foreach_base_name(array).as_deref() == Some(prop) => {
+                self.collect_elem_domain(body, prop, out);
+            }
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                if self.eval_expr(condition).is_true() {
+                    self.collect_elem_domain(then_item, prop, out);
+                } else if let Some(e) = else_item {
+                    self.collect_elem_domain(e, prop, out);
+                }
+            }
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            } if self.eval_expr(condition).is_true() => {
+                self.collect_elem_domain(constraint, prop, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// A constraint item made only of soft constraints: `soft …`, or a
+    /// `foreach` / block whose every item is one (`foreach (q[i]) soft q[i]
+    /// == -1;`).
+    fn soft_only(item: &ConstraintItem) -> bool {
+        match item {
+            ConstraintItem::Soft(_) => true,
+            ConstraintItem::Foreach { item, .. } => Self::soft_only(item),
+            ConstraintItem::Block(items) => !items.is_empty() && items.iter().all(Self::soft_only),
+            _ => false,
+        }
+    }
+
     fn constraint_item_target(item: &ConstraintItem) -> Option<String> {
         fn ident_of(e: &Expression) -> Option<String> {
             match &e.kind {

@@ -473,6 +473,8 @@ mod receiver_call_evaluated_once;
 mod ref_formal_shadows_property;
 #[path = "classes/soft_constraint_compatibility.rs"]
 mod soft_constraint_compatibility;
+#[path = "classes/soft_constraint_matrix.rs"]
+mod soft_constraint_matrix;
 #[path = "classes/sqr_zero_time_loop.rs"]
 mod sqr_zero_time_loop;
 #[path = "classes/static_assoc_struct_pool.rs"]
