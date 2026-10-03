@@ -336,6 +336,24 @@ mod typedef_extends_cast;
 mod typedef_param_base_inherits_spec_arg;
 #[path = "classes/typename_param_class.rs"]
 mod typename_param_class;
+#[path = "classes/nba_region_event_same_slot.rs"]
+mod nba_region_event_same_slot;
+
+#[path = "classes/factory_vif_type_param_specialization.rs"]
+mod factory_vif_type_param_specialization;
+
+#[path = "classes/type_param_member_resolves_to_own_spec.rs"]
+mod type_param_member_resolves_to_own_spec;
+
+#[path = "classes/process_kill_via_member_handle.rs"]
+mod process_kill_via_member_handle;
+
+#[path = "classes/sibling_type_param_default_cast.rs"]
+mod sibling_type_param_default_cast;
+#[path = "classes/queue_eq_construction_path.rs"]
+mod queue_eq_construction_path;
+#[path = "classes/queue_elem_receiver_splice.rs"]
+mod queue_elem_receiver_splice;
 #[path = "classes/unpacked_struct_class_property_whole_value.rs"]
 mod unpacked_struct_class_property_whole_value;
 #[path = "classes/uvm_config_db_tests.rs"]
@@ -352,6 +370,8 @@ mod uvm_integration_tests;
 mod uvm_objection_bridge;
 #[path = "classes/uvm_printer_fixes.rs"]
 mod uvm_printer_fixes;
+#[path = "classes/uvm_resource_db_raw_type_roundtrip.rs"]
+mod uvm_resource_db_raw_type_roundtrip;
 #[path = "classes/virtual_iface_this_binding.rs"]
 mod virtual_iface_this_binding;
 
