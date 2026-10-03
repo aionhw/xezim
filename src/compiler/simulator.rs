@@ -68367,6 +68367,19 @@ impl Simulator {
                         .max(1);
                         return Value::from_u64(w as u64, 32);
                     }
+                    // §8.23/§20.6.2: `$bits(pkg::cls::td)` — a `::`-chained
+                    // scoped TYPE name parses as nested member accesses, not
+                    // an Ident. Resolve it against the typedef tables by its
+                    // FULL qualified key (no suffix fallback: `$bits(s.m)` on
+                    // a real struct member must keep falling through to the
+                    // member paths below).
+                    if matches!(&arg.kind, ExprKind::MemberAccess { .. }) {
+                        if let Some(key) = Self::expr_scoped_chain_key(arg) {
+                            if let Some(&w) = self.module.typedefs.get(&key) {
+                                return Value::from_u64(w as u64, 32);
+                            }
+                        }
+                    }
                     if let ExprKind::Ident(hier) = &arg.kind {
                         let name = self.resolve_hier_name(hier);
                         // A bare TYPE PARAMETER of the enclosing class
@@ -68377,7 +68390,7 @@ impl Simulator {
                         if let Some(leaf) = hier.path.last().map(|s| s.name.name.clone()) {
                             let as_ty = crate::ast::types::DataType::TypeReference {
                                 name: crate::ast::types::TypeName {
-                                    scope: None,
+                                    scopes: Vec::new(),
                                     name: crate::ast::Identifier {
                                         name: leaf,
                                         span: arg.span,
@@ -80687,9 +80700,9 @@ impl Simulator {
                                 // scalar, so a later `ref` call saw
                                 // no collection to write back to.
                                 let start = name
-                                    .scope
-                                    .as_ref()
-                                    .map(|s| s.name.clone())
+                                    .scopes
+                                    .first()
+                                    .map(|s| s.name.name.clone())
                                     .or_else(|| self.class_context_stack.last().cloned().flatten())
                                     .or_else(|| {
                                         self.this_stack.last().copied().flatten().and_then(|h| {
@@ -94434,7 +94447,7 @@ impl Simulator {
     /// Resolve a class name / typedef / specialization string to a class name.
     fn resolve_typeref_class_name_str(&self, s: &str) -> Option<String> {
         let tnname = crate::ast::types::TypeName {
-            scope: None,
+            scopes: Vec::new(),
             name: crate::ast::Identifier {
                 name: s.to_string(),
                 span: crate::ast::Span::dummy(),
@@ -97951,7 +97964,12 @@ impl Simulator {
             Some(Some(c)) => c.as_str(),
             _ => "",
         };
-        let scope_key: &str = tref.scope.as_ref().map(|s| s.name.as_str()).unwrap_or("");
+        let scope_key_owned = if tref.scopes.is_empty() {
+            String::new()
+        } else {
+            tref.scope_prefix()
+        };
+        let scope_key: &str = &scope_key_owned;
         // A specialization's own class entry (`wrap_c<derived_c>`) is no
         // name any source can spell, so making one does not stale an entry.
         let ncls = self.module.classes.len() - self.spec_clone_origin.len();
@@ -98000,9 +98018,12 @@ impl Simulator {
         }
         // Find the typedef's target DataType.
         let mut target: Option<DataType> = None;
-        if let Some(scope) = &tref.scope {
-            if let Some(cls) = self.module.classes.get(&scope.name) {
+        for link in tref.scopes.iter().rev() {
+            if let Some(cls) = self.module.classes.get(&link.name.name) {
                 target = cls.typedef_targets.get(nm).cloned();
+                if target.is_some() {
+                    break;
+                }
             }
         }
         // A bare class-local typedef referenced inside a method (e.g.
@@ -98452,7 +98473,7 @@ impl Simulator {
                 // Resolve a type/class alias (e.g. `this_type`) to the
                 // concrete class name in the enclosing context.
                 let synth = crate::ast::types::TypeName {
-                    scope: None,
+                    scopes: Vec::new(),
                     name: crate::ast::Identifier {
                         name: nm.clone(),
                         span: crate::ast::Span::dummy(),
@@ -98600,7 +98621,7 @@ impl Simulator {
                 return None;
             }
             let synth = crate::ast::types::TypeName {
-                scope: None,
+                scopes: Vec::new(),
                 name: crate::ast::Identifier {
                     name: tn.name.name.clone(),
                     span: crate::ast::Span::dummy(),
@@ -98635,7 +98656,7 @@ impl Simulator {
                 return None;
             }
             let synth = crate::ast::types::TypeName {
-                scope: None,
+                scopes: Vec::new(),
                 name: crate::ast::Identifier {
                     name: tn.name.name.clone(),
                     span: crate::ast::Span::dummy(),
@@ -98692,7 +98713,7 @@ impl Simulator {
                 base
             } else {
                 let synth = crate::ast::types::TypeName {
-                    scope: None,
+                    scopes: Vec::new(),
                     name: crate::ast::Identifier {
                         name: base.clone(),
                         span: crate::ast::Span::dummy(),
@@ -125543,31 +125564,71 @@ impl Simulator {
         Value::from_u64(f.round() as i64 as u64, width.max(1))
     }
 
-    /// The table key of a parser-lowered named cast's target (`T'(v)`,
-    /// `pkg::T'(v)`). A package-scoped name prefers its qualified `pkg::T`
-    /// registration, so a same-named module-local typedef cannot capture it.
-    fn named_cast_key(&self, e: &Expression) -> Option<String> {
-        match &e.kind {
-            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
-            ExprKind::MemberAccess { expr, member } => {
-                let ExprKind::Ident(h) = &expr.kind else {
-                    return None;
-                };
-                let key = format!("{}::{}", h.path.last()?.name.name, member.name);
-                let m = &self.module;
-                Some(
-                    if m.typedef_types.contains_key(&key)
-                        || m.typedefs.contains_key(&key)
-                        || m.parameters.contains_key(&key)
-                    {
-                        key
-                    } else {
-                        member.name.clone()
-                    },
-                )
+    /// The full `a::b::c` join of a pure `::`-chain expression (nested
+    /// member accesses rooted at a plain identifier), or `None` when the
+    /// expression is not a pure name chain. Unlike
+    /// [`Self::named_cast_key`] there is NO suffix fallback — used where a
+    /// partial match would capture a same-named local.
+    fn expr_scoped_chain_key(e: &Expression) -> Option<String> {
+        let mut links: Vec<String> = Vec::new();
+        let mut cur = e;
+        for _ in 0..16 {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    links.push(member.name.clone());
+                    cur = expr;
+                }
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    links.push(h.path[0].name.name.clone());
+                    links.reverse();
+                    return Some(links.join("::"));
+                }
+                _ => return None,
             }
-            _ => None,
         }
+        None
+    }
+
+    /// The table key of a parser-lowered named cast's target (`T'(v)`,
+    /// `pkg::T'(v)`, `pkg::cls::T'(v)`). A scoped name prefers its
+    /// qualified registration (`pkg::T`, `pkg::cls::T`), so a same-named
+    /// module-local typedef cannot capture it; a `::`-chained scope
+    /// (§8.23) parses as nested member accesses and is joined the same
+    /// way, trying the longest chain first and falling back to shorter
+    /// suffixes then the bare leaf.
+    fn named_cast_key(&self, e: &Expression) -> Option<String> {
+        // Flatten the (possibly nested) member-access chain into
+        // [root, link..., leaf].
+        let mut links: Vec<String> = Vec::new();
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    links.push(member.name.clone());
+                    cur = expr;
+                }
+                ExprKind::Ident(h) => {
+                    links.push(h.path.last()?.name.name.clone());
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        links.reverse();
+        let m = &self.module;
+        // Try the longest join first (`pkg::cls::T`), then shorter
+        // suffixes (`cls::T`), then the bare leaf — the old single-link
+        // behavior is the len==2 case.
+        for start in 0..links.len() {
+            let key = links[start..].join("::");
+            if m.typedef_types.contains_key(&key)
+                || m.typedefs.contains_key(&key)
+                || m.parameters.contains_key(&key)
+            {
+                return Some(key);
+            }
+        }
+        links.last().cloned()
     }
 
     /// The `1` that `++`/`--` add to or subtract from `v`, carrying `v`'s
@@ -125738,7 +125799,7 @@ impl Simulator {
         else {
             return None;
         };
-        if !dimensions.is_empty() || name.scope.is_some() {
+        if !dimensions.is_empty() || name.has_scope() {
             return None;
         }
         let mut cell = self.plain_class_types.borrow_mut();
@@ -128571,7 +128632,7 @@ impl Simulator {
                 },
             ) => {
                 n1.name.name == n2.name.name
-                    && n1.scope.as_ref().map(|s| &s.name) == n2.scope.as_ref().map(|s| &s.name)
+                    && n1.qualified() == n2.qualified()
                     && d1.is_empty()
                     && d2.is_empty()
                     && t1.is_empty()
@@ -139416,7 +139477,7 @@ impl Simulator {
         else {
             return None;
         };
-        if !dimensions.is_empty() || !type_args.is_empty() || name.scope.is_some() {
+        if !dimensions.is_empty() || !type_args.is_empty() || name.has_scope() {
             return None;
         }
         let tn = name.name.name.as_str();
@@ -139617,7 +139678,7 @@ impl Simulator {
             else {
                 break;
             };
-            if !dimensions.is_empty() || !type_args.is_empty() || name.scope.is_some() {
+            if !dimensions.is_empty() || !type_args.is_empty() || name.has_scope() {
                 break;
             }
             let tn = name.name.name.as_str();
@@ -147343,7 +147404,7 @@ impl Simulator {
                         // matched none of the cases above, returned None, and
                         // `new()` fell through to a wrong/empty construction.
                         let tn = crate::ast::types::TypeName {
-                            scope: None,
+                            scopes: Vec::new(),
                             name: crate::ast::Identifier {
                                 name: t.clone(),
                                 span: crate::ast::Span::dummy(),

@@ -526,7 +526,7 @@ impl<'a> Ck<'a> {
                     return Ty::Unknown;
                 }
                 let n = name.name.name.as_str();
-                if let Some(scope) = &name.scope {
+                if let Some(scope) = name.single_scope() {
                     return self
                         .env
                         .packages
@@ -614,7 +614,7 @@ impl<'a> Ck<'a> {
                 dimensions,
                 type_args,
                 ..
-            } if name.scope.is_none() && type_args.is_empty() => {
+            } if name.scopes.is_empty() && type_args.is_empty() => {
                 match self.lookup_base(&name.name.name)? {
                     BaseKind::Atom if !dimensions.is_empty() => {
                         BaseKind::Illegal("an integer atom type with a packed dimension")
@@ -660,7 +660,7 @@ impl<'a> Ck<'a> {
                 dimensions,
                 type_args,
                 ..
-            } if name.scope.is_none() && type_args.is_empty() => {
+            } if name.scopes.is_empty() && type_args.is_empty() => {
                 match self.lookup_base(&name.name.name) {
                     Some(BaseKind::Atom) if !dimensions.is_empty() => {
                         Some("an integer atom type with a packed dimension")
@@ -894,11 +894,11 @@ impl<'a> Ck<'a> {
                             .insert(n.name.clone(), Ty::int(Some(32), true, false));
                     }
                 }
-                ModuleItem::FunctionDeclaration(f) if f.name.scope.is_none() => {
+                ModuleItem::FunctionDeclaration(f) if f.name.scopes.is_empty() => {
                     let s = self.sig_of_function(f);
                     self.top().subs.insert(f.name.name.name.clone(), Some(s));
                 }
-                ModuleItem::TaskDeclaration(t) if t.name.scope.is_none() => {
+                ModuleItem::TaskDeclaration(t) if t.name.scopes.is_empty() => {
                     let s = self.sig_of_task(t);
                     self.top().subs.insert(t.name.name.name.clone(), Some(s));
                 }
@@ -2455,10 +2455,10 @@ impl<'a> Ck<'a> {
                 ModuleItem::AlwaysConstruct(a) => self.walk_stmt(&a.stmt),
                 ModuleItem::InitialConstruct(i) => self.walk_stmt(&i.stmt),
                 ModuleItem::FinalConstruct(f) => self.walk_stmt(&f.stmt),
-                ModuleItem::FunctionDeclaration(f) if f.name.scope.is_none() => {
+                ModuleItem::FunctionDeclaration(f) if f.name.scopes.is_empty() => {
                     self.walk_function(f)
                 }
-                ModuleItem::TaskDeclaration(t) if t.name.scope.is_none() => self.walk_task(t),
+                ModuleItem::TaskDeclaration(t) if t.name.scopes.is_empty() => self.walk_task(t),
                 ModuleItem::ClassDeclaration(c) => self.walk_class(c),
                 ModuleItem::GenerateRegion(g) => self.walk_block(&g.items, None),
                 ModuleItem::GenerateIf(g) => {
@@ -2863,8 +2863,8 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 declare_package_items(&mut ck, &p.items);
                 for it in &p.items {
                     match it {
-                        PackageItem::Function(f) if f.name.scope.is_none() => ck.walk_function(f),
-                        PackageItem::Task(t) if t.name.scope.is_none() => ck.walk_task(t),
+                        PackageItem::Function(f) if f.name.scopes.is_empty() => ck.walk_function(f),
+                        PackageItem::Task(t) if t.name.scopes.is_empty() => ck.walk_task(t),
                         PackageItem::Class(c) => ck.walk_class(c),
                         _ => {}
                     }
@@ -2899,11 +2899,11 @@ fn declare_package_items(ck: &mut Ck<'_>, items: &[PackageItem]) {
                     ck.declare_value(&dc.name.name, vt);
                 }
             }
-            PackageItem::Function(f) if f.name.scope.is_none() => {
+            PackageItem::Function(f) if f.name.scopes.is_empty() => {
                 let s = ck.sig_of_function(f);
                 ck.top().subs.insert(f.name.name.name.clone(), Some(s));
             }
-            PackageItem::Task(t) if t.name.scope.is_none() => {
+            PackageItem::Task(t) if t.name.scopes.is_empty() => {
                 let s = ck.sig_of_task(t);
                 ck.top().subs.insert(t.name.name.name.clone(), Some(s));
             }

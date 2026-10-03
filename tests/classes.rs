@@ -459,6 +459,8 @@ mod named_base_forward_matrix;
 mod nopack_member_array;
 #[path = "classes/package_class_nested_class.rs"]
 mod package_class_nested_class;
+#[path = "classes/pkg_class_scope_types.rs"]
+mod pkg_class_scope_types;
 #[path = "classes/parked_task_local_vif_alias.rs"]
 mod parked_task_local_vif_alias;
 #[path = "classes/rand_collection_element_signedness.rs"]

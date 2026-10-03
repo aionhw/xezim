@@ -1517,7 +1517,7 @@ fn check_typedef(
     check_enum_type(&t.data_type, elab, errs);
     if let DataType::TypeReference { name, .. } = &t.data_type {
         // package-qualified (`pkg::T`) — out of scope for this conservative check
-        if name.scope.is_some() {
+        if name.has_scope() {
             return;
         }
         let n = &name.name.name;
@@ -2649,7 +2649,7 @@ fn check_pattern_counts(
         let dt = match &d.data_type {
             DataType::TypeReference {
                 name, dimensions, ..
-            } if name.scope.is_none() && dimensions.is_empty() => match typedef(&name.name.name) {
+            } if name.scopes.is_empty() && dimensions.is_empty() => match typedef(&name.name.name) {
                 Some(t) => t,
                 None => continue,
             },
@@ -3057,7 +3057,7 @@ fn check_subroutine_port_types(
                 continue;
             };
             let n = &name.name.name;
-            if name.scope.is_some() || n.is_empty() || is_builtin_type(n) {
+            if name.has_scope() || n.is_empty() || is_builtin_type(n) {
                 continue;
             }
             let known = local_types.contains(n)
@@ -3441,7 +3441,7 @@ fn check_wildcard_import_conflicts(
     for it in items {
         if let ModuleItem::DataDeclaration(d) = it
             && let DataType::TypeReference { name, .. } = &d.data_type
-            && name.scope.is_none()
+            && name.scopes.is_empty()
             && ambiguous(&name.name.name)
         {
             hits.push(name.name.name.clone());

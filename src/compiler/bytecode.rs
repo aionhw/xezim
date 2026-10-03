@@ -5763,7 +5763,7 @@ impl<'a> BytecodeCompiler<'a> {
             ..
         } = dt
         {
-            if dimensions.is_empty() && tn.scope.is_none() {
+            if dimensions.is_empty() && tn.scopes.is_empty() {
                 let bare = tn.name.name.as_str();
                 if let Some(t) = self.typedefs {
                     if !t.contains_key(bare) {

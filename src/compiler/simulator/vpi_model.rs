@@ -1958,7 +1958,7 @@ impl<'a> Builder<'a> {
                 // `[N]` with a constant name parses as associative.
                 if let Some(dt) = data_type {
                     if let DataType::TypeReference { name, .. } = dt.as_ref() {
-                        if name.scope.is_none() {
+                        if name.scopes.is_empty() {
                             if let Some(n) =
                                 ctx.params.get(&name.name.name).and_then(|v| v.to_i64())
                             {
@@ -2126,9 +2126,10 @@ impl<'a> Builder<'a> {
                 name, dimensions, ..
             } => {
                 let outer = self.packed_dims(dimensions, ctx);
-                let key = match &name.scope {
-                    Some(sc) => format!("{}::{}", sc.name, name.name.name),
-                    None => name.name.name.clone(),
+                let key = if name.scopes.is_empty() {
+                    name.name.name.clone()
+                } else {
+                    name.qualified()
                 };
                 if depth < 16 {
                     if let Some(&(td, _)) = self
@@ -3758,7 +3759,7 @@ impl<'a> Builder<'a> {
     }
 
     fn function(&mut self, fd: &'a FunctionDeclaration, ctx: &Ctx, dpi: Option<(bool, bool)>) {
-        if fd.name.scope.is_some() {
+        if fd.name.has_scope() {
             return; // an out-of-class method body
         }
         let Some(s) = self.subroutine_scope(
@@ -3800,7 +3801,7 @@ impl<'a> Builder<'a> {
     }
 
     fn task(&mut self, td: &'a TaskDeclaration, ctx: &Ctx, dpi: Option<(bool, bool)>) {
-        if td.name.scope.is_some() {
+        if td.name.has_scope() {
             return;
         }
         let Some(s) =
