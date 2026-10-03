@@ -85,6 +85,8 @@ mod this_super_member;
 mod type_param_base_class;
 #[path = "classes/type_param_base_named_forward.rs"]
 mod type_param_base_named_forward;
+#[path = "classes/type_param_base_typedef_arg.rs"]
+mod type_param_base_typedef_arg;
 #[path = "classes/type_param_default_implicit_extends.rs"]
 mod type_param_default_implicit_extends;
 #[path = "classes/type_param_formal_stale_local.rs"]

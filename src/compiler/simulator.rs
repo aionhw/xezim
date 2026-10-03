@@ -114526,6 +114526,22 @@ impl Simulator {
     /// A type fragment naming a class (`derived_c`, `pbase#(8)`, or a typedef
     /// of either) as `(class, specialization args)`.
     #[inline(never)]
+    /// A type argument naming a typedef of a class specialization
+    /// (`my_s` for `typedef sbase #(my_cfg) my_s;`), spelled out as that
+    /// specialization (`sbase#(my_cfg)`); any other argument as written.
+    fn spell_typedef_spec(&self, arg: &str) -> String {
+        let a = arg.trim();
+        if a.contains('#') || self.module.classes.contains_key(a) {
+            return a.to_string();
+        }
+        match self.resolve_typedef_spec(a) {
+            Some((b, sig)) if !sig.trim().is_empty() && self.module.classes.contains_key(&b) => {
+                format!("{}#({})", b, sig)
+            }
+            _ => a.to_string(),
+        }
+    }
+
     fn type_base_frag_class(&self, frag: &str) -> Option<(String, Vec<String>)> {
         let frag = frag.trim();
         let (b, args) = Self::strip_class_specialization(frag);
@@ -115051,6 +115067,12 @@ impl Simulator {
             } else {
                 targs
             };
+            // §6.18: a typedef names the type it is declared as. The base
+            // entry reads its arguments back from the binding of the type
+            // parameter (`BASE#[i]`), which a bare typedef name does not
+            // spell — `wrap #(my_s)` with `typedef sbase #(my_cfg) my_s;`
+            // gave `sbase` its defaults — so spell the specialization out.
+            let args: Vec<String> = args.iter().map(|a| self.spell_typedef_spec(a)).collect();
             let args = if args.is_empty() {
                 args
             } else {
@@ -115061,7 +115083,7 @@ impl Simulator {
             };
             let key = self.ensure_spec_class(&b, &args);
             if let Some(cd) = self.module.classes.get_mut(c).map(std::sync::Arc::make_mut) {
-                if !direct && cd.extends_type_args.is_empty() {
+                if (!direct && cd.extends_type_args.is_empty()) || (direct && !args.is_empty()) {
                     cd.extends_type_args = args;
                 }
                 cd.extends = Some(key);
