@@ -52019,7 +52019,7 @@ impl Simulator {
                                 .flatten()
                             {
                                 if self.stmts_have_blocking(&td.items) {
-                                    let cleanup = self.bind_task_frame(&td, args);
+                                    let cleanup = self.bind_task_frame(&td, args, None);
                                     self.task_cleanup.push(cleanup);
                                     let mut cont: Vec<Statement> = td.items.clone();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -52044,7 +52044,7 @@ impl Simulator {
                 if let ExprKind::Call { func, args } = &expr.kind {
                     if let Some(td) = self.package_task_target(func) {
                         if self.stmts_have_blocking(&td.items) {
-                            let cleanup = self.bind_task_frame(&td, args);
+                            let cleanup = self.bind_task_frame(&td, args, None);
                             self.task_cleanup.push(cleanup);
                             let mut cont: Vec<Statement> = td.items.clone();
                             cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -52079,7 +52079,7 @@ impl Simulator {
                                         .rsplit_once('.')
                                         .map(|(sc, _)| sc.to_string())
                                         .unwrap_or_default();
-                                    let mut cleanup = self.bind_task_frame(&td, args);
+                                    let mut cleanup = self.bind_task_frame(&td, args, None);
                                     self.push_instance_task_context(&mut cleanup);
                                     cleanup.prev_hint = self.name_resolve_hint.borrow().clone();
                                     cleanup.frame_scope_hint = Some(scope.clone());
@@ -52217,7 +52217,11 @@ impl Simulator {
                                         unreachable!("resolve_class_task yields tasks only")
                                     };
                                     if self.stmts_have_blocking(&td.items) {
-                                        let mut cleanup = self.bind_task_frame(td, args);
+                                        let spec = self
+                                            .task_method_spec(Some(rh), &mclass)
+                                            .or_else(|| self.current_spec.clone());
+                                        let mut cleanup =
+                                            self.bind_task_frame(td, args, Some(spec));
                                         // Even a same-object bare call changes
                                         // the defining-class context used by
                                         // `super`; push both stacks uniformly.
@@ -52395,7 +52399,8 @@ impl Simulator {
                                 unreachable!("resolve_class_task yields tasks only")
                             };
                             if self.stmts_have_blocking(&td.items) {
-                                let mut cleanup = self.bind_task_frame(td, args);
+                                let spec = recv_spec.clone().or_else(|| self.current_spec.clone());
+                                let mut cleanup = self.bind_task_frame(td, args, Some(spec));
                                 // Static context: push the declaring class for
                                 // member/static resolution, with a null `this`.
                                 self.m_scope_stack.clear();
@@ -106423,14 +106428,49 @@ impl Simulator {
     }
 
     fn push_local_frame(&mut self, f: HashMap<String, Value>) {
+        let types = self.take_pooled_types();
+        self.push_local_frame_typed(f, types);
+    }
+
+    /// Push a local frame together with its type overlay (the declared
+    /// class / typedef names of its variables, see `local_type_stack`). A
+    /// subroutine collects its formals' types while binding them and hands
+    /// them over here: recording them with `record_local_*` before the push
+    /// wrote them into the CALLER's overlay instead.
+    fn push_local_frame_typed(
+        &mut self,
+        f: HashMap<String, Value>,
+        types: (HashMap<String, String>, HashMap<String, String>),
+    ) {
         if self.name_stats_on {
             self.name_stats[2].set(self.name_stats[2].get() + 1);
         }
         self.local_stack.push(f);
         let fgen = self.next_frame_gen();
         self.local_gen_stack.push(fgen);
-        let pair = self.local_type_pool.pop().unwrap_or_default();
-        self.local_type_stack.push(pair);
+        self.local_type_stack.push(types);
+    }
+
+    /// An empty type-overlay pair from the pool (capacity retained) or a
+    /// fresh one.
+    fn take_pooled_types(&mut self) -> (HashMap<String, String>, HashMap<String, String>) {
+        self.local_type_pool.pop().unwrap_or_default()
+    }
+
+    /// The type bound to the class type parameter `dt` names under the
+    /// current specialization, or `None` when `dt` names no type parameter.
+    fn formal_type_param_binding(&self, dt: &DataType) -> Option<String> {
+        let DataType::TypeReference { name: tn, .. } = dt else {
+            return None;
+        };
+        let type_name = &tn.name.name;
+        if self.module.classes.contains_key(type_name)
+            || self.module.enum_members.contains_key(type_name)
+            || self.module.typedefs.contains_key(type_name)
+        {
+            return None;
+        }
+        self.resolve_type_param_binding(type_name)
     }
 
     /// Return a popped `local_type_stack` pair to the pool: only lookups ever
@@ -128525,6 +128565,8 @@ impl Simulator {
 
         // Set up local scope with parameters
         let mut locals = self.take_pooled_frame();
+        // The callee frame's type overlay, pushed together with `locals`.
+        let mut frame_types = self.take_pooled_types();
         self.push_queue_frame();
         // `output`/`inout`/`ref` formals copy back to the caller's actual on
         // return (e.g. `get_int_arg_value(string s, ref int val)`).
@@ -128651,7 +128693,7 @@ impl Simulator {
                 // §13.5.3: a default may reference EARLIER formals (`int b =
                 // a + 1`). Push the partially-bound frame so they resolve —
                 // evaluated bare, `a` was unknown and the default was x.
-                self.push_local_frame(locals.clone());
+                self.push_local_frame_typed(locals.clone(), frame_types.clone());
                 let v = self.eval_expr(def);
                 self.pop_local_frame();
                 v
@@ -128718,14 +128760,18 @@ impl Simulator {
                 // lands in the typedef maps and `class_of_var` misses it
                 // (id-collision-in-heap receiver gating).
                 if self.module.classes.contains_key(&type_name) {
-                    self.record_local_class_type(&port.name.name, &type_name);
+                    frame_types
+                        .0
+                        .insert(port.name.name.clone(), type_name.clone());
                     self.var_class_types
                         .insert(port.name.name.clone(), type_name);
                     self.note_formal_type_args(&port.name.name, type_args);
                 } else if self.module.enum_members.contains_key(&type_name)
                     || self.module.typedefs.contains_key(&type_name)
                 {
-                    self.record_local_typedef_type(&port.name.name, &type_name);
+                    frame_types
+                        .1
+                        .insert(port.name.name.clone(), type_name.clone());
                     self.var_typedef_types
                         .insert(port.name.name.clone(), type_name);
                 } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
@@ -128750,7 +128796,9 @@ impl Simulator {
                                 .classes
                                 .contains_key(concrete.split('#').next().unwrap_or(&concrete)));
                     if cn_is_class {
-                        self.record_local_class_type(&port.name.name, &concrete);
+                        frame_types
+                            .0
+                            .insert(port.name.name.clone(), concrete.clone());
                         self.var_class_types
                             .insert(port.name.name.clone(), concrete);
                     }
@@ -128861,12 +128909,12 @@ impl Simulator {
             // Class check first — see the port loop above (a class name can
             // also key the typedef width table).
             if self.module.classes.contains_key(&type_name) {
-                self.record_local_class_type(&ret_name, &type_name);
+                frame_types.0.insert(ret_name.clone(), type_name.clone());
                 self.var_class_types.insert(ret_name.clone(), type_name);
             } else if self.module.enum_members.contains_key(&type_name)
                 || self.module.typedefs.contains_key(&type_name)
             {
-                self.record_local_typedef_type(&ret_name, &type_name);
+                frame_types.1.insert(ret_name.clone(), type_name.clone());
                 self.var_typedef_types.insert(ret_name.clone(), type_name);
             }
         }
@@ -128913,7 +128961,7 @@ impl Simulator {
             }
         }
         self.local_iface_aliases.push(iface_alias_frame);
-        self.push_local_frame(locals);
+        self.push_local_frame_typed(locals, frame_types);
         self.open_decl_shadow_frame();
         self.return_value = None;
         let saved_break = self.break_flag;
@@ -129147,7 +129195,7 @@ impl Simulator {
             .pending_pkg_scope
             .take()
             .or_else(|| self.module.func_decl_scope.get(&td.name.name.name).cloned());
-        let mut cleanup = self.bind_task_frame(td, args);
+        let mut cleanup = self.bind_task_frame(td, args, None);
         self.open_decl_shadow_frame();
         if std::mem::take(&mut self.task_clears_this) {
             self.push_instance_task_context(&mut cleanup);
@@ -129855,10 +129903,34 @@ impl Simulator {
         }
     }
 
-    fn bind_task_frame(&mut self, td: &TaskDeclaration, args: &[Expression]) -> TaskCleanup {
+    /// `type_ctx` is `Some(spec)` for a class method task: `spec` is the
+    /// `current_spec` its body runs under (see `task_method_spec`).
+    fn bind_task_frame(
+        &mut self,
+        td: &TaskDeclaration,
+        args: &[Expression],
+        type_ctx: Option<Option<(String, String)>>,
+    ) -> TaskCleanup {
         use crate::ast::types::PortDirection;
         let normalized = Self::normalize_call_args(&td.ports, args);
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
+        // §8.25: a formal typed by one of the class's type parameters has
+        // the type bound in the CALLEE's specialization. Resolve each under
+        // it now — the arguments below evaluate in the caller's context,
+        // where the parameter means something else or nothing.
+        let bound_types: Vec<Option<String>> = match type_ctx {
+            Some(spec) => {
+                let saved = std::mem::replace(&mut self.current_spec, spec);
+                let bound = td
+                    .ports
+                    .iter()
+                    .map(|port| self.formal_type_param_binding(&port.data_type))
+                    .collect();
+                self.current_spec = saved;
+                bound
+            }
+            None => vec![None; td.ports.len()],
+        };
         // Dedup by borrowed name: the formal list is tiny, so a linear
         // scan beats a HashSet plus one String allocation per formal on
         // EVERY call.
@@ -129879,6 +129951,8 @@ impl Simulator {
             .collect();
         // Evaluate input args and collect output/ref arg expressions
         let mut locals = self.take_pooled_frame();
+        // The callee frame's type overlay, pushed together with `locals`.
+        let mut frame_types = self.take_pooled_types();
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
         // §25.9 via the __vif_local__ convention: a virtual-interface ACTUAL
         // records its interface under the formal's name (cleared otherwise so
@@ -129918,14 +129992,46 @@ impl Simulator {
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
         for (i, port) in td.ports.iter().enumerate() {
+            // A type-parameter formal's bound type: a typedef (an unpacked
+            // struct binds member-wise below) or a class.
+            let bound = bound_types[i].as_deref();
+            let data_type = match bound.and_then(|b| self.module.typedef_types.get(b)) {
+                Some(dt) => std::borrow::Cow::Owned(dt.clone()),
+                None => std::borrow::Cow::Borrowed(&port.data_type),
+            };
             // §13.3: a formal is a variable of its declared type — give it the
             // same structural metadata a local declaration gets, or member and
             // element selects on it silently read 0.
             self.register_formal_type_metadata(
                 &port.name.name,
-                &port.data_type,
+                &data_type,
                 port.dimensions.is_empty(),
             );
+            if let Some(b) = bound {
+                let base = b.split('#').next().unwrap_or(b);
+                if self.module.classes.contains_key(base) {
+                    frame_types.0.insert(port.name.name.clone(), b.to_string());
+                    self.var_class_types
+                        .insert(port.name.name.clone(), b.to_string());
+                } else if self.module.enum_members.contains_key(b)
+                    || self.module.typedefs.contains_key(b)
+                {
+                    frame_types.1.insert(port.name.name.clone(), b.to_string());
+                }
+            } else if let DataType::TypeReference { name: tn, .. } = &port.data_type {
+                let type_name = &tn.name.name;
+                if self.module.classes.contains_key(type_name) {
+                    frame_types
+                        .0
+                        .insert(port.name.name.clone(), type_name.clone());
+                } else if self.module.enum_members.contains_key(type_name)
+                    || self.module.typedefs.contains_key(type_name)
+                {
+                    frame_types
+                        .1
+                        .insert(port.name.name.clone(), type_name.clone());
+                }
+            }
             // Unpacked array formal (`int a[2:0]` or `int a[3]`): copy the
             // caller's elements in, and copy them back for an out/inout/ref.
             if i < args.len() {
@@ -129954,8 +130060,9 @@ impl Simulator {
                             (self.port_class_ref(port).is_some(), &port.data_type)
                         {
                             let tn = &name.name.name;
-                            let concrete = self
-                                .resolve_type_param_binding(tn)
+                            let concrete = bound
+                                .map(str::to_string)
+                                .or_else(|| self.resolve_type_param_binding(tn))
                                 .unwrap_or_else(|| tn.clone());
                             self.module
                                 .typedef_unpacked_dims
@@ -129989,7 +130096,7 @@ impl Simulator {
             if i < args.len() && port.dimensions.is_empty() {
                 if let Some(backs) = self.bind_unpacked_struct_formal(
                     &port.name.name,
-                    &port.data_type,
+                    &data_type,
                     port.direction,
                     &args[i],
                     &mut locals,
@@ -130146,7 +130253,7 @@ impl Simulator {
                 }
             }
         }
-        self.push_local_frame(locals);
+        self.push_local_frame_typed(locals, frame_types);
         // §6.21: open a static-local sync frame keyed by this task name.
         let sync_name = self.sync_frame_name(&td.name.name.name);
         self.static_local_syncs.push((sync_name, Vec::new()));
@@ -130314,6 +130421,21 @@ impl Simulator {
         // right after binding the locals frame; mirror it here.
         self.method_local_base
             .push(self.local_stack.len().saturating_sub(1));
+        if let Some(spec) = self.task_method_spec(handle_opt, &mclass) {
+            self.current_spec = Some(spec);
+        }
+    }
+
+    /// The class specialization a method task's body runs under — what
+    /// `push_task_method_this` makes `current_spec` — or `None` when the
+    /// caller's stays in force. `bind_task_frame` resolves the formals'
+    /// type parameters under it before `this` is pushed.
+    fn task_method_spec(
+        &self,
+        handle_opt: Option<usize>,
+        mclass: &str,
+    ) -> Option<(String, String)> {
+        let mut spec = None;
         if let Some(h) = handle_opt {
             if let Some(inst) = self.heap.get(h).and_then(|o| o.as_ref()) {
                 let cn = inst.class_name.clone();
@@ -130330,7 +130452,7 @@ impl Simulator {
                 };
                 if differs {
                     if inst.spec.is_some() {
-                        self.current_spec = inst.spec.clone();
+                        spec = inst.spec.clone();
                     } else if let Some(cd) = self.module.classes.get(&cn) {
                         let mut param_names = cd.param_order.clone();
                         if param_names.is_empty() {
@@ -130350,7 +130472,7 @@ impl Simulator {
                                 })
                                 .collect();
                             if sig_frags.len() == param_names.len() {
-                                self.current_spec = Some((cn, sig_frags.join(",")));
+                                spec = Some((cn, sig_frags.join(",")));
                             }
                         }
                     }
@@ -130367,9 +130489,10 @@ impl Simulator {
         // `T::type_id::create`) resolved `T` to the unknown-type fallback,
         // `logic`, and every create returned null: the run reported UVM_ERROR 0
         // while driving no transactions at all. Mirror the function path here.
-        if let Some(spec) = handle_opt.and_then(|h| self.inherited_method_spec(h, &mclass)) {
-            self.current_spec = Some(spec);
+        if let Some(s) = handle_opt.and_then(|h| self.inherited_method_spec(h, mclass)) {
+            spec = Some(s);
         }
+        spec
     }
 
     /// The covergroup definition `new` instantiates for a type name: inside
@@ -144516,6 +144639,8 @@ impl Simulator {
                     }
                 };
                 let mut locals: HashMap<String, Value> = self.take_pooled_frame();
+                // The callee frame's type overlay, pushed together with `locals`.
+                let mut frame_types = self.take_pooled_types();
                 // §13.5.3: reorder named args into formal order and fill any
                 // omitted (`.name()` / positional `,,`) slot from the formal's
                 // default before positional binding below.
@@ -144631,18 +144756,6 @@ impl Simulator {
                 // Member-wise struct `output`/`inout`/`ref` formals bypass the
                 // whole-value `output_bindings` path (see exec_function_call).
                 let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
-                // PORT TYPE-PARAMETER CLASS BINDINGS: a formal declared with a
-                // TYPE PARAMETER class type (`IMP imp`) resolves to a concrete
-                // class per-call (see the branch below). Record it NOW so that
-                // after the callee's frame is pushed (push_local_frame below)
-                // we can re-record into the CALLEE's frame slot — the body's
-                // `$cast`/`new` reads it via `local_class_type_of`, which
-                // scans only frames at/after the callee's method_local_base
-                // and would otherwise miss it (and fall back to a STALE,
-                // same-named global `var_class_types` entry from an unrelated
-                // scope such as uvm_config_db's `imp`, failing a valid TLM
-                // initiator socket $cast with UVM/TLM2/NOIMP).
-                let mut frame_class_ports: Vec<(String, String)> = Vec::new();
                 for (i, port) in ports.iter().enumerate() {
                     // A plain scalar or class formal: none of the struct,
                     // collection, array or width probes below can claim it.
@@ -144845,7 +144958,7 @@ impl Simulator {
                         // of silently evaluating to the type's zero value.
                         self.this_stack.push(Some(handle));
                         self.class_context_stack.push(Some(cname.clone()));
-                        self.push_local_frame(locals.clone());
+                        self.push_local_frame_typed(locals.clone(), frame_types.clone());
                         let v = self.eval_expr(def);
                         self.pop_local_frame();
                         self.class_context_stack.pop();
@@ -144932,7 +145045,9 @@ impl Simulator {
                         // typedef maps).
                         let forward_declared = class_ref == Some(true);
                         if !forward_declared && self.module.classes.contains_key(&type_name) {
-                            self.record_local_class_type(&port.name.name, &type_name);
+                            frame_types
+                                .0
+                                .insert(port.name.name.clone(), type_name.clone());
                             self.note_formal_type_args(&port.name.name, type_args);
                             if self.var_class_types.get(port.name.name.as_str()) != Some(&type_name)
                             {
@@ -144943,7 +145058,9 @@ impl Simulator {
                         } else if self.module.enum_members.contains_key(&type_name)
                             || self.module.typedefs.contains_key(&type_name)
                         {
-                            self.record_local_typedef_type(&port.name.name, &type_name);
+                            frame_types
+                                .1
+                                .insert(port.name.name.clone(), type_name.clone());
                             // An entry already holding this type is left as
                             // is: rewriting it changes nothing, and an
                             // untouched name needs no metadata save.
@@ -144972,7 +145089,9 @@ impl Simulator {
                                         concrete.split('#').next().unwrap_or(&concrete),
                                     ));
                             if cn_is_class {
-                                frame_class_ports.push((port.name.name.clone(), concrete.clone()));
+                                frame_types
+                                    .0
+                                    .insert(port.name.name.clone(), concrete.clone());
                                 if self.var_class_types.get(port.name.name.as_str())
                                     != Some(&concrete)
                                 {
@@ -145075,7 +145194,7 @@ impl Simulator {
                     // real report message's set_action/get_action persist so
                     // the report-server `$display` fires natively.
                     if let Some(cn) = plan.ret.as_ref().and_then(|r| r.class.as_deref()) {
-                        self.record_local_class_type(rn, cn);
+                        frame_types.0.insert(rn.to_string(), cn.to_string());
                         if self.var_class_types.get(rn).map(String::as_str) != Some(cn) {
                             self.meta_note(rn);
                             self.var_class_types.insert(rn.to_string(), cn.to_string());
@@ -145313,20 +145432,8 @@ impl Simulator {
                         Some(prev)
                     }
                 };
-                self.push_local_frame(locals);
+                self.push_local_frame_typed(locals, frame_types);
                 self.open_decl_shadow_frame();
-                // Re-apply the TYPE-PARAMETER class bindings now that the
-                // callee's own frame is on top of `local_type_stack`. During
-                // the port loop above, `local_type_stack.last_mut()` still
-                // pointed at the CALLER's frame, so recording there would be
-                // invisible to `local_class_type_of` (which scans only from
-                // this method's base downward via `method_local_base`).
-                // Recording here makes `$cast(imp, parent)` in a socket `new`
-                // body resolve `imp` to its concrete class (e.g. `producer`)
-                // instead of a stale same-named global entry.
-                for (pn, pconcrete) in frame_class_ports {
-                    self.record_local_class_type(&pn, &pconcrete);
-                }
                 // Record the `local_stack` depth BEFORE this method's own
                 // frame (i.e. the count of caller frames) so that
                 // `get_expr_type_name`'s `in_any_frame` check only considers

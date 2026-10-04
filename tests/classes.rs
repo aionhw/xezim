@@ -77,6 +77,8 @@ mod static_fixed_array_storage;
 mod static_param_class_collection_reuse;
 #[path = "classes/struct_member_class_handle_new.rs"]
 mod struct_member_class_handle_new;
+#[path = "classes/subroutine_formal_frame_type.rs"]
+mod subroutine_formal_frame_type;
 #[path = "classes/this_collection_struct_members.rs"]
 mod this_collection_struct_members;
 #[path = "classes/this_super_member.rs"]
