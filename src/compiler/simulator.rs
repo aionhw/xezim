@@ -52670,7 +52670,7 @@ impl Simulator {
                             if bound > 0 {
                                 let len = self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
                                 if len >= bound {
-                                    let value = self.eval_expr(&args[0]);
+                                    let value = self.mbx_message(&args[0]);
                                     let cont = pc.resume_at(pc.start + i + 1);
                                     self.mailbox_put_waiters
                                         .entry(handle)
@@ -97221,10 +97221,7 @@ impl Simulator {
                     self.time, pid, is_peek, handle
                 );
             }
-            self.deliver_to_mailbox_waiter(pid, &lvalue, front.clone(), cont);
-            if !is_peek {
-                self.mbx_release_msg(&front);
-            }
+            self.deliver_to_mailbox_waiter(pid, &lvalue, front, cont, !is_peek);
         }
     }
 
@@ -97283,13 +97280,27 @@ impl Simulator {
         }
     }
 
+    /// The value a mailbox `put` queues for `arg`: an unpacked struct is
+    /// stashed member-wise and queued as its shadow id.
+    fn mbx_message(&mut self, arg: &Expression) -> Value {
+        match self.mbx_struct_arg(arg) {
+            Some((src, su)) => self.mbx_stash_struct(&src, &su),
+            None => self.eval_expr(arg),
+        }
+    }
+
     /// Write one delivered message into a parked waiter's lvalue, taking the
     /// aggregate path when the destination is an unpacked struct. Must run
     /// with the waiter's process context restored, so the lvalue's frame-local
-    /// name resolves to that process's storage.
-    fn mbx_assign_delivered(&mut self, lvalue: &Expression, v: &Value) {
+    /// name resolves to that process's storage. A `consume`d (`get`, not
+    /// `peek`) struct message frees its stash id; only a struct destination
+    /// says the value IS one — a scalar message's value is not an id.
+    fn mbx_assign_delivered(&mut self, lvalue: &Expression, v: &Value, consume: bool) {
         if let Some((dst, su)) = self.mbx_struct_arg(lvalue) {
             self.mbx_unstash_struct(&dst, &su, v);
+            if consume {
+                self.mbx_release_msg(v);
+            }
             return;
         }
         let width = self.infer_lhs_width(lvalue);
@@ -97302,16 +97313,17 @@ impl Simulator {
         lvalue: &Expression,
         v: Value,
         cont: ProcCont,
+        consume: bool,
     ) {
         if let Some(ctx) = self.process_contexts.remove(&pid) {
             let saved = self.take_process_context();
             self.restore_process_context(ctx);
-            self.mbx_assign_delivered(lvalue, &v);
+            self.mbx_assign_delivered(lvalue, &v, consume);
             let ctx = self.take_process_context();
             self.process_contexts.insert(pid, ctx);
             self.restore_process_context(saved);
         } else {
-            self.mbx_assign_delivered(lvalue, &v);
+            self.mbx_assign_delivered(lvalue, &v, consume);
         }
         if !cont.is_empty() {
             self.event_queue.schedule(self.time, pid, cont);
@@ -125542,7 +125554,14 @@ impl Simulator {
                 let base = self.eval_expr(expr);
                 let handle = base.to_u64().unwrap_or(0) as usize;
                 if let Some(arg) = args.first() {
-                    let v = self.eval_expr(arg);
+                    // A `put` inside a task body (an argument that is a
+                    // formal of that task) arrives here, not through
+                    // `exec_method_call`, so the message is built the same way.
+                    let v = if self.mailboxes.contains_key(&handle) {
+                        self.mbx_message(arg)
+                    } else {
+                        self.eval_expr(arg)
+                    };
                     // LRM §15.4.3/§15.4.5: a `put` stores in FIFO order and
                     // unblocks any process waiting in a `get`/`peek` on this
                     // mailbox. Hand the value directly to the FIFO-ordered
@@ -125572,7 +125591,7 @@ impl Simulator {
                                     .unwrap()
                                     .push_back(v.clone());
                             }
-                            self.deliver_to_mailbox_waiter(pid, &lvalue, v, cont);
+                            self.deliver_to_mailbox_waiter(pid, &lvalue, v, cont, !is_peek);
                         } else if let Some(q) = self.mailboxes.get_mut(&handle) {
                             q.push_back(v);
                         }
@@ -125603,8 +125622,7 @@ impl Simulator {
                             .pop_front()
                             .unwrap();
                         if let Some(arg) = args.first() {
-                            let w = self.infer_lhs_width(arg);
-                            self.assign_value(arg, &val.resize(w));
+                            self.mbx_assign_delivered(arg, &val, true);
                         }
                         self.admit_mailbox_put_waiter(handle);
                         return Value::zero(32);
@@ -125646,8 +125664,7 @@ impl Simulator {
                 if self.mailboxes.contains_key(&handle) {
                     let val = self.mailboxes.get_mut(&handle).and_then(|q| q.pop_front());
                     if let (Some(v), Some(arg)) = (val, args.first()) {
-                        let w = self.infer_lhs_width(arg);
-                        self.assign_value(arg, &v.resize(w));
+                        self.mbx_assign_delivered(arg, &v, true);
                         self.admit_mailbox_put_waiter(handle);
                         return Value::from_u64(1, 32);
                     }
@@ -136082,10 +136099,7 @@ impl Simulator {
                     if let Some(arg) = args.first() {
                         // An UNPACKED struct has no single value to queue;
                         // stash it member-wise and queue its shadow id.
-                        let v = match self.mbx_struct_arg(arg) {
-                            Some((src, su)) => self.mbx_stash_struct(&src, &su),
-                            None => self.eval_expr(arg),
-                        };
+                        let v = self.mbx_message(arg);
                         // LRM §15.4.2: if a blocking get is waiting on this
                         // mailbox, hand the value directly to the waiter
                         // (skipping the queue) and reschedule its
@@ -136127,21 +136141,10 @@ impl Simulator {
                         }
                     }
                     if let (Some(v), Some(arg)) = (&val, args.first()) {
-                        match self.mbx_struct_arg(arg) {
-                            Some((dst, su)) => {
-                                self.mbx_unstash_struct(&dst, &su, v);
-                            }
-                            None => {
-                                let w = self.infer_lhs_width(arg);
-                                self.assign_value(arg, &v.resize(w));
-                            }
-                        }
+                        self.mbx_assign_delivered(arg, v, method_name == "get");
                     }
                     // A consuming `get` frees a slot — admit a parked producer.
                     if method_name == "get" {
-                        if let Some(v) = &val {
-                            self.mbx_release_msg(v);
-                        }
                         self.admit_mailbox_put_waiter(handle);
                     }
                     return Value::zero(32);
@@ -136158,10 +136161,7 @@ impl Simulator {
                                 return Value::zero(32);
                             }
                         }
-                        let v = match self.mbx_struct_arg(arg) {
-                            Some((src, su)) => self.mbx_stash_struct(&src, &su),
-                            None => self.eval_expr(arg),
-                        };
+                        let v = self.mbx_message(arg);
                         // Push-then-drain — see the blocking `put` arm.
                         self.mailboxes.get_mut(&handle).unwrap().push_back(v);
                         self.drain_mailbox_get_waiters(handle);
@@ -136175,17 +136175,8 @@ impl Simulator {
                         self.mailboxes.get(&handle).and_then(|q| q.front().cloned())
                     };
                     if let (Some(v), Some(arg)) = (&val, args.first()) {
-                        match self.mbx_struct_arg(arg) {
-                            Some((dst, su)) => {
-                                self.mbx_unstash_struct(&dst, &su, v);
-                            }
-                            None => {
-                                let w = self.infer_lhs_width(arg);
-                                self.assign_value(arg, &v.resize(w));
-                            }
-                        }
+                        self.mbx_assign_delivered(arg, v, method_name == "try_get");
                         if method_name == "try_get" {
-                            self.mbx_release_msg(v);
                             self.admit_mailbox_put_waiter(handle);
                         }
                         return Value::from_u64(1, 32);

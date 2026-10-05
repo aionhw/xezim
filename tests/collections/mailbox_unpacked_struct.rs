@@ -194,3 +194,162 @@ module t;\n\
 endmodule";
     assert_eq!(lines(src), vec!["T packed 1 2"]);
 }
+
+/// The message passes through a FORMAL of the task that calls `put` / `get`
+/// — a FIFO class wrapping its mailbox, plain or with the message type from
+/// a type parameter (issue #243). Inside a task body the calls reach the
+/// expression-statement mailbox path, which queued and assigned the formal
+/// as one scalar.
+#[test]
+fn task_formals_carry_an_unpacked_struct() {
+    let src = format!(
+        "{S}\
+class fifo;\n\
+  mailbox #(pair_t) mb = new();\n\
+  task put(pair_t t); mb.put(t); endtask\n\
+  task get(output pair_t t); mb.get(t); endtask\n\
+  task peek(output pair_t t); mb.peek(t); endtask\n\
+endclass\n\
+class gfifo #(type T = int);\n\
+  local mailbox #(T) mb = new();\n\
+  task put(T t); mb.put(t); endtask\n\
+  task get(output T t); mb.get(t); endtask\n\
+endclass\n\
+module t;\n\
+  initial begin\n\
+    fifo f = new();\n\
+    gfifo #(pair_t) g = new();\n\
+    pair_t p, q;\n\
+    p = '{{1, 2}}; q = '{{99, 99}};\n\
+    f.put(p); f.mb.get(q);\n\
+    $display(\"T put %0d %0d\", q.a, q.b);\n\
+    p = '{{3, 4}}; q = '{{99, 99}};\n\
+    f.mb.put(p); f.peek(q);\n\
+    $display(\"T peek %0d %0d\", q.a, q.b);\n\
+    q = '{{99, 99}};\n\
+    f.get(q);\n\
+    $display(\"T get %0d %0d num %0d\", q.a, q.b, f.mb.num());\n\
+    p = '{{5, 6}}; q = '{{99, 99}};\n\
+    g.put(p); g.get(q);\n\
+    $display(\"T param %0d %0d\", q.a, q.b);\n\
+  end\n\
+endmodule"
+    );
+    assert_eq!(
+        lines(&src),
+        vec!["T put 1 2", "T peek 3 4", "T get 3 4 num 0", "T param 5 6"]
+    );
+}
+
+/// Through task formals on the blocking paths: a `get` parked on the empty
+/// box takes the message handed over by a later `put`, and a `put` parked on
+/// a full bounded box queues its message once a slot frees.
+#[test]
+fn task_formals_on_the_blocking_paths() {
+    let src = format!(
+        "{S}\
+class fifo;\n\
+  mailbox #(pair_t) mb;\n\
+  function new(int bound); mb = new(bound); endfunction\n\
+  task put(pair_t t); mb.put(t); endtask\n\
+  task get(output pair_t t); mb.get(t); endtask\n\
+endclass\n\
+module t;\n\
+  fifo e = new(0);\n\
+  fifo b = new(1);\n\
+  initial begin\n\
+    pair_t c;\n\
+    c = '{{99, 99}};\n\
+    e.get(c);\n\
+    $display(\"T parked get %0d %0d at %0t\", c.a, c.b, $time);\n\
+  end\n\
+  initial begin\n\
+    pair_t d;\n\
+    #5;\n\
+    d = '{{11, 22}};\n\
+    e.put(d);\n\
+  end\n\
+  initial begin\n\
+    pair_t p;\n\
+    #10;\n\
+    p = '{{1, 2}}; b.put(p);\n\
+    p = '{{3, 4}}; b.put(p);\n\
+    $display(\"T parked put done at %0t\", $time);\n\
+  end\n\
+  initial begin\n\
+    pair_t q1, q2;\n\
+    #20;\n\
+    q1 = '{{99, 99}}; b.get(q1);\n\
+    q2 = '{{99, 99}}; b.get(q2);\n\
+    #1;\n\
+    $display(\"T bounded %0d %0d, %0d %0d\", q1.a, q1.b, q2.a, q2.b);\n\
+  end\n\
+endmodule"
+    );
+    assert_eq!(
+        lines(&src),
+        vec![
+            "T parked get 11 22 at 5",
+            "T parked put done at 20",
+            "T bounded 1 2, 3 4"
+        ]
+    );
+}
+
+/// Function formals with the non-blocking calls.
+#[test]
+fn function_formals_with_try_put_try_get() {
+    let src = format!(
+        "{S}\
+class fifo;\n\
+  mailbox #(pair_t) mb = new();\n\
+  function bit put(pair_t t); return mb.try_put(t); endfunction\n\
+  function bit get(output pair_t t); return mb.try_get(t); endfunction\n\
+endclass\n\
+module t;\n\
+  initial begin\n\
+    fifo f = new();\n\
+    pair_t p, q;\n\
+    p = '{{7, 8}}; q = '{{99, 99}};\n\
+    void'(f.put(p)); void'(f.get(q));\n\
+    $display(\"T try %0d %0d num %0d\", q.a, q.b, f.mb.num());\n\
+  end\n\
+endmodule"
+    );
+    assert_eq!(lines(&src), vec!["T try 7 8 num 0"]);
+}
+
+/// Consuming a message frees a stash id only when that message IS a stashed
+/// struct. A scalar message whose value happened to equal a queued struct's
+/// id freed that id, so the next struct `put` reused the slot and overwrote
+/// the message still waiting in the box.
+#[test]
+fn a_scalar_message_does_not_free_a_queued_struct_slot() {
+    let src = format!(
+        "{S}\
+class ififo;\n\
+  mailbox #(int) mb = new();\n\
+  task put(int v); mb.put(v); endtask\n\
+  task get(output int v); mb.get(v); endtask\n\
+endclass\n\
+module t;\n\
+  initial begin\n\
+    mailbox #(pair_t) ms = new();\n\
+    mailbox #(int) mi = new();\n\
+    ififo f = new();\n\
+    pair_t p, q;\n\
+    int n;\n\
+    p = '{{1, 2}}; ms.put(p);\n\
+    mi.put(1); mi.get(n);\n\
+    f.put(1); f.get(n);\n\
+    p = '{{3, 4}}; ms.put(p);\n\
+    p = '{{5, 6}}; ms.put(p);\n\
+    for (int i = 0; i < 3; i++) begin\n\
+      q = '{{99, 99}}; ms.get(q);\n\
+      $display(\"T msg %0d %0d\", q.a, q.b);\n\
+    end\n\
+  end\n\
+endmodule"
+    );
+    assert_eq!(lines(&src), vec!["T msg 1 2", "T msg 3 4", "T msg 5 6"]);
+}
