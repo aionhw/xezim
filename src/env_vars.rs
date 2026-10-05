@@ -756,6 +756,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Debug: trace randomize()/constraint solving",
     ),
     (
+        "XEZIM_RAND_DIAG",
+        "Debug: on a failed randomize(), report the switched-off variables and constraints and the unsatisfied constraint items",
+    ),
+    (
         "XEZIM_RANGE_COPY",
         "Comb settle: lower direct constant-range assignments to slice copies (1 enables)",
     ),

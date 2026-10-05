@@ -2554,6 +2554,7 @@ mod event_bits;
 mod module_paths;
 mod names;
 mod rand_csp;
+mod rand_diag;
 mod rand_scope;
 mod sv_file;
 mod timing_checks;
@@ -139850,6 +139851,7 @@ impl Simulator {
             && rand_nd_arrays.is_empty();
         let sub_objs = sub_objs.unwrap_or_default();
         let mut csp_runs = 0u32;
+        let mut rand_diag = rand_diag::rand_diag_enabled().then(rand_diag::RandDiag::default);
         let array_enums: HashMap<String, String> = rand_arrays
             .iter()
             .filter_map(|a| a.5.clone().map(|t| (a.0.clone(), t)))
@@ -141140,6 +141142,9 @@ impl Simulator {
             let mut fe_failed = false;
             let mut all_ok =
                 self.rand_items_accept(handle, &constraints, &rand_colls, &mut fe_failed);
+            if !all_ok && let Some(diag) = rand_diag.as_mut() {
+                self.rand_diag_tally(handle, &constraints, diag);
+            }
             if fe_failed {
                 fixed_fe_fail_streak += 1;
             }
@@ -141295,6 +141300,18 @@ impl Simulator {
                     }
                 }
             }
+        }
+        if let Some(diag) = &rand_diag {
+            self.rand_diag_report(
+                &class_name,
+                &rand_props,
+                &rand_colls,
+                &rand_obj_props,
+                &rand_disabled,
+                &constraint_disabled,
+                &constraints,
+                diag,
+            );
         }
         // §18.4: randomize() failed — no value was actually produced, so give
         // every tentatively-drawn randc value back to its permutation cycle.

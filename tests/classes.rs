@@ -71,6 +71,8 @@ mod rand_array_elem_signedness;
 mod rand_obj_array_elem_constraints;
 #[path = "classes/randomize_args_name_object_members.rs"]
 mod randomize_args_name_object_members;
+#[path = "classes/randomize_failure_diag.rs"]
+mod randomize_failure_diag;
 #[path = "classes/static_fixed_array_storage.rs"]
 mod static_fixed_array_storage;
 #[path = "classes/static_param_class_collection_reuse.rs"]
