@@ -139334,6 +139334,13 @@ impl Simulator {
         } else {
             return Value::zero(32);
         };
+        // §18.6.2: randomize() calls pre_randomize() first and only then
+        // computes the new values — so before anything below reads the
+        // rand_mode / constraint_mode state or the object's members, which
+        // pre_randomize() may change for THIS call (§18.8, §18.9).
+        if self.class_has_method(&class_name, "pre_randomize") {
+            self.exec_pre_randomize_preserving_children(handle);
+        }
 
         let mut rand_props = Vec::new();
         let mut constraints = Vec::new();
@@ -139674,10 +139681,6 @@ impl Simulator {
         // `class_context_stack`; without pushing it the call fell through to the
         // "unknown name" path and silently yielded 0.
         self.class_context_stack.push(Some(class_name.clone()));
-        // SV semantics: randomize() calls pre_randomize() before solving.
-        if self.class_has_method(&class_name, "pre_randomize") {
-            self.exec_pre_randomize_preserving_children(handle);
-        }
         let has_post = self.class_has_method(&class_name, "post_randomize");
 
         // §18.6: a failed enclosing solve restores the rand state of its

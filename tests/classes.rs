@@ -63,6 +63,8 @@ mod nested_same_named_ref_assoc_formal;
 mod param_type_binding_resolves_enclosing_value_param;
 #[path = "classes/parameterized_class_scope.rs"]
 mod parameterized_class_scope;
+#[path = "classes/pre_randomize_mode_changes.rs"]
+mod pre_randomize_mode_changes;
 #[path = "classes/pure_constraint_implemented.rs"]
 mod pure_constraint_implemented;
 #[path = "classes/rand_array_elem_signedness.rs"]
