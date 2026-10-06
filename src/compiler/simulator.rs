@@ -73161,6 +73161,12 @@ impl Simulator {
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
+        if matches!(expr.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. })
+            && !self.local_stack.is_empty()
+            && let Some(v) = self.frame_handle_path_read(expr)
+        {
+            return v;
+        }
         match &expr.kind {
             ExprKind::Ident(h) => {
                 if let Some(v) = self.plain_ident_read(h) {
@@ -77726,6 +77732,99 @@ impl Simulator {
         }
     }
 
+    /// The handle held by `name` when it is a class-handle variable of the
+    /// innermost frame (declared class-typed in that frame's overlay).
+    fn frame_class_handle(&self, name: &str) -> Option<usize> {
+        let v = self.local_stack.last()?.get(name)?;
+        self.local_class_type_of(name)?;
+        v.to_u64().map(|h| h as usize)
+    }
+
+    /// Whether `name`, not a variable of the innermost frame, is a
+    /// class-handle property of the running method's object — the next scope
+    /// out (§8.11) after the frame, ahead of any same-named variable outside
+    /// the class.
+    fn this_class_handle_prop(&self, name: &str) -> bool {
+        if self.local_stack.last().is_some_and(|f| f.contains_key(name)) {
+            return false;
+        }
+        let Some(Some(h)) = self.this_stack.last().copied() else {
+            return false;
+        };
+        let Some(Some(inst)) = self.heap.get(h) else {
+            return false;
+        };
+        self.class_prop_type_named(&inst.class_name, name)
+            .is_some_and(|t| self.module.classes.contains_key(&t))
+    }
+
+    /// §8.11 / §13.3: a member path through a class-handle variable of the
+    /// innermost frame (`item.item`, `item.item.len`), read by following the
+    /// handles. The flat name of the same spelling may belong to an unrelated
+    /// struct variable elsewhere — a module-scope `item` with a member `item`
+    /// — which the local name shadows (#258). `None` for anything else, or
+    /// when a segment is not a plain property, so the general paths decide.
+    fn frame_handle_path_read(&self, expr: &Expression) -> Option<Value> {
+        fn names<'a>(e: &'a Expression, out: &mut Vec<&'a str>) -> Option<()> {
+            match &e.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) =>
+                {
+                    out.extend(h.path.iter().map(|s| s.name.name.as_str()));
+                    Some(())
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    names(expr, out)?;
+                    out.push(member.name.as_str());
+                    Some(())
+                }
+                _ => None,
+            }
+        }
+        let root = match &expr.kind {
+            ExprKind::Ident(h) if h.path.len() >= 2 => h.path[0].name.name.as_str(),
+            ExprKind::MemberAccess { .. } => {
+                let mut e = expr;
+                while let ExprKind::MemberAccess { expr: inner, .. } = &e.kind {
+                    e = inner;
+                }
+                match &e.kind {
+                    ExprKind::Ident(h) => h.path.first()?.name.name.as_str(),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        let mut h = self.frame_class_handle(root)?;
+        let mut cls = self.local_class_type_of(root)?;
+        let mut path = Vec::new();
+        names(expr, &mut path)?;
+        let segs = &path[1..];
+        for (i, seg) in segs.iter().enumerate() {
+            // §8.10 / §8.14: the member is the one the handle's DECLARED
+            // class sees. A static, or a property the object's class
+            // re-declares, is stored elsewhere — the general paths decide.
+            let decl = self.prop_owners(&cls);
+            let (owner, cd) = decl.get(*seg)?;
+            if cd.static_properties.contains(*seg) {
+                return None;
+            }
+            let inst = self.heap.get(h)?.as_ref()?;
+            if self.prop_owners(&inst.class_name).get(*seg)?.0 != *owner {
+                return None;
+            }
+            let v = inst.properties.get(*seg)?;
+            if i + 1 == segs.len() {
+                return Some(v.clone());
+            }
+            cls = self
+                .class_prop_type_named(owner, seg)
+                .filter(|t| self.module.classes.contains_key(t))?;
+            h = v.to_u64()? as usize;
+        }
+        None
+    }
+
     /// The member-wise struct type of whole-value copy target `dst`, with the
     /// name it was found under: `dst` itself or, when `dst` has no declared
     /// type, `dst` under the resolution hint.
@@ -77733,6 +77832,13 @@ impl Simulator {
         &self,
         dst: String,
     ) -> (String, Option<crate::ast::types::StructUnionType>) {
+        // §13.3 / §8.11: a class-handle variable of the running subroutine,
+        // or a class-handle property of its object, is not a struct, whatever
+        // a same-named variable elsewhere is declared as — `var_decl_types`
+        // is keyed by the bare name and shared by every process (#258).
+        if self.frame_class_handle(&dst).is_some() || self.this_class_handle_prop(&dst) {
+            return (dst, None);
+        }
         // A whole dynamic/fixed/associative ARRAY of structs is not itself a
         // struct target: `b = a` copies elements (the collection copy), and
         // spreading it member-wise would drop every element's leaves.
