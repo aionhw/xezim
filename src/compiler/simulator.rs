@@ -117797,6 +117797,37 @@ impl Simulator {
         }
     }
 
+    /// A specialization written as an `extends` argument (`base#(REQ)` in
+    /// `class sqr #(type REQ) extends wrap #(.BASE(base #(REQ)))`) with the
+    /// child's parameter names inside its `#(...)` replaced by their carried
+    /// bindings, in one pass so a binding is never re-substituted (§8.25).
+    /// Anything else is returned as written.
+    fn carry_spec_arg_names(
+        arg: &str,
+        carried: &std::collections::HashMap<String, String>,
+    ) -> String {
+        let Some(open) = arg.find("#(") else {
+            return arg.to_string();
+        };
+        let (head, args) = arg.split_at(open);
+        let mut out = String::with_capacity(arg.len());
+        out.push_str(head);
+        let mut ident = String::new();
+        for ch in args.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+                ident.push(ch);
+                continue;
+            }
+            if !ident.is_empty() {
+                out.push_str(carried.get(&ident).map_or(&ident, |b| b));
+                ident.clear();
+            }
+            out.push(ch);
+        }
+        out.push_str(carried.get(&ident).map_or(&ident, |b| b));
+        out
+    }
+
     /// The declared default of type parameter `tp` of `cd` as a fragment
     /// WITH its `#(...)` arguments (`uvm_sequence#(uvm_reg_item)`), when it
     /// is a specialized class type.
@@ -119357,7 +119388,12 @@ impl Simulator {
                         .filter(|a| Self::spec_projection(a).is_none())
                     {
                         let a = arg.trim();
-                        Some(carried.get(a).cloned().unwrap_or_else(|| a.to_string()))
+                        Some(
+                            carried
+                                .get(a)
+                                .cloned()
+                                .unwrap_or_else(|| Self::carry_spec_arg_names(a, &carried)),
+                        )
                     } else if let Some(arg) = cd.extends_type_args.get(i) {
                         // `BASE#[i]`: the argument of this class's binding of
                         // its base type parameter, else the parent's default.
@@ -148860,7 +148896,20 @@ impl Simulator {
                                 self.var_typedef_types
                                     .insert(port.name.name.clone(), type_name);
                             }
-                        } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
+                        } else if let Some(concrete) = self
+                            .heap
+                            .get(handle)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|i| i.type_bindings.get(&type_name).cloned())
+                            .or_else(|| self.resolve_type_param_binding(&type_name))
+                        {
+                            // The receiver's own binding first: `current_spec`
+                            // is not switched to the receiver until the body
+                            // runs, and may still name another specialization
+                            // (one a blocked process left behind), so `T` of
+                            // `fifo #(item)` resolved as `fifo #(msg_t)`'s
+                            // struct and the class handle `t` went unrecorded.
+                            //
                             // See the identical branch in exec_function_call's
                             // port loop: the formal is typed with a class TYPE
                             // PARAMETER (`IMP imp`), not a real class name. It
