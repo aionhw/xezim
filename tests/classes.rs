@@ -93,6 +93,8 @@ mod struct_member_bitselect_frame_local;
 mod subroutine_formal_frame_type;
 #[path = "classes/this_collection_struct_members.rs"]
 mod this_collection_struct_members;
+#[path = "classes/this_path_state_soft_randomize.rs"]
+mod this_path_state_soft_randomize;
 #[path = "classes/this_super_member.rs"]
 mod this_super_member;
 #[path = "classes/type_param_base_class.rs"]

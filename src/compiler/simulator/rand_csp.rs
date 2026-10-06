@@ -2920,6 +2920,18 @@ impl Simulator {
                     push_name(&n, out);
                     return true;
                 }
+                // §8.11: `this.a…` names what the path `a…` names. Settle it
+                // like the Ident arm — a lone member reads that member, a
+                // field of a packed-struct variable reads the variable, and
+                // anything else through a handle is state — rather than
+                // descending to `this`, which reads as unanalyzable.
+                if let Some(path) = Self::csp_member_path(e)
+                    && path.len() >= 2
+                    && path[0] == "this"
+                {
+                    push_name(&path[1], out);
+                    return true;
+                }
                 if member.name == "index" {
                     if let ExprKind::Ident(h) = &expr.kind {
                         if let Some((it, _, _)) = &env.it {
