@@ -136291,8 +136291,8 @@ impl Simulator {
         enclosing: &Option<(String, String)>,
     ) -> Option<(String, String)> {
         let (base, sig) = spec?;
-        let resolved = sig
-            .split(',')
+        let resolved = Self::split_spec_args(&sig)
+            .iter()
             .map(|part| {
                 let p = part.trim();
                 if let Some(r) = self.resolve_type_param_with(p, enclosing) {

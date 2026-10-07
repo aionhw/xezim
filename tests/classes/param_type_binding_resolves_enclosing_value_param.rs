@@ -15,6 +15,18 @@
 //! state.
 use std::process::Command;
 
+#[test]
+fn nested_static_call_resolves_both_enclosing_value_params() {
+    let src = include_str!("nested_static_call_type_params.sv");
+    let sim = xezim::simulate(src, 10).expect("nested static specialization must simulate");
+    assert!(
+        sim.output
+            .iter()
+            .any(|line| line.message == "NESTED_SPEC_PASS"),
+        "nested types with multiple arguments must preserve each specialization's static state"
+    );
+}
+
 fn xezim() -> String {
     let mut p = std::env::current_exe().expect("current_exe");
     p.pop();
