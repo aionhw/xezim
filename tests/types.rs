@@ -189,6 +189,8 @@ mod packed_struct_member_width;
 mod param_cb_isolation;
 #[path = "types/param_registry_typeid_identity.rs"]
 mod param_registry_typeid_identity;
+#[path = "types/param_range_signedness.rs"]
+mod param_range_signedness;
 #[path = "types/param_signedness_and_generate_scope.rs"]
 mod param_signedness_and_generate_scope;
 #[path = "types/param_sized_array.rs"]
