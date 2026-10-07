@@ -270,6 +270,8 @@ mod covergroup_sample_args;
 mod covergroup_sampling_event;
 #[path = "classes/factory_run_test.rs"]
 mod factory_run_test;
+#[path = "classes/factory_typedef_chain.rs"]
+mod factory_typedef_chain;
 #[path = "classes/foreach_member_multidim.rs"]
 mod foreach_member_multidim;
 #[path = "classes/generate_and_class_parameters.rs"]

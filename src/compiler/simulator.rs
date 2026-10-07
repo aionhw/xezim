@@ -126250,7 +126250,8 @@ impl Simulator {
                         }
                         // §6.18/§8.23: `Alias::typedef::method(args)` where the
                         // FIRST segment `pkg` is a MODULE-LEVEL TYPEDEF ALIAS to a
-                        // parameterized class (`typedef base_class#(9) BaseType;`),
+                        // class (`typedef base_class#(9) BaseType;` or a chain of
+                        // plain class aliases),
                         // and `cls` is a member typedef of that class
                         // (`BaseType::type_id::get()` where `base_class` declares
                         // `typedef uvm_object_registry#(base_class#(P)) type_id;`).
@@ -126267,7 +126268,11 @@ impl Simulator {
                             .is_some_and(|m| m.contains_key(pkg.as_str()))
                             && !self.signal_name_to_id.contains_key(pkg.as_str())
                         {
-                            if let Some((alias_base, alias_sig)) = self.resolve_typedef_spec(pkg)
+                            if let Some((alias_base, alias_sig)) =
+                                self.resolve_typedef_spec(pkg).or_else(|| {
+                                    self.resolve_simple_typedef_class(pkg)
+                                        .map(|base| (base, String::new()))
+                                })
                                 && self.module.classes.contains_key(&alias_base)
                             {
                                 // Resolve the member typedef within the alias's
@@ -127713,6 +127718,31 @@ impl Simulator {
         if let ExprKind::Ident(hier) = &func.kind {
             let path = &hier.path;
             let len = path.len();
+
+            // §6.18/§8.23: resolve a plain typedef receiver before dispatching
+            // Alias::member_type::method (or pkg::Alias::member_type::method).
+            // Following the real class's member typedef executes the registry
+            // method, including factory overrides, rather than constructing
+            // the aliased class directly at the type_id::create shortcut.
+            if (len == 3 || len == 4 && self.module.packages.contains(&path[0].name.name))
+                && path.iter().all(|s| s.selects.is_empty())
+                && !self
+                    .local_stack
+                    .last()
+                    .is_some_and(|m| m.contains_key(&path[0].name.name))
+                && !self.signal_name_to_id.contains_key(&path[0].name.name)
+            {
+                let receiver = len - 3;
+                if !self.module.classes.contains_key(&path[receiver].name.name)
+                    && let Some(class_name) =
+                        self.resolve_simple_typedef_class(&path[receiver].name.name)
+                {
+                    let mut resolved = hier.clone();
+                    resolved.path[receiver].name.name = class_name;
+                    let call = Expression::new(ExprKind::Ident(resolved), func.span);
+                    return self.eval_call_inner(&call, args);
+                }
+            }
 
             // IEEE 1800-2017 §8.15: `super.m(args)` whose call flattened into
             // a hierarchical Ident([super, m]) (the statement-level parse

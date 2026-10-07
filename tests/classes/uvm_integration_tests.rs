@@ -300,6 +300,29 @@ fn uvm_2020_factory_type_override() {
     );
 }
 
+/// §6.18/§8.23: a class alias must reach the same registry and factory as
+/// the class name. In particular, create must still apply type overrides.
+#[test]
+fn uvm_2020_factory_typedef_chain_honors_override() {
+    let src = CFG_TEST.replace(
+        "class cfg_test extends uvm_test;",
+        "typedef base_c base_alias;\ntypedef base_alias chained_alias;\nclass cfg_test extends uvm_test;",
+    );
+    for receiver in ["base_alias", "chained_alias"] {
+        let src = src.replace(
+            "comp = base_c::type_id::create",
+            &format!("comp = {receiver}::type_id::create"),
+        );
+        let sim =
+            run_uvm("1800.2-2020", &[], src, "top").expect("factory alias override must simulate");
+        let out: Vec<_> = sim.output.iter().map(|o| o.message.as_str()).collect();
+        assert!(
+            out.iter().any(|line| line.contains("kind=deriv")),
+            "{receiver} must preserve the factory override: {out:?}"
+        );
+    }
+}
+
 /// Restoration of the shim-era `analysis_imp_decl_test.sv` (removed with the
 /// PURE_SV_LRM=0 intercepts in 8bace9e without a native successor): two
 /// `uvm_analysis_imp_decl` suffixed imps must route `port.write()` through
