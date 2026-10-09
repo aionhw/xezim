@@ -16071,6 +16071,19 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                     if let Some(id) = self.lookup_signal_id(hier) {
+                        // §6.16: a character-indexed write into a STRING
+                        // signal (`s[2] = "r"`) is a string splice, not a bit
+                        // write, but `BlockingAssignBitDyn` below would
+                        // bit-bash the byte-vector container. Defer the whole
+                        // target to the AST interpreter, which routes it
+                        // through the string-char arm of `assign_value_index`.
+                        if self.signal_is_string_name(hier) {
+                            // Defer to the AST interpreter, whose
+                            // `assign_value_index` string-char arm splices a
+                            // byte rather than bit-bashing the container.
+                            self.bail("blocking_target_string_char");
+                            return false;
+                        }
                         // Packed multi-D LHS: `mem_n[i] = data_i` for
                         // `logic [N-1:0][W-1:0] mem_n` must write a W-bit
                         // slice at `i*W +: W`, not a single bit. Emit a

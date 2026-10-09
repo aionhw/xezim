@@ -4105,6 +4105,11 @@ struct TaskCleanup {
     /// all, so a `task push(ref int q[$])` pushed into storage named after the
     /// FORMAL and the caller's queue never changed.
     queue_writebacks: Vec<(String, String)>,
+    /// String-typed formals registered in `string_signals` for the duration of
+    /// this frame so `s[i]` byte-selects (a character write) instead of the
+    /// frame-local unpacked-struct bit-slice arm. Removed on unwind (mirrors
+    /// the free-function and class-method frame paths).
+    frame_string_signals: Vec<String>,
     saved_break: bool,
     saved_continue: bool,
     saved_return: bool,
@@ -36770,6 +36775,8 @@ impl Simulator {
                         &self.module.queue_vars,
                     );
                     compiler.set_array_first_id(&self.array_first_id);
+                    compiler.set_string_signals(&self.module.string_signals);
+                    compiler.set_signal_real(&self.signal_real);
                     compiler.top_module_name = Some(self.module.name.clone());
                     // Enable AST fallback so partially-unsupported constructs
                     // compile to StmtFallback insns instead of failing the
@@ -63186,6 +63193,79 @@ impl Simulator {
         Some(changed)
     }
 
+    /// §6.16: a character-indexed write `s[i] = byte` through a base the
+    /// flat-name string path cannot see. The string-char block in
+    /// `assign_value_index` keys on `string_signals` + a resolvable flat
+    /// `name`, so it misses:
+    ///   - a CLASS-member string (`this.s[i]`, `c.s[i]`, `C::s[i]`), a
+    ///     `MemberAccess` base with no flat signal name, and
+    ///   - a string-array / string-queue ELEMENT (`sa[k][i]`, `q[k][i]`),
+    ///     which arrives here with `expr` = `sa[k]` (an `Index`), not the
+    ///     collection name.
+    /// Both would otherwise byte-select into the packed container (bit-bash)
+    /// or vanish. Reads the current string, replaces byte `i`, and stores the
+    /// whole string back via `assign_value` — exactly what the flat-name block
+    /// does. Returns `None` when the base is not one of these shapes or is not
+    /// string-valued, so callers fall through to the existing arms unchanged.
+    fn try_string_index_char_write(
+        &mut self,
+        expr: &Expression,
+        index: &Expression,
+        val: &Value,
+    ) -> Option<bool> {
+        // Only the two basic shapes the flat-name block can't reach, plus the
+        // dotted-Ident form (`c.s` parses as a two-segment HierarchicalIdentifier
+        // when the receiver is a module-scope handle, vs. the MemberAccess shape
+        // `this.s` gets inside a method). A single-segment bare Ident in
+        // `string_signals` already lands in the flat-name block, and a whole
+        // collection-name write (`sa[1] = "..."`) must NOT be char-spliced.
+        let is_member = matches!(&expr.kind, ExprKind::MemberAccess { .. });
+        let is_elem = matches!(&expr.kind, ExprKind::Index { .. });
+        let is_dotted_ident = matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() >= 2);
+        if !is_member && !is_elem && !is_dotted_ident {
+            return None;
+        }
+        if !self.expr_is_string_valued(expr) {
+            return None;
+        }
+        // Defensive: a whole-COLLECTION write (`sa[1] = ...`, `c.sa[k] = ...`)
+        // is an element write, not a character write. A string ARRAY / QUEUE
+        // has string ELEMENTS, so reading the bare collection name is
+        // string-Valued and would otherwise be mistaken for a single string
+        // and char-spliced (this dropped string-keyed assoc element writes in
+        // a foreach). The index base `sa[k]` resolves to the ELEMENT's flat
+        // name (not in a collection set), so genuine `sa[k][i]` char writes
+        // still pass; only the dotted/member collection name is excluded.
+        // Module-scope collections live in `module.*`; class-member
+        // collections (`obj.sa`) are resolved by receiver-class ancestry.
+        if self.class_member_is_collection(expr) {
+            return None;
+        }
+        if let Some(fm) = self.flat_member_name(expr) {
+            let hits = |n: &str| {
+                self.module.arrays.contains_key(n)
+                    || self.module.queue_vars.contains(n)
+                    || self.module.dynamic_arrays.contains(n)
+                    || self.module.associative_arrays.contains_key(n)
+            };
+            if hits(&fm) || fm.rsplit(['.', '[', ']']).next().is_some_and(|l| hits(l)) {
+                return None;
+            }
+        }
+        let content = self.eval_expr(expr).to_sv_string();
+        let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
+        let cbyte = (val.resize(8).to_u64().unwrap_or(0) & 0xFF) as u8;
+        let mut b = content.into_bytes();
+        if i < b.len() && cbyte != 0 {
+            b[i] = cbyte;
+            let out = String::from_utf8_lossy(&b).into_owned();
+            // A `Value` may carry string metadata; store the freshly rebuilt
+            // string so the element keeps its string-ness.
+            return Some(self.assign_value(expr, &Value::from_string(&out)));
+        }
+        Some(false)
+    }
+
     /// Outlined from `assign_value_inner` (see `exec_stmt_blocking_assign`): keeps
     /// the dispatcher's stack frame small.
     #[inline(never)]
@@ -63196,6 +63276,9 @@ impl Simulator {
         expr: &Box<Expression>,
         index: &Box<Expression>,
     ) -> bool {
+        if let Some(r) = self.try_string_index_char_write(expr, index, val) {
+            return r;
+        }
         // §7.4.1 / §11.5.1: BIT write into an ELEMENT of an unpacked
         // array/queue/assoc whose declared packed range needs label
         // mapping (`logic [31:8] a[0:0]; a[0][8] = b` — storage bit
@@ -87924,6 +88007,40 @@ impl Simulator {
         self.class_string_props_of(&inst.class_name)
             .iter()
             .any(|p| *p == prop)
+    }
+
+    /// Does `expr` resolve to a COLLECTION property (assoc / queue / dynamic-
+    /// array / fixed array) of its receiver's class? Complements
+    /// `class_member_is_string`: a `string[string]` / `string[$]` member is
+    /// STRING-VALUED when read as a bare collection name, but a write into it
+    /// (`c.sa[k] = ...`, a foreach assoc-element store) is an ELEMENT write,
+    /// NOT a character splice. Resolve the receiver handle exactly as
+    /// `class_member_is_string` does, then consult the class's collection
+    /// property sets.
+    fn class_member_is_collection(&self, expr: &Expression) -> bool {
+        let (handle_opt, prop): (Option<usize>, String) = match &expr.kind {
+            ExprKind::MemberAccess { expr: recv, member } => {
+                let h = match &recv.kind {
+                    ExprKind::This => self.this_stack.last().copied().flatten(),
+                    ExprKind::Ident(hier) if hier.path.len() == 1 => {
+                        self.peek_local_handle(&hier.path[0].name.name)
+                    }
+                    _ => None,
+                };
+                (h, member.name.clone())
+            }
+            // `obj.col` / `c.sa` (two-segment HierarchicalIdentifier): the
+            // receiver is the head handle.
+            ExprKind::Ident(hier) if hier.path.len() == 2 => {
+                (self.peek_local_handle(&hier.path[0].name.name), hier.path[1].name.name.clone())
+            }
+            _ => return false,
+        };
+        let Some(handle) = handle_opt else { return false };
+        let Some(inst) = self.heap.get(handle).and_then(|c| c.as_ref()) else {
+            return false;
+        };
+        self.class_assoc_member(&inst.class_name, &prop)
     }
 
     /// Peek a class-typed procedural local's heap handle WITHOUT mutating
@@ -134174,6 +134291,18 @@ impl Simulator {
         self.ref_identity_stack.pop();
         self.refresh_ref_redirect_hot();
         self.local_iface_aliases.pop();
+        // §23.8: stop leaking this frame's string-typed formal names into the
+        // global `string_signals` set now that the body is done; restore the
+        // frame-scoped snapshot (mirrors the free-function and class-method
+        // frame paths).
+        for n in &c.frame_string_signals {
+            self.string_signals.remove(n);
+        }
+        if let Some(removed) = self.string_signals_removed.pop() {
+            for n in removed {
+                self.string_signals.insert(n);
+            }
+        }
         self.continue_flag = c.saved_continue;
         self.sync_static_locals();
         let locals = self.pop_local_frame_take().unwrap_or_default();
@@ -135242,6 +135371,23 @@ impl Simulator {
         self.ref_alias_stack.push(alias_map);
         self.ref_identity_stack.push(identity_formals);
         self.refresh_ref_redirect_hot();
+        // §23.8: register string-typed FORMALS in `string_signals` for the
+        // duration of this frame so `s[i]` byte-selects (a character write)
+        // instead of hitting the frame-local unpacked-struct bit-slice arm
+        // (a task `ref string s` formal is a frame local, not a registered
+        // signal, so the free-function/class-method registration was the
+        // only thing absent here). Frame-scoped: remember each newly-added
+        // name and the snapshot so the unwind can restore exactly those,
+        // exactly as the function and class-method frame paths do.
+        self.string_signals_removed.push(Vec::new());
+        let mut frame_string_signals: Vec<String> = Vec::new();
+        for port in &td.ports {
+            if Self::is_string_data_type(&port.data_type) {
+                if self.string_signals.insert(port.name.name.clone()) {
+                    frame_string_signals.push(port.name.name.clone());
+                }
+            }
+        }
         self.return_value = None;
         let saved_break = self.break_flag;
         let saved_continue = self.continue_flag;
@@ -135275,6 +135421,7 @@ impl Simulator {
             output_bindings,
             assoc_params,
             array_params,
+            frame_string_signals,
             saved_break,
             saved_continue,
             saved_return,

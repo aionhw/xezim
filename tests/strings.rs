@@ -79,6 +79,8 @@ mod ref_arg_collection_writeback;
 mod string_eq_relational_2state;
 #[path = "strings/string_index_write_frame_local.rs"]
 mod string_index_write_frame_local;
+#[path = "strings/string_char_index_write_followups.rs"]
+mod string_char_index_write_followups;
 #[path = "strings/string_flag_not_clobbered_by_samed_name_local.rs"]
 mod string_flag_not_clobbered_by_samed_name_local;
 #[path = "strings/string_index_ref_queue.rs"]
