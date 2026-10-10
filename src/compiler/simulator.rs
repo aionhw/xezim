@@ -3875,6 +3875,16 @@ type FormalDynSetup = (usize, Vec<(String, String)>, Vec<(String, String)>);
 struct ProcessContext {
     this_stack: Vec<Option<usize>>,
     local_stack: Vec<HashMap<String, Value>>,
+    /// Per blocking-loop shadow saves (§6.21): for each active suspend-aware
+    /// `foreach` whose body declares a block-local that shadows an enclosing
+    /// local, the outer value of each shadowed name, captured at loop entry
+    /// and restored on loop exit (return/break/exhausted). Stored here so it
+    /// rides process suspension like `local_stack`. Empty inner Vec means no
+    /// scope was isolated for that loop. Mirrors `saved_shadows` in the
+    /// synchronous SeqBlock path, but across the flattened blocking body (no
+    /// throwaway frame is pushed, so `local_stack.last()` keeps pointing at
+    /// the method frame and handle resolution / phasing is undisturbed).
+    loop_shadow_restores: Vec<Vec<(String, Option<Value>)>>,
     /// Parallel to `local_stack`: the frame generation each slot was pushed
     /// with. Two different method activations never share a generation even
     /// when they occupy the same slot index, so a fork child can tell whether
@@ -6461,6 +6471,8 @@ pub struct Simulator {
     /// are bound in the caller's context.
     task_clears_this: bool,
     local_stack: Vec<HashMap<String, Value>>,
+    /// Per blocking-loop shadow saves; see `ProcessContext::loop_shadow_restores`.
+    loop_shadow_restores: Vec<Vec<(String, Option<Value>)>>,
     /// Parallel to `local_stack`: the frame generation each slot was pushed
     /// with (see `ProcessContext::local_gen_stack`). Kept on the active
     /// `Simulator` exactly like `local_stack`, and moved into/out of a
@@ -11952,6 +11964,7 @@ impl Simulator {
             this_stack: vec![],
             task_clears_this: false,
             local_stack: vec![],
+            loop_shadow_restores: vec![],
             local_gen_stack: Vec::new(),
             class_context_stack: vec![],
             method_local_base: vec![],
@@ -44293,6 +44306,30 @@ impl Simulator {
             return;
         }
 
+        self.promote_condition_waiters_for_names(&target_names);
+    }
+
+    /// Re-check parked condition waiters whose condition names one of
+    /// `target_names`, promoting those now true to `ready_condition_waiters`.
+    /// Shared by `check_condition_waiters_for_write` (a blocking procedural
+    /// write) and the fork-child merge path (a child's write propagating back
+    /// into a parked parent's activation). The promotion is what unblocks the
+    /// waiter inside a long-running edge cascade, which drains only READY
+    /// waiters (`ready_condition_waiters`) and would otherwise starve a parked
+    /// (§9.4.2) condition-maintained handshake.
+    fn promote_condition_waiters_for_names(&mut self, target_names: &[String]) {
+        if self.condition_waiters.is_empty() {
+            return;
+        }
+        let any_match = self.condition_waiters.iter().any(|(pid, _)| {
+            self.cond_waiter_reads
+                .get(pid)
+                .is_some_and(|reads| target_names.iter().any(|tn| reads.contains(tn)))
+        });
+        if !any_match {
+            return;
+        }
+
         let mut i = 0;
         while i < self.condition_waiters.len() {
             let (pid, _) = self.condition_waiters[i];
@@ -48152,6 +48189,7 @@ impl Simulator {
         ProcessContext {
             this_stack: self.this_stack.clone(),
             local_stack: self.local_stack.clone(),
+            loop_shadow_restores: self.loop_shadow_restores.clone(),
             local_gen_stack: self.local_gen_stack.clone(),
             local_type_stack: self.local_type_stack.clone(),
             class_context_stack: self.class_context_stack.clone(),
@@ -48239,6 +48277,7 @@ impl Simulator {
         ProcessContext {
             this_stack: std::mem::take(&mut self.this_stack),
             local_stack: std::mem::take(&mut self.local_stack),
+            loop_shadow_restores: std::mem::take(&mut self.loop_shadow_restores),
             local_gen_stack: std::mem::take(&mut self.local_gen_stack),
             local_type_stack: std::mem::take(&mut self.local_type_stack),
             class_context_stack: std::mem::take(&mut self.class_context_stack),
@@ -48265,6 +48304,7 @@ impl Simulator {
     fn restore_process_context(&mut self, ctx: ProcessContext) {
         self.this_stack = ctx.this_stack;
         self.local_stack = ctx.local_stack;
+        self.loop_shadow_restores = ctx.loop_shadow_restores;
         self.local_gen_stack = ctx.local_gen_stack;
         self.local_type_stack = ctx.local_type_stack;
         self.class_context_stack = ctx.class_context_stack;
@@ -49150,6 +49190,51 @@ impl Simulator {
             Self::recycle_string(&mut self.hint_string_pool, mine);
             return;
         }
+        // A schedule entry for a pid that is NOT a fork child created by
+        // `inherit_fork_child_context` (so absent from `process_contexts`)
+        // but whose working context is LIVE on the stack is a resumed PARENT
+        // — a continuation trampolined through the event queue by
+        // `continue_stmts_or_trampoline` when the `run_process_stmts`
+        // recursion crossed `RPS_TRAMPOLINE_DEPTH`. Its `this`/frames must
+        // stay in place for the body (e.g. a `foreach (m_fields[i])` on a
+        // UVM register that resolves `this`). The fork-child dance below
+        // would `take_process_context()` the live frames, restore an EMPTY
+        // table entry (`unwrap_or_default()` — this pid was never parked
+        // there), run the body context-less, and only put `this` back at
+        // the end — too late, the reads already saw null → null-deref. Run
+        // the payload directly so the live context is preserved, parking a
+        // snapshot into the table only if the body suspends. Requires
+        // `saved_ctx_needed` (there IS a live context worth keeping),
+        // `method_local_base` non-empty (the continuation is inside an
+        // inlined task-method, so the live `this` is genuinely the method's
+        // receiver and must stay — NOT a frame leaked onto a module-scope
+        // process after a fork/join), and `process_parents.get(&pid).is_none()`
+        // (a genuine fork child — which does have a parent entry — still
+        // takes the fork-dance below and gets its `this`/locals isolated
+        // from the parent's live stack).
+        if saved_ctx_needed
+            && !has_pid_ctx
+            && !self.method_local_base.is_empty()
+            && self.process_parents.get(&pid).is_none()
+        {
+            self.run_process_payload(pid, stmts);
+            let susp = self.is_pid_suspended(pid);
+            if susp
+                && (!self.this_stack.is_empty()
+                    || !self.local_stack.is_empty()
+                    || !self.class_context_stack.is_empty()
+                    || !self.method_local_base.is_empty())
+            {
+                self.process_contexts
+                    .insert(pid, self.snapshot_process_context());
+            } else {
+                self.process_contexts.remove(&pid);
+            }
+            self.auto_loop_vars.truncate(saved_auto_len);
+            let mine = self.name_resolve_hint.replace(saved_hint);
+            Self::recycle_string(&mut self.hint_string_pool, mine);
+            return;
+        }
         // The caller's context is MOVED aside (the restore below overwrites
         // every field, so a clone bought nothing) and moved back at the end.
         let mut saved = self.take_process_context();
@@ -49179,28 +49264,39 @@ impl Simulator {
         //       into `self.signals`, which is what the parent reads from.
         let child_frames: &[HashMap<String, Value>] = &child_ctx.local_stack;
         let child_frames_gen: &[u64] = &child_ctx.local_gen_stack;
-        let baseline = self.fork_baselines.get(&pid);
-        let signal_caps = self.fork_signal_captures.get(&pid);
+        let baseline = self.fork_baselines.get(&pid).cloned();
+        let signal_caps = self.fork_signal_captures.get(&pid).cloned();
         if !child_frames.is_empty() {
             if let Some(parent_pid) = self.process_parents.get(&pid).copied() {
                 // (a) subroutine-frame merge
-                if let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) {
-                    Self::merge_fork_writes(
+                let (written, _parent_in_pctx) = if let Some(parent_ctx) =
+                    self.process_contexts.get_mut(&parent_pid)
+                {
+                    let w = Self::merge_fork_writes(
                         &mut parent_ctx.local_stack,
                         &parent_ctx.local_gen_stack,
                         child_frames,
                         child_frames_gen,
-                        baseline,
+                        baseline.as_ref(),
                     );
+                    (w, true)
                 } else {
                     // Parent is the active process — its context is `saved`.
-                    Self::merge_fork_writes(
+                    let w = Self::merge_fork_writes(
                         &mut saved.local_stack,
                         &saved.local_gen_stack,
                         child_frames,
                         child_frames_gen,
-                        baseline,
+                        baseline.as_ref(),
                     );
+                    (w, false)
+                };
+                if !written.is_empty() {
+                    // A child wrote a key a parked `wait` of the parent reads —
+                    // promote it to ready so a long-running edge cascade (which
+                    // drains only READY waiters) unblocks the handshake instead
+                    // of starving it.
+                    self.promote_condition_waiters_for_names(&written);
                 }
             }
         }
@@ -49210,11 +49306,12 @@ impl Simulator {
         // clobber a sibling's or the parent's concurrent write.
         if let Some(caps) = signal_caps {
             let top = child_frames.last();
-            for nm in caps {
+            for nm in &caps {
                 let Some(v) = top.and_then(|f| f.get(nm)) else {
                     continue;
                 };
                 let inherited_unchanged = baseline
+                    .as_ref()
                     .and_then(|b| b.last())
                     .and_then(|f| f.get(nm))
                     .is_some_and(|old| old == v);
@@ -49902,13 +49999,17 @@ impl Simulator {
     /// clobber the unrelated activation that now occupies the same slot
     /// (regression 3627: an alpha reader orphaned by `join_any` kept overwriting
     /// beta's `count` with its own stale value).
+    /// Returns the names of keys actually propagated (child value differs
+    /// from both baseline and parent, so a real write landed). The caller
+    /// uses this to promote parked condition waiters that read those names.
     fn merge_fork_writes(
         parent_frames: &mut [HashMap<String, Value>],
         parent_gens: &[u64],
         child_frames: &[HashMap<String, Value>],
         child_gens: &[u64],
         baseline: Option<&Vec<HashMap<String, Value>>>,
-    ) {
+    ) -> Vec<String> {
+        let mut written = Vec::new();
         let n = parent_frames.len().min(child_frames.len());
         for i in 0..n {
             let same_activation = parent_gens.get(i).copied() == child_gens.get(i).copied();
@@ -49940,6 +50041,7 @@ impl Simulator {
                             *slot = v.clone();
                             // A parked `wait` of the parent may read it.
                             note_store_write(name_bit(k));
+                            written.push(k.clone());
                         }
                     }
                 }
@@ -49960,12 +50062,14 @@ impl Simulator {
                             *slot = v.clone();
                             // A parked `wait` of the parent may read it.
                             note_store_write(name_bit(k));
+                            written.push(k.clone());
                         }
                     }
                     None => continue,
                 }
             }
         }
+        written
     }
 
     /// Evaluate a `#delay` expression to an integer number of simulator ticks.
@@ -50957,7 +51061,18 @@ impl Simulator {
                                 .flatten()
                             {
                                 if self.stmts_have_blocking(&td.items) {
-                                    let cleanup = self.bind_task_frame(&td, args, None);
+                                    let mut cleanup = self.bind_task_frame(&td, args, None);
+                                    // §13.4/§13.3.2: a free task body must NOT
+                                    // see the caller's class context — task-scope
+                                    // `static` locals key off
+                                    // `class_context_stack` at their declaration,
+                                    // so an unshielded body silently gave every
+                                    // CALLING CLASS its own copy of the static
+                                    // cell (uvm_wait_for_nba_region's shared
+                                    // nba/next_nba barrier split per caller
+                                    // class). Self-guarded: only shields when
+                                    // the caller actually has a `this`.
+                                    self.push_instance_task_context(&mut cleanup);
                                     self.task_cleanup.push(cleanup);
                                     let mut cont: Vec<Statement> = td.items.clone();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -50982,7 +51097,10 @@ impl Simulator {
                 if let ExprKind::Call { func, args } = &expr.kind {
                     if let Some(td) = self.package_task_target(func) {
                         if self.stmts_have_blocking(&td.items) {
-                            let cleanup = self.bind_task_frame(&td, args, None);
+                            let mut cleanup = self.bind_task_frame(&td, args, None);
+                            // §13.4/§13.3.2 class-context shield — see the
+                            // bare free-task arm above (Stage 1).
+                            self.push_instance_task_context(&mut cleanup);
                             self.task_cleanup.push(cleanup);
                             let mut cont: Vec<Statement> = td.items.clone();
                             cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -52695,6 +52813,7 @@ impl Simulator {
                     // task's ScopePop (handled by the top-of-loop return_flag
                     // skip). Just exit this foreach without consuming flags.
                     if self.return_flag {
+                        self.exit_loop_shadow_scope();
                         self.auto_loop_vars.truncate(*fe_auto_len);
                         i += 1;
                         continue;
@@ -52702,6 +52821,7 @@ impl Simulator {
                     // A `break` (set WITHOUT return_flag) exits this loop —
                     // consume it, mirroring the synchronous `while` at L30181.
                     if self.break_flag {
+                        self.exit_loop_shadow_scope();
                         self.break_flag = false;
                         self.continue_flag = false;
                         self.auto_loop_vars.truncate(*fe_auto_len);
@@ -52729,6 +52849,7 @@ impl Simulator {
                     };
                     if exhausted {
                         // loop exhausted — restore automatic-loop-var scope
+                        self.exit_loop_shadow_scope();
                         self.auto_loop_vars.truncate(*fe_auto_len);
                         i += 1;
                         continue;
@@ -52870,6 +52991,19 @@ impl Simulator {
                                 self.set_loop_var_aliased(var_scope.as_deref(), vn, kv);
                             }
                             self.continue_flag = false;
+                            // §6.21: isolate a body-local that shadows an
+                            // enclosing local (see `enter_loop_shadow_scope`).
+                            // Rather than push a throwaway frame (which would
+                            // re-point `local_stack.last()` for EVERY lookup in
+                            // the loop and disturb handle resolution / phasing),
+                            // SAVE the overwritten outer binding in the current
+                            // frame and restore it at loop exit. The saved values
+                            // ride process suspension on `loop_shadow_restores`, so
+                            // they survive the loop's blocking body. Evaluating the
+                            // predicate at exit against a live `local_stack` would
+                            // be asymmetric (the method frame lands during the
+                            // body), so the restore set is captured HERE once.
+                            self.enter_loop_shadow_scope(body);
                             let body_stmts = match &body.kind {
                                 StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
                                 _ => vec![(**body).clone()],
@@ -53358,6 +53492,68 @@ impl Simulator {
             }
         }
         false
+    }
+
+    /// §6.21: for a suspend-aware `foreach` body that declares a block-local
+    /// shadowing an enclosing local, capture the outer value of each shadowed
+    /// name so it can be restored on loop exit. See the push-site comment on
+    /// why this prefers save/restore over pushing a throwaway frame. The record
+    /// rides `loop_shadow_restores` across the loop's suspensions. The body's
+    /// VarDecl exec writes the shadow into `local_stack.last()` (the method
+    /// frame), overwriting the outer binding; `exit_loop_shadow_scope` undoes
+    /// it after the loop.
+    fn enter_loop_shadow_scope(&mut self, body: &Statement) {
+        if let StatementKind::SeqBlock { stmts, .. } = &body.kind {
+            let mut saves: Vec<(String, Option<Value>)> = Vec::new();
+            for s in stmts {
+                if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                    for d in declarators {
+                        let nm = d.name.name.as_str();
+                        // Isolate ANY name the loop body is about to clobber in
+                        // the current frame (the body reprograms it): an
+                        // enclosing local or a module signal (which, with a
+                        // frame present, lands in the frame too).
+                        let shadows = self.local_stack.iter().any(|f| f.contains_key(nm))
+                            || self.signal_name_to_id.contains_key(nm);
+                        if shadows && !saves.iter().any(|(n, _)| n == nm) {
+                            let outer = self
+                                .local_stack
+                                .last()
+                                .and_then(|f| f.get(nm).cloned());
+                            saves.push((nm.to_string(), outer));
+                        }
+                    }
+                }
+            }
+            self.loop_shadow_restores.push(saves);
+        } else {
+            self.loop_shadow_restores.push(Vec::new());
+        }
+    }
+
+    /// Restore the outer bindings a blocking `foreach` body's shadowing locals
+    /// overwrote, and pop the restore record — symmetric with
+    /// `enter_loop_shadow_scope` (called once at each of the three ForeachTail
+    /// loop exits: return, break, exhausted). No frame is popped; the restore
+    /// writes the saved values back into the method frame, so
+    /// `local_stack.last()` semantics and handle resolution stay intact.
+    fn exit_loop_shadow_scope(&mut self) {
+        if let Some(saves) = self.loop_shadow_restores.pop() {
+            if !saves.is_empty() {
+                if let Some(f) = self.local_stack.last_mut() {
+                    for (nm, prev) in saves {
+                        match prev {
+                            Some(v) => {
+                                f.insert(nm, v);
+                            }
+                            None => {
+                                f.remove(&nm);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Check if any statements contain blocking constructs (timing, events, wait).
@@ -76153,7 +76349,15 @@ impl Simulator {
         let struct_decl = self.module.var_decl_types.get(&dst).is_some_and(|dt| {
             matches!(self.resolve_dt_ref(dt), DataType::Struct(su) if Self::spreads_member_wise(su))
         });
-        !struct_decl && self.struct_copy_target(dst).1.is_none()
+        // §8.10 / §13.3: a bare name that is an INTEGRAL property of the
+        // running object (`this.s`) is a scalar, not the module/package-scope
+        // variable that a same-named STRUCT type may declare (`var_decl_types`
+        // is keyed by the bare name and shared by every scope). UVM's
+        // field-automation macros assign `s = __rdone__` for an `int s` while
+        // some unrelated global `s` is a struct: without this, the whole-struct
+        // copy path diverts the write and `s` silently stays 0.
+        let this_scalar = self.this_integral_prop(n);
+        (!struct_decl || this_scalar) && (self.struct_copy_target(dst).1.is_none() || this_scalar)
     }
 
     /// Does `flat_member_name(e)` evaluate nothing but plain reads? Its only
@@ -76191,6 +76395,61 @@ impl Simulator {
         let v = self.local_stack[depth].get(name)?;
         let cls = self.local_type_stack.get(depth)?.0.get(name)?;
         Some((v.to_u64()? as usize, cls.as_str()))
+    }
+
+    /// Whether `name` is a scalar INTEGRAL property of the running method's
+    /// object (`this`), regardless of any same-named variable or struct type
+    /// in module/package scope. Returns false when `name` is currently a
+    /// frame local (the innermost frame shadows the property) or when no
+    /// `this` is bound. Used to keep the whole-struct copy branch from
+    /// diverting `s = v` when a global `s` is an unrelated struct.
+    fn this_integral_prop(&self, name: &str) -> bool {
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|f| f.contains_key(name))
+        {
+            return false;
+        }
+        let Some(Some(h)) = self.this_stack.last().copied() else {
+            return false;
+        };
+        let Some(Some(inst)) = self.heap.get(h) else {
+            return false;
+        };
+        let owners = self.prop_owners(&inst.class_name);
+        let Some((_, cd)) = owners.get(name) else {
+            return false;
+        };
+        let Some(prop) = cd.properties.get(name) else {
+            return false;
+        };
+        // Collections and structs: not an integral scalar target.
+        if cd.array_properties.contains_key(name)
+            || cd.assoc_properties.contains_key(name)
+            || cd.queue_properties.contains_key(name)
+            || cd.array_nd_properties.contains_key(name)
+        {
+            return false;
+        }
+        // A class-handle / enum / covergroup-typed property is routed via
+        // `class_prop_type_named`; leave it to the other guards.
+        if self.class_prop_type_named(&inst.class_name, name).is_some() {
+            return false;
+        }
+        // A struct-typed property (declared via typedef) is a real struct
+        // copy target, not an integral scalar.
+        if let Some(tn) = prop.type_name.as_ref() {
+            if self.module.typedef_types.get(tn).is_some_and(|dt| {
+                matches!(
+                    Self::resolve_type_ref(dt, &self.module.typedef_types),
+                    crate::ast::types::DataType::Struct(_)
+                )
+            }) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Whether `name`, not a variable of the innermost frame, is a
@@ -83286,14 +83545,51 @@ impl Simulator {
                 // exactly like the for-loop shadow frame. Only when a direct
                 // child declaration actually collides, so the common case pays
                 // one scan and no allocation.
-                let shadow_frame = self.local_stack.last().is_none()
-                    && stmts.iter().any(|s| match &s.kind {
-                        StatementKind::VarDecl { declarators, .. } => declarators
-                            .iter()
-                            .any(|d| self.signal_name_to_id.contains_key(d.name.name.as_str())),
-                        _ => false,
-                    });
+                //
+                // A block-local may also shadow an ENCLOSING LOCAL (a call
+                // frame is on the stack): the VarDecl exec writes into
+                // `local_stack.last_mut()` (the one shared frame), overwriting
+                // the outer same-named binding, and nothing restores it when
+                // the inner block ends — reads after the block see the
+                // shadow's stale value (UVM's `do_write` owns `uvm_reg_cb_iter
+                // cbs` at task scope and its field-body re-declares `cbs`).
+                // Rather than push a throwaway frame (which would re-point
+                // `local_stack.last()` for EVERY lookup in the block and
+                // disturb handle resolution / `this`-scoped reads), SAVE the
+                // overwritten outer bindings and restore them on exit — the
+                // shadowing writes land in the existing frame and are undone
+                // afterward (same pattern as `push_pattern_bindings`).
+                let mut saved_shadows: Vec<(String, Option<Value>)> = Vec::new();
+                let mut module_signal_shadow = false;
+                {
+                    let frameless = self.local_stack.last().is_none();
+                    for s in stmts {
+                        if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                            for d in declarators {
+                                let nm = d.name.name.as_str();
+                                if frameless && self.signal_name_to_id.contains_key(nm) {
+                                    // Frameless block-local shadowing a module
+                                    // signal: needs the throwaway frame (there
+                                    // is no enclosing local frame to restore
+                                    // into).
+                                    module_signal_shadow = true;
+                                }
+                                if !frameless
+                                    && self.local_stack.iter().any(|f| f.contains_key(nm))
+                                    && !saved_shadows.iter().any(|(n, _)| n == nm)
+                                {
+                                    let f = self.local_stack.last().unwrap();
+                                    saved_shadows.push((nm.to_string(), f.get(nm).cloned()));
+                                }
+                            }
+                        }
+                    }
+                }
+                let shadow_frame = module_signal_shadow;
                 if shadow_frame {
+                    // The frameless module-signal shadow has no enclosing local
+                    // frame to save/restore into, so isolate it with a
+                    // throwaway frame (as originally).
                     self.push_local_frame(HashMap::default());
                 }
                 // `automatic` locals declared in this block (see the VarDecl
@@ -83319,6 +83615,23 @@ impl Simulator {
                 }
                 if shadow_frame {
                     self.pop_local_frame();
+                }
+                // Restore outer bindings the block's shadowing locals
+                // overwrote, so reads after the block see the enclosing value
+                // again (frame-model block-local scoping; see above).
+                if !saved_shadows.is_empty() {
+                    if let Some(f) = self.local_stack.last_mut() {
+                        for (nm, prev) in saved_shadows {
+                            match prev {
+                                Some(v) => {
+                                    f.insert(nm, v);
+                                }
+                                None => {
+                                    f.remove(&nm);
+                                }
+                            }
+                        }
+                    }
                 }
                 self.auto_loop_vars.truncate(seq_auto_len);
                 // A `disable` naming THIS block ends here; execution resumes
@@ -134096,9 +134409,19 @@ impl Simulator {
             .or_else(|| self.module.func_decl_scope.get(&td.name.name.name).cloned());
         let mut cleanup = self.bind_task_frame(td, args, None);
         self.open_decl_shadow_frame();
-        if std::mem::take(&mut self.task_clears_this) {
-            self.push_instance_task_context(&mut cleanup);
-        }
+        // Consume the flag so a stale set at a call site cannot leak into a
+        // later invocation (it is subsumed by the unconditional shield
+        // below).
+        let _ = std::mem::take(&mut self.task_clears_this);
+        // §13.4/§13.3.2: shield the SYNCHRONOUS free-task path too — a free
+        // task body must not see a class-method caller's `this`/class
+        // context, or its task-scope `static` locals get keyed per calling
+        // class (one shared cell per class instead of one per declaration;
+        // IEEE 1800-2023 §13.3.2 requires a single variable "in a module
+        // instance, regardless of the number of concurrent activations").
+        // `push_instance_task_context` self-guards on the caller having a
+        // `this`, so module/package callers are unaffected.
+        self.push_instance_task_context(&mut cleanup);
         self.pkg_scope_stack.push(pkg_scope);
         // Execute task body
         for stmt in &td.items {
@@ -140214,6 +140537,7 @@ impl Simulator {
                             ProcessContext {
                                 this_stack: vec![Some(handle)],
                                 local_stack: vec![locals],
+                                loop_shadow_restores: Vec::new(),
                                 local_gen_stack: vec![fgen],
                                 local_type_stack: vec![(HashMap::default(), HashMap::default())],
                                 class_context_stack: vec![Some(cname.clone())],

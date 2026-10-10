@@ -101,6 +101,22 @@ fn fork_child_blocking_live_share() {
 }
 
 #[test]
+fn fork_child_merge_wake() {
+    // A fork...join_none child whose first action is a #0 deferral runs after
+    // the parent parks, so its write to the parent's task-local automatic is
+    // delivered back to the suspended parent through the child->parent frame
+    // merge (the path Fix #2's wake-promotion touches) — a deferred child
+    // write must still re-check and wake the parked level-sensitive `wait`.
+    let msgs = outputs(include_str!("../fork_child_merge_wake.sv"), 100_000);
+    assert!(
+        msgs.iter().any(|m| m.contains("PASS result=1")),
+        "{:?}",
+        msgs
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:?}", msgs);
+}
+
+#[test]
 fn orphan_force_release_compliance_ratchet() {
     let msgs = outputs(include_str!("../dpi/force_release_compliance.sv"), 100_000);
     let fails = msgs.iter().filter(|m| m.starts_with("FAIL")).count();

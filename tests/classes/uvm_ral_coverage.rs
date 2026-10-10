@@ -214,6 +214,34 @@ fn bus(v: &str, test: &str) -> Vec<String> {
     lines(&run(v, src, &[&format!("+UVM_TESTNAME={test}")]))
 }
 
+/// A NO_MAP register's SECOND backdoor `write` trampolines its resumed
+/// `do_write` continuation (an inlined `foreach (m_fields[i])` that must
+/// resolve the live `this`) through the event queue; the resumed parent was
+/// once mistaken for a fork child and its live context clobbered, so the
+/// field loop read through a phantom null `this` and xezim (internally
+/// catching it) logged `map_info.frontdoor` null-derefs. 25 fields plus a
+/// `read`+`peek` before the two writes push the inlined chain past the
+/// trampoline depth. 1800.2-2020 only: UVM 1.2's `UVM_NO_DPI` build has
+/// backdoor uvm_hdl compiled off and aborts before the loop.
+#[test]
+fn uvm_ral_backdoor_second_write_keeps_this() {
+    let src = include_str!("../uvm/uvm_ral_backdoor_toggle_write2.sv");
+    let out = lines(&run("1800.2-2020", src, &[]));
+    assert_eq!(
+        tagged(&out),
+        ["T|write1|mirror=0000000000000000", "T|write2|mirror=0000000000000000"]
+    );
+    // The bug signal is a null dereference xezim logs (and catches) when the
+    // second write's field loop reads through the clobbered `this`. The
+    // `UVM/DPI/HDL_GET` errors are expected noise (no DUT behind the NO_MAP
+    // backdoor), so reject only the simulator's own error/fatal lines.
+    assert!(
+        !out.iter().any(|l| l.contains("[xezim][error]") || l.contains("[xezim][fatal]")),
+        "1800.2-2020: simulator error:
+{out:#?}"
+    );
+}
+
 #[test]
 fn uvm_ral_frontdoor_policies_and_update() {
     for v in VERSIONS {

@@ -23,6 +23,10 @@ mod blocking_task_super_dispatch;
 mod class_assoc_struct_string_keys;
 #[path = "classes/class_formal_named_like_struct.rs"]
 mod class_formal_named_like_struct;
+#[path = "classes/block_local_shadows_enclosing.rs"]
+mod block_local_shadows_enclosing;
+#[path = "classes/integral_prop_named_like_struct.rs"]
+mod integral_prop_named_like_struct;
 #[path = "classes/class_formal_typedef_widen.rs"]
 mod class_formal_typedef_widen;
 #[path = "classes/class_interface_same_name.rs"]
