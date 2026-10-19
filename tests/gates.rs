@@ -19,6 +19,8 @@ mod bare_gate_delay_value;
 mod const_cont_assign_time0_seed;
 #[path = "gates/cont_assign_packed2d_unit_inner.rs"]
 mod cont_assign_packed2d_unit_inner;
+#[path = "gates/cont_assign_packed_multid_wide_elem.rs"]
+mod cont_assign_packed_multid_wide_elem;
 #[path = "gates/ctl_mask_gates.rs"]
 mod ctl_mask_gates;
 #[path = "gates/drive_strength_pull.rs"]

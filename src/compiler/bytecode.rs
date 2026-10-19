@@ -9961,6 +9961,40 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Width of a chained select `d[i][j]...` on a multi-D packed signal: the
+    /// product of the dimensions the chain leaves unconsumed. The indices may
+    /// be dynamic — the selected width depends only on how many levels are
+    /// indexed. `packed_full_dims_of` lists every packed dimension down to the
+    /// bit (element types included), so the product of them all must equal
+    /// the signal's width; any other layout, and every unpacked, associative
+    /// or collection root, answers None and keeps its existing path.
+    fn chained_packed_select_width(&self, lhs: &Expression) -> Option<u32> {
+        let ExprKind::Index { expr, index } = &lhs.kind else {
+            return None;
+        };
+        let (hier, idxs) = self.flatten_index_chain_exprs(expr, index)?;
+        if idxs.len() < 2
+            || self.lookup_array_name(hier).is_some()
+            || self.is_multi_dim_array(hier)
+            || self.is_assoc_target(hier)
+        {
+            return None;
+        }
+        let id = self.lookup_signal_id(hier)?;
+        let dims = self.packed_full_dims_of(hier)?;
+        if dims.len() < idxs.len() {
+            return None;
+        }
+        let counts: Vec<u64> = dims
+            .iter()
+            .map(|&(l, r)| (l.max(r) - l.min(r) + 1) as u64)
+            .collect();
+        if counts.iter().product::<u64>() != self.signal_widths[id] as u64 {
+            return None;
+        }
+        u32::try_from(counts[idxs.len()..].iter().product::<u64>()).ok()
+    }
+
     /// Walk a chain of constant `Index` nodes down to its root identifier.
     /// Returns the root and the indices outermost-first.
     fn flatten_const_index_chain<'e>(
@@ -18083,6 +18117,12 @@ impl<'a> BytecodeCompiler<'a> {
                     // A bit of one unpacked-array element (`arr[i][j]`): the
                     // context width of its RHS is 1 (§11.6.1), not 32.
                     1
+                } else if let Some(w) = self.chained_packed_select_width(lhs) {
+                    // `d[i][j] = v` on a multi-D packed vector selects a whole
+                    // sub-array (§7.4.1). The 32-bit default below truncated
+                    // the RHS of a continuous assign or always_comb write to
+                    // a wider element before the store ever saw it.
+                    w
                 } else {
                     32
                 }
