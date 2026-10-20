@@ -548,6 +548,17 @@ impl Simulator {
     /// Returns that key when `e` supplies exactly the outer indices; with
     /// fewer or more indices the caller's element paths apply.
     pub(super) fn class_array_of_coll_key(&mut self, e: &Expression) -> Option<String> {
+        self.class_coll_elem_key(e, false)
+    }
+
+    /// [`class_array_of_coll_key`] restricted to a FIXED outer shape, with
+    /// every index inside its declared bounds: an element that exists for
+    /// as long as the object does.
+    pub(super) fn class_fixed_array_of_coll_key(&mut self, e: &Expression) -> Option<String> {
+        self.class_coll_elem_key(e, true)
+    }
+
+    fn class_coll_elem_key(&mut self, e: &Expression, fixed_only: bool) -> Option<String> {
         let mut idxs: Vec<&Expression> = Vec::new();
         let mut cur = e;
         while let ExprKind::Index { expr: b, index } = &cur.kind {
@@ -591,15 +602,20 @@ impl Simulator {
             .map(|i| i.class_name.clone())?;
         let mut cur_cls: Option<String> = Some(cn);
         let mut outer_len: Option<usize> = None;
+        let mut bounds: Option<Vec<(i64, i64)>> = None;
         while let Some(c) = cur_cls {
             let Some(cd) = self.module.classes.get(&c) else {
                 break;
             };
             if let Some((shape, _, _)) = cd.array_of_coll_properties.get(&member) {
                 outer_len = Some(shape.len());
+                if fixed_only {
+                    bounds = Some(shape.clone());
+                }
                 break;
             }
-            if !cd.dynamic_assoc_properties.is_empty()
+            if !fixed_only
+                && !cd.dynamic_assoc_properties.is_empty()
                 && cd.dynamic_assoc_properties.contains_key(&member)
             {
                 outer_len = Some(1);
@@ -611,8 +627,13 @@ impl Simulator {
             return None;
         }
         let mut key = format!("{}#{}", handle, member);
-        for ix in idxs {
+        for (d, ix) in idxs.into_iter().enumerate() {
             let i = self.eval_expr(ix).to_i64().unwrap_or(0);
+            if let Some(b) = &bounds
+                && !(b[d].0..=b[d].1).contains(&i)
+            {
+                return None;
+            }
             key.push('[');
             key.push_str(&i.to_string());
             key.push(']');

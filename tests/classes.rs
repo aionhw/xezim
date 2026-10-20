@@ -771,3 +771,6 @@ mod randomize_hook_signatures;
 
 #[path = "classes/static_class_members_382.rs"]
 mod static_class_members_382;
+
+#[path = "classes/foreach_array_of_collections_elem.rs"]
+mod foreach_array_of_collections_elem;

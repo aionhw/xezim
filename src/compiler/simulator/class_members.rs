@@ -1613,6 +1613,10 @@ impl Simulator {
             }
             let mut work: Vec<DataType> = Vec::new();
             for cd in self.module.classes.values() {
+                // A class property that is itself a fixed array of
+                // collections (`int q[3][$]`): its elements are stored
+                // per object (see `class_array_of_coll_key`).
+                set.extend(cd.array_of_coll_properties.keys().cloned());
                 work.extend(cd.property_types.values().cloned());
             }
             work.extend(self.module.typedef_types.values().cloned());
@@ -1770,15 +1774,16 @@ impl Simulator {
     #[cold]
     #[inline(never)]
     pub(super) fn indexed_coll_name(&mut self, e: &Expression) -> Option<String> {
-        let n = self.flat_member_name(e)?;
-        if self.module.dynamic_arrays.contains(&n)
-            || self.module.associative_arrays.contains_key(&n)
-            || (self.struct_colls_possible() && self.ensure_struct_member_coll(&n))
+        if let Some(n) = self.flat_member_name(e)
+            && (self.module.dynamic_arrays.contains(&n)
+                || self.module.associative_arrays.contains_key(&n)
+                || (self.struct_colls_possible() && self.ensure_struct_member_coll(&n)))
         {
-            Some(n)
-        } else {
-            None
+            return Some(n);
         }
+        // An element of a class property that is a fixed array of
+        // collections lives under the object-scoped key `<h>#q[i]`.
+        self.class_fixed_array_of_coll_key(e)
     }
 
     /// Evaluate a scalar expression to an i64 in a `&self` context (literals,
