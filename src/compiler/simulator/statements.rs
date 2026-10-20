@@ -677,6 +677,96 @@ impl Simulator {
             }
             return;
         }
+        // §12.7.3/§7.4.5: `foreach (a[i, j, k])` over fixed dimensions
+        // that end in a collection (`int a[3][3][$]`, `int a[2][2][int]`,
+        // a class property too): the last variable walks each element's
+        // own size or keys, not the element's packed bits.
+        if vars.len() >= 2
+            && self.indexed_colls_live()
+            && let Some((an, dims)) = self.fixed_dims_of_colls(array)
+            && vars.len() == dims.len() + 1
+            && vars[..dims.len()].iter().all(|v| v.is_some())
+        {
+            let names: Vec<Option<String>> = vars
+                .iter()
+                .map(|v| v.as_ref().map(|v| v.name.clone()))
+                .collect();
+            for n in names.iter().flatten() {
+                self.widths.insert(n.clone(), 32);
+            }
+            let nd = dims.len();
+            let mut idx: Vec<i64> = dims.iter().map(|d| d.0).collect();
+            'elems: loop {
+                let en = idx
+                    .iter()
+                    .fold(an.clone(), |n, &i| Self::name_with_index(&n, i));
+                let keys: Vec<Value> = if self.is_associative_array(&en) {
+                    let is_str = self.is_string_keyed_array(&en);
+                    let (kw, signed) = self.assoc_index_width_for(&en).unwrap_or((32, false));
+                    if let (false, Some(n)) = (is_str, &names[nd]) {
+                        self.widths.insert(n.clone(), kw);
+                    }
+                    self.assoc_top_level_keys(&en)
+                        .iter()
+                        .map(|k| {
+                            if is_str {
+                                Value::from_string(k)
+                            } else if kw > 64 {
+                                Value::from_str_radix(k, 16, kw)
+                            } else {
+                                let mut v =
+                                    Value::from_u64(k.parse::<i64>().unwrap_or(0) as u64, kw);
+                                v.is_signed = signed;
+                                v
+                            }
+                        })
+                        .collect()
+                } else {
+                    (0..self.get_queue_size(&en))
+                        .map(|j| Self::signed_loop_val(j as i64))
+                        .collect()
+                };
+                for kv in keys {
+                    if self.finished {
+                        break 'elems;
+                    }
+                    for (d, n) in names[..nd].iter().enumerate() {
+                        if let Some(n) = n {
+                            self.set_loop_var(n, Self::signed_loop_val(idx[d]));
+                        }
+                    }
+                    if let Some(n) = &names[nd] {
+                        self.set_loop_var(n, kv);
+                    }
+                    self.continue_flag = false;
+                    *iterations = iterations.saturating_add(1);
+                    self.exec_statement(body);
+                    if self.break_flag {
+                        break 'elems;
+                    }
+                    self.continue_flag = false;
+                }
+                // Next element, last outer dimension fastest.
+                let mut d = nd;
+                loop {
+                    if d == 0 {
+                        break 'elems;
+                    }
+                    d -= 1;
+                    idx[d] += 1;
+                    if idx[d] <= dims[d].1 {
+                        break;
+                    }
+                    idx[d] = dims[d].0;
+                }
+            }
+            self.auto_loop_vars.truncate(fe_auto_len);
+            self.restore_loop_vars(&fe_saved);
+            if !self.return_flag && self.disable_target.is_none() {
+                self.break_flag = false;
+            }
+            return;
+        }
         // `foreach (obj.assoc_member[k])` — iterate that object's
         // instance-scoped associative array (base may be a 2-seg
         // Ident `b.edges` or a MemberAccess).

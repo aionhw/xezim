@@ -145,3 +145,90 @@ endmodule",
     assert_line(&msgs, "blk n=2 t=2");
     assert_line(&msgs, "blk_nested s=6 t=5");
 }
+
+// §12.7.3: in the one-list form `foreach (a[i, j, k])` over fixed dimensions
+// that end in a collection, `k` walks each element collection. It walked the
+// 32 bits of the `int` element instead (9 x 32 iterations for 3 elements).
+// Expected values match the equivalent nested `foreach` in the reference
+// simulator.
+#[test]
+fn one_list_foreach_over_module_array_of_collections() {
+    let msgs = messages(
+        "module tb;
+  int m2 [3][3][$];
+  int m3 [2][2][2][$];
+  int md [2][2][];
+  int ma [2][2][int];
+  initial begin
+    int n, s;
+    m2[2][0].push_back(1); m2[2][0].push_back(2); m2[0][1].push_back(3);
+    m3[1][0][1].push_back(4); m3[1][0][1].push_back(5);
+    md[1][0] = new[3];
+    ma[1][1][5] = 50; ma[1][1][9] = 90; ma[0][0][2] = 20;
+    n = 0; s = 0;
+    foreach (m2[i, j, k]) begin n++; s += m2[i][j][k] * (10 * i + j + 1); end
+    $display(\"q2 n=%0d s=%0d\", n, s);
+    n = 0; foreach (m3[i, j, l, k]) n++;
+    $display(\"q3 n=%0d\", n);
+    n = 0; foreach (md[i, j, k]) n++;
+    $display(\"dyn n=%0d\", n);
+    n = 0; s = 0;
+    foreach (ma[i, j, k]) begin n++; s += ma[i][j][k] + k; end
+    $display(\"assoc n=%0d s=%0d\", n, s);
+    n = 0; foreach (m2[i, j, k]) begin if (k == 1) break; n++; end
+    $display(\"break n=%0d\", n);
+    n = 0; foreach (m2[i, j, k]) begin if (k == 0) continue; n++; end
+    $display(\"continue n=%0d\", n);
+    $finish;
+  end
+endmodule",
+    );
+    assert_line(&msgs, "q2 n=3 s=69");
+    assert_line(&msgs, "q3 n=2");
+    assert_line(&msgs, "dyn n=3");
+    assert_line(&msgs, "assoc n=3 s=176");
+    assert_line(&msgs, "break n=2");
+    assert_line(&msgs, "continue n=1");
+}
+
+#[test]
+fn one_list_foreach_over_class_array_of_collections() {
+    let msgs = messages(
+        "class c;
+  int q [3][3][$];
+  int a [2][2][int];
+  function void fill();
+    q[2][0].push_back(1); q[2][0].push_back(2); q[0][1].push_back(3);
+    a[1][1][5] = 50; a[0][0][2] = 20;
+  endfunction
+  function int in_method();
+    int n = 0;
+    foreach (q[i, j, k]) n += q[i][j][k];
+    foreach (a[i, j, k]) n += a[i][j][k];
+    return n;
+  endfunction
+  task blocking();
+    int s = 0;
+    foreach (q[i, j, k]) begin #1; s += q[i][j][k]; end
+    $display(\"blk s=%0d t=%0t\", s, $time);
+  endtask
+endclass
+module tb;
+  initial begin
+    c h = new; int n;
+    h.fill();
+    $display(\"in_method s=%0d\", h.in_method());
+    n = 0; foreach (h.q[i, j, k]) n++;
+    $display(\"handle n=%0d\", n);
+    n = 0; foreach (h.a[i, j, k]) n++;
+    $display(\"handle_assoc n=%0d\", n);
+    h.blocking();
+    $finish;
+  end
+endmodule",
+    );
+    assert_line(&msgs, "in_method s=76");
+    assert_line(&msgs, "handle n=3");
+    assert_line(&msgs, "handle_assoc n=2");
+    assert_line(&msgs, "blk s=6 t=3");
+}

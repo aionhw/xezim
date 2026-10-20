@@ -2787,6 +2787,41 @@ impl Simulator {
         Some((name, rows))
     }
 
+    /// §12.7.3/§7.4.5: the store and fixed outer shape of `foreach (a[i, j,
+    /// k])` over an array whose fixed dimensions end in a collection — a
+    /// variable (`int a[3][3][$]`) or a class property (`q`, `h.q`). The
+    /// variable after the fixed ones walks each element collection.
+    pub(super) fn fixed_dims_of_colls(
+        &mut self,
+        array: &Expression,
+    ) -> Option<(String, Vec<(i64, i64)>)> {
+        let ExprKind::Ident(h) = &array.kind else {
+            return None;
+        };
+        if h.path.iter().any(|s| !s.selects.is_empty())
+            || !self.indexed_coll_root(&h.path.last()?.name.name)
+        {
+            return None;
+        }
+        if let Some(r) = self.class_fixed_array_of_coll_base(array) {
+            return Some(r);
+        }
+        if h.path.len() != 1 {
+            return None;
+        }
+        let name = self.resolve_hier_name(h).into_owned();
+        let dims = self.foreach_dims(&name)?;
+        let first = dims
+            .iter()
+            .fold(name.clone(), |n, d| Self::name_with_index(&n, d.0));
+        if !self.module.dynamic_arrays.contains(&first)
+            && !self.module.associative_arrays.contains_key(&first)
+        {
+            return None;
+        }
+        Some((name, dims))
+    }
+
     /// Put the struct-member collection `name` on the §7.8 collection
     /// registries (see [`register_coll_name`]) when its declared type says it
     /// is one. Returns whether `name` is a registered collection afterwards.
