@@ -83,15 +83,19 @@ fn c8_25_static_via_handle() {
 // §8.26.6: Interface classes: $cast between interface class handles
 #[test]
 fn c8_26_cast_between_iface_classes() {
-    // Known gap (§8.26.6): `a` reference `cast iface->iface=1`, xezim `cast iface->iface=0`
-    // Known gap (§8.26.6): `b`: xezim misses `get=6`
+    // §8.26.5: `$cast(ig, ip)` succeeds because the object's class implements
+    // both interface classes; the other direction (class downcast) also works.
     check(
         "8.26_cast_between_iface_classes",
         include_str!("sv/8.26_cast_between_iface_classes.sv"),
         "t8_26",
         Order::Exact,
-        &["T|c|cast iface->class=1"],
-        &["T|a|", "T|b|"],
+        &[
+            "T|a|cast iface->iface=1",
+            "T|b|get=6",
+            "T|c|cast iface->class=1",
+        ],
+        &[],
     );
 }
 

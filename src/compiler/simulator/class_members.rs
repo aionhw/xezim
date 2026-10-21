@@ -2976,6 +2976,33 @@ impl Simulator {
         false
     }
 
+    /// §8.26.5: `derived` is `base`, extends it, or IMPLEMENTS it — directly,
+    /// through a base class, or through an implemented interface class's own
+    /// `extends` chain. Interface class assignment and `$cast` follow
+    /// `implements` edges, which `class_is_a` (an `extends` walk) does not.
+    pub(super) fn class_is_a_or_implements(&self, derived: &str, base: &str) -> bool {
+        let strip = |s: &str| s.split('#').next().unwrap_or(s).to_string();
+        let base = strip(base);
+        let mut todo: Vec<String> = vec![derived.to_string()];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::default();
+        while let Some(c) = todo.pop() {
+            let c = self.typedef_unroll(&c);
+            if !seen.insert(c.clone()) {
+                continue;
+            }
+            if strip(&c) == base || self.class_origin(&c) == base {
+                return true;
+            }
+            if let Some(cd) = self.module.classes.get(&c) {
+                if let Some(b) = &cd.extends {
+                    todo.push(b.clone());
+                }
+                todo.extend(cd.implements.iter().cloned());
+            }
+        }
+        false
+    }
+
     /// `$cast(dest, src)` dynamic type check: succeeds if `src`'s object class
     /// is assignment-compatible with `dest`'s declared class type. Permissive
     /// when types are unknown (null src, non-class handle, untracked dest type)
@@ -3080,8 +3107,21 @@ impl Simulator {
                 }
                 let resolved = base;
                 // Hierarchy check: the src instance must be `resolved` or a
-                // subclass of it, else the downcast must fail.
-                let is_a = self.class_is_a(&src_class, &resolved);
+                // subclass of it, else the downcast must fail. §8.26.5: an
+                // interface class destination is satisfied by any class that
+                // IMPLEMENTS it (directly or through its bases), which is not
+                // an `extends` edge — e.g. `$cast(get_ref, put_ref)` where the
+                // object's class implements both PutImp and GetImp.
+                let is_a = if self
+                    .module
+                    .classes
+                    .get(&resolved)
+                    .is_some_and(|cd| cd.is_interface)
+                {
+                    self.class_is_a_or_implements(&src_class, &resolved)
+                } else {
+                    self.class_is_a(&src_class, &resolved)
+                };
                 if !is_a {
                     return false;
                 }

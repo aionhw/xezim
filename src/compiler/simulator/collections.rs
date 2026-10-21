@@ -602,6 +602,12 @@ impl Simulator {
     ///     variable (a module signal whose declared type is a class, or a block
     ///     local declared with a class type) AND the RHS is a bare identifier
     ///     that is a user-declared enum member, or an integer literal;
+    ///   * §8.26.5: it also rejects a direct assignment between two UNRELATED
+    ///     interface class handles. "It shall be legal to assign an object
+    ///     handle to a variable of an interface class type that the object
+    ///     implements"; a handle whose declared type is an unrelated interface
+    ///     class must go through `$cast`, so the assignment is illegal even
+    ///     when the dynamic object happens to implement both;
     ///   * it reads only declared types and the enum-member tables, and uses
     ///     the RAW identifier leaf name — it must never call resolve_hier_name,
     ///     because prepopulating that shared per-AST-node cache with a
@@ -660,11 +666,40 @@ impl Simulator {
                 _ => false,
             }
         }
+        // Declared class type of a bare handle variable: a block local's
+        // (resolved) declaration or a module signal's declared type.
+        fn declared_class(
+            sim: &Simulator,
+            locals: &std::collections::HashMap<String, String>,
+            name: &str,
+        ) -> Option<String> {
+            if let Some(t) = locals.get(name) {
+                return Some(t.clone());
+            }
+            if std::env::var("XEZIM_DBG_IFACE").is_ok() {
+                eprintln!(
+                    "DBG decl_class {name}: signal={:?} keys={:?}",
+                    sim.module.signals.get(name).map(|s| s.type_name.clone()),
+                    sim.module
+                        .signals
+                        .iter()
+                        .filter(|(k, _)| k.ends_with(name))
+                        .map(|(k, v)| (k.clone(), v.type_name.clone()))
+                        .collect::<Vec<_>>()
+                );
+            }
+            let t = sim.module.signals.get(name)?.type_name.as_ref()?;
+            let base = t.split('#').next().unwrap_or(t);
+            sim.module
+                .classes
+                .contains_key(base)
+                .then(|| base.to_string())
+        }
         fn walk(
             stmt: &crate::ast::stmt::Statement,
             sim: &Simulator,
             el: &std::collections::HashSet<String>,
-            locals: &mut std::collections::HashSet<String>,
+            locals: &mut std::collections::HashMap<String, String>,
             errs: &mut Vec<String>,
         ) {
             match &stmt.kind {
@@ -675,7 +710,13 @@ impl Simulator {
                 } => {
                     if is_class_data_type(data_type, sim) {
                         for d in declarators {
-                            locals.insert(d.name.name.clone());
+                            let ty = match data_type {
+                                crate::ast::types::DataType::TypeReference { name, .. } => sim
+                                    .resolve_typeref_class_name(name)
+                                    .unwrap_or_default(),
+                                _ => String::new(),
+                            };
+                            locals.insert(d.name.name.clone(), ty);
                         }
                     }
                 }
@@ -688,9 +729,10 @@ impl Simulator {
                     // must not run here. Block-locals and module signals are both
                     // keyed by their declared (leaf) name.
                     let name = lhier.path[0].name.name.clone();
-                    let is_class = lhier.path.len() == 1
-                        && lhier.path[0].selects.is_empty()
-                        && (locals.contains(&name)
+                    let bare = lhier.path.len() == 1 && lhier.path[0].selects.is_empty();
+                    let lhs_ty = bare.then(|| declared_class(sim, locals, &name)).flatten();
+                    let is_class = bare
+                        && (locals.contains_key(&name)
                             || sim
                                 .module
                                 .signals
@@ -702,17 +744,37 @@ impl Simulator {
                                         .unwrap_or(false)
                                 })
                                 .is_some());
+                    let loc = || {
+                        sim.span_file_line_in(
+                            rvalue.span,
+                            sim.module.src_file_of_module.get(&sim.module.name).copied(),
+                        )
+                        .unwrap_or_else(|| "<source>".to_string())
+                    };
                     if is_class && rhs_is_non_class(rvalue, el) {
-                        let loc = sim
-                            .span_file_line_in(
-                                rvalue.span,
-                                sim.module.src_file_of_module.get(&sim.module.name).copied(),
-                            )
-                            .unwrap_or_else(|| "<source>".to_string());
                         errs.push(format!(
                             "{}: illegal assignment of a non-class value to class handle '{}' (only a class handle or null is allowed)",
-                            loc, name
+                            loc(), name
                         ));
+                    }
+                    // §8.26.5: unrelated interface class handles are not
+                    // assignment compatible; only `$cast` may bridge them.
+                    if std::env::var("XEZIM_DBG_IFACE").is_ok() {
+                        eprintln!("DBG assign name={name} lhs={lhs_ty:?} rv={:?}", rvalue.kind);
+                    }
+                    if let (Some(lt), EK::Ident(rh)) = (lhs_ty, &rvalue.kind) {
+                        let rh_bare = rh.path.len() == 1 && rh.path[0].selects.is_empty();
+                        if rh_bare
+                            && let Some(rt) = declared_class(sim, locals, &rh.path[0].name.name)
+                            && sim.module.classes.get(&lt).is_some_and(|c| c.is_interface)
+                            && sim.module.classes.get(&rt).is_some_and(|c| c.is_interface)
+                            && !sim.class_is_a_or_implements(&rt, &lt)
+                        {
+                            errs.push(format!(
+                                "{}: illegal assignment between unrelated interface class handles '{}' ({}) and '{}' ({}) — use $cast (§8.26.5)",
+                                loc(), name, lt, rh.path[0].name.name, rt
+                            ));
+                        }
                     }
                 }
                 SK::If {
@@ -746,7 +808,13 @@ impl Simulator {
                         } = i
                         {
                             if is_class_data_type(data_type, sim) {
-                                in_.insert(name.name.clone());
+                                let ty = match data_type {
+                                    crate::ast::types::DataType::TypeReference { name, .. } => sim
+                                        .resolve_typeref_class_name(name)
+                                        .unwrap_or_default(),
+                                    _ => String::new(),
+                                };
+                                in_.insert(name.name.clone(), ty);
                             }
                         }
                     }
@@ -767,7 +835,8 @@ impl Simulator {
         }
 
         let mut errs: Vec<String> = Vec::new();
-        let mut locals: std::collections::HashSet<String> = std::collections::HashSet::default();
+        let mut locals: std::collections::HashMap<String, String> =
+            std::collections::HashMap::default();
         for ib in &self.module.initial_blocks {
             walk(&ib.stmt, self, &enum_lits, &mut locals, &mut errs);
         }
