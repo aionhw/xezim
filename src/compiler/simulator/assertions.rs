@@ -609,6 +609,17 @@ impl Simulator {
                     cons: Box::new(self.sva_compile_node(right)),
                 }
             }
+            // §16.12.8 `property iff (guard)` — vacuous pass when guard is false.
+            ExprKind::Binary { op, left, right } if matches!(op, BinaryOp::Iff) =>
+            {
+                // `property iff guard` ≡ `guard |-> property` (overlapping implication)
+                let ante = self.sva_build_seq(right);
+                SvaNode::Impl {
+                    ante,
+                    overlap: true,
+                    cons: Box::new(self.sva_compile_node(left)),
+                }
+            }
             ExprKind::Binary { op, left, right }
                 if matches!(op, BinaryOp::SvaAnd)
                     && (Self::sva_has_property_op(left) || Self::sva_has_property_op(right)) =>

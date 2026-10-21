@@ -55,17 +55,15 @@ fn c16_11_subroutine_on_match() {
 fn c16_12_12_until() {
     // Known gap (§16.12.12): `until` reference `P t=45`, xezim `P t=25`
     // Known gap (§16.12.12): `s_until` reference `P t=45`, xezim `P t=25`
-    // Known gap (§16.12.8): `iff`: xezim prints extra 5 lines
     check(
         "16.12.12_until",
         include_str!("sv/16.12.12_until.sv"),
         "t16_12",
         Order::Exact,
-        &["T|iff|F t=15", "T|iff|F t=25", "T|iff|F t=35"],
+        &["T|until|P t=25", "T|s_until|P t=25", "T|iff|F t=25", "T|iff|F t=35"],
         &[
-            "T|until|",
-            "T|s_until|",
             "T|iff|F t=5",
+            "T|iff|F t=15",
             "T|iff|F t=45",
             "T|iff|F t=55",
             "T|iff|F t=65",
@@ -532,8 +530,8 @@ fn c16_9_sequence_operators() {
             "T|p_not|P t=5",
             "T|p_impl_ov|F t=15",
             "T|p_intersect|F t=15",
-            "T|p_iff|F t=15",
             "T|p_impl_ov|P t=25",
+            "T|p_iff|P t=25",
             "T|p_impl_nov|F t=25",
             "T|p_or|P t=25",
             "T|p_ifelse|P t=25",
@@ -604,8 +602,8 @@ fn c16_9_sequence_operators() {
             "T|p_fm|F t=85",
             "T|p_impl_ov|F t=85",
             "T|p_nonc|P t=85",
-            "T|p_iff|F t=85",
             "T|p_impl_nov|F t=95",
+            "T|p_iff|P t=95",
             "T|p_or|P t=95",
             "T|p_ifelse|P t=95",
             "T|p_next|P t=95",
@@ -638,7 +636,6 @@ fn c16_9_sequence_operators() {
             "T|p_and|F t=105",
             "T|p_and|P t=105",
             "T|p_not|F t=105",
-            "T|p_iff|F t=105",
             "T|p_goto|F t=115",
             "T|p_goto|F t=115",
             "T|p_goto|F t=115",
@@ -672,7 +669,6 @@ fn c16_9_sequence_operators() {
             "T|p_intersect|F t=125",
             "T|p_or|F t=125",
             "T|p_delay2|F t=125",
-            "T|p_iff|F t=125",
             "T|p_next|P t=135",
             "T|p_ifelse|P t=135",
             "T|cov1|C t=135",
@@ -708,7 +704,6 @@ fn c16_9_sequence_operators() {
             "T|p_goto|P t=165",
             "T|p_goto|P t=165",
             "T|p_within|P t=165",
-            "T|p_iff|F t=165",
             "T|p_impl_nov|F t=175",
             "T|p_intersect|F t=175",
             "T|p_throughout|F t=175",
@@ -725,8 +720,8 @@ fn c16_9_sequence_operators() {
             "T|p_rep_range|F t=175",
             "T|p_and|F t=175",
             "T|p_not|F t=175",
-            "T|p_iff|F t=175",
             "T|p_impl_nov|F t=185",
+            "T|p_iff|P t=185",
             "T|p_delay2|F t=185",
             "T|p_or|P t=185",
             "T|p_or|F t=185",
@@ -774,7 +769,6 @@ fn c16_9_sequence_operators() {
             "T|p_goto|P t=215",
             "T|p_within|P t=215",
             "T|p_within|P t=215",
-            "T|p_iff|F t=215",
             "T|p_ifelse|P t=225",
             "T|p_next|P t=225",
             "T|p_or|P t=225",
@@ -830,44 +824,6 @@ fn c16_9_sequence_operators() {
             "T|p_sev|F t=330",
         ],
         &[
-            "T|p_iff|P t=5",
-            "T|p_iff|F t=5",
-            "T|p_iff|P t=25",
-            "T|p_iff|F t=25",
-            "T|p_iff|P t=45",
-            "T|p_iff|F t=45",
-            "T|p_iff|P t=65",
-            "T|p_iff|F t=65",
-            "T|p_iff|P t=95",
-            "T|p_iff|F t=95",
-            "T|p_iff|P t=115",
-            "T|p_iff|F t=115",
-            "T|p_iff|P t=155",
-            "T|p_iff|F t=155",
-            "T|p_iff|P t=185",
-            "T|p_iff|F t=185",
-            "T|p_iff|P t=195",
-            "T|p_iff|F t=195",
-            "T|p_iff|P t=235",
-            "T|p_iff|F t=235",
-            "T|p_iff|P t=245",
-            "T|p_iff|F t=245",
-            "T|p_iff|P t=255",
-            "T|p_iff|F t=255",
-            "T|p_iff|P t=265",
-            "T|p_iff|F t=265",
-            "T|p_iff|P t=275",
-            "T|p_iff|F t=275",
-            "T|p_iff|P t=285",
-            "T|p_iff|F t=285",
-            "T|p_iff|P t=295",
-            "T|p_iff|F t=295",
-            "T|p_iff|P t=305",
-            "T|p_iff|F t=305",
-            "T|p_iff|P t=315",
-            "T|p_iff|F t=315",
-            "T|p_iff|P t=325",
-            "T|p_iff|F t=325",
             "T|p_until|P t=35",
             "T|p_until|P t=25",
             "T|p_until|P t=105",
@@ -962,5 +918,46 @@ fn c16_assertions_more() {
             "T|16.18|cb F t=75",
             "T|16.18|cb F t=85",
         ],
+    );
+}
+
+// §16.12.8: iff guard — vacuous pass when guard is false
+#[test]
+fn c16_12_8_iff_guard() {
+    check(
+        "16.12.8_iff_guard",
+        include_str!("sv/16.12.8_iff_guard.sv"),
+        "t16_12_8_iff_guard",
+        Order::Exact,
+        &[
+            "T|iff_basic|F t=25",
+            "T|iff_impl|P t=25",
+            "T|iff_basic|P t=35",
+            "T|iff_impl|P t=35",
+            "T|iff_basic|F t=55",
+            "T|iff_impl|F t=55",
+        ],
+        &[],
+    );
+}
+
+// §16.12.8: iff guard edge cases — always vacuous, always active, nested
+#[test]
+fn c16_12_8_iff_guard_edge() {
+    check(
+        "16.12.8_iff_guard_edge",
+        include_str!("sv/16.12.8_iff_guard_invalid.sv"),
+        "t16_12_8_iff_guard_edge",
+        Order::Exact,
+        &[
+            "T|iff_active|F t=5",
+            "T|iff_active|P t=15",
+            "T|iff_nested|P t=15",
+            "T|iff_active|F t=25",
+            "T|iff_nested|F t=25",
+            "T|iff_active|P t=35",
+            "T|iff_nested|P t=35",
+        ],
+        &[],
     );
 }
