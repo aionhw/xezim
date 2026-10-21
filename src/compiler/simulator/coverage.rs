@@ -904,13 +904,28 @@ impl Simulator {
                 }
             } else if b.array_form && !b.is_wildcard {
                 // §19.5.1 `name[]`: one bin per value, `cp.name[<value>]`.
+                // If a `with (expr)` clause is present, only values for which
+                // `expr` evaluates to true (with `item` bound to the value)
+                // create bins.
                 let mut n = 0u64;
                 for (l, h) in Self::cg_merge_ranges(ranges) {
                     for v in l..=h {
                         if n >= 1 << 20 {
                             break;
                         }
-                        if !Self::cg_in_ranges(v, &excl) {
+                        if Self::cg_in_ranges(v, &excl) {
+                            continue;
+                        }
+                        // Check `with` clause if present.
+                        let with_holds = if let Some(with_e) = &b.with_expr {
+                            let mut params: xezim_core::hasher::HashMap<String, Value> = ctor.iter().cloned().collect();
+                            params.insert("item".to_string(), Value::from_u64(v as u64, 64));
+                            super::elaborate::const_eval_i64_with_params(with_e, Some(&params))
+                                .is_some_and(|x| x != 0)
+                        } else {
+                            true
+                        };
+                        if with_holds {
                             bins.push(CgBin {
                                 key: Some(format!("{}[{}]", key, v)),
                                 name: b.name.name.clone(),
@@ -1099,7 +1114,69 @@ impl Simulator {
                 let cp_name = Self::cg_point_name(cp);
                 let shape = self.cg_point_shape(def, cp, insts, None);
                 let hits = Self::cg_shape_hits(&cp_name, &shape, insts);
-                let covered = hits.iter().filter(|&&c| c >= at_least).count() as u64;
+
+                // Build a map from bin name to the AST CoverBin to check for `with` clauses.
+                // §19.5.1: `bins name = {...} with (expr)` — the bin is only counted if
+                // `expr` evaluates to true for that bin's VALUES.
+                // For array-form bins (`bins name[]`), each value in the range creates a bin,
+                // and the `with` clause filters which of those values create bins.
+                let bin_with_map: std::collections::HashMap<String, &crate::ast::decl::CoverBin> = cp
+                    .bins
+                    .iter()
+                    .filter(|b| matches!(b.kind, crate::ast::decl::CoverBinKind::Bins))
+                    .map(|b| (b.name.name.clone(), b))
+                    .collect();
+
+                let mut covered = 0u64;
+                let mut total_bins = 0u64;
+                for (idx, &c) in hits.iter().enumerate() {
+                    // Check if this bin has a `with` clause.
+                    let bin_name = shape.bins[idx].name.clone();
+                    let with_holds = if let Some(ast_bin) = bin_with_map.get(&bin_name) {
+                        if let Some(with_e) = &ast_bin.with_expr {
+                            // Evaluate the `with` expression with the BIN'S value, not the sampled value.
+                            // For each value in the bin's ranges, if the with expression is true,
+                            // that value creates a bin. We count the bin as existing if ANY value
+                            // in its ranges satisfies the with expression.
+                            let mut holds = false;
+                            for &(lo, hi) in &shape.bins[idx].ranges {
+                                if lo > hi {
+                                    continue;
+                                }
+                                let max_test = (hi - lo + 1).min(256) as i64;
+                                for v in lo..=lo + max_test - 1 {
+                                    let mut params: xezim_core::hasher::HashMap<String, Value> = ctor.iter().cloned().collect();
+                                    // The 'item' variable in the with expression refers to the bin's value.
+                                    params.insert("item".to_string(), Value::from_u64(v as u64, 64));
+                                    if super::elaborate::const_eval_i64_with_params(with_e, Some(&params))
+                                        .is_some_and(|x| x != 0)
+                                    {
+                                        holds = true;
+                                        break;
+                                    }
+                                }
+                                if holds {
+                                    break;
+                                }
+                            }
+                            holds
+                        } else {
+                            true // No with clause = bin always counts
+                        }
+                    } else {
+                        true // No with clause = bin always counts
+                    };
+
+                    if !with_holds {
+                        continue; // Skip this bin; its `with` clause filters it out.
+                    }
+
+                    total_bins += 1;
+                    if c >= at_least {
+                        covered += 1;
+                    }
+                }
+
                 // §19.7 option.weight (default 1) weights this coverpoint in
                 // the covergroup's mean.
                 let weight = cp
