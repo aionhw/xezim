@@ -573,6 +573,9 @@ impl Simulator {
     /// Automatic-bin shape over a sampled width (§19.5.1): (value space,
     /// values per bin, bin count).
     pub(super) fn cg_auto_shape(width: u32, auto_bin_max: u64) -> (u64, u64, u64) {
+        if auto_bin_max == 0 {
+            return (0, 0, 0);
+        }
         let space = if width >= 63 { u64::MAX } else { 1u64 << width };
         if space <= auto_bin_max {
             (space, 1, space)
@@ -825,10 +828,18 @@ impl Simulator {
             .filter(|b| matches!(b.kind, crate::ast::decl::CoverBinKind::Bins))
             .collect();
         if explicit.is_empty() {
-            let auto_bin_max = self
-                .cg_option_i64(def, &cp.options, "auto_bin_max", ctor)
-                .filter(|&n| n > 0)
-                .unwrap_or(64) as u64;
+            // Check if this coverpoint has its own auto_bin_max option
+            let has_own_auto_bin_max = cp.options.iter().any(|(n, _)| n == "auto_bin_max");
+            let auto_bin_max = if has_own_auto_bin_max {
+                // Coverpoint has its own auto_bin_max: use it directly.
+                // Per LRM, 0 means no automatic bins. Negative treated as 0.
+                self.cg_option_i64(def, &cp.options, "auto_bin_max", ctor)
+                    .map(|n| n.max(0) as u64)
+                    .unwrap_or(64)
+            } else {
+                // No coverpoint auto_bin_max: allocate from covergroup budget
+                self.cg_allocate_auto_bin_max(def, &cp_name, ctor, insts, width_hint)
+            };
             let (space, group, nbins) = Self::cg_auto_shape(
                 Self::cg_sampled_width(&cp_name, insts, width_hint),
                 auto_bin_max,
@@ -941,6 +952,57 @@ impl Simulator {
             auto: None,
             excl,
         }
+    }
+
+    /// Allocate automatic bins from covergroup's auto_bin_max budget.
+    /// Covergroup option auto_bin_max is a TOTAL budget for all coverpoints
+    /// that don't have their own auto_bin_max option AND need automatic bins
+    /// (i.e., have no explicit bins). Allocation is in declaration order.
+    /// A value of 0 means no automatic bins for any coverpoint.
+    /// Negative values are treated as 0.
+    fn cg_allocate_auto_bin_max(
+        &self,
+        def: &crate::ast::decl::CovergroupDeclaration,
+        cp_name: &str,
+        ctor: &[(String, Value)],
+        insts: &[&CovergroupInstance],
+        width_hint: Option<u32>,
+    ) -> u64 {
+        // Get covergroup's auto_bin_max (total budget). 0 or negative means no auto bins.
+        let cg_auto_bin_max = self
+            .cg_option_i64(def, &[], "auto_bin_max", ctor)
+            .map(|n| n.max(0) as u64)
+            .unwrap_or(64);
+
+        // Collect coverpoints that need automatic bins (no explicit bins, no own auto_bin_max)
+        let mut auto_cps: Vec<(&crate::ast::decl::Coverpoint, u64)> = Vec::new();
+        for item in &def.items {
+            if let crate::ast::decl::CovergroupItem::Coverpoint(cp) = item {
+                let has_own_auto_bin_max = cp.options.iter().any(|(n, _)| n == "auto_bin_max");
+                let has_explicit_bins = cp.bins.iter().any(|b| {
+                    matches!(b.kind, crate::ast::decl::CoverBinKind::Bins)
+                });
+                if !has_own_auto_bin_max && !has_explicit_bins {
+                    let name = Self::cg_point_name(cp);
+                    let width = Self::cg_sampled_width(&name, insts, width_hint);
+                    let space = if width >= 63 { u64::MAX } else { 1u64 << width };
+                    auto_cps.push((cp, space));
+                }
+            }
+        }
+
+        // Allocate in declaration order
+        let mut remaining = cg_auto_bin_max;
+        for (cp, space) in auto_cps {
+            let name = Self::cg_point_name(cp);
+            let alloc = space.min(remaining);
+            if name == cp_name {
+                return alloc;
+            }
+            remaining = remaining.saturating_sub(alloc);
+        }
+        // Should not reach here if cp_name is in auto_cps
+        0
     }
 
     /// Hits of each bin of `shape` for the coverpoint `cp_name`, summed

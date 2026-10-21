@@ -27,7 +27,6 @@ fn c19_6_cross_coverage() {
 // §19.5.3, §19.5.6, §19.6: covergroups, coverpoints, bins, auto bins
 #[test]
 fn c19_coverage_basic() {
-    // Known gap (§19.7): `19.7` reference `auto_bin_max cp=100.00 cp2=0.00 tot=100.00`, xezim `auto_bin_max cp=100.00 cp2=100.00 tot=100.00`
     check(
         "c19_basic",
         include_str!("sv/c19_basic.sv"),
@@ -39,8 +38,9 @@ fn c19_coverage_basic() {
             "T|19.5|stopped inst=0.00",
             "T|19.6|cross cpa=100.00 cpb=100.00 xc=100.00 tot=100.00",
             "T|19.7|args at_least cp=100.00",
+            "T|19.7|auto_bin_max cp=100.00 cp2=0.00 tot=100.00",
         ],
-        &["T|19.7|auto_bin_max cp=100.00 cp2="],
+        &[],
     );
 }
 
@@ -76,6 +76,39 @@ fn c19_coverage_options() {
             "T|19.3|event iff cov=50.00",
             "T|19.7.1|merge_instances type=50.00 i1=50.00",
             "T|19.9|$get_coverage=50.00",
+        ],
+        &[],
+    );
+}
+
+// §19.7: auto_bin_max option behavior
+#[test]
+fn c19_7_auto_bin_max() {
+    check(
+        "c19_7_auto_bin_max",
+        include_str!("sv/19.7_auto_bin_max.sv"),
+        "c19_7_auto_bin_max",
+        Order::Exact,
+        &[
+            "T|19.7|cg1 cp_a=100.00 cp_b=0.00 tot=50.00",
+            "T|19.7|cg2 cp_x=100.00 cp_y=0.00 cp_z=0.00 tot=33.33",
+            "T|19.7|cg3 cp_m=0.00 cp_n=0.00 tot=0.00",
+            "T|19.7|cg4 cp_p=100.00 cp_q=100.00 tot=100.00",
+        ],
+        &[],
+    );
+}
+
+// §19.7: auto_bin_max with invalid values
+#[test]
+fn c19_7_auto_bin_max_invalid() {
+    check(
+        "c19_7_auto_bin_max_invalid",
+        include_str!("sv/19.7_auto_bin_max_invalid.sv"),
+        "c19_7_auto_bin_max_invalid",
+        Order::Exact,
+        &[
+            "T|19.7|neg cp_a=0.00 tot=0.00",
         ],
         &[],
     );
