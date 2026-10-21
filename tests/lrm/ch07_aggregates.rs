@@ -60,6 +60,19 @@ fn c7_2_2_struct_member_default_blocklocal() {
     );
 }
 
+// §7.3.2: Tagged union: reading the active member returns its stored value
+#[test]
+fn c7_3_2_tagged_union_active_member() {
+    check(
+        "7.3.2_tagged_union_active_member",
+        include_str!("sv/7.3.2_tagged_union_active_member.sv"),
+        "tu_active",
+        Order::Exact,
+        &["T|7.3.2|42"],
+        &[],
+    );
+}
+
 // §7.2: Structures: unpacked struct 2-state members default value
 #[test]
 fn c7_2_struct_2state_member_default() {

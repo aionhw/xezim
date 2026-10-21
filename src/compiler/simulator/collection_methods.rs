@@ -655,9 +655,9 @@ impl Simulator {
         }
     }
 
-    /// IEEE 1800-2017 §7.3.2: a tagged union stores ONE member at a time. A
-    /// member expression yields the stored value only when that member is the
-    /// active one; reading any other member is not valid and yields X.
+    /// IEEE 1800-2023 §7.3.2/§11.9: a tagged union stores ONE member at a
+    /// time. Reading the active member yields the stored value; reading any
+    /// other member is a run-time error.
     pub(super) fn tagged_union_member(&mut self, base: &str, member: &str) -> Option<Value> {
         let tag = self.active_union_tag.get(base)?.clone();
         let w = self.lookup_signal_width(base).unwrap_or(32);
@@ -667,6 +667,11 @@ impl Simulator {
                     .unwrap_or_else(|| Value::new(w)),
             )
         } else {
+            let body = format!(
+                "Read of inactive tagged union member '{}.{}' (active member is '{}')",
+                base, member, tag
+            );
+            self.emit_severity_text("Error", &body);
             Some(Value::new(w))
         }
     }

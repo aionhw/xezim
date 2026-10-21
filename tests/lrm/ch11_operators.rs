@@ -1,6 +1,6 @@
 //! IEEE 1800-2023 clause 11: operators and expressions.
 
-use crate::harness::{Order, check};
+use crate::harness::{Order, check, check_error};
 
 // §11.4.12.1: string replication
 #[test]
@@ -129,6 +129,17 @@ fn c11_9_tagged_union_and_11_11_minmax() {
             "T|11.10.2|1",
         ],
         &[],
+    );
+}
+
+// §11.9: reading an inactive member of a tagged union is a run-time error
+#[test]
+fn c11_9_tagged_union_inactive_member() {
+    check_error(
+        "11.9_tagged_union_inactive_member",
+        include_str!("sv/11.9_tagged_union_inactive_member.sv"),
+        "tu_inactive",
+        "inactive tagged union member 'a.Valid'",
     );
 }
 
