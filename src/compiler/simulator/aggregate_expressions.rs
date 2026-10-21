@@ -2812,12 +2812,15 @@ impl Simulator {
                 v.is_signed = true;
                 v
             }
-            "$rose_gclk" | "$fell_gclk" | "$steady_gclk" | "$changing_gclk" | "$past_gclk"
-            | "$future_gclk"
-                if sv_parser::is_sv2023() =>
-            {
-                Value::from_u64(0, 1)
-            }
+            // §16.9.4 global clocking sampled-value functions. `$future_gclk`
+            // is a future function but the reference returns 0 when read
+            // procedurally, which is what `eval_gclk_fn` reproduces.
+            "$rose_gclk" | "$fell_gclk" | "$stable_gclk" | "$changed_gclk" | "$past_gclk"
+            | "$future_gclk" => self
+                .eval_gclk_fn(name, expr, args)
+                .unwrap_or_else(|| Value::zero(1)),
+            // §16.9.4 future edge functions: not modelled (reference 0).
+            "$steady_gclk" | "$changing_gclk" => Value::zero(1),
             "$test$plusargs" => {
                 sim_dbg_eprintln!("[DEBUG] eval $test$plusargs with {} args", args.len());
                 let pat = match args.first().map(|a| &a.kind) {

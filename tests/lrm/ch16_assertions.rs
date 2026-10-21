@@ -482,7 +482,6 @@ fn c16_9_3_past_gating() {
 #[test]
 fn c16_9_3_sampled_value_functions() {
     // Known gap (§16.9.3): `16.9.3`: 4 reference lines differ from xezim's 4, e.g. reference `t=15 v=0 past=0 past2=x pastE=x rose=0 fell=0 stable=1 changed=0 lr...`, xezim `t=15 v=0 past=0 past2=x pastE=0 rose=0 fell=0 stable=1 changed=0 lr...`
-    // Known gap (§16.9.4): `16.9.4`: 5 reference lines differ from xezim's 5, e.g. reference `t=15 rose_gclk=0 stable_gclk=1 future_gclk=0`, xezim `t=15 rose_gclk=0 stable_gclk=0 future_gclk=0`
     check(
         "c16_sampled",
         include_str!("sv/c16_sampled.sv"),
@@ -491,25 +490,37 @@ fn c16_9_3_sampled_value_functions() {
         &[
             "T|16.9.3|t=5 v=0 past=x past2=x pastE=x rose=0 fell=0 stable=0 changed=1 lrose=0 lfell=0 lstab=1",
             "T|16.9.4|t=5 rose_gclk=0 stable_gclk=0 future_gclk=0",
+            "T|16.9.4|t=15 rose_gclk=0 stable_gclk=1 future_gclk=0",
+            "T|16.9.4|t=25 rose_gclk=1 stable_gclk=0 future_gclk=0",
             "T|16.9.3|t=35 v=1 past=1 past2=0 pastE=1 rose=0 fell=0 stable=1 changed=0 lrose=1 lfell=0 lstab=0",
+            "T|16.9.4|t=35 rose_gclk=0 stable_gclk=1 future_gclk=0",
             "T|16.9.3|t=45 v=3 past=1 past2=1 pastE=1 rose=0 fell=1 stable=0 changed=1 lrose=0 lfell=0 lstab=0",
             "T|16.9.4|t=45 rose_gclk=0 stable_gclk=0 future_gclk=0",
             "T|16.9.4|t=55 rose_gclk=0 stable_gclk=0 future_gclk=0",
+            "T|16.9.4|t=65 rose_gclk=1 stable_gclk=0 future_gclk=0",
             "T|16.9.3|past-fail t=65",
             "T|16.9.3|t=75 v=2 past=2 past2=x pastE=2 rose=0 fell=0 stable=1 changed=0 lrose=0 lfell=0 lstab=1",
+            "T|16.9.4|t=75 rose_gclk=0 stable_gclk=1 future_gclk=0",
         ],
         &[
             "T|16.9.3|t=15 v=0 past=0 past2=x pastE=",
             "T|16.9.3|t=25 v=1 past=0 past2=0 pastE=",
             "T|16.9.3|t=55 v=x past=3 past2=1 pastE=",
             "T|16.9.3|t=65 v=2 past=x past2=3 pastE=",
-            "T|16.9.4|t=15 rose_gclk=0 stable_gclk=",
-            "T|16.9.4|t=25 rose_gclk=",
-            "T|16.9.4|t=35 rose_gclk=0 stable_gclk=",
-            "T|16.9.4|t=65 rose_gclk=",
-            "T|16.9.4|t=75 rose_gclk=0 stable_gclk=",
         ],
     );
+}
+
+// §16.9.4: the global clocking sampled-value functions take one argument
+#[test]
+fn c16_9_4_gclk_one_argument() {
+    let err = crate::harness::t_lines(
+        include_str!("sv/16.9.4_gclk_arity.sv"),
+        "t16_9g",
+    )
+    .expect_err("$past_gclk(a, 1) must be rejected (IEEE 1800-2023 §16.9.4)");
+    assert!(err.contains("$past_gclk"), "unexpected error: {err}");
+    assert!(err.contains("16.9.4"), "unexpected error: {err}");
 }
 
 // §16.5, §16.9.2, §16.9.5, §16.9.6, §16.9.7, §16.9.8, ...: sequence and property operators

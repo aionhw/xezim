@@ -777,6 +777,70 @@ impl Simulator {
         Some(self.sampled_cur_and_past(widx, &operand, n))
     }
 
+    /// §14.14/§16.9.4: the clock signal and edge of the global clocking
+    /// event. The parser folds `global clocking` into an ordinary clocking
+    /// block and does not record the `global` qualifier, so the default
+    /// clocking event is the only handle available (compilation aliases a
+    /// lone clocking block as the default).
+    pub(super) fn global_clocking_event(&self) -> Option<(u8, usize)> {
+        let (clk, _) = self.clocking_meta.get("__xz_default_clocking")?;
+        let edge = match self.clocking_edge.get("__xz_default_clocking") {
+            Some(EdgeKind::Negedge) => 2,
+            Some(EdgeKind::LsbEdge) => 0,
+            _ => 1,
+        };
+        let clk_id = self.signal_name_to_id.get(clk.as_str()).copied()?;
+        Some((edge, clk_id))
+    }
+
+    /// §16.9.4: a global-clocking sampled-value function. Samples `operand`
+    /// on every global clocking event and answers from that history.
+    pub(super) fn eval_gclk_fn(
+        &mut self,
+        name: &str,
+        expr: &Expression,
+        args: &[Expression],
+    ) -> Option<Value> {
+        let operand = args.first()?;
+        let (edge, clk) = self.global_clocking_event()?;
+        let widx = self.sampled_watch_for(expr.span.start, operand, edge, clk, 1, None)?;
+        let (cur, past) = self.sampled_cur_and_past(widx, operand, 1);
+        if name == "$past_gclk" {
+            // §16.9.4: same as `$past(v,,,@$global_clock)`; before the first
+            // global tick the operand's default value is returned.
+            let w = args.first().map(|a| self.infer_width(a)).unwrap_or(1);
+            return Some(past.unwrap_or_else(|| Value::new(w.max(1))));
+        }
+        if name == "$future_gclk" {
+            // §16.9.4 defines the value at the NEXT global tick. A
+            // procedural read happens before that tick exists, and the
+            // reference simulator returns 0 here, so match it.
+            return Some(Value::zero(1));
+        }
+        let sampled_this_slot = self.sampled_watches[widx].last_sample_time == Some(self.time);
+        let prev = self.sampled_watches[widx]
+            .hist
+            .get(if sampled_this_slot { 1 } else { 0 })
+            .cloned();
+        // The first global tick has no earlier sample: nothing has changed
+        // yet and it is not "stable".
+        let Some(prev) = prev else {
+            return Some(Value::zero(1));
+        };
+        let base = match name {
+            "$rose_gclk" => "$rose",
+            "$fell_gclk" => "$fell",
+            "$stable_gclk" => "$stable",
+            "$changed_gclk" => "$changed",
+            _ => return None,
+        };
+        Some(if Self::sampled_change_fn(base, &cur, Some(&prev)) {
+            Value::ones(1)
+        } else {
+            Value::zero(1)
+        })
+    }
+
     /// (current sample, `n` edges back) for a sampled-value call. The per-slot
     /// sampler runs after the Active processes and before the SVA sites, so
     /// when the reader runs BEFORE this slot's sample the front of the
@@ -1307,6 +1371,23 @@ impl Simulator {
                     1
                 };
                 let _ = self.sampled_fn_via_watch(&ex, &ar, depth);
+            }
+            // §16.9.4: register global-clocking watches up front so their
+            // history accumulates from the first global tick.
+            ExprKind::SystemCall { name, args }
+                if matches!(
+                    name.as_str(),
+                    "$rose_gclk"
+                        | "$fell_gclk"
+                        | "$stable_gclk"
+                        | "$changed_gclk"
+                        | "$past_gclk"
+                        | "$future_gclk"
+                ) =>
+            {
+                let ex = e.clone();
+                let ar = args.clone();
+                let _ = self.eval_gclk_fn(name, &ex, &ar);
             }
             ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
                 for a in args {

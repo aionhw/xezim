@@ -1640,7 +1640,29 @@ impl<'a> Ck<'a> {
                 }
                 None => self.walk_value(expr, true),
             },
-            ExprKind::SystemCall { args, .. } => args.iter().for_each(|x| self.walk_value(x, true)),
+            ExprKind::SystemCall { name, args } => {
+                // §16.9.4: the global clocking sampled-value functions take
+                // exactly one expression argument.
+                if matches!(
+                    name.as_str(),
+                    "$rose_gclk"
+                        | "$fell_gclk"
+                        | "$stable_gclk"
+                        | "$changed_gclk"
+                        | "$past_gclk"
+                        | "$future_gclk"
+                ) && args.len() != 1
+                {
+                    self.report(
+                        e.span,
+                        format!(
+                            "'{name}' takes exactly one argument \
+                             (IEEE 1800-2023 §16.9.4)"
+                        ),
+                    );
+                }
+                args.iter().for_each(|x| self.walk_value(x, true))
+            }
             _ => {}
         }
     }
