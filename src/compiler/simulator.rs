@@ -3583,6 +3583,8 @@ enum SvaSeq {
     Throughout(Expression, Box<SvaSeq>),
     Within(Box<SvaSeq>, Box<SvaSeq>),
     FirstMatch(Box<SvaSeq>),
+    /// §16.12.12: `left until right` (weak) / `left s_until right` (strong).
+    Until(Box<SvaSeq>, Box<SvaSeq>, bool),
     /// `s[*min:max]`.
     Rep {
         seq: Box<SvaSeq>,
@@ -3628,6 +3630,9 @@ struct SvaNfa {
     states: Vec<Vec<SvaEdge>>,
     start: usize,
     accept: usize,
+    /// §16.12.15: the sequence contains an `s_until`, so an attempt still in
+    /// flight when the clock stops fails instead of holding vacuously.
+    strong: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3657,6 +3662,8 @@ enum SvaCompound {
     Delay(u64, u64),
     /// §16.9.2: counted copies of the unit, one cycle apart.
     Repeat(SvaNfa, u64, u64),
+    /// §16.12.12: `left until right` (weak) / `left s_until right` (strong).
+    Until { left: SvaNfa, right: SvaNfa },
 }
 
 /// A sequence in flight: `pcs` are the states waiting for the next cycle,
@@ -3771,6 +3778,8 @@ enum SvaState {
 /// Thompson-style construction of `SvaNfa` fragments.
 struct SvaNfaBuilder {
     states: Vec<Vec<SvaEdge>>,
+    /// An `s_until` arm was built (see `SvaNfa::strong`).
+    strong: bool,
 }
 
 enum SvaRepUnit<'a> {
@@ -3789,13 +3798,24 @@ impl SvaNfaBuilder {
     }
 
     fn build(seq: &SvaSeq) -> SvaNfa {
-        let mut b = SvaNfaBuilder { states: Vec::new() };
+        let mut b = SvaNfaBuilder {
+            states: Vec::new(),
+            strong: false,
+        };
         let (start, accept) = b.frag(seq);
         SvaNfa {
             states: b.states,
             start,
             accept,
+            strong: b.strong,
         }
+    }
+
+    /// Build a nested sequence, noting whether it is strong (§16.12.15).
+    fn sub_seq(&mut self, seq: &SvaSeq) -> SvaNfa {
+        let nfa = Self::build(seq);
+        self.strong |= nfa.strong;
+        nfa
     }
 
     fn not_of(e: &Expression) -> Expression {
@@ -3844,8 +3864,8 @@ impl SvaNfaBuilder {
         // complete unit (including multi-cycle matches and local variables).
         if min > 256 || (max != u64::MAX && max > 256) {
             let unit = match u {
-                SvaRepUnit::Seq(seq) => Self::build(seq),
-                SvaRepUnit::Goto(cond) => Self::build(&SvaSeq::Goto {
+                SvaRepUnit::Seq(seq) => self.sub_seq(seq),
+                SvaRepUnit::Goto(cond) => self.sub_seq(&SvaSeq::Goto {
                     cond: (*cond).clone(),
                     min: 1,
                     max: 1,
@@ -3951,12 +3971,17 @@ impl SvaNfaBuilder {
                 self.add(eb, SvaEdge::Eps(t));
                 (s, t)
             }
-            SvaSeq::And(a, b) => self.sub(SvaCompound::And(Self::build(a), Self::build(b))),
+            SvaSeq::And(a, b) => {
+                let (a, b) = (self.sub_seq(a), self.sub_seq(b));
+                self.sub(SvaCompound::And(a, b))
+            }
             SvaSeq::Intersect(a, b) => {
-                self.sub(SvaCompound::Intersect(Self::build(a), Self::build(b)))
+                let (a, b) = (self.sub_seq(a), self.sub_seq(b));
+                self.sub(SvaCompound::Intersect(a, b))
             }
             SvaSeq::Throughout(e, a) => {
-                self.sub(SvaCompound::Throughout(e.clone(), Self::build(a)))
+                let a = self.sub_seq(a);
+                self.sub(SvaCompound::Throughout(e.clone(), a))
             }
             SvaSeq::Within(a, b) => {
                 // §16.9.10: `(1[*0:$] ##1 a ##1 1[*0:$]) intersect b`.
@@ -3967,9 +3992,18 @@ impl SvaNfaBuilder {
                     SvaSeq::Delay(0, u64::MAX),
                     SvaSeq::Bool(Self::true_lit(span)),
                 ]);
-                self.sub(SvaCompound::Intersect(Self::build(&padded), Self::build(b)))
+                let (padded, b) = (self.sub_seq(&padded), self.sub_seq(b));
+                self.sub(SvaCompound::Intersect(padded, b))
             }
-            SvaSeq::FirstMatch(a) => self.sub(SvaCompound::FirstMatch(Self::build(a))),
+            SvaSeq::FirstMatch(a) => {
+                let a = self.sub_seq(a);
+                self.sub(SvaCompound::FirstMatch(a))
+            }
+            SvaSeq::Until(left, right, strong) => {
+                let (left, right) = (self.sub_seq(left), self.sub_seq(right));
+                self.strong |= *strong;
+                self.sub(SvaCompound::Until { left, right })
+            }
             SvaSeq::Rep { seq, min, max } => self.rep(&SvaRepUnit::Seq(seq), *min, *max),
             SvaSeq::Goto { cond, min, max } => self.rep(&SvaRepUnit::Goto(cond), *min, *max),
             SvaSeq::Assign(items) => {

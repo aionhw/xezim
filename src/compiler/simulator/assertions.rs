@@ -371,6 +371,17 @@ impl Simulator {
                     Box::new(self.sva_seq_from_expr(left)),
                     Box::new(self.sva_seq_from_expr(right)),
                 ),
+                // §16.12.12: weak non-overlapping `until`, strong `s_until`.
+                BinaryOp::Until => SvaSeq::Until(
+                    Box::new(self.sva_seq_from_expr(left)),
+                    Box::new(self.sva_seq_from_expr(right)),
+                    false,
+                ),
+                BinaryOp::SUntil => SvaSeq::Until(
+                    Box::new(self.sva_seq_from_expr(left)),
+                    Box::new(self.sva_seq_from_expr(right)),
+                    true,
+                ),
                 _ => SvaSeq::Bool(e.clone()),
             },
             // A trailing bare `##N`: a delay with nothing to check.
@@ -459,6 +470,8 @@ impl Simulator {
                         | BinaryOp::Intersect
                         | BinaryOp::Throughout
                         | BinaryOp::Within
+                        | BinaryOp::Until
+                        | BinaryOp::SUntil
                         | BinaryOp::OrMinusArrow
                         | BinaryOp::OrFatArrow
                 ) || Self::sva_is_temporal(left)
@@ -645,7 +658,11 @@ impl Simulator {
                 let nfa = self.sva_build_seq(&args[0]);
                 SvaNode::Seq(nfa, name == "$sva_strong")
             }
-            _ => SvaNode::Seq(self.sva_build_seq(e), false),
+            _ => {
+                let nfa = self.sva_build_seq(e);
+                let strong = nfa.strong;
+                SvaNode::Seq(nfa, strong)
+            }
         }
     }
 
@@ -774,6 +791,34 @@ impl Simulator {
             }
             _ => false,
         }
+    }
+
+    /// §16.12.12: the operands of `until` / `s_until` are sequence
+    /// expressions. A property operator in one of them is illegal.
+    pub(super) fn sva_until_operand_error(e: &Expression) -> Option<String> {
+        let mut bad = false;
+        Self::walk_operands(e, &mut |x| {
+            if let ExprKind::Binary {
+                op: BinaryOp::Until | BinaryOp::SUntil,
+                left,
+                right,
+            } = &x.kind
+            {
+                for operand in [left, right] {
+                    let property = matches!(
+                        &operand.kind,
+                        ExprKind::Binary {
+                            op: BinaryOp::Iff | BinaryOp::SvaDisableIff,
+                            ..
+                        }
+                    ) || Self::sva_has_property_op(operand);
+                    bad |= property;
+                }
+            }
+        });
+        bad.then(|| {
+            "§16.12.12: until/s_until operands shall be sequences, not properties".to_string()
+        })
     }
 
     /// Split a site body into its `disable iff` guard and compiled property.
@@ -958,7 +1003,9 @@ impl Simulator {
                     }
                     SvaEdge::Sub(comp, t) => {
                         let n = match &**comp {
-                            SvaCompound::And(..) | SvaCompound::Intersect(..) => 2,
+                            SvaCompound::And(..)
+                            | SvaCompound::Intersect(..)
+                            | SvaCompound::Until { .. } => 2,
                             _ => 1,
                         };
                         let mut sub = SvaSubRun {
@@ -1097,6 +1144,23 @@ impl Simulator {
                     Vec::new()
                 };
                 (out, a1 && a2)
+            }
+            // §16.12.12 non-overlapping `until`: the match completes at the
+            // first tick `right` holds, provided `left` held at every earlier
+            // tick. If `right` does not hold, `left` must hold at this tick
+            // and both operands are re-armed for the next one.
+            SvaCompound::Until { left, right } => {
+                let (matched, _) = self.sva_run_advance(right, &mut sub.runs[1], true);
+                if !matched.is_empty() {
+                    return (matched, false);
+                }
+                let (held, _) = self.sva_run_advance(left, &mut sub.runs[0], true);
+                if held.is_empty() {
+                    return (Vec::new(), false);
+                }
+                sub.runs[0] = SvaRun::with_env(sub.env.clone());
+                sub.runs[1] = SvaRun::with_env(sub.env.clone());
+                (Vec::new(), true)
             }
         }
     }
@@ -1359,7 +1423,7 @@ impl Simulator {
         a: &crate::ast::stmt::AssertionStatement,
         events: Vec<EventExpr>,
         body: Expression,
-    ) {
+    ) -> bool {
         use crate::ast::stmt::AssertionKind;
         let span_key = a.span.start;
         let kind: u8 = match a.kind {
@@ -1371,6 +1435,10 @@ impl Simulator {
         // expand here, once.
         let mut body_expanded = self.sva_expand_named(&body, 0);
         self.sva_fold_scopes(&mut body_expanded);
+        if let Some(err) = Self::sva_until_operand_error(&body_expanded) {
+            self.compile_errors.push(err);
+            return false;
+        }
         let mut lv_init: Vec<Value> = Vec::new();
         let mut lv_types =
             self.sva_bind_locals(&mut body_expanded, &HashMap::default(), &mut lv_init);
@@ -1588,6 +1656,7 @@ impl Simulator {
             self.active_sva_site = old_site;
             *self.activation_scope.borrow_mut() = saved_scope;
         }
+        true
     }
 
     /// Tally one finished attempt on a site: cover sites count matches only.

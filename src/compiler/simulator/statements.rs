@@ -5412,7 +5412,9 @@ impl Simulator {
                         let idx = match existing {
                             Some(i) => i,
                             None => {
-                                self.register_sva_site(a, events, body);
+                                if !self.register_sva_site(a, events, body) {
+                                    return;
+                                }
                                 self.sva_sites.len() - 1
                             }
                         };
