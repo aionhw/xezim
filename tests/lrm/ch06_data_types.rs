@@ -1,6 +1,31 @@
 //! IEEE 1800-2023 clause 6: data types.
 
-use crate::harness::{Order, check};
+use crate::harness::{Order, check, t_lines};
+
+// §6.20.5: specparam can only be used in specify blocks and timing checks
+#[test]
+fn c6_20_5_specparam_valid() {
+    check(
+        "6.20.5_specparam_valid",
+        include_str!("sv/6.20.5_specparam_valid.sv"),
+        "spv",
+        Order::Exact,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn c6_20_5_specparam_invalid() {
+    // This test expects an elaboration error for using specparam in a parameter expression
+    let result = t_lines(include_str!("sv/6.20.5_specparam_invalid.sv"), "spi");
+    assert!(result.is_err(), "expected elaboration error for specparam in parameter expression");
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("specparam 'delay' used in parameter expression (illegal per IEEE 1800 §6.20.5)"),
+        "unexpected error: {err}"
+    );
+}
 
 // §6.19.5: Enum name() of a value not in the enum
 #[test]
