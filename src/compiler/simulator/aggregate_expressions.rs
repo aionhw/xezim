@@ -1109,7 +1109,27 @@ impl Simulator {
                     return None;
                 }
                 let dt = self.module.var_decl_types.get(&name)?;
-                let (element_type, dimensions, width) = self.declared_packed_type(dt)?;
+                let (element_type, mut dimensions, mut width) = self.declared_packed_type(dt)?;
+                // §23.10: a declaration inside an instantiated module sizes its
+                // dimensions with THAT instance's parameters. The declaration
+                // above was evaluated against the design-wide table, where a
+                // child's `N` is stored as `<inst>.N`: a bare `N` misses (the
+                // shape collapses to a plain 2-bit vector, so `mv[1][0]` read
+                // one bit) or hits an unrelated top-level `N`. Elaboration
+                // recorded this signal's dimensions per instance; use them.
+                if let Some(recorded) = self.module.packed_full_dims.get(&name)
+                    && matches!(
+                        element_type,
+                        DataType::IntegerVector { .. } | DataType::Implicit { .. }
+                    )
+                {
+                    let mut total: u32 = 1;
+                    for &(l, r) in recorded {
+                        total = total.checked_mul(u32::try_from(l.abs_diff(r) + 1).ok()?)?;
+                    }
+                    dimensions = recorded.clone();
+                    width = total;
+                }
                 let unpacked = if let Some((dims, _)) = self.module.arrays_nd.get(&name) {
                     dims.len()
                 } else if self.module.arrays_2d.contains_key(&name) {
