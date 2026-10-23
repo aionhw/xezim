@@ -1,0 +1,9 @@
+bv=10100101 lv=1001 s=-5 u=2748
+hex u=0abc 255=ff dec=255
+range=11 bit3=1 xor=1
+t=3500 ps double=3.5
+11 10 100 100 -1 
+n=4 rev=240
+printf 42 ff str Z
+d*3=7.5 int=7
+b=1

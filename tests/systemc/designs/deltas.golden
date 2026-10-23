@@ -1,0 +1,6 @@
+0 s a=1 b=1 c=2
+0 s a=1 b=2 c=4
+10 ns a=2 b=3 c=6
+20 ns a=3 b=4 c=8
+30 ns stim done
+30 ns a=4 b=5 c=10

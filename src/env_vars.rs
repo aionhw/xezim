@@ -812,6 +812,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Stuck-clock detector: wall-clock window (seconds)",
     ),
     (
+        "XEZIM_SYSTEMC_DUMP",
+        "SystemC: print the SystemVerilog modules generated from the SystemC sources (as AST)",
+    ),
+    (
         "XEZIM_TEMPLATE_CENSUS",
         "Profiling: group compiled blocks by canonical shape; report repeated-template dynamic coverage (wants COMB_PATHS + EDGE_BLOCK_STATS)",
     ),

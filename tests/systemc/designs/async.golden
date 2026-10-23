@@ -1,0 +1,6 @@
+0 s reset section
+10 ns reset section
+95 ns q=4
+95 ns reset section
+98 ns q=0
+138 ns q=2

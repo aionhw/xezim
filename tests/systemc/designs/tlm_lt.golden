@@ -1,0 +1,8 @@
+trans = { W, 0 } , data = ff000000 at time 0 s delay = 10 ns
+trans = { R, 4 } , data = aa00002e at time 10 ns delay = 10 ns
+trans = { W, 8 } , data = ff000008 at time 20 ns delay = 10 ns
+trans = { R, c } , data = aa00002e at time 30 ns delay = 10 ns
+trans = { W, 10 } , data = ff000010 at time 40 ns delay = 10 ns
+trans = { R, 14 } , data = aa00002e at time 50 ns delay = 10 ns
+trans = { W, 18 } , data = ff000018 at time 60 ns delay = 10 ns
+trans = { R, 1c } , data = aa00002e at time 70 ns delay = 10 ns

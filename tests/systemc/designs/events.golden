@@ -1,0 +1,12 @@
+10 ns notify go 0
+10 ns consumer woke count=1
+12 ns got ack 0
+22 ns notify go 1
+22 ns consumer woke count=2
+24 ns got ack 1
+34 ns notify go 2
+34 ns consumer woke count=3
+36 ns got ack 2
+41 ns consumer woke count=4
+100 ns timeout fired
+done at 200 ns

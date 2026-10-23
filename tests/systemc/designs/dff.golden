@@ -1,0 +1,3 @@
+after reset q=0
+after edge  q=1
+after edge  q=0

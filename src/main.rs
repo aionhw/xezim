@@ -3162,6 +3162,14 @@ fn run_main() -> i32 {
         std::process::exit(1);
     }
 
+    // SystemC (C++) sources are lowered to SystemVerilog by xezim-core
+    // (IEEE 1666); everything after this sees SystemVerilog only.
+    let (systemc_files, sv_files): (Vec<String>, Vec<String>) = std::mem::take(&mut source_files)
+        .into_iter()
+        .partition(|f| xezim_core::sv_parser::systemc::is_systemc_path(f));
+    source_files = sv_files;
+    xezim_core::systemc::configure(systemc_files, include_dirs.clone(), defines.clone());
+
     // XTrace option validation. Every one of these degrades to what we really
     // emit and SAYS SO — the header must never claim a level, a format or a
     // transport the file does not carry (XTrace §6, §24).
@@ -3256,7 +3264,7 @@ suppressed but the explicit SDF annotation still applies."
             .unwrap_or_else(default_design_cache_dir);
         let dependency_files = design_dependency_files(&lib_files, &lib_dirs, lib_exts.as_deref());
         let semantic_salt = format!(
-            "sv2023={};strict={};delay_select={};module_timescale={:?};lib_dirs={:?};lib_files={:?};lib_exts={:?};nospecify={};param_overrides={:?}",
+            "sv2023={};strict={};delay_select={};module_timescale={:?};lib_dirs={:?};lib_files={:?};lib_exts={:?};nospecify={};param_overrides={:?};systemc={:?}",
             sv2023_mode,
             strict_checks,
             source_delay_select,
@@ -3266,6 +3274,7 @@ suppressed but the explicit SDF annotation still applies."
             lib_exts,
             nospecify,
             compat.param_overrides,
+            xezim_core::systemc::cache_digest(),
         );
         // Set cache compression settings before cache is used
         if let Some(level) = cache_compression_level {

@@ -45,6 +45,7 @@
 - UDPs, drive strengths, specify-block delays and timing checks
 - SDF back-annotation (`--sdf`)
 - IEEE 1801 UPF power intent (`--upf`)
+- SystemC (IEEE 1666) RTL, testbenches and TLM-2.0 LT from `.cpp` sources
 
 </td>
 </tr>
@@ -194,6 +195,7 @@ with few, very hot blocks, so measure it on yours.
 | [DPI and VPI guide](docs/dpi-guide.md) | Loading C and C++ libraries, the VPI surface |
 | [Coverage guide](docs/coverage-guide.md) | Functional, assertion and code coverage, `xezim_cov.json` |
 | [UPF guide](docs/upf-guide.md) | IEEE 1801 power intent |
+| [SystemC guide](docs/systemc-guide.md) | IEEE 1666 SystemC and TLM-2.0 designs |
 | [Debugging guide](docs/DEBUGGING.md) | Tracing, diagnosing hangs, comparing against another simulator |
 | [Building from source](docs/building.md) | Requirements, profile-guided builds, working on xezim-core |
 | [Release notes](NOTES.md) | Changes per release, verified workloads, compliance results |
