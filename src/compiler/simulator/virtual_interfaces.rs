@@ -1800,16 +1800,38 @@ impl Simulator {
 
     /// The instance subroutine key a BARE `name` called from a method of a
     /// class declared inside a (non-top) module names: `name` under the
-    /// resolve hint or its nearest ancestor scope that declares it (§23.8).
-    /// None outside such a method, so other bare calls are unchanged.
+    /// object's instance (or the resolve hint inside it) or its nearest
+    /// ancestor scope that declares it (§23.8). None outside such a method,
+    /// so other bare calls are unchanged.
     pub(super) fn class_module_subroutine_key(&self, name: &str) -> Option<String> {
         if !self.module_class_method_active()
             || !self.class_member_names().subroutine_suffixes.contains(name)
         {
             return None;
         }
-        let hint = self.name_resolve_hint.borrow().clone()?;
-        let mut scope = hint.as_str();
+        // §8 / §23.8: the method body lives in the instance holding its
+        // object, whichever process called it. The resolve hint is the
+        // CALLING process's scope once an inlined method body runs (each
+        // `run_process_stmts` activation reinstalls it), so a call reached
+        // through a handle passed to a sibling instance found no subroutine
+        // there and the module task was dropped.
+        let hint = self.name_resolve_hint.borrow().clone();
+        let inst = self
+            .this_stack
+            .last()
+            .copied()
+            .flatten()
+            .and_then(|h| self.modclass_instance(h));
+        let start = match (inst, hint) {
+            (Some(i), Some(h))
+                if h == i || h.strip_prefix(i.as_str()).is_some_and(|r| r.starts_with('.')) =>
+            {
+                h
+            }
+            (Some(i), _) => i,
+            (None, h) => h?,
+        };
+        let mut scope = start.as_str();
         loop {
             let cand = format!("{}.{}", scope, name);
             if self.module.functions.contains_key(&cand) || self.module.tasks.contains_key(&cand) {

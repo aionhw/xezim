@@ -230,6 +230,28 @@ impl Simulator {
         if declared(canon) {
             return Some(canon.to_string());
         }
+        // §26.3: `pkg::ev` (parsed as the member chain `pkg.ev`) names the
+        // package's event, stored under its hoisted name — or its own
+        // `<pkg>::<name>` cell when contested. Package events are not in
+        // `events`, so `->pkg::ev` fired a nonexistent `pkg.ev` and no
+        // `@(pkg::ev)` / `@(ev)` waiter woke.
+        if let Some((pkg, leaf)) = name.split_once('.')
+            && !leaf.contains('.')
+            && self.module.packages.contains(pkg)
+            && self.module.pkg_var_decls.contains_key(&format!("{pkg}::{leaf}"))
+            && matches!(
+                self.module.var_decl_types.get(leaf),
+                Some(DataType::Simple {
+                    kind: crate::ast::types::SimpleType::Event,
+                    ..
+                })
+            )
+        {
+            let key = self.pkg_var_storage(pkg, leaf).unwrap_or_else(|| leaf.to_string());
+            if self.signal_name_to_id.contains_key(key.as_str()) {
+                return Some(key);
+            }
+        }
         None
     }
 

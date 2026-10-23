@@ -3443,6 +3443,22 @@ impl Simulator {
                 self.exec_task_call(&td, args);
                 return Value::zero(32);
             }
+            // A module-class method naming an instance subroutine that
+            // resolved nowhere: report the skipped call instead of dropping
+            // it silently.
+            if hier.path.len() == 1
+                && self.module_class_method_active()
+                && self.class_member_names().subroutine_suffixes.contains(name.as_str())
+            {
+                self.warn_system_task_once(
+                    &format!("call:{}", name),
+                    &format!(
+                        "Warning: call to '{}' in a method of a class declared in a module \
+                         resolved to no subroutine of its instance; call skipped",
+                        name
+                    ),
+                );
+            }
         }
         Value::zero(32)
     }

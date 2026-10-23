@@ -3038,7 +3038,16 @@ impl Simulator {
                             // that are not module/package tasks skip the
                             // `this_stack` + `class_has_method` check entirely.
                             let tname = h.path[0].name.name.as_str();
-                            if let Some(td) = self.task_decl_rc(tname) {
+                            // §23.8: in a method of a class declared inside a
+                            // module the bare name is that instance's task
+                            // (see `class_module_subroutine_key`); None
+                            // elsewhere, leaving the free-task lookup as is.
+                            let modclass_key = self.class_module_subroutine_key(tname);
+                            let td = match &modclass_key {
+                                Some(full) => self.task_decl_rc(full),
+                                None => self.task_decl_rc(tname),
+                            };
+                            if let Some(td) = td {
                                 let is_this_method = self
                                     .this_stack
                                     .last()
@@ -3066,6 +3075,16 @@ impl Simulator {
                                     // class). Self-guarded: only shields when
                                     // the caller actually has a `this`.
                                     self.push_instance_task_context(&mut cleanup);
+                                    // The instance task's body resolves in its
+                                    // instance across suspends, as Stage 1-hier.
+                                    if let Some((scope, _)) =
+                                        modclass_key.as_deref().and_then(|k| k.rsplit_once('.'))
+                                    {
+                                        cleanup.prev_hint = self.name_resolve_hint.borrow().clone();
+                                        cleanup.frame_scope_hint = Some(scope.to_string());
+                                        *self.name_resolve_hint.borrow_mut() =
+                                            Some(scope.to_string());
+                                    }
                                     self.task_cleanup.push(cleanup);
                                     let mut cont: Vec<Statement> = td.items.clone();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -3195,7 +3214,25 @@ impl Simulator {
                                     None
                                 }
                             } else {
-                                self.eval_handle_expr(&recv)
+                                match self.eval_handle_expr(&recv) {
+                                    // §23.6: a hierarchical receiver
+                                    // (`u_mem.obj.t()`) names another
+                                    // instance's handle, which the
+                                    // frame-local walk above cannot read;
+                                    // the call ran synchronously and a
+                                    // blocking body's event control was
+                                    // dropped.
+                                    None if self
+                                        .class_member_names()
+                                        .tasks
+                                        .contains(last.name.name.as_str()) =>
+                                    {
+                                        let handle = self.eval_live_object_receiver(&recv);
+                                        call_recv = handle.map(|hh| (hh, last.name.name.clone()));
+                                        handle
+                                    }
+                                    hh => hh,
+                                }
                             };
                             handle.map(|hh| (hh, last.name.name))
                         }

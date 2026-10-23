@@ -463,3 +463,197 @@ endmodule
     ];
     assert_eq!(got, expected);
 }
+
+/// §8.25 / §23.8: a class declared inside a module resolves its bare names in
+/// that module's instance — the instance holding the object — whichever
+/// process calls the method. A blocking module task called from such a
+/// method reached through a handle copied into a SIBLING instance was
+/// skipped (no delay, no side effects) because the name resolved under the
+/// calling process's instance; the module function next to it ran.
+#[test]
+fn module_class_task_from_sibling_instance() {
+    let src = r#"`timescale 1ps/1ps
+package p;
+  virtual class fw_if; pure virtual task run(string who); endclass
+endpackage
+module mem; import p::*;
+  int hits;
+  task automatic mt(input string who); #5; hits++; $display("T|mt from %s hits=%0d t=%0t", who, hits, $time); endtask
+  function automatic int mf(int a); return a + 100; endfunction
+  class fw_c extends fw_if;
+    virtual task run(string who); $display("T|run(%s) mf=%0d", who, mf(1)); mt(who); $display("T|run(%s) done hits=%0d t=%0t", who, hits, $time); endtask
+  endclass
+  fw_if fw;
+  initial begin fw_c o = new; fw = o; end
+  initial begin #1; fw.run("self"); end
+endmodule
+module init_m; import p::*; fw_if fw;
+  initial begin #10; fw.run("other"); end
+endmodule
+module top; import p::*;
+  mem u_mem(); init_m u_init();
+  initial u_init.fw = u_mem.fw;
+  initial begin #20; u_mem.fw.run("top-hier"); #10 $finish; end
+endmodule
+"#;
+    // Expected values from the reference simulator.
+    let expected = [
+        "T|run(self) mf=101",
+        "T|mt from self hits=1 t=6",
+        "T|run(self) done hits=1 t=6",
+        "T|run(other) mf=101",
+        "T|mt from other hits=2 t=15",
+        "T|run(other) done hits=2 t=15",
+        "T|run(top-hier) mf=101",
+        "T|mt from top-hier hits=3 t=25",
+        "T|run(top-hier) done hits=3 t=25",
+    ];
+    assert_eq!(t_lines(src), expected);
+}
+
+/// §8.25 / §23.8 / §13.5: the sibling-instance call with output and ref
+/// arguments to a module task that waits on the instance's clock and event
+/// (§9.4.2); the method body and the task body suspend, and a hierarchical
+/// `u_mem.fw.run()` from the parent (§23.6) suspends too instead of running
+/// synchronously with its event controls dropped.
+#[test]
+fn module_class_blocking_task_with_output_ref_args() {
+    let src = r#"`timescale 1ps/1ps
+package p;
+  virtual class fw_if; pure virtual task run(string who); endclass
+endpackage
+module mem; import p::*;
+  int hits; bit clk; event ev;
+  always #2 clk = ~clk;
+  initial begin #13 ->ev; #10 ->ev; end
+  task automatic mt(input string who, output int o, ref int r);
+    @(posedge clk); hits++; o = hits * 10; r += 1;
+    @(ev);
+    $display("T|mt %s hits=%0d o=%0d r=%0d t=%0t", who, hits, o, r, $time);
+  endtask
+  class fw_c extends fw_if;
+    virtual task run(string who);
+      int o, r;
+      r = 5;
+      mt(who, o, r);
+      $display("T|run %s o=%0d r=%0d hits=%0d t=%0t", who, o, r, hits, $time);
+    endtask
+  endclass
+  fw_if fw;
+  initial begin fw_c c = new; fw = c; end
+endmodule
+module init_m; import p::*;
+  fw_if fw;
+  initial begin #3; fw.run("other"); $display("T|init back t=%0t", $time); end
+endmodule
+module top; import p::*;
+  mem u_mem(); init_m u_init();
+  initial u_init.fw = u_mem.fw;
+  initial begin #15; u_mem.fw.run("top"); $display("T|top back t=%0t", $time); #5 $finish; end
+endmodule
+"#;
+    // Expected values from the reference simulator.
+    let expected = [
+        "T|mt other hits=1 o=10 r=6 t=13",
+        "T|run other o=10 r=6 hits=1 t=13",
+        "T|init back t=13",
+        "T|mt top hits=2 o=20 r=6 t=23",
+        "T|run top o=20 r=6 hits=2 t=23",
+        "T|top back t=23",
+    ];
+    assert_eq!(t_lines(src), expected);
+}
+
+/// §8.25 / §23.8: two instances of the module, each object handed to a
+/// process of another instance; each method calls ITS OWN instance's task
+/// (not the other instance's, nor the top's same-named task).
+#[test]
+fn module_class_task_cross_instances() {
+    let src = r#"`timescale 1ps/1ps
+package p;
+  virtual class fw_if; pure virtual task run(string who, output int o); endclass
+endpackage
+module mem #(parameter int B = 0); import p::*;
+  int hits; bit clk;
+  always #2 clk = ~clk;
+  task automatic mt(input string who, output int o, ref int r);
+    @(posedge clk); hits++; o = B + hits; r += B;
+    $display("T|mt %m who=%s hits=%0d t=%0t", who, hits, $time);
+  endtask
+  class fw_c extends fw_if;
+    virtual task run(string who, output int o);
+      int r = 1;
+      mt(who, o, r);
+      $display("T|run B=%0d who=%s o=%0d r=%0d hits=%0d t=%0t", B, who, o, r, hits, $time);
+    endtask
+  endclass
+  fw_if fw;
+  initial begin fw_c c = new; fw = c; end
+endmodule
+module init_m #(parameter int D = 0); import p::*;
+  fw_if fw; int o;
+  initial begin #D; fw.run($sformatf("%m"), o); $display("T|%m o=%0d t=%0t", o, $time); end
+endmodule
+module top;
+  task automatic mt(input string who, output int o, ref int r); $display("T|WRONG top mt"); endtask
+  mem #(100) a(); mem #(200) b();
+  init_m #(3) ia(); init_m #(7) ib();
+  initial begin ia.fw = b.fw; ib.fw = a.fw; end
+  initial #20 $display("T|hits a=%0d b=%0d", a.hits, b.hits);
+  initial #30 $finish;
+endmodule
+"#;
+    // Expected values from the reference simulator.
+    let expected = [
+        "T|mt top.b.mt who=top.ia hits=1 t=6",
+        "T|run B=200 who=top.ia o=201 r=201 hits=1 t=6",
+        "T|top.ia o=201 t=6",
+        "T|mt top.a.mt who=top.ib hits=1 t=10",
+        "T|run B=100 who=top.ib o=101 r=101 hits=1 t=10",
+        "T|top.ib o=101 t=10",
+        "T|hits a=1 b=1",
+    ];
+    assert_eq!(t_lines(src), expected);
+}
+
+/// §8.25 / §23.8: the initiator-socket shape — a package class holds the
+/// peer socket, whose package-typed handle reaches the module class's method;
+/// its call to the module task runs in the object's instance.
+#[test]
+fn module_class_task_through_socket_handle() {
+    let src = r#"`timescale 1ps/1ps
+package p;
+  virtual class fw_if; pure virtual task run(string who); endclass
+  class tsock; fw_if fw; endclass
+  class isock;
+    tsock peer;
+    task run(); peer.fw.run("x"); endtask
+  endclass
+endpackage
+module mem; import p::*;
+  int hits;
+  task automatic mt(input string who); #5; hits++; $display("T|mt %s hits=%0d t=%0t", who, hits, $time); endtask
+  class fw_c extends fw_if;
+    virtual task run(string who); mt(who); $display("T|run %s hits=%0d t=%0t", who, hits, $time); endtask
+  endclass
+  tsock ts;
+  initial begin fw_c c = new; ts = new; ts.fw = c; end
+endmodule
+module init_m; import p::*;
+  isock is;
+  initial begin #3; is.run(); $display("T|init back t=%0t", $time); end
+endmodule
+module top; import p::*;
+  mem u_mem(); init_m u_init();
+  initial begin #1; u_init.is = new; u_init.is.peer = u_mem.ts; end
+  initial #20 $finish;
+endmodule
+"#;
+    // Expected values from the reference simulator.
+    let expected = [
+        "T|mt x hits=1 t=8",
+        "T|run x hits=1 t=8",
+        "T|init back t=8",
+    ];
+    assert_eq!(t_lines(src), expected);
+}

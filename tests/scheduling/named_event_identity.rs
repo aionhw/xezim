@@ -283,3 +283,47 @@ endmodule
         "->> does not resume a waiter inline"
     );
 }
+
+/// §15.5.1 / §26.3: an event declared in a PACKAGE is one synchronization
+/// object however it is named — `rt::ev` by scope resolution or `ev` through
+/// `import rt::*`. `-> rt::ev` parsed to the member chain `rt.ev`, which
+/// matched no declared event, so it toggled nothing and every waiter (scoped
+/// or imported) slept forever. Covers each trigger/wait spelling pair, `->>`
+/// (§15.5.2) and `.triggered` (§15.5.3) through the scoped name.
+#[test]
+fn package_event_scoped_and_imported_names_agree() {
+    let src = r#"
+`timescale 1ns/1ns
+package rt;
+  event e_ss, e_sb, e_bs, e_bb, e_nb;
+endpackage
+module top;
+  import rt::*;
+  int t_ss, t_sb, t_bs, t_bb, t_nb, trig_seen;
+  initial begin
+    fork
+      begin @(rt::e_ss); t_ss = $time; end
+      begin @(e_sb);     t_sb = $time; end
+      begin @(rt::e_bs); t_bs = $time; end
+      begin @(e_bb);     t_bb = $time; end
+      begin @(rt::e_nb); t_nb = $time; end
+    join_none
+    #10 -> rt::e_ss;
+    #10 -> rt::e_sb;
+    #10 -> e_bs;
+    #10 -> e_bb;
+    #10 ->> rt::e_nb;
+    #10 -> rt::e_ss; trig_seen = e_ss.triggered;
+    #5 $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 200).expect("simulate failed");
+    // Expected values from the reference simulator.
+    assert_eq!(u(&sim, "t_ss"), 10, "-> rt::ev wakes @(rt::ev)");
+    assert_eq!(u(&sim, "t_sb"), 20, "-> rt::ev wakes @(ev)");
+    assert_eq!(u(&sim, "t_bs"), 30, "-> ev wakes @(rt::ev)");
+    assert_eq!(u(&sim, "t_bb"), 40, "-> ev wakes @(ev)");
+    assert_eq!(u(&sim, "t_nb"), 50, "->> rt::ev wakes @(rt::ev)");
+    assert_eq!(u(&sim, "trig_seen"), 1, "-> rt::ev sets ev.triggered");
+}
