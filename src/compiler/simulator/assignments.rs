@@ -85,6 +85,28 @@ impl Simulator {
         Some(out)
     }
 
+    /// Instance prefix for resolving bare array names in the current process.
+    pub(super) fn process_scope_for_arrays(&self) -> Option<String> {
+        self.process_scope_hint
+            .get(&self.current_pid)
+            .cloned()
+            .or_else(|| self.name_resolve_hint.borrow().clone())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub(super) fn resolve_type_width_in_process_scope(
+        &self,
+        dt: &crate::ast::types::DataType,
+    ) -> u32 {
+        crate::compiler::scoped_arrays::resolve_type_width_with_instance_arrays(
+            dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+            self.process_scope_for_arrays().as_deref(),
+            &self.module.arrays,
+        )
+    }
+
     /// `format!("{}{}", base, suffix)` without the formatting machinery.
     pub(super) fn name_with_suffix(base: &str, suffix: &str) -> String {
         let mut out = String::with_capacity(base.len() + suffix.len());

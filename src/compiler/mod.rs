@@ -14,6 +14,7 @@ pub mod fst_sink;
 mod interrupt;
 pub mod jit;
 pub mod prof_sampler;
+pub(crate) mod scoped_arrays;
 pub mod simulator;
 pub mod soa;
 pub mod ts_jit;

@@ -1821,11 +1821,7 @@ impl Simulator {
             .and_then(|c| self.concrete_type_width(c));
         let w0 = match tp_width.or_else(|| self.bound_agg_width(data_type)) {
             Some(w) => w,
-            None => super::elaborate::resolve_type_width(
-                data_type,
-                Some(&self.module.parameters),
-                Some(&self.module.typedefs),
-            ),
+            None => self.resolve_type_width_in_process_scope(data_type),
         };
         // A class-handle-typed variable holds a 32-bit handle, not
         // the class's content layout (which `resolve_type_width`

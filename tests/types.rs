@@ -41,6 +41,8 @@ mod bits_package_scoped_type_width;
 mod block_local_unpacked_struct;
 #[path = "types/block_local_width_in_index_shift.rs"]
 mod block_local_width_in_index_shift;
+#[path = "types/block_local_size_query_scope.rs"]
+mod block_local_size_query_scope;
 #[path = "types/byte_local_narrow.rs"]
 mod byte_local_narrow;
 #[path = "types/callback_typedef_static.rs"]

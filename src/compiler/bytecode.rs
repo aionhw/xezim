@@ -7106,6 +7106,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// it; enclosing inline frames are tried otherwise.
     fn decl_width_in(&self, dt: &crate::ast::types::DataType, scope: Option<&str>) -> u32 {
         use crate::ast::types::DataType;
+        let inst_scope = self.scope_hint.as_deref().or(scope);
         let mut cur = dt;
         let mut owner = scope;
         let mut factor = 1u32;
@@ -7117,11 +7118,15 @@ impl<'a> BytecodeCompiler<'a> {
                 span,
             } = cur
             else {
-                return factor.saturating_mul(crate::compiler::elaborate::resolve_type_width(
-                    cur,
-                    self.params,
-                    self.typedefs,
-                ));
+                return factor.saturating_mul(
+                    crate::compiler::scoped_arrays::resolve_type_width_with_instance_arrays(
+                        cur,
+                        self.params,
+                        self.typedefs,
+                        inst_scope,
+                        self.arrays,
+                    ),
+                );
             };
             if !type_args.is_empty() || name.has_specialized_scope() {
                 break;
@@ -7133,11 +7138,15 @@ impl<'a> BytecodeCompiler<'a> {
                 dimensions: dimensions.clone(),
                 span: *span,
             };
-            factor = factor.saturating_mul(crate::compiler::elaborate::resolve_type_width(
-                &dims,
-                self.params,
-                self.typedefs,
-            ));
+            factor = factor.saturating_mul(
+                crate::compiler::scoped_arrays::resolve_type_width_with_instance_arrays(
+                    &dims,
+                    self.params,
+                    self.typedefs,
+                    inst_scope,
+                    self.arrays,
+                ),
+            );
             if self.runtime_type_param(name, owner) {
                 return crate::compiler::elaborate::resolve_type_width(dt, self.params, None);
             }
@@ -7156,7 +7165,13 @@ impl<'a> BytecodeCompiler<'a> {
                 break;
             }
         }
-        crate::compiler::elaborate::resolve_type_width(dt, self.params, self.typedefs)
+        crate::compiler::scoped_arrays::resolve_type_width_with_instance_arrays(
+            dt,
+            self.params,
+            self.typedefs,
+            inst_scope,
+            self.arrays,
+        )
     }
 
     /// Packed ELEMENT width of a declared type, for register-backed locals:
