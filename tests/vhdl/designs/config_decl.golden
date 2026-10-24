@@ -1,0 +1,6 @@
+config_decl.vhd:8:17:@0ms:(report note): buf 0
+config_decl.vhd:13:17:@0ms:(report note): inv 11
+config_decl.vhd:13:17:@0ms:(report note): inv 2
+config_decl.vhd:13:17:@0ms:(report note): inv 100
+config_decl.vhd:44:5:@1ns:(report note): y1='0' y2='1'
+config_decl.vhd:47:5:@2ns:(report note): y1='1' y2='0'

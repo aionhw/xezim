@@ -1,0 +1,8 @@
+blocks.vhd:31:42:@5ns:(report note): even bit 0 k=0 -> '1' inv='0'
+blocks.vhd:31:42:@15ns:(report note): even bit 0 k=0 -> '0' inv='1'
+blocks.vhd:31:42:@25ns:(report note): even bit 0 k=0 -> '1' inv='0'
+blocks.vhd:31:42:@35ns:(report note): even bit 0 k=0 -> '0' inv='1'
+blocks.vhd:31:42:@35ns:(report note): even bit 2 k=20 -> '1' inv='0'
+blocks.vhd:31:42:@45ns:(report note): even bit 0 k=0 -> '1' inv='0'
+blocks.vhd:39:5:@52ns:(report note): q=0101
+blocks.vhd:31:42:@55ns:(report note): even bit 0 k=0 -> '0' inv='1'

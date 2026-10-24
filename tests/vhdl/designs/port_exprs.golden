@@ -1,0 +1,8 @@
+port_exprs.vhd:22:5:@0ms:(report note): init expr=UUUU name=UUUU conv=UUUU
+port_exprs.vhd:25:7:@0ms:(report note): delta 1 expr=UUUU name=0011 conv=0011
+port_exprs.vhd:25:7:@0ms:(report note): delta 2 expr=0011 name=0011 conv=0011
+port_exprs.vhd:25:7:@0ms:(report note): delta 3 expr=0011 name=0011 conv=0011
+port_exprs.vhd:31:7:@1ns:(report note): delta 1 expr=0011 name=0011 conv=0011
+port_exprs.vhd:31:7:@1ns:(report note): delta 2 expr=0011 name=1111 conv=1111
+port_exprs.vhd:31:7:@1ns:(report note): delta 3 expr=0011 name=1111 conv=1111
+port_exprs.vhd:31:7:@1ns:(report note): delta 4 expr=0011 name=1111 conv=1111

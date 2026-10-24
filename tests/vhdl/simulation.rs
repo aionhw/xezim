@@ -212,3 +212,61 @@ fn counter_tb() {
 fn numeric_div() {
     check("numeric_div");
 }
+
+/// For-, if-/elsif-/else- and case-generate statements (§11.8): one block
+/// per iteration with its own signals, processes and instances, elaborated
+/// depth-first in iteration order (§14.5.3).
+#[test]
+fn generates() {
+    check("generates");
+}
+
+/// A block statement with generics, generic map, ports and port map
+/// (§11.2, §14.5.2) holding a for-generate with declarations and a nested
+/// if-generate; signals and subprograms of the enclosing scopes.
+#[test]
+fn blocks() {
+    check("blocks");
+}
+
+/// Component declarations and instantiation (§6.8, §11.7.2): default
+/// binding to the entity of the same name, configuration specifications by
+/// label and `others` with generic and port maps naming the local generics
+/// (§7.3), an unbound component, and instantiation of a configuration.
+#[test]
+fn components() {
+    check("components");
+}
+
+/// A configuration declaration as the top (§3.4): block configurations of
+/// an architecture, of generate iterations by index and range and of an
+/// if-generate, component configurations with nested block configurations.
+#[test]
+fn config_decl() {
+    check("config_decl");
+}
+
+/// Port associations (§6.5.7.1): conversion functions and type conversions
+/// of actuals, formal conversions of out ports, partial association of
+/// formals in both directions, a resolved inout bus and a buffer port; no
+/// delta is added (§14.7.3.4).
+#[test]
+fn port_maps() {
+    check("port_maps");
+}
+
+/// A non-static actual expression is assigned to an implicit signal by an
+/// implicit process, one delta behind (§6.5.6.3), unlike a signal name or
+/// a conversion function.
+#[test]
+fn port_exprs() {
+    check("port_exprs");
+}
+
+/// A generic-width ripple-carry adder of full-adder components in a
+/// for-generate with if-generate alternatives, bound by a configuration to
+/// two architectures and checked against IEEE.NUMERIC_STD addition.
+#[test]
+fn ripple_adder() {
+    check("ripple_adder");
+}

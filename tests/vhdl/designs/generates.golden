@@ -1,0 +1,17 @@
+generates.vhd:24:26:@0ms:(report note): gen proc 0
+generates.vhd:8:5:@0ms:(report note): leaf 0 a='0'
+generates.vhd:24:26:@0ms:(report note): gen proc 1
+generates.vhd:8:5:@0ms:(report note): leaf 1 a='0'
+generates.vhd:24:26:@0ms:(report note): gen proc 2
+generates.vhd:8:5:@0ms:(report note): leaf 2 a='0'
+generates.vhd:24:26:@0ms:(report note): gen proc 3
+generates.vhd:8:5:@0ms:(report note): leaf 3 a='0'
+generates.vhd:30:19:@0ms:(report note): if-gen true
+generates.vhd:38:34:@0ms:(report note): case others
+generates.vhd:8:5:@0ms:(report note): leaf 10 a='0'
+generates.vhd:8:5:@1ns:(report note): leaf 10 a='1'
+generates.vhd:8:5:@1ns:(report note): leaf 0 a='1'
+generates.vhd:8:5:@1ns:(report note): leaf 1 a='1'
+generates.vhd:8:5:@1ns:(report note): leaf 2 a='1'
+generates.vhd:8:5:@1ns:(report note): leaf 3 a='1'
+generates.vhd:46:5:@2ns:(report note): t=0000 xe='0'

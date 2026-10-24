@@ -36,12 +36,24 @@ SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
 - Entities and architectures, processes (with or without sensitivity
   lists, `process (all)`), concurrent signal assignments (simple,
   conditional, selected), concurrent assertions and procedure calls.
-- Hierarchy: entity instantiation (`entity work.e(a)`, or a component
-  named like an entity) with port maps and generic maps. A port associated
-  with a signal or a static part of one is that signal (no extra delta);
-  `open`, unassociated and literal actuals get a signal of their own.
-  Each distinct set of generic values is analysed on its own, so subtypes
-  may depend on generics.
+- Hierarchy: entity instantiation (`entity work.e(a)`), component
+  instantiation, configuration instantiation, with port maps and generic
+  maps. A port associated with a signal or a static part of one is that
+  signal (no extra delta); `open`, unassociated and literal actuals get a
+  signal of their own. Each distinct set of generic values is analysed on
+  its own, so subtypes may depend on generics.
+- Components bind by default to the entity of the same name, by
+  configuration specifications (`for u1 : c use entity ...`, `for others`,
+  `for all`, `use open`), or by a configuration declaration, which may also
+  be the top: block configurations of architectures, blocks and generate
+  iterations (by index, range or alternative label), component
+  configurations with nested block configurations.
+- Block statements (with generics and ports) and for-, if- and
+  case-generate statements, with their own declarations.
+- Port maps with conversion functions and type conversions (in and out),
+  partial association of formals (`v(3 downto 2) => x`), `inout` and
+  `buffer` ports; a non-static actual expression goes through an implicit
+  signal, one delta behind, as in GHDL.
 - Types: enumeration, integer, real, physical (TIME), arrays (any number
   of dimensions; constrained, unconstrained, and with bounds computed at
   elaboration), records, access types, subtypes with range checks.
@@ -69,9 +81,10 @@ SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
 
 ## Not supported yet
 
-Each is reported at its source location: generate and block statements,
-configurations, port maps with conversion functions or non-static
-expressions, signal parameters of mode `out`/`inout`, procedures that wait,
+Each is reported at its source location: guarded blocks, conversions and
+partial association of `inout` ports, compound configuration
+specifications, configuration declarative parts, signal parameters of mode
+`out`/`inout`, procedures that wait,
 assignments to record elements of a signal, file I/O other than WRITELINE
 to OUTPUT and TEXTIO reads, protected types, generic types, subprograms and
 packages, external names, force/release, `case?`, and mixing with
@@ -84,3 +97,8 @@ output and exit status (`*.golden`, `*.exit`, made by `regen.sh`). The
 group is behind a feature, so plain `cargo test` skips it:
 
     cargo test --features vhdl-tests --test vhdl
+
+Processes resumed in the same simulation cycle run in an order the LRM
+leaves to the implementation (§14.7.5.3): xezim uses elaboration order and
+GHDL its own, so output written by several processes in one delta may come
+in a different order. The test designs print from one process per delta.

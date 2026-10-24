@@ -1,0 +1,6 @@
+components.vhd:8:17:@0ms:(report note): add plus w=20 extra='0'
+components.vhd:13:17:@0ms:(report note): u2 minus w=7
+components.vhd:8:17:@0ms:(report note): add plus w=50 extra='0'
+components.vhd:13:17:@0ms:(report note): cmp minus w=8
+components.vhd:13:17:@0ms:(report note): cfg minus w=99
+components.vhd:56:5:@1ns:(report note): r1=13 r2=7 r3=13 r4=9 r5=9

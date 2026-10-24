@@ -1,0 +1,5 @@
+port_maps.vhd:42:5:@1ns:(report note): r=00001010 wh=0101 wl=1010 b='H' c=1
+port_maps.vhd:45:5:@1ns:(report note): d1 r=00001010 wh=0101 b='H'
+port_maps.vhd:47:5:@1ns:(report note): d2 r=00011001 wh=1001 b='1'
+port_maps.vhd:49:5:@1ns:(report note): d3 r=00011001 wh=1001 b='1' c=2
+port_maps.vhd:53:5:@3ns:(report note): r=00011011 wh=1011 wl=0100 b='H' c=2

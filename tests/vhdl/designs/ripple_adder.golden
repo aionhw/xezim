@@ -1,0 +1,6 @@
+ripple_adder.vhd:75:9:@10ns:(report note): 100010 + 111001 + '0' = 1011011
+ripple_adder.vhd:75:9:@90ns:(report note): 100010 + 110010 + '1' = 1010101
+ripple_adder.vhd:75:9:@170ns:(report note): 100010 + 101011 + '0' = 1001101
+ripple_adder.vhd:75:9:@250ns:(report note): 100010 + 100100 + '1' = 1000111
+ripple_adder.vhd:75:9:@330ns:(report note): 100010 + 011101 + '0' = 0111111
+ripple_adder.vhd:79:5:@401ns:(report note): done, errors=0
