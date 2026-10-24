@@ -325,7 +325,7 @@ impl Simulator {
                         tn = Some(r);
                     }
                 }
-                return tn;
+                return tn.and_then(|t| self.resolved_class_key(&t));
             }
             cur = cd.extends.clone();
         }
@@ -406,7 +406,7 @@ impl Simulator {
                         tn = Some(r);
                     }
                 }
-                return tn.filter(|t| self.module.classes.contains_key(t));
+                return tn.and_then(|t| self.resolved_class_key(&t));
             }
             cur = cd.extends.as_deref();
         }
@@ -544,7 +544,12 @@ impl Simulator {
                 // packed element types `type_name` is None or a non-class.
                 // §8.25: an element type that is a class type parameter is a
                 // class when this object binds the parameter to one.
-                let is_object_elem = self.prop_class_type(handle, prop).is_some();
+                let is_object_elem = self.prop_class_type(handle, prop).is_some()
+                    || cd
+                        .properties
+                        .get(prop)
+                        .and_then(|s| s.type_name.clone())
+                        .is_some_and(|tn| self.resolved_class_key(&tn).is_some());
                 // §8.25/§6.20.2: the element width in this object's
                 // specialization. The class tables hold the default's, so a
                 // `rand T beats[]` bound wider than T's default solved its

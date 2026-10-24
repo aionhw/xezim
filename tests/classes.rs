@@ -1149,3 +1149,5 @@ mod review_940_process_status;
 mod static_shadow_write_944;
 #[path = "classes/vif_collection_formals_925.rs"]
 mod vif_collection_formals_925;
+#[path = "classes/rand_typedef_handle.rs"]
+mod rand_typedef_handle;
