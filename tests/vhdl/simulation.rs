@@ -270,3 +270,63 @@ fn port_exprs() {
 fn ripple_adder() {
     check("ripple_adder");
 }
+
+/// Projected waveforms (§10.5.2.2): inertial rejection of several pending
+/// transactions keeping the run of the new value, `reject 0 ns`, transport
+/// deleting later transactions, and zero-delay elements.
+#[test]
+fn waveforms() {
+    check("waveforms");
+}
+
+/// Implicit signals S'STABLE(T), S'QUIET(T), S'DELAYED(T), S'TRANSACTION
+/// of signals and elements (§16.2.4) as sensitivities, in a wait condition
+/// and in concurrent assignments; 'LAST_ACTIVE.
+#[test]
+fn implicit_signals() {
+    check("implicit_signals");
+}
+
+/// Implicit signals are updated in the cycle of their prefix's event or
+/// activity (§14.7.5.3 c); 'DELAYED with no time is one delta later.
+#[test]
+fn implicit_deltas() {
+    check("implicit_deltas");
+}
+
+/// Postponed processes, a postponed assertion and a postponed procedure
+/// call run at the end of a time step with its final values, and last at
+/// initialization (§11.3, §14.7.5.2, §14.7.5.3).
+#[test]
+fn postponed_procs() {
+    check("postponed_procs");
+}
+
+/// A postponed process causing a delta cycle is an error (§11.3).
+#[test]
+fn postponed_delta() {
+    check("postponed_delta");
+}
+
+/// Guarded blocks and assignments (§11.2, §11.6) with nested guards,
+/// guarded signals of kinds bus and register (§6.4.2.3), disconnection
+/// specifications (§7.4) and drivers turned off by null transactions
+/// (§14.7.3.2).
+#[test]
+fn guarded_blocks() {
+    check("guarded_blocks");
+}
+
+/// Procedures that wait and assign signals through signal parameters of
+/// modes in, out and inout and elements of signals (§4.2.2.3, §10.2), in
+/// a package and in a process.
+#[test]
+fn procedure_waits() {
+    check("procedure_waits");
+}
+
+/// 'DRIVING and 'DRIVING_VALUE of a signal and an out port (§16.2.4).
+#[test]
+fn driving_values() {
+    check("driving_values");
+}

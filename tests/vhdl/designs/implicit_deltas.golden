@@ -1,0 +1,4 @@
+implicit_deltas.vhd:11:5:@0ms:(report note): init tr='1' nod.tr='1' u.tr='1'
+implicit_deltas.vhd:16:5:@1ns:(report note): same cycle: stable=false d0=0 q=false tr='0'
+implicit_deltas.vhd:19:5:@1ns:(report note): next delta: stable=true d0=1 q=true
+implicit_deltas.vhd:23:5:@1ns:(report note): active: stable=true q=false tr='1'

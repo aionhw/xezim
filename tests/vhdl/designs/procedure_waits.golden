@@ -1,0 +1,12 @@
+procedure_waits.vhd:93:21:@0ms:(report note): p='0' at 0 fs
+procedure_waits.vhd:74:5:@15ns:(report note): after 2 cycles 15000000 fs
+procedure_waits.vhd:93:21:@25ns:(report note): p='1' at 25000000 fs
+procedure_waits.vhd:76:5:@28ns:(report note): after step 28000000 fs p='1'
+procedure_waits.vhd:93:21:@28ns:(report note): p='0' at 28000000 fs
+procedure_waits.vhd:80:5:@29ns:(report note): v=010H
+procedure_waits.vhd:35:23:@41ns:(report note): ack event at 41000000 fs
+procedure_waits.vhd:82:5:@41ns:(report note): hs1 ok=true at 41000000 fs
+procedure_waits.vhd:85:5:@71ns:(report note): hs2 ok=false at 71000000 fs
+procedure_waits.vhd:87:5:@71ns:(report note): n=2 t=2
+procedure_waits.vhd:88:16:@72ns:(report note): t=9 at 72000000 fs
+procedure_waits.vhd:89:16:@73ns:(report note): t=12 at 73000000 fs

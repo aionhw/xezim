@@ -75,3 +75,21 @@ fn std_other_than_2008_is_rejected() {
     );
     assert!(text.contains("[work]: entity clock_report"), "{}", text);
 }
+
+/// Guarded signals must be resolved (§6.4.2.3), a disconnection
+/// specification names guarded signals (§7.4), a null transaction needs a
+/// guarded target (§10.5.2.2) and a guarded assignment a GUARD signal
+/// (§11.6); each error is located.
+#[test]
+fn guarded_signal_errors_are_located() {
+    let (out, text) = xezim(&["errors/guarded.vhd"], &[]);
+    assert!(!out.status.success(), "{}", text);
+    for e in [
+        "errors/guarded.vhd:4:3: error: VHDL: a guarded signal must be of a resolved subtype",
+        "errors/guarded.vhd:6:14: error: VHDL: 's' is not a guarded signal of type 'integer'",
+        "errors/guarded.vhd:8:17: error: VHDL: the target of a null waveform element must be a guarded signal",
+        "errors/guarded.vhd:9:3: error: VHDL: a guarded assignment needs a GUARD signal (a guarded block)",
+    ] {
+        assert!(text.contains(e), "{}\n{}", e, text);
+    }
+}

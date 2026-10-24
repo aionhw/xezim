@@ -1,0 +1,4 @@
+driving_values.vhd:12:5:@0ms:(report note): driving=true dv=1 o.dv=3
+driving_values.vhd:16:5:@1ns:(report note): driving=true dv=2 o.dv=4
+driving_values.vhd:19:5:@1ns:(report note): dv now=2
+driving_values.vhd:21:5:@1ns:(report note): dv after=5 s=5

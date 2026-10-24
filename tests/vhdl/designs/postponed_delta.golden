@@ -1,0 +1,4 @@
+postponed_delta.vhd:9:5:@0ms:(report note): s=0
+postponed_delta.vhd:9:5:@1ns:(report note): s=1
+ghdl:error: postponed process causes a delta cycle
+ghdl:error: simulation failed

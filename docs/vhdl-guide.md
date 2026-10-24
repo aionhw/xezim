@@ -35,7 +35,9 @@ SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
 
 - Entities and architectures, processes (with or without sensitivity
   lists, `process (all)`), concurrent signal assignments (simple,
-  conditional, selected), concurrent assertions and procedure calls.
+  conditional, selected), concurrent assertions and procedure calls, all
+  of them also `postponed` (run at the end of a time step; causing a
+  delta cycle there is an error).
 - Hierarchy: entity instantiation (`entity work.e(a)`), component
   instantiation, configuration instantiation, with port maps and generic
   maps. A port associated with a signal or a static part of one is that
@@ -48,8 +50,9 @@ SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
   be the top: block configurations of architectures, blocks and generate
   iterations (by index, range or alternative label), component
   configurations with nested block configurations.
-- Block statements (with generics and ports) and for-, if- and
-  case-generate statements, with their own declarations.
+- Block statements (with generics and ports, guarded with a GUARD
+  signal) and for-, if- and case-generate statements, with their own
+  declarations.
 - Port maps with conversion functions and type conversions (in and out),
   partial association of formals (`v(3 downto 2) => x`), `inout` and
   `buffer` ports; a non-static actual expression goes through an implicit
@@ -59,13 +62,21 @@ SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
   elaboration), records, access types, subtypes with range checks.
 - Signals of those types with inertial and transport delays, `reject`,
   multi-element waveforms; `'event`, `'active`, `'last_value`,
-  `'last_event`, also of elements. Several processes may drive a signal:
-  resolved signals (`std_logic`, user resolution functions, element-wise
-  resolution of `std_logic_vector`) and drivers of single elements or
-  slices.
+  `'last_event`, `'last_active`, also of elements; `'driving`,
+  `'driving_value`. Several processes may drive a signal: resolved signals
+  (`std_logic`, user resolution functions, element-wise resolution of
+  `std_logic_vector`) and drivers of single elements or slices.
+- Implicit signals `'stable(t)`, `'quiet(t)`, `'delayed(t)`,
+  `'transaction`, updated in the cycle of their prefix's event or
+  activity; usable in sensitivity lists, waits and expressions.
+- Guarded assignments, guarded signals of kind `bus` and `register`,
+  disconnection specifications and null transactions (`s <= null after
+  t`): a bus with no driver on resolves an empty array, a register keeps
+  its value.
 - `wait on/until/for`, every sequential statement, labelled `next`/`exit`.
 - Functions and procedures: overloading, default and named parameters,
-  `out`/`inout`, signal parameters of mode `in` (`rising_edge`),
+  `out`/`inout`, signal parameters of every mode, procedures that wait and
+  assign signals (lowered once per calling process and signal actuals),
   recursion, packages with deferred constants, aliases (also with a
   subtype).
 - Expressions: all predefined operators (short-circuit `and`/`or`,
@@ -81,10 +92,11 @@ SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
 
 ## Not supported yet
 
-Each is reported at its source location: guarded blocks, conversions and
-partial association of `inout` ports, compound configuration
-specifications, configuration declarative parts, signal parameters of mode
-`out`/`inout`, procedures that wait,
+Each is reported at its source location: conversions and partial
+association of `inout` ports, compound configuration specifications,
+configuration declarative parts, null transactions to part of a signal,
+implicit signals and `'last_active` of a function's signal parameter,
+calls of procedures that wait or assign signals from outside a process,
 assignments to record elements of a signal, file I/O other than WRITELINE
 to OUTPUT and TEXTIO reads, protected types, generic types, subprograms and
 packages, external names, force/release, `case?`, and mixing with
@@ -102,3 +114,8 @@ Processes resumed in the same simulation cycle run in an order the LRM
 leaves to the implementation (§14.7.5.3): xezim uses elaboration order and
 GHDL its own, so output written by several processes in one delta may come
 in a different order. The test designs print from one process per delta.
+
+GHDL 4.1's mcode backend cannot run a sequential null assignment
+(`s <= null;` in a process stops with an internal error), so null
+transactions are checked through guarded assignments, whose disconnection
+is the same null transaction (§11.6).

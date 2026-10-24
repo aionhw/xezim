@@ -1,0 +1,24 @@
+implicit_signals.vhd:35:5:@0ms:(report note): stable5=true quiet2=true delayed4=0 transaction='1' d=0000 y=-2147483648 st=false
+implicit_signals.vhd:35:5:@0ms:(report note): stable5=true quiet2=true delayed4=0 transaction='1' d=0000 y=1 st=true
+implicit_signals.vhd:35:5:@10ns:(report note): stable5=false quiet2=false delayed4=0 transaction='0' d=0000 y=1 st=true
+implicit_signals.vhd:35:5:@12ns:(report note): stable5=false quiet2=true delayed4=0 transaction='0' d=0000 y=1 st=true
+implicit_signals.vhd:35:5:@12ns:(report note): stable5=false quiet2=true delayed4=0 transaction='0' d=0000 y=2 st=true
+implicit_signals.vhd:35:5:@14ns:(report note): stable5=false quiet2=true delayed4=1 transaction='0' d=0000 y=2 st=true
+implicit_signals.vhd:35:5:@15ns:(report note): stable5=true quiet2=true delayed4=1 transaction='0' d=0000 y=2 st=true
+implicit_signals.vhd:35:5:@20ns:(report note): stable5=true quiet2=false delayed4=1 transaction='1' d=0000 y=2 st=true
+implicit_signals.vhd:35:5:@22ns:(report note): stable5=true quiet2=true delayed4=1 transaction='1' d=0000 y=2 st=true
+implicit_signals.vhd:35:5:@23ns:(report note): stable5=false quiet2=false delayed4=1 transaction='0' d=0000 y=2 st=true
+implicit_signals.vhd:35:5:@24ns:(report note): stable5=false quiet2=false delayed4=1 transaction='1' d=0000 y=2 st=true
+implicit_signals.vhd:35:5:@25ns:(report note): stable5=false quiet2=false delayed4=1 transaction='1' d=0000 y=3 st=true
+implicit_signals.vhd:35:5:@26ns:(report note): stable5=false quiet2=true delayed4=1 transaction='1' d=0000 y=3 st=true
+implicit_signals.vhd:35:5:@26ns:(report note): stable5=false quiet2=true delayed4=1 transaction='1' d=0000 y=4 st=true
+implicit_signals.vhd:35:5:@27ns:(report note): stable5=false quiet2=true delayed4=2 transaction='1' d=0000 y=4 st=true
+implicit_signals.vhd:35:5:@28ns:(report note): stable5=false quiet2=true delayed4=3 transaction='1' d=0000 y=4 st=true
+implicit_signals.vhd:35:5:@29ns:(report note): stable5=true quiet2=true delayed4=3 transaction='1' d=0000 y=4 st=true
+implicit_signals.vhd:35:5:@47ns:(report note): stable5=true quiet2=true delayed4=3 transaction='1' d=0010 y=4 st=true
+implicit_signals.vhd:35:5:@49ns:(report note): stable5=true quiet2=true delayed4=3 transaction='1' d=0010 y=4 st=false
+implicit_signals.vhd:35:5:@52ns:(report note): stable5=true quiet2=true delayed4=3 transaction='1' d=0110 y=4 st=false
+implicit_signals.vhd:35:5:@53ns:(report note): stable5=true quiet2=true delayed4=3 transaction='1' d=0010 y=4 st=false
+implicit_signals.vhd:35:5:@54ns:(report note): stable5=true quiet2=true delayed4=3 transaction='1' d=0010 y=4 st=true
+implicit_signals.vhd:25:5:@70ns:(report note): end s=3 stable=true stable5=true quiet=true la=46000000 fs le=46000000 fs v2la=20000000 fs v1st=true
+implicit_signals.vhd:30:5:@74ns:(report note): v(1) stable for 30 ns at 74000000 fs

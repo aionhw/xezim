@@ -1,0 +1,8 @@
+waveforms.vhd:33:5:@0ms:(report note): a=0 b=0 c=0 d=0 e=0
+waveforms.vhd:33:5:@4ns:(report note): a=0 b=0 c=0 d=0 e=2
+waveforms.vhd:33:5:@4ns:(report note): a=0 b=0 c=0 d=0 e=3
+waveforms.vhd:33:5:@5ns:(report note): a=0 b=0 c=1 d=7 e=4
+waveforms.vhd:33:5:@6ns:(report note): a=0 b=0 c=1 d=8 e=4
+waveforms.vhd:33:5:@7ns:(report note): a=0 b=5 c=1 d=8 e=4
+waveforms.vhd:33:5:@11ns:(report note): a=0 b=5 c=2 d=8 e=4
+waveforms.vhd:33:5:@15ns:(report note): a=3 b=5 c=2 d=8 e=4

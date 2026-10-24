@@ -1,0 +1,15 @@
+guarded_blocks.vhd:72:5:@0ms:(report note): q=0 bus='0' reg='0' sl='U' bv=UUUU r=1010 o=0
+guarded_blocks.vhd:72:5:@0ms:(report note): q=0 bus='0' reg='0' sl='Z' bv=UUUU r=1010 o=0
+guarded_blocks.vhd:72:5:@2ns:(report note): q=0 bus='0' reg='0' sl='Z' bv=ZZZZ r=1010 o=0
+guarded_blocks.vhd:72:5:@5ns:(report note): q=5 bus='0' reg='0' sl='Z' bv=ZZZZ r=1010 o=0
+guarded_blocks.vhd:72:5:@15ns:(report note): q=6 bus='0' reg='0' sl='Z' bv=ZZZZ r=1010 o=0
+guarded_blocks.vhd:72:5:@20ns:(report note): q=6 bus='1' reg='1' sl='H' bv=ZZZZ r=1010 o=0
+guarded_blocks.vhd:72:5:@30ns:(report note): q=6 bus='1' reg='1' sl='0' bv=ZZZZ r=1010 o=0
+guarded_blocks.vhd:72:5:@40ns:(report note): q=6 bus='1' reg='0' sl='0' bv=ZZZZ r=1010 o=0
+guarded_blocks.vhd:72:5:@43ns:(report note): q=6 bus='0' reg='0' sl='0' bv=ZZZZ r=1010 o=0
+guarded_blocks.vhd:72:5:@50ns:(report note): q=6 bus='0' reg='0' sl='Z' bv=ZZZZ r=1010 o=0
+guarded_blocks.vhd:72:5:@65ns:(report note): q=6 bus='0' reg='0' sl='Z' bv=0101 r=1010 o=0
+guarded_blocks.vhd:72:5:@70ns:(report note): q=6 bus='0' reg='0' sl='Z' bv=0011 r=1010 o=0
+guarded_blocks.vhd:72:5:@75ns:(report note): q=6 bus='0' reg='0' sl='Z' bv=0011 r=0101 o=3
+guarded_blocks.vhd:72:5:@80ns:(report note): q=6 bus='0' reg='0' sl='Z' bv=0011 r=1111 o=7
+guarded_blocks.vhd:72:5:@97ns:(report note): q=6 bus='0' reg='0' sl='Z' bv=ZZZZ r=1111 o=7

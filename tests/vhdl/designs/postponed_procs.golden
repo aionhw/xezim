@@ -1,0 +1,9 @@
+postponed_procs.vhd:30:5:@0ms:(report note): a=0 b=0 c=0
+postponed_procs.vhd:12:5:@0ms:(report note): e=0
+postponed_procs.vhd:30:5:@0ms:(report note): a=1 b=2 c=4
+postponed_procs.vhd:30:5:@10ns:(report note): a=2 b=3 c=6
+postponed_procs.vhd:32:3:@10ns:(assertion note): c is 6
+postponed_procs.vhd:30:5:@21ns:(report note): a=4 b=5 c=10
+postponed_procs.vhd:12:5:@30ns:(report note): e=100
+postponed_procs.vhd:12:5:@40ns:(report note): e=200
+postponed_procs.vhd:37:5:@45ns:(report note): timeout at 45000000 fs e=200
