@@ -947,6 +947,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "JIT: shadow-verify the inline-bits mirror against Values",
     ),
     (
+        "XEZIM_VHDL_DUMP",
+        "VHDL: print each VHDL file's design units (kind and name) after parsing",
+    ),
+    (
         "XEZIM_VIRTUAL_NAME_MIN_CELLS",
         "Names: arrays of at least this many cells get virtual element names (default 257; 0 = all)",
     ),

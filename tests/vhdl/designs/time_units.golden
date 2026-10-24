@@ -1,0 +1,6 @@
+time_units.vhd:6:20:@2ms:(report note): 2ms
+time_units.vhd:7:22:@1000ms:(report note): 1sec
+time_units.vhd:8:22:@60000ms:(report note): 1min
+time_units.vhd:9:22:@3600000ms:(report note): 1hr
+time_units.vhd:10:5:@3600000ms:(report note): high=2147483647 low=-2147483648
+time_units.vhd:11:5:@3600000ms:(report note): timehigh=9223372036854775807 fs

@@ -1,0 +1,5 @@
+clock_report.vhd:6:23:@0ms:(report note): clk='0'
+clock_report.vhd:6:23:@5ns:(report note): clk='1'
+clock_report.vhd:6:23:@10ns:(report note): clk='0'
+clock_report.vhd:6:23:@15ns:(report note): clk='1'
+clock_report.vhd:6:23:@20ns:(report note): clk='0'

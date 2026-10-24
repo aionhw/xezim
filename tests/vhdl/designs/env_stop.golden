@@ -1,0 +1,2 @@
+env_stop.vhd:6:5:@5ns:(report note): stopping
+simulation stopped @5ns

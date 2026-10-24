@@ -1,0 +1,2 @@
+ghdl:error: bound check failure at bound_check.vhd:12
+ghdl:error: simulation failed

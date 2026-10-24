@@ -82,6 +82,14 @@ opcode-census = []
 # resolution points that can plausibly reach one).
 elide-audit = []
 jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native", "xezim-core/native-layout"]
+# Build the VHDL regression group (tests/vhdl). Off in plain `cargo test`;
+# the VHDL CI workflow enables it when VHDL paths change.
+vhdl-tests = []
+
+[[test]]
+name = "vhdl"
+path = "tests/vhdl.rs"
+required-features = ["vhdl-tests"]
 
 [[bin]]
 name = "xezim"

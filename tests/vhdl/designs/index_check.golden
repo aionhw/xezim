@@ -1,0 +1,2 @@
+ghdl:error: index (9) out of bounds (3 downto 0) at index_check.vhd:7
+ghdl:error: simulation failed

@@ -1,0 +1,3 @@
+assert_failure.vhd:4:5:@0ms:(assertion failure): fatal assert
+ghdl:error: assertion failed
+ghdl:error: simulation failed

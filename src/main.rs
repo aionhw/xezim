@@ -251,6 +251,10 @@ fn print_usage() {
         "  --upf-top <path>         Instance the UPF scope applies to (default: first instance of"
     );
     eprintln!("                           the set_design_top module)");
+    eprintln!(
+        "  --work=<lib>             VHDL library for the .vhd/.vhdl files that follow (default work)"
+    );
+    eprintln!("  --std=08                 VHDL standard (VHDL-2008, the default and only one)");
     eprintln!("  --dump-merged-sv <file>  Write the sources, fully preprocessed (`ifdef");
     eprintln!("                     resolved, macros expanded, `includes inlined), into one");
     eprintln!("                     self-contained .sv file — a standalone repro for");
@@ -2058,6 +2062,9 @@ fn run_main() -> i32 {
     let mut dump_files_list = false;
     let mut dump_merged_sv: Option<String> = None;
     let mut upf_files: Vec<String> = Vec::new();
+    // VHDL design library of the VHDL files that follow (`--work=<lib>`).
+    let mut vhdl_work = String::from("work");
+    let mut vhdl_file_libs: Vec<(String, String)> = Vec::new();
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut vpi_libs: Vec<String> = Vec::new();
     let mut module_timescale_args: Vec<String> = Vec::new();
@@ -2716,6 +2723,23 @@ fn run_main() -> i32 {
                     std::process::exit(1);
                 }
             }
+            _ if arg.starts_with("--work=") => {
+                vhdl_work = arg["--work=".len()..].to_ascii_lowercase();
+                if vhdl_work.is_empty() {
+                    eprintln!("Error: --work= requires a VHDL library name");
+                    std::process::exit(1);
+                }
+            }
+            _ if arg.starts_with("--std=") => {
+                let v = &arg["--std=".len()..];
+                if !matches!(v, "08" | "2008") {
+                    eprintln!(
+                        "Error: --std={}: only VHDL-2008 (--std=08) is supported",
+                        v
+                    );
+                    std::process::exit(1);
+                }
+            }
             "--upf-top" => {
                 i += 1;
                 if i < args.len() {
@@ -2940,7 +2964,12 @@ fn run_main() -> i32 {
                 Some(top) => {
                     top_modules.push(top);
                 }
-                None => source_files.push(arg.clone()),
+                None => {
+                    if xezim_core::vhdl::is_vhdl_path(arg) {
+                        vhdl_file_libs.push((arg.clone(), vhdl_work.clone()));
+                    }
+                    source_files.push(arg.clone())
+                }
             },
         }
         i += 1;
@@ -3161,6 +3190,24 @@ fn run_main() -> i32 {
         print_usage();
         std::process::exit(1);
     }
+    // VHDL sources go to the VHDL front end, each into the library the
+    // last `--work=` before it named (args-file entries: `work`).
+    let (vhdl_sources, sv_sources): (Vec<String>, Vec<String>) = std::mem::take(&mut source_files)
+        .into_iter()
+        .partition(|f| xezim_core::vhdl::is_vhdl_path(f));
+    source_files = sv_sources;
+    xezim_core::vhdl::configure(
+        vhdl_sources
+            .into_iter()
+            .map(|path| {
+                let library = vhdl_file_libs
+                    .iter()
+                    .find(|(p, _)| *p == path)
+                    .map_or_else(|| "work".to_string(), |(_, l)| l.clone());
+                xezim_core::vhdl::VhdlFile { path, library }
+            })
+            .collect(),
+    );
 
     // XTrace option validation. Every one of these degrades to what we really
     // emit and SAYS SO — the header must never claim a level, a format or a
@@ -3256,7 +3303,7 @@ suppressed but the explicit SDF annotation still applies."
             .unwrap_or_else(default_design_cache_dir);
         let dependency_files = design_dependency_files(&lib_files, &lib_dirs, lib_exts.as_deref());
         let semantic_salt = format!(
-            "sv2023={};strict={};delay_select={};module_timescale={:?};lib_dirs={:?};lib_files={:?};lib_exts={:?};nospecify={};param_overrides={:?}",
+            "sv2023={};strict={};delay_select={};module_timescale={:?};lib_dirs={:?};lib_files={:?};lib_exts={:?};nospecify={};param_overrides={:?};vhdl={:?}",
             sv2023_mode,
             strict_checks,
             source_delay_select,
@@ -3266,6 +3313,7 @@ suppressed but the explicit SDF annotation still applies."
             lib_exts,
             nospecify,
             compat.param_overrides,
+            xezim_core::vhdl::cache_digest(),
         );
         // Set cache compression settings before cache is used
         if let Some(level) = cache_compression_level {

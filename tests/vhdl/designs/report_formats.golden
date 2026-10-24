@@ -1,0 +1,14 @@
+report_formats.vhd:10:5:@0ms:(report note): plain report
+report_formats.vhd:11:5:@0ms:(report note): note sev
+report_formats.vhd:12:5:@0ms:(report warning): warning sev
+report_formats.vhd:14:5:@10ns:(report error): error sev
+report_formats.vhd:15:5:@10ns:(assertion error): assert default
+report_formats.vhd:16:5:@10ns:(assertion warning): assert warning
+report_formats.vhd:17:5:@10ns:(report note): image int=-42 real=3.25 time=1500000 fs
+report_formats.vhd:18:5:@10ns:(report note): image real2=1.0e10 1.0e-1 -2.5e-7
+report_formats.vhd:19:5:@10ns:(report note): image time2=1000000000 fs 0 fs 2500000 fs
+report_formats.vhd:20:5:@10ns:(report note): image bool=true char='a' bit='1'
+report_formats.vhd:22:5:@11ns:(report note): failure next
+report_formats.vhd:23:5:@11ns:(report failure): fail sev
+ghdl:error: report failed
+ghdl:error: simulation failed

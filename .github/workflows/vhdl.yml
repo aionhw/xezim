@@ -1,0 +1,48 @@
+name: VHDL
+
+# The VHDL regression group (tests/vhdl, IEEE 1076-2008 designs checked
+# against GHDL reference output). It is behind the `vhdl-tests` feature, so
+# the main CI skips it; it runs here only when the VHDL front end can have
+# changed: its tests, the CLI routing in src/main.rs, or Cargo.toml (the
+# xezim-core pin, where the VHDL front end lives).
+on:
+  push:
+    paths:
+      - "tests/vhdl.rs"
+      - "tests/vhdl/**"
+      - "src/main.rs"
+      - "Cargo.toml"
+      - ".github/workflows/vhdl.yml"
+  pull_request:
+    paths:
+      - "tests/vhdl.rs"
+      - "tests/vhdl/**"
+      - "src/main.rs"
+      - "Cargo.toml"
+      - ".github/workflows/vhdl.yml"
+  workflow_dispatch:
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_BUILD_JOBS: 1
+
+jobs:
+  vhdl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargoreg-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargoreg-
+
+      - name: VHDL regression
+        run: cargo test --features vhdl-tests --test vhdl --no-fail-fast
