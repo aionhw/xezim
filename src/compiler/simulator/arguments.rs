@@ -1370,7 +1370,7 @@ impl Simulator {
                         let tmp = format!("{}.{}", stage_root, sfx);
                         self.register_struct_member_coll_as(&tmp, kind, &dt, sk);
                         self.clear_coll(&tmp, kind);
-                        self.copy_coll(&tmp, &src, kind);
+                        self.copy_coll_typed(&tmp, &src, kind, &dt);
                         Some(tmp)
                     }
                     _ => None,
@@ -1428,7 +1428,7 @@ impl Simulator {
             self.register_struct_member_coll_as(&local, kind, &dt, sk);
             self.clear_coll(&local, kind);
             if let Some(tmp) = staged {
-                self.copy_coll(&local, &tmp, kind);
+                self.copy_coll_typed(&local, &tmp, kind, &dt);
                 self.clear_coll(&tmp, kind);
             }
         }

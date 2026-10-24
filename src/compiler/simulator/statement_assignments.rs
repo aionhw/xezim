@@ -1773,8 +1773,14 @@ impl Simulator {
                                 self.settle_after_proc_write();
                                 return;
                             }
+                            // §13.4.1: a call's result carries its dynamic
+                            // members through the return staging.
+                            self.pending_ret_struct = None;
                             let v = self.eval_expr(rvalue);
                             if self.spread_into_unpacked_struct(&dst_s, &su, &v) {
+                                if self.pending_ret_struct.is_some() {
+                                    self.copy_ret_struct_colls(&dst_s, &su);
+                                }
                                 self.settle_after_proc_write();
                                 return;
                             }

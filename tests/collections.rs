@@ -210,3 +210,6 @@ mod struct_member_coll_actuals;
 
 #[path = "collections/struct_nested_queue_elems.rs"]
 mod struct_nested_queue_elems;
+
+#[path = "collections/struct_nested_dyn_arrays.rs"]
+mod struct_nested_dyn_arrays;

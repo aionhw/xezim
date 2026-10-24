@@ -1629,6 +1629,13 @@ impl Simulator {
                     if !self.ensure_struct_member_coll(&d) {
                         self.module.dynamic_arrays.insert(d.clone());
                     }
+                    // §7.5: elements that are unpacked structs copy member by
+                    // member, their own dynamic members included.
+                    if let Some(esu) = self.unpacked_struct_of(&m.data_type) {
+                        self.ensure_struct_member_coll(&sname);
+                        self.copy_struct_elems(&d, &sname, &esu);
+                        continue;
+                    }
                     let n = self.get_queue_size(&sname);
                     for j in 0..n {
                         if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", sname, j))
@@ -2607,6 +2614,44 @@ impl Simulator {
         }
     }
 
+    /// `copy_coll` for a collection whose element type `elem_dt` is known.
+    /// §7.2/§7.5: an element that is an unpacked struct has no value of its
+    /// own — it is its members, dynamic ones included — so each element is
+    /// copied member by member. Composed storage names (a struct formal's or
+    /// return's staged members) carry no declared type to recover this from.
+    pub(super) fn copy_coll_typed(
+        &mut self,
+        dst: &str,
+        src: &str,
+        kind: StructCollKind,
+        elem_dt: &DataType,
+    ) {
+        if dst != src
+            && kind != StructCollKind::Assoc
+            && let Some(esu) = self.unpacked_struct_of(elem_dt)
+        {
+            self.copy_struct_elems(dst, src, &esu);
+            return;
+        }
+        self.copy_coll(dst, src, kind);
+    }
+
+    /// Copy the queue / dynamic array of unpacked structs `src` onto `dst`
+    /// element by element, member by member, and set its size.
+    pub(super) fn copy_struct_elems(
+        &mut self,
+        dst: &str,
+        src: &str,
+        esu: &crate::ast::types::StructUnionType,
+    ) {
+        let n = self.get_queue_size(src);
+        for j in 0..n {
+            let (d, s) = (format!("{}[{}]", dst, j), format!("{}[{}]", src, j));
+            self.copy_unpacked_struct(&d, &s, esu);
+        }
+        self.set_queue_size(dst, n);
+    }
+
     /// §6.21/§7.2.1: a fresh automatic struct variable `base` of type `su`
     /// starts with EMPTY dynamic members of its own. They are named by the
     /// variable's path (`v.q`), so the enclosing frame's same-named storage
@@ -2665,7 +2710,7 @@ impl Simulator {
                 || self.module.associative_arrays.contains_key(&src)
                 || self.ensure_struct_member_coll(&src)
             {
-                self.copy_coll(&dst, &src, kind);
+                self.copy_coll_typed(&dst, &src, kind, &dt);
             }
         }
         self.pending_ret_struct = Some(RET_STRUCT.to_string());
@@ -2687,7 +2732,7 @@ impl Simulator {
                 self.register_struct_member_coll_as(&d, kind, &dt, sk);
             }
             self.clear_coll(&d, kind);
-            self.copy_coll(&d, &format!("{}.{}", src, sfx), kind);
+            self.copy_coll_typed(&d, &format!("{}.{}", src, sfx), kind, &dt);
         }
     }
 
@@ -2958,8 +3003,14 @@ impl Simulator {
                 // queue copies (`q2 = q`) and foreach loops with its string
                 // members intact. Storing only the packed scalar left every
                 // leaf-based consumer reading "".
+                // The result's dynamic members travel through the return
+                // staging, as for `r = make(...)`.
+                self.pending_ret_struct = None;
                 let v = self.queue_eval_arg(obj_name, arg);
                 self.spread_into_unpacked_struct(elem, &su, &v);
+                if self.pending_ret_struct.is_some() {
+                    self.copy_ret_struct_colls(elem, &su);
+                }
                 // Keep the packed view even when no leaves can be laid out.
                 // The argument has already run; falling through would repeat
                 // its side effects (§13.5.1).
