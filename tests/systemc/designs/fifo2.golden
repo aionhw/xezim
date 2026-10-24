@@ -1,0 +1,13 @@
+0 s wrote 10
+0 s wrote 20
+avail 2
+1 ns read 10
+1 ns wrote 30
+5 ns read 20
+5 ns wrote 40
+9 ns read 30
+9 ns wrote 50
+13 ns read 40
+17 ns read 50
+21 ns nb_read 0
+done 21 ns

@@ -1,0 +1,9 @@
+0 s in=1
+main 5 ns
+5 ns timer 0
+5 ns in=2
+main 10 ns
+10 ns timer 1
+10 ns in=4
+15 ns timer 2
+main 20 ns

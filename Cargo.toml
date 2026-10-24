@@ -82,6 +82,9 @@ opcode-census = []
 # resolution points that can plausibly reach one).
 elide-audit = []
 jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native", "xezim-core/native-layout"]
+# Build the SystemC regression group (tests/systemc). Off in plain `cargo
+# test`; the SystemC CI workflow enables it when SystemC paths change.
+systemc-tests = []
 
 [[bin]]
 name = "xezim"
@@ -90,6 +93,11 @@ path = "src/main.rs"
 [[bin]]
 name = "xezim-bench"
 path = "src/bin/bench.rs"
+
+[[test]]
+name = "systemc"
+path = "tests/systemc.rs"
+required-features = ["systemc-tests"]
 
 [lib]
 name = "xezim"

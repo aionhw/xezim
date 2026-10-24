@@ -29,6 +29,7 @@ match the SystemC 2.3 reference kernel:
 | `SC_CTHREAD` + `reset_signal_is` / `async_reset_signal_is`, `wait(n)` | first runs at its first clock edge; restarts on reset |
 | `sc_signal` / port writes | update phase (nonblocking); `sc_main` writes apply at the next `sc_start` |
 | `sc_start(t)` | stops before the events *at* `t` (they run in the next `sc_start`) |
+| `sc_start()` | returns at `sc_stop()` or when no events are left; the rest of `sc_main` then runs (in a `final` block, so it cannot call `sc_start` or `wait` again) |
 | `sc_stop()` | stops at the end of the delta cycle, with SystemC's message |
 | `sc_clock` | period, duty cycle, start time, `posedge_first` |
 | time | picoseconds (SystemC's default resolution); `sc_time` prints like SystemC (`1500 ps`, `1 us`) |
@@ -41,10 +42,12 @@ match the SystemC 2.3 reference kernel:
   initializer lists), named and positional port binding, `sc_vector` ports
   and signals.
 - **Ports and channels**: `sc_in`/`sc_out`/`sc_inout` (an `sc_inout` is an
-  output its owner also reads), `sc_signal`, `sc_buffer`, `sc_clock`,
-  `sc_fifo` with `sc_fifo_in`/`sc_fifo_out`, `sc_event`.
+  output its owner also reads), `sc_signal`, `sc_buffer` (an event on every
+  write), `sc_clock`, `sc_fifo` (with its depth) with
+  `sc_fifo_in`/`sc_fifo_out`, `sc_event`.
 - **Data types**: `bool`, `sc_uint`/`sc_int`/`sc_biguint`/`sc_bigint` (up to
-  the width SystemVerilog vectors allow), `sc_bv`, `sc_lv`, `sc_logic`, the C++
+  the width SystemVerilog vectors allow), `sc_bv`, `sc_lv`, `sc_logic` (and
+  bit-string literals such as `"01XZ"`), the C++
   integer and floating types, `std::string`, `std::vector`, `sc_time`; part and
   bit selects, `(a, b)` concatenation, reductions, `to_uint()` and friends.
 - **Output**: `std::cout` (with `hex`/`dec`/`setw`/`setfill`, printing
@@ -66,6 +69,7 @@ Each of these is reported as an error at its C++ source line, never
 simulated approximately:
 
 - `sc_port`/`sc_export` with user interfaces (custom hierarchical channels),
+  an `sc_buffer` bound to a port (a port passes on value changes only),
   `sc_mutex`/`sc_semaphore`, approximately-timed TLM (`nb_transport`,
   payload event queues), `sc_spawn`, `SC_FORK`/`SC_JOIN`, `next_trigger`.
 - User classes and structs as data (including signal payloads with
@@ -79,8 +83,19 @@ object assigned to another variable is shared, not copied.
 
 ## Verification
 
-Every design under `tests/systemc/designs/` is checked against the output of
-the same program built with the SystemC 2.3.4 reference kernel
-(`tests/systemc/designs/*.golden`). From the Accellera SystemC examples, `pipe` and
+Every design under `tests/systemc/designs/` (a `.cpp`, or a directory of
+`.cpp` files) is checked against the output of the same program built with
+the SystemC 2.3.4 reference kernel (`tests/systemc/designs/*.golden`), and
+each unsupported construct in `tests/systemc/errors/` must be rejected at its
+source line. The group is behind a feature, so plain `cargo test` skips it:
+
+    cargo test --features systemc-tests --test systemc
+
+CI runs it (`.github/workflows/systemc.yml`) only when a change touches the
+SystemC tests, `src/main.rs` or `Cargo.toml` (the xezim-core pin, where the
+lowering lives). To add a design, write it, build it against SystemC and save
+its output (banner removed) as the golden file:
+
+    g++ -std=c++17 design.cpp -lsystemc -o ref && ./ref > design.golden From the Accellera SystemC examples, `pipe` and
 `reset_signal_is` simulate with identical output; the others need features
 listed above.

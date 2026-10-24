@@ -1,0 +1,9 @@
+start
+3 ns tick 1
+6 ns tick 2
+9 ns tick 3
+12 ns tick 4
+14 ns stopping
+
+Info: /OSCI/SystemC: Simulation stopped by user.
+after sc_start at 14 ns n=4

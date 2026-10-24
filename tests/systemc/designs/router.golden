@@ -1,0 +1,13 @@
+0 s mem0 write @0
+25 ns mem1 write @4
+60 ns mem0 write @8
+85 ns mem1 write @12
+120 ns mem0 read @0
+145 ns cpu read 1000
+145 ns mem1 read @4
+180 ns cpu read 2001
+180 ns mem0 read @8
+205 ns cpu read 3002
+205 ns mem1 read @12
+240 ns cpu read 4003
+end 240 ns

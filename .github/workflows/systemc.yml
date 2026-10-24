@@ -1,0 +1,48 @@
+name: SystemC
+
+# The SystemC regression group (tests/systemc, IEEE 1666 designs checked
+# against SystemC 2.3.4 reference output). It is behind the `systemc-tests`
+# feature, so the main CI skips it; it runs here only when the SystemC
+# front end can have changed: its tests, the CLI routing in src/main.rs, or
+# Cargo.toml (the xezim-core pin, where the SystemC lowering lives).
+on:
+  push:
+    paths:
+      - "tests/systemc.rs"
+      - "tests/systemc/**"
+      - "src/main.rs"
+      - "Cargo.toml"
+      - ".github/workflows/systemc.yml"
+  pull_request:
+    paths:
+      - "tests/systemc.rs"
+      - "tests/systemc/**"
+      - "src/main.rs"
+      - "Cargo.toml"
+      - ".github/workflows/systemc.yml"
+  workflow_dispatch:
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_BUILD_JOBS: 1
+
+jobs:
+  systemc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargoreg-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargoreg-
+
+      - name: SystemC regression
+        run: cargo test --features systemc-tests --test systemc --no-fail-fast

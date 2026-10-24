@@ -1,0 +1,8 @@
+0 s s=7
+500 ps b=7
+1500 ps b=7
+2500 ps b=7
+3500 ps b=7
+4 ns s=8
+4500 ps b=8
+signal events 2 buffer events 5

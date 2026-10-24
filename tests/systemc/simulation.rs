@@ -11,13 +11,26 @@ fn designs() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/systemc/designs")
 }
 
-/// Run `xezim` on `designs/<name>.cpp` (from that directory, so reports
-/// name the file as the reference did) and compare with the golden output.
+/// Run `xezim` on `designs/<name>.cpp`, or on every `.cpp` of the
+/// directory `designs/<name>/` (from that directory, so reports name the
+/// file as the reference did), and compare with `designs/<name>.golden`.
 fn check(name: &str) {
     let dir = designs();
+    let (run_dir, files) = if dir.join(name).is_dir() {
+        let mut cpps: Vec<String> = std::fs::read_dir(dir.join(name))
+            .expect("design directory")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|f| f.ends_with(".cpp"))
+            .collect();
+        cpps.sort();
+        (dir.join(name), cpps)
+    } else {
+        (dir.clone(), vec![format!("{}.cpp", name)])
+    };
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .current_dir(&dir)
-        .args(["--no-cache", &format!("{}.cpp", name)])
+        .current_dir(&run_dir)
+        .arg("--no-cache")
+        .args(&files)
         .output()
         .expect("run xezim");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -120,4 +133,96 @@ fn async_reset() {
 #[test]
 fn tlm_lt() {
     check("tlm_lt");
+}
+
+/// §6.7 sc_clock duty cycle, start time and `posedge_first = false`;
+/// negedge sensitivity (§5.4.3); sc_time printing (§5.11.10).
+#[test]
+fn clocks() {
+    check("clocks");
+}
+
+/// §6.9 sc_buffer notifies on every write; sc_signal (§6.4) only on a
+/// value change.
+#[test]
+fn buffer() {
+    check("buffer");
+}
+
+/// SC_HAS_PROCESS with constructor parameters (§5.2.8), an out-of-class
+/// constructor, member child modules built in the initializer list,
+/// positional binding (§4.1.3) and sc_inout (§6.10).
+#[test]
+fn ctor_params() {
+    check("ctor");
+}
+
+/// §4.5.7 `sc_start()` without a limit ended by `sc_stop()`; statements
+/// after it; timed and SC_ZERO_TIME notification (§5.10.8).
+#[test]
+fn stop() {
+    check("stop");
+}
+
+/// C++ in process bodies: free functions, reference parameters, static
+/// locals, `<cmath>`, break/continue in nested loops.
+#[test]
+fn functions() {
+    check("funcs");
+}
+
+/// §7.9 four-valued sc_logic/sc_lv with X and Z, bit-string literals
+/// (§7.9.8).
+#[test]
+fn logic() {
+    check("logic");
+}
+
+/// §7.6 sc_uint/sc_int/sc_biguint: signed arithmetic and arithmetic right
+/// shift, range assignment, reductions, wrap-around.
+#[test]
+fn slices() {
+    check("slices");
+}
+
+/// §4.5.7 sc_start(t) in steps: events at the end time run in the next
+/// call; sc_main writes apply at the next sc_start.
+#[test]
+fn start_boundary() {
+    check("boundary");
+}
+
+/// TLM-2.0 transport_dbg (§11.3), word and byte views of target memory,
+/// an array as a data pointer, address error responses (§14.17).
+#[test]
+fn tlm_dbg() {
+    check("tlm_dbg");
+}
+
+/// §6.23 sc_fifo of depth 2: blocking write and read, num_available,
+/// nb_read on an empty fifo; sc_start() ends when no events are left.
+#[test]
+fn fifo_depth() {
+    check("fifo2");
+}
+
+/// Moore FSM with an enum state: SC_METHOD next-state logic, SC_CTHREAD
+/// state register with `reset_signal_is` (§5.2.13), `negedge_event()`.
+#[test]
+fn fsm() {
+    check("fsm");
+}
+
+/// TLM-2.0 LT interconnect: a router's target socket forwards through two
+/// initiator sockets by address (§11.1); delays accumulate.
+#[test]
+fn tlm_router() {
+    check("router");
+}
+
+/// Several translation units sharing a header: a module declared in
+/// `alu.h`, its process defined in `alu.cpp`.
+#[test]
+fn multi_file() {
+    check("multi");
 }

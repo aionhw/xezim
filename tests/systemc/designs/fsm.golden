@@ -1,0 +1,12 @@
+25 ns in=1 hit=0
+35 ns in=1 hit=0
+45 ns in=0 hit=0
+55 ns in=1 hit=0
+65 ns in=0 hit=0
+75 ns in=1 hit=0
+85 ns in=1 hit=1
+95 ns in=0 hit=0
+105 ns in=1 hit=0
+115 ns in=1 hit=1
+
+Info: /OSCI/SystemC: Simulation stopped by user.
