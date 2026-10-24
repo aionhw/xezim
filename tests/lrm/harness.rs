@@ -31,10 +31,8 @@ fn fixture_dir() -> String {
     format!("{}/tests/lrm/sv", env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The `T|` lines `src` prints when elaborated with `top` as the top module
-/// (an empty `top` elaborates every uninstantiated module as a top).
-pub fn t_lines(src: &str, top: &str) -> Result<Vec<String>, String> {
-    let sim = xezim::simulate_multi(
+fn simulate(src: &str, top: &str) -> Result<xezim::compiler::Simulator, String> {
+    xezim::simulate_multi(
         &[src.to_string()],
         MAX_TIME,
         (!top.is_empty()).then_some(top),
@@ -57,8 +55,34 @@ pub fn t_lines(src: &str, top: &str) -> Result<Vec<String>, String> {
         None,
         None,
         false,
-    )?;
+    )
+}
+
+/// The `T|` lines `src` prints when elaborated with `top` as the top module
+/// (an empty `top` elaborates every uninstantiated module as a top).
+pub fn t_lines(src: &str, top: &str) -> Result<Vec<String>, String> {
+    let sim = simulate(src, top)?;
     Ok(extract(sim.output.iter().map(|o| o.message.as_str())))
+}
+
+/// Run fixture `name` and require a run-time error whose message contains
+/// `needle`; a run that reports no error panics with all of its output.
+pub fn check_error(name: &str, src: &str, top: &str, needle: &str) {
+    let sim = simulate(src, top).unwrap_or_else(|e| panic!("{name}: simulate failed: {e}"));
+    let text = sim
+        .output
+        .iter()
+        .map(|o| o.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        sim.error_count > 0,
+        "{name}: expected a run-time error, none was reported\n{text}"
+    );
+    assert!(
+        text.contains(needle),
+        "{name}: expected an error containing {needle:?}\n{text}"
+    );
 }
 
 /// Keep the `T|...` tail of every output line that has one.
