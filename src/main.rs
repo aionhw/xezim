@@ -3208,6 +3208,11 @@ fn run_main() -> i32 {
             })
             .collect(),
     );
+    // A VHDL simulation runs until no events are left (IEEE 1076-2008
+    // §14.7.5), as GHDL does: no default run-length limit.
+    if xezim_core::vhdl::configured() && !max_time_explicit {
+        max_time = RUN_ALL_NS;
+    }
 
     // XTrace option validation. Every one of these degrades to what we really
     // emit and SAYS SO — the header must never claim a level, a format or a

@@ -1,0 +1,5 @@
+subprograms.vhd:47:5:@0ms:(report note): swap: x=9 y=3
+subprograms.vhd:50:5:@0ms:(report note): bump: x=20
+subprograms.vhd:51:5:@0ms:(report note): twice: 42 2.5
+subprograms.vhd:52:5:@0ms:(report note): fact(10)=3628800 base=40
+subprograms.vhd:53:5:@0ms:(report note): local_add=42

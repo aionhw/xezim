@@ -2830,7 +2830,8 @@ impl<'a> BytecodeCompiler<'a> {
                 parts.iter().any(|p| self.expr_is_string_concat_operand(p))
             }
             ExprKind::SystemCall { name, args } => match name.as_str() {
-                "$sformatf" | "$psprintf" => true,
+                // `$__vh_real_image`: VHDL REAL'IMAGE (xezim-core's lowering).
+                "$sformatf" | "$psprintf" | "$__vh_real_image" => true,
                 // §6.24.3: `string'(x)` compiles to a string value (ToStr),
                 // so it is a string operand of an §11.4.12 concat.
                 "$__xz_type_cast" | "$__xz_named_cast" => self.cast_arg_targets_string(args),
@@ -7233,7 +7234,7 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Index { expr: base, .. } => self.local_string_coll(base),
             ExprKind::Paren(inner) => self.expr_is_string_static(inner),
             ExprKind::SystemCall { name, args } => match name.as_str() {
-                "$sformatf" | "$psprintf" => true,
+                "$sformatf" | "$psprintf" | "$__vh_real_image" => true,
                 // §6.24.3: `string'(x)` compiles to a string value (ToStr).
                 "$__xz_type_cast" | "$__xz_named_cast" => self.cast_arg_targets_string(args),
                 _ => false,

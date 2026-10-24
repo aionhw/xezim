@@ -6,3 +6,5 @@
 
 #[path = "vhdl/front_end.rs"]
 mod front_end;
+#[path = "vhdl/simulation.rs"]
+mod simulation;

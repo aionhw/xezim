@@ -1,0 +1,6 @@
+waits.vhd:19:5:@15ns:(report note): n reached 2 at 15000000 fs
+waits.vhd:21:5:@25ns:(report note): n changed to 3
+waits.vhd:23:5:@37ns:(report note): timeout: n=4
+waits.vhd:25:5:@40ns:(report note): falling clk, n=4
+waits.vhd:27:5:@43ns:(report note): 3 ns later
+waits.vhd:29:5:@45ns:(report note): rising edge, n=4

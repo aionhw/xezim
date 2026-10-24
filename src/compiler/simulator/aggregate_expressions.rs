@@ -2162,6 +2162,12 @@ impl Simulator {
                 let s = self.format_args(args, "$display");
                 Value::from_string(&s)
             }
+            // VHDL REAL'IMAGE in GHDL's format, for designs lowered from
+            // VHDL by xezim-core (IEEE 1076-2008 §16.2.2).
+            "$__vh_real_image" => {
+                let r = args.first().map(|a| self.eval_expr(a).to_f64()).unwrap_or(0.0);
+                Value::from_string(&xezim_core::vhdl::real_image(r))
+            }
             "$cast" => {
                 // `$cast(dest, src)` as a function: succeeds (returns 1 and
                 // assigns) iff src's object is assignment-compatible with

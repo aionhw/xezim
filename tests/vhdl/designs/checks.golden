@@ -1,0 +1,12 @@
+checks.vhd:12:7:@0ms:(report note): d=0
+checks.vhd:12:7:@0ms:(report note): d=1
+checks.vhd:12:7:@0ms:(report note): d=2
+checks.vhd:12:7:@0ms:(report note): d=3
+checks.vhd:12:7:@0ms:(report note): d=4
+checks.vhd:12:7:@0ms:(report note): d=5
+checks.vhd:12:7:@0ms:(report note): d=6
+checks.vhd:12:7:@0ms:(report note): d=7
+checks.vhd:12:7:@0ms:(report note): d=8
+checks.vhd:12:7:@0ms:(report note): d=9
+ghdl:error: bound check failure at checks.vhd:11
+ghdl:error: simulation failed

@@ -1,0 +1,9 @@
+arrays.vhd:22:5:@0ms:(report note): sum a=150 sum b=28
+arrays.vhd:25:5:@0ms:(report note): a(2)=99 b(3)=1 b(0)=4
+arrays.vhd:26:5:@0ms:(report note): slice sum=159
+arrays.vhd:27:5:@0ms:(report note): s=hello s(2 to 4)=ell length=5
+arrays.vhd:28:5:@0ms:(report note): cat: hello world [h]
+arrays.vhd:30:5:@0ms:(report note): bv and: '1''0''1''0'
+arrays.vhd:32:5:@0ms:(report note): bv not: '1''1'
+arrays.vhd:33:5:@0ms:(report note): eq: true true lt: true
+arrays.vhd:34:5:@0ms:(report note): attrs: 3 0 3 false

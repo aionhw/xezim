@@ -1,0 +1,5 @@
+deltas.vhd:13:5:@0ms:(report note): assigned a, a=0
+deltas.vhd:15:5:@0ms:(report note): delta 1: a=5 b=1 c=0
+deltas.vhd:17:5:@0ms:(report note): delta 2: b=6 c=2
+deltas.vhd:19:5:@0ms:(report note): delta 3: c=12
+deltas.vhd:21:5:@1ns:(report note): 1 ns: c=12

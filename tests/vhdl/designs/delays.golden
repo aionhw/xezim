@@ -1,0 +1,11 @@
+delays.vhd:20:21:@0ms:(report note): i=0
+delays.vhd:21:21:@0ms:(report note): t=0
+delays.vhd:22:21:@0ms:(report note): r=0
+delays.vhd:23:21:@0ms:(report note): w=0
+delays.vhd:23:21:@4ns:(report note): w=1
+delays.vhd:23:21:@5ns:(report note): w=2
+delays.vhd:23:21:@6ns:(report note): w=3
+delays.vhd:22:21:@8ns:(report note): r=8
+delays.vhd:21:21:@10ns:(report note): t=1
+delays.vhd:20:21:@12ns:(report note): i=2
+delays.vhd:21:21:@12ns:(report note): t=2

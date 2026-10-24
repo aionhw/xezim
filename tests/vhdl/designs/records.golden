@@ -1,0 +1,2 @@
+records.vhd:18:5:@0ms:(report note): q=(3,4) tag='q' dist2=25
+records.vhd:23:5:@1ns:(report note): p.x=-1 p.tag='q' equal=true

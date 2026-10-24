@@ -471,6 +471,13 @@ impl Simulator {
             "$error" => {
                 self.emit_severity("Error", args);
             }
+            // A VHDL check failure or severity FAILURE (designs lowered from
+            // VHDL by xezim-core): the message is already printed; end the
+            // run with a failing exit status, as GHDL does.
+            "$__vh_fail" => {
+                self.saw_fatal = true;
+                self.finished = true;
+            }
             "$fatal" => {
                 // `$fatal [ ( finish_number [, list_of_arguments] ) ]`. The
                 // first argument, when it is an integer literal 0/1/2, is the

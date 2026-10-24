@@ -1,0 +1,5 @@
+attrs.vhd:13:5:@0ms:(report note): color'left=red right=yellow pos(blue)=2 val(3)=yellow succ(red)=green pred(yellow)=blue
+attrs.vhd:16:5:@0ms:(report note): warm'high=green small'low=-3 small'high=7
+attrs.vhd:22:5:@4ns:(report note): s'event=true s'last_value='0' c'last_value=red s'active=true
+attrs.vhd:25:5:@10ns:(report note): s'event=false s'last_event=6000000 fs
+attrs.vhd:28:5:@10ns:(report note): same value: s'event=false s'active=true

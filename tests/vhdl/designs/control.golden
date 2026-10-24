@@ -1,0 +1,5 @@
+control.vhd:18:5:@0ms:(report note): case acc=235
+control.vhd:23:5:@0ms:(report note): downto acc=54321
+control.vhd:32:5:@0ms:(report note): nested acc=20
+control.vhd:37:5:@0ms:(report note): while acc=1023
+control.vhd:48:5:@0ms:(report note): if msg=2
