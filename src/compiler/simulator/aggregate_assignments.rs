@@ -250,6 +250,89 @@ impl Simulator {
         !su.packed && !untagged_union
     }
 
+    /// Whether the unpacked structs `a` and `b` have the same members — names,
+    /// unpacked dimensions and widths in order — as two uses of one type do.
+    pub(super) fn same_struct_shape(
+        &self,
+        a: &crate::ast::types::StructUnionType,
+        b: &crate::ast::types::StructUnionType,
+    ) -> bool {
+        let width = |dt: &DataType| {
+            super::elaborate::resolve_type_width(
+                dt,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            )
+        };
+        a.members.len() == b.members.len()
+            && a.members.iter().zip(&b.members).all(|(ma, mb)| {
+                ma.declarators.len() == mb.declarators.len()
+                    && width(&ma.data_type) == width(&mb.data_type)
+                    && ma.declarators.iter().zip(&mb.declarators).all(|(da, db)| {
+                        da.name.name == db.name.name && da.dimensions.len() == db.dimensions.len()
+                    })
+            })
+    }
+
+    /// §7.2/§10.9.2: assign the struct-valued expression `e` — a struct
+    /// variable, formal, local, element or member, or a call returning one —
+    /// to the unpacked struct `target` of type `su`, member by member
+    /// (dynamic members included). `false`, writing nothing, when `e` is not
+    /// a struct of that type.
+    pub(super) fn assign_struct_value_to(
+        &mut self,
+        target: &str,
+        su: &crate::ast::types::StructUnionType,
+        e: &Expression,
+    ) -> bool {
+        let mut inner = e;
+        while let ExprKind::Paren(i) = &inner.kind {
+            inner = i;
+        }
+        if let ExprKind::Call { func, .. } = &inner.kind {
+            let ExprKind::Ident(h) = &func.kind else {
+                return false;
+            };
+            let ret = h
+                .path
+                .last()
+                .and_then(|seg| self.module.functions.get(&seg.name.name))
+                .map(|fd| fd.return_type.clone());
+            let Some(rsu) = ret.and_then(|dt| self.unpacked_struct_of(&dt)) else {
+                return false;
+            };
+            if !self.same_struct_shape(&rsu, su) {
+                return false;
+            }
+            self.pending_ret_struct = None;
+            let v = self.eval_expr(inner);
+            if !self.spread_into_unpacked_struct(target, su, &v) {
+                return false;
+            }
+            if self.pending_ret_struct.is_some() {
+                self.copy_ret_struct_colls(target, su);
+            }
+            return true;
+        }
+        if !matches!(
+            inner.kind,
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } | ExprKind::Index { .. }
+        ) {
+            return false;
+        }
+        let Some((src, ssu)) = self.struct_storage_of(inner) else {
+            return false;
+        };
+        if src == target
+            || !self.same_struct_shape(&ssu, su)
+            || !self.struct_storage_exists(&src, su)
+        {
+            return false;
+        }
+        self.copy_unpacked_struct(target, &src, su);
+        true
+    }
+
     /// Assign `e` to the flattened target `target` of declared type `dt`. When
     /// `e` is itself an assignment pattern and `dt` an unpacked struct, recurse
     /// member-wise; otherwise evaluate and write the leaf.
@@ -271,6 +354,12 @@ impl Simulator {
             // member values survived an assignment that should overwrite
             // everything. Re-enter the spread with a synthetic default item.
             if Self::spreads_member_wise(&su) {
+                // §10.9.2: an item (or `default:` value) that is itself a
+                // struct of the member's type is assigned to the member
+                // whole; only any other value applies member by member.
+                if self.assign_struct_value_to(target, &su, e) {
+                    return;
+                }
                 let synthetic = [AssignmentPatternItem::Default(e.clone())];
                 self.assign_pattern_into_struct(target, &su, &synthetic);
                 return;

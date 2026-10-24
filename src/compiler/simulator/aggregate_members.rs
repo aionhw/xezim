@@ -1102,14 +1102,37 @@ impl Simulator {
         if suffix.is_empty() {
             return None;
         }
-        let ret = self.call_return_type(call)?;
-        let su = self.unpacked_struct_of(&ret)?;
+        // §7.10.2.5/§7.10.2.6: `pop_front()` / `pop_back()` of a queue of
+        // unpacked structs returns an element, packed by `queue_elem_value`
+        // over the same leaf layout.
+        let su = match self.call_return_type(call) {
+            Some(ret) => self.unpacked_struct_of(&ret)?,
+            None => {
+                let (obj, m) = self.collection_method_of(call)?;
+                if m != "pop_front" && m != "pop_back" {
+                    return None;
+                }
+                self.queue_elem_struct(&obj)?
+            }
+        };
         suffix.reverse();
         let want = format!("X{}", suffix.concat());
-        let (_, off, w, leaf_is_real) = self
-            .struct_leaf_layout("X", &su)
-            .into_iter()
-            .find(|(k, ..)| *k == want)?;
+        let layout = self.struct_leaf_layout("X", &su);
+        let (off, w, leaf_is_real) = match layout.iter().find(|(k, ..)| *k == want) {
+            Some(&(_, off, w, r)) => (off, w, r),
+            None => {
+                // §7.2: a member that is itself an unpacked struct spans its
+                // leaves, which the layout keeps contiguous and ordered as
+                // that struct's own packed form.
+                let prefix = format!("{}.", want);
+                let span = layout
+                    .iter()
+                    .filter(|(k, ..)| k.starts_with(&prefix))
+                    .map(|&(_, off, w, _)| (off, off + w))
+                    .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))?;
+                (span.0, span.1 - span.0, false)
+            }
+        };
         let v = self.eval_expr(cur);
         let mut out = v.range_select((off + w - 1) as usize, off as usize);
         // `struct_leaf_layout` already knows which leaves are `real`; that flag
@@ -1119,8 +1142,43 @@ impl Simulator {
         // function's struct return goes through — `Tsum('{...}).field1`.
         if leaf_is_real {
             out.is_real = true;
+        } else if let Some(dt) = self.struct_path_member_type(&su, &suffix) {
+            // §7.2.1/§11.8.1: the slice is a raw bit pattern; the member keeps
+            // its declared signedness (an `int` member read back as unsigned).
+            out.is_signed = self.type_is_signed_concrete(&dt);
         }
         Some(out)
+    }
+
+    /// The declared type of the member that `path` (`.v`, `.f0`, `[2]`, as
+    /// `eval_unpacked_call_member` collects it) selects below the unpacked
+    /// struct `su`: an element select of a member array keeps its element
+    /// type. `None` when a step names no member.
+    pub(super) fn struct_path_member_type(
+        &self,
+        su: &crate::ast::types::StructUnionType,
+        path: &[String],
+    ) -> Option<DataType> {
+        let mut cur_su = su.clone();
+        let mut dt: Option<DataType> = None;
+        for step in path {
+            let Some(name) = step.strip_prefix('.') else {
+                // An index of a member array: the element has the member's
+                // data type.
+                dt.as_ref()?;
+                continue;
+            };
+            let m = cur_su
+                .members
+                .iter()
+                .find(|m| m.declarators.iter().any(|d| d.name.name == name))?;
+            let t = m.data_type.clone();
+            if let Some(inner) = self.unpacked_struct_of(&t) {
+                cur_su = inner;
+            }
+            dt = Some(t);
+        }
+        dt
     }
 
     /// The PACKED-struct element type of an array-typed expression —

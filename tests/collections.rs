@@ -207,3 +207,6 @@ mod struct_dyn_subroutine_members;
 
 #[path = "collections/struct_member_coll_actuals.rs"]
 mod struct_member_coll_actuals;
+
+#[path = "collections/struct_nested_queue_elems.rs"]
+mod struct_nested_queue_elems;
