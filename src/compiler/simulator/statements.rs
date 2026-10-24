@@ -4959,6 +4959,13 @@ impl Simulator {
             }
             StatementKind::Return(expr) => {
                 if let Some(e) = expr {
+                    // §11.4.11/§13.4.1: `return c ? a : b` of unpacked structs
+                    // returns the selected operand, dynamic members included.
+                    let e = if matches!(e.kind, ExprKind::Conditional { .. }) {
+                        self.struct_cond_operand(e).unwrap_or(e)
+                    } else {
+                        e
+                    };
                     // One call for a receiver call in the returned chain
                     // (`return me().o.x;`), shared by the probes below.
                     let pinned = Self::recv_chain_call(e)
@@ -5124,7 +5131,27 @@ impl Simulator {
                                 Some((name, su)) => self
                                     .pack_unpacked_struct(&name, &su)
                                     .unwrap_or_else(|| self.eval_expr(e)),
-                                None => self.eval_expr(e),
+                                // §13.4.1/§7.2: any other unpacked-struct
+                                // storage (a module or package variable, a
+                                // member, an element) is its leaves too.
+                                None => {
+                                    let storage = if matches!(
+                                        e.kind,
+                                        ExprKind::Ident(_)
+                                            | ExprKind::MemberAccess { .. }
+                                            | ExprKind::Index { .. }
+                                    ) && self.root_may_hold_struct(e)
+                                    {
+                                        self.struct_storage_of(e)
+                                    } else {
+                                        None
+                                    };
+                                    storage
+                                        .and_then(|(name, su)| {
+                                            self.pack_unpacked_struct(&name, &su)
+                                        })
+                                        .unwrap_or_else(|| self.eval_expr(e))
+                                }
                             },
                         }
                     };

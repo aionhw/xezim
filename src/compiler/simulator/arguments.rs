@@ -1277,6 +1277,8 @@ impl Simulator {
         locals: &mut HashMap<String, Value>,
     ) -> Option<Vec<(String, Expression)>> {
         let su = self.unpacked_struct_of(dt)?;
+        // §11.4.11: a conditional actual binds its selected operand.
+        let arg = self.struct_cond_operand(arg).unwrap_or(arg);
         let copies_in = matches!(
             dir,
             PortDirection::Input | PortDirection::Inout | PortDirection::Ref

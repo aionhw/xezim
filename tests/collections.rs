@@ -213,3 +213,6 @@ mod struct_nested_queue_elems;
 
 #[path = "collections/struct_nested_dyn_arrays.rs"]
 mod struct_nested_dyn_arrays;
+
+#[path = "collections/struct_cond_operands.rs"]
+mod struct_cond_operands;

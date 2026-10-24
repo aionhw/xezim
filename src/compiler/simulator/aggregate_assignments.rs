@@ -274,6 +274,71 @@ impl Simulator {
             })
     }
 
+    /// §11.4.11: the operand a conditional expression of unpacked-struct type
+    /// selects (through nested conditionals and parentheses), its
+    /// conditions evaluated once. An unpacked struct has no single packed
+    /// value to carry its dynamic members, so a consumer treats the selected
+    /// operand as the source itself. `None` when `e` is no conditional, its
+    /// operands are not unpacked structs, or the first condition is x/z (the
+    /// caller's general path then evaluates it).
+    pub(super) fn struct_cond_operand<'e>(&mut self, e: &'e Expression) -> Option<&'e Expression> {
+        let mut leaf = e;
+        loop {
+            match &leaf.kind {
+                ExprKind::Paren(i) => leaf = i,
+                ExprKind::Conditional { then_expr, .. } => leaf = then_expr,
+                _ => break,
+            }
+        }
+        if std::ptr::eq(leaf, e) || !self.expr_is_unpacked_struct(leaf) {
+            return None;
+        }
+        let mut cur = e;
+        let mut selected = false;
+        loop {
+            match &cur.kind {
+                ExprKind::Paren(i) => cur = i,
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => {
+                    let c = self.eval_expr(condition);
+                    if c.has_unknown() {
+                        return selected.then_some(cur);
+                    }
+                    cur = if c.is_true() { then_expr } else { else_expr };
+                    selected = true;
+                }
+                _ => return selected.then_some(cur),
+            }
+        }
+    }
+
+    /// Whether `e` is an unpacked struct by its declaration: a call of a
+    /// function returning one, or struct storage (a variable, formal, local,
+    /// element or member). Evaluates nothing.
+    pub(super) fn expr_is_unpacked_struct(&mut self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Call { func, .. } => {
+                let ExprKind::Ident(h) = &func.kind else {
+                    return false;
+                };
+                h.path.len() == 1
+                    && self
+                        .module
+                        .functions
+                        .get(&h.path[0].name.name)
+                        .map(|fd| fd.return_type.clone())
+                        .is_some_and(|dt| self.unpacked_struct_of(&dt).is_some())
+            }
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } | ExprKind::Index { .. } => {
+                self.root_may_hold_struct(e) && self.struct_storage_of(e).is_some()
+            }
+            _ => false,
+        }
+    }
+
     /// §7.2/§10.9.2: assign the struct-valued expression `e` — a struct
     /// variable, formal, local, element or member, or a call returning one —
     /// to the unpacked struct `target` of type `su`, member by member
@@ -285,7 +350,7 @@ impl Simulator {
         su: &crate::ast::types::StructUnionType,
         e: &Expression,
     ) -> bool {
-        let mut inner = e;
+        let mut inner = self.struct_cond_operand(e).unwrap_or(e);
         while let ExprKind::Paren(i) = &inner.kind {
             inner = i;
         }
@@ -2970,6 +3035,8 @@ impl Simulator {
         }
         if let Some(su) = self.queue_elem_struct(obj_name) {
             if Self::spreads_member_wise(&su) {
+                // §11.4.11: a conditional stores its selected operand.
+                let arg = self.struct_cond_operand(arg).unwrap_or(arg);
                 if let ExprKind::AssignmentPattern(items) = &arg.kind {
                     if !items.is_empty() {
                         self.assign_pattern_into_struct(elem, &su, items);
