@@ -145,3 +145,60 @@ endmodule",
     );
     assert_line(&msgs, "P2=5 P3=5 P4=-32768 P6=6 P7=-3 P8=2 P9=4");
 }
+
+#[test]
+fn instance_typedefs_type_params_and_imports() {
+    let msgs = messages(
+        "package pk;
+  typedef logic [3:0] n_t;
+  typedef enum logic [2:0] {X0, X1, X2} k_e;
+endpackage
+typedef logic [7:0] w_t;
+module grand #(parameter int G = 3) ();
+  typedef logic [G-1:0] g_t;
+  function automatic int fg(int x); return g_t'(x); endfunction
+  localparam int CG = fg(13);
+  initial #1 $display(\"%m CG=%0d\", CG);
+endmodule
+module child #(parameter int W = 5, parameter type T = logic [3:0]) ();
+  import pk::*;
+  typedef logic [W-1:0] w_t;
+  typedef w_t v_t;
+  typedef pk::n_t a_t;
+  typedef enum logic [1:0] {A, B, C, D} e_t;
+  typedef logic signed [3:0] s_t;
+  function automatic int fw(int x); return w_t'(x); endfunction
+  function automatic int fv(int x); return v_t'(x); endfunction
+  function automatic int fe(int x); return 32'(e_t'(x)); endfunction
+  function automatic int fs(int x); return int'(s_t'(x) < 0); endfunction
+  function automatic int ft(int x); return T'(x); endfunction
+  function automatic int fi(int x); return n_t'(x); endfunction
+  function automatic int fa(int x); return a_t'(x); endfunction
+  function automatic int fk(int x); return 32'(k_e'(x)); endfunction
+  function automatic int floop(); int n = 0;
+    for (int i = 0; i < 8; i++) if (e_t'(i) == B) n++;
+    return n; endfunction
+  localparam int CW = fw(37);
+  localparam int CV = fv(37);
+  localparam int CE = fe(6);
+  localparam int CS = fs(12);
+  localparam int CT = ft(45);
+  localparam int CI = fi(37);
+  localparam int CA = fa(38);
+  localparam int CK = fk(13);
+  localparam int CL = floop();
+  logic [CW-1:0] sized;
+  grand #(.G(W - 2)) gr ();
+  initial #1 $display(\"%m CW=%0d CV=%0d CE=%0d CS=%0d CT=%0d CI=%0d CA=%0d CK=%0d CL=%0d bits=%0d\",
+                      CW, CV, CE, CS, CT, CI, CA, CK, CL, $bits(sized));
+endmodule
+module tb;
+  child c5 ();
+  child #(.W(6), .T(logic [2:0])) c6 ();
+endmodule",
+    );
+    assert_line(&msgs, "tb.c5 CW=5 CV=5 CE=2 CS=1 CT=13 CI=5 CA=6 CK=5 CL=2 bits=5");
+    assert_line(&msgs, "tb.c6 CW=37 CV=37 CE=2 CS=1 CT=5 CI=5 CA=6 CK=5 CL=2 bits=37");
+    assert_line(&msgs, "tb.c5.gr CG=5");
+    assert_line(&msgs, "tb.c6.gr CG=13");
+}
