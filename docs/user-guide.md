@@ -49,7 +49,10 @@ xezim testbench.v synth.v +firmware=firmware/firmware.hex --max-time 50000000
 ```
 
 The exit status is 1 for parse and elaboration errors (among them a
-hierarchical name that does not resolve, §23.8), `$fatal`, a
+hierarchical name that does not resolve, §23.8), `$fatal`, a run-time error
+that ends the run (a read or call through a null handle in a process, a wait
+on a mailbox that was never constructed, a loop or delta cycle that can never
+let time advance, an SDF file `$sdf_annotate` cannot read), a
 `--dpi-lib` library that cannot be loaded, and an `-s` that names no module
 (`--no-strict-top` falls back to finding tops automatically). `$error` exits 0
 unless `--error-exit` is given.

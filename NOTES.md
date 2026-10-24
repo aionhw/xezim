@@ -6,6 +6,20 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 # What's new in 0.11
 
+### Unreleased
+
+**Correctness**
+
+* A run that ends on a run-time error exits 1, as one that ends on `$fatal`
+  does (§20.10): a read or a task call through a null handle in a process
+  body, or a wait on a mailbox that was never constructed (§8.4); a `forever`
+  with no timing control, or a zero-delay loop, that can never let time
+  advance; a nonblocking-assignment cascade that does not converge; a
+  `foreach` that makes no progress; an SDF file `$sdf_annotate` cannot read or
+  parse; and a failed internal consistency check. Each printed its error and
+  stopped the run, but the exit status was 0, so a script or harness that
+  checks it took the run for a pass.
+
 ### 0.11.3 — hierarchy, interfaces, assertions and collection correctness (October 2026)
 
 **Correctness**

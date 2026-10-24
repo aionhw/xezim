@@ -815,7 +815,7 @@ impl Simulator {
                             "Fatal: $sdf_annotate cannot read SDF file '{}': {}",
                             path, e
                         );
-                        self.finished = true;
+                        self.abort_run();
                     }
                     Ok(content) => match super::sdf::parse_sdf(&content) {
                         Err(e) => {
@@ -823,7 +823,7 @@ impl Simulator {
                                 "Fatal: $sdf_annotate cannot parse SDF file '{}': {}",
                                 path, e
                             );
-                            self.finished = true;
+                            self.abort_run();
                         }
                         Ok(sdf) => {
                             let select = self.sdf_select.unwrap_or(super::sdf::DelaySelect::Typ);
@@ -1126,6 +1126,19 @@ impl Simulator {
             self.format_args(args, "$display")
         };
         self.emit_severity_text(severity, &body);
+    }
+
+    /// End the run on a run-time error the simulator itself reports and
+    /// cannot continue past: a null handle a process body reads through or
+    /// calls a method on (§8.4), a loop or delta cycle that can never let
+    /// time advance, an SDF file `$sdf_annotate` cannot read, or a failed
+    /// internal consistency check. Like `$fatal` (§20.10), such an error ends
+    /// the simulation with a failing exit status, not 0.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn abort_run(&mut self) {
+        self.saw_fatal = true;
+        self.finished = true;
     }
 
     /// `emit_severity` with the message already formatted.

@@ -2947,7 +2947,7 @@ impl Simulator {
                                     "[SOA-SHADOW] LoadSignal mismatch sid={} inline=({:#x},{:#x}) table=({:#x},{:#x}) — aborting",
                                     s, v, x, cv, cx
                                 );
-                                self.finished = true;
+                                self.abort_run();
                             }
                         }
                         let (w, sg) = (self.signal_widths[s], self.signal_signed[s]);
@@ -2984,7 +2984,7 @@ impl Simulator {
                                     "[SOA-SHADOW] LoadSignalSigned mismatch sid={} inline=({:#x},{:#x}) table=({:#x},{:#x}) — aborting",
                                     s, v, x, cv, cx
                                 );
-                                self.finished = true;
+                                self.abort_run();
                             }
                         }
                         self.vm_regs[d] = Value::from_inline(v, x, self.signal_widths[s]);
@@ -4403,7 +4403,7 @@ impl Simulator {
                                         "[SOA-SHADOW] LoadArrayElem mismatch eid={} inline=({:#x},{:#x}) table=({:#x},{:#x}) — aborting",
                                         eid, v, x, cv, cx
                                     );
-                                    self.finished = true;
+                                    self.abort_run();
                                 }
                             }
                             let (w, sg) = (self.signal_widths[eid], self.signal_signed[eid]);

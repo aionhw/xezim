@@ -579,7 +579,7 @@ impl Simulator {
                 "[BSP-SHADOW] time={} FIRST divergence: {} signals differ — aborting",
                 self.time, diffs
             );
-            self.finished = true;
+            self.abort_run();
             return;
         }
         self.bsp_shadow_checks += 1;

@@ -253,6 +253,8 @@ mod reduce_loop_unroll;
 mod repeat_real_count;
 #[path = "misc/replication_and_cast_operands.rs"]
 mod replication_and_cast_operands;
+#[path = "misc/runtime_error_exit_status.rs"]
+mod runtime_error_exit_status;
 #[path = "misc/select_depth.rs"]
 mod select_depth;
 #[path = "misc/select_semantics_11_5_1.rs"]

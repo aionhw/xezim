@@ -2114,7 +2114,7 @@ impl Simulator {
             );
             self.record_output(m.clone());
             self.stdout_writeln(&m);
-            self.finished = true;
+            self.abort_run();
             return true;
         }
         true
@@ -2490,7 +2490,7 @@ impl Simulator {
                 "               Simulated time can never advance past this loop. Add a timing control,"
             );
             eprintln!("               or raise/disable the check with XEZIM_STALL_LIMIT=<n>.");
-            self.finished = true;
+            self.abort_run();
         }
     }
 
@@ -3956,7 +3956,7 @@ impl Simulator {
             passes += 1;
             if self.stall_limit > 0 && passes > self.stall_limit {
                 self.report_edge_rescan_stall(passes);
-                self.finished = true;
+                self.abort_run();
                 break;
             }
             self.check_edges_inner(Some(&subset), false);

@@ -6480,7 +6480,8 @@ pub struct Simulator {
     pub output: Vec<SimOutput>,
     capture_output: bool,
     pub finished: bool,
-    /// §20.10: a `$fatal` executed — the run must not exit 0.
+    /// §20.10: a `$fatal` executed, or the run ended on a run-time error
+    /// (`abort_run`) — the run must not exit 0.
     pub saw_fatal: bool,
     /// `$fatal`'s finish_number (0/1/2), for the exit status.
     pub fatal_finish_number: Option<i32>,

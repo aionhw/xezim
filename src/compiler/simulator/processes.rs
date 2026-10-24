@@ -3648,7 +3648,7 @@ impl Simulator {
                                      first `{}`.",
                                     what, method
                                 );
-                                self.finished = true;
+                                self.abort_run();
                                 return;
                             }
                             let mbx_empty = self
@@ -5256,7 +5256,7 @@ impl Simulator {
                                  the usual cause. Raise or disable with \
                                  XEZIM_FOREACH_REPLAY_LIMIT=<n> (0 = never check)."
                             );
-                            self.finished = true;
+                            self.abort_run();
                         }
                     } else {
                         // Completed without parking — clear any earlier streak
