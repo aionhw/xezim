@@ -947,6 +947,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "JIT: shadow-verify the inline-bits mirror against Values",
     ),
     (
+        "XEZIM_VHDL_DEBUG",
+        "VHDL: print why overload resolution rejected each candidate, and ambiguous literals",
+    ),
+    (
         "XEZIM_VHDL_DUMP",
         "VHDL: print each VHDL file's design units (kind and name) after parsing",
     ),
