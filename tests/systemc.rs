@@ -7,5 +7,7 @@
 
 #[path = "systemc/errors.rs"]
 mod errors;
+#[path = "systemc/mixed.rs"]
+mod mixed;
 #[path = "systemc/simulation.rs"]
 mod simulation;

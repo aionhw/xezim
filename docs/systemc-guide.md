@@ -11,6 +11,33 @@ and `-D` apply to their C++ preprocessor too. `#include <systemc>` and the
 other SystemC/TLM library headers are not read (xezim knows the library);
 the design's own headers are. Without `-s`, the top is `sc_main`.
 
+## Mixing with SystemVerilog
+
+SystemC and SystemVerilog sources can be given together; the SystemC
+modules become SystemVerilog modules, so instantiation works both ways.
+
+- **SystemVerilog instantiating SystemC**: instantiate the SystemC module by
+  its class name, with its ports by name (`counter u(.clk(clk), .q(q));`).
+  With no `sc_main` in the design, the SystemVerilog top is found as usual
+  and the SystemC processes start at time 0.
+- **SystemC instantiating SystemVerilog**: declare the SystemVerilog module
+  as a class deriving from `sc_foreign_module`, with its ports as members:
+
+      class shifter : public sc_foreign_module {
+      public:
+          sc_in<bool> clk;
+          sc_out<sc_uint<8> > q;
+          shifter(sc_module_name nm) : sc_foreign_module(nm, "shifter") {}
+      };
+
+  The SystemVerilog module name is the second argument of
+  `sc_foreign_module(...)`, or what `const char* hdl_name() const` returns,
+  else the class name. Instances bind ports as for any SystemC module.
+  Parameters of the SystemVerilog module (generics) cannot be set this way.
+
+Port types must have the same width on both sides (`sc_uint<8>` ↔
+`logic [7:0]`, `int` ↔ `int`, `bool` ↔ `bit`/`logic`).
+
 ## How it works
 
 xezim-core parses the C++ (`sv_parser::systemc`) and lowers each module to a
@@ -87,7 +114,9 @@ Every design under `tests/systemc/designs/` (a `.cpp`, or a directory of
 `.cpp` files) is checked against the output of the same program built with
 the SystemC 2.3.4 reference kernel (`tests/systemc/designs/*.golden`), and
 each unsupported construct in `tests/systemc/errors/` must be rejected at its
-source line. The group is behind a feature, so plain `cargo test` skips it:
+source line. The mixed designs in `tests/systemc/mixed/` are checked against
+the output of the same design written entirely in SystemC
+(`reference/all_sc.cpp`). The group is behind a feature, so plain `cargo test` skips it:
 
     cargo test --features systemc-tests --test systemc
 

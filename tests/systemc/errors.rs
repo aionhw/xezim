@@ -18,7 +18,12 @@ fn rejects(name: &str, expected: &str) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!out.status.success(), "{}.cpp was accepted:\n{}", name, text);
+    assert!(
+        !out.status.success(),
+        "{}.cpp was accepted:\n{}",
+        name,
+        text
+    );
     assert!(
         text.contains(expected),
         "{}.cpp: expected `{}` in:\n{}",

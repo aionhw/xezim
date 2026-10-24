@@ -1,0 +1,10 @@
+5 ns acc=0
+15 ns acc=3
+25 ns acc=103
+35 ns acc=2103
+45 ns acc=32103
+55 ns acc=532103
+65 ns acc=2147483647
+75 ns acc=2147483640
+85 ns acc=2147483641
+top: acc=2147483641

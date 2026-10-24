@@ -1,0 +1,10 @@
+5 ns loaded 0a5
+15 ns sin=1 q=04b
+25 ns sin=0 q=096
+35 ns sin=1 q=02d
+45 ns sin=1 q=05b
+55 ns sin=0 q=0b6
+65 ns sin=0 q=06c
+75 ns sin=1 q=0d9
+
+Info: /OSCI/SystemC: Simulation stopped by user.
