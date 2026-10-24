@@ -2168,6 +2168,16 @@ impl Simulator {
                 let r = args.first().map(|a| self.eval_expr(a).to_f64()).unwrap_or(0.0);
                 Value::from_string(&xezim_core::vhdl::real_image(r))
             }
+            // A REAL with DIGITS decimals (TEXTIO WRITE, IEEE 1076-2008
+            // §16.4).
+            "$__vh_real_fixed" => {
+                let r = args.first().map(|a| self.eval_expr(a).to_f64()).unwrap_or(0.0);
+                let d = args
+                    .get(1)
+                    .and_then(|a| self.eval_expr(a).to_u64())
+                    .unwrap_or(0) as usize;
+                Value::from_string(&format!("{:.*}", d, r))
+            }
             "$cast" => {
                 // `$cast(dest, src)` as a function: succeeds (returns 1 and
                 // assigns) iff src's object is assignment-compatible with

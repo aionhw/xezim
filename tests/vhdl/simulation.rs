@@ -162,3 +162,53 @@ fn records() {
 fn range_checks() {
     check("checks");
 }
+
+/// IEEE.STD_LOGIC_1164 compiled from its source: the logical operators
+/// through their two-dimensional tables, conversions, TO_STRING and
+/// TO_HSTRING, RESOLVED, the matching operators `?=` (§9.2.3).
+#[test]
+fn std_logic() {
+    check("std_logic");
+}
+
+/// An entity instance with ports collapsed onto the actual signals
+/// (§14.7.3.4), IEEE `rising_edge` through a signal parameter, drivers of
+/// single elements and slices from several processes (§14.7.2), and a
+/// user-defined resolution function (§4.6).
+#[test]
+fn hierarchy() {
+    check("hierarchy");
+}
+
+/// Generic values per instance: positional and named generic maps,
+/// defaults, generic-dependent subtypes, `open` and literal port actuals
+/// (§6.5.6, §14.4.2.2).
+#[test]
+fn generics() {
+    check("generics");
+}
+
+/// STD.TEXTIO WRITE of the standard types with justification, field width,
+/// DIGITS and UNIT, WRITELINE to OUTPUT, SWRITE, JUSTIFY; LINE as an access
+/// type: allocators, `.all`, indexing through it, DEALLOCATE (§5.4, §16.4).
+#[test]
+fn textio_write() {
+    check("textio_write");
+}
+
+/// Milestone M2: a clocked IEEE.NUMERIC_STD counter instantiated by a
+/// testbench with a generic, a resolved tri-state bus of std_logic
+/// vectors driven from two instances and a pull, TEXTIO logging and
+/// numeric_std arithmetic, ending with std.env.finish.
+#[test]
+fn counter_tb() {
+    check("counter_tb");
+}
+
+/// IEEE.NUMERIC_STD division, MOD and REM of UNSIGNED and SIGNED (the
+/// DIVMOD procedure's unconstrained `out` parameters take the actuals'
+/// bounds, §4.2.2.2).
+#[test]
+fn numeric_div() {
+    check("numeric_div");
+}

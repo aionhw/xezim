@@ -1,0 +1,4 @@
+numeric_div.vhd:11:5:@0ms:(report note): div=00011100 28
+numeric_div.vhd:12:5:@0ms:(report note): divu=00011100
+numeric_div.vhd:13:5:@0ms:(report note): mod=00000100 rem=00000100
+numeric_div.vhd:14:5:@0ms:(report note): s/=-14 -2 5

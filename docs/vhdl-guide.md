@@ -36,27 +36,44 @@ SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
 - Entities and architectures, processes (with or without sensitivity
   lists, `process (all)`), concurrent signal assignments (simple,
   conditional, selected), concurrent assertions and procedure calls.
-- Types: enumeration, integer, real, physical (TIME), arrays (one
-  dimension; constrained and unconstrained), records, subtypes with range
-  checks.
+- Hierarchy: entity instantiation (`entity work.e(a)`, or a component
+  named like an entity) with port maps and generic maps. A port associated
+  with a signal or a static part of one is that signal (no extra delta);
+  `open`, unassociated and literal actuals get a signal of their own.
+  Each distinct set of generic values is analysed on its own, so subtypes
+  may depend on generics.
+- Types: enumeration, integer, real, physical (TIME), arrays (any number
+  of dimensions; constrained, unconstrained, and with bounds computed at
+  elaboration), records, access types, subtypes with range checks.
 - Signals of those types with inertial and transport delays, `reject`,
   multi-element waveforms; `'event`, `'active`, `'last_value`,
-  `'last_event`.
+  `'last_event`, also of elements. Several processes may drive a signal:
+  resolved signals (`std_logic`, user resolution functions, element-wise
+  resolution of `std_logic_vector`) and drivers of single elements or
+  slices.
 - `wait on/until/for`, every sequential statement, labelled `next`/`exit`.
 - Functions and procedures: overloading, default and named parameters,
-  `out`/`inout`, recursion, packages with deferred constants.
-- Expressions: all predefined operators, aggregates, slices,
-  concatenation, type conversions, attributes, `'image` in GHDL's format.
-- `report`/`assert` and run-time checks (range, index, overflow) with
-  GHDL's messages and exit status; `std.env.stop`/`finish`.
+  `out`/`inout`, signal parameters of mode `in` (`rising_edge`),
+  recursion, packages with deferred constants, aliases (also with a
+  subtype).
+- Expressions: all predefined operators (short-circuit `and`/`or`,
+  matching `?=` etc.), aggregates, slices, concatenation, type
+  conversions, attributes, allocators, `'image` and TO_STRING in GHDL's
+  format.
+- IEEE `std_logic_1164`, `numeric_std` and the other IEEE packages are
+  compiled from their sources.
+- TEXTIO output: WRITE of the standard types (justification, field,
+  DIGITS, UNIT), SWRITE, JUSTIFY, WRITELINE to OUTPUT.
+- `report`/`assert` and run-time checks (range, index, overflow, null
+  access) with GHDL's messages and exit status; `std.env.stop`/`finish`.
 
 ## Not supported yet
 
-Each is reported at its source location: component and entity
-instantiation (hierarchy), generate and block statements, resolved
-signals (several drivers, `std_logic` resolution), signal parameters,
-assignments to parts of a signal, procedures that wait, multi-dimensional
-arrays, access, file and protected types, TEXTIO, generic types and
+Each is reported at its source location: generate and block statements,
+configurations, port maps with conversion functions or non-static
+expressions, signal parameters of mode `out`/`inout`, procedures that wait,
+assignments to record elements of a signal, file I/O other than WRITELINE
+to OUTPUT and TEXTIO reads, protected types, generic types, subprograms and
 packages, external names, force/release, `case?`, and mixing with
 SystemVerilog.
 

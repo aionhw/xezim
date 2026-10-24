@@ -1,0 +1,23 @@
+generics.vhd:20:5:@0ms:(report note): eight: W=8 half=4 r=00000000 len=8
+generics.vhd:20:5:@0ms:(report note): three: W=3 half=1 r=111 len=3
+generics.vhd:20:5:@0ms:(report note): dflt: W=4 half=2 r=0000 len=4
+generics.vhd:20:5:@0ms:(report note): eight: W=8 half=4 r=00000001 len=8
+generics.vhd:20:5:@10ns:(report note): eight: W=8 half=4 r=00000010 len=8
+generics.vhd:20:5:@10ns:(report note): three: W=3 half=1 r=110 len=3
+generics.vhd:20:5:@20ns:(report note): eight: W=8 half=4 r=00000101 len=8
+generics.vhd:20:5:@20ns:(report note): three: W=3 half=1 r=101 len=3
+generics.vhd:20:5:@30ns:(report note): eight: W=8 half=4 r=00001010 len=8
+generics.vhd:20:5:@30ns:(report note): three: W=3 half=1 r=010 len=3
+generics.vhd:20:5:@40ns:(report note): eight: W=8 half=4 r=00010101 len=8
+generics.vhd:20:5:@40ns:(report note): three: W=3 half=1 r=101 len=3
+generics.vhd:20:5:@50ns:(report note): eight: W=8 half=4 r=00101010 len=8
+generics.vhd:20:5:@50ns:(report note): three: W=3 half=1 r=010 len=3
+generics.vhd:20:5:@60ns:(report note): eight: W=8 half=4 r=01010101 len=8
+generics.vhd:20:5:@60ns:(report note): three: W=3 half=1 r=101 len=3
+generics.vhd:20:5:@70ns:(report note): eight: W=8 half=4 r=10101010 len=8
+generics.vhd:20:5:@70ns:(report note): three: W=3 half=1 r=010 len=3
+generics.vhd:20:5:@80ns:(report note): eight: W=8 half=4 r=01010101 len=8
+generics.vhd:20:5:@80ns:(report note): three: W=3 half=1 r=101 len=3
+generics.vhd:20:5:@90ns:(report note): eight: W=8 half=4 r=10101010 len=8
+generics.vhd:20:5:@90ns:(report note): three: W=3 half=1 r=010 len=3
+generics.vhd:43:5:@100ns:(report note): q8=10101010 q3=010 m8='1'

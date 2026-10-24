@@ -1,0 +1,27 @@
+t=25 ns count=0000 wrap=0 int=0
+t=35 ns count=0001 wrap=0 int=1
+t=45 ns count=0010 wrap=0 int=2
+t=55 ns count=0011 wrap=0 int=3
+t=65 ns count=0100 wrap=0 int=4
+t=75 ns count=0101 wrap=0 int=5
+t=85 ns count=0110 wrap=0 int=6
+t=95 ns count=0111 wrap=0 int=7
+t=105 ns count=1000 wrap=0 int=8
+t=115 ns count=1001 wrap=0 int=9
+t=125 ns count=1010 wrap=0 int=10
+t=135 ns count=1011 wrap=0 int=11
+t=145 ns count=1100 wrap=0 int=12
+t=155 ns count=1101 wrap=0 int=13
+t=165 ns count=1110 wrap=0 int=14
+t=175 ns count=1111 wrap=0 int=15
+t=185 ns count=0000 wrap=1 int=0
+t=195 ns count=0001 wrap=0 int=1
+counter_tb.vhd:116:5:@210ns:(report note): after load: C 1100
+counter_tb.vhd:120:5:@211ns:(report note): bus oe1: 1010
+counter_tb.vhd:123:5:@212ns:(report note): bus both: XX10
+counter_tb.vhd:126:5:@213ns:(report note): bus oe2: 0110
+counter_tb.vhd:130:5:@214ns:(report note): bus none: ZZZZ
+counter_tb.vhd:134:5:@214ns:(report note): u+77=21 u*2=0190 s=-56 s-100=100 shl=01000000 sra=11110010 resize=111111001000 cmp=true div=28 mod=4
+counter_tb.vhd:139:5:@214ns:(report note): std_match: true
+counter_tb.vhd:140:5:@214ns:(report note): x: XXXXXXXX
+simulation finished @224ns

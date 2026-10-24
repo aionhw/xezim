@@ -1,0 +1,14 @@
+hello 42    -7|13    |
+true false 1 1010 1.5 3.14 1.0e10
+10 ns 1.5 ns 0 ns 2000 ns   |
+textio_write.vhd:28:5:@0ms:(report note): len after writeline: 0
+textio_write.vhd:29:42:@0ms:(report note): not null
+
+textio_write.vhd:32:5:@0ms:(report note): l2: abc 3 b
+textio_write.vhd:34:5:@0ms:(report note): l2: Xbc
+textio_write.vhd:36:23:@0ms:(report note): l2 null
+   xy  |
+sw  j
+3.333333333333333e-1 -1.23e-4 0.0 1.0e2
+   2.500|
+7 ns 7000 ps 0.007 us

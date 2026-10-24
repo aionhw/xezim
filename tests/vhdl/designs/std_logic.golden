@@ -1,0 +1,15 @@
+std_logic.vhd:15:5:@0ms:(report note): and: '1'
+std_logic.vhd:16:5:@0ms:(report note): or: '0'
+std_logic.vhd:17:5:@0ms:(report note): xor: 'X'
+std_logic.vhd:18:5:@0ms:(report note): not: 'X'
+std_logic.vhd:19:5:@0ms:(report note): to_x01: '1'
+std_logic.vhd:20:5:@0ms:(report note): vec: 01XZ
+std_logic.vhd:22:5:@0ms:(report note): and vec: 0100
+std_logic.vhd:23:5:@0ms:(report note): not vec: 10XX
+std_logic.vhd:24:5:@0ms:(report note): hex: A5
+std_logic.vhd:25:5:@0ms:(report note): is_x: true
+std_logic.vhd:26:5:@0ms:(report note): resolved: '1'
+std_logic.vhd:27:5:@0ms:(report note): resolved2: 'X'
+std_logic.vhd:28:5:@0ms:(report note): match: '1'
+std_logic.vhd:29:5:@0ms:(report note): to_bit: '1'
+std_logic.vhd:30:5:@0ms:(report note): bv: 1010
