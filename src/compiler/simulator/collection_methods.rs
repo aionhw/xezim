@@ -1893,6 +1893,23 @@ impl Simulator {
     /// `@q#7`), or a member chain `obj.q` / `a.b.q` mapped to the owning
     /// object's `<handle>#q` storage. `None` when `arg` names no collection.
     pub(super) fn queue_actual_storage(&mut self, arg: &Expression) -> Option<String> {
+        // §7.2.1/§7.5: a dynamic / queue member of an unpacked STRUCT (`s.d`,
+        // `s.in.q`, `a[k].q`) is a collection of its own, named by its path
+        // wherever the struct lives (a variable, a formal, a subroutine
+        // local) — it has no owning object handle to resolve.
+        let member_path = match &arg.kind {
+            ExprKind::Ident(h) => h.path.len() >= 2,
+            ExprKind::MemberAccess { .. } => true,
+            _ => false,
+        };
+        if member_path
+            && self.struct_colls_possible()
+            && let Some(n) = self.flat_member_name(arg)
+            && self.ensure_struct_member_coll(&n)
+            && self.module.dynamic_arrays.contains(&n)
+        {
+            return Some(n);
+        }
         let cname = match &arg.kind {
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 let mut n = self.resolve_hier_name(h);

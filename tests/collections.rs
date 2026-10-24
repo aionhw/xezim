@@ -204,3 +204,6 @@ mod review_package_collection_aliases;
 
 #[path = "collections/struct_dyn_subroutine_members.rs"]
 mod struct_dyn_subroutine_members;
+
+#[path = "collections/struct_member_coll_actuals.rs"]
+mod struct_member_coll_actuals;
