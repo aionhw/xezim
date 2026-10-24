@@ -2452,6 +2452,15 @@ impl Simulator {
         }
     }
 
+    /// Whether a member declarator's unpacked dimensions include a dynamic,
+    /// queue or associative one (§7.5/§7.8/§7.10): such a member is a
+    /// collection (or a fixed array of them) with element storage of its
+    /// own, never a scalar leaf of the struct.
+    pub(super) fn has_coll_dim(dims: &[crate::ast::types::UnpackedDimension]) -> bool {
+        dims.iter()
+            .any(|d| Self::coll_kind_of(std::slice::from_ref(d)).is_some())
+    }
+
     /// Instance-scoped storage name of a COLLECTION member of a struct
     /// class property — `<handle>#<prop>.<member>` — registering the
     /// collection on first sight so the §7.8 machinery (element cells at

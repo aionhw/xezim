@@ -207,6 +207,7 @@ impl Simulator {
         let mut frame_types = self.take_pooled_types();
         self.push_queue_frame();
         let formal_dyn = self.begin_formal_dyn();
+        let struct_coll_in_base = self.pending_struct_coll_in.len();
         // `output`/`inout`/`ref` formals copy back to the caller's actual on
         // return (e.g. `get_int_arg_value(string s, ref int val)`).
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
@@ -622,6 +623,7 @@ impl Simulator {
             self.consume_vif_argument_return();
         }
         self.local_iface_aliases.push(iface_alias_frame);
+        self.install_struct_formal_colls(struct_coll_in_base);
         self.commit_formal_dyn(formal_dyn);
         self.push_local_frame_typed(locals, frame_types);
         self.open_decl_shadow_frame();
@@ -2027,6 +2029,7 @@ impl Simulator {
         let mut identity_formals: Vec<String> = Vec::new(); // ref aggregates bound by identity
         self.push_queue_frame();
         let formal_dyn = self.begin_formal_dyn();
+        let struct_coll_in_base = self.pending_struct_coll_in.len();
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
         for (i, port) in td.ports.iter().enumerate() {
@@ -2327,6 +2330,7 @@ impl Simulator {
                 self.signals.remove(&key);
             }
         }
+        self.install_struct_formal_colls(struct_coll_in_base);
         self.commit_formal_dyn(formal_dyn);
         self.push_local_frame_typed(locals, frame_types);
         // §6.21: open a static-local sync frame keyed by this task name.

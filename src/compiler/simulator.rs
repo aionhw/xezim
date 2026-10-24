@@ -8030,6 +8030,11 @@ pub struct Simulator {
     /// members of an output/inout/ref struct formal, drained into the call's
     /// queue writebacks (see `bind_unpacked_struct_formal`).
     pending_struct_coll_wb: Vec<(String, String)>,
+    /// The dynamic members of the struct formals bound so far, as `(callee
+    /// member, kind, element type, string-keyed, staged copy of the actual's
+    /// member)`: installed only once every actual of the call is evaluated
+    /// (see `install_struct_formal_colls`).
+    pending_struct_coll_in: Vec<(String, StructCollKind, DataType, bool, Option<String>)>,
     /// The staged dynamic members of a struct a `return` handed back (see
     /// `stage_ret_struct_colls`), for the caller's assignment to copy.
     pending_ret_struct: Option<String>,

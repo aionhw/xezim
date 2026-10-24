@@ -4220,6 +4220,7 @@ impl Simulator {
             local_coll_elems: HashMap::default(),
             dynamic_assoc_dims: HashMap::default(),
             pending_struct_coll_wb: Vec::new(),
+            pending_struct_coll_in: Vec::new(),
             pending_ret_struct: None,
             class_member_names_cell: std::cell::OnceCell::new(),
             vif_local_names: HashSet::default(),

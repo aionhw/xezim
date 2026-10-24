@@ -201,3 +201,6 @@ mod collection_returns_387;
 
 #[path = "collections/review_package_collection_aliases.rs"]
 mod review_package_collection_aliases;
+
+#[path = "collections/struct_dyn_subroutine_members.rs"]
+mod struct_dyn_subroutine_members;

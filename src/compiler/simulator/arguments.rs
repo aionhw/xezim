@@ -862,6 +862,11 @@ impl Simulator {
             let is_real = super::elaborate::is_type_real(&m.data_type);
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
+                // §7.5/§7.10: a dynamic / queue / associative member is a
+                // collection of its own (`struct_coll_members`), not a leaf.
+                if Self::has_coll_dim(&md.dimensions) {
+                    continue;
+                }
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
                 let mexpr = mk_member(base, &md.name.name);
                 match self.member_elem_indices(&md.dimensions) {
@@ -947,8 +952,12 @@ impl Simulator {
             };
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
+                // Same keys as `unpacked_struct_leaves`: a collection member
+                // has no leaf.
+                if Self::has_coll_dim(&md.dimensions) {
+                    continue;
+                }
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
-                // Same keys as `unpacked_struct_leaves`.
                 let keys = match self.member_elem_indices(&md.dimensions) {
                     Some(tups) => tups
                         .iter()
@@ -1218,6 +1227,8 @@ impl Simulator {
         if !matches!(e.kind, ExprKind::Call { .. }) {
             return None;
         }
+        // Only this call's `return` may leave dynamic members staged.
+        self.pending_ret_struct = None;
         let v = self.eval_expr(e);
         Some(self.split_packed_struct(base, su, &v).into_iter().collect())
     }
@@ -1309,8 +1320,25 @@ impl Simulator {
         // An actual that IS the same-named variable (a formal handed on to a
         // callee whose formal has its name) shares the storage for
         // output/inout/ref and keeps its contents for an input.
+        // §13.4.1: an actual that is a CALL returning the struct hands its
+        // dynamic members over through the return staging
+        // (`stage_ret_struct_colls`), as `dst = f()` receives them.
+        // The formal's member is named like a caller variable's (`x.q`), so
+        // the actual's contents are staged and installed only once every
+        // actual is evaluated (`install_struct_formal_colls`): installing
+        // here would clobber a caller variable a later actual still reads.
         if self.struct_colls_possible() {
             let caller_base = self.flat_member_name(arg);
+            let ret_staged = if caller_base.is_none() && call_vals.is_some() {
+                self.pending_ret_struct.take()
+            } else {
+                None
+            };
+            let stage_root = format!(
+                "__xz_arg_struct__{}.{}",
+                self.queue_frame_saves.len(),
+                port_name
+            );
             for (sfx, kind, dt, sk) in self.struct_coll_members(&su) {
                 let local = format!("{}.{}", port_name, sfx);
                 let caller = caller_base
@@ -1318,24 +1346,41 @@ impl Simulator {
                     .map(|b| format!("{}.{}", b, sfx))
                     .filter(|c| self.ensure_struct_member_coll(c));
                 let same = caller.as_deref() == Some(local.as_str());
-                if !(same && copies_out) {
-                    self.snapshot_queue_local(&local);
-                }
-                self.register_struct_member_coll_as(&local, kind, &dt, sk);
                 if same {
+                    if !copies_out {
+                        self.snapshot_queue_local(&local);
+                    }
+                    self.register_struct_member_coll_as(&local, kind, &dt, sk);
                     if !copies_in {
                         self.clear_coll(&local, kind);
                     }
                     continue;
                 }
-                self.clear_coll(&local, kind);
-                let Some(caller) = caller else {
-                    continue;
+                let source = caller.clone().or_else(|| {
+                    ret_staged
+                        .as_ref()
+                        .map(|r| format!("{}.{}", r, sfx))
+                        .filter(|r| {
+                            self.module.dynamic_arrays.contains(r)
+                                || self.module.associative_arrays.contains_key(r)
+                        })
+                });
+                let staged = match source {
+                    Some(src) if copies_in => {
+                        let tmp = format!("{}.{}", stage_root, sfx);
+                        self.register_struct_member_coll_as(&tmp, kind, &dt, sk);
+                        self.clear_coll(&tmp, kind);
+                        self.copy_coll(&tmp, &src, kind);
+                        Some(tmp)
+                    }
+                    _ => None,
                 };
-                if copies_in {
-                    self.copy_coll(&local, &caller, kind);
-                }
-                if copies_out && kind != StructCollKind::Assoc {
+                self.pending_struct_coll_in
+                    .push((local.clone(), kind, dt, sk, staged));
+                if let Some(caller) = caller
+                    && copies_out
+                    && kind != StructCollKind::Assoc
+                {
                     self.pending_struct_coll_wb.push((local, caller));
                 }
             }
@@ -1366,6 +1411,27 @@ impl Simulator {
             }
         }
         Some(backs)
+    }
+
+    /// §13.5: install the dynamic members of the struct formals bound since
+    /// `base` (see `bind_unpacked_struct_formal`) — each fresh for the call,
+    /// holding the staged copy of its actual's member when it copies in. Run
+    /// once all of the call's actuals are evaluated; the caller's same-named
+    /// storage is snapshotted for restore when the callee returns.
+    pub(super) fn install_struct_formal_colls(&mut self, base: usize) {
+        if self.pending_struct_coll_in.len() <= base {
+            return;
+        }
+        let pending: Vec<_> = self.pending_struct_coll_in.drain(base..).collect();
+        for (local, kind, dt, sk, staged) in pending {
+            self.snapshot_queue_local(&local);
+            self.register_struct_member_coll_as(&local, kind, &dt, sk);
+            self.clear_coll(&local, kind);
+            if let Some(tmp) = staged {
+                self.copy_coll(&local, &tmp, kind);
+                self.clear_coll(&tmp, kind);
+            }
+        }
     }
 
     /// The frame key for a struct-member reference of ANY depth — `s.a`,
