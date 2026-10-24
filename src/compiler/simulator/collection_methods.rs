@@ -2500,7 +2500,10 @@ impl Simulator {
                 let mut compound = false;
                 for k in self.signals.elem_keys_with_prefix(&prefix) {
                     count += 1;
-                    compound = compound || k[prefix.len()..].contains("][");
+                    // §7.9.1: an element that is an unpacked struct is
+                    // stored as member cells (`aa[k].m`), several per key.
+                    let rest = &k[prefix.len()..];
+                    compound = compound || rest.contains("][") || Self::key_has_member_suffix(rest);
                 }
                 if compound {
                     let n = self.assoc_top_level_keys(obj_name).len();
@@ -3034,7 +3037,11 @@ impl Simulator {
                     let key = self.eval_expr(arg);
                     let key_str = self.assoc_key_str(obj_name, &key);
                     let elem_name = format!("{}[{}]", obj_name, key_str);
-                    if self.signals.remove(&elem_name).is_none() {
+                    // §7.9.2: an unpacked-struct element may also keep a
+                    // packed view under `aa[k]`; its member cells go too.
+                    if self.signals.remove(&elem_name).is_none()
+                        || self.queue_elem_struct(obj_name).is_some()
+                    {
                         // §7.9.2: an aggregate element (an unpacked struct,
                         // a nested collection) has no `aa[k]` cell of its
                         // own — it lives as member / element cells under
