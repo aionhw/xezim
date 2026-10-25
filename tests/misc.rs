@@ -99,6 +99,8 @@ mod elaboration_runaway_guards;
 mod escaped_identifier_matches_nonescaped;
 #[path = "misc/event_argument.rs"]
 mod event_argument;
+#[path = "misc/for_loop_block_local_array.rs"]
+mod for_loop_block_local_array;
 #[path = "misc/for_loop_var_declaration.rs"]
 mod for_loop_var_declaration;
 #[path = "misc/force_assign_override_restore.rs"]

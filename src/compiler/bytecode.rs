@@ -2609,20 +2609,33 @@ impl<'a> BytecodeCompiler<'a> {
         self.array_first_id = Some(arrays);
     }
 
-    fn array_operand(&self, name: String) -> Box<ArrayOperand> {
+    /// The operand of an element access on the 1-D array `name`, or `None`
+    /// when its elements have no signal-table cells. §6.21: a fixed array
+    /// declared in a procedural block or subroutine (`int v[3];` in an
+    /// `initial`) is registered in `arrays` when its declaration runs, but
+    /// its elements live in the interpreter's by-name store. The array insns
+    /// resolve an element only through the signal table, so a compiled
+    /// `for (int i ...) v[i] = ...` store into such an array found no cell
+    /// and was silently dropped. The caller must bail to the interpreter;
+    /// treating the name as a non-array instead could resolve a same-named
+    /// signal the local shadows.
+    fn array_operand(&self, name: String) -> Option<Box<ArrayOperand>> {
         if let Some(&(first_id, lo, hi)) = self
             .array_first_id
             .and_then(|arrays| arrays.get(name.as_str()))
         {
-            Box::new(ArrayOperand::Dense {
+            return Some(Box::new(ArrayOperand::Dense {
                 name,
                 first_id,
                 lo,
                 hi,
-            })
-        } else {
-            Box::new(ArrayOperand::Named(name))
+            }));
         }
+        let lo = self.arrays.get(name.as_str()).map_or(0, |&(lo, _, _)| lo);
+        self.signal_name_to_id
+            .get(&format!("{name}[{lo}]"))
+            .is_some()
+            .then(|| Box::new(ArrayOperand::Named(name)))
     }
 
     pub fn set_params(&mut self, params: &'a HashMap<String, Value>) {
@@ -14167,9 +14180,12 @@ impl<'a> BytecodeCompiler<'a> {
                         return None;
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
+                        let Some(array) = self.array_operand(name) else {
+                            self.bail("array_elem_without_cells");
+                            return None;
+                        };
                         let idx_reg = self.compile_expr(index, 0)?;
                         let dest = self.alloc_reg();
-                        let array = self.array_operand(name);
                         self.emit(Insn::LoadArrayElem(dest, array, idx_reg));
                         return Some(dest);
                     }
@@ -15971,7 +15987,7 @@ impl<'a> BytecodeCompiler<'a> {
             lo_reg,
             Box::new(Value::from_u64(off as u64, 32)),
         ));
-        Some((self.array_operand(name), idx_reg, hi_reg, lo_reg, resized))
+        Some((self.array_operand(name)?, idx_reg, hi_reg, lo_reg, resized))
     }
 
     /// A packed lvalue PATH that mixes several dynamic steps:
@@ -16348,8 +16364,11 @@ impl<'a> BytecodeCompiler<'a> {
                         return false;
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
+                        let Some(array) = self.array_operand(name) else {
+                            self.bail("nba_target_array_without_cells");
+                            return false;
+                        };
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            let array = self.array_operand(name);
                             self.emit(Insn::NbaAssignArray(array, idx_reg, val_reg, width));
                             return true;
                         }
@@ -16653,7 +16672,10 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                 };
                                 if let Some((hi_reg, lo_reg)) = regs {
-                                    let array = self.array_operand(name);
+                                    let Some(array) = self.array_operand(name) else {
+                                        self.bail("nba_target_array_without_cells");
+                                        return false;
+                                    };
                                     self.emit(Insn::NbaAssignArrayRange(
                                         array, idx_reg, hi_reg, lo_reg, val_reg,
                                     ));
@@ -16919,7 +16941,10 @@ impl<'a> BytecodeCompiler<'a> {
                     b_reg,
                     Box::new(Value::from_u64(b as u64, 32)),
                 ));
-                let array = self.array_operand(name);
+                let Some(array) = self.array_operand(name) else {
+                    self.bail("blocking_target_array_without_cells");
+                    return Some(false);
+                };
                 self.emit(Insn::BlockingAssignArrayRange(
                     array, idx_reg, b_reg, b_reg, val_reg,
                 ));
@@ -17537,8 +17562,11 @@ impl<'a> BytecodeCompiler<'a> {
                         return false;
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
+                        let Some(array) = self.array_operand(name) else {
+                            self.bail("blocking_target_array_without_cells");
+                            return false;
+                        };
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            let array = self.array_operand(name);
                             self.emit(Insn::BlockingAssignArray(array, idx_reg, val_reg, width));
                             return true;
                         }
@@ -17962,7 +17990,10 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                 };
                                 if let Some((hi_reg, lo_reg)) = regs {
-                                    let array = self.array_operand(name);
+                                    let Some(array) = self.array_operand(name) else {
+                                        self.bail("blocking_target_array_without_cells");
+                                        return false;
+                                    };
                                     self.emit(Insn::BlockingAssignArrayRange(
                                         array, idx_reg, hi_reg, lo_reg, val_reg,
                                     ));
