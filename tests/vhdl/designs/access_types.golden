@@ -1,0 +1,5 @@
+access_types.vhd:33:5:@0ms:(report note): sum=100 head=40
+access_types.vhd:35:5:@0ms:(report note): ip=6
+access_types.vhd:38:5:@0ms:(report note): sp=Jello len=5 5
+access_types.vhd:41:5:@0ms:(report note): vp(3)=9 len=4
+access_types.vhd:51:5:@0ms:(report note): freed true true

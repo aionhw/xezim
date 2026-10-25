@@ -1,0 +1,11 @@
+file_io.vhd:50:5:@0ms:(report note): early=7
+file_io.vhd:58:5:@0ms:(report note): append open_ok
+file_io.vhd:61:5:@0ms:(report note): again status_error
+file_io.vhd:70:5:@0ms:(report note): count=6 sum=1005 last=1000
+file_io.vhd:72:5:@0ms:(report note): missing name_error
+file_io.vhd:80:5:@0ms:(report note): rec 7 2.5 1010 q 3000000 fs true
+file_io.vhd:83:5:@0ms:(report note): rec -3 -1.25e-1 0110 z 1 fs false eof true
+file_io.vhd:97:5:@0ms:(report note): header #GHDL-BINARY-FILE-0
+file_io.vhd:106:5:@0ms:(report note): s=hell len=4
+file_io.vhd:109:5:@0ms:(report note): s=ab.. len=2 eof true
+file_io.vhd:118:5:@0ms:(report note): pair 11 -22

@@ -1,0 +1,9 @@
+tee line
+textio_files.vhd:54:7:@0ms:(report note): 1: [count      42] 13
+textio_files.vhd:54:7:@0ms:(report note): 2: [BA 56   1100] 12
+textio_files.vhd:54:7:@0ms:(report note): 3: [     3.142|1.0e10|2500 ps   |] 29
+textio_files.vhd:54:7:@0ms:(report note): 4: [dos] 3
+textio_files.vhd:54:7:@0ms:(report note): 5: [tee line] 8
+../../src/std/v08/textio-body.vhdl:422:5:@0ms:(assertion failure): eof in std.textio.readline
+ghdl:error: assertion failed
+ghdl:error: simulation failed

@@ -1,0 +1,4 @@
+protected_types.vhd:134:5:@0ms:(report note): queue(4 of 4, limit 20) queue(3 of 3, limit 20) local=4
+protected_types.vhd:136:5:@0ms:(report note): sum=30 empty=true q2.size=3
+protected_types.vhd:140:5:@15ns:(report note): events=104
+protected_types.vhd:142:5:@15ns:(report note): after reset=0

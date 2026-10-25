@@ -7,8 +7,9 @@ cd "$(dirname "$0")"
 work=$(mktemp -d)
 for f in *.vhd; do
   n=${f%.vhd}
-  ghdl -a --std=08 --workdir="$work" "$f" && ghdl -e --std=08 --workdir="$work" "$n" || { echo "GHDL failed on $f"; continue; }
-  ghdl -r --std=08 --workdir="$work" "$n" > "$n.golden" 2>/dev/null
+  # Elaborate and run in the work directory: a design may create files.
+  ghdl -a --std=08 --workdir="$work" "$f" && (cd "$work" && ghdl -e --std=08 --workdir="$work" "$n") || { echo "GHDL failed on $f"; continue; }
+  (cd "$work" && ghdl -r --std=08 --workdir="$work" "$n") > "$n.golden" 2>/dev/null
   echo $? > "$n.exit"
 done
 rm -rf "$work"

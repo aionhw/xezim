@@ -1,0 +1,3 @@
+file_errors.vhd:18:5:@0ms:(report note): closed twice
+read called on a non-open file
+ghdl:error: simulation failed

@@ -97,8 +97,19 @@ SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
   `fixed_pkg` and `float_pkg` among them, are compiled from their sources.
   Their bodies run as ordinary compiled code, without native intrinsics,
   so wide arithmetic such as `float64` division is slow.
-- TEXTIO output: WRITE of the standard types (justification, field,
-  DIGITS, UNIT), SWRITE, JUSTIFY, WRITELINE to OUTPUT.
+- Protected types: declarations and bodies (also split between a package
+  and its body), shared variables, variables of protected types in
+  processes and subprograms, methods calling each other, objects passed to
+  subprograms.
+- Files: FILE_OPEN (with or without a status), FILE_CLOSE, READ (with
+  LENGTH for an unconstrained array), WRITE, FLUSH, ENDFILE, and files
+  declared with open information. Values are stored in GHDL's binary
+  format, so files written by one simulator read in the other.
+- TEXTIO: READ of the standard types with or without GOOD, SREAD, HREAD,
+  OREAD (with GHDL's acceptance rules and failure messages), WRITE of the
+  standard types (justification, field, DIGITS, UNIT), SWRITE, HWRITE,
+  OWRITE, BWRITE, JUSTIFY, READLINE, WRITELINE, TEE, on TEXT files and on
+  INPUT/OUTPUT; TO_BSTRING/TO_OSTRING/TO_HSTRING of BIT_VECTOR.
 - `report`/`assert` and run-time checks (range, index, overflow, null
   access) with GHDL's messages and exit status; `std.env.stop`/`finish`.
 
@@ -111,8 +122,10 @@ implicit signals and `'last_active` of a function's signal parameter,
 calls of procedures that wait or assign signals from outside a process,
 assignments to record elements of a signal, forcing part of a signal,
 external variable names and package paths (`@lib.pkg`) in external names,
-ranges in the choices of `case?`, file I/O other than WRITELINE to OUTPUT
-and TEXTIO reads, protected types, and mixing with SystemVerilog.
+ranges in the choices of `case?`, READ of a TEXT file (READLINE is
+supported), WRITE of a REAL with a FORMAT (VHDL-2019), and mixing with
+SystemVerilog. A NUL character in a report message is dropped (GHDL prints
+it).
 
 ## Verification
 
@@ -126,6 +139,9 @@ Processes resumed in the same simulation cycle run in an order the LRM
 leaves to the implementation (§14.7.5.3): xezim uses elaboration order and
 GHDL its own, so output written by several processes in one delta may come
 in a different order. The test designs print from one process per delta.
+
+Each design runs in a directory of its own (and `regen.sh` runs GHDL in
+its work directory), so designs may create files.
 
 GHDL 4.1's mcode backend cannot run a sequential null assignment
 (`s <= null;` in a process stops with an internal error), so null

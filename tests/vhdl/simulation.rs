@@ -12,11 +12,18 @@ fn designs() -> PathBuf {
 
 fn check(name: &str) {
     let dir = designs();
+    // Run in a directory of its own: a design may create files.
+    let run_dir = std::env::temp_dir().join(format!("xezim-vhdl-{}-{}", name, std::process::id()));
+    let _ = std::fs::remove_dir_all(&run_dir);
+    std::fs::create_dir_all(&run_dir).expect("run directory");
+    let src = format!("{}.vhd", name);
+    std::fs::copy(dir.join(&src), run_dir.join(&src)).expect("copy design");
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .current_dir(&dir)
-        .args(["--no-cache", &format!("{}.vhd", name)])
+        .current_dir(&run_dir)
+        .args(["--no-cache", &src])
         .output()
         .expect("run xezim");
+    let _ = std::fs::remove_dir_all(&run_dir);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let actual: Vec<&str> = stdout
         .lines()
@@ -386,4 +393,54 @@ fn record_constraints() {
 #[test]
 fn fixed_float() {
     check("fixed_float");
+}
+
+/// Access types (§5.4): an incomplete type for a linked list, allocators,
+/// implicit dereference, DEALLOCATE and null.
+#[test]
+fn access_types() {
+    check("access_types");
+}
+
+/// Protected types (§5.6) declared in a package and shared between
+/// entities and processes, local objects, nested objects, private
+/// subprograms and an object passed to a procedure.
+#[test]
+fn protected_types() {
+    check("protected_types");
+}
+
+/// Files (§5.5): FILE_OPEN with and without a status, the open kinds,
+/// READ/WRITE of scalars, records and arrays (READ with LENGTH), ENDFILE,
+/// and GHDL's binary file format.
+#[test]
+fn file_io() {
+    check("file_io");
+}
+
+/// A READ of a file that is not open stops the run (§5.5.2).
+#[test]
+fn file_errors() {
+    check("file_errors");
+}
+
+/// TEXTIO READ, SREAD, HREAD and OREAD (§16.4) and STD_LOGIC_1164's READ
+/// and HREAD, accepting and failing as GHDL does; a failed READ without
+/// GOOD stops with GHDL's assertion.
+#[test]
+fn textio_read() {
+    check("textio_read");
+}
+
+/// TEXTIO files (§16.4): WRITE variants, HWRITE/OWRITE/BWRITE, TEE,
+/// WRITELINE and READLINE of a TEXT file, ENDFILE, READLINE past the end.
+#[test]
+fn textio_files() {
+    check("textio_files");
+}
+
+/// Slices and elements as actuals of out/inout parameters (§4.2.2.2).
+#[test]
+fn slice_actuals() {
+    check("slice_actuals");
 }

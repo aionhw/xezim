@@ -1,0 +1,123 @@
+textio_read.vhd:39:7:@0ms:(report note): int '  42 abc' -> 42 true
+textio_read.vhd:20:7:@0ms:(report note):    [ abc] 5 8
+textio_read.vhd:39:7:@0ms:(report note): int '+5' -> 5 true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:39:7:@0ms:(report note): int '1_000' -> 1 true
+textio_read.vhd:20:7:@0ms:(report note):    [_000] 2 5
+textio_read.vhd:39:7:@0ms:(report note): int '12abc' -> 12 true
+textio_read.vhd:20:7:@0ms:(report note):    [abc] 3 5
+textio_read.vhd:39:7:@0ms:(report note): int '  abc' -> -2147483648 false
+textio_read.vhd:20:7:@0ms:(report note):    [  abc] 1 5
+textio_read.vhd:39:7:@0ms:(report note): int '   ' -> -2147483648 false
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:39:7:@0ms:(report note): int '  -' -> -1 true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:39:7:@0ms:(report note): int '2147483647' -> 2147483647 true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:39:7:@0ms:(report note): int '-2147483648' -> -2147483648 true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:39:7:@0ms:(report note): int '1.5' -> 1 true
+textio_read.vhd:20:7:@0ms:(report note):    [.5] 2 3
+textio_read.vhd:39:7:@0ms:(report note): int '	7' -> 7 true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:43:7:@0ms:(report note): real '1.5e2' -> 1.5e2 true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:43:7:@0ms:(report note): real '-.5' -> -1.7976931348623157e308 false
+textio_read.vhd:20:7:@0ms:(report note):    [-.5] 1 3
+textio_read.vhd:43:7:@0ms:(report note): real '3' -> -1.7976931348623157e308 false
+textio_read.vhd:20:7:@0ms:(report note):    [3] 1 1
+textio_read.vhd:43:7:@0ms:(report note): real '1.0E-2' -> 1.0e-2 true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:43:7:@0ms:(report note): real '  2.5x' -> 2.5 true
+textio_read.vhd:20:7:@0ms:(report note):    [x] 6 6
+textio_read.vhd:43:7:@0ms:(report note): real '1.' -> -1.7976931348623157e308 false
+textio_read.vhd:20:7:@0ms:(report note):    [1.] 1 2
+textio_read.vhd:43:7:@0ms:(report note): real '-1.25E+1 z' -> -1.25e1 true
+textio_read.vhd:20:7:@0ms:(report note):    [ z] 9 10
+textio_read.vhd:47:7:@0ms:(report note): bool 'TRUE' -> true true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:47:7:@0ms:(report note): bool 'truex' -> true true
+textio_read.vhd:20:7:@0ms:(report note):    [x] 5 5
+textio_read.vhd:47:7:@0ms:(report note): bool ' false;' -> false true
+textio_read.vhd:20:7:@0ms:(report note):    [;] 7 7
+textio_read.vhd:47:7:@0ms:(report note): bool 'f' -> false false
+textio_read.vhd:20:7:@0ms:(report note):    [f] 1 1
+textio_read.vhd:51:7:@0ms:(report note): time '15 ns' -> 15000000 fs true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:51:7:@0ms:(report note): time '1.5 us' -> 1500000000 fs true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:51:7:@0ms:(report note): time '5ns' -> -9223372036854775808 fs false
+textio_read.vhd:20:7:@0ms:(report note):    [5ns] 1 3
+textio_read.vhd:51:7:@0ms:(report note): time '10 NS' -> 10000000 fs true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:51:7:@0ms:(report note): time '7 sec' -> 7000000000000000 fs true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:51:7:@0ms:(report note): time '3 xs' -> -9223372036854775808 fs false
+textio_read.vhd:20:7:@0ms:(report note):    [3 xs] 1 4
+textio_read.vhd:51:7:@0ms:(report note): time '-4 fs' -> -4 fs true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:51:7:@0ms:(report note): time '1 hr' -> 3600000000000000000 fs true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:51:7:@0ms:(report note): time '0.05 ns' -> 500000 fs true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:51:7:@0ms:(report note): time '15 nsx' -> 15000000 fs true
+textio_read.vhd:20:7:@0ms:(report note):    [x] 6 6
+textio_read.vhd:55:7:@0ms:(report note): bv '1_0_1_0' -> 0000 false
+textio_read.vhd:20:7:@0ms:(report note):    [1_0_1_0] 1 7
+textio_read.vhd:55:7:@0ms:(report note): bv ' 1010z' -> 1010 true
+textio_read.vhd:20:7:@0ms:(report note):    [z] 6 6
+textio_read.vhd:55:7:@0ms:(report note): bv '101' -> 0000 false
+textio_read.vhd:20:7:@0ms:(report note):    [101] 1 3
+textio_read.vhd:55:7:@0ms:(report note): bv '10101' -> 1010 true
+textio_read.vhd:20:7:@0ms:(report note):    [1] 5 5
+textio_read.vhd:59:7:@0ms:(report note): hread6 '3F' -> 111111 true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:61:7:@0ms:(report note): oread6 '3F' -> 000000 false
+textio_read.vhd:20:7:@0ms:(report note):    [3F] 1 2
+textio_read.vhd:59:7:@0ms:(report note): hread6 '7F' -> 000000 false
+textio_read.vhd:20:7:@0ms:(report note):    [7F] 1 2
+textio_read.vhd:61:7:@0ms:(report note): oread6 '7F' -> 000000 false
+textio_read.vhd:20:7:@0ms:(report note):    [7F] 1 2
+textio_read.vhd:59:7:@0ms:(report note): hread6 '2_a' -> 101010 true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:61:7:@0ms:(report note): oread6 '2_a' -> 000000 false
+textio_read.vhd:20:7:@0ms:(report note):    [2_a] 1 3
+textio_read.vhd:59:7:@0ms:(report note): hread6 '  77 x' -> 000000 false
+textio_read.vhd:20:7:@0ms:(report note):    [  77 x] 1 6
+textio_read.vhd:61:7:@0ms:(report note): oread6 '  77 x' -> 111111 true
+textio_read.vhd:20:7:@0ms:(report note):    [ x] 5 6
+textio_read.vhd:59:7:@0ms:(report note): hread6 '03F' -> 000011 true
+textio_read.vhd:20:7:@0ms:(report note):    [F] 3 3
+textio_read.vhd:61:7:@0ms:(report note): oread6 '03F' -> 000011 true
+textio_read.vhd:20:7:@0ms:(report note):    [F] 3 3
+textio_read.vhd:65:7:@0ms:(report note): str 'abc' -> ..... false
+textio_read.vhd:20:7:@0ms:(report note):    [abc] 1 3
+textio_read.vhd:67:7:@0ms:(report note): sread 'abc' -> abc.. 3
+textio_read.vhd:20:7:@0ms:(report note):    [] 4 3
+textio_read.vhd:65:7:@0ms:(report note): str 'abcdefg' -> abcde true
+textio_read.vhd:20:7:@0ms:(report note):    [fg] 6 7
+textio_read.vhd:67:7:@0ms:(report note): sread 'abcdefg' -> abcde 5
+textio_read.vhd:20:7:@0ms:(report note):    [fg] 6 7
+textio_read.vhd:65:7:@0ms:(report note): str '  ab cd' ->   ab  true
+textio_read.vhd:20:7:@0ms:(report note):    [cd] 6 7
+textio_read.vhd:67:7:@0ms:(report note): sread '  ab cd' -> ab... 2
+textio_read.vhd:20:7:@0ms:(report note):    [ cd] 5 7
+textio_read.vhd:65:7:@0ms:(report note): str 'abcde' -> abcde true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:67:7:@0ms:(report note): sread 'abcde' -> abcde 5
+textio_read.vhd:20:7:@0ms:(report note):    [] 6 5
+textio_read.vhd:65:7:@0ms:(report note): str ' abcde' ->  abcd true
+textio_read.vhd:20:7:@0ms:(report note):    [e] 6 6
+textio_read.vhd:67:7:@0ms:(report note): sread ' abcde' -> abcde 5
+textio_read.vhd:20:7:@0ms:(report note):    [] 7 6
+textio_read.vhd:71:7:@0ms:(report note): char ' x' ->   true
+textio_read.vhd:20:7:@0ms:(report note):    [x] 2 2
+textio_read.vhd:71:7:@0ms:(report note): char 'y' -> y true
+textio_read.vhd:20:7:@0ms:(report note):    [] 1 0
+textio_read.vhd:86:5:@0ms:(report note): bit 1 true
+textio_read.vhd:90:5:@0ms:(report note): slv 01ZX10LH
+textio_read.vhd:92:5:@0ms:(report note): hread slv A5 10100101
+textio_read.vhd:94:5:@0ms:(report note): bv 0110 6 06
+../../src/std/v08/textio-body.vhdl:817:5:@0ms:(assertion failure): integer read failure
+ghdl:error: assertion failed
+ghdl:error: simulation failed
