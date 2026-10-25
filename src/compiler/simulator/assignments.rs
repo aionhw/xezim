@@ -4079,7 +4079,13 @@ impl Simulator {
                 let prev = self.frame_get(&key).cloned();
                 let fitted = match prev.as_ref() {
                     Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
-                    Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
+                    // §10.7: the stored leaf keeps its own signedness, not
+                    // the rvalue's.
+                    Some(p) if !p.is_real && !val.is_real && p.width > 0 => {
+                        let mut f = val.resize(p.width);
+                        f.is_signed = p.is_signed;
+                        f
+                    }
                     Some(p) if !p.is_real && val.is_real => {
                         let mut f = Self::real_to_int(val.to_f64(), p.width.max(1));
                         f.is_signed = p.is_signed;

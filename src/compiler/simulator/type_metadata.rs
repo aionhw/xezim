@@ -1747,6 +1747,17 @@ impl Simulator {
             self.set_signal_value_by_name(flat, resized);
             return;
         }
+        // §10.7: a leaf outside the table — a subroutine local's or formal's
+        // in the frame, a block local's in the signal map — keeps its
+        // member's declared signedness too.
+        let mut val = val;
+        if !val.is_real {
+            if let Some(p) = self.frame_get(flat) {
+                val.is_signed = p.is_signed;
+            } else if self.signed_signals.contains(flat) {
+                val.is_signed = true;
+            }
+        }
         self.set_signal_value_by_name(flat, val);
     }
 

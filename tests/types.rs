@@ -548,3 +548,6 @@ mod review_nested_struct_params;
 
 #[path = "types/struct_param_override.rs"]
 mod struct_param_override;
+
+#[path = "types/struct_member_signed_store.rs"]
+mod struct_member_signed_store;

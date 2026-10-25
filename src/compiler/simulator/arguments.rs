@@ -940,7 +940,7 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            let dv = if super::elaborate::is_type_real(&m.data_type) {
+            let mut dv = if super::elaborate::is_type_real(&m.data_type) {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state_resolved(
                 &m.data_type,
@@ -950,6 +950,11 @@ impl Simulator {
             } else {
                 Value::new(mw)
             };
+            // §7.2: the leaf has the member's declared type, signedness
+            // included, which every later store keeps (§10.7).
+            if !dv.is_real {
+                dv.is_signed = self.type_is_signed_concrete(&m.data_type);
+            }
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 // Same keys as `unpacked_struct_leaves`: a collection member

@@ -3315,6 +3315,13 @@ impl Simulator {
                                 for (k, dv, mdt) in leaves {
                                     self.register_packed_leaf_layout(&k, &mdt);
                                     self.widths.insert(k.clone(), dv.width);
+                                    // §10.7: a store to the leaf takes its
+                                    // signedness from this set.
+                                    if dv.is_signed {
+                                        self.signed_signals.insert(k.clone());
+                                    } else {
+                                        self.signed_signals.remove(&k);
+                                    }
                                     self.signals.insert(k, dv);
                                 }
                                 if self.struct_colls_possible() {
