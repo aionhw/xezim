@@ -255,6 +255,14 @@ fn print_usage() {
         "  --work=<lib>             VHDL library for the .vhd/.vhdl files that follow (default work)"
     );
     eprintln!("  --std=08                 VHDL standard (VHDL-2008, the default and only one)");
+    eprintln!(
+        "  --ieee-asserts=<m>       VHDL assertions of the IEEE packages: enable (default), disable,"
+    );
+    eprintln!("                           disable-at-0 (as GHDL)");
+    eprintln!(
+        "  --assert-level=<s>       VHDL severity that stops the simulation: note, warning, error,"
+    );
+    eprintln!("                           failure (default), none (as GHDL)");
     eprintln!("  --dump-merged-sv <file>  Write the sources, fully preprocessed (`ifdef");
     eprintln!("                     resolved, macros expanded, `includes inlined), into one");
     eprintln!("                     self-contained .sv file — a standalone repro for");
@@ -2064,6 +2072,7 @@ fn run_main() -> i32 {
     let mut upf_files: Vec<String> = Vec::new();
     // VHDL design library of the VHDL files that follow (`--work=<lib>`).
     let mut vhdl_work = String::from("work");
+    let mut vhdl_options = xezim_core::vhdl::VhdlOptions::default();
     let mut vhdl_file_libs: Vec<(String, String)> = Vec::new();
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut vpi_libs: Vec<String> = Vec::new();
@@ -2730,6 +2739,36 @@ fn run_main() -> i32 {
                     std::process::exit(1);
                 }
             }
+            _ if arg.starts_with("--ieee-asserts=") => {
+                vhdl_options.ieee_asserts = match &arg["--ieee-asserts=".len()..] {
+                    "enable" => 0,
+                    "disable" => 1,
+                    "disable-at-0" => 2,
+                    v => {
+                        eprintln!(
+                            "Error: --ieee-asserts={}: expected enable, disable or disable-at-0",
+                            v
+                        );
+                        std::process::exit(1);
+                    }
+                };
+            }
+            _ if arg.starts_with("--assert-level=") => {
+                vhdl_options.assert_level = match &arg["--assert-level=".len()..] {
+                    "note" => 0,
+                    "warning" => 1,
+                    "error" => 2,
+                    "failure" => 3,
+                    "none" => 4,
+                    v => {
+                        eprintln!(
+                            "Error: --assert-level={}: expected note, warning, error, failure or none",
+                            v
+                        );
+                        std::process::exit(1);
+                    }
+                };
+            }
             _ if arg.starts_with("--std=") => {
                 let v = &arg["--std=".len()..];
                 if !matches!(v, "08" | "2008") {
@@ -3196,7 +3235,7 @@ fn run_main() -> i32 {
         .into_iter()
         .partition(|f| xezim_core::vhdl::is_vhdl_path(f));
     source_files = sv_sources;
-    xezim_core::vhdl::configure(
+    xezim_core::vhdl::configure_with(
         vhdl_sources
             .into_iter()
             .map(|path| {
@@ -3207,6 +3246,7 @@ fn run_main() -> i32 {
                 xezim_core::vhdl::VhdlFile { path, library }
             })
             .collect(),
+        vhdl_options,
     );
     // A VHDL simulation runs until no events are left (IEEE 1076-2008
     // §14.7.5), as GHDL does: no default run-length limit.

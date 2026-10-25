@@ -1,0 +1,6 @@
+assert_options.vhd:14:5:@0ms:(report note): i=0
+../../src/ieee2008/numeric_std-body.vhdl:3036:7:@1ns:(assertion warning): NUMERIC_STD.TO_INTEGER: metavalue detected, returning 0
+assert_options.vhd:17:5:@1ns:(assertion warning): a warning
+assert_options.vhd:18:5:@1ns:(assertion error): an error
+ghdl:error: assertion failed
+ghdl:error: simulation failed

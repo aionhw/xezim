@@ -18,9 +18,13 @@ fn check(name: &str) {
     std::fs::create_dir_all(&run_dir).expect("run directory");
     let src = format!("{}.vhd", name);
     std::fs::copy(dir.join(&src), run_dir.join(&src)).expect("copy design");
+    // Run options (GHDL's), if the design has any.
+    let opts = std::fs::read_to_string(dir.join(format!("{}.args", name))).unwrap_or_default();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .current_dir(&run_dir)
-        .args(["--no-cache", &src])
+        .arg("--no-cache")
+        .args(opts.split_whitespace())
+        .arg(&src)
         .output()
         .expect("run xezim");
     let _ = std::fs::remove_dir_all(&run_dir);
@@ -460,4 +464,20 @@ fn record_signals() {
 #[test]
 fn synopsys_packages() {
     check("synopsys_packages");
+}
+
+/// Actuals of constrained array parameters take the formal's bounds
+/// (§4.2.2.1); a length mismatch found at run time is a bound check
+/// failure.
+#[test]
+fn constrained_params() {
+    check("constrained_params");
+}
+
+/// GHDL's run options `--ieee-asserts=disable-at-0` (the IEEE packages'
+/// assertions hidden at time 0) and `--assert-level=error` (an assertion of
+/// severity error stops the simulation), from `assert_options.args`.
+#[test]
+fn assert_options() {
+    check("assert_options");
 }

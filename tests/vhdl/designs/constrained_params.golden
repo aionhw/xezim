@@ -1,0 +1,5 @@
+constrained_params.vhd:25:5:@0ms:(report note): low='1' left=3
+constrained_params.vhd:17:5:@0ms:(report note): d(0)='0' left=0
+constrained_params.vhd:27:5:@0ms:(report note): low='1'
+ghdl:error: bound check failure at constrained_params.vhd:28
+ghdl:error: simulation failed

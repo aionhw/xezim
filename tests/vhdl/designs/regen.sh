@@ -10,7 +10,9 @@ for f in *.vhd; do
   n=${f%.vhd}
   # Elaborate and run in the work directory: a design may create files.
   ghdl -a --std=08 -fsynopsys --workdir="$work" "$f" && (cd "$work" && ghdl -e --std=08 -fsynopsys --workdir="$work" "$n") || { echo "GHDL failed on $f"; continue; }
-  (cd "$work" && ghdl -r --std=08 -fsynopsys --workdir="$work" "$n") > "$n.golden" 2>/dev/null
+  # Run options from <name>.args, if any.
+  opts=$(cat "$n.args" 2>/dev/null)
+  (cd "$work" && ghdl -r --std=08 -fsynopsys --workdir="$work" "$n" $opts) > "$n.golden" 2>/dev/null
   echo $? > "$n.exit"
 done
 rm -rf "$work"

@@ -16,6 +16,9 @@ instantiates. Output, messages and exit status follow GHDL:
     ghdl:error: bound check failure at tb.vhd:20
 
 Without `--max-time`, a VHDL simulation runs until no events are left.
+GHDL's run options `--ieee-asserts=enable|disable|disable-at-0` (the
+assertions of the IEEE packages) and `--assert-level=note|warning|error|failure|none`
+(the severity that stops the simulation; default failure) are accepted.
 
 ## How it works
 
@@ -33,6 +36,17 @@ SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
 
 ## Supported (so far)
 
+- Signals driven by parts from several processes (§14.7.2): elements and
+  slices of arrays, elements of records, and any nesting of them
+  (`a(i)(j)`, `r.f(3 downto 0)`, `a(i).f`), with per-scalar resolution;
+  parts of signals as port actuals. An actual of a constrained array
+  parameter takes the formal's bounds.
+- Static expressions that call functions (constants, generics, generate
+  conditions and ranges computed by package functions, `'image`), as
+  elaboration evaluates them (§9.4).
+- Library IEEE also holds the Synopsys packages STD_LOGIC_ARITH,
+  STD_LOGIC_UNSIGNED, STD_LOGIC_SIGNED and STD_LOGIC_MISC (as GHDL's
+  `-fsynopsys` and Questa provide them).
 - Entities and architectures, processes (with or without sensitivity
   lists, `process (all)`), concurrent signal assignments (simple,
   conditional, selected), concurrent assertions and procedure calls, all
@@ -158,7 +172,7 @@ association of `inout` ports, compound configuration specifications,
 configuration declarative parts, null transactions to part of a signal,
 implicit signals and `'last_active` of a function's signal parameter,
 calls of procedures that wait or assign signals from outside a process,
-assignments to record elements of a signal, forcing part of a signal,
+forcing part of a signal,
 external variable names and package paths (`@lib.pkg`) in external names,
 ranges in the choices of `case?`, READ of a TEXT file (READLINE is
 supported), WRITE of a REAL with a FORMAT (VHDL-2019), and across the
@@ -185,6 +199,12 @@ The mixed-language designs under `tests/vhdl/mixed/` are checked against
 Questa 2021.2 (`mixed/regen.sh`): GHDL does not simulate SystemVerilog.
 Icarus Verilog's VHDL regression (ivtest `regress-vhdl.list`, not
 vendored) runs with `scripts/ivtest_vhdl.py <ivtest dir> <xezim>`.
+
+The NEORV32 RISC-V processor's testbench (`sim/neorv32_tb.vhd`, not
+vendored) elaborates and runs; its start-up messages and the instruction
+trace logs of its first microsecond equal GHDL's. Compiling the generated
+design takes most of a run, and the simulation is far slower than GHDL's,
+so longer comparisons wait for the native intrinsics of the next phase.
 
 GHDL 4.1's mcode backend cannot run a sequential null assignment
 (`s <= null;` in a process stops with an internal error), so null
