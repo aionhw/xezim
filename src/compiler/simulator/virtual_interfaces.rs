@@ -1842,8 +1842,10 @@ impl Simulator {
         let saved = self.name_resolve_hint.borrow().clone();
         *self.name_resolve_hint.borrow_mut() = scope.clone();
         // §20.3: `$time`/`%m` inside the body belong to the defining instance.
-        let saved_ts = self.timescale_scope_override.take();
-        self.timescale_scope_override = scope;
+        let saved_ts = std::mem::replace(
+            &mut self.timescale_scope_override,
+            Self::ts_scope_of(scope.as_deref()),
+        );
         let r = if let Some(fd) = self.fn_decl_rc(full) {
             self.exec_function_call(&fd, args)
         } else if let Some(td) = self.task_decl_rc(full) {

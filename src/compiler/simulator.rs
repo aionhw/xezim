@@ -1547,6 +1547,12 @@ struct CombEntry {
 struct CombEntryCold {
     /// Preferred hierarchical scope for resolving unqualified identifiers.
     scope_hint: Option<String>,
+    /// §20.3: the instance the entry's SOURCE sits in, when it differs from
+    /// `scope_hint` (`None` = the hint, or the top module without one).
+    /// A continuous assign elaborated with fully qualified names carries no
+    /// resolution hint, yet its `$time` must still count its own module's
+    /// timeunit. Read through `CombEntryCold::ts_scope`.
+    ts_scope: Option<String>,
     /// Pre-resolved signal IDs for reads (for fast dependency lookup).
     read_signal_ids: Vec<usize>,
     /// Pre-resolved signal IDs for writes. The original layout
@@ -1566,7 +1572,15 @@ struct CombEntryCold {
     cov: Option<u32>,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB020";
+impl CombEntryCold {
+    /// The timescale scope to install while the entry evaluates (see
+    /// `Simulator::ts_scope_of`): its source instance, `""` for the top.
+    fn ts_scope(&self) -> Option<String> {
+        Simulator::ts_scope_of(self.ts_scope.as_deref().or(self.scope_hint.as_deref()))
+    }
+}
+
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB021";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

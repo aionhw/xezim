@@ -312,6 +312,7 @@ impl Simulator {
                         },
                         cold: Box::new(CombEntryCold {
                             scope_hint: None,
+                            ts_scope: None,
                             read_signal_ids: read_ids,
                             write_signal_ids: write_ids,
                             span: inst.span,
@@ -367,6 +368,7 @@ impl Simulator {
                 item: CombItem::Udp { idx },
                 cold: Box::new(CombEntryCold {
                     scope_hint: None,
+                    ts_scope: None,
                     read_signal_ids: read_ids,
                     write_signal_ids: write_ids,
                     span: inst.span,
@@ -391,6 +393,7 @@ impl Simulator {
                 },
                 cold: Box::new(CombEntryCold {
                     scope_hint: None,
+                    ts_scope: None,
                     read_signal_ids: vec![event_ref.sig_id as usize],
                     write_signal_ids,
                     span: crate::ast::Span::dummy(),

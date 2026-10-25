@@ -103,28 +103,37 @@ pub unsafe extern "C" fn xezim_jit_load_signal_xz(sim: *mut u8, id: u32) -> u64 
     }
 }
 
+/// The scopes a JIT'd block's AST fallback statements run under. One is
+/// leaked per fallback-bearing block and baked into its bridge calls.
+pub struct JitFallbackScope {
+    /// Name-resolution / `%m` scope hint (`None` = no hint).
+    pub hint: Option<String>,
+    /// §20.3 timescale owner: the block's instance, `""` for the top. Kept
+    /// apart from `hint`, which may be inferred from a sensitivity signal.
+    pub ts: String,
+}
+
 /// AST-statement escape hatch: run ONE fallback statement (a $display /
 /// $error / other non-compilable stmt) through the interpreter from JIT'd
-/// code, with the owning block's scope hint applied around it exactly like
-/// the interpreter's fallback path (timescale for %t, %m instance naming,
-/// bare-name resolution). `stmt` is the Arc payload baked into the block's
-/// StmtFallback insn — the CompiledBlock outlives the JIT fn, keeping it
-/// alive. `hint` is a leaked per-block scope string (may be null).
+/// code, with the owning block's scopes applied around it exactly like
+/// the interpreter's fallback path (timescale for $time/%t, %m instance
+/// naming, bare-name resolution). `stmt` is the Arc payload baked into the
+/// block's StmtFallback insn — the CompiledBlock outlives the JIT fn,
+/// keeping it alive. `scope` is the block's leaked `JitFallbackScope`
+/// (may be null: no hint, top-module timescale).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xezim_jit_stmt_fallback(
     sim: *mut u8,
     stmt: *const crate::ast::stmt::Statement,
-    hint_ptr: *const u8,
-    hint_len: usize,
+    scope: *const JitFallbackScope,
 ) -> u32 {
     unsafe {
         let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
-        let hint = if hint_ptr.is_null() || hint_len == 0 {
-            None
-        } else {
-            std::str::from_utf8(std::slice::from_raw_parts(hint_ptr, hint_len)).ok()
+        let (hint, ts) = match scope.as_ref() {
+            Some(s) => (s.hint.as_deref(), s.ts.as_str()),
+            None => (None, ""),
         };
-        sim.jit_exec_fallback_stmt(&*stmt, hint) as u32
+        sim.jit_exec_fallback_stmt(&*stmt, hint, ts) as u32
     }
 }
 
@@ -382,6 +391,7 @@ mod stub {
             _xz_ptr: u64,
             _xz_len: u32,
             _scope_hint: Option<&str>,
+            _ts_scope: &str,
         ) -> Option<JitFn> {
             None
         }
@@ -396,7 +406,7 @@ mod stub {
 mod enabled {
     use super::super::bytecode::Insn;
     use super::{
-        JitFn, xezim_jit_blocking_assign_range_dyn, xezim_jit_inputs_have_xz,
+        JitFallbackScope, JitFn, xezim_jit_blocking_assign_range_dyn, xezim_jit_inputs_have_xz,
         xezim_jit_load_array_elem, xezim_jit_load_signal, xezim_jit_load_signal_slice,
         xezim_jit_load_signal_slice_xz, xezim_jit_load_signal_xz, xezim_jit_load_signal2,
         xezim_jit_schedule_nba, xezim_jit_schedule_nba_4s, xezim_jit_schedule_nba_bit_dyn,
@@ -427,9 +437,9 @@ mod enabled {
         /// JitModule is constructed, by the simulator caller that knows
         /// the pointer and length.
         inline_bits_ptr: Option<(u64, u32)>,
-        /// Scope hint (leaked ptr, len) for the block currently being
-        /// compiled; baked into StmtFallback bridge calls.
-        block_scope_hint: Option<(u64, u64)>,
+        /// Leaked `JitFallbackScope` of the block currently being
+        /// compiled (0 = none); baked into StmtFallback bridge calls.
+        block_fallback_scope: u64,
         /// JIT Stage 4 Tier A: snapshot of `Simulator::signal_widths` used
         /// at JIT-compile time to pick between the slow nba bridge (with
         /// width arg) and the leaner nba_fast bridge (assumes
@@ -535,7 +545,7 @@ mod enabled {
                 module: ClJitModule::new(builder),
                 next_id: 0,
                 inline_bits_ptr: None,
-                block_scope_hint: None,
+                block_fallback_scope: 0,
                 signal_widths_snapshot: Vec::new(),
                 signal_signed_snapshot: Vec::new(),
                 nba_side_queue: None,
@@ -621,7 +631,7 @@ mod enabled {
             xz_ptr: u64,
             xz_len: u32,
         ) -> Option<JitFn> {
-            self.try_compile_with_xz_hint(insns, num_regs, xz_ptr, xz_len, None)
+            self.try_compile_with_xz_hint(insns, num_regs, xz_ptr, xz_len, None, "")
         }
 
         pub fn try_compile_with_xz_hint(
@@ -631,6 +641,7 @@ mod enabled {
             xz_ptr: u64,
             xz_len: u32,
             scope_hint: Option<&str>,
+            ts_scope: &str,
         ) -> Option<JitFn> {
             for insn in insns {
                 if !is_supported(insn) {
@@ -651,12 +662,18 @@ mod enabled {
                     }
                 }
             }
-            // Fallback stmts carry the block's scope hint into the bridge;
-            // leak one copy per block (block count is static and small).
-            self.block_scope_hint = scope_hint.map(|h| {
-                let leaked: &'static str = Box::leak(h.to_string().into_boxed_str());
-                (leaked.as_ptr() as u64, leaked.len() as u64)
-            });
+            // Fallback stmts carry the block's scopes into the bridge; leak
+            // one copy per fallback-bearing block (block count is static).
+            self.block_fallback_scope = if insns.iter().any(|i| matches!(i, Insn::StmtFallback(..)))
+            {
+                let leaked: &'static JitFallbackScope = Box::leak(Box::new(JitFallbackScope {
+                    hint: scope_hint.map(str::to_string),
+                    ts: ts_scope.to_string(),
+                }));
+                leaked as *const JitFallbackScope as u64
+            } else {
+                0
+            };
             self.codegen_block(insns, num_regs, &input_ids, xz_ptr, xz_len)
                 .ok()
         }
@@ -737,8 +754,7 @@ mod enabled {
             let mut fb_sig = self.module.make_signature();
             fb_sig.params.push(AbiParam::new(pointer_type)); // sim
             fb_sig.params.push(AbiParam::new(pointer_type)); // stmt
-            fb_sig.params.push(AbiParam::new(pointer_type)); // hint ptr
-            fb_sig.params.push(AbiParam::new(types::I64)); // hint len
+            fb_sig.params.push(AbiParam::new(pointer_type)); // JitFallbackScope
             fb_sig.returns.push(AbiParam::new(types::I32)); // simulation finished
             let fb_id: FuncId = self
                 .module
@@ -1487,10 +1503,10 @@ mod enabled {
                     Insn::StmtFallback(payload) => {
                         let stmt_ptr = std::sync::Arc::as_ptr(&payload.0) as i64;
                         let sp = builder.ins().iconst(pointer_type, stmt_ptr);
-                        let (hp, hl) = self.block_scope_hint.unwrap_or((0, 0));
-                        let hpc = builder.ins().iconst(pointer_type, hp as i64);
-                        let hlc = builder.ins().iconst(types::I64, hl as i64);
-                        let call = builder.ins().call(fb_ref, &[sim_ptr, sp, hpc, hlc]);
+                        let scp = builder
+                            .ins()
+                            .iconst(pointer_type, self.block_fallback_scope as i64);
+                        let call = builder.ins().call(fb_ref, &[sim_ptr, sp, scp]);
                         let finished = builder.inst_results(call)[0];
                         let resume = builder.create_block();
                         // §20.2: a terminating fallback completes the native

@@ -2819,13 +2819,15 @@ impl Simulator {
     /// JIT bridge target: execute one AST fallback statement with the
     /// owning block's scope hint applied, mirroring the interpreter path's
     /// timescale/%m/name-resolution setup around fallback-bearing blocks.
+    /// `ts` is the block's timescale owner (`""` = the top module).
     pub(crate) fn jit_exec_fallback_stmt(
         &mut self,
         stmt: &crate::ast::stmt::Statement,
         hint: Option<&str>,
+        ts: &str,
     ) -> bool {
         let saved_ts = self.timescale_scope_override.take();
-        self.timescale_scope_override = hint.map(|h| h.to_string());
+        self.timescale_scope_override = Self::ts_scope_of(Some(ts));
         // `%m` wants the instance-relative scope the interpreter's edge path
         // records; a root block's hint is the top module's name.
         let m_scope = hint.map(|h| self.instance_relative_scope(h));

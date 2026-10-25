@@ -471,6 +471,16 @@ impl Simulator {
                 self.infer_contassign_scope_hint(&ca.lhs, &ca.rhs)
                     .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads))
             };
+            // §20.3: `$time` in the assign counts the timeunit of the module
+            // the `assign` is written in. A submodule's assign is elaborated
+            // with fully qualified names and often has NO resolution hint, so
+            // record its source instance when the hint would not name it.
+            let ts_scope = ca
+                .origin
+                .as_ref()
+                .map(|(_, sc)| sc.as_str())
+                .filter(|sc| *sc != scope_hint.as_deref().unwrap_or(""))
+                .map(str::to_string);
             // Detect identity assigns: assign dst = src (simple signal-to-signal copy)
             let direct_copy = if let Some((dst_id, src_id)) = ident_copy_ids {
                 let width = self.signal_widths[dst_id];
@@ -1177,6 +1187,7 @@ impl Simulator {
                 item,
                 cold: Box::new(CombEntryCold {
                     scope_hint,
+                    ts_scope,
                     read_signal_ids: rids,
                     write_signal_ids: wids,
                     span: ca_span,
@@ -1553,6 +1564,8 @@ impl Simulator {
                     item,
                     cold: Box::new(CombEntryCold {
                         scope_hint,
+                        // An always block's hint is its own instance scope.
+                        ts_scope: None,
                         read_signal_ids: rids,
                         write_signal_ids: wids,
                         span: ab.stmt.span,

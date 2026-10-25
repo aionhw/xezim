@@ -2864,6 +2864,11 @@ impl Simulator {
                     xz_ptr,
                     xz_len,
                     self.comb_entries[idx].cold.scope_hint.as_deref(),
+                    self.comb_entries[idx]
+                        .cold
+                        .ts_scope()
+                        .as_deref()
+                        .unwrap_or(""),
                 );
                 if compiled_fn.is_none() && std::env::var("XEZIM_JIT_BAIL_TRACE").is_ok() {
                     eprintln!(

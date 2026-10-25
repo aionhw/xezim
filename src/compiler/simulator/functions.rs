@@ -25,10 +25,11 @@ impl Simulator {
         if let Some(sc) = &scope {
             *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
         }
-        let saved_ts = self.timescale_scope_override.take();
-        if let Some(_sc) = &scope {
-            self.timescale_scope_override = scope.clone();
-        }
+        // §20.3: `$time` in the body counts the DECLARING module's unit.
+        let saved_ts = std::mem::replace(
+            &mut self.timescale_scope_override,
+            Self::ts_scope_of(scope.as_deref()),
+        );
         let r = self.exec_function_call(fd, args);
         self.timescale_scope_override = saved_ts;
         *self.name_resolve_hint.borrow_mut() = saved;

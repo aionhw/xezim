@@ -258,10 +258,10 @@ impl Simulator {
                         if let Some(sc) = &scope {
                             *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
                         }
-                        let saved_ts = self.timescale_scope_override.take();
-                        if let Some(_sc) = &scope {
-                            self.timescale_scope_override = scope.clone();
-                        }
+                        let saved_ts = std::mem::replace(
+                            &mut self.timescale_scope_override,
+                            Self::ts_scope_of(scope.as_deref()),
+                        );
                         self.exec_task_call(&td, args);
                         self.timescale_scope_override = saved_ts;
                         *self.name_resolve_hint.borrow_mut() = saved;
@@ -3210,8 +3210,12 @@ impl Simulator {
                     // the module where it is DEFINED — i.e. the instance we
                     // dispatched into — not the caller. Point the timescale scope
                     // at that instance for the duration of the body.
-                    let saved_ts = self.timescale_scope_override.take();
-                    self.timescale_scope_override = scope.clone();
+                    // A top-level callee (`scope` None) still installs the
+                    // top, not the caller's module.
+                    let saved_ts = std::mem::replace(
+                        &mut self.timescale_scope_override,
+                        Self::ts_scope_of(scope.as_deref()),
+                    );
                     let r = self.exec_function_call(&fd, args);
                     self.timescale_scope_override = saved_ts;
                     *self.name_resolve_hint.borrow_mut() = saved;
@@ -3220,8 +3224,10 @@ impl Simulator {
                 if let Some(td) = self.task_decl_rc(&full) {
                     let saved = self.name_resolve_hint.borrow().clone();
                     *self.name_resolve_hint.borrow_mut() = scope.clone();
-                    let saved_ts = self.timescale_scope_override.take();
-                    self.timescale_scope_override = scope.clone();
+                    let saved_ts = std::mem::replace(
+                        &mut self.timescale_scope_override,
+                        Self::ts_scope_of(scope.as_deref()),
+                    );
                     self.exec_task_call(&td, args);
                     self.timescale_scope_override = saved_ts;
                     *self.name_resolve_hint.borrow_mut() = saved;

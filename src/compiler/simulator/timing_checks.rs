@@ -469,6 +469,7 @@ impl Simulator {
                 item: CombItem::TimingCheck { idx: w },
                 cold: Box::new(CombEntryCold {
                     scope_hint: None,
+                    ts_scope: None,
                     read_signal_ids: vec![watch.sig],
                     write_signal_ids: Vec::new(),
                     span: crate::ast::Span::dummy(),

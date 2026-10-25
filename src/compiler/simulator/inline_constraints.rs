@@ -3643,6 +3643,19 @@ impl Simulator {
         }
     }
 
+    /// §20.3: the `timescale_scope_override` to install while a block or
+    /// subroutine body owned by instance `scope` runs (`None` = the top
+    /// module). An override of `None` means "no owner installed" and makes
+    /// `current_module_def` fall back to the RUNNING PROCESS — but a comb
+    /// entry, edge block or subroutine can run inside a different module's
+    /// process (a blocking write settles its fanout eagerly), and `$time`
+    /// there counted the WRITER's timeunit. So a top-level owner is
+    /// installed explicitly as `""`, never left as `None`.
+    #[inline]
+    pub(super) fn ts_scope_of(scope: Option<&str>) -> Option<String> {
+        Some(scope.unwrap_or_default().to_string())
+    }
+
     /// Timeunit / time-precision exponents (powers of 10 in seconds) of the
     /// current process's module (§20.3). Falls back to the design defaults.
     pub(super) fn current_timescale_exp(&self) -> (i32, i32) {

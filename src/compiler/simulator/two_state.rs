@@ -5620,6 +5620,9 @@ impl Simulator {
                     let edge_scopes: Vec<Option<String>> = (0..self.compiled_edge_blocks.len())
                         .map(|i| self.edge_block_scope_for(i))
                         .collect();
+                    let edge_ts_scopes: Vec<Option<String>> = (0..self.compiled_edge_blocks.len())
+                        .map(|i| self.edge_block_ts_scope(i))
+                        .collect();
                     if let Some(jm) = self.jit_module.as_mut() {
                         if inline_len > 0 {
                             jm.set_inline_bits_storage(inline_ptr, inline_len);
@@ -5845,6 +5848,10 @@ impl Simulator {
                                     xz_ptr,
                                     xz_len,
                                     edge_scopes.get(idx).and_then(|s| s.as_deref()),
+                                    edge_ts_scopes
+                                        .get(idx)
+                                        .and_then(|s| s.as_deref())
+                                        .unwrap_or(""),
                                 );
                                 if compiled_fn.is_none() && trace_bails {
                                     eprintln!(

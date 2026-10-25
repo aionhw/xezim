@@ -891,7 +891,7 @@ impl Simulator {
                         )
                     };
                     let saved_ts = self.timescale_scope_override.take();
-                    self.timescale_scope_override = entry.cold.scope_hint.clone();
+                    self.timescale_scope_override = entry.cold.ts_scope();
                     let saved_hint = if compiled.has_fallback {
                         let prev = self.name_resolve_hint.borrow().clone();
                         if let Some(sc) = entry.cold.scope_hint.as_ref() {

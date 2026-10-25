@@ -1054,6 +1054,15 @@ impl Simulator {
     /// inlining scope, else the instance prefix of its first sensitivity.
     /// Shared by the `edge_block_scope` table and the native compile of the
     /// block, so `%m`, bare names and `%t` agree between the two paths.
+    /// §20.3: the timescale owner of edge block `idx` — the instance it was
+    /// elaborated in, `""` for the top. Not `edge_block_scope_for`: that
+    /// falls back to a sensitivity signal's parent for name resolution, and a
+    /// top block clocked by a submodule's output port (`@(posedge clk)`,
+    /// `clk` aliased to `u.clk`) would count the SUBMODULE's timeunit.
+    pub(super) fn edge_block_ts_scope(&self, idx: usize) -> Option<String> {
+        Self::ts_scope_of(self.edge_blocks.get(idx).map(|b| b.scope.as_str()))
+    }
+
     pub(super) fn edge_block_scope_for(&self, idx: usize) -> Option<String> {
         self.edge_blocks.get(idx).and_then(|b| {
             if !b.scope.is_empty() {

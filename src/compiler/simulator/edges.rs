@@ -3022,16 +3022,20 @@ impl Simulator {
                             .flatten()
                             .unwrap_or_default(),
                     ));
-                    if let Some(scope) = self.edge_block_scope.get(bi).and_then(|s| s.as_ref()) {
+                    let block_scope = self.edge_block_scope.get(bi).and_then(|s| s.as_ref());
+                    if let Some(scope) = block_scope {
                         *self.name_resolve_hint.borrow_mut() = Some(scope.clone());
-                        // $time/%t in the fallback body must scale to THIS
-                        // block's module timescale (see current_module_def).
-                        self.timescale_scope_override = Some(scope.clone());
                     }
+                    // $time/%t in the fallback body must scale to THIS
+                    // block's module timescale (see current_module_def) —
+                    // a top block included: left unset, it took the
+                    // timeunit of whichever process ran last.
+                    let ts = self.edge_block_ts_scope(bi);
+                    let saved_ts = std::mem::replace(&mut self.timescale_scope_override, ts);
                     if !self.exec_bytecode(bi) {
                         self.exec_statement(&blocks[bi].stmt);
                     }
-                    self.timescale_scope_override = None;
+                    self.timescale_scope_override = saved_ts;
                     *self.name_resolve_hint.borrow_mut() = saved_hint;
                     *self.activation_scope.borrow_mut() = saved_activation_scope;
                     if let Some(ctx) = saved_context {

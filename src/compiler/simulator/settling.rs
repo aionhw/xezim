@@ -659,6 +659,10 @@ impl Simulator {
                     *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                 }
                 let w = self.infer_lhs_width(lhs);
+                // §20.3: `$time` in the RHS counts the assign's own module's
+                // timeunit, not that of the process whose write woke it.
+                let saved_ts =
+                    std::mem::replace(&mut self.timescale_scope_override, entry.cold.ts_scope());
                 // §7.4.2/§10.9: `assign x = '{...}` (or `assign x[i] = '{...}`
                 // on an array of packed vectors) converts each item to the
                 // ELEMENT type. The generic eval concatenates items at their
@@ -673,6 +677,7 @@ impl Simulator {
                 } else {
                     self.eval_expr_ctx(rhs, w).resize(w)
                 };
+                self.timescale_scope_override = saved_ts;
                 let delay = if *explicit_delay > 0 {
                     *explicit_delay
                 } else {
@@ -761,7 +766,7 @@ impl Simulator {
                 }
                 // $time/%t in the body scales to the BLOCK's module timescale.
                 let saved_ts = self.timescale_scope_override.take();
-                self.timescale_scope_override = scope_hint.clone();
+                self.timescale_scope_override = entry.cold.ts_scope();
                 self.exec_statement(stmt);
                 self.timescale_scope_override = saved_ts;
                 *self.name_resolve_hint.borrow_mut() = saved_hint;
@@ -805,7 +810,15 @@ impl Simulator {
                         compiled.instructions.len(),
                     )
                 };
+                // §20.3: `$time` in a fallback counts the entry's own module,
+                // not the process whose write or release reached it.
+                let saved_ts = compiled.has_fallback.then(|| {
+                    std::mem::replace(&mut self.timescale_scope_override, entry.cold.ts_scope())
+                });
                 self.exec_insns(insns);
+                if let Some(ts) = saved_ts {
+                    self.timescale_scope_override = ts;
+                }
             }
             CombItem::FusedGate { op } => {
                 self.exec_fused_gate(op);
@@ -2289,9 +2302,10 @@ impl Simulator {
                                         let sc = entries[eidx].cold.scope_hint.clone();
                                         self.set_m_block_scope(sc.as_deref());
                                         if sc.is_some() {
-                                            *self.name_resolve_hint.borrow_mut() = sc.clone();
+                                            *self.name_resolve_hint.borrow_mut() = sc;
                                         }
-                                        self.timescale_scope_override = sc;
+                                        self.timescale_scope_override =
+                                            entries[eidx].cold.ts_scope();
                                         Some((prev_hint, prev_ts))
                                     } else {
                                         None
@@ -2380,8 +2394,7 @@ impl Simulator {
                                     // $time/%t in a fallback stmt scales to the BLOCK's
                                     // module timescale (mirrors the edge-block dispatch).
                                     let saved_ts = self.timescale_scope_override.take();
-                                    self.timescale_scope_override =
-                                        entries[eidx].cold.scope_hint.clone();
+                                    self.timescale_scope_override = entries[eidx].cold.ts_scope();
                                     // …and `%m` in that fallback names the BLOCK's instance.
                                     self.set_m_block_scope(
                                         entries[eidx].cold.scope_hint.as_deref(),
