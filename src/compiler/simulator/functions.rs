@@ -793,7 +793,12 @@ impl Simulator {
             // Reading the bare name yielded x, so a function assigning
             // `f.a = ...` or `f = '{...}` returned nothing at all. Collapse the
             // leaves into the packed form while the frame is still live; the
-            // caller's assignment scatters them back.
+            // caller's assignment scatters them back. Its dynamic members are
+            // staged for the caller as `return f;` stages them.
+            if self.struct_colls_possible() && !self.struct_coll_members(&su).is_empty() {
+                let ret_var = Self::bare_ident_expr(ret_name.clone(), fd.name.name.span);
+                self.stage_ret_struct_colls(&ret_var);
+            }
             self.pack_unpacked_struct(&ret_name, &su)
                 .unwrap_or_else(|| Value::new(32))
         } else {

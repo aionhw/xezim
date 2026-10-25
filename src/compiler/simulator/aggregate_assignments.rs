@@ -2781,6 +2781,55 @@ impl Simulator {
         self.pending_ret_struct = Some(RET_STRUCT.to_string());
     }
 
+    /// §10.9.2/§13.4.1: `return '{...}` from a function returning an
+    /// unpacked struct with dynamic members. The packed value of the pattern
+    /// cannot carry those members, so the pattern is assigned to the return
+    /// variable, and that variable is what gets returned (and staged by
+    /// `stage_ret_struct_colls`), exactly as for `f = '{...}; return f;`.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn struct_pattern_return_var(&mut self, e: &Expression) -> Option<Expression> {
+        let ExprKind::AssignmentPattern(items) = &e.kind else {
+            return None;
+        };
+        if items.is_empty() || !self.struct_colls_possible() {
+            return None;
+        }
+        let fname = self.func_call_stack.last()?.clone();
+        let rt = self.module.functions.get(&fname)?.return_type.clone();
+        let su = self.unpacked_struct_of(&rt)?;
+        if self.struct_coll_members(&su).is_empty() {
+            return None;
+        }
+        let lvalue = Self::bare_ident_expr(fname, e.span);
+        let assign = crate::ast::stmt::Statement::new(
+            crate::ast::stmt::StatementKind::BlockingAssign {
+                lvalue: lvalue.clone(),
+                rvalue: e.clone(),
+            },
+            e.span,
+        );
+        self.exec_statement(&assign);
+        Some(lvalue)
+    }
+
+    /// The expression naming the variable `name` (a one-segment identifier).
+    pub(super) fn bare_ident_expr(name: String, span: crate::ast::Span) -> Expression {
+        Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier { name, span },
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            span,
+        )
+    }
+
     /// The caller half of `stage_ret_struct_colls`: `dst = f(...)` gets the
     /// returned struct's dynamic members.
     pub(super) fn copy_ret_struct_colls(

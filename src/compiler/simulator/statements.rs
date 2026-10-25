@@ -4973,6 +4973,13 @@ impl Simulator {
                     } else {
                         e
                     };
+                    // §10.9.2/§13.4.1: `return '{...}` of an unpacked struct
+                    // with dynamic members returns the return variable the
+                    // pattern was assigned to.
+                    let ret_var = matches!(e.kind, ExprKind::AssignmentPattern(_))
+                        .then(|| self.struct_pattern_return_var(e))
+                        .flatten();
+                    let e = ret_var.as_ref().unwrap_or(e);
                     // One call for a receiver call in the returned chain
                     // (`return me().o.x;`), shared by the probes below.
                     let pinned = Self::recv_chain_call(e)

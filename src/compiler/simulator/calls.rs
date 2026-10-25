@@ -94,6 +94,15 @@ impl Simulator {
                 return v;
             }
         }
+        // §13.4.1/§7.5.1: a method of a dynamic member of a returned struct
+        // (`f(x).d.size()`) runs on the member the call staged.
+        if let ExprKind::MemberAccess { expr: recv, member } = &func.kind
+            && Self::chain_has_call_base(recv)
+            && let Some(cn) = self.call_result_coll_name(recv)
+            && let Some(v) = self.eval_builtin_method(&cn, &member.name, args)
+        {
+            return v;
+        }
         // Normalize away Specialization wrappers for dispatch shape-matching
         // (the `#(...)` text is retained in the original AST + `current_spec`
         // for per-spec static keying). Keeps pre-Specialization dispatch exact.

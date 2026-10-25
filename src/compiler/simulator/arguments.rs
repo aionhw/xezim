@@ -1314,7 +1314,15 @@ impl Simulator {
             })
             .count();
         let pattern_vals = self.eval_flat_struct_pattern(arg, leaf_count);
-        let call_vals = if copies_in && pattern_vals.is_none() {
+        // §10.9.2: any other pattern actual — one with struct-valued or
+        // dynamic members — is assigned to a staging struct, which then binds
+        // like a struct variable actual.
+        let pattern_tmp = if pattern_vals.is_none() && matches!(dir, PortDirection::Input) {
+            self.stage_struct_pattern_arg(port_name, &su, arg)
+        } else {
+            None
+        };
+        let call_vals = if copies_in && pattern_vals.is_none() && pattern_tmp.is_none() {
             self.call_struct_leaf_values(port_name, &su, arg)
         } else {
             None
@@ -1335,7 +1343,7 @@ impl Simulator {
         // actual is evaluated (`install_struct_formal_colls`): installing
         // here would clobber a caller variable a later actual still reads.
         if self.struct_colls_possible() {
-            let caller_base = self.flat_member_name(arg);
+            let caller_base = pattern_tmp.clone().or_else(|| self.flat_member_name(arg));
             let ret_staged = if caller_base.is_none() && call_vals.is_some() {
                 self.pending_ret_struct.take()
             } else {
@@ -1392,25 +1400,44 @@ impl Simulator {
                 }
             }
         }
+        // §13.5/§7.2: each formal leaf has its member's declared signedness,
+        // whatever the actual's value carries (a call's packed result is an
+        // unsigned bit pattern).
+        let mut decl = Vec::new();
+        self.unpacked_struct_leaf_defaults(port_name, &su, 0, &mut decl);
+        let signed_leaves: HashSet<String> = decl
+            .into_iter()
+            .filter(|(_, dv, _)| dv.is_signed)
+            .map(|(k, ..)| k)
+            .collect();
         let mut leaf_pos = 0usize;
         let mut backs = Vec::new();
         for (key, caller_expr, w, is_real) in leaves {
             if copies_in {
-                let v = if let Some(pv) = &pattern_vals {
+                let mut v = if let Some(pv) = &pattern_vals {
                     pv[leaf_pos].clone()
                 } else if let Some(cv) = &call_vals {
                     cv.get(&key).cloned().unwrap_or_else(|| Value::new(w))
+                } else if let Some(t) = &pattern_tmp {
+                    self.get_signal_value_by_name(&format!("{}{}", t, &key[port_name.len()..]))
+                        .unwrap_or_else(|| Value::new(w))
                 } else {
                     self.eval_expr(&caller_expr)
                 };
+                if !v.is_real {
+                    v.is_signed = signed_leaves.contains(&key);
+                }
                 locals.insert(key.clone(), v);
                 leaf_pos += 1;
             } else {
-                let seed = if is_real {
+                let mut seed = if is_real {
                     Value::from_f64(0.0)
                 } else {
                     Value::new(w)
                 };
+                if !seed.is_real {
+                    seed.is_signed = signed_leaves.contains(&key);
+                }
                 locals.insert(key.clone(), seed);
             }
             if copies_out {
@@ -1418,6 +1445,49 @@ impl Simulator {
             }
         }
         Some(backs)
+    }
+
+    /// §10.9.2/§13.5.1: assign the assignment-pattern actual `arg` of the
+    /// unpacked-struct input formal `port_name` to a fresh staging struct —
+    /// leaves at their declared defaults, dynamic members empty — so its
+    /// struct-valued items (variables, calls) bring their dynamic members
+    /// along. Returns the staging struct's name; `None` for a non-pattern.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn stage_struct_pattern_arg(
+        &mut self,
+        port_name: &str,
+        su: &crate::ast::types::StructUnionType,
+        arg: &Expression,
+    ) -> Option<String> {
+        let ExprKind::AssignmentPattern(items) = &arg.kind else {
+            return None;
+        };
+        if items.is_empty() {
+            return None;
+        }
+        let tmp = format!(
+            "__xz_arg_pat_{}_{}",
+            self.queue_frame_saves.len(),
+            port_name
+        );
+        let mut leaves = Vec::new();
+        self.unpacked_struct_leaf_defaults(&tmp, su, 0, &mut leaves);
+        for (k, dv, _) in leaves {
+            if dv.is_signed {
+                self.signed_signals.insert(k.clone());
+            } else {
+                self.signed_signals.remove(&k);
+            }
+            self.signals.insert(k, dv);
+        }
+        for (sfx, kind, dt, sk) in self.struct_coll_members(su) {
+            let d = format!("{}.{}", tmp, sfx);
+            self.register_struct_member_coll_as(&d, kind, &dt, sk);
+            self.clear_coll(&d, kind);
+        }
+        self.assign_pattern_into_struct(&tmp, su, items);
+        Some(tmp)
     }
 
     /// §13.5: install the dynamic members of the struct formals bound since

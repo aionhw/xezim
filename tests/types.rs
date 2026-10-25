@@ -551,3 +551,6 @@ mod struct_param_override;
 
 #[path = "types/struct_member_signed_store.rs"]
 mod struct_member_signed_store;
+
+#[path = "types/struct_call_pattern_members.rs"]
+mod struct_call_pattern_members;

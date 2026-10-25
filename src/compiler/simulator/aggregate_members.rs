@@ -1081,7 +1081,61 @@ impl Simulator {
     /// sliced out of the packed form the return produced, using the very leaf
     /// layout that produced it. The packed-aggregate path cannot serve this:
     /// it declines member-wise structs, so these reads returned 0.
+    /// §13.4.1/§7.2: the storage of a dynamic member of a call result —
+    /// `f(x).d` or `f(x).s.d` — which the packed return value cannot carry.
+    /// Evaluates the call once and names the member it staged
+    /// (`stage_ret_struct_colls`). `None` when `e` is not a dynamic member of
+    /// a call returning an unpacked struct.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn call_result_coll_name(&mut self, e: &Expression) -> Option<String> {
+        let ExprKind::MemberAccess { expr: base, member } = &e.kind else {
+            return None;
+        };
+        if !self.struct_coll_member_possible(&member.name) {
+            return None;
+        }
+        let mut path = vec![member.name.as_str()];
+        let mut cur = &**base;
+        let func = loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    path.push(member.name.as_str());
+                    cur = expr;
+                }
+                ExprKind::Call { func, .. } => break func,
+                _ => return None,
+            }
+        };
+        let ret = self.call_return_type(func)?;
+        let su = self.unpacked_struct_of(&ret)?;
+        path.reverse();
+        let sfx = path.join(".");
+        if !self
+            .struct_coll_members(&su)
+            .iter()
+            .any(|(s, ..)| *s == sfx)
+        {
+            return None;
+        }
+        // A receiver call held for this evaluation (`recv_call_once_eval`)
+        // has run already, and staged its members then.
+        if self.recv_call_memo.is_empty() || self.recv_call_memo_hit(cur).is_none() {
+            self.pending_ret_struct = None;
+            self.eval_expr(cur);
+        }
+        let staged = self.pending_ret_struct.clone()?;
+        Some(format!("{}.{}", staged, sfx))
+    }
+
     pub(super) fn eval_unpacked_call_member(&mut self, e: &Expression) -> Option<Value> {
+        // §7.5.1: an element of a dynamic member of the result (`f(x).d[i]`).
+        if let ExprKind::Index { expr: base, index } = &e.kind
+            && let Some(cn) = self.call_result_coll_name(base)
+        {
+            let i = self.eval_expr(index).to_i64()?;
+            return self.get_signal_value_by_name(&format!("{}[{}]", cn, i));
+        }
         let mut suffix: Vec<String> = Vec::new();
         let mut cur = e;
         let call = loop {
