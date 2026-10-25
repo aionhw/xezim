@@ -1,0 +1,28 @@
+record_signals.vhd:94:5:@0ms:(report note): copy stb='U' clk='U'
+record_signals.vhd:94:5:@0ms:(report note): copy stb='0' clk='0'
+record_signals.vhd:94:5:@0ms:(report note): copy stb='0' clk='0'
+record_signals.vhd:94:5:@2ns:(report note): copy stb='1' clk='0'
+record_signals.vhd:70:5:@3ns:(report note): data=C3 a='H'
+record_signals.vhd:94:5:@3ns:(report note): copy stb='1' clk='0'
+record_signals.vhd:94:5:@3ns:(report note): copy stb='0' clk='0'
+record_signals.vhd:86:7:@5ns:(report note): edge 0 addr=3C
+record_signals.vhd:94:5:@5ns:(report note): copy stb='0' clk='1'
+record_signals.vhd:94:5:@6ns:(report note): copy stb='1' clk='1'
+record_signals.vhd:94:5:@7ns:(report note): copy stb='1' clk='1'
+record_signals.vhd:77:5:@8ns:(report note): data=5A b=7
+record_signals.vhd:94:5:@10ns:(report note): copy stb='1' clk='0'
+record_signals.vhd:86:7:@15ns:(report note): edge 1 addr=A5
+record_signals.vhd:94:5:@15ns:(report note): copy stb='1' clk='1'
+record_signals.vhd:94:5:@20ns:(report note): copy stb='1' clk='0'
+record_signals.vhd:86:7:@25ns:(report note): edge 2 addr=A5
+record_signals.vhd:94:5:@25ns:(report note): copy stb='1' clk='1'
+record_signals.vhd:94:5:@30ns:(report note): copy stb='1' clk='0'
+record_signals.vhd:86:7:@35ns:(report note): edge 3 addr=A5
+record_signals.vhd:94:5:@35ns:(report note): copy stb='1' clk='1'
+record_signals.vhd:94:5:@40ns:(report note): copy stb='1' clk='0'
+record_signals.vhd:86:7:@45ns:(report note): edge 4 addr=A5
+record_signals.vhd:94:5:@45ns:(report note): copy stb='1' clk='1'
+record_signals.vhd:94:5:@50ns:(report note): copy stb='1' clk='0'
+record_signals.vhd:86:7:@55ns:(report note): edge 5 addr=A5
+record_signals.vhd:94:5:@55ns:(report note): copy stb='1' clk='1'
+record_signals.vhd:94:5:@60ns:(report note): copy stb='1' clk='0'

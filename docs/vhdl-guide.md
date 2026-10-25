@@ -113,6 +113,44 @@ SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
 - `report`/`assert` and run-time checks (range, index, overflow, null
   access) with GHDL's messages and exit status; `std.env.stop`/`finish`.
 
+## Mixed with SystemVerilog
+
+VHDL and SystemVerilog sources can be given together:
+
+    xezim tb.sv dut.vhd          # an SV testbench around a VHDL entity
+    xezim tb.vhd counter.sv      # a VHDL testbench with an SV module
+
+- An SV module may instantiate a VHDL entity by its name (any case). The
+  parameter overrides of the instance set the entity's generics; they must
+  be constant expressions of literals and the module's parameters
+  (integer, real, string and bit values; a based literal gives a
+  std_logic or std_logic_vector generic its bits, right-aligned). Ports
+  connect by name or position.
+- A VHDL component with no entity of its name binds to the SV module of
+  that name (§7.3.3 leaves the default binding to the tool). Its generics
+  become the module's parameters and its ports connect to the module's
+  ports by name (any case); actuals may be signals, parts of signals,
+  static values (inputs) or `open`.
+- The top is the SV module no other module instantiates; a VHDL top level
+  is the top only when no SV module is left over (or when `-s` names it).
+  An SV testbench may read the signals and constants of the VHDL entity it
+  instantiates by hierarchical names (`dut.count`).
+
+Ports cross the boundary as Questa passes them: std_ulogic and its
+vectors become 4-state logic (`U X W -` → x, `0 L` → 0, `1 H` → 1, `Z` →
+z; back as 0 1 x z → `'0' '1' 'X' 'Z'`), the left element of a vector
+being the most significant bit (`(0 to 3)` too); bit and boolean are 0/1
+(x and z become `'0'`); integers are 32-bit; reals are reals. Arrays of
+integers or reals (outputs and hierarchical reads) are unpacked arrays
+with the VHDL bounds.
+
+VHDL keeps its own simulation cycle inside each instantiated entity. A
+change of an SV input runs the VHDL cycles of that time at once, the way
+xezim settles SV combinational logic, so an SV check one step after the
+stimulus sees the VHDL outputs settled (a process that waits resumes from
+the kernel instead). Each SV instance of a VHDL entity is a separate
+elaboration: signals and shared variables of packages are per instance.
+
 ## Not supported yet
 
 Each is reported at its source location: conversions and partial
@@ -123,8 +161,8 @@ calls of procedures that wait or assign signals from outside a process,
 assignments to record elements of a signal, forcing part of a signal,
 external variable names and package paths (`@lib.pkg`) in external names,
 ranges in the choices of `case?`, READ of a TEXT file (READLINE is
-supported), WRITE of a REAL with a FORMAT (VHDL-2019), and mixing with
-SystemVerilog. A NUL character in a report message is dropped (GHDL prints
+supported), WRITE of a REAL with a FORMAT (VHDL-2019), and across the
+language boundary inout ports, records and multi-dimensional arrays. A NUL character in a report message is dropped (GHDL prints
 it).
 
 ## Verification
@@ -142,6 +180,11 @@ in a different order. The test designs print from one process per delta.
 
 Each design runs in a directory of its own (and `regen.sh` runs GHDL in
 its work directory), so designs may create files.
+
+The mixed-language designs under `tests/vhdl/mixed/` are checked against
+Questa 2021.2 (`mixed/regen.sh`): GHDL does not simulate SystemVerilog.
+Icarus Verilog's VHDL regression (ivtest `regress-vhdl.list`, not
+vendored) runs with `scripts/ivtest_vhdl.py <ivtest dir> <xezim>`.
 
 GHDL 4.1's mcode backend cannot run a sequential null assignment
 (`s <= null;` in a process stops with an internal error), so null

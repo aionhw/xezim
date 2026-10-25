@@ -1,0 +1,11 @@
+synopsys_packages.vhd:17:5:@0ms:(report note): x+y=41
+synopsys_packages.vhd:19:5:@0ms:(report note): x-1=3B
+synopsys_packages.vhd:20:5:@0ms:(report note): x>y true x=60 true
+synopsys_packages.vhd:22:5:@0ms:(report note): conv_integer=60
+synopsys_packages.vhd:24:5:@0ms:(report note): conv_unsigned=C8
+synopsys_packages.vhd:26:5:@0ms:(report note): conv_slv=FD
+synopsys_packages.vhd:27:5:@0ms:(report note): or_reduce='1' and_reduce='0'
+synopsys_packages.vhd:29:5:@0ms:(report note): shl=F0
+synopsys_packages.vhd:30:5:@0ms:(report note): ext=005 sxt=FF0
+ghdl:error: bound check failure at synopsys_packages.vhd:31
+ghdl:error: simulation failed

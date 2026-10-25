@@ -444,3 +444,20 @@ fn textio_files() {
 fn slice_actuals() {
     check("slice_actuals");
 }
+
+/// Signals of record types driven element by element from several
+/// processes (§14.7.2), record elements as port actuals, a resolved
+/// element with two drivers, and the event of one element (`rising_edge`
+/// of a clock in a record).
+#[test]
+fn record_signals() {
+    check("record_signals");
+}
+
+/// The Synopsys packages in library IEEE (GHDL `-fsynopsys`):
+/// STD_LOGIC_ARITH, STD_LOGIC_UNSIGNED and STD_LOGIC_MISC, including a
+/// loop over `integer range 0 to n - 1` in their bodies.
+#[test]
+fn synopsys_packages() {
+    check("synopsys_packages");
+}

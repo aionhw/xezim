@@ -1,0 +1,17 @@
+0 ns cnt event XXXXXX
+six: width 6 step 0.25
+c: width 2 step 1.00
+5 ns cnt event 111100
+15 ns cnt event 111101
+16 ns cnt=3D wrap='0' steps=183 scaled*100=1525 half=0111
+25 ns cnt event 111110
+26 ns cnt=3E wrap='0' steps=186 scaled*100=1550 half=0000
+35 ns cnt event 111111
+36 ns cnt=3F wrap='1' steps=189 scaled*100=1575 half=0010
+45 ns cnt event 000000
+46 ns cnt=00 wrap='0' steps=0 scaled*100=0 half=0100
+55 ns cnt event 000001
+56 ns cnt=01 wrap='0' steps=3 scaled*100=25 half=0111
+65 ns cnt event 000010
+66 ns cnt=02 wrap='0' steps=6 scaled*100=50 half=0000
+done

@@ -6,5 +6,7 @@
 
 #[path = "vhdl/front_end.rs"]
 mod front_end;
+#[path = "vhdl/mixed.rs"]
+mod mixed;
 #[path = "vhdl/simulation.rs"]
 mod simulation;

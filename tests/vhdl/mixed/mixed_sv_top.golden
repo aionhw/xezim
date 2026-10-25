@@ -1,0 +1,20 @@
+nine=xx01zx01x seen=01xz b_out=1 i_out=9 r_out=1.500000
+6 q=03 sum=03 carry=0 zero=0 count=0
+16 q=03 sum=03 carry=0 zero=0 count=1
+26 q=0a sum=0a carry=0 zero=0 count=2
+36 q=18 sum=18 carry=0 zero=0 count=3
+46 q=2d sum=2d carry=0 zero=0 count=4
+56 q=09 sum=49 carry=1 zero=0 count=5
+66 q=2c sum=2c carry=0 zero=0 count=6
+76 q=16 sum=56 carry=1 zero=0 count=7
+86 q=07 sum=47 carry=1 zero=0 count=8
+96 q=3f sum=3f carry=0 zero=0 count=9
+106 q=3e sum=7e carry=1 zero=0 count=10
+116 q=04 sum=44 carry=1 zero=0 count=11
+126 q=11 sum=11 carry=0 zero=0 count=12
+seen=1100 b_out=0 i_out=-41 r_out=-0.750000
+i_in=0 i_out=-1
+i_in=3 i_out=5
+i_in=6 i_out=11
+i_in=9 i_out=17
+i_in=12 i_out=23
