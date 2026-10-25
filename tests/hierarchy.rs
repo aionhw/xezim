@@ -179,6 +179,8 @@ mod t_nested_value_param_in_type_arg;
 mod t_no_parens_static_method;
 #[path = "hierarchy/typedef_array_ports_in_children.rs"]
 mod typedef_array_ports_in_children;
+#[path = "hierarchy/typedef_arrays_declared_in_children.rs"]
+mod typedef_arrays_declared_in_children;
 #[path = "hierarchy/undefined_call_in_instance.rs"]
 mod undefined_call_in_instance;
 #[path = "hierarchy/undriven_implicit_output_is_z.rs"]
