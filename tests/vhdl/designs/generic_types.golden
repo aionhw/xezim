@@ -1,0 +1,2 @@
+generic_types.vhd:31:5:@0ms:(report note): qi=3 qr=5.0e-1 qp=1,2
+generic_types.vhd:33:5:@2ns:(report note): qi=5 qr=2.5 qp=1,2 changed truetruefalse

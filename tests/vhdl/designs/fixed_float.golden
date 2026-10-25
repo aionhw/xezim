@@ -1,0 +1,5 @@
+fixed_float.vhd:21:5:@0ms:(report note): x+y=00001.0100 x*y=11111011.11100000 -4.125
+fixed_float.vhd:24:5:@0ms:(report note): saturate=01.11 1.75
+fixed_float.vhd:26:5:@0ms:(report note): round=00.10 5.0e-1
+fixed_float.vhd:27:5:@0ms:(report note): cmp true true int=3
+fixed_float.vhd:29:5:@0ms:(report note): f+g=0:01111111:01000000000000000000000 f*g=-3.75e-1 f<g=false

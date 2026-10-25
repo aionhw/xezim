@@ -7,3 +7,7 @@ each through xezim and compares.
 
 The top unit of `<name>.vhd` is named `<name>`: an entity, or a
 configuration declaration that configures one.
+
+`generic_subprograms.golden` is written by hand from the LRM: GHDL 4.1
+cannot call instantiated generic subprograms (it reports an internal
+error), so `regen.sh` reports it as failed and leaves the golden alone.

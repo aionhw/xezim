@@ -1,0 +1,3 @@
+generic_subprograms.vhd:37:5:@0ms:(report note): swap_int=2 swap_bit='1'
+generic_subprograms.vhd:39:5:@0ms:(report note): r=2.5
+generic_subprograms.vhd:40:5:@0ms:(report note): twice_inc=42 twice_neg='1'

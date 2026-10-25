@@ -1,0 +1,3 @@
+record_constraints.vhd:21:5:@0ms:(report note): 01 hi 3 111 ab 1 1
+record_constraints.vhd:23:5:@0ms:(report note): 1010 xyz 3 '1'
+record_constraints.vhd:25:5:@1ns:(report note): 0001 abc 2 '1' 3

@@ -1,0 +1,5 @@
+external_names.vhd:27:5:@0ms:(report note): h=3 k=11 d='1'
+external_names.vhd:36:5:@0ms:(report note): x=-2147483648 h=3
+external_names.vhd:36:5:@5ns:(report note): x=1 h=4
+external_names.vhd:30:5:@8ns:(report note): h=4 d='0' at 8000000 fs
+external_names.vhd:32:5:@13ns:(report note): h=5 at 13000000 fs

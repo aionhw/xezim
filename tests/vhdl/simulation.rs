@@ -330,3 +330,60 @@ fn procedure_waits() {
 fn driving_values() {
     check("driving_values");
 }
+
+/// Matching case statements and selected assignments (§10.9, §10.5.4)
+/// with '-' choices, and the matching operators (§9.2.3).
+#[test]
+fn matching_case() {
+    check("matching_case");
+}
+
+/// Force and release of signals (§10.5.2.1): the forced value holds from
+/// the next cycle whatever the drivers do, until released.
+#[test]
+fn force_release() {
+    check("force_release");
+}
+
+/// Generic packages instantiated as a library unit and in an architecture
+/// (§4.9, §6.5.6), with a generic type, constants and a function.
+#[test]
+fn generic_packages() {
+    check("generic_packages");
+}
+
+/// Generic types of an entity (§6.5.3) bound to INTEGER, REAL and a
+/// record, with out-port defaults as initial driving values (§14.7.2).
+#[test]
+fn generic_types() {
+    check("generic_types");
+}
+
+/// Generic subprograms instantiated in a package and an architecture
+/// (§4.2.1, §4.4), with a generic subprogram formal; the golden is written
+/// by hand (GHDL 4.1 cannot call instantiated generic subprograms).
+#[test]
+fn generic_subprograms() {
+    check("generic_subprograms");
+}
+
+/// External names (§8.7): absolute and relative paths to signals and
+/// constants of instances and blocks.
+#[test]
+fn external_names() {
+    check("external_names");
+}
+
+/// Records with unconstrained elements and record constraints (§5.3.3).
+#[test]
+fn record_constraints() {
+    check("record_constraints");
+}
+
+/// The IEEE fixed_pkg and float_pkg (§16.10, §16.11), compiled from their
+/// sources: fixed-point sizing, resize with saturation and rounding, and
+/// float32 arithmetic.
+#[test]
+fn fixed_float() {
+    check("fixed_float");
+}

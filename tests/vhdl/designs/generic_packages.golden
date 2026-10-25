@@ -1,0 +1,5 @@
+generic_packages.vhd:44:5:@0ms:(report note): first=5 size=4
+generic_packages.vhd:46:5:@0ms:(report note): first=9
+generic_packages.vhd:48:5:@0ms:(report note): empty first=7
+generic_packages.vhd:50:5:@0ms:(report note): bit first='1' size=2
+generic_packages.vhd:52:5:@0ms:(report note): bit first='0'

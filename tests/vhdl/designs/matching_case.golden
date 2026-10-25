@@ -1,0 +1,14 @@
+matching_case.vhd:22:24:@0ms:(report note): other 000
+matching_case.vhd:21:31:@0ms:(report note): 01- or 001 001
+matching_case.vhd:21:31:@0ms:(report note): 01- or 001 010
+matching_case.vhd:21:31:@0ms:(report note): 01- or 001 011
+matching_case.vhd:20:23:@0ms:(report note): 1-- 100
+matching_case.vhd:20:23:@0ms:(report note): 1-- 101
+matching_case.vhd:20:23:@0ms:(report note): 1-- 110
+matching_case.vhd:20:23:@0ms:(report note): 1-- 111
+matching_case.vhd:27:21:@0ms:(report note): H0L matches 1-0
+matching_case.vhd:30:43:@1ns:(report note): y=2 z=10
+matching_case.vhd:31:43:@2ns:(report note): y=1 z=20
+matching_case.vhd:32:33:@3ns:(report note): y=4
+matching_case.vhd:33:5:@3ns:(report note): m '1''0''1''X'
+matching_case.vhd:35:25:@3ns:(report note): cond ok

@@ -43,7 +43,14 @@ SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
   maps. A port associated with a signal or a static part of one is that
   signal (no extra delta); `open`, unassociated and literal actuals get a
   signal of their own. Each distinct set of generic values is analysed on
-  its own, so subtypes may depend on generics.
+  its own, so subtypes may depend on generics. Generic types; an out
+  port's default value is its drivers' initial value.
+- Generic packages, instantiated as library units or in declarative
+  parts, with generic constants, types, subprograms and packages; generic
+  subprograms and their instantiation. Each instance is analysed with its
+  generics bound, so it has its own types and subprograms.
+- External names (`<<signal .top.u.s : t>>`, relative paths, `^`) of
+  signals and constants.
 - Components bind by default to the entity of the same name, by
   configuration specifications (`for u1 : c use entity ...`, `for others`,
   `for all`, `use open`), or by a configuration declaration, which may also
@@ -59,7 +66,8 @@ SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
   signal, one delta behind, as in GHDL.
 - Types: enumeration, integer, real, physical (TIME), arrays (any number
   of dimensions; constrained, unconstrained, and with bounds computed at
-  elaboration), records, access types, subtypes with range checks.
+  elaboration), records (also with unconstrained elements and record
+  constraints), access types, subtypes with range checks.
 - Signals of those types with inertial and transport delays, `reject`,
   multi-element waveforms; `'event`, `'active`, `'last_value`,
   `'last_event`, `'last_active`, also of elements; `'driving`,
@@ -73,7 +81,9 @@ SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
   disconnection specifications and null transactions (`s <= null after
   t`): a bus with no driver on resolves an empty array, a register keeps
   its value.
-- `wait on/until/for`, every sequential statement, labelled `next`/`exit`.
+- `wait on/until/for`, every sequential statement (also `case?` and
+  `select?`), labelled `next`/`exit`; `force`/`release` of signals (the
+  modes `in` and `out` act alike: a port shares its actual's signal).
 - Functions and procedures: overloading, default and named parameters,
   `out`/`inout`, signal parameters of every mode, procedures that wait and
   assign signals (lowered once per calling process and signal actuals),
@@ -83,8 +93,10 @@ SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
   matching `?=` etc.), aggregates, slices, concatenation, type
   conversions, attributes, allocators, `'image` and TO_STRING in GHDL's
   format.
-- IEEE `std_logic_1164`, `numeric_std` and the other IEEE packages are
-  compiled from their sources.
+- IEEE `std_logic_1164`, `numeric_std` and the other IEEE packages,
+  `fixed_pkg` and `float_pkg` among them, are compiled from their sources.
+  Their bodies run as ordinary compiled code, without native intrinsics,
+  so wide arithmetic such as `float64` division is slow.
 - TEXTIO output: WRITE of the standard types (justification, field,
   DIGITS, UNIT), SWRITE, JUSTIFY, WRITELINE to OUTPUT.
 - `report`/`assert` and run-time checks (range, index, overflow, null
@@ -97,10 +109,10 @@ association of `inout` ports, compound configuration specifications,
 configuration declarative parts, null transactions to part of a signal,
 implicit signals and `'last_active` of a function's signal parameter,
 calls of procedures that wait or assign signals from outside a process,
-assignments to record elements of a signal, file I/O other than WRITELINE
-to OUTPUT and TEXTIO reads, protected types, generic types, subprograms and
-packages, external names, force/release, `case?`, and mixing with
-SystemVerilog.
+assignments to record elements of a signal, forcing part of a signal,
+external variable names and package paths (`@lib.pkg`) in external names,
+ranges in the choices of `case?`, file I/O other than WRITELINE to OUTPUT
+and TEXTIO reads, protected types, and mixing with SystemVerilog.
 
 ## Verification
 
