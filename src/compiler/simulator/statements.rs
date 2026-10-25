@@ -4416,6 +4416,17 @@ impl Simulator {
                                         self.drive_clocking_select(t, val, skew);
                                         return;
                                     }
+                                    // §14.3: an edge skew drives on the next
+                                    // such edge of the clock after the event.
+                                    if let Some((edge, d)) =
+                                        self.clocking_drive_edge(&cb, raw_sig, &net)
+                                    {
+                                        self.clocking_edge_out_pending
+                                            .entry(cb)
+                                            .or_default()
+                                            .push((net, val, edge, d));
+                                        return;
+                                    }
                                     if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
                                         let w = self.signal_widths[id];
                                         self.schedule_delayed_with_delay(id, val.resize(w), skew);

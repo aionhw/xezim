@@ -180,3 +180,56 @@ fn c14_clocking_blocks() {
         &[],
     );
 }
+
+// §14.3, §14.4: an edge output skew drives on that edge of the clock after the
+// clocking event.
+#[test]
+fn c14_4_clocking_edge_output_skew() {
+    check(
+        "c14_edge_skew",
+        include_str!("sv/c14_edge_skew.sv"),
+        "c14e",
+        Order::Exact,
+        &[
+            "T|edge|t=14000 u=0 d=0",
+            "T|edge|t=18000 u=0 d=1",
+            "T|edge|uz rose t=20000",
+            "T|edge|t=21000 u=1 d=1",
+        ],
+        &[],
+    );
+}
+
+// §14.16: drives at, after `##1`, and between clocking events through a
+// negedge skew.
+#[test]
+fn c14_16_clocking_negedge_skew_timing() {
+    check(
+        "c14_negedge_timing",
+        include_str!("sv/c14_negedge_timing.sv"),
+        "c14nt",
+        Order::Multiset,
+        &["T|chg|t=20000 u=1", "T|chg|t=30000 w=1", "T|chg|t=30000 v=1"],
+        &[],
+    );
+}
+
+// §14.16 / §14.16.2: a between-event drive and the next event's drive mature
+// together and the last one wins.
+#[test]
+fn c14_16_2_clocking_offedge_negedge_last_wins() {
+    check(
+        "c14_offedge_negedge",
+        include_str!("sv/c14_offedge_negedge.sv"),
+        "c14on",
+        Order::Exact,
+        &[
+            "T|pos|t=5000 branch=0",
+            "T|pos|t=15000 branch=0",
+            "T|chg|t=20000 branch=0",
+            "T|pos|t=25000 branch=0",
+            "T|pos|t=35000 branch=0",
+        ],
+        &[],
+    );
+}
