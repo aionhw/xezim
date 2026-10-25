@@ -51,6 +51,8 @@ mod fwrite_mcd_fd;
 mod hierarchical_string_method;
 #[path = "strings/interface_event_and_submodule_string.rs"]
 mod interface_event_and_submodule_string;
+#[path = "strings/issue548_unescaped_percent.rs"]
+mod issue548_unescaped_percent;
 #[path = "strings/local_string_array_init.rs"]
 mod local_string_array_init;
 #[path = "strings/local_string_dynamic.rs"]

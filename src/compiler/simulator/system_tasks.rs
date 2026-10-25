@@ -2503,10 +2503,33 @@ impl Simulator {
                         format!("{}{}", " ".repeat(pad), core)
                     }
                 };
+                let push_raw_spec = |out: &mut String, spec: Option<char>| {
+                    out.push('%');
+                    if left_align {
+                        out.push('-');
+                    }
+                    if plus_sign {
+                        out.push('+');
+                    }
+                    out.push_str(&width_str);
+                    if let Some(p) = precision {
+                        use std::fmt::Write as _;
+                        let _ = write!(out, ".{}", p);
+                    }
+                    if let Some(s) = spec {
+                        out.push(s);
+                    }
+                };
                 if let Some(&spec) = chars.peek() {
                     chars.next();
                     match spec {
-                        '%' => result.push('%'),
+                        '%' => {
+                            if left_align || plus_sign || has_width || precision.is_some() {
+                                push_raw_spec(&mut result, Some('%'));
+                            } else {
+                                result.push('%');
+                            }
+                        }
                         't' | 'T' => {
                             if ai < args.len() {
                                 // The argument carries a time in the scope's
@@ -3277,24 +3300,17 @@ impl Simulator {
                                         result.push_str(&field(s, 0));
                                     }
                                     _ => {
-                                        result.push('%');
-                                        if left_align {
-                                            result.push('-');
-                                        }
-                                        if plus_sign {
-                                            result.push('+');
-                                        }
-                                        result.push_str(&width_str);
-                                        if let Some(p) = precision {
-                                            result.push_str(&format!(".{}", p));
-                                        }
-                                        result.push(spec);
+                                        push_raw_spec(&mut result, Some(spec));
                                         ai -= 1;
                                     }
                                 }
+                            } else {
+                                push_raw_spec(&mut result, Some(spec));
                             }
                         }
                     }
+                } else {
+                    push_raw_spec(&mut result, None);
                 }
             } else if c == '\\' {
                 if let Some(&e) = chars.peek() {
