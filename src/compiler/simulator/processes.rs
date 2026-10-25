@@ -584,6 +584,7 @@ impl Simulator {
                 }
                 self.time = nt;
                 publish_sim_time(nt);
+                self.refresh_edge_skip_after_t0();
                 if let Some(sink) = self.stdout_sink.as_mut() {
                     sink.flush_if_stale();
                 }

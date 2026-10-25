@@ -3113,6 +3113,24 @@ impl TimingWheel {
         out
     }
 
+    /// Every pending (pid, absolute time, continuation) in the wheel and
+    /// overflow, in no particular order. Read-only; used once at event-loop
+    /// start by the event-edge writer census, never on the hot path.
+    fn for_each_pending<'a>(&'a self, mut f: impl FnMut(usize, u64, &'a ProcCont)) {
+        let cur_slot = Self::slot(self.current_time);
+        for (s, slot) in self.wheel.iter().enumerate() {
+            let delta = ((s + WHEEL_SIZE - cur_slot) % WHEEL_SIZE) as u64;
+            for (p, c) in slot {
+                f(*p, self.current_time + delta, c);
+            }
+        }
+        for (t, list) in &self.overflow {
+            for (p, c) in list {
+                f(*p, *t, c);
+            }
+        }
+    }
+
     fn pending_stmts_for(&self, pid: usize) -> Option<&ProcCont> {
         if !self.has_pid(pid) {
             return None;
@@ -8958,6 +8976,11 @@ pub struct Simulator {
     edge_block_snap_flat: Vec<(u64, u64)>,
     edge_block_off: Vec<u32>,
     edge_block_snap_valid: Vec<bool>,
+    /// Set when the event-edge writer census left out process writes made
+    /// at time 0 (see `foreign_procedural_writes`): the first time advance
+    /// then invalidates every edge-block snapshot once, so a block that
+    /// fired at time 0 before such a write runs again on its next event.
+    edge_skip_t0_refresh: bool,
     // Blocks whose inputs change on nearly every fire temporarily use epochs
     // to bypass the redundant snapshot compare. Epochs may only force an
     // execution; every skip is still verified against the value snapshot.

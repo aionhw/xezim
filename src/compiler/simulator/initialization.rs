@@ -4510,6 +4510,7 @@ impl Simulator {
             edge_block_snap_flat: Vec::new(),
             edge_block_off: Vec::new(),
             edge_block_snap_valid: Vec::new(),
+            edge_skip_t0_refresh: false,
             edge_block_change_streak: Vec::new(),
             edge_block_skip_streak: Vec::new(),
             event_heal: 16,

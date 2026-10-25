@@ -1226,6 +1226,314 @@ impl Simulator {
         }
     }
 
+    /// Signal ids, and dense array element ranges `(first_id, len)`, that
+    /// procedural code OUTSIDE the edge blocks and the settle entries can
+    /// write: the processes still queued at event-loop start (initial
+    /// blocks, always blocks run as processes, static initializers),
+    /// process FSMs, program blocks, class methods, and the module tasks
+    /// and functions those call by statement. Names resolve scope-first,
+    /// then as written; a name that resolves nowhere is not something an
+    /// edge block writes either.
+    ///
+    /// A task called only from edge blocks is part of those blocks (their
+    /// compiled code carries its writes), so it is not walked unless a
+    /// process calls it. The leading statements of a time-0 process that
+    /// cannot suspend or defer (`initial begin q = 0; mem[i] = 0; ... end`)
+    /// run before time advances; their writes are left out and instead
+    /// `edge_skip_t0_refresh` is set so the first time advance invalidates
+    /// every snapshot once (`refresh_edge_skip_after_t0`).
+    pub(super) fn foreign_procedural_writes(
+        &mut self,
+        top_prefix: &str,
+    ) -> (HashSet<usize>, HashSet<(usize, usize)>) {
+        use super::bytecode::{ArrayOperand, Insn};
+        type Out = (HashSet<usize>, HashSet<(usize, usize)>);
+        let mut out: Out = (HashSet::default(), HashSet::default());
+        let note = |name: &str, scope: &str, out: &mut Out| {
+            let scoped = (!scope.is_empty()).then(|| format!("{}.{}", scope, name));
+            for cand in scoped.as_deref().into_iter().chain(std::iter::once(name)) {
+                let dense = self.array_first_id.get(cand).or_else(|| {
+                    self.array_first_id
+                        .get(format!("{}{}", top_prefix, cand).as_str())
+                });
+                if let Some(&(first, lo, hi)) = dense {
+                    let len = ((hi - lo).max(0) as usize).saturating_add(1);
+                    out.1.insert((first, len));
+                } else if let Some(&(lo, hi, _)) = self.module.arrays.get(cand) {
+                    for i in lo..=hi {
+                        if let Some(id) =
+                            self.resolve_read_name(&format!("{}[{}]", cand, i), top_prefix)
+                        {
+                            out.0.insert(id);
+                        }
+                    }
+                } else if let Some(id) = self.resolve_read_name(cand, top_prefix) {
+                    out.0.insert(id);
+                }
+            }
+        };
+        // Statement-position task/function calls: (raw dotted name, scope).
+        let mut calls: Vec<(String, String)> = Vec::new();
+        let note_stmt = |stmt: &Statement, scope: &str, out: &mut Out, calls: &mut Vec<_>| {
+            for name in super::elaborate::stmt_write_targets(stmt).1 {
+                note(&name, scope, out);
+            }
+            Self::collect_stmt_call_names(stmt, &mut |raw| {
+                calls.push((raw.to_string(), scope.to_string()))
+            });
+        };
+        let mut t0_prefix_skipped = false;
+        let now = self.time;
+        let mut queued: Vec<(usize, u64, &ProcCont)> = Vec::new();
+        self.event_queue
+            .for_each_pending(|pid, t, c| queued.push((pid, t, c)));
+        for (pid, t, cont) in queued {
+            let scope = self
+                .process_scope_hint
+                .get(&pid)
+                .map(String::as_str)
+                .unwrap_or("");
+            let mut in_prefix = t == 0 && now == 0;
+            let mut frame = Some(cont);
+            while let Some(c) = frame {
+                for st in c.stmts.iter() {
+                    if in_prefix && self.stmt_is_instant(st) {
+                        t0_prefix_skipped = true;
+                        continue;
+                    }
+                    in_prefix = false;
+                    note_stmt(st, scope, &mut out, &mut calls);
+                }
+                frame = c.next.as_deref();
+            }
+        }
+        for (stmts, scope) in &self.pending_reactive {
+            for st in stmts {
+                note_stmt(st, scope, &mut out, &mut calls);
+            }
+        }
+        for fsm in self.proc_fsm.values() {
+            for insn in &fsm.compiled.instructions {
+                match insn {
+                    Insn::BlockingAssign(id, ..)
+                    | Insn::BlockingAssignString(id, _)
+                    | Insn::BlockingAssignRange(id, ..)
+                    | Insn::BlockingAssignRangeDyn(id, ..)
+                    | Insn::BlockingAssignBitDyn(id, ..)
+                    | Insn::NbaAssign(id, ..)
+                    | Insn::NbaAssignConst(id, ..)
+                    | Insn::NbaAssignRange(id, ..)
+                    | Insn::NbaAssignRangeDyn(id, ..)
+                    | Insn::NbaAssignBitDyn(id, ..)
+                    | Insn::NbaAssignArrayRead(id, ..) => {
+                        out.0.insert(*id as usize);
+                    }
+                    Insn::NbaAssignArray(arr, ..)
+                    | Insn::NbaAssignArrayRange(arr, ..)
+                    | Insn::BlockingAssignArray(arr, ..)
+                    | Insn::BlockingAssignArrayRange(arr, ..) => match &**arr {
+                        ArrayOperand::Dense {
+                            first_id, lo, hi, ..
+                        } => {
+                            let len = ((*hi - *lo).max(0) as usize).saturating_add(1);
+                            out.1.insert((*first_id, len));
+                        }
+                        ArrayOperand::Named(name) => note(name, &fsm.scope, &mut out),
+                    },
+                    Insn::StmtFallback(payload) => {
+                        note_stmt(&payload.0, &fsm.scope, &mut out, &mut calls)
+                    }
+                    Insn::CallFreeFunction(_, name, ..) => {
+                        calls.push((name.0.to_string(), fsm.scope.clone()))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Class methods run only from processes (or other methods).
+        {
+            use crate::ast::decl::ClassMethodKind as CMK;
+            for c in self.module.classes.values() {
+                for m in c.methods.values() {
+                    let items = match &m.kind {
+                        CMK::Function(f) | CMK::Extern(f) | CMK::PureVirtual(f) => &f.items,
+                        CMK::Task(t) => &t.items,
+                    };
+                    for st in items {
+                        note_stmt(st, "", &mut out, &mut calls);
+                    }
+                }
+            }
+        }
+        // Module tasks/functions reachable from the code above, matched the
+        // way `stmt_calls_blocking_task` resolves a callee (scoped, as
+        // written, scoped leaf) plus any `*.leaf` key, an over-approximation.
+        let mut walked: HashSet<String> = HashSet::default();
+        while let Some((raw, scope)) = calls.pop() {
+            let leaf = raw.rsplit('.').next().unwrap_or(&raw).to_string();
+            let mut keys: Vec<String> = Vec::new();
+            for cand in [
+                (!scope.is_empty()).then(|| format!("{}.{}", scope, raw)),
+                Some(raw.clone()),
+                (!scope.is_empty()).then(|| format!("{}.{}", scope, leaf)),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if self.module.tasks.contains_key(cand.as_str())
+                    || self.module.functions.contains_key(cand.as_str())
+                {
+                    keys.push(cand);
+                }
+            }
+            let dotted = format!(".{}", leaf);
+            keys.extend(
+                self.module
+                    .tasks
+                    .keys()
+                    .chain(self.module.functions.keys())
+                    .filter(|k| k.ends_with(dotted.as_str()))
+                    .map(|k| k.to_string()),
+            );
+            for key in keys {
+                if !walked.insert(key.clone()) {
+                    continue;
+                }
+                let body_scope = key.rsplit_once('.').map_or("", |(s, _)| s).to_string();
+                let items = self
+                    .module
+                    .tasks
+                    .get(key.as_str())
+                    .map(|t| &t.items)
+                    .or_else(|| self.module.functions.get(key.as_str()).map(|f| &f.items));
+                for st in items.into_iter().flatten() {
+                    note_stmt(st, &body_scope, &mut out, &mut calls);
+                }
+            }
+        }
+        if t0_prefix_skipped {
+            self.edge_skip_t0_refresh = true;
+        }
+        out
+    }
+
+    /// A statement that runs to completion in the instant it starts, writing
+    /// nothing later: assignments without intra-assignment timing, system
+    /// task calls, declarations, and control flow made only of those. Any
+    /// timing control, wait, fork, event trigger or user subroutine call
+    /// disqualifies it (a callee may suspend).
+    fn stmt_is_instant(&self, stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::Null | StatementKind::VarDecl { .. } => true,
+            StatementKind::BlockingAssign { rvalue, .. } => !Self::intra_timing_suspends(rvalue),
+            StatementKind::NonblockingAssign { delay, rvalue, .. } => {
+                delay.is_none() && !Self::intra_timing_suspends(rvalue)
+            }
+            StatementKind::Expr(e) => matches!(e.kind, ExprKind::SystemCall { .. }),
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.stmt_is_instant(then_stmt)
+                    && else_stmt.as_ref().is_none_or(|e| self.stmt_is_instant(e))
+            }
+            StatementKind::Case { items, .. } => {
+                items.iter().all(|it| self.stmt_is_instant(&it.stmt))
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Foreach { body, .. } => self.stmt_is_instant(body),
+            StatementKind::SeqBlock { stmts, .. } => stmts.iter().all(|s| self.stmt_is_instant(s)),
+            _ => false,
+        }
+    }
+
+    /// Calls in statement position (`t(x);`, `t;`, `obj.m();`), reported as
+    /// the dotted callee name, through every nested statement.
+    fn collect_stmt_call_names(stmt: &Statement, f: &mut dyn FnMut(&str)) {
+        let callee_name = |e: &Expression| -> Option<String> {
+            let target = match &e.kind {
+                ExprKind::Call { func, .. } => &**func,
+                _ => e,
+            };
+            match &target.kind {
+                ExprKind::Ident(h) => Some(
+                    h.path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                ),
+                ExprKind::MemberAccess { member, .. } => Some(member.name.clone()),
+                _ => None,
+            }
+        };
+        match &stmt.kind {
+            StatementKind::Expr(e) => {
+                if let Some(n) = callee_name(e) {
+                    f(&n);
+                }
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::collect_stmt_call_names(then_stmt, f);
+                if let Some(e) = else_stmt {
+                    Self::collect_stmt_call_names(e, f);
+                }
+            }
+            StatementKind::Case { items, .. } => {
+                for it in items {
+                    Self::collect_stmt_call_names(&it.stmt, f);
+                }
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::ForeverTail { body }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::ForeachTail { body, .. } => Self::collect_stmt_call_names(body, f),
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                for st in stmts {
+                    Self::collect_stmt_call_names(st, f);
+                }
+            }
+            StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+                Self::collect_stmt_call_names(stmt, f)
+            }
+            StatementKind::RandCase { items } => {
+                for (_, st) in items {
+                    Self::collect_stmt_call_names(st, f);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// One-shot follow-up to the time-0 writes `foreign_procedural_writes`
+    /// left out of the writer census: on the first time advance, make every
+    /// gateable edge block run on its next event (the same invalidation a
+    /// `release` performs). One branch per time advance otherwise.
+    #[inline]
+    pub(super) fn refresh_edge_skip_after_t0(&mut self) {
+        if self.edge_skip_t0_refresh {
+            self.edge_skip_t0_refresh = false;
+            self.edge_block_snap_valid
+                .iter_mut()
+                .for_each(|v| *v = false);
+            self.edge_block_armed
+                .iter_mut()
+                .for_each(|v| *v |= EDGE_ARMED);
+        }
+    }
+
     pub(super) fn build_event_measure_state(&mut self) {
         use super::bytecode::Insn;
         let nb = self.compiled_edge_blocks.len();
@@ -1374,6 +1682,22 @@ impl Simulator {
                 bump(&mut writer_counts, id);
             }
         }
+        // §9.2.2/§10.4.1: a PROCESS writing a block's output breaks the same
+        // invariant. `always @(a) ext = 1;` with a testbench `ext = 0;`
+        // between events reads no data input, so every later event of `a`
+        // was skipped as "unchanged" and `ext` stayed 0; a flop whose `q` a
+        // testbench overwrote kept the overwritten value across its next
+        // clock edge. Count those writers like any other driver.
+        let (foreign_ids, foreign_arrays) = self.foreign_procedural_writes(&top_prefix);
+        for &id in &foreign_ids {
+            bump(&mut writer_counts, id);
+        }
+        for &(first, len) in &foreign_arrays {
+            let end = first.saturating_add(len).min(writer_counts.len());
+            for c in &mut writer_counts[first.min(end)..end] {
+                *c = c.saturating_add(1);
+            }
+        }
         // Who else claims the bits of a multiply driven signal. Only those
         // signals can conflict, so a design where every register has one
         // driver — the ordinary case — builds an empty index.
@@ -1386,12 +1710,16 @@ impl Simulator {
             }
         }
         // A settle-region writer drives the whole signal and is never one of
-        // the edge blocks, so it conflicts with every span of it.
-        for entry in &self.comb_entries {
-            for &id in &entry.cold.write_signal_ids {
-                if let Some(v) = spans_by_sig.get_mut(&id) {
-                    v.push((usize::MAX, 0, whole_hi(&self.signal_widths, id)));
-                }
+        // the edge blocks, so it conflicts with every span of it. So does a
+        // process writer (its names carry no slice).
+        for &id in self
+            .comb_entries
+            .iter()
+            .flat_map(|e| e.cold.write_signal_ids.iter())
+            .chain(foreign_ids.iter())
+        {
+            if let Some(v) = spans_by_sig.get_mut(&id) {
+                v.push((usize::MAX, 0, whole_hi(&self.signal_widths, id)));
             }
         }
         // A whole-array claim covers every element id in its range; it is
@@ -1407,6 +1735,11 @@ impl Simulator {
                 v.iter()
                     .map(move |&(first, len)| (bj, first, first.saturating_add(len)))
             })
+            .chain(
+                foreign_arrays
+                    .iter()
+                    .map(|&(first, len)| (usize::MAX, first, first.saturating_add(len))),
+            )
             .collect();
         let mut data_reads: Vec<Vec<u32>> = vec![Vec::new(); nb];
         let mut data_metas: Vec<Vec<(u16, u16)>> = vec![Vec::new(); nb];

@@ -271,6 +271,8 @@ mod comb_self_member_sensitivity;
 mod delay_always_compound_body;
 #[path = "scheduling/delayed_write_pending_semantics.rs"]
 mod delayed_write_pending_semantics;
+#[path = "scheduling/edge_skip_process_writer.rs"]
+mod edge_skip_process_writer;
 #[path = "scheduling/edge_skip_shared_output.rs"]
 mod edge_skip_shared_output;
 #[path = "scheduling/finish_with_live_fork_child.rs"]

@@ -4812,6 +4812,7 @@ impl Simulator {
                         if self.time < target {
                             self.time = target;
                             publish_sim_time(target);
+                            self.refresh_edge_skip_after_t0();
                         }
                         // Full active→inactive→NBA traversal at the new
                         // time, per LRM §4.4: a delayed update or clocked

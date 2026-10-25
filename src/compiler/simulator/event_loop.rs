@@ -541,6 +541,7 @@ impl Simulator {
         // and the dump.
         self.time = ft;
         publish_sim_time(ft);
+        self.refresh_edge_skip_after_t0();
         self.stall_iters = 0;
         self.stall_time = ft;
         self.stall_pid_hits.clear();
@@ -2261,6 +2262,7 @@ impl Simulator {
                 self.dump_slot_end();
                 self.time = next_time;
                 publish_sim_time(next_time);
+                self.refresh_edge_skip_after_t0();
                 // Lines printed near the end of a burst stay buffered until the
                 // next line; release them once they are stale (core #49).
                 if let Some(sink) = self.stdout_sink.as_mut() {
