@@ -253,6 +253,8 @@ mod stmt_local_scoped_decls;
 mod streaming_and_typedef_array_width;
 #[path = "types/struct_copy_and_queue_ops.rs"]
 mod struct_copy_and_queue_ops;
+#[path = "types/struct_dynamic_member_element_copy.rs"]
+mod struct_dynamic_member_element_copy;
 #[path = "types/struct_member_array_of_structs_copy.rs"]
 mod struct_member_array_of_structs_copy;
 #[path = "types/struct_named_patterns.rs"]

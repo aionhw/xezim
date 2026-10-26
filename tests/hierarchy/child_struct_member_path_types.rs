@@ -45,3 +45,49 @@ module top; sub dut(); endmodule
         "{got:?}"
     );
 }
+
+#[test]
+fn colliding_queue_and_fixed_members_three_levels_deep() {
+    let got = output(
+        r#"
+module sub;
+  typedef struct { int k; byte unsigned d[$]; shortint x[2]; } lv0;
+  typedef struct { lv0 a; lv0 b; int d[$]; } lv1;
+  typedef struct { int k; lv1 d[]; lv0 x[2]; } lv2;
+  typedef struct { lv2 d[$]; int x; } lv3;
+  lv3 top3;
+  lv2 m2;
+  initial begin
+    lv1 e;
+    lv2 f;
+    e.a.d.push_back(8'h7); e.a.d.push_back(8'h8);
+    e.b.d.push_back(8'h9);
+    e.d.push_back(100);
+    e.a.x[1] = 5;
+    f.d = new[1];
+    f.d[0] = e;
+    f.x[1].d.push_back(8'h4);
+    f.x[0].x[0] = 3;
+    top3.d.push_back(f);
+    m2 = f;
+    m2.d[0].a.d.push_back(8'h1);
+    $display("T|e %p", e);
+    $display("T|top3 %p", top3);
+    $display("T|m2 %p", m2);
+    $display("T|sz %0d %0d %0d %0d", top3.d[0].d[0].a.d.size(), m2.d[0].a.d.size(), top3.d[0].x[1].d.size(), m2.d[0].d.size());
+  end
+endmodule
+module top; sub dut(); endmodule
+"#,
+    );
+    assert_eq!(
+        got,
+        [
+            "e '{a:'{k:0, d:'{7, 8}, x:'{0, 5}}, b:'{k:0, d:'{9}, x:'{0, 0}}, d:'{100}}",
+            "top3 '{d:'{'{k:0, d:'{'{a:'{k:0, d:'{7, 8}, x:'{0, 5}}, b:'{k:0, d:'{9}, x:'{0, 0}}, d:'{100}}}, x:'{'{k:0, d:'{}, x:'{3, 0}}, '{k:0, d:'{4}, x:'{0, 0}}}}}, x:0}",
+            "m2 '{k:0, d:'{'{a:'{k:0, d:'{7, 8, 1}, x:'{0, 5}}, b:'{k:0, d:'{9}, x:'{0, 0}}, d:'{100}}}, x:'{'{k:0, d:'{}, x:'{3, 0}}, '{k:0, d:'{4}, x:'{0, 0}}}}",
+            "sz 2 3 1 1",
+        ],
+        "{got:?}"
+    );
+}

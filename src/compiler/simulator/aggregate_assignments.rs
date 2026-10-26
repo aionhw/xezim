@@ -1702,10 +1702,16 @@ impl Simulator {
                         continue;
                     }
                     let n = self.get_queue_size(&sname);
+                    // An element that is an unpacked STRUCT is its member
+                    // leaves (and its own dynamic members), not a cell:
+                    // copying only `d[j]` left a nested `d[j].q` empty.
+                    let elem_su = self.unpacked_struct_of(&m.data_type);
                     for j in 0..n {
-                        if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", sname, j))
-                        {
-                            self.set_signal_value_by_name(&format!("{}[{}]", d, j), v);
+                        let (dj, sj) = (format!("{}[{}]", d, j), format!("{}[{}]", sname, j));
+                        if let Some(inner) = &elem_su {
+                            self.copy_unpacked_struct(&dj, &sj, inner);
+                        } else if let Some(v) = self.get_signal_value_by_name(&sj) {
+                            self.set_signal_value_by_name(&dj, v);
                         }
                     }
                     self.set_queue_size(&d, n);
