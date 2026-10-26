@@ -616,6 +616,26 @@ pub(crate) struct Csp {
     /// The problem is the size phase's relaxation: an item it cannot model
     /// is dropped rather than making the solve inapplicable.
     size_phase: bool,
+    /// `(x & M) == C` judged by the evaluator because `M` or `C` reads
+    /// other variables (`csp_note_mask`): once those are fixed, `x` is drawn
+    /// with the masked bits already equal to `C`'s.
+    masks: Vec<MaskHint>,
+}
+
+/// See `Csp::masks`.
+#[derive(Clone, Debug)]
+struct MaskHint {
+    /// The variable `x` names, and the bits (lsb, width) of it that `x` is.
+    var: usize,
+    lo: u32,
+    w: u32,
+    mask: Expression,
+    want: Expression,
+    /// The variables `mask` and `want` read, and a source carrying the
+    /// foreach bindings to evaluate them under.
+    deps: Vec<usize>,
+    src: usize,
+    guards: Vec<Node>,
 }
 
 /// One modular reduction of a relation being translated (see
@@ -2340,6 +2360,7 @@ impl Simulator {
             carry_base: None,
             sizes: HashMap::default(),
             size_phase: false,
+            masks: Vec::new(),
         };
         let dom_of = |w: u32, s: bool, members: &Option<Vec<u64>>| -> Dom {
             match members {
@@ -2560,6 +2581,7 @@ impl Simulator {
             carry_base: None,
             sizes: HashMap::default(),
             size_phase: false,
+            masks: Vec::new(),
         };
         let enum_dom = |me: &Self, tn: &str| -> Option<Dom> {
             let members = me.module.enum_members.get(tn)?;
@@ -2759,6 +2781,7 @@ impl Simulator {
         csp.carries.clear();
         csp.carry_accs.clear();
         csp.wraps.clear();
+        csp.masks.clear();
         match csp.carry_base {
             Some(b) => {
                 csp.vars.truncate(b);
@@ -3264,6 +3287,9 @@ impl Simulator {
                     return x;
                 }
             }
+        }
+        if let Some(x) = self.csp_mask_draw(csp, st, v) {
+            return x;
         }
         // A size bounded only below stays near that bound (see `SIZE_OPEN`).
         if st.bounds(v).1 == SIZE_TOP && csp.sizes.values().any(|&sv| sv == v) {
@@ -7011,6 +7037,8 @@ impl Simulator {
             {
                 return Some(n);
             }
+            self.csp_note_mask(csp, whole, left, right, env);
+            self.csp_note_mask(csp, whole, right, left, env);
         }
         let (Some(a), Some(b)) = (self.csp_ae(csp, left, env), self.csp_ae(csp, right, env)) else {
             return fallback(self, csp);
@@ -10360,6 +10388,134 @@ impl Simulator {
             return Some(Self::csp_and(nodes));
         }
         None
+    }
+
+    /// `(x & M) == C` where `M` or `C` reads other variables, such as
+    /// `(addr & ((1 << m) - 1)) == ((1 << m) - 1)`: the evaluator judges it
+    /// once `x` is fixed, and a uniform `x` meets `k` pinned bits one time in
+    /// 2**k. Noted in `Csp::masks` so the value of `x` is drawn with those
+    /// bits set (`csp_mask_draw`).
+    fn csp_note_mask(
+        &mut self,
+        csp: &mut Csp,
+        whole: &Expression,
+        masked: &Expression,
+        other: &Expression,
+        env: &Env,
+    ) {
+        let ExprKind::Binary {
+            op: BinaryOp::BitAnd,
+            left,
+            right,
+        } = &Self::unparen(masked).kind
+        else {
+            return;
+        };
+        for (x, m) in [(left, right), (right, left)] {
+            let mut konst = |me: &mut Self, y: &Expression| -> Option<i64> {
+                if !me.csp_free(csp, y, env) {
+                    return None;
+                }
+                me.csp_const(y, env)?.to_i64()
+            };
+            let Some((var, lo, w, _)) = self.csp_slice_base_k(csp, x, &mut konst) else {
+                continue;
+            };
+            let mut deps = Vec::new();
+            if !self.csp_refs(csp, m, env, &mut deps) || !self.csp_refs(csp, other, env, &mut deps) {
+                return;
+            }
+            deps.sort_unstable();
+            deps.dedup();
+            let base_of = |d: usize| csp.aux_base.get(&d).map_or(d, |b| b.0);
+            if deps.is_empty()
+                || deps.iter().any(|&d| base_of(d) == var)
+                || csp.vars[var].signed
+                || csp.vars[var].width > 64
+            {
+                return;
+            }
+            let src = self.csp_src(csp, SrcItem::Expr(whole.clone()), env, deps.clone());
+            csp.masks.push(MaskHint {
+                var,
+                lo,
+                w,
+                mask: (**m).clone(),
+                want: other.clone(),
+                deps,
+                src,
+                guards: env.guards.clone(),
+            });
+            return;
+        }
+    }
+
+    /// A value of `v` drawn uniformly from its domain with the bits that the
+    /// `Csp::masks` in force pin set to their values. In force: every guard
+    /// holds and `M` and `C` are fixed. None when no mask is in force or no
+    /// draw lands in the domain.
+    fn csp_mask_draw(&mut self, csp: &Csp, st: &St, v: usize) -> Option<i128> {
+        let (base, off, width) = csp
+            .aux_base
+            .get(&v)
+            .copied()
+            .unwrap_or((v, 0, csp.vars[v].width));
+        if csp.masks.is_empty() || width > 64 || csp.vars[v].signed {
+            return None;
+        }
+        let ones = |w: u32| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let (mut pin, mut val) = (0u64, 0u64);
+        for h in csp.masks.iter().filter(|h| h.var == base) {
+            if !st.all_fixed(&h.deps)
+                || !h
+                    .guards
+                    .iter()
+                    .all(|g| self.csp_status(csp, g, st) == Some(true))
+            {
+                continue;
+            }
+            let m = self.csp_eval_in(csp, st, h.src, &h.mask).to_u64()? & ones(h.w);
+            let c = self.csp_eval_in(csp, st, h.src, &h.want).to_u64()?;
+            if c & !m != 0 {
+                return None;
+            }
+            let (m, c) = (m.checked_shl(h.lo)?, c.checked_shl(h.lo)?);
+            let (m, c) = ((m >> off) & ones(width), (c >> off) & ones(width));
+            if (val ^ c) & pin & m != 0 {
+                return None;
+            }
+            pin |= m;
+            val = (val & !m) | (c & m);
+        }
+        if pin == 0 {
+            return None;
+        }
+        let size = dom_size(&st.d[v]);
+        for _ in 0..16 {
+            let k = self.cur_rng().gen_range(0..size);
+            let u = dom_nth(&st.d[v], k);
+            let x = ((u as u64 & !pin) | val) as i128;
+            if dom_has(&st.d[v], x) {
+                return Some(x);
+            }
+        }
+        None
+    }
+
+    /// The value of `e` (a part of source `src`'s constraint) with the fixed
+    /// variables written and the source's foreach indices bound.
+    fn csp_eval_in(&mut self, csp: &Csp, st: &St, src: usize, e: &Expression) -> Value {
+        let s = &csp.srcs[src];
+        for &v in &s.deps {
+            if let Some(x) = st.fixed(v) {
+                self.csp_write(csp, v, x);
+            }
+        }
+        let frame = self.csp_frame(&s.binds);
+        self.push_local_frame(frame);
+        let v = self.eval_expr(e);
+        self.pop_local_frame();
+        v
     }
 
     /// A select or field of a split scalar as its solver variable.

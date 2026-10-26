@@ -438,6 +438,8 @@ mod randomize_wide_sets;
 mod randomize_wide_open;
 #[path = "classes/randomize_shift_mask_wide_peer.rs"]
 mod randomize_shift_mask_wide_peer;
+#[path = "classes/rand_masked_eq_variable_mask.rs"]
+mod rand_masked_eq_variable_mask;
 #[path = "classes/randomize_inside_range.rs"]
 mod randomize_inside_range;
 #[path = "classes/rand_inline_bitand_bool.rs"]
