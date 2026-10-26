@@ -162,8 +162,12 @@ VHDL keeps its own simulation cycle inside each instantiated entity. A
 change of an SV input runs the VHDL cycles of that time at once, the way
 xezim settles SV combinational logic, so an SV check one step after the
 stimulus sees the VHDL outputs settled (a process that waits resumes from
-the kernel instead). Each SV instance of a VHDL entity is a separate
-elaboration: signals and shared variables of packages are per instance.
+the kernel instead). Clocked VHDL logic behaves like an SV flip-flop: once
+a process that tests `'event` (`rising_edge`, `falling_edge`) has run, the
+next VHDL cycle waits for SV's NBA region, so SV and VHDL registers on one
+clock edge sample each other's values from before the edge. Each SV
+instance of a VHDL entity is a separate elaboration: signals and shared
+variables of packages are per instance.
 
 ## Not supported yet
 
@@ -202,9 +206,10 @@ vendored) runs with `scripts/ivtest_vhdl.py <ivtest dir> <xezim>`.
 
 The NEORV32 RISC-V processor's testbench (`sim/neorv32_tb.vhd`, not
 vendored) elaborates and runs; its start-up messages and the instruction
-trace logs of its first microsecond equal GHDL's. Compiling the generated
-design takes most of a run, and the simulation is far slower than GHDL's,
-so longer comparisons wait for the native intrinsics of the next phase.
+trace logs of its first microsecond equal GHDL's. Compiling takes about
+11 s; the simulation is far slower than GHDL's because the generated
+subprograms (composite parameters and results, the kernel's module state)
+run on xezim's interpreter, so longer comparisons wait for the next phase.
 
 GHDL 4.1's mcode backend cannot run a sequential null assignment
 (`s <= null;` in a process stops with an internal error), so null

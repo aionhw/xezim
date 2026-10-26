@@ -1,0 +1,8 @@
+20 q=1 dec=14 svq=0 svc=9 seen=8
+30 q=2 dec=13 svq=1 svc=10 seen=9
+40 q=3 dec=12 svq=2 svc=11 seen=10
+50 q=4 dec=11 svq=3 svc=12 seen=11
+60 q=5 dec=10 svq=4 svc=13 seen=12
+70 q=6 dec=9 svq=5 svc=14 seen=13
+80 q=7 dec=8 svq=6 svc=15 seen=14
+90 q=8 dec=7 svq=7 svc=0 seen=15

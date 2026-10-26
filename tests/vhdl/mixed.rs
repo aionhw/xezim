@@ -63,3 +63,9 @@ fn mixed_vhdl_top() {
 fn mixed_sandwich() {
     check("mixed_sandwich");
 }
+
+/// VHDL and SV registers on one clock edge sample each other's old values.
+#[test]
+fn mixed_clocked() {
+    check("mixed_clocked");
+}
