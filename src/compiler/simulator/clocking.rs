@@ -90,13 +90,15 @@ impl Simulator {
     }
 
     /// §14.3: an output with an edge skew is driven on that edge of the
-    /// block's clock. Apply, in issue order, the drives of `cb` waiting for
-    /// this transition, so the last one wins (§14.16.2).
+    /// block's clock. Of the drives of `cb` waiting for this transition, only
+    /// the last one issued on each output is applied (§14.16.2), so an earlier
+    /// value never reaches the net.
     fn mature_edge_skew_drives(&mut self, cb: &str, rising: bool) {
         let Some(pend) = self.clocking_edge_out_pending.remove(cb) else {
             return;
         };
         let mut keep = Vec::new();
+        let mut due: Vec<(String, Value, u64)> = Vec::new();
         for (net, val, edge, delay) in pend {
             let hit = match edge {
                 EdgeKind::Posedge => rising,
@@ -107,6 +109,10 @@ impl Simulator {
                 keep.push((net, val, edge, delay));
                 continue;
             }
+            due.retain(|(n, _, _)| *n != net);
+            due.push((net, val, delay));
+        }
+        for (net, val, delay) in due {
             if delay > 0
                 && let Some(&id) = self.signal_name_to_id.get(net.as_str())
             {
@@ -291,7 +297,10 @@ impl Simulator {
                             continue;
                         }
                     }
-                    // §14.4 output skew for drives maturing at THIS edge.
+                    // §14.4 output skew for drives maturing at THIS edge. A
+                    // `#0` drive on the plain net is scheduled like one made at
+                    // this event so a later drive in the same time step replaces
+                    // it (§14.16.2).
                     let skew = self.clocking_net_out_skew(&cb, &sig).unwrap_or(dskew);
                     if let Some(t) = target {
                         if skew > 0 {
@@ -301,12 +310,10 @@ impl Simulator {
                         }
                         continue;
                     }
-                    if skew > 0 {
-                        if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
-                            let w = self.signal_widths[id];
-                            self.schedule_delayed_with_delay(id, val.resize(w), skew);
-                            continue;
-                        }
+                    if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
+                        let w = self.signal_widths[id];
+                        self.schedule_delayed_with_delay(id, val.resize(w), skew);
+                        continue;
                     }
                     let lval = Expression::new(
                         ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {

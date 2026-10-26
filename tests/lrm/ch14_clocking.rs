@@ -226,10 +226,24 @@ fn c14_16_2_clocking_offedge_negedge_last_wins() {
         &[
             "T|pos|t=5000 branch=0",
             "T|pos|t=15000 branch=0",
-            "T|chg|t=20000 branch=0",
             "T|pos|t=25000 branch=0",
             "T|pos|t=35000 branch=0",
         ],
+        &[],
+    );
+}
+
+// §14.16.2: of two drives maturing together, only the last reaches the
+// output, so a 1-then-0 pair never wakes the output's waiters. Held,
+// `##1`-matured and `#0`-skew drives alike.
+#[test]
+fn c14_16_2_clocking_last_wins_no_glitch() {
+    check(
+        "c14_lastwins_glitch",
+        include_str!("sv/c14_lastwins_glitch.sv"),
+        "c14lg",
+        Order::Multiset,
+        &["T|end a=0 b=0 c=0 d=0"],
         &[],
     );
 }
