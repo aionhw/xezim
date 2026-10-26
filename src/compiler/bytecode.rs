@@ -2016,6 +2016,17 @@ pub struct BytecodeCompiler<'a> {
     /// runs on the AST path, worked. Detected here so the statement bails to
     /// that AST path instead.
     assoc_arrays: Option<&'a HashMap<String, bool>>,
+    /// §7.2: signal ids of module variables whose declared type is an
+    /// UNPACKED struct kept member-wise (one leaf signal per member, see
+    /// `Simulator::spreads_member_wise`). The whole-struct signal under the
+    /// variable's own name is a placeholder nothing maintains: a member
+    /// write lands in `s.m`, and the AST interpreter copies, spreads and
+    /// renders such a variable leaf by leaf. A compiled load or store of the
+    /// placeholder therefore moves stale bits (`pv = q;` in an `always`
+    /// block left every member of `pv` at zero while the same statement in
+    /// an `initial` block copied all three); such accesses bail to the
+    /// interpreter instead.
+    member_wise_struct_ids: Option<&'a HashSet<usize>>,
     /// Declared packed dimensions (outermost first) per signal, from the
     /// elaborated model. Needed because a packed element's LSB offset is
     /// `(idx - low_bound) * elem_w` for a DESCENDING range — the plain
@@ -2203,6 +2214,7 @@ impl<'a> BytecodeCompiler<'a> {
             packed_elem_widths: None,
             assoc_elem_widths: None,
             assoc_arrays: None,
+            member_wise_struct_ids: None,
             packed_full_dims: None,
             loop_break_patches: Vec::new(),
             loop_continue_patches: Vec::new(),
@@ -2582,6 +2594,19 @@ impl<'a> BytecodeCompiler<'a> {
     ) {
         self.dynamic_arrays = Some(dyn_arrays);
         self.queue_vars = Some(queues);
+    }
+
+    pub fn set_member_wise_struct_ids(&mut self, ids: &'a HashSet<usize>) {
+        self.member_wise_struct_ids = Some(ids);
+    }
+
+    /// Is signal `id` the unmaintained whole-struct placeholder of a
+    /// member-wise unpacked struct variable (see `member_wise_struct_ids`)?
+    /// A whole-value access to one must take the interpreter's leaf-wise
+    /// paths (§7.2, §10.4).
+    fn is_member_wise_struct_id(&self, id: usize) -> bool {
+        self.member_wise_struct_ids
+            .is_some_and(|ids| ids.contains(&id))
     }
 
     /// Must an element STORE to this name avoid the dense array fast path?
@@ -13428,6 +13453,16 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 }
                 if let Some(id) = self.lookup_signal_id(hier) {
+                    // §7.2: the placeholder of a member-wise unpacked struct
+                    // holds no value — its members live in `s.m` leaves — so
+                    // a whole read of one (`pv = q;`, `q == pv`) must take the
+                    // interpreter's STATEMENT paths, which copy and compare
+                    // leaf by leaf. Not an expression fallback: evaluating
+                    // the bare name alone yields the stale placeholder.
+                    if self.is_member_wise_struct_id(id) {
+                        self.bail("ident_unpacked_struct");
+                        return None;
+                    }
                     // An integral parameter's signal-table twin: fold to the
                     // parameter's constant instead of a runtime load. On
                     // c906 `tmp_out[n*DATA +: DATA]` read DATA as a signal,
@@ -16376,6 +16411,12 @@ impl<'a> BytecodeCompiler<'a> {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 if let Some(id) = self.lookup_signal_id(hier) {
+                    // §7.2/§10.4: same as the blocking arm — the whole
+                    // member-wise struct is committed leaf by leaf.
+                    if self.is_member_wise_struct_id(id) {
+                        self.bail("nba_target_unpacked_struct");
+                        return false;
+                    }
                     self.emit(Insn::NbaAssign(as_sig_id(id), val_reg, width));
                     true
                 } else if let Some((base_id, off, mw)) = self.packed_struct_member_target(hier) {
@@ -17565,6 +17606,13 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 }
                 if let Some(id) = self.lookup_signal_id(hier) {
+                    // §7.2/§10.4: a whole member-wise struct target
+                    // (`pv = q;`) is copied leaf by leaf by the interpreter;
+                    // a store into the placeholder reaches no member.
+                    if self.is_member_wise_struct_id(id) {
+                        self.bail("blocking_target_unpacked_struct");
+                        return false;
+                    }
                     if self.signal_is_string_name(hier) {
                         self.emit(Insn::BlockingAssignString(as_sig_id(id), val_reg));
                     } else {

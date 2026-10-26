@@ -840,6 +840,9 @@ impl Simulator {
         }
         self.in_const_param_eval = false;
         mark_compile_phase("runtime metadata and static init", &mut compile_phase_start);
+        // The whole-struct placeholders the bytecode compiler must not touch
+        // (§7.2); classification below is the first point a block compiles.
+        self.init_member_wise_struct_ids();
         self.classify_always_blocks();
         mark_compile_phase("classify always blocks", &mut compile_phase_start);
         // Signal table is final here: optionally widen the NBA index's dense

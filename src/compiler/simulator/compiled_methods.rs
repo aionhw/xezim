@@ -2121,6 +2121,7 @@ impl Simulator {
                     );
                     compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                     compiler.set_typedef_types(&self.module.typedef_types);
+                    compiler.set_member_wise_struct_ids(&self.member_wise_struct_ids);
                     compiler.set_method_formal_types(ports);
                     if let CompiledBodyKind::Function(function) = kind {
                         compiler.set_method_return_type(&function.return_type);

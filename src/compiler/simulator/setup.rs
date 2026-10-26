@@ -2093,6 +2093,25 @@ impl Simulator {
                 // `collect` leaves room for four terms; an edge block keeps
                 // its list for the whole run and nearly always has one.
                 let mut resolved = resolved;
+                // §9.4.2: `@(q)` on a member-wise unpacked struct names the
+                // placeholder, which no member write changes; the block
+                // wakes on any change of a member, so watch the leaves too.
+                if !self.member_wise_struct_leaves.is_empty() {
+                    let mut extra: Vec<SensitivityId> = Vec::new();
+                    for s in resolved.iter().filter(|s| s.edge == EdgeKind::AnyEdge) {
+                        if let Some(leaves) = self.member_wise_struct_leaves.get(&s.signal_id) {
+                            extra.extend(leaves.iter().map(|&leaf| SensitivityId {
+                                signal_id: leaf,
+                                ..s.clone()
+                            }));
+                        }
+                    }
+                    for s in extra {
+                        if !resolved.iter().any(|r| r.signal_id == s.signal_id) {
+                            resolved.push(s);
+                        }
+                    }
+                }
                 resolved.shrink_to_fit();
                 // A lazy block keeps its source, not the tree: the body is
                 // rebuilt (and usually dropped again) when it compiles.
@@ -2291,6 +2310,7 @@ impl Simulator {
         compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
         compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
         compiler.set_typedef_types(&self.module.typedef_types);
+        compiler.set_member_wise_struct_ids(&self.member_wise_struct_ids);
         compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
         compiler.set_assoc_arrays(&self.module.associative_arrays);
         compiler.set_packed_full_dims(&self.module.packed_full_dims);

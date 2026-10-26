@@ -11,6 +11,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "types/always_whole_unpacked_struct_copy.rs"]
+mod always_whole_unpacked_struct_copy;
 #[path = "types/ansi_port_name_with_unpacked_dim.rs"]
 mod ansi_port_name_with_unpacked_dim;
 #[path = "types/array_element_declared_signedness.rs"]

@@ -285,6 +285,86 @@ impl Simulator {
         }
     }
 
+    /// §7.2: collect the signal ids of the whole-struct placeholders of the
+    /// member-wise unpacked-struct variables, for the bytecode compiler
+    /// (`BytecodeCompiler::set_member_wise_struct_ids`). Such a variable is
+    /// stored one leaf signal per member; the signal under its own name is
+    /// never written or read by the interpreter, which copies (`pv = q;`),
+    /// spreads and renders it leaf by leaf (`struct_copy_target`,
+    /// `copy_unpacked_struct`). A compiled block that loaded or stored the
+    /// placeholder instead moved nothing: `pv = q;` in an `always` block left
+    /// `pv` at zero while the same statement in an `initial` block worked.
+    /// The same exclusions as `struct_copy_target`: a collection of structs
+    /// is not a struct, and only a name whose leaves exist is a member-wise
+    /// variable (`var_decl_types` is keyed by bare name, shared by every
+    /// scope). Runs before the always blocks are classified, the first point
+    /// a block is compiled.
+    pub(super) fn init_member_wise_struct_ids(&mut self) {
+        let mut ids: HashSet<usize> = HashSet::default();
+        let mut holders: HashMap<&str, usize> = HashMap::default();
+        for (name, dt) in self.module.var_decl_types.iter() {
+            let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
+                continue;
+            };
+            if self.module.dynamic_arrays.contains(name)
+                || self.module.arrays.contains_key(name)
+                || self.module.associative_arrays.contains_key(name)
+            {
+                continue;
+            }
+            if let DataType::Struct(su) = self.resolve_dt_ref(dt)
+                && Self::spreads_member_wise(su)
+                && self.struct_storage_exists(name, su)
+            {
+                ids.insert(id);
+                holders.insert(name.as_str(), id);
+            }
+        }
+        // §9.4.2: the leaves under each placeholder, for the sensitivity
+        // of a block that names the whole variable. Every signal whose name
+        // extends a holder's name by `.…` is one of its leaves (a nested
+        // member's leaves included).
+        let mut leaves: HashMap<usize, Vec<usize>> = HashMap::default();
+        if !holders.is_empty() {
+            for (name, &id) in self.signal_name_to_id.iter() {
+                let name: &str = name;
+                let mut end = name.len();
+                while let Some(dot) = name[..end].rfind('.') {
+                    if let Some(&holder) = holders.get(&name[..dot]) {
+                        leaves.entry(holder).or_default().push(id);
+                    }
+                    end = dot;
+                }
+            }
+            for v in leaves.values_mut() {
+                v.sort_unstable();
+            }
+        }
+        self.member_wise_struct_ids = ids;
+        self.member_wise_struct_leaves = leaves;
+    }
+
+    /// §9.4.2: a dependency on a member-wise struct placeholder becomes a
+    /// dependency on each of its leaves (`always @(q)` wakes when any member
+    /// of `q` changes; the placeholder itself never does). `ids` keeps the
+    /// placeholder and gains the leaves not already present.
+    pub(super) fn expand_member_wise_struct_ids(&self, ids: &mut Vec<usize>) {
+        if self.member_wise_struct_leaves.is_empty() {
+            return;
+        }
+        let mut extra: Vec<usize> = Vec::new();
+        for id in ids.iter() {
+            if let Some(leaves) = self.member_wise_struct_leaves.get(id) {
+                extra.extend(leaves.iter().copied());
+            }
+        }
+        for id in extra {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+
     /// §7.4.1/§11.5.1: the declared (left, right) range of the class
     /// property a select's base names (`a`, `this.a`, `obj.a`) when that
     /// range is ascending or does not end at bit 0 (`logic [31:8] a`):

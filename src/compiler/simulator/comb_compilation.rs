@@ -687,6 +687,7 @@ impl Simulator {
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                 compiler.set_typedef_types(&self.module.typedef_types);
+                compiler.set_member_wise_struct_ids(&self.member_wise_struct_ids);
                 compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -770,6 +771,7 @@ impl Simulator {
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                 compiler.set_typedef_types(&self.module.typedef_types);
+                compiler.set_member_wise_struct_ids(&self.member_wise_struct_ids);
                 compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -1483,6 +1485,11 @@ impl Simulator {
                         }
                     }
                 }
+                // §9.4.2: a whole member-wise struct read (`cv = q;`) resolved
+                // to the placeholder `q`, which no member write ever changes
+                // — depend on its leaves, or the block fires once at time 0
+                // and never again.
+                self.expand_member_wise_struct_ids(&mut rids);
                 if std::env::var("XEZIM_DUMP_COMB_SENS").is_ok() {
                     let names: Vec<&str> = rids.iter().map(|&id| self.name_for_id(id)).collect();
                     eprintln!(
@@ -1530,6 +1537,7 @@ impl Simulator {
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                     compiler.set_typedef_types(&self.module.typedef_types);
+                    compiler.set_member_wise_struct_ids(&self.member_wise_struct_ids);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                     compiler.set_packed_full_dims(&self.module.packed_full_dims);

@@ -6744,6 +6744,18 @@ pub struct Simulator {
     /// Names of the static unpacked-struct properties any class declares
     /// (gates the `static_struct_holders` lookups).
     static_struct_names: HashSet<String>,
+    /// §7.2: signal ids of the whole-struct placeholders of member-wise
+    /// unpacked-struct variables (`init_member_wise_struct_ids`). The
+    /// bytecode compiler refuses a whole-value load or store of one — the
+    /// placeholder is never maintained; the members live in `s.m` leaves —
+    /// so such statements take the interpreter's leaf-wise paths.
+    member_wise_struct_ids: HashSet<usize>,
+    /// §9.4.2: the leaf signal ids under each such placeholder (`q` ->
+    /// `q.f0`, `q.f1`, `q.n.lo`, ...). A block sensitive to the whole
+    /// variable (`always @(q)`, `always_comb cv = q;`) depends on these — a
+    /// member write never changes the placeholder, so a dependency on it
+    /// alone never re-fired the block.
+    member_wise_struct_leaves: HashMap<usize, Vec<usize>>,
     /// `module.packed_struct_fields` without the `mixed_packed_vars` entries;
     /// `None` when there are none.
     bc_packed_fields: Option<HashMap<String, Vec<(String, u32, u32)>>>,
