@@ -312,3 +312,6 @@ mod dyn_collection_compiled_read_live;
 mod dyn_row_array_queries;
 #[path = "collections/dyn_row_sized_new_copy.rs"]
 mod dyn_row_sized_new_copy;
+
+#[path = "collections/package_array_operand_in_method.rs"]
+mod package_array_operand_in_method;
