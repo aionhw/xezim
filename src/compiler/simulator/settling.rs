@@ -1358,6 +1358,7 @@ impl Simulator {
         // re-trigger through the ordinary dependency walk below.
         if !self.proc_settle_defer && !self.deferred_proc_entries.is_empty() {
             let deferred = std::mem::take(&mut self.deferred_proc_entries);
+            self.defer_epoch += 1;
             for sid in deferred {
                 let sid = sid as usize;
                 if sid < self.dirty_signals.len() && !self.dirty_signals[sid] {
@@ -1912,6 +1913,11 @@ impl Simulator {
                             | CombItem::FusedAndFanout { .. }
                     )
                 {
+                    let cold = &entries[eidx].cold;
+                    if cold.deferred_epoch.get() == self.defer_epoch {
+                        continue;
+                    }
+                    cold.deferred_epoch.set(self.defer_epoch);
                     self.deferred_proc_entries.extend(
                         entries[eidx]
                             .cold

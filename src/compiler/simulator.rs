@@ -1570,6 +1570,10 @@ struct CombEntryCold {
     /// compiled form counts with an `Insn::CovHit`). Never cached.
     #[serde(skip)]
     cov: Option<u32>,
+    /// The `defer_epoch` in which a deferring settle last recorded this
+    /// entry's reads in `deferred_proc_entries`: recorded once per epoch.
+    #[serde(skip)]
+    deferred_epoch: std::cell::Cell<u64>,
 }
 
 impl CombEntryCold {
@@ -6786,6 +6790,11 @@ pub struct Simulator {
     /// normal dependency machinery — entry INDICES would go stale across the
     /// topo reorder / lazy materialization of `comb_entries`.
     deferred_proc_entries: Vec<u32>,
+    /// Advances each time a full settle drains `deferred_proc_entries`; an
+    /// entry deferred again in the same epoch adds nothing (a process
+    /// writing many signals a wide entry reads would otherwise append the
+    /// entry's reads once per write).
+    defer_epoch: u64,
     /// Maximum snapshot→apply_nba→settle→check_edges rounds per event-loop
     /// iter (see drain_edge_cascade). Cached at sim init; override via
     /// XEZIM_CASCADE_LIMIT env var.

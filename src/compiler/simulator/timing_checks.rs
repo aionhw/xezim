@@ -474,6 +474,7 @@ impl Simulator {
                     write_signal_ids: Vec::new(),
                     span: crate::ast::Span::dummy(),
                     cov: None,
+                    deferred_epoch: Default::default(),
                 }),
                 has_unresolved_reads: false,
                 defer_at_time0: false,

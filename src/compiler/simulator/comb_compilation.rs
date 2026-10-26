@@ -1192,6 +1192,7 @@ impl Simulator {
                     write_signal_ids: wids,
                     span: ca_span,
                     cov,
+                    deferred_epoch: Default::default(),
                 }),
                 has_unresolved_reads,
                 defer_at_time0: false,
@@ -1570,6 +1571,7 @@ impl Simulator {
                         write_signal_ids: wids,
                         span: ab.stmt.span,
                         cov: None,
+                        deferred_epoch: Default::default(),
                     }),
                     has_unresolved_reads,
                     // §9.2.2.1: a level-only `always @(sensitivity)` block
