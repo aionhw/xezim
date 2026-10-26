@@ -1128,6 +1128,18 @@ impl Simulator {
             out
         };
 
+        // An array of unpacked structs is solved through its member
+        // collections, never as one scalar or one struct.
+        let struct_coll_bases: HashSet<String> = rand_colls
+            .iter()
+            .filter(|c| c.member.is_some())
+            .filter_map(|c| c.prop.split_once('.').map(|(b, _)| b.to_string()))
+            .collect();
+        if !struct_coll_bases.is_empty() {
+            rand_props.retain(|(n, _)| !struct_coll_bases.contains(n));
+            prop_type_names.retain(|n, _| !struct_coll_bases.contains(n));
+        }
+
         // ---- IEEE 1800-2017 §18.4: classify the non-scalar rand properties ----
         // Object handles were already split out above (`rand_obj_props`).
         //

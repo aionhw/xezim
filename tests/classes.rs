@@ -732,6 +732,8 @@ mod implication_joint_distribution;
 mod interface_class_extends_type_param;
 #[path = "classes/issue_246_struct_member_randomize.rs"]
 mod issue_246_struct_member_randomize;
+#[path = "classes/rand_dyn_array_of_unpacked_structs.rs"]
+mod rand_dyn_array_of_unpacked_structs;
 #[path = "classes/issue_249_rand_mode_receiver.rs"]
 mod issue_249_rand_mode_receiver;
 #[path = "classes/rand_mode_element_769.rs"]
