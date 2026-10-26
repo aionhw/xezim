@@ -646,12 +646,32 @@ impl Simulator {
         // The root must be a plain Ident naming an associative array, or
         // (§7.4.5) a prefix of the chain names one: `v[0]["A"]` of
         // `int v[2][string][string]`, or `a[0].m["A"]` of a struct member.
-        let bh = if let ExprKind::Ident(bh) = &cur.kind {
-            bh
-        } else {
-            return self
-                .inner_assoc_compound_key(start, &rev, 1)
-                .map(|(_, k)| k);
+        let bh = match &cur.kind {
+            ExprKind::Ident(bh) => bh,
+            // `C::aq[k]` inside a class body parses as a member access on
+            // the class name.
+            ExprKind::MemberAccess { expr: base, .. }
+                if matches!(&base.kind, ExprKind::Ident(b)
+                    if b.path.len() == 1 && self.module.classes.contains_key(&b.path[0].name.name)) =>
+            {
+                let Some(bn) = self
+                    .expr_assoc_name(cur)
+                    .filter(|n| self.is_associative_array(n))
+                else {
+                    return None;
+                };
+                let mut name = bn.clone();
+                for idx in rev.iter().rev() {
+                    let kv = self.eval_expr(idx);
+                    name = format!("{}[{}]", name, self.assoc_key_str(&bn, &kv));
+                }
+                return Some(name);
+            }
+            _ => {
+                return self
+                    .inner_assoc_compound_key(start, &rev, 1)
+                    .map(|(_, k)| k);
+            }
         };
         let mut bn = self.resolve_hier_name(bh);
         if let Some(s) = self.instance_assoc_member(&bn) {
