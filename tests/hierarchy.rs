@@ -31,6 +31,8 @@ mod bind_through_nested_part_select;
 mod bind_upward_refs;
 #[path = "hierarchy/c910_scoped_cont_assign.rs"]
 mod c910_scoped_cont_assign;
+#[path = "hierarchy/child_array_direction_copies.rs"]
+mod child_array_direction_copies;
 #[path = "hierarchy/child_struct_member_path_types.rs"]
 mod child_struct_member_path_types;
 #[path = "hierarchy/class_method_hier_subroutine_calls.rs"]
