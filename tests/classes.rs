@@ -304,6 +304,8 @@ mod constraint_funcs_aggregates;
 mod constraint_inline_caller_scope;
 #[path = "classes/constraint_inline_enclosing_scope.rs"]
 mod constraint_inline_enclosing_scope;
+#[path = "classes/constraint_inline_caller_foreach.rs"]
+mod constraint_inline_caller_foreach;
 #[path = "classes/constraint_inside_rand_bound.rs"]
 mod constraint_inside_rand_bound;
 #[path = "classes/constraint_logical_or.rs"]

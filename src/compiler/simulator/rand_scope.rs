@@ -673,6 +673,7 @@ impl Simulator {
             return Bind::Object;
         }
         if self.local_stack.last().is_some_and(|f| f.contains_key(n))
+            || self.dyn_name_lookup_innermost(n).is_some()
             || self.class_chain_declares(cx.caller_class.as_deref(), n)
         {
             return Bind::Caller;
@@ -885,6 +886,12 @@ impl Simulator {
             ConstraintItem::Foreach {
                 array, vars, item, ..
             } => {
+                if let Some(iters) = self.unroll_caller_foreach(array, vars, item, cx, bound) {
+                    let mut block = ConstraintItem::Block(iters);
+                    self.freeze_item(&mut block, cx, bound);
+                    *it = block;
+                    return;
+                }
                 self.freeze_expr(array, cx, bound);
                 let depth = bound.len();
                 bound.extend(vars.iter().flatten().map(|v| v.name.clone()));
@@ -1566,11 +1573,77 @@ impl Simulator {
         } else {
             return None;
         };
+        Self::unroll_foreach_dims(&dims, vars, item)
+    }
+
+    /// §18.5.8.1/§18.7: `foreach (arr[vars]) item` whose array binds in the
+    /// scope of the randomize() call (`cfg.held` read from a method
+    /// of the calling class). The solve runs with `this` switched to the
+    /// object, where the caller's array no longer resolves, so the loop is
+    /// unrolled here over the array's current shape. None when the array is
+    /// not a caller-scope collection.
+    fn unroll_caller_foreach(
+        &mut self,
+        array: &Expression,
+        vars: &[Option<crate::ast::Identifier>],
+        item: &ConstraintItem,
+        cx: &CallerScope,
+        bound: &[String],
+    ) -> Option<Vec<ConstraintItem>> {
+        if vars.is_empty() || self.operand_bind(array, cx, bound) != Some(true) {
+            return None;
+        }
+        let dims = match self.foreach_check_operand_name(array) {
+            Some(name) if self.is_associative_array(&name) => return None,
+            Some(name) => self.foreach_check_dims(&name, vars.len()),
+            None => self.query_foreach_dims(array, vars.len())?,
+        };
+        Self::unroll_foreach_dims(&dims, vars, item)
+    }
+
+    /// §20.7: (low, high) of the first `nvars` unpacked dimensions of
+    /// `array`, read with the array query functions. Covers operands the
+    /// name-keyed stores do not (`cfg.grid` for a 2-D member of a handle).
+    fn query_foreach_dims(&mut self, array: &Expression, nvars: usize) -> Option<Vec<(i64, i64)>> {
+        let call = |name: &str, d: Option<usize>| {
+            let mut args = vec![array.clone()];
+            if let Some(d) = d {
+                args.push(Self::literal_of(&Value::from_u64(d as u64, 32), array.span));
+            }
+            Expression::new(
+                ExprKind::SystemCall {
+                    name: name.to_string(),
+                    args,
+                },
+                array.span,
+            )
+        };
+        let nd = self.eval_expr(&call("$unpacked_dimensions", None)).to_u64()? as usize;
+        if nd < nvars {
+            return None;
+        }
+        (1..=nvars)
+            .map(|d| {
+                let l = self.eval_expr(&call("$left", Some(d))).to_i64()?;
+                let r = self.eval_expr(&call("$right", Some(d))).to_i64()?;
+                Some((l.min(r), l.max(r)))
+            })
+            .collect()
+    }
+
+    /// The iterations of `foreach (...[vars]) item` over `dims`, each loop
+    /// variable replaced by its index literal. None above 4096 iterations or
+    /// when the dimensions do not match the loop variables.
+    fn unroll_foreach_dims(
+        dims: &[(i64, i64)],
+        vars: &[Option<crate::ast::Identifier>],
+        item: &ConstraintItem,
+    ) -> Option<Vec<ConstraintItem>> {
         if dims.len() != vars.iter().filter(|v| v.is_some()).count() && dims.len() != vars.len() {
             return None;
         }
         let mut total: u64 = 1;
-        for &(lo, hi) in &dims {
+        for &(lo, hi) in dims {
             if hi < lo {
                 return Some(Vec::new());
             }
