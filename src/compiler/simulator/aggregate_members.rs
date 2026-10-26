@@ -2832,13 +2832,18 @@ impl Simulator {
         }
         // The root's declared type; for an array root this is already the
         // ELEMENT type, so the root's own selects are consumed.
-        let root = segs[0].0.as_str();
-        let mut dt: DataType = match self.module.var_decl_types.get(root) {
-            Some(d) => d.clone(),
-            None => self.class_member_coll_type(root)?.clone(),
-        };
+        let (first, root) = Self::flat_path_root(&segs, |b| {
+            self.module.var_decl_types.contains_key(b) || self.class_member_coll_type(b).is_some()
+        })?;
         let last = segs.len() - 1;
-        for (j, (seg, nidx)) in segs.iter().enumerate().skip(1) {
+        if first == last {
+            return None;
+        }
+        let mut dt: DataType = match self.module.var_decl_types.get(root.as_str()) {
+            Some(d) => d.clone(),
+            None => self.class_member_coll_type(&root)?.clone(),
+        };
+        for (j, (seg, nidx)) in segs.iter().enumerate().skip(first + 1) {
             let su = self.unpacked_struct_of(&dt)?;
             let (mdt, dims) = Self::struct_member_decl(&su, seg)?;
             if j == last {

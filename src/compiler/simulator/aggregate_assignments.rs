@@ -3933,6 +3933,31 @@ impl Simulator {
         out
     }
 
+    /// The root variable of a split flat path: the SHORTEST unselected dotted
+    /// prefix `is_root` accepts, as (index of its last segment, name) — `s`
+    /// in `s.d[0].f0.d`, but `u.s` in an instance's `u.s.d[0].f0.d`. A
+    /// variable of an inlined child carries the instance prefix, so its first
+    /// segment alone (`u`) names nothing.
+    pub(super) fn flat_path_root(
+        segs: &[(String, usize)],
+        is_root: impl Fn(&str) -> bool,
+    ) -> Option<(usize, String)> {
+        let mut base = String::new();
+        for (i, (seg, idx)) in segs.iter().enumerate() {
+            if i > 0 {
+                base.push('.');
+            }
+            base.push_str(seg);
+            if is_root(&base) {
+                return Some((i, base));
+            }
+            if *idx > 0 {
+                return None;
+            }
+        }
+        None
+    }
+
     /// The base of a flat path `base[..][..]` that `split_flat_path` reads as
     /// ONE segment named by the text before the first `[`; None for any
     /// other shape (a `.` or other text outside the brackets).
@@ -3962,16 +3987,21 @@ impl Simulator {
     /// a member's dimensions for `s.mm`, the inner ones for `s.mm[1]` — so
     /// `%p`, `$bits` and pattern assignment see the whole sub-array.
     pub(super) fn flat_path_type(&self, flat: &str) -> Option<(DataType, Option<Vec<Vec<i64>>>)> {
-        // Without a select the first segment is the text before the first
-        // `.`; a base with no declared type answers None before any split.
-        if !flat.as_bytes().contains(&b'[') {
-            let base = flat.split('.').next().unwrap_or(flat);
-            if !self.module.var_decl_types.contains_key(base) {
-                return None;
-            }
+        // Without a select the base is a dotted prefix; a path none of whose
+        // prefixes has a declared type answers None before any split.
+        if !flat.as_bytes().contains(&b'[')
+            && !flat
+                .match_indices('.')
+                .map(|(i, _)| &flat[..i])
+                .chain(std::iter::once(flat))
+                .any(|p| self.module.var_decl_types.contains_key(p))
+        {
+            return None;
         }
         let segs = Self::split_flat_path(flat);
-        let (base, base_idx) = segs.first()?.clone();
+        let (first, base) =
+            Self::flat_path_root(&segs, |b| self.module.var_decl_types.contains_key(b))?;
+        let base_idx = segs[first].1;
         // For an array (or associative array) this is already the ELEMENT type.
         let mut dt = self.module.var_decl_types.get(&base)?.clone();
         let mut arr: Option<Vec<Vec<i64>>> =
@@ -3987,7 +4017,7 @@ impl Simulator {
                 })
             };
 
-        for (seg, nidx) in segs.iter().skip(1) {
+        for (seg, nidx) in segs.iter().skip(first + 1) {
             let DataType::Struct(su) = self.resolve_dt(&dt) else {
                 return None;
             };
@@ -4069,7 +4099,13 @@ impl Simulator {
             // instance-scoped `arr[2] = arr[0]` found no struct type and
             // copied a packed container nobody reads, leaving the members
             // x, while the same statement at top level resolved through
-            // `flat_path_type`.
+            // `flat_path_type`. Only a path that ENDS in that select: in
+            // `u.s.d[0].f0.d` the select is followed by members, so the
+            // container's element type is not the path's (it gave the byte
+            // array `f0.d` the element type of the outer `d`).
+            if !name.ends_with(']') {
+                return None;
+            }
             let base = name.rfind('[').map(|i| &name[..i])?;
             if base.is_empty() {
                 return None;
