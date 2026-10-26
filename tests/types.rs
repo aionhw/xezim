@@ -113,6 +113,8 @@ mod enum_signedness_and_pkg_scope;
 mod enum_typeparam_wrapper_from_name;
 #[path = "types/enum_xz_and_package_shapes.rs"]
 mod enum_xz_and_package_shapes;
+#[path = "types/formal_range_not_other_modules.rs"]
+mod formal_range_not_other_modules;
 #[path = "types/formal_type_metadata_and_typedef_packed_array.rs"]
 mod formal_type_metadata_and_typedef_packed_array;
 #[path = "types/forward_referenced_parameter.rs"]

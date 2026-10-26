@@ -2097,6 +2097,11 @@ impl Simulator {
                         self.module.packed_full_dims.remove(&d.name.name);
                     }
                 }
+                // §7.4.1: `logic [0:7] v;` indexes from its msb end, and a
+                // descending local must not inherit the ascending entry
+                // of a same-named signal elsewhere (see
+                // `note_ascending_formal`).
+                self.note_ascending_formal(&d.name.name);
             } else if d.dimensions.is_empty() {
                 // Packed multi-D local (`logic [1:0][3:0] m;`): record
                 // the per-element width so `m[i]` is an element slice,
@@ -2247,6 +2252,7 @@ impl Simulator {
                             .insert(d.name.name.clone(), names);
                     }
                 }
+                self.note_ascending_formal(&d.name.name);
             } else {
                 // §7.2.1/§7.4: an ARRAY local of a packed struct element
                 // (`s_t a [];` in a task or function) gets the element's

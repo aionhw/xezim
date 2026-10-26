@@ -1889,6 +1889,13 @@ pub struct BytecodeCompiler<'a> {
     /// entry (an unsupported type, a process-frame import) makes any fallback
     /// that names it refuse, so the enclosing unit is interpreted instead.
     local_kinds: HashMap<RegId, LocalKind>,
+    /// §7.4.1 / §13.4: the declared packed dimensions of a register-backed
+    /// local or formal, keyed by its register. A subroutine body is its own
+    /// scope, so a select of such a name takes the range of THIS declaration
+    /// — never the `packed_full_dims` entry of a same-named signal elsewhere
+    /// in the design (which `packed_full_dims_of` would otherwise find by
+    /// the bare leaf). No entry means no declared range (`[N-1:0]`).
+    local_var_dims: HashMap<RegId, Vec<(i64, i64)>>,
     /// Enclosing inlined task bodies declared in a DIFFERENT scope than the
     /// block being compiled. A fallback inside one would print the block's
     /// `%m` and use its timescale, so none is emitted there.
@@ -2168,6 +2175,7 @@ impl<'a> BytecodeCompiler<'a> {
             decl_local_regs: std::collections::HashSet::default(),
             process_local_names: HashSet::default(),
             local_kinds: HashMap::default(),
+            local_var_dims: HashMap::default(),
             inline_foreign: 0,
             reg_var_loop_depth: 0,
             allow_expr_fallback: false,
@@ -2719,13 +2727,24 @@ impl<'a> BytecodeCompiler<'a> {
             .and_then(|d| d.first().copied())
     }
 
-    /// Declared packed dimensions of `hier`: exact name, then the name under
-    /// the current instance scope, then — for a SINGLE-segment name only —
-    /// the bare leaf. A multi-segment name (a struct member, a hierarchical
-    /// reference) must never match an unrelated same-named declaration
-    /// elsewhere in the design (see `packed_elem_width_of`).
-    fn packed_full_dims_of(&self, hier: &HierarchicalIdentifier) -> Option<&'a Vec<(i64, i64)>> {
+    /// Declared packed dimensions of `hier`: a register-backed local or
+    /// formal has exactly its own declaration's (`local_var_dims`); a signal
+    /// is looked up by exact name, then the name under the current instance
+    /// scope, then — for a SINGLE-segment name only — the bare leaf. A
+    /// multi-segment name (a struct member, a hierarchical reference) must
+    /// never match an unrelated same-named declaration elsewhere in the
+    /// design (see `packed_elem_width_of`); nor may a local, whose bare name
+    /// the design-wide table knows nothing about — a `bit [22:0] a` formal
+    /// read the `[0:22]` of another module's `a` and its selects mirrored.
+    fn packed_full_dims_of(&self, hier: &HierarchicalIdentifier) -> Option<&Vec<(i64, i64)>> {
         let raw = Self::hier_raw_cow(hier);
+        // A process-frame import (`set_process_locals`) has an interpreter
+        // home, which registered its dims in the table under this name.
+        if let Some(&(reg, _)) = self.local_var_regs.get(raw.as_ref())
+            && !self.process_local_names.contains(raw.as_ref())
+        {
+            return self.local_var_dims.get(&reg);
+        }
         let m = self.packed_full_dims?;
         m.get(raw.as_ref())
             .or_else(|| {
@@ -3410,6 +3429,9 @@ impl<'a> BytecodeCompiler<'a> {
                 // signing before any wider use of the formal.
                 self.emit_local_fit(slot);
             }
+            if p.dimensions.is_empty() {
+                self.note_local_dims(slot, Self::port_effective_type(&fd.ports, i));
+            }
             binds.push((p.name.name.clone(), (slot, w)));
             if let Some(ew) = self.decl_elem_width_in(&p.data_type, Some(&name)) {
                 if ew > 0 && w > ew && w % ew == 0 {
@@ -3485,6 +3507,7 @@ impl<'a> BytecodeCompiler<'a> {
         if let Some(kind) = self.local_kind_of(&fd.return_type, Some(&name)) {
             self.local_kinds.insert(ret_slot, kind);
         }
+        self.note_local_dims(ret_slot, &fd.return_type);
         if let Some(pfx) = &qpfx {
             self.local_var_regs
                 .insert(format!("{}.{}", pfx, fd.name.name.name), (ret_slot, ret_w));
@@ -3654,6 +3677,7 @@ impl<'a> BytecodeCompiler<'a> {
                             self.local_kinds.insert(slot, k);
                             self.emit_local_fit(slot);
                         }
+                        self.note_local_dims(slot, data_type);
                         self.local_var_regs.insert(d.name.name.clone(), (slot, w));
                     }
                 }
@@ -3775,6 +3799,9 @@ impl<'a> BytecodeCompiler<'a> {
                 None => {
                     self.local_kinds.remove(&slot);
                 }
+            }
+            if p.dimensions.is_empty() {
+                self.note_local_dims(slot, eff_dt);
             }
             if matches!(p.direction, PortDirection::Output) {
                 if is_string {
@@ -4395,6 +4422,30 @@ impl<'a> BytecodeCompiler<'a> {
                 })
             }
             _ => None,
+        }
+    }
+
+    /// Record the declared packed dimensions of the register-backed local or
+    /// formal just bound to `slot` (see `local_var_dims`): a `[7:0]` leaves
+    /// physical and declared positions equal, an offset or ascending range
+    /// routes its selects the way the same declaration at module scope
+    /// would. Replaces whatever an earlier binding of the register left.
+    fn note_local_dims(&mut self, slot: RegId, dt: &crate::ast::types::DataType) {
+        // A typedef'd range resolves through the module's typedef table; an
+        // alias only an instance scope knows keeps no entry, as before.
+        let dims = self.params.and_then(|p| {
+            crate::compiler::elaborate::packed_full_dims_of(dt, p).or_else(|| {
+                self.typedef_types
+                    .and_then(|t| crate::compiler::elaborate::packed_full_dims_chained(dt, p, t))
+            })
+        });
+        match dims {
+            Some(d) => {
+                self.local_var_dims.insert(slot, d);
+            }
+            None => {
+                self.local_var_dims.remove(&slot);
+            }
         }
     }
 
@@ -7654,6 +7705,9 @@ impl<'a> BytecodeCompiler<'a> {
         // a typed local before: whoever binds a local here re-types it.
         if !self.local_kinds.is_empty() {
             self.local_kinds.remove(&r);
+        }
+        if !self.local_var_dims.is_empty() {
+            self.local_var_dims.remove(&r);
         }
         r
     }
@@ -11622,6 +11676,7 @@ impl<'a> BytecodeCompiler<'a> {
                             if let Some(k) = self.local_kind_of(data_type, None) {
                                 self.local_kinds.insert(slot, k);
                             }
+                            self.note_local_dims(slot, data_type);
                         }
                         self.local_var_regs
                             .insert(decl.name.name.clone(), (slot, w));
@@ -11671,6 +11726,7 @@ impl<'a> BytecodeCompiler<'a> {
                             self.local_kinds.remove(&slot);
                         }
                     }
+                    self.note_local_dims(slot, data_type);
                     match &decl.init {
                         Some(expr) => {
                             let Some(value) = self.compile_expr(expr, width) else {
@@ -19313,6 +19369,9 @@ impl<'a> BytecodeCompiler<'a> {
                         .filter(|&i| ports[i].dimensions.is_empty())
                         .map(|i| Self::port_effective_type(ports, i).clone())
                 });
+                if let Some(dt) = dt.as_ref() {
+                    self.note_local_dims(r, dt);
+                }
                 if let Some(kind) = dt.as_ref().and_then(|dt| {
                     let unpacked_alias = matches!(dt,
                         crate::ast::types::DataType::TypeReference { name, .. }

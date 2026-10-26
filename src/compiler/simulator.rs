@@ -4402,6 +4402,9 @@ struct FormalMetaParts {
     packed_fields: Option<Vec<(String, u32, u32)>>,
     packed_element_widths: Vec<(String, u32)>,
     packed_dimensions: Option<Vec<(i64, i64)>>,
+    /// §7.4.1: the `ascending_packed` entry — a plain vector declared
+    /// `[lo:hi]` with lo < hi indexes from its msb end.
+    ascending_range: Option<(i64, i64)>,
     class_type: Option<String>,
     typedef_type: Option<String>,
 }
@@ -4501,7 +4504,7 @@ impl MethodCallPlan {
 /// taken when that name's metadata is first written — up to then the tables
 /// hold the entry state for it, which is what an eager snapshot would have
 /// saved — and a name never written has nothing to restore. Every writer of
-/// the six tables calls `meta_note` first.
+/// the seven tables calls `meta_note` first.
 struct MetaFrame {
     plan: std::rc::Rc<MethodCallPlan>,
     /// Positions in `plan.meta_ks` already saved (all of them once `full`).

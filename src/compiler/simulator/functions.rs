@@ -1307,7 +1307,7 @@ impl Simulator {
         }
     }
 
-    /// Formal-metadata write barrier: called before any write to the six
+    /// Formal-metadata write barrier: called before any write to the seven
     /// tables `snapshot_formal_parts` reads, with the written key. Every open
     /// class-method save (see `MetaFrame`) that names the key's base and has
     /// no snapshot yet takes it now.
@@ -1408,6 +1408,7 @@ impl Simulator {
             packed_fields: self.module.packed_struct_fields.get(name).cloned(),
             packed_element_widths,
             packed_dimensions: self.module.packed_full_dims.get(name).cloned(),
+            ascending_range: self.module.ascending_packed.get(name).copied(),
             class_type: self.var_class_types.get(name).cloned(),
             typedef_type: self.var_typedef_types.get(name).cloned(),
         }
@@ -1419,8 +1420,46 @@ impl Simulator {
         self.module.packed_struct_fields.remove(name);
         self.clear_formal_elem_widths(name);
         self.module.packed_full_dims.remove(name);
+        self.module.ascending_packed.remove(name);
         self.var_class_types.remove(name);
         self.var_typedef_types.remove(name);
+    }
+
+    /// §7.4.1 / §13.4: a subroutine formal or local is a plain 1-D vector
+    /// with an ASCENDING range (`bit [0:7] b`) exactly when the
+    /// `packed_full_dims` just registered for it say so; record that in
+    /// `ascending_packed` under its bare name, the way the elaborator does
+    /// for a module-scope declaration, and drop any entry a same-named
+    /// signal of another scope left there. The bit- and part-select paths
+    /// consult that table first, so without this a formal `bit [22:0] a`
+    /// of module `m` indexed by the range of a `reg [0:22] a` declared in
+    /// module `test` (reading bit `22-i` for `a[i]`), and an ascending
+    /// formal indexed as if it were descending. The caller has noted
+    /// `name` for the metadata write barrier.
+    pub(super) fn note_ascending_formal(&mut self, name: &str) {
+        let asc = match self.module.packed_full_dims.get(name).map(|d| d.as_slice()) {
+            Some([(l, r)])
+                if l < r
+                    && !self.module.packed_signal_elem_widths.contains_key(name)
+                    && !self.module.packed_struct_fields.contains_key(name) =>
+            {
+                Some((*l, *r))
+            }
+            _ => None,
+        };
+        match asc {
+            Some(bounds) => match self.module.ascending_packed.get_mut(name) {
+                Some(slot) => *slot = bounds,
+                None => {
+                    self.module
+                        .ascending_packed
+                        .insert(name.to_string(), bounds);
+                }
+            },
+            None => {
+                self.module.ascending_packed.remove(name);
+            }
+        }
     }
 
     /// The `packed_signal_elem_widths` part of `clear_formal_metadata`.
@@ -1577,6 +1616,7 @@ impl Simulator {
                 packed_fields: self.module.packed_struct_fields.remove(name),
                 packed_element_widths,
                 packed_dimensions: self.module.packed_full_dims.remove(name),
+                ascending_range: self.module.ascending_packed.remove(name),
                 class_type: self.var_class_types.remove(name),
                 typedef_type: self.var_typedef_types.remove(name),
             },
@@ -1693,6 +1733,11 @@ impl Simulator {
             name,
             saved.packed_dimensions,
         );
+        put(
+            &mut self.module.ascending_packed,
+            name,
+            saved.ascending_range,
+        );
         put(&mut self.var_class_types, name, saved.class_type);
         put(&mut self.var_typedef_types, name, saved.typedef_type);
     }
@@ -1753,6 +1798,7 @@ impl Simulator {
             if let Some(fdims) = super::elaborate::packed_full_dims_of(dt, &self.module.parameters)
             {
                 self.module.packed_full_dims.insert(name.to_string(), fdims);
+                self.note_ascending_formal(name);
             }
             return;
         }
@@ -1813,6 +1859,7 @@ impl Simulator {
                     .insert(name.to_string(), fields);
             }
         }
+        self.note_ascending_formal(name);
     }
 
     fn apply_default_formal_outputs(&mut self, bindings: &[(String, Expression)]) {
