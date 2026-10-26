@@ -7168,6 +7168,10 @@ pub struct Simulator {
     /// Emitted at end-of-sim under `[COV] assertion summary` + (when
     /// `XEZIM_COV_DB` is set) the JSON coverage database file.
     assertion_stats: HashMap<usize, AssertionStat>,
+    /// Statement label of a labelled assertion site (`ap: assert property`,
+    /// §16.5, §16.14), keyed like `assertion_stats`. Filled once when the
+    /// site registers; read only by the coverage DB writer.
+    assertion_labels: HashMap<usize, String>,
     /// Code coverage sites and toggle state (`--code-coverage`); `None` when
     /// the run collects none. See `code_cov`.
     code_cov: Option<Box<code_cov::CodeCov>>,

@@ -4001,6 +4001,7 @@ impl Simulator {
             semaphores: HashMap::default(),
             cg_heap: vec![None],
             assertion_stats: HashMap::default(),
+            assertion_labels: HashMap::default(),
             code_cov: None,
             code_cov_hits: Vec::new(),
             code_cov_toggle_names,

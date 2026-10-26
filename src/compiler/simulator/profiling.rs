@@ -2808,7 +2808,14 @@ impl Simulator {
         json.push_str("  \"assertions\": [\n");
         let mut sites: Vec<_> = self.assertion_stats.iter().collect();
         sites.sort_by_key(|(k, _)| **k);
-        for (i, (_, st)) in sites.iter().enumerate() {
+        for (i, (key, st)) in sites.iter().enumerate() {
+            // §16.5 / §16.14: a labelled site carries its label; an
+            // unlabelled one has no `name` key.
+            let name = self
+                .assertion_labels
+                .get(*key)
+                .map(|l| format!("\"name\": \"{}\", ", json_escape(l)))
+                .unwrap_or_default();
             let kind = match st.kind {
                 0 => "assert",
                 1 => "assume",
@@ -2826,7 +2833,8 @@ impl Simulator {
                 None => (0, String::new()),
             };
             json.push_str(&format!(
-                "    {{{}\"span_start\": {}, \"kind\": \"{}\", \"pass\": {}, \"fail\": {}}}{}\n",
+                "    {{{}{}\"span_start\": {}, \"kind\": \"{}\", \"pass\": {}, \"fail\": {}}}{}\n",
+                name,
                 place,
                 off,
                 kind,

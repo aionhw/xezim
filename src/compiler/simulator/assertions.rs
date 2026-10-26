@@ -1801,9 +1801,15 @@ impl Simulator {
             Some(Edge::Negedge) => 1,
             _ => 2,
         };
+        let stat_key = Self::assert_stat_key(span_key, src);
+        if let Some(l) = &a.label {
+            self.assertion_labels
+                .entry(stat_key)
+                .or_insert_with(|| l.name.clone());
+        }
         self.sva_sites.push(SvaClockedSite {
             span_key,
-            stat_key: Self::assert_stat_key(span_key, src),
+            stat_key,
             stat_loc: (src, span_key),
             dedup_scope: self.current_scope.clone(),
             kind,

@@ -1,7 +1,8 @@
 //! The results file and exit status, end to end: assertion entries carry
 //! their file and line (they were keyed by byte offset alone, so two files'
 //! statements at the same offset merged into one entry), and an
-//! `illegal_bins` hit fails a `--error-exit` run.
+//! `illegal_bins` hit fails a `--error-exit` run, and a labelled assertion
+//! or cover site carries its label.
 use std::process::Command;
 
 fn xezim() -> String {
@@ -86,5 +87,61 @@ fn illegal_bin_hit_fails_error_exit() {
         text.contains("Illegal bin hit at value 3: cg.cp.bad"),
         "{text}"
     );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// §16.5 / §16.14: `c_hit: cover property (...)` names the site. The
+/// results file gives a labelled site's label as `name`, so a tool can match
+/// cover points to a verification plan; an unlabelled site has no `name`.
+#[test]
+fn labelled_assertion_entries_carry_name() {
+    let d = scratch("label");
+    let f = d.join("tb_cov.sv");
+    std::fs::write(
+        &f,
+        "module tb_cov;\n\
+         \x20 logic clk=0; always #5 clk=~clk;\n\
+         \x20 logic [1:0] s=0;\n\
+         \x20 always @(posedge clk) s <= s+1;\n\
+         \x20 c_hit: cover property (@(posedge clk) s==2);\n\
+         \x20 c_miss: cover property (@(posedge clk) s==7);\n\
+         \x20 a_lbl: assert property (@(posedge clk) s < 4);\n\
+         \x20 cover property (@(posedge clk) s==1);\n\
+         \x20 initial begin #60 $finish; end\n\
+         endmodule\n",
+    )
+    .unwrap();
+    let db = d.join("cov.json");
+    let out = Command::new(xezim())
+        .env("XEZIM_COV_DB", &db)
+        .arg(&f)
+        .output()
+        .expect("run xezim");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = std::fs::read_to_string(&db).expect("coverage file");
+    // Clock edges at 5..55 sample s = 0, 1, 2, 3, 0, 1. The span offset is
+    // not pinned: an entry is matched by what precedes and follows it.
+    let has = |name: &str, line: u32, kind: &str, pass: u32| {
+        let head = format!(
+            "{{{}\"file\": \"{}\", \"line\": {}, \"span_start\": ",
+            name,
+            f.display(),
+            line
+        );
+        let tail = format!("\"kind\": \"{}\", \"pass\": {}, \"fail\": 0}}", kind, pass);
+        json.lines()
+            .map(|l| l.trim().trim_end_matches(','))
+            .any(|l| l.starts_with(&head) && l.ends_with(&tail))
+    };
+    assert!(has("\"name\": \"c_hit\", ", 5, "cover", 1), "{json}");
+    assert!(has("\"name\": \"c_miss\", ", 6, "cover", 0), "{json}");
+    assert!(has("\"name\": \"a_lbl\", ", 7, "assert", 6), "{json}");
+    assert!(has("", 8, "cover", 2), "{json}");
+    assert_eq!(json.matches("\"name\": ").count(), 3, "{json}");
+    assert!(json.contains("\"assertion_sites\": 4"), "{json}");
     let _ = std::fs::remove_dir_all(&d);
 }
