@@ -1909,6 +1909,21 @@ impl Simulator {
             let key = self.formal_dyn_key(pname, queue_data_type);
             self.module.arrays.insert(key.clone(), (0, -1, 32));
             self.module.dynamic_arrays.insert(key.clone());
+            // §10.10: a queue or array operand of `{..}` contributes all of
+            // its elements (`{jal}`, `{q, X}`).
+            if matches!(arg.kind, ExprKind::Concatenation(_))
+                && !parts
+                    .iter()
+                    .any(|p| matches!(p.kind, ExprKind::AssignmentPattern(_)))
+            {
+                let vals = self.unpacked_concat_operand_values(parts);
+                let n = vals.len() as u64;
+                for (j, v) in vals.into_iter().enumerate() {
+                    self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
+                }
+                self.set_queue_size(&key, n);
+                return Some((key, String::new()));
+            }
             // An element that is itself a `'{..}` pattern (a dynamic array of
             // UNPACKED structs) is scattered member-wise, not evaluated.
             for (j, part) in parts.iter().enumerate() {
