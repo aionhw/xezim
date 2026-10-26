@@ -2304,6 +2304,36 @@ impl Simulator {
             }
             _ => return None,
         };
+        let descending = match dims.first() {
+            Some(UD::Range { left, right, .. }) => {
+                super::elaborate::const_eval_i64_with_params(left, params)
+                    > super::elaborate::const_eval_i64_with_params(right, params)
+            }
+            _ => false,
+        };
+        // §10.8 / §10.10: an input actual is an assignment-like context, so a
+        // concatenation passed to an unpacked array formal is an unpacked
+        // array concatenation. An array operand contributes all of its
+        // elements; there is no storage to copy back.
+        if let ExprKind::Concatenation(parts) = &Self::unparen(arg).kind {
+            if dims.len() != 1 {
+                return None;
+            }
+            let param = port.name.name.clone();
+            let w = super::elaborate::resolve_type_width(
+                &port.data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            )
+            .max(1);
+            let vals = self.unpacked_concat_operand_values(parts.iter().collect());
+            self.module.arrays.insert(param.clone(), (lo, hi, w));
+            for (j, v) in vals.into_iter().take((hi - lo + 1) as usize).enumerate() {
+                let idx = if descending { hi - j as i64 } else { lo + j as i64 };
+                self.set_signal_value_by_name(&format!("{}[{}]", param, idx), v.resize(w));
+            }
+            return Some((param, String::new(), lo, hi));
+        }
         // §13.5.3 / §10.9.1: an assignment-pattern actual (in practice a
         // formal's default, `byte v[2] = '{8'hA5, 8'h5A}`) has no storage to
         // copy from: register the formal and assign the pattern's items to
@@ -2321,13 +2351,6 @@ impl Simulator {
                 Some(&self.module.typedefs),
             )
             .max(1);
-            let descending = match dims.first() {
-                Some(UD::Range { left, right, .. }) => {
-                    super::elaborate::const_eval_i64_with_params(left, params)
-                        > super::elaborate::const_eval_i64_with_params(right, params)
-                }
-                _ => false,
-            };
             self.module.arrays.insert(param.clone(), (lo, hi, w));
             let ordered: Vec<Expression> =
                 self.pattern_ordered(items).into_iter().cloned().collect();
