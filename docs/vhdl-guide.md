@@ -34,6 +34,23 @@ SystemVerilog scheduler.
 `XEZIM_VHDL_DUMP=1` lists the design units and prints the generated
 SystemVerilog; `XEZIM_VHDL_DEBUG=1` explains rejected overloads.
 
+The generated code is shaped for the simulator's compiled tier. A
+one-dimensional array with static bounds of an enumeration element
+(`std_ulogic_vector`, `bit_vector`, `unsigned`) is a packed vector of a few
+bits per element; arrays with run-time bounds are structs of dynamic
+arrays, and values are converted where they cross. A subprogram on
+unconstrained arrays (`"+"` of numeric_std) is lowered once per static shape
+of its actuals, with its locals' bounds folded, so the copy takes and
+returns packed vectors. The hot subprograms of std_logic_1164 and
+numeric_std (logic operators, `+`, `-`, comparisons, TO_INTEGER,
+TO_UNSIGNED) compute natively on operands of '0' and '1' and call the IEEE
+body otherwise, so their warnings and results stay the IEEE source's. The
+simulation cycle itself (signal update, the resumption of the processes
+with a sensitivity list, the next cycle's time) runs in compiled `always`
+blocks; a kernel thread advances time and hands control to processes that
+wait. Zero-delay assignments keep a pending value instead of a queued
+transaction.
+
 ## Supported (so far)
 
 - Signals driven by parts from several processes (§14.7.2): elements and
@@ -206,10 +223,12 @@ vendored) runs with `scripts/ivtest_vhdl.py <ivtest dir> <xezim>`.
 
 The NEORV32 RISC-V processor's testbench (`sim/neorv32_tb.vhd`, not
 vendored) elaborates and runs; its start-up messages and the instruction
-trace logs of its first microsecond equal GHDL's. Compiling takes about
-11 s; the simulation is far slower than GHDL's because the generated
-subprograms (composite parameters and results, the kernel's module state)
-run on xezim's interpreter, so longer comparisons wait for the next phase.
+trace logs of its first microsecond equal GHDL's. Compiling the generated
+design takes about 25 s and a microsecond of simulation about 7 minutes
+(GHDL: seconds): the record signals assigned by parts and the calls into
+the IEEE bodies still go through the simulator's interpreter. A small
+clocked design with numeric_std arithmetic (a 16-bit counter, an
+accumulator, an LFSR; 20,000 cycles) runs in 4 s against GHDL's 0.3 s.
 
 GHDL 4.1's mcode backend cannot run a sequential null assignment
 (`s <= null;` in a process stops with an internal error), so null
