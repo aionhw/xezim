@@ -4093,6 +4093,19 @@ impl Simulator {
                 return;
             }
         }
+        // §10.10: an unpacked-array concatenation written to a queue or
+        // dynamic-array member through a handle (`cfg.r = {…}`,
+        // `s[i].q = {s[i].q, x}`). Inside a subroutine the target is a
+        // member chain, which the flat-name path below does not take.
+        if let ExprKind::MemberAccess { .. } = &lvalue.kind
+            && let ExprKind::Concatenation(_) = &rvalue.kind
+            && let Some(n) = self.expr_assoc_name(lvalue)
+            && self.class_queue_prop(&n)
+            && self.assign_whole_coll(&n, None, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
         if let ExprKind::Ident(lhier) = &lvalue.kind {
             let mut lname = if self.ident_shadowed_by_non_collection(lhier) {
                 std::borrow::Cow::Borrowed("")
