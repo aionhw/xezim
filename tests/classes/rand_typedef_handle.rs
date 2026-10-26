@@ -33,10 +33,12 @@ class cfg;
   rand inner_t p;
   rand plain q;
   rand plain_t r;
+  rand plain_t ra[2], rd[];
   function new();
     p = new;
     q = new;
     r = new;
+    rd = new[2]; foreach (ra[i]) begin ra[i] = new; rd[i] = new; end
   endfunction
 endclass
 
@@ -45,8 +47,8 @@ module t;
     cfg c = new;
     int ok;
     ok = c.randomize();
-    $display("ok=%0d ptag=%0d pn=%0d qtag=%0d qn=%0d rtag=%0d rn=%0d",
-      ok, c.p.tag, c.p.n, c.q.tag, c.q.n, c.r.tag, c.r.n);
+    $display("ok=%0d ptag=%0d pn=%0d qtag=%0d qn=%0d rtag=%0d rn=%0d a=%0d,%0d d=%0d,%0d,%0d",
+      ok, c.p.tag, c.p.n, c.q.tag, c.q.n, c.r.tag, c.r.n, c.ra[1].tag, c.ra[1].n, c.rd.size(), c.rd[1].tag, c.rd[1].n);
   end
 endmodule
 "#;
@@ -72,4 +74,8 @@ fn rand_typedef_handle_keeps_its_object() {
     assert_eq!(fields[5], "rtag=7", "{line}");
     let rn: i32 = fields[6].strip_prefix("rn=").unwrap().parse().unwrap_or(-1);
     assert!((4..=6).contains(&rn), "{line}");
+    for (f, p) in [(fields[7], "a=7,"), (fields[8], "d=2,7,")] {
+        let n: i32 = f.strip_prefix(p).and_then(|v| v.parse().ok()).unwrap_or(-1);
+        assert!((4..=6).contains(&n), "{line}");
+    }
 }
