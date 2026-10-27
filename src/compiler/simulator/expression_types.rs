@@ -168,6 +168,14 @@ impl Simulator {
                                 .any(|m| m.contains_key(&*name))
                         });
                 if in_any_frame {
+                    // The frame overlay first: `var_class_types` is one flat
+                    // map, so while another process is suspended in a
+                    // subroutine with a same-named formal (UVM's
+                    // `finish_item(uvm_sequence_item item)`), it holds THAT
+                    // formal's class, not this frame's.
+                    if let Some(t) = self.local_class_type_of(&name) {
+                        return Some(t);
+                    }
                     // A class-typed procedural local declared in this scope.
                     if let Some(t) = self.var_class_types.get(&*name) {
                         return Some(t.clone());

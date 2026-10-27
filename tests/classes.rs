@@ -852,3 +852,5 @@ mod method_array_write_shadows_module_array;
 
 #[path = "classes/constructor_default_args_2023.rs"]
 mod constructor_default_args_2023;
+#[path = "classes/shadowed_member_same_named_formal.rs"]
+mod shadowed_member_same_named_formal;
