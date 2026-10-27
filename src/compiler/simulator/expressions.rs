@@ -4959,7 +4959,8 @@ impl Simulator {
                 if let ExprKind::Ident(_h) = &expr.kind {
                     let nm = base_nm.as_deref().unwrap_or("");
                     if !self.module.arrays.contains_key(nm)
-                        && self.signal_name_to_id.contains_key(nm)
+                        && (self.signal_name_to_id.contains_key(nm)
+                            || self.module.packed_signal_elem_widths.contains_key(nm))
                     {
                         if let Some(&ew) = self.module.packed_signal_elem_widths.get(nm) {
                             // `ew == 1` is a real element width when the inner
