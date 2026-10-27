@@ -1822,9 +1822,21 @@ impl Simulator {
         if let Some(h) = owner {
             self.this_stack.push(Some(h));
         }
+        let scope = self
+            .cg_heap
+            .get(handle)
+            .and_then(|x| x.as_ref())
+            .filter(|i| !i.cg_name.contains("::"))
+            .and_then(|i| i.cg_name.rsplit_once('.').map(|(s, _)| s.to_string()));
+        let saved_hint = scope
+            .as_ref()
+            .map(|s| self.name_resolve_hint.replace(Some(s.clone())));
         // The guard reads the instance's scope (its object and formals).
         if guard.is_none_or(|g| self.eval_expr(g).is_true()) {
             self.sample_covergroup_inner(handle);
+        }
+        if let Some(h) = saved_hint {
+            *self.name_resolve_hint.borrow_mut() = h;
         }
         if owner.is_some() {
             self.this_stack.pop();
