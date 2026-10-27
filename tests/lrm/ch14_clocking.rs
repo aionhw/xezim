@@ -201,7 +201,7 @@ fn c14_4_clocking_edge_output_skew() {
 }
 
 // §14.16: drives at, after `##1`, and between clocking events through a
-// negedge skew.
+// negedge skew, a renamed posedge-skew output and a two-state output.
 #[test]
 fn c14_16_clocking_negedge_skew_timing() {
     check(
@@ -209,7 +209,13 @@ fn c14_16_clocking_negedge_skew_timing() {
         include_str!("sv/c14_negedge_timing.sv"),
         "c14nt",
         Order::Multiset,
-        &["T|chg|t=20000 u=1", "T|chg|t=30000 w=1", "T|chg|t=30000 v=1"],
+        &[
+            "T|chg|t=20000 u=1",
+            "T|chg|t=30000 w=1",
+            "T|chg|t=30000 v=1",
+            "T|chg|t=35000 qn=1",
+            "T|chg|t=25000 b=0",
+        ],
         &[],
     );
 }

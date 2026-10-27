@@ -54,6 +54,11 @@ impl Simulator {
         raw: &str,
         net: &str,
     ) -> Option<(EdgeKind, u64)> {
+        let raw = self
+            .clocking_sig_alias
+            .get(cb)
+            .and_then(|m| m.iter().find(|(_, n)| n.as_str() == net))
+            .map_or(raw, |(v, _)| v.as_str());
         let per_sig = |m: &HashMap<String, u64>| m.get(raw).or_else(|| m.get(net)).copied();
         if let Some(e) = self
             .clocking_sig_out_edge
@@ -89,6 +94,16 @@ impl Simulator {
         self.assign_value(&lval, val);
     }
 
+    /// `val` at the width of signal `id`, with X/Z bits zeroed when the
+    /// signal is two-state, as an assignment stores it.
+    fn fit_clocking_value(&self, id: usize, val: &Value) -> Value {
+        let v = val.resize(self.signal_widths[id]);
+        if v.has_xz() && self.signal_two_state.get(id).copied().unwrap_or(false) {
+            return v.to_two_state();
+        }
+        v
+    }
+
     /// §14.3: an output with an edge skew is driven on that edge of the
     /// block's clock. Of the drives of `cb` waiting for this transition, only
     /// the last one issued on each output is applied (§14.16.2), so an earlier
@@ -116,8 +131,8 @@ impl Simulator {
             if delay > 0
                 && let Some(&id) = self.signal_name_to_id.get(net.as_str())
             {
-                let w = self.signal_widths[id];
-                self.schedule_delayed_with_delay(id, val.resize(w), delay);
+                let v = self.fit_clocking_value(id, &val);
+                self.schedule_delayed_with_delay(id, v, delay);
             } else {
                 self.drive_clocking_net(&net, &val);
                 self.clocking_edge_drive_dirty = true;
@@ -311,8 +326,8 @@ impl Simulator {
                         continue;
                     }
                     if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
-                        let w = self.signal_widths[id];
-                        self.schedule_delayed_with_delay(id, val.resize(w), skew);
+                        let v = self.fit_clocking_value(id, &val);
+                        self.schedule_delayed_with_delay(id, v, skew);
                         continue;
                     }
                     let lval = Expression::new(
