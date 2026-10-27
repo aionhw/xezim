@@ -6719,6 +6719,9 @@ impl Simulator {
                     if known(&n) {
                         return Some(n);
                     }
+                    if let Some(n) = self.csp_member_through_handles(csp, &path) {
+                        return Some(n);
+                    }
                 }
             }
         }
@@ -6739,6 +6742,28 @@ impl Simulator {
             _ => return None,
         };
         known(&name).then_some(name)
+    }
+
+    /// §18.5.9: a member path that reaches an object of this solve through
+    /// handle members (`sub.p.x`, `p` a sub-object's handle back to the
+    /// object being solved) names that object's variable, not a state value.
+    fn csp_member_through_handles(&self, csp: &Csp, path: &[String]) -> Option<String> {
+        if csp.scope.is_some() {
+            return None;
+        }
+        let (leaf, hops) = path.split_last()?;
+        let mut h = csp.handle;
+        for m in hops {
+            h = self.member_handle(h, m).filter(|&h| h != 0)?;
+        }
+        csp.scalars.iter().find_map(|(n, &v)| {
+            let hit = match &csp.vars[v].key {
+                VarKey::Prop(p) => h == csp.handle && p == leaf,
+                VarKey::Sub(s, p) => *s == h && p == leaf,
+                _ => false,
+            };
+            hit.then(|| n.clone())
+        })
     }
 
     /// The names of a plain member path (`a.b`, `this.a.b`), `this` kept.

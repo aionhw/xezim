@@ -123,6 +123,8 @@ mod rand_array_elem_signedness;
 mod rand_obj_array_elem_constraints;
 #[path = "classes/rand_package_struct_enum_member.rs"]
 mod rand_package_struct_enum_member;
+#[path = "classes/rand_sub_object_back_handle.rs"]
+mod rand_sub_object_back_handle;
 #[path = "classes/randomize_args_name_object_members.rs"]
 mod randomize_args_name_object_members;
 #[path = "classes/randomize_assoc_joint_solve.rs"]
