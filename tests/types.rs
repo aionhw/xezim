@@ -575,5 +575,7 @@ mod wide_array_elem_x_index;
 mod packed_elem_const_index_out_of_range;
 #[path = "types/fn_return_width_struct_param_member.rs"]
 mod fn_return_width_struct_param_member;
+#[path = "types/const_bits_of_cast.rs"]
+mod const_bits_of_cast;
 #[path = "types/const_typedef_cast.rs"]
 mod const_typedef_cast;
