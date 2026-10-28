@@ -515,14 +515,25 @@ impl Simulator {
         {
             return None;
         }
-        // A suspended task keeps its typedef in the process-local frame.
-        // Another task may meanwhile bind a same-named formal of a different
-        // type, replacing the shared var_decl_types / packed-element tables.
-        // Resolve the active declaration before consulting those tables.
-        let (mut dt, unpacked, _) = self.query_root_decl_type(name)?;
-        if !unpacked.is_empty() {
-            return None;
-        }
+        // A suspended struct task keeps its typedef in the process-local
+        // frame. Another task may meanwhile bind a same-named formal of a
+        // different type, replacing the shared declaration tables.
+        let mut dt = if self.any_struct_formal_markers
+            && self
+                .local_stack
+                .last()
+                .is_some_and(|f| f.contains_key(&format!("{name}.")))
+        {
+            let (dt, unpacked, _) = self.query_root_decl_type(name)?;
+            if !unpacked.is_empty() {
+                return None;
+            }
+            dt
+        } else {
+            // Packed locals need the full declaration: a typedef-only lookup
+            // loses use-site dimensions, e.g. `enum_t [1:0] a`.
+            self.module.var_decl_types.get(name)?.clone()
+        };
         let mut cell = std::borrow::Cow::Borrowed(name);
         // Unpacked structs are stored as individual frame leaves (`req.data`),
         // not as a packed value at `req`. Walk to that leaf, then use the
