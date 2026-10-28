@@ -401,7 +401,7 @@ impl Simulator {
         matches!(
             expr.kind,
             ExprKind::Index { .. } | ExprKind::MemberAccess { .. } | ExprKind::Paren(_)
-        )
+        ) || matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() > 1)
     }
 
     /// A select of a select of a variable the innermost call frame owns (a
@@ -455,11 +455,10 @@ impl Simulator {
             return None;
         }
         let name = h.path[0].name.name.as_str();
-        if !self
-            .local_stack
-            .last()
-            .is_some_and(|f| f.contains_key(name))
-            && !self.hoisted_sub_static_names.contains(name)
+        if !self.local_stack.last().is_some_and(|f| {
+            f.contains_key(name)
+                || (self.any_struct_formal_markers && f.contains_key(&format!("{name}.")))
+        }) && !self.hoisted_sub_static_names.contains(name)
         {
             return None;
         }
@@ -508,7 +507,7 @@ impl Simulator {
         Vec<PackedHop>,
         bool,
     )> {
-        let (root, name, steps) = self.frame_packed_chain(e)?;
+        let (mut root, name, mut steps) = self.frame_packed_chain(e)?;
         if self.module.arrays.contains_key(name)
             || self.module.dynamic_arrays.contains(name)
             || self.module.associative_arrays.contains_key(name)
@@ -516,9 +515,37 @@ impl Simulator {
         {
             return None;
         }
-        let dt = self.module.var_decl_types.get(name)?;
-        let (hops, total, two) = self.packed_hops(dt, &steps)?;
-        let valid = if let Some(cur) = self.local_stack.last().and_then(|f| f.get(name)) {
+        // A suspended task keeps its typedef in the process-local frame.
+        // Another task may meanwhile bind a same-named formal of a different
+        // type, replacing the shared var_decl_types / packed-element tables.
+        // Resolve the active declaration before consulting those tables.
+        let (mut dt, unpacked, _) = self.query_root_decl_type(name)?;
+        if !unpacked.is_empty() {
+            return None;
+        }
+        let mut cell = std::borrow::Cow::Borrowed(name);
+        // Unpacked structs are stored as individual frame leaves (`req.data`),
+        // not as a packed value at `req`. Walk to that leaf, then use the
+        // member's declared packed geometry for the remaining selects. Never
+        // derive its shape from a different activation's name-keyed metadata.
+        while matches!(self.resolve_dt_ref(&dt), DataType::Struct(su) if !su.packed) {
+            let PendingSel::Member(member) = steps.first()? else {
+                return None;
+            };
+            let (member_dt, dims) = self.member_decl_type(&dt, member)?;
+            if !dims.is_empty() {
+                return None;
+            }
+            cell = std::borrow::Cow::Owned(format!("{cell}.{member}"));
+            root = std::borrow::Cow::Owned(Self::append_member_expr(root.as_ref(), member));
+            dt = member_dt;
+            steps.remove(0);
+        }
+        if steps.is_empty() {
+            return None;
+        }
+        let (hops, total, two) = self.packed_hops(&dt, &steps)?;
+        let valid = if let Some(cur) = self.local_stack.last().and_then(|f| f.get(cell.as_ref())) {
             !cur.is_real && cur.width == total
         } else if self.hoisted_sub_static_names.contains(name) {
             self.get_signal_value_by_name(name)
