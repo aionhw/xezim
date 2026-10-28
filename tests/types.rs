@@ -169,6 +169,8 @@ mod nba_context_width;
 mod nested_packed_member_lvalue;
 #[path = "types/nested_packed_struct_array_access.rs"]
 mod nested_packed_struct_array_access;
+#[path = "types/nested_packed_struct_pattern.rs"]
+mod nested_packed_struct_pattern;
 #[path = "types/nested_packed_typedefs.rs"]
 mod nested_packed_typedefs;
 #[path = "types/nonzero_based_vector_reads.rs"]

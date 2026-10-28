@@ -7794,8 +7794,25 @@ impl<'a> BytecodeCompiler<'a> {
         if layout.is_empty() {
             return None;
         }
+        // The recorded layout is flattened: a nested member is its own row
+        // (`exception.cause`) as well as its parent (`exception`). Those rows
+        // overlap. Concatenating every row builds a value wider than the
+        // struct, and the assignment keeps the low bits, so a named member
+        // such as `trans_id` lands outside its slot. A later member write
+        // repairs the fields it touches and leaves the shifted one at 0.
+        // Pack only the direct children — the same set the interpreter walks
+        // in `apply_packed_struct_pattern`. A pattern on a nested member
+        // still bails (this function's caller has already taken
+        // `pattern_layout`), and the statement runs on the interpreter.
+        let mut fields: Vec<(String, u32, u32)> = layout
+            .iter()
+            .filter(|(n, _, _)| !n.contains('.'))
+            .cloned()
+            .collect();
+        if fields.is_empty() {
+            return None;
+        }
         // MSB-first: highest offset first.
-        let mut fields: Vec<(String, u32, u32)> = layout.to_vec();
         fields.sort_by(|a, b| b.1.cmp(&a.1));
 
         let mut named: Vec<(usize, &Expression)> = Vec::new();
