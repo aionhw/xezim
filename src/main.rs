@@ -2771,12 +2771,15 @@ fn run_main() -> i32 {
             }
             _ if arg.starts_with("--std=") => {
                 let v = &arg["--std=".len()..];
-                if !matches!(v, "08" | "2008") {
-                    eprintln!(
-                        "Error: --std={}: only VHDL-2008 (--std=08) is supported",
-                        v
-                    );
-                    std::process::exit(1);
+                match xezim_core::vhdl::VhdlStd::from_arg(v) {
+                    Some(s) => vhdl_options.std = s,
+                    None => {
+                        eprintln!(
+                            "Error: --std={}: only VHDL-2008 (--std=08) and VHDL-2019 (--std=19) are supported",
+                            v
+                        );
+                        std::process::exit(1);
+                    }
                 }
             }
             "--upf-top" => {

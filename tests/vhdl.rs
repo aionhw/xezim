@@ -10,3 +10,5 @@ mod front_end;
 mod mixed;
 #[path = "vhdl/simulation.rs"]
 mod simulation;
+#[path = "vhdl/simulation19.rs"]
+mod simulation19;

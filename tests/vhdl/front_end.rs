@@ -59,21 +59,25 @@ fn work_library_of_design_units() {
     );
 }
 
-/// Only VHDL-2008 is supported; another `--std=` is rejected.
+/// VHDL-2008 and VHDL-2019 are supported; another `--std=` is rejected.
 #[test]
-fn std_other_than_2008_is_rejected() {
+fn std_other_than_2008_or_2019_is_rejected() {
     let (out, text) = xezim(&["--std=93", "designs/clock_report.vhd"], &[]);
     assert!(!out.status.success());
     assert!(
-        text.contains("--std=93: only VHDL-2008 (--std=08) is supported"),
+        text.contains(
+            "--std=93: only VHDL-2008 (--std=08) and VHDL-2019 (--std=19) are supported"
+        ),
         "{}",
         text
     );
-    let (_, text) = xezim(
-        &["--std=08", "designs/clock_report.vhd"],
-        &[("XEZIM_VHDL_DUMP", "1")],
-    );
-    assert!(text.contains("[work]: entity clock_report"), "{}", text);
+    for std in ["--std=08", "--std=19"] {
+        let (_, text) = xezim(
+            &[std, "designs/clock_report.vhd"],
+            &[("XEZIM_VHDL_DUMP", "1")],
+        );
+        assert!(text.contains("[work]: entity clock_report"), "{}: {}", std, text);
+    }
 }
 
 /// Guarded signals must be resolved (§6.4.2.3), a disconnection
