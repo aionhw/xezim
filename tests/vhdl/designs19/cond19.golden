@@ -1,0 +1,19 @@
+revision 2019
+a simulator
+-2: clamp 0 sign -1
+-1: clamp 0 sign -1
+0: clamp 0 sign -1
+1: clamp 1 sign -1
+2: clamp 2 sign -1
+3: clamp 3 sign -1
+4: clamp 4 sign -1
+5: clamp 5 sign 0
+6: clamp 6 sign 1
+7: clamp 7 sign 1
+8: clamp 8 sign 1
+9: clamp 9 sign 1
+10: clamp 10 sign 1
+11: clamp 10 sign 1
+12: clamp 10 sign 1
+bump 35
+larger 7 q twice 42

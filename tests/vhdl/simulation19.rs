@@ -70,3 +70,41 @@ fn check(name: &str) {
 fn basics19() {
     check("basics19");
 }
+
+/// VHDL-2019 §24.2 conditional analysis: `` `if ``/`` `elsif ``/`` `else ``
+/// over VHDL_VERSION, TOOL_TYPE and TOOL_NAME; §10.13 `return ... when` with
+/// an `unaffected` arm and `return when c`; §6.5.3 generic type classes
+/// (`(<>)`, `range <>`) on generic subprograms.
+#[test]
+fn cond19() {
+    check("cond19");
+}
+
+/// VHDL-2019 §24.2: `` `warning `` and `` `error `` directives of the
+/// analysed branches are reported at their location; an error fails the
+/// analysis. Directives of excluded branches are not.
+#[test]
+fn tool_directives_are_reported() {
+    let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vhdl"))
+        .args(["--no-cache", "--std=19", "errors19/directives.vhd"])
+        .output()
+        .expect("run xezim");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{}", text);
+    assert!(
+        text.contains("errors19/directives.vhd:4:1: warning: VHDL: check the configuration"),
+        "{}",
+        text
+    );
+    assert!(
+        text.contains("errors19/directives.vhd:8:3: error: VHDL: this design needs a synthesis tool"),
+        "{}",
+        text
+    );
+    assert!(!text.contains("not taken"), "{}", text);
+}
