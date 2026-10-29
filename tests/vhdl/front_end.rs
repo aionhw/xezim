@@ -32,7 +32,7 @@ fn syntax_error_is_located() {
     let (out, text) = xezim(&["errors/syntax.vhd"], &[]);
     assert!(!out.status.success(), "{}", text);
     assert!(
-        text.contains("errors/syntax.vhd:2:19: error: VHDL: syntax error: expected ')'"),
+        text.contains("errors/syntax.vhd:2:19: error: VHDL: syntax error: Expected ';' or ')'"),
         "{}",
         text
     );

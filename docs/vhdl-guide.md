@@ -22,8 +22,8 @@ assertions of the IEEE packages) and `--assert-level=note|warning|error|failure|
 
 ## How it works
 
-xezim-core parses VHDL with the `vhdl_syntax` crate and does the rest
-itself: design libraries, visibility, types, overload resolution, static
+xezim-core parses VHDL with the parser of the rust_hdl project
+(`vhdl_lang`, vendored with a few patches) and does the rest itself: design libraries, visibility, types, overload resolution, static
 evaluation, and lowering of the elaborated design to SystemVerilog, which
 the simulator runs. The packages of libraries `std` and `ieee` are the
 IEEE P1076 Working Group sources, built in. VHDL's own simulation cycle
