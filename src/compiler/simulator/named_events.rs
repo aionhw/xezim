@@ -1118,6 +1118,12 @@ impl Simulator {
         )
     }
 
+    /// The waiter key of a local event (see `fire_named_event`): no class
+    /// instance has this handle id.
+    pub(super) fn local_event_key(name: &str) -> (usize, String) {
+        (usize::MAX, name.to_string())
+    }
+
     /// Mark the parked waiters armed plainly on the event signal `sid` (no
     /// `iff` guard, value expression or clocking event) as triggered; the
     /// drain resumes them in its usual region and order.
@@ -1151,6 +1157,12 @@ impl Simulator {
             self.pending_t0_triggers.push(canon.to_string());
             return;
         }
+        // §6.17: a block- or subroutine-local event has no backing signal.
+        let local = self
+            .module
+            .events
+            .contains(canon)
+            .then(|| Self::local_event_key(canon));
         let event = self.event_triggered_time.intern(canon);
         let plan = self.named_event_plan(event);
         for target in &plan.targets {
@@ -1187,6 +1199,12 @@ impl Simulator {
         }
         // Unregistered and dynamic names still have a .triggered stamp.
         self.event_triggered_time.mark(event, self.time);
+        // It wakes the processes parked on its name.
+        if plan.targets.is_empty()
+            && let Some(key) = local
+        {
+            self.fire_instance_event(key);
+        }
         // Preserve scheduler, force, VPI and combinational checkpoints. A
         // listener-only guard would skip work unrelated to this event's fanout.
         self.settle_combinatorial();

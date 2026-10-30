@@ -343,3 +343,33 @@ fn delta_wait() {
 fn event_lists() {
     check("andlist");
 }
+
+/// §5.2.17 next_trigger(): a method's next activation waits for a time, an
+/// event, an AND/OR list, a timeout or a delta cycle, once; then its static
+/// sensitivity again.
+#[test]
+fn next_trigger() {
+    check("nexttrig");
+}
+
+/// §5.5–§5.6 sc_spawn of member and free functions with sc_bind (bound
+/// arguments copied, sc_ref/sc_cref shared), a result through `&r`,
+/// SC_FORK/SC_JOIN, process handles (`terminated`, `terminated_event`),
+/// function-local events passed by reference.
+#[test]
+fn spawn() {
+    check("spawn");
+}
+
+/// §4.4 callbacks in the kernel's hierarchy order; end_of_simulation after
+/// sc_stop.
+#[test]
+fn callbacks() {
+    check("callbacks");
+}
+
+/// `sc_assert` (fatal error F4, in a process) and `assert`: exit 134.
+#[test]
+fn asserts() {
+    assert_eq!(check("asserts"), Some(134));
+}

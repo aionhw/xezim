@@ -1,0 +1,17 @@
+before sc_start
+t.a before_end_of_elaboration
+t.b before_end_of_elaboration
+t end_of_elaboration
+t.a end_of_elaboration
+t.b end_of_elaboration
+t.a start_of_simulation at 0 s
+t.b start_of_simulation at 0 s
+0 s t.a runs
+0 s t.b runs
+between
+
+Info: /OSCI/SystemC: Simulation stopped by user.
+t end_of_simulation
+t.a end_of_simulation at 10 ns
+t.b end_of_simulation at 10 ns
+after, argc 1

@@ -1,8 +1,8 @@
+#define SC_INCLUDE_DYNAMIC_PROCESSES
 #include <systemc.h>
 SC_MODULE(m) {
-    void child() {}
     void run() {
-        sc_spawn(sc_bind(&m::child, this));
+        sc_spawn([this]() { wait(1, SC_NS); });
     }
     SC_CTOR(m) { SC_THREAD(run); }
 };

@@ -4204,6 +4204,19 @@ impl Simulator {
                                 }
                                 return;
                             }
+                            // §6.17: an `event` declared in a block or a
+                            // subroutine has no backing signal; it parked on
+                            // the NBA region and woke at once. Park on its
+                            // name, as class events park on theirs.
+                            if self.module.events.contains(canon.as_str()) {
+                                let cont = pc.pushed_body(body, pc.start + i + 1);
+                                self.instance_event_waiters.push(InstanceEventWaiter {
+                                    key: InstanceEventKeys::One(Self::local_event_key(&canon)),
+                                    pid,
+                                    continuation: cont,
+                                });
+                                return;
+                            }
                         }
                         let is_star = matches!(event, EventControl::Star | EventControl::ParenStar);
                         let sens = if is_star {

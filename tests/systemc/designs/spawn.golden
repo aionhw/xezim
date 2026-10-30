@@ -1,0 +1,13 @@
+100 ns one
+110 ns two
+120 ns one
+130 ns two
+140 ns joined, r -1
+141 ns later 0
+142 ns later 1
+143 ns later 2
+150 ns total 3
+terminated 0
+151 ns twice 42 terminated 1
+151 ns show 1.5
+int(9.87) 9

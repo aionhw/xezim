@@ -1,0 +1,9 @@
+2 ns n 0
+4 ns n 4
+6 ns n 8
+
+Fatal: (F4) assertion failed: n < 10
+In file: asserts.cpp:16
+In process: u.run @ 6 ns
+
+Info: (I99) simulation aborted

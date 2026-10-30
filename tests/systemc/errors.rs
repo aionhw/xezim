@@ -33,12 +33,23 @@ fn rejects(name: &str, expected: &str) {
     );
 }
 
-/// §5.5 dynamic processes.
+/// §5.5 a thread spawned from a lambda (sc_bind of a function works; see
+/// the `spawn` design).
 #[test]
-fn sc_spawn() {
+fn spawn_lambda() {
     rejects(
         "spawn",
-        "spawn.cpp:5:9: error: SystemC: dynamic processes (sc_spawn) are not supported in simulation",
+        "spawn.cpp:5:18: error: SystemC: sc_spawn of a lambda is not supported in simulation",
+    );
+}
+
+/// A module constructor argument computed at run time: constructor
+/// parameters are SystemVerilog parameters, fixed before simulation.
+#[test]
+fn runtime_constructor_argument() {
+    rejects(
+        "runtime_ctor_arg",
+        "runtime_ctor_arg.cpp:10:14: error: SystemC: a module constructor argument must be known before simulation ('size' is computed at run time)",
     );
 }
 

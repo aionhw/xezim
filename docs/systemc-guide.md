@@ -60,6 +60,9 @@ match the SystemC 2.3 reference kernel:
 | `sc_start(t)` | stops before the events *at* `t` (they run in the next `sc_start`) |
 | `sc_start()` | returns at `sc_stop()` or when no events are left; the rest of `sc_main` then runs (in a `final` block, so it cannot call `sc_start` or `wait` again) |
 | `sc_stop()` | stops at the end of the delta cycle, with SystemC's message |
+| `next_trigger(...)` in an `SC_METHOD` | its next activation waits for that time, event, list or timeout, then for the static sensitivity again |
+| `sc_spawn(sc_bind(&f, args…))` | a `fork … join_none` thread (arguments copied at the spawn, `sc_ref`/`sc_cref` shared); `SC_FORK … SC_JOIN` a `fork … join` |
+| `before_end_of_elaboration`, `end_of_elaboration`, `start_of_simulation` | at the first `sc_start`, module before children; `end_of_simulation` after `sc_stop` |
 | `sc_clock` | period, duty cycle, start time, `posedge_first` |
 | time | picoseconds (SystemC's default resolution); `sc_time` prints like SystemC (`1500 ps`, `1 us`) |
 
@@ -90,6 +93,18 @@ match the SystemC 2.3 reference kernel:
   run with SystemC's error E109. Channels are modules (`sc_channel`,
   `sc_module`) or primitive channels (`sc_prim_channel`, with
   `request_update()` and `update()`) implementing one or more interfaces.
+- **Dynamic threads** (§5.5–§5.6): `sc_spawn` of member and free functions
+  through `sc_bind`, with a result through `&r`, a name and
+  `sc_spawn_options` (`set_stack_size` only); `SC_FORK`/`SC_JOIN`;
+  `sc_process_handle` with `terminated()`, `terminated_event()` and
+  `valid()`. Events local to a function, passed by reference.
+- **sc_main's arguments**: `argv[0]` is `sc_main`, the others are the
+  comma-separated values of the plusarg `+sc_args=a,b,…`; `atoi`/`atof`
+  convert them. Module constructor arguments become SystemVerilog
+  parameters, so they must be known before simulation (constants, or the
+  enclosing module's own constructor parameters); a value computed at run
+  time is an error.
+- **Checks**: `sc_assert` (SystemC's fatal error F4) and `assert`.
 - **Kernel objects**: `sc_mutex` (`lock`, `trylock`, `unlock`, owner-only),
   `sc_semaphore` (`wait`, `trywait`, `post`, `get_value`), `sc_event_queue`
   (several pending notifications, `cancel_all`, as a sensitivity).
@@ -144,8 +159,10 @@ Each of these is reported as an error at its C++ source line, never
 simulated approximately:
 
 - Approximately-timed TLM (`nb_transport`, payload event queues),
-  `sc_spawn`, `SC_FORK`/`SC_JOIN`, `next_trigger`, `sc_event_and_list` /
-  `sc_event_or_list` objects (the `e1 & e2` / `e1 | e2` expressions work).
+  `sc_event_and_list` / `sc_event_or_list` objects (the `e1 & e2` /
+  `e1 | e2` expressions work), spawned method processes and lambdas,
+  `SC_CJOIN`, process control (`suspend`, `kill`, `reset`, …),
+  `sc_report_handler`.
 - Function templates, pointers other than byte/word data pointers and
   pointers to objects, destructors with statements in a class that is not a
   module (an empty one is fine).
