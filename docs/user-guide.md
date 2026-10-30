@@ -54,6 +54,23 @@ hierarchical name that does not resolve, §23.8), `$fatal`, a
 (`--no-strict-top` falls back to finding tops automatically). `$error` exits 0
 unless `--error-exit` is given.
 
+## VHDL designs
+
+VHDL sources (`.vhd`, `.vhdl`) go on the command line with the
+SystemVerilog ones; xezim analyses, elaborates and simulates them in the
+same run, VHDL-2008 by default and VHDL-2019 with `--std=19`:
+
+```bash
+xezim tb.vhd                                  # VHDL-2008
+xezim --std=19 tb.vhd                         # VHDL-2019
+xezim --work=mylib pkg.vhd --work=work top.vhd  # design libraries
+xezim top.sv counter.vhd                      # mixed: SV instantiating VHDL
+```
+
+Output, report and assertion messages and the exit status follow GHDL. The
+[VHDL guide](vhdl-guide.md) lists what is supported, the VHDL-2019
+additions, mixed-language designs and how the results are verified.
+
 ## Waveforms
 
 Waveform support is compiled into the model only on request, because it is

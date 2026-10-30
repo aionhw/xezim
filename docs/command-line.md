@@ -21,6 +21,10 @@ how to use them together, see the [user guide](user-guide.md).
 | `--no-strict-top` | When an `-s` names no module, warn and find the tops automatically instead of exiting 1 |
 | `--sv2017` | Parse with the IEEE 1800-2017 grammar instead of the default 1800-2023 |
 | `--no-strict` (`--lenient`) | Accept some LRM-illegal constructs that are errors by default, among them a hierarchical name that does not resolve (§23.8), which is then left unchecked |
+| `--std=08`, `--std=19` | VHDL revision of the `.vhd`/`.vhdl` sources: VHDL-2008 (the default) or VHDL-2019 (also `2008`, `2019`). See the [VHDL guide](vhdl-guide.md#vhdl-2019) |
+| `--work=<lib>` | VHDL design library the `.vhd`/`.vhdl` files that follow are analysed into (default `work`). Repeatable |
+| `--ieee-asserts=<enable\|disable\|disable-at-0>` | VHDL assertions of the IEEE packages, as GHDL's option (default `enable`) |
+| `--assert-level=<note\|warning\|error\|failure\|none>` | VHDL severity that stops the simulation, as GHDL's option (default `failure`) |
 | `--dpi-lib <path>` | Load a DPI-C shared library (`.so`/`.dylib`/`.dll`). Repeatable. See the [DPI and VPI guide](dpi-guide.md) |
 | `--vpi-lib <path>` (`-m`) | Load a VPI module and run its `vlog_startup_routines`. Repeatable. See the [DPI and VPI guide](dpi-guide.md) |
 | `--module-timescale [mods=]<unit>/<prec>` | Assign a timescale to modules with no explicit source-level one. Repeatable. See the [user guide](user-guide.md#module-timescale-extension) |

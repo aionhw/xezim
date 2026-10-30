@@ -254,7 +254,7 @@ fn print_usage() {
     eprintln!(
         "  --work=<lib>             VHDL library for the .vhd/.vhdl files that follow (default work)"
     );
-    eprintln!("  --std=08                 VHDL standard (VHDL-2008, the default and only one)");
+    eprintln!("  --std=08|19              VHDL revision: VHDL-2008 (the default) or VHDL-2019");
     eprintln!(
         "  --ieee-asserts=<m>       VHDL assertions of the IEEE packages: enable (default), disable,"
     );

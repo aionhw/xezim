@@ -45,7 +45,8 @@
 - UDPs, drive strengths, specify-block delays and timing checks
 - SDF back-annotation (`--sdf`)
 - IEEE 1801 UPF power intent (`--upf`)
-- VHDL-2008 (in development): `.vhd`/`.vhdl` sources, checked against GHDL
+- VHDL-2008 and VHDL-2019 (`--std=19`): `.vhd`/`.vhdl` sources and mixed
+  SystemVerilog/VHDL designs, checked against GHDL (2008) and nvc (2019)
 
 </td>
 </tr>
@@ -195,7 +196,7 @@ with few, very hot blocks, so measure it on yours.
 | [DPI and VPI guide](docs/dpi-guide.md) | Loading C and C++ libraries, the VPI surface |
 | [Coverage guide](docs/coverage-guide.md) | Functional, assertion and code coverage, `xezim_cov.json` |
 | [UPF guide](docs/upf-guide.md) | IEEE 1801 power intent |
-| [VHDL guide](docs/vhdl-guide.md) | IEEE 1076-2008 VHDL designs |
+| [VHDL guide](docs/vhdl-guide.md) | IEEE 1076-2008 and 1076-2019 VHDL designs, mixed with SystemVerilog |
 | [Debugging guide](docs/DEBUGGING.md) | Tracing, diagnosing hangs, comparing against another simulator |
 | [Building from source](docs/building.md) | Requirements, profile-guided builds, working on xezim-core |
 | [Release notes](NOTES.md) | Changes per release, verified workloads, compliance results |

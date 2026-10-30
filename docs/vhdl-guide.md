@@ -1,7 +1,8 @@
 # VHDL (IEEE 1076-2008, 1076-2019)
 
 xezim simulates VHDL-2008 designs, and VHDL-2019 designs with `--std=19`
-(in development, see [VHDL-2019](#vhdl-2019)). Give it the `.vhd`/`.vhdl` files like
+(see [VHDL-2019](#vhdl-2019) for what it adds and what is not supported
+yet). Give it the `.vhd`/`.vhdl` files like
 any other source:
 
     xezim tb.vhd
@@ -260,6 +261,11 @@ output and exit status (`*.golden`, `*.exit`, made by `regen.sh`). The
 group is behind a feature, so plain `cargo test` skips it:
 
     cargo test --features vhdl-tests --test vhdl
+
+The VHDL-2019 designs under `tests/vhdl/designs19/` are checked against nvc
+1.23 (`regen.sh` there) under `--std=19`, by their TEXTIO output and exit
+status. Where nvc lacks a feature or gives a wrong result, the golden is
+written from the LRM and a `<name>.lrm` file says why.
 
 Processes resumed in the same simulation cycle run in an order the LRM
 leaves to the implementation (§14.7.5.3): xezim uses elaboration order and

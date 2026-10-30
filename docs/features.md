@@ -57,6 +57,25 @@ per release are in the [release notes](../NOTES.md).
   isolation and retention, with the supplies driven from the testbench through
   the standard `UPF` package. See the [UPF guide](upf-guide.md).
 
+## VHDL
+
+* **VHDL-2008** (IEEE 1076-2008): entities, architectures, configurations,
+  packages and generic packages, processes, signals with resolution,
+  drivers and delta cycles as the LRM's simulation cycle, generics and
+  generate, records, arrays, access and protected types, files and TEXTIO,
+  the IEEE packages (`std_logic_1164`, `numeric_std`, `fixed_pkg`,
+  `float_pkg`, ...), external names, force and release; results and messages
+  as GHDL's.
+* **VHDL-2019** (IEEE 1076-2019, `--std=19`): conditional analysis, mode
+  views, conditional expressions and returns, sequential blocks, generic
+  type classes, generic protected types and private variables, `'image` and
+  `'value` of composites, STD.ENV (time, environment, directories,
+  assertion state), the file API and STD.REFLECTION.
+* **Mixed designs**: SystemVerilog instantiating VHDL entities and VHDL
+  instantiating SystemVerilog modules.
+
+See the [VHDL guide](vhdl-guide.md).
+
 ## UVM
 
 * **Accellera 1800.2-2017 and 1800.2-2020.3.1** run end to end: build →
