@@ -125,6 +125,13 @@ SystemC tests, `src/main.rs` or `Cargo.toml` (the xezim-core pin, where the
 lowering lives). To add a design, write it, build it against SystemC and save
 its output (banner removed) as the golden file:
 
-    g++ -std=c++17 design.cpp -lsystemc -o ref && ./ref > design.golden From the Accellera SystemC examples, `pipe` and
-`reset_signal_is` simulate with identical output; the others need features
-listed above.
+    g++ -std=c++17 design.cpp -lsystemc -o ref && ./ref > design.golden
+
+The Accellera examples of the SystemC 2.3.4 source release are the wider
+acceptance check: `scripts/systemc_examples.py` builds each one against the
+installed SystemC, runs it under xezim and reports which match:
+
+    python3 scripts/systemc_examples.py --examples systemc-2.3.4/examples --work /tmp/scx
+
+`pipe`, `fir` and `reset_signal_is` simulate with identical output; the
+others need features listed above.
