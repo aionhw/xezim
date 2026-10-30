@@ -2814,6 +2814,9 @@ impl Simulator {
                 self.prof_multicore_fast,
                 self.prof_multicore_fallback
             );
+            if let Some(pool) = &self.edge_workers {
+                pool.report_credits();
+            }
         }
         if self.prof_par_dispatch_partition + self.prof_par_dispatch_legacy > 0 {
             chatter!(

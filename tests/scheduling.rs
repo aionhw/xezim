@@ -426,3 +426,6 @@ mod always_property;
 
 #[path = "scheduling/multicore_workers.rs"]
 mod multicore_workers;
+
+#[path = "scheduling/multicore_credits.rs"]
+mod multicore_credits;

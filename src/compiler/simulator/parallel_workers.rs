@@ -1,8 +1,8 @@
-//! Persistent workers with immutable input epochs and ordered NBA publication.
-//! IEEE 1800-2023 §4.6 / §10.4.2: evaluation finishes before publishing results.
+//! Credit-scheduled workers with immutable event inputs (§4.6 / §10.4.2).
+use super::credit_event::EventCredits;
 use super::parallel_word::WordProgram;
 use super::*;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 struct BlockPlan {
@@ -13,9 +13,8 @@ struct BlockPlan {
     duplicate_nba: bool,
     word: Option<WordProgram>,
 }
-// Only positively admitted immutable instruction streams enter a plan. The
-// simulator owns their backing allocation and waits for every job before it
-// can mutate/drop that allocation. No AST fallback executes on a worker.
+// Plans contain only positively admitted immutable instructions. Their backing
+// allocations stay alive until all event credits retire; no AST fallback runs.
 unsafe impl Send for BlockPlan {}
 unsafe impl Sync for BlockPlan {}
 
@@ -30,151 +29,241 @@ struct Epoch {
     packed: *const PackedMem,
     fast: bool,
 }
-// dispatch waits for ALL replies, including failures, before the simulator
-// regains mutable access. Workers only form shared references to these fields.
+// Evaluators retire their credit only after every shared input borrow ends.
+// Once credits reach zero, stale notifications can only find an empty cursor;
+// they cannot dereference this epoch after the coordinator regains mutability.
 unsafe impl Send for Epoch {}
+unsafe impl Sync for Epoch {}
 
-struct Job {
-    epoch: Epoch,
-    blocks: Arc<Vec<Arc<BlockPlan>>>,
-    writes: Vec<NbaFast>,
-}
-struct Reply {
-    worker: usize,
+#[derive(Default)]
+struct TaskOutput {
     writes: Vec<NbaFast>,
     fast: u64,
     fallback: u64,
-    error: Option<String>,
+}
+struct Task {
+    blocks: Vec<Arc<BlockPlan>>,
+    // A claimed task has one writer. The slot retains capacity across events;
+    // the coordinator takes ownership of results only after credit quiescence.
+    output: Mutex<TaskOutput>,
+}
+struct EventWork {
+    epoch: Epoch,
+    tasks: Arc<Vec<Task>>,
+    credits: EventCredits,
+    error: Mutex<Option<&'static str>>,
+}
+impl EventWork {
+    fn fail(&self, error: &'static str) {
+        let mut slot = self.error.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+        drop(slot);
+        self.credits.cancel();
+    }
+}
+
+fn evaluate(
+    epoch: Epoch,
+    blocks: &[Arc<BlockPlan>],
+    output: &mut TaskOutput,
+    vm: &mut Vec<Value>,
+    words: &mut Vec<u64>,
+) {
+    output.writes.clear();
+    output.fast = 0;
+    output.fallback = 0;
+    // SAFETY: the caller owns a live task credit throughout evaluation. No
+    // mutable access to these input allocations resumes before credit zero.
+    let signals = unsafe { std::slice::from_raw_parts(epoch.values, epoch.len) };
+    let signed = unsafe { std::slice::from_raw_parts(epoch.signed, epoch.signed_len) };
+    let names = unsafe { &*epoch.names };
+    let arrays = unsafe { &*epoch.arrays };
+    let packed = unsafe { &*epoch.packed };
+    for block in blocks {
+        let before = output.writes.len();
+        if epoch.fast
+            && block.word.as_ref().is_some_and(|program| {
+                program.execute(
+                    signals,
+                    signed,
+                    words,
+                    &mut output.writes,
+                    block.index,
+                    block.duplicate_nba,
+                )
+            })
+        {
+            output.fast += 1;
+            continue;
+        }
+        output.writes.truncate(before);
+        output.fallback += 1;
+        vm.resize(block.regs, Value::zero(1));
+        let insns = unsafe { std::slice::from_raw_parts(block.ptr, block.len) };
+        let mut result = Simulator::exec_insns_isolated(
+            insns,
+            signals,
+            signed,
+            names,
+            arrays,
+            Some(packed),
+            vm,
+            block.index,
+            block.duplicate_nba,
+        );
+        output.writes.append(&mut result);
+    }
+}
+
+fn consume(work: &EventWork, vm: &mut Vec<Value>, words: &mut Vec<u64>) {
+    while let Some(ticket) = work.credits.claim() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let task = &work.tasks[ticket.index()];
+            let mut output = task.output.lock().unwrap_or_else(|e| e.into_inner());
+            evaluate(work.epoch, &task.blocks, &mut output, vm, words);
+        }));
+        if result.is_err() {
+            // Publish failure and cancel queued work BEFORE retiring this
+            // ticket. Other claimed tasks retain their input-lifetime credits.
+            work.fail("parallel worker failed before publication");
+        }
+        // The output guard and all evaluator borrows ended above. Remaining
+        // code only claims another credit or touches owned control metadata.
+        drop(ticket);
+    }
+}
+
+#[derive(Default)]
+struct MailboxState {
+    work: Option<Arc<EventWork>>,
+    closed: bool,
+}
+#[derive(Default)]
+struct Mailbox {
+    state: Mutex<MailboxState>,
+    ready: Condvar,
+}
+impl Mailbox {
+    fn notify(&self, work: Arc<EventWork>) -> Result<(), &'static str> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return Err("parallel worker stopped");
+        }
+        // At most one notification per worker is retained. A previous event
+        // has no credits left before the coordinator can replace its notice.
+        state.work = Some(work);
+        self.ready.notify_one();
+        Ok(())
+    }
+    fn receive(&self) -> Option<Arc<EventWork>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while state.work.is_none() && !state.closed {
+            state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        state.work.take()
+    }
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+        if let Some(work) = state.work.take() {
+            work.fail("parallel worker stopped");
+        }
+        self.ready.notify_one();
+    }
+}
+struct WorkerExit(Arc<Mailbox>);
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 struct Worker {
-    jobs: mpsc::Sender<Option<Job>>,
+    mailbox: Arc<Mailbox>,
     handle: Option<JoinHandle<()>>,
 }
 
-fn evaluate(worker: usize, mut job: Job, vm: &mut Vec<Value>, words: &mut Vec<u64>) -> Reply {
-    job.writes.clear();
-    let mut fast = 0;
-    let mut fallback = 0;
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: the synchronous epoch remains read-only and
-        // alive until every worker has returned its reply.
-        let e = job.epoch;
-        let signals = unsafe { std::slice::from_raw_parts(e.values, e.len) };
-        let signed = unsafe { std::slice::from_raw_parts(e.signed, e.signed_len) };
-        let names = unsafe { &*e.names };
-        let arrays = unsafe { &*e.arrays };
-        let packed = unsafe { &*e.packed };
-        for block in job.blocks.iter() {
-            let before = job.writes.len();
-            if e.fast
-                && block.word.as_ref().is_some_and(|program| {
-                    program.execute(
-                        signals,
-                        signed,
-                        words,
-                        &mut job.writes,
-                        block.index,
-                        block.duplicate_nba,
-                    )
-                })
-            {
-                fast += 1;
-                continue;
-            }
-            job.writes.truncate(before);
-            fallback += 1;
-            vm.resize(block.regs, Value::zero(1));
-            let insns = unsafe { std::slice::from_raw_parts(block.ptr, block.len) };
-            let mut result = Simulator::exec_insns_isolated(
-                insns,
-                signals,
-                signed,
-                names,
-                arrays,
-                Some(packed),
-                vm,
-                block.index,
-                block.duplicate_nba,
-            );
-            job.writes.append(&mut result);
-        }
-    }));
-
-    let error = result
-        .err()
-        .map(|_| "parallel worker failed before publication".to_string());
-    Reply {
-        worker,
-        writes: job.writes,
-        fast,
-        fallback,
-        error,
-    }
+#[derive(Default)]
+struct CreditStats {
+    epochs: u64,
+    issued: u64,
+    retired: u64,
+    cancelled: u64,
+    wakes: u64,
+    wait_ns: u128,
 }
 
 pub(super) struct EdgeWorkers {
     workers: Vec<Worker>,
-    replies: mpsc::Receiver<Reply>,
     plans: Vec<Option<Arc<BlockPlan>>>,
     last_blocks: Vec<usize>,
     last_partitions: Vec<u32>,
-    groups: Vec<Arc<Vec<Arc<BlockPlan>>>>,
-    outputs: Vec<Vec<NbaFast>>,
+    tasks: Arc<Vec<Task>>,
     order: Vec<usize>,
     serial_vm: Vec<Value>,
     serial_words: Vec<u64>,
+    stats: CreditStats,
 }
 impl EdgeWorkers {
     pub(super) fn worker_count(&self) -> usize {
         self.workers.len()
     }
-
+    pub(super) fn report_credits(&self) {
+        let s = &self.stats;
+        chatter!(
+            "[PROF] multicore credits_issued={} credits_retired={} credits_cancelled={} credit_pending={} credit_epochs={} worker_wakes={} credit_wait_ms={:.1}",
+            s.issued,
+            s.retired,
+            s.cancelled,
+            s.issued - s.retired - s.cancelled,
+            s.epochs,
+            s.wakes,
+            s.wait_ns as f64 / 1_000_000.0
+        );
+    }
     fn new(count: usize) -> Self {
-        let (reply_tx, replies) = mpsc::channel();
         let mut workers = Vec::with_capacity(count);
         for worker in 0..count {
-            let (jobs, rx) = mpsc::channel::<Option<Job>>();
-            let tx = reply_tx.clone();
+            let mailbox = Arc::new(Mailbox::default());
+            let receiver = mailbox.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("simulation-{worker}"))
                 .spawn(move || {
-                    let mut vm = Vec::<Value>::new();
-                    let mut words = Vec::<u64>::new();
-                    while let Ok(Some(job)) = rx.recv() {
-                        let reply = evaluate(worker, job, &mut vm, &mut words);
-                        if tx.send(reply).is_err() {
-                            break;
-                        }
+                    let _exit = WorkerExit(receiver.clone());
+                    let mut vm = Vec::new();
+                    let mut words = Vec::new();
+                    while let Some(work) = receiver.receive() {
+                        consume(&work, &mut vm, &mut words);
                     }
                 })
                 .expect("start simulation worker");
             workers.push(Worker {
-                jobs,
+                mailbox,
                 handle: Some(handle),
             });
         }
         Self {
             workers,
-            replies,
             plans: Vec::new(),
             last_blocks: Vec::new(),
             last_partitions: Vec::new(),
-            groups: Vec::new(),
-            outputs: (0..count).map(|_| Vec::new()).collect(),
+            tasks: Arc::new(Vec::new()),
             order: Vec::new(),
             serial_vm: Vec::new(),
             serial_words: Vec::new(),
+            stats: CreditStats::default(),
         }
     }
 }
 impl Drop for EdgeWorkers {
     fn drop(&mut self) {
-        for w in &self.workers {
-            let _ = w.jobs.send(None);
+        for worker in &self.workers {
+            worker.mailbox.close();
         }
-        for w in &mut self.workers {
-            if let Some(h) = w.handle.take() {
-                let _ = h.join();
+        for worker in &mut self.workers {
+            if let Some(handle) = worker.handle.take() {
+                let _ = handle.join();
             }
         }
     }
@@ -204,6 +293,9 @@ impl Simulator {
     }
 
     pub(super) fn dispatch_multicore(&mut self, blocks: &mut [usize]) -> Result<(), String> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
         let partitioned =
             self.edge_block_partition_count > 0 && !self.edge_block_partition.is_empty();
         if partitioned {
@@ -278,11 +370,10 @@ impl Simulator {
             for (rank, &bi) in blocks.iter().enumerate() {
                 pool.order[bi] = rank;
             }
-            let mut groups: Vec<Vec<usize>> = (0..count).map(|_| Vec::new()).collect();
-            let mut costs = vec![0usize; count];
-            // Coarse cost-balanced batches. A loaded logical partition stays
-            // intact; the number of physical workers remains hardware bounded.
-            let mut units: Vec<Vec<usize>> = if partitioned {
+            // A logical partition is one indivisible task. Otherwise create
+            // several balanced tasks per worker, allowing any free worker to
+            // claim the next task instead of waiting for a fixed peer batch.
+            let mut groups: Vec<Vec<usize>> = if partitioned {
                 let mut units: Vec<Vec<usize>> = (0..self.edge_block_partition_count)
                     .map(|_| Vec::new())
                     .collect();
@@ -291,35 +382,41 @@ impl Simulator {
                 }
                 units.into_iter().filter(|u| !u.is_empty()).collect()
             } else {
-                blocks.iter().map(|&bi| vec![bi]).collect()
+                let tasks = blocks.len().min(count.saturating_mul(4)).max(1);
+                let mut groups: Vec<Vec<usize>> = (0..tasks).map(|_| Vec::new()).collect();
+                let mut costs = vec![0usize; tasks];
+                let mut ranked = blocks.to_vec();
+                ranked.sort_by_key(|&i| std::cmp::Reverse(pool.plans[i].as_ref().unwrap().len));
+                for bi in ranked {
+                    let task = (0..tasks).min_by_key(|&i| (costs[i], i)).unwrap();
+                    costs[task] += pool.plans[bi].as_ref().unwrap().len;
+                    groups[task].push(bi);
+                }
+                groups
             };
-            units.sort_by_key(|u| {
+            groups.sort_by_key(|group| {
                 std::cmp::Reverse(
-                    u.iter()
-                        .map(|&bi| pool.plans[bi].as_ref().unwrap().len)
+                    group
+                        .iter()
+                        .map(|&i| pool.plans[i].as_ref().unwrap().len)
                         .sum::<usize>(),
                 )
             });
-            for unit in units {
-                let worker = (0..count).min_by_key(|&i| (costs[i], i)).unwrap();
-                costs[worker] += unit
-                    .iter()
-                    .map(|&i| pool.plans[i].as_ref().unwrap().len)
-                    .sum::<usize>();
-                groups[worker].extend(unit);
-            }
-            pool.groups = groups
-                .into_iter()
-                .map(|mut group| {
-                    group.sort_by_key(|&bi| pool.order[bi]);
-                    Arc::new(
-                        group
-                            .into_iter()
-                            .map(|bi| pool.plans[bi].as_ref().unwrap().clone())
-                            .collect(),
-                    )
-                })
-                .collect();
+            pool.tasks = Arc::new(
+                groups
+                    .into_iter()
+                    .map(|mut group| {
+                        group.sort_by_key(|&bi| pool.order[bi]);
+                        Task {
+                            blocks: group
+                                .into_iter()
+                                .map(|bi| pool.plans[bi].as_ref().unwrap().clone())
+                                .collect(),
+                            output: Mutex::new(TaskOutput::default()),
+                        }
+                    })
+                    .collect(),
+            );
             pool.last_blocks = blocks.to_vec();
             pool.last_partitions = if partitioned {
                 blocks
@@ -330,65 +427,67 @@ impl Simulator {
                 Vec::new()
             };
         }
-        let epoch = Epoch {
-            values: self.signal_table.as_ptr(),
-            len: self.signal_table.len(),
-            signed: self.signal_signed.as_ptr(),
-            signed_len: self.signal_signed.len(),
-            names: &self.signal_name_to_id,
-            arrays: &self.array_first_id,
-            packed: &self.packed,
-            fast: !self.warn_x && !matches!(std::env::var("XEZIM_TWO_STATE").as_deref(), Ok("0")),
-        };
-        let mut sent = 0;
-        let mut error = None;
-        let serialized = parallel_serialize_enabled();
-        for i in 0..count {
-            let job = Job {
-                epoch,
-                blocks: pool.groups[i].clone(),
-                writes: std::mem::take(&mut pool.outputs[i]),
-            };
-            if serialized {
-                let reply = evaluate(i, job, &mut pool.serial_vm, &mut pool.serial_words);
-                self.prof_multicore_fast += reply.fast;
-                self.prof_multicore_fallback += reply.fallback;
-                if reply.error.is_some() {
-                    error = reply.error;
-                }
-                pool.outputs[i] = reply.writes;
-                continue;
-            }
-            if pool.workers[i].jobs.send(Some(job)).is_err() {
-                error = Some("parallel worker stopped".to_string());
-                break;
-            }
-            sent += 1;
-        }
-        // Always drain successful submissions before leaving this epoch,
-        // including when another worker failed. Nothing has been published.
-        for _ in 0..sent {
-            match pool.replies.recv() {
-                Ok(reply) => {
-                    self.prof_multicore_fast += reply.fast;
-                    self.prof_multicore_fallback += reply.fallback;
-                    if reply.error.is_some() {
-                        error = reply.error;
-                    }
-                    pool.outputs[reply.worker] = reply.writes;
-                }
-                Err(_) => {
-                    error = Some("parallel worker reply lost".into());
+        let work = Arc::new(EventWork {
+            epoch: Epoch {
+                values: self.signal_table.as_ptr(),
+                len: self.signal_table.len(),
+                signed: self.signal_signed.as_ptr(),
+                signed_len: self.signal_signed.len(),
+                names: &self.signal_name_to_id,
+                arrays: &self.array_first_id,
+                packed: &self.packed,
+                fast: !self.warn_x
+                    && !matches!(std::env::var("XEZIM_TWO_STATE").as_deref(), Ok("0")),
+            },
+            credits: EventCredits::new(pool.tasks.len()),
+            tasks: pool.tasks.clone(),
+            error: Mutex::new(None),
+        });
+        pool.stats.epochs += 1;
+        pool.stats.issued += work.tasks.len() as u64;
+        if parallel_serialize_enabled() {
+            consume(&work, &mut pool.serial_vm, &mut pool.serial_words);
+        } else {
+            for worker in pool.workers.iter().take(work.tasks.len()) {
+                if let Err(error) = worker.mailbox.notify(work.clone()) {
+                    work.fail(error);
                     break;
                 }
+                pool.stats.wakes += 1;
             }
         }
+        work.credits.seal();
+        let wait = self.profile_report.then(std::time::Instant::now);
+        // Event quiescence depends on actual queued/in-flight work credits,
+        // not on acknowledgements or arrivals from every configured worker.
+        work.credits.wait();
+        if let Some(start) = wait {
+            pool.stats.wait_ns += start.elapsed().as_nanos();
+        }
+        pool.stats.retired += work.credits.completed() as u64;
+        pool.stats.cancelled += work.credits.cancelled() as u64;
+        debug_assert_eq!(
+            work.tasks.len(),
+            work.credits.completed() + work.credits.cancelled()
+        );
+        let error = *work.error.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(error) = error {
-            return Err(error);
+            return Err(error.into());
+        }
+        // Credit zero proves every task output and input borrow is complete.
+        // Draining retains task-local vector capacity for the next event.
+        let mut outputs: Vec<_> = work
+            .tasks
+            .iter()
+            .map(|task| task.output.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
+        for output in &outputs {
+            self.prof_multicore_fast += output.fast;
+            self.prof_multicore_fallback += output.fallback;
         }
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
-        let mut drains: Vec<_> = pool.outputs.iter_mut().map(|v| v.drain(..)).collect();
+        let mut drains: Vec<_> = outputs.iter_mut().map(|o| o.writes.drain(..)).collect();
         let mut heads: Vec<_> = drains.iter_mut().map(Iterator::next).collect();
         let mut ready = BinaryHeap::new();
         for (i, head) in heads.iter().enumerate() {
@@ -407,6 +506,7 @@ impl Simulator {
             }
         }
         drop(drains);
+        drop(outputs);
         self.edge_workers = Some(pool);
         Ok(())
     }
@@ -489,3 +589,7 @@ impl Simulator {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "parallel_workers_tests.rs"]
+mod tests;

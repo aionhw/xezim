@@ -2568,6 +2568,7 @@ mod process_control;
 mod process_scopes;
 mod processes;
 mod profiling;
+mod credit_event;
 mod parallel_word;
 mod parallel_workers;
 mod sensitivity;
