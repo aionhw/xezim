@@ -1,0 +1,13 @@
+push 1 ok
+push 2 ok
+push 3 ok
+push 4 full
+pop 10 size 2 copy size 3
+pair sum 5 then 12
+counted 2 size 2 first 1.5
+0 s ra=0 rb=0
+10 ns ra=0 rb=0
+20 ns ra=0 rb=0
+30 ns ra=0 rb=0
+40 ns ra=1 rb=100
+50 ns ra=2 rb=101

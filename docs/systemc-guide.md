@@ -64,10 +64,14 @@ match the SystemC 2.3 reference kernel:
 ## Supported
 
 - **Modules**: `SC_MODULE` and classes deriving from `sc_module` (with
-  `SC_HAS_PROCESS` and out-of-class constructors), template modules with
-  integer parameters, constructor parameters, child modules (members, `new`,
-  initializer lists), named and positional port binding, `sc_vector` ports
-  and signals.
+  `SC_HAS_PROCESS` and out-of-class constructors), template modules,
+  constructor parameters, child modules (members, `new`, initializer
+  lists), named and positional port binding, `sc_vector` ports and signals,
+  arrays of signals.
+- **Templates**: class templates and module templates with type and value
+  parameters (defaults included) are instantiated per argument list, each
+  instantiation lowered on its own; a module template with value parameters
+  only is one SystemVerilog module with parameters.
 - **Ports and channels**: `sc_in`/`sc_out`/`sc_inout` (an `sc_inout` is an
   output its owner also reads), `sc_signal`, `sc_buffer` (an event on every
   write, also through the ports bound to it), `sc_clock`, `sc_fifo` (with its
@@ -122,9 +126,9 @@ simulated approximately:
 - `sc_port`/`sc_export` with user interfaces (custom hierarchical channels),
   `sc_mutex`/`sc_semaphore`, approximately-timed TLM (`nb_transport`,
   payload event queues), `sc_spawn`, `SC_FORK`/`SC_JOIN`, `next_trigger`.
-- Type template parameters of modules and classes, pointers other than
-  byte/word data pointers and pointers to objects, destructors with
-  statements in them (an empty destructor is fine).
+- Function templates, pointers other than byte/word data pointers and
+  pointers to objects, destructors with statements in them (an empty
+  destructor is fine).
 - C file I/O (`FILE*`), exceptions, `goto`, lambdas.
 - The SystemC 3.0 in-class process macros (`SC_METHOD_IMP`, …).
 

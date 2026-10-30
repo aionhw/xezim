@@ -280,3 +280,12 @@ fn class_payload() {
 fn class_objects() {
     check("objects");
 }
+
+/// C++ templates: a module template with a type parameter at two types
+/// (one SV module per instantiation), class templates with type and value
+/// parameters (defaults, as another template's argument and as a base
+/// class, the injected class name); arrays of signals.
+#[test]
+fn templates() {
+    check("templates");
+}
