@@ -2380,6 +2380,24 @@ impl Simulator {
                             }
                             return;
                         }
+                        // §9.4.2: a class property or event reached through a
+                        // handle (`forever @(h.val)`) has no signal to arm
+                        // on; the general process path resolves the handle
+                        // when the wait arms, so run this iteration there.
+                        if Self::event_control_single_expr(event)
+                            .is_some_and(|e| self.expr_instance_prop_field_general(&e).is_some())
+                        {
+                            let cont = self.forever_cont(pid, body, body_stmts, i, 2, s);
+                            let contp = pc.pushed_frame(cont, resume_at);
+                            if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
+                                self.event_queue.schedule(self.time, pid, contp);
+                                return;
+                            }
+                            self.forever_depth += 1;
+                            self.run_process_stmts(pid, &contp);
+                            self.forever_depth -= 1;
+                            return;
+                        }
                     }
                 }
             }

@@ -1692,7 +1692,29 @@ impl Simulator {
         }
         let clocking_head =
             leading_event(&ab.stmt).is_some_and(|event| self.is_clocking_event(event));
+        // §9.2.2/§9.4.2: `always @(h.val)` waits on a class member through a
+        // handle, which no static sensitivity can name; run it as the
+        // `forever` loop it is, on the process path that resolves handles.
+        let handle_head = leading_event(&ab.stmt)
+            .is_some_and(|event| self.wait_reaches_through_handle(event, &ab.scope));
         *self.name_resolve_hint.borrow_mut() = saved_hint;
+        if handle_head {
+            let forever_stmt = Statement::new(
+                StatementKind::Forever {
+                    body: Box::new(ab.stmt.clone()),
+                },
+                ab.stmt.span,
+            );
+            let pid = self.next_pid;
+            self.next_pid += 1;
+            if !ab.scope.is_empty() {
+                self.process_scope_hint.insert(pid, ab.scope.clone());
+            }
+            self.process_origin
+                .insert(pid, (ab.stmt.span, "always block"));
+            self.event_queue.schedule(0, pid, vec![forever_stmt].into());
+            return None;
+        }
         if let Some((sens, body)) = extracted {
             if !sens.is_empty() {
                 let all_level = sens.iter().all(|s| s.edge == EdgeKind::AnyEdge);
@@ -2335,6 +2357,16 @@ impl Simulator {
             *self.name_resolve_hint.borrow_mut() = saved;
             v
         };
+        // §9.4.2: a wait on a class property or event reached through a
+        // handle (`@(h.val)`, `@(h.ev)`) has no signal to arm on — the
+        // FSM would park on a name that never changes. The AST process
+        // path resolves the handle when the wait arms.
+        if waits.iter().any(|w| self.wait_reaches_through_handle(&w.0, scope)) {
+            if dbg {
+                eprintln!("[PROC-FSM] scope '{}': waits through a class handle", scope);
+            }
+            return false;
+        }
         let mut cb = compiler.finish();
         // Constant-delay fold: an integer bare delay elaborates to
         // `LoadConst(int) ; LoadConst(real scale) ; Mul ; WaitDelayReg`.
@@ -2471,6 +2503,49 @@ impl Simulator {
         }
         self.event_queue.schedule(0, pid, Vec::new().into());
         true
+    }
+
+    /// Whether an event control names a member of a class object through a
+    /// handle variable (`@(h.val)`): the head is a signal (the handle) but
+    /// the dotted name is not.
+    fn wait_reaches_through_handle(&self, ev: &EventControl, scope: &str) -> bool {
+        fn segments<'e>(e: &'e Expression, out: &mut Vec<&'e str>) -> bool {
+            match &e.kind {
+                ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                    out.extend(h.path.iter().map(|s| s.name.name.as_str()));
+                    true
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    let ok = segments(expr, out);
+                    out.push(member.name.as_str());
+                    ok
+                }
+                ExprKind::Paren(inner) => segments(inner, out),
+                _ => false,
+            }
+        }
+        let exprs: Vec<&Expression> = match ev {
+            EventControl::EventExpr(terms) => terms.iter().map(|t| &t.expr).collect(),
+            EventControl::HierIdentifier(e) => vec![e],
+            _ => Vec::new(),
+        };
+        let scoped = |n: &str| {
+            if scope.is_empty() {
+                n.to_string()
+            } else {
+                format!("{scope}.{n}")
+            }
+        };
+        exprs.into_iter().any(|e| {
+            let mut segs = Vec::new();
+            if !segments(e, &mut segs) || segs.len() < 2 {
+                return false;
+            }
+            let full = segs.join(".");
+            self.signal_name_to_id.contains_key(scoped(segs[0]).as_str())
+                && !self.signal_name_to_id.contains_key(scoped(&full).as_str())
+                && !self.signal_name_to_id.contains_key(full.as_str())
+        })
     }
 
     /// The write-target census of every process body (see

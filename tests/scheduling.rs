@@ -259,6 +259,8 @@ mod bare_randomize_in_method;
 mod class_event_member_wait;
 #[path = "scheduling/class_nonevent_prop_wait.rs"]
 mod class_nonevent_prop_wait;
+#[path = "scheduling/handle_member_wait_process_forms.rs"]
+mod handle_member_wait_process_forms;
 #[path = "scheduling/clock_gen_dotted_target.rs"]
 mod clock_gen_dotted_target;
 #[path = "scheduling/clock_gen_fifo_rank.rs"]
