@@ -176,3 +176,48 @@ fn prot19() {
 fn retid19() {
     check("retid19");
 }
+
+/// VHDL-2019 §16.2.2 'IMAGE and §5.7 TO_STRING of records and arrays
+/// (nested), the subtype attributes 'SUBTYPE, 'ELEMENT, 'BASE,
+/// 'DESIGNATED_SUBTYPE and 'INDEX as type marks, and scalar 'VALUE.
+#[test]
+fn attr19() {
+    check("attr19");
+}
+
+/// VHDL-2019 §16.2.2 'VALUE of records and arrays (nested, a string literal
+/// for an array of character literals), and a failure for text with the
+/// wrong number of elements (LRM golden: nvc 1.23.1 fails on these).
+#[test]
+fn value19() {
+    check("value19");
+}
+
+/// VHDL-2019 §16.5 STD.ENV: VHDL_VERSION, TOOL_TYPE, FILE_NAME, FILE_LINE,
+/// DIR_SEPARATOR, GETENV, the calendar and time conversions of fixed
+/// times, the assertion counts and enables, and the directory functions.
+#[test]
+fn env19() {
+    check("env19");
+}
+
+/// VHDL-2019 §5.5.2 file state, mode, size, position and seeking (LRM
+/// golden for xezim's file format).
+#[test]
+fn fileapi19() {
+    check("fileapi19");
+}
+
+/// VHDL-2019 §16.5: TOOL_* name xezim (the values of the conditional
+/// analysis identifiers, §24.2) and VHDL_VERSION the revision.
+#[test]
+fn tool_identity() {
+    let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vhdl"))
+        .args(["--no-cache", "--std=19", "errors19/tool19.vhd"])
+        .output()
+        .expect("run xezim");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let expect = format!("[SIMULATION|xezim|xezim||{}|2019]", env!("CARGO_PKG_VERSION"));
+    assert!(text.contains(&expect), "{}", text);
+}

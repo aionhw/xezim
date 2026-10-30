@@ -1,0 +1,2 @@
+state_closed state_open write_mode size=20 pos=20 true state_closed
+seek8=30 pos=12 cur+4=50 rewind=10 end-4=50 true

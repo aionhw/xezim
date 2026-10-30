@@ -2168,6 +2168,14 @@ impl Simulator {
                 let r = args.first().map(|a| self.eval_expr(a).to_f64()).unwrap_or(0.0);
                 Value::from_string(&xezim_core::vhdl::real_image(r))
             }
+            // The operating-system services of VHDL's STD.ENV (IEEE
+            // 1076-2019 §16.5) for designs lowered from VHDL: GETENV, the
+            // time, the file system (xezim_core::vhdl::os_call).
+            "$__vh_os" => {
+                let op = args.first().map(|a| self.eval_expr(a).to_sv_string()).unwrap_or_default();
+                let arg = args.get(1).map(|a| self.eval_expr(a).to_sv_string()).unwrap_or_default();
+                Value::from_string(&xezim_core::vhdl::os_call(&op, &arg))
+            }
             // A REAL with DIGITS decimals (TEXTIO WRITE, IEEE 1076-2008
             // §16.4).
             "$__vh_real_fixed" => {

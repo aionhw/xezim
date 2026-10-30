@@ -1,0 +1,6 @@
+nvc 1.23.1 stops with an internal error on 'VALUE of a record or array type.
+The golden follows IEEE 1076-2019 §16.2.2: the parameter is the image of
+an aggregate (or, for an array of character literals, a string literal);
+blanks around it and around the elements are ignored. The last 'VALUE has
+two elements for a three-element array type: an error, as for text that
+is no value of a scalar type (GHDL: "bound check failure", exit 1).

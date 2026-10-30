@@ -123,7 +123,8 @@ transaction.
   subtype).
 - Expressions: all predefined operators (short-circuit `and`/`or`,
   matching `?=` etc.), aggregates, slices, concatenation, type
-  conversions, attributes, allocators, `'image` and TO_STRING in GHDL's
+  conversions, attributes, allocators, `'value` of scalar types (decimal,
+  based and exponent literals), `'image` and TO_STRING in GHDL's
   format.
 - IEEE `std_logic_1164`, `numeric_std` and the other IEEE packages,
   `fixed_pkg` and `float_pkg` among them, are compiled from their sources.
@@ -208,10 +209,25 @@ these VHDL-2019 additions work, checked against nvc 1.23 (`tests/vhdl/designs19/
   elements associated together or one by one;
 - empty record types, subtypes of variables and signals inferred from a
   static initial value, function return identifiers (`return r of t`), and
-  private variables of protected types (with aliases of their methods).
+  private variables of protected types (with aliases of their methods);
+- `'image`, `'value` and `TO_STRING` of records and one-dimensional arrays
+  (aggregates of the elements' images), and the type marks `t'base`,
+  `x'subtype`, `a'element`, `p'designated_subtype` and `a'index(n)`;
+- STD.ENV: `VHDL_VERSION`, `TOOL_*`, `GETENV`, `EPOCH`, `LOCALTIME`,
+  `GMTIME` and the time-record conversions, `TIME_TO_SECONDS`,
+  `SECONDS_TO_TIME`, `FILE_NAME`, `FILE_PATH`, `FILE_LINE`, `DIR_SEPARATOR`,
+  the directory functions (`DIR_ITEMEXISTS`, `DIR_WORKINGDIR`,
+  `DIR_CREATEDIR`, `DIR_DELETEDIR`, `DIR_DELETEFILE`, ...), and the
+  assertion counts and enables (`GetVhdlAssertCount`, `SetVhdlAssertEnable`,
+  ...);
+- the file operations `FILE_STATE`, `FILE_MODE`, `FILE_POSITION`,
+  `FILE_SIZE`, `FILE_CANSEEK`, `FILE_SEEK` and `FILE_REWIND` (positions in
+  bytes of xezim's GHDL-format files).
 
-Not yet (each a located error): generics of protected types, and a port
-with a mode view at the SystemVerilog boundary.
+Not yet (each a located error): generics of protected types, a port with
+a mode view at the SystemVerilog boundary, `'image` of multi-dimensional
+arrays, `DIR_OPEN`/`DIR_CLOSE`, `GET_CALL_PATH`, the assertion formats
+(`SetVhdlAssertFormat`) and `FILE_TRUNCATE`.
 
 ## Not supported yet
 

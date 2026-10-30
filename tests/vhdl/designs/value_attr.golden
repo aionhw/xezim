@@ -1,0 +1,6 @@
+value_attr.vhd:12:5:@0ms:(report note): -123 255 1000
+value_attr.vhd:13:5:@0ms:(report note): 2.5 1.0e-2
+value_attr.vhd:14:5:@0ms:(report note): green 'x' true
+value_attr.vhd:15:5:@0ms:(report note): 3000 mm 7 mm
+ghdl:error: bound check failure at value_attr.vhd:16
+ghdl:error: simulation failed

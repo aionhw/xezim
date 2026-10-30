@@ -481,3 +481,11 @@ fn constrained_params() {
 fn assert_options() {
     check("assert_options");
 }
+
+/// §16.2.2 'VALUE of scalar types: decimal, based and exponent integer
+/// literals, reals, enumeration and character literals, physical literals,
+/// blanks ignored; text that is no value fails as in GHDL.
+#[test]
+fn value_attr() {
+    check("value_attr");
+}

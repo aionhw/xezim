@@ -1,0 +1,8 @@
+The positions and sizes FILE_POSITION, FILE_SIZE and FILE_SEEK use depend
+on the file's format, which IEEE 1076-2019 leaves to the implementation.
+xezim writes GHDL's binary format (a header, then each INTEGER in 4 bytes);
+nvc writes 8 bytes per INTEGER without a header, so its numbers differ.
+The golden is IEEE 1076-2019 §5.5.2 applied to xezim's format: the file
+holds 10, 20, 30, 40, 50 in 20 bytes (the header not counted); byte 8 is
+the third element, 4 bytes after position 12 the fifth, and the last 4
+bytes the fifth.
