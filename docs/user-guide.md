@@ -4,10 +4,11 @@ How to run simulations with xezim and use its main facilities. The full list
 of options and environment variables is in the
 [command-line reference](command-line.md). Topic guides cover
 [UVM](uvm-guide.md), [DPI-C and VPI](dpi-guide.md),
-[coverage](coverage-guide.md), [power intent (UPF)](upf-guide.md) and
-[debugging](DEBUGGING.md).
+[coverage](coverage-guide.md), [power intent (UPF)](upf-guide.md),
+[SystemC](systemc-guide.md) and [debugging](DEBUGGING.md).
 
 * [Running a simulation](#running-a-simulation)
+* [SystemC designs](#systemc-designs)
 * [Waveforms](#waveforms)
 * [Warm design cache](#warm-design-cache)
 * [Native compilation](#native-compilation)
@@ -53,6 +54,37 @@ hierarchical name that does not resolve, §23.8), `$fatal`, a
 `--dpi-lib` library that cannot be loaded, and an `-s` that names no module
 (`--no-strict-top` falls back to finding tops automatically). `$error` exits 0
 unless `--error-exit` is given.
+
+## SystemC designs
+
+SystemC (IEEE 1666) designs run from their C++ sources, with no SystemC
+library or C++ compiler involved: xezim lowers the modules, processes and
+channels to SystemVerilog and simulates them with the same kernel.
+
+```bash
+xezim top.cpp                          # an sc_main design
+xezim -I include design.cpp tb.cpp     # several translation units
+xezim counter.cpp tb.sv                # mixed: SystemVerilog instantiating SystemC
+xezim app.cpp +sc_args=16,fast         # sc_main's argv: sc_main, 16, fast
+```
+
+Files ending in `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp` or `.hh` are SystemC;
+`-I` and `-D` apply to their preprocessor. Without `-s`, the top is
+`sc_main`. The output and exit status are the reference kernel's: reports
+print in SystemC's format, an error report or an uncaught `SC_THROW` exits
+with status 1 and a fatal one with 134, and `sc_main`'s return value is the
+exit status otherwise. Constructs that cannot be simulated faithfully are
+rejected at their source line instead of being approximated.
+
+Processes of one delta cycle run in the order SystemVerilog scheduling
+gives them, which can differ from the reference kernel's order; output that
+depends on it (two processes printing in the same delta cycle) may come out
+in another order. Everything else, including update-phase semantics and
+times, matches SystemC 2.3.4.
+
+The [SystemC guide](systemc-guide.md) lists what is supported, how to mix
+SystemC and SystemVerilog, and how designs are checked against the
+reference kernel.
 
 ## Waveforms
 

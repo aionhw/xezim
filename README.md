@@ -45,7 +45,9 @@
 - UDPs, drive strengths, specify-block delays and timing checks
 - SDF back-annotation (`--sdf`)
 - IEEE 1801 UPF power intent (`--upf`)
-- SystemC (IEEE 1666) RTL, testbenches and TLM-2.0 LT from `.cpp` sources
+- SystemC (IEEE 1666) from `.cpp` sources: RTL, `sc_main` testbenches,
+  channels, dynamic processes and TLM-2.0, alone or mixed with
+  SystemVerilog
 
 </td>
 </tr>
@@ -101,6 +103,11 @@ event-driven kernel that follows the IEEE 1800 scheduling semantics. Most
 logic runs on fast two-state executors, which fall back to full four-state
 evaluation wherever `x` and `z` values appear.
 
+SystemC (IEEE 1666) sources take the same path: xezim parses the C++,
+lowers its modules, processes, channels and TLM-2.0 sockets to SystemVerilog
+and simulates them with the same kernel, so SystemC and SystemVerilog parts
+of one design can instantiate each other.
+
 Everything happens in one invocation, so a design goes from source to results
 without a separate build step, and a test suite made of many short runs gets
 its answers quickly. The same command line works for an RTL unit test, a
@@ -144,8 +151,31 @@ xezim -s top -I $UVM/src $UVM/src/uvm_pkg.sv <design and testbench files> \
       +UVM_TESTNAME=my_test
 ```
 
-See the [user guide](docs/user-guide.md) and the
-[UVM guide](docs/uvm-guide.md) for more.
+A SystemC design runs the same way, from its C++ sources; no SystemC
+library or C++ compiler is needed:
+
+```cpp
+// hello.cpp
+#include <systemc.h>
+SC_MODULE(hello) {
+    void run() { wait(5, SC_NS); std::cout << sc_time_stamp() << " hello" << std::endl; }
+    SC_CTOR(hello) { SC_THREAD(run); }
+};
+int sc_main(int, char*[]) { hello h("h"); sc_start(); return 0; }
+```
+
+```text
+$ ./target/release/xezim hello.cpp
+5 ns hello
+Simulation finished at time 5000 ($finish called)
+```
+
+(SystemC time runs in picoseconds, the reference kernel's default
+resolution.)
+
+See the [user guide](docs/user-guide.md), the
+[UVM guide](docs/uvm-guide.md) and the
+[SystemC guide](docs/systemc-guide.md) for more.
 
 ## Performance
 
@@ -195,7 +225,7 @@ with few, very hot blocks, so measure it on yours.
 | [DPI and VPI guide](docs/dpi-guide.md) | Loading C and C++ libraries, the VPI surface |
 | [Coverage guide](docs/coverage-guide.md) | Functional, assertion and code coverage, `xezim_cov.json` |
 | [UPF guide](docs/upf-guide.md) | IEEE 1801 power intent |
-| [SystemC guide](docs/systemc-guide.md) | IEEE 1666 SystemC and TLM-2.0 designs |
+| [SystemC guide](docs/systemc-guide.md) | IEEE 1666 SystemC and TLM-2.0 designs: what is supported, mixing with SystemVerilog, how results are checked against the reference kernel |
 | [Debugging guide](docs/DEBUGGING.md) | Tracing, diagnosing hangs, comparing against another simulator |
 | [Building from source](docs/building.md) | Requirements, profile-guided builds, working on xezim-core |
 | [Release notes](NOTES.md) | Changes per release, verified workloads, compliance results |

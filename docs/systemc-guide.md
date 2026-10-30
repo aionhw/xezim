@@ -1,7 +1,9 @@
 # SystemC (IEEE 1666)
 
-xezim simulates SystemC designs: RTL modules, `sc_main` testbenches and
-TLM-2.0 loosely-timed models. Give it the `.cpp` files like any other source:
+xezim simulates SystemC designs: RTL modules, `sc_main` testbenches,
+hierarchical and primitive channels, dynamic processes, the report handler
+and TLM-2.0 loosely-timed models, with no SystemC library or C++ compiler.
+Give it the `.cpp` files like any other source:
 
     xezim top.cpp
     xezim -I include design.cpp tb.cpp      # several translation units
@@ -96,8 +98,17 @@ match the SystemC 2.3 reference kernel:
 - **Dynamic threads** (§5.5–§5.6): `sc_spawn` of member and free functions
   through `sc_bind`, with a result through `&r`, a name and
   `sc_spawn_options` (`set_stack_size` only); `SC_FORK`/`SC_JOIN`;
-  `sc_process_handle` with `terminated()`, `terminated_event()` and
-  `valid()`. Events local to a function, passed by reference.
+  `sc_process_handle` with `terminated()`, `terminated_event()`,
+  `valid()`, `name()`, `proc_kind()`, `kill()`, `suspend()` and `resume()`
+  (a process due to wake while suspended runs when resumed), for spawned
+  and static processes (`sc_get_current_process_handle()` in a process, or
+  in a constructor after `SC_THREAD`/`SC_METHOD`). Events local to a
+  function, passed by reference.
+- **Kernel queries**: `sc_is_running()`, `sc_get_status()`; the object
+  hierarchy (§5.16): `sc_get_top_level_objects()`, `get_child_objects()`,
+  `get_parent_object()`, `sc_find_object()`, with each object's `name()`,
+  `basename()` and `kind()` (modules, ports, channels and processes, in
+  creation order).
 - **sc_main's arguments**: `argv[0]` is `sc_main`, the others are the
   comma-separated values of the plusarg `+sc_args=a,b,…`; `atoi`/`atof`
   convert them. Module constructor arguments become SystemVerilog
@@ -174,8 +185,8 @@ simulated approximately:
 - Approximately-timed TLM (`nb_transport`, payload event queues),
   `sc_event_and_list` / `sc_event_or_list` objects (the `e1 & e2` /
   `e1 | e2` expressions work), spawned method processes and lambdas,
-  `SC_CJOIN`, process control (`suspend`, `kill`, `reset`, …), report
-  log files (`SC_LOG`) and cached reports.
+  `SC_CJOIN`, `disable`/`enable` and `reset` of a process handle, report
+  log files (`SC_LOG`) and cached reports, `sc_pending_activity`.
 - Function templates, pointers other than byte/word data pointers and
   pointers to objects, destructors with statements in a class that is not a
   module (an empty one is fine).
@@ -207,5 +218,11 @@ installed SystemC, runs it under xezim and reports which match:
 
     python3 scripts/systemc_examples.py --examples systemc-2.3.4/examples --work /tmp/scx
 
-`pipe`, `fir` and `reset_signal_is` simulate with identical output; the
-others need features listed above.
+Seven of them simulate with identical output (`pipe`, `fir`,
+`reset_signal_is`, `sc_export`, `simple_fifo`, `forkjoin`, `sc_report`), and
+`scx_barrier` with the same lines in a different same-delta order (the
+script reports it as ORDER). `rsa` and `pkt_switch` seed their random
+numbers from the wall clock, so even the reference output differs between
+runs; `simple_perf` passes a run-time value to a module constructor; the
+rest need the features listed as not supported (approximately-timed TLM,
+C file I/O, fixed-point types and more of the C++ library).
