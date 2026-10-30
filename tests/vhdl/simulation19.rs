@@ -221,3 +221,25 @@ fn tool_identity() {
     let expect = format!("[SIMULATION|xezim|xezim||{}|2019]", env!("CARGO_PKG_VERSION"));
     assert!(text.contains(&expect), "{}", text);
 }
+
+/// VHDL-2019 STD.REFLECTION: subtype and value mirrors of enumeration,
+/// integer, floating, physical, record, array and access types.
+#[test]
+fn refl19() {
+    check("refl19");
+}
+
+/// VHDL-2019 STD.REFLECTION: the designated object of an access value
+/// mirror (LRM golden: nvc 1.23.1 gives a wrong value).
+#[test]
+fn reflacc19() {
+    check("reflacc19");
+}
+
+/// VHDL-2019 §5.4.1: access types of protected types, a protected type
+/// completing an incomplete type, method calls through access values (LRM
+/// golden: nvc 1.23.1 rejects the incomplete type through a use clause).
+#[test]
+fn protacc19() {
+    check("protacc19");
+}

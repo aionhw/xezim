@@ -1,0 +1,9 @@
+COLOR class_enumeration red 3 blue 2
+green 1 COLOR
+REC 2 A 1 COLOR
+7 blue
+20 2 3 INTEGER 1 ARR
+5 1 MM 1000 2
+2.5 REAL
+SMALL 3 1 false 3
+true class_access INTEGER

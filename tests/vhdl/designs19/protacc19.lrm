@@ -1,0 +1,4 @@
+nvc 1.23.1 reports "multiple conflicting visible declarations of COUNTER_PT"
+for the incomplete type and its completion seen through a use clause.
+The golden follows IEEE 1076-2019: A and B designate two objects; A gets
+2 and 5, B 1; after B := A both designate A's object, which gets 10.

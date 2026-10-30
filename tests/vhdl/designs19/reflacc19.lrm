@@ -1,0 +1,3 @@
+nvc 1.23.1 gives a wrong value (an address) for the designated object of an
+access value mirror. The golden follows IEEE 1076-2019: GET of the access
+value mirror of P (designating 9) mirrors that INTEGER value.

@@ -220,6 +220,13 @@ these VHDL-2019 additions work, checked against nvc 1.23 (`tests/vhdl/designs19/
   `DIR_CREATEDIR`, `DIR_DELETEDIR`, `DIR_DELETEFILE`, ...), and the
   assertion counts and enables (`GetVhdlAssertCount`, `SetVhdlAssertEnable`,
   ...);
+- STD.REFLECTION: `'reflect` of types (subtype mirrors) and objects (value
+  mirrors) of enumeration, integer, floating, physical, record,
+  one-dimensional array, access, file and protected types, with the
+  mirrors' methods (names in upper case as in nvc; a value mirror is a
+  snapshot, an access value's designated object included);
+- access types of protected types (`new`, method calls through the access
+  value);
 - the file operations `FILE_STATE`, `FILE_MODE`, `FILE_POSITION`,
   `FILE_SIZE`, `FILE_CANSEEK`, `FILE_SEEK` and `FILE_REWIND` (positions in
   bytes of xezim's GHDL-format files).
@@ -227,7 +234,9 @@ these VHDL-2019 additions work, checked against nvc 1.23 (`tests/vhdl/designs19/
 Not yet (each a located error): generics of protected types, a port with
 a mode view at the SystemVerilog boundary, `'image` of multi-dimensional
 arrays, `DIR_OPEN`/`DIR_CLOSE`, `GET_CALL_PATH`, the assertion formats
-(`SetVhdlAssertFormat`) and `FILE_TRUNCATE`.
+(`SetVhdlAssertFormat`), `FILE_TRUNCATE`, and value mirrors of
+multi-dimensional arrays (and of cyclic access structures, which are
+mirrored eagerly).
 
 ## Not supported yet
 
