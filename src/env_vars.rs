@@ -599,6 +599,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "compile a class method after N calls (0 = first call); an explicit setting also attempts compilation on the next call after a wait-free method reaches N measured loop iterations",
     ),
     (
+        "XEZIM_MULTICORE",
+        "Parallel: opt-in persistent workers with guarded word execution (1)",
+    ),
+    (
         "XEZIM_NAME_STATS",
         "Count string-keyed name lookups per site (UVM runtime-ID investigation)",
     ),
@@ -653,14 +657,6 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_PACKED_MEM",
         "Memory: packed arena storage for large integral arrays (on; 0 turns it off)",
-    ),
-    (
-        "XEZIM_MULTICORE",
-        "Parallel: opt-in persistent workers with guarded word execution (1)",
-    ),
-    (
-        "XEZIM_THREADS",
-        "Parallel: worker count for XEZIM_MULTICORE, bounded by available CPUs",
     ),
     (
         "XEZIM_PARALLEL_SERIALIZE",
@@ -862,6 +858,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_TEMPLATE_CENSUS",
         "Profiling: group compiled blocks by canonical shape; report repeated-template dynamic coverage (wants COMB_PATHS + EDGE_BLOCK_STATS)",
+    ),
+    (
+        "XEZIM_THREADS",
+        "Parallel: worker count for XEZIM_MULTICORE, bounded by available CPUs",
     ),
     (
         "XEZIM_TOPO_JOIN",
