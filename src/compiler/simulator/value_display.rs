@@ -1324,7 +1324,7 @@ impl Simulator {
     /// breaks `.name()` on the result. Constraints in a `with {}` clause still
     /// refine the value afterwards, exactly as for a plain integral target.
     pub(super) fn exec_std_randomize(&mut self, args: &[Expression]) -> Value {
-        use rand::Rng;
+        use rand::RngExt;
         for a in args {
             // IEEE 1800-2017 §18.12: an OBJECT handle argument
             // (`std::randomize(obj)`) randomizes the referenced object's
@@ -1346,11 +1346,11 @@ impl Simulator {
                     let w = self.infer_lhs_width(fexpr).max(1);
                     let members = self.declared_enum_members(name).filter(|m| !m.is_empty());
                     let rv = if let Some(ms) = members {
-                        let i = self.cur_rng().gen_range(0..ms.len());
+                        let i = self.cur_rng().random_range(0..ms.len());
                         Value::from_u64(ms[i].1, w)
                     } else if w <= 64 {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                        Value::from_u64(self.cur_rng().r#gen::<u64>() & mask, w)
+                        Value::from_u64(self.cur_rng().random::<u64>() & mask, w)
                     } else {
                         Value::zero(w)
                     };
@@ -1375,11 +1375,11 @@ impl Simulator {
                 let members = self.declared_enum_members(&nm).filter(|m| !m.is_empty());
                 for i in 0..size {
                     let rv = if let Some(ms) = &members {
-                        let k = self.cur_rng().gen_range(0..ms.len());
+                        let k = self.cur_rng().random_range(0..ms.len());
                         Value::from_u64(ms[k].1, w)
                     } else {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                        Value::from_u64(self.cur_rng().r#gen::<u64>() & mask, w)
+                        Value::from_u64(self.cur_rng().random::<u64>() & mask, w)
                     };
                     self.set_signal_value_by_name(&format!("{}[{}]", nm, i), rv);
                 }
@@ -1393,7 +1393,7 @@ impl Simulator {
                     let members = self.declared_enum_members(&bare).filter(|m| !m.is_empty());
                     if let Some(members) = members {
                         let w = self.infer_lhs_width(a).max(1);
-                        let i = self.cur_rng().gen_range(0..members.len());
+                        let i = self.cur_rng().random_range(0..members.len());
                         let rv = Value::from_u64(members[i].1, w);
                         self.assign_value(a, &rv);
                         continue;

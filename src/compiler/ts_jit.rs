@@ -10,7 +10,7 @@
 pub mod enabled {
     use super::super::bytecode::TsInsn;
     use super::super::simulator::Simulator;
-    use cranelift::codegen::ir::MemFlags;
+    use cranelift::codegen::ir::MemFlagsData;
     use cranelift::prelude::*;
     use cranelift_jit::{JITBuilder, JITModule as ClJitModule};
     use cranelift_module::{FuncId, Linkage, Module};
@@ -594,7 +594,7 @@ pub mod enabled {
             let sim = b.block_params(entry)[0];
             let table = b.block_params(entry)[1];
             let mut regs: Vec<Option<Value>> = vec![None; num_regs as usize];
-            let flags = MemFlags::trusted();
+            let flags = MemFlagsData::trusted();
             macro_rules! reg {
                 ($r:expr) => {{
                     let i = $r as usize;
@@ -621,7 +621,7 @@ pub mod enabled {
             macro_rules! load_sig {
                 ($sig:expr) => {{
                     let off = ($sig as i64) * 32;
-                    let base = b.ins().iadd_imm(table, off);
+                    let base = b.ins().iadd_imm_s(table, off);
                     // One branch per load: a non-inline tag or any x/z bit
                     // both hand the block to the four-state path (the
                     // interpreter re-runs it either way; only the demotion
@@ -656,13 +656,13 @@ pub mod enabled {
                     }
                     T::SigBit { d, sig, bit } => {
                         let v = load_sig!(*sig);
-                        let s = b.ins().ushr_imm(v, *bit as i64);
-                        let r = b.ins().band_imm(s, 1);
+                        let s = b.ins().ushr_imm_s(v, *bit as i64);
+                        let r = b.ins().band_imm_s(s, 1);
                         set!(*d, r);
                     }
                     T::SigRange { d, sig, lo, mask } => {
                         let v = load_sig!(*sig);
-                        let s = b.ins().ushr_imm(v, *lo as i64);
+                        let s = b.ins().ushr_imm_s(v, *lo as i64);
                         let m = b.ins().iconst(types::I64, *mask as i64);
                         let r = b.ins().band(s, m);
                         set!(*d, r);
@@ -673,13 +673,13 @@ pub mod enabled {
                     }
                     T::Bit { d, s, bit } => {
                         let sv = reg!(*s);
-                        let t = b.ins().ushr_imm(sv, *bit as i64);
-                        let r = b.ins().band_imm(t, 1);
+                        let t = b.ins().ushr_imm_s(sv, *bit as i64);
+                        let r = b.ins().band_imm_s(t, 1);
                         set!(*d, r);
                     }
                     T::Range { d, s, lo, mask } => {
                         let sv = reg!(*s);
-                        let t = b.ins().ushr_imm(sv, *lo as i64);
+                        let t = b.ins().ushr_imm_s(sv, *lo as i64);
                         let m = b.ins().iconst(types::I64, *mask as i64);
                         let r = b.ins().band(t, m);
                         set!(*d, r);
@@ -775,14 +775,14 @@ pub mod enabled {
                     }
                     T::LogNot { d, s } => {
                         let sv = reg!(*s);
-                        let c = b.ins().icmp_imm(IntCC::Equal, sv, 0);
+                        let c = b.ins().icmp_imm_s(IntCC::Equal, sv, 0);
                         let r = bool64!(c);
                         set!(*d, r);
                     }
                     T::LogAnd { d, a, b: bb } | T::LogOr { d, a, b: bb } => {
                         let (x, y) = (reg!(*a), reg!(*bb));
-                        let cx = b.ins().icmp_imm(IntCC::NotEqual, x, 0);
-                        let cy = b.ins().icmp_imm(IntCC::NotEqual, y, 0);
+                        let cx = b.ins().icmp_imm_s(IntCC::NotEqual, x, 0);
+                        let cy = b.ins().icmp_imm_s(IntCC::NotEqual, y, 0);
                         let c = if matches!(insn, T::LogAnd { .. }) {
                             b.ins().band(cx, cy)
                         } else {
@@ -793,7 +793,7 @@ pub mod enabled {
                     }
                     T::RedOr { d, s } => {
                         let sv = reg!(*s);
-                        let c = b.ins().icmp_imm(IntCC::NotEqual, sv, 0);
+                        let c = b.ins().icmp_imm_s(IntCC::NotEqual, sv, 0);
                         let r = bool64!(c);
                         set!(*d, r);
                     }
@@ -820,7 +820,7 @@ pub mod enabled {
                         let (x, amt) = (reg!(*a), reg!(*bb));
                         let ge =
                             b.ins()
-                                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, amt, *w as i64);
+                                .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, amt, *w as i64);
                         let t = b.ins().ishl(x, amt);
                         let m = b.ins().iconst(types::I64, *mask as i64);
                         let shifted = b.ins().band(t, m);
@@ -832,7 +832,7 @@ pub mod enabled {
                         let (x, amt) = (reg!(*a), reg!(*bb));
                         let ge =
                             b.ins()
-                                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, amt, *w as i64);
+                                .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, amt, *w as i64);
                         let shifted = b.ins().ushr(x, amt);
                         let zero = b.ins().iconst(types::I64, 0);
                         let r = b.ins().select(ge, zero, shifted);
@@ -842,7 +842,7 @@ pub mod enabled {
                         let part = reg!(*s);
                         let mut acc = b.ins().iconst(types::I64, 0);
                         for _ in 0..*count {
-                            let sh = b.ins().ishl_imm(acc, *w as i64);
+                            let sh = b.ins().ishl_imm_s(acc, *w as i64);
                             acc = b.ins().bor(sh, part);
                         }
                         set!(*d, acc);
@@ -851,7 +851,7 @@ pub mod enabled {
                         let mut acc = b.ins().iconst(types::I64, 0);
                         for &(r, w) in parts.iter() {
                             let pv = reg!(r);
-                            let sh = b.ins().ishl_imm(acc, w as i64);
+                            let sh = b.ins().ishl_imm_s(acc, w as i64);
                             acc = b.ins().bor(sh, pv);
                         }
                         set!(*d, acc);
@@ -941,7 +941,7 @@ pub mod enabled {
             b.ins().return_(&[two]);
             let _ = &bail_abort;
             b.seal_all_blocks();
-            b.finalize();
+            b.finalize(self.module.target_config());
             if std::env::var_os("XEZIM_TS_JIT_CLIF").is_some() {
                 eprintln!("[TS-JIT CLIF]\n{}", ctx.func.display());
             }

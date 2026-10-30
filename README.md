@@ -13,7 +13,7 @@
   <a href="https://github.com/aionhw/xezim/actions/workflows/test.yml"><img alt="CI" src="https://github.com/aionhw/xezim/actions/workflows/test.yml/badge.svg"></a>
   <a href="https://github.com/aionhw/xezim/tags"><img alt="Release" src="https://img.shields.io/github/v/tag/aionhw/xezim?label=release&amp;color=informational"></a>
   <a href="https://github.com/chipsalliance/sv-tests"><img alt="sv-tests: 99.0%" src="https://img.shields.io/badge/sv--tests-99.0%25-brightgreen"></a>
-  <a href="docs/building.md#requirements"><img alt="Rust 1.92+" src="https://img.shields.io/badge/rust-1.92%2B-orange"></a>
+  <a href="docs/building.md#requirements"><img alt="Rust 1.99.1+" src="https://img.shields.io/badge/rust-1.99.1%2B-orange"></a>
   <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-blue"></a>
 </p>
 

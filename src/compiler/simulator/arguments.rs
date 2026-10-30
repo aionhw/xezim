@@ -2928,7 +2928,7 @@ impl Simulator {
     /// sum(weights). Zero-weight branches are never taken; an all-zero (or
     /// empty) list selects nothing.
     pub(super) fn randcase_pick(&mut self, items: &[(Expression, Statement)]) -> Option<usize> {
-        use rand::Rng;
+        use rand::RngExt;
         let weights: Vec<u64> = items
             .iter()
             .map(|(w, _)| self.eval_expr(w).to_u64().unwrap_or(0))
@@ -2937,7 +2937,7 @@ impl Simulator {
         if total == 0 {
             return None;
         }
-        let mut draw = self.cur_rng().gen_range(0..total);
+        let mut draw = self.cur_rng().random_range(0..total);
         for (i, w) in weights.iter().enumerate() {
             if *w == 0 {
                 continue;

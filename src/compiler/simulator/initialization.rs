@@ -4942,8 +4942,8 @@ impl Simulator {
             if let Some(v) = a.strip_prefix("seed=").or_else(|| a.strip_prefix("+seed=")) {
                 let v = v.trim();
                 if v.eq_ignore_ascii_case("random") {
-                    use rand::Rng;
-                    let seed = rand::rngs::StdRng::from_entropy().r#gen::<u64>();
+                    use rand::RngExt;
+                    let seed = rand::rng().random::<u64>();
                     eprintln!("[xezim] random seed: {} (replay with +seed={})", seed, seed);
                     self.rng = SvRng::from_seed(seed);
                     self.run_seed = Some(seed);

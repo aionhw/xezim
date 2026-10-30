@@ -404,7 +404,7 @@ mod enabled {
         xezim_jit_store_signal, xezim_jit_store_signal_4s, xezim_jit_take_interrupt,
     };
     use cranelift::codegen::ir::{
-        BlockArg, BlockCall, FuncRef, JumpTableData, MemFlags, StackSlot,
+        BlockArg, BlockCall, FuncRef, JumpTableData, MemFlagsData, StackSlot,
     };
 
     /// The two leaner NBA emission paths below move only the VALUE plane, so
@@ -1007,7 +1007,7 @@ mod enabled {
                     let byte =
                         builder
                             .ins()
-                            .load(types::I8, MemFlags::trusted(), xz_base, id as i32);
+                            .load(types::I8, MemFlagsData::trusted(), xz_base, id as i32);
                     acc = builder.ins().bor(acc, byte);
                 }
                 builder.ins().brif(
@@ -1028,7 +1028,9 @@ mod enabled {
                 ));
                 for (i, &id) in input_ids.iter().enumerate() {
                     let id_val = builder.ins().iconst(types::I32, id as i64);
-                    builder.ins().stack_store(id_val, id_slot, (i * 4) as i32);
+                    builder
+                        .ins()
+                        .stack_store(pointer_type, id_val, id_slot, (i * 4) as i32);
                 }
                 let ids_ptr = builder.ins().stack_addr(pointer_type, id_slot, 0);
                 let n_val = builder.ins().iconst(types::I32, input_ids.len() as i64);
@@ -1135,13 +1137,18 @@ mod enabled {
                         // §12.4 truth = any DEFINITE 1 (v & ~x): with raw
                         // val planes a Z bit carries v=1, so the bare plane
                         // is no longer a valid truth test.
-                        let cv0 =
-                            builder
-                                .ins()
-                                .stack_load(types::I64, reg_slots[*cond as usize], 0);
-                        let cx0 = builder
-                            .ins()
-                            .stack_load(types::I64, xz_slots[*cond as usize], 0);
+                        let cv0 = builder.ins().stack_load(
+                            pointer_type,
+                            types::I64,
+                            reg_slots[*cond as usize],
+                            0,
+                        );
+                        let cx0 = builder.ins().stack_load(
+                            pointer_type,
+                            types::I64,
+                            xz_slots[*cond as usize],
+                            0,
+                        );
                         let ncx = builder.ins().bnot(cx0);
                         let cv = builder.ins().band(cv0, ncx);
                         let target_b = resolve_target(*target as usize, &pc_to_block);
@@ -1162,7 +1169,9 @@ mod enabled {
                             // loop inside one time slot never stops.
                             let ib = *intr_block.get_or_insert_with(|| builder.create_block());
                             let fa = builder.ins().iconst(pointer_type, loop_stop_addr);
-                            let f = builder.ins().load(types::I8, MemFlags::trusted(), fa, 0);
+                            let f = builder
+                                .ins()
+                                .load(types::I8, MemFlagsData::trusted(), fa, 0);
                             builder.ins().brif(f, ib, &[], target_b, &[]);
                         } else {
                             builder.ins().jump(target_b, &[]);
@@ -1189,7 +1198,9 @@ mod enabled {
                             builder.ins().brif(nz, check_b, &[], fall_b, &[]);
                             builder.switch_to_block(check_b);
                             let fa = builder.ins().iconst(pointer_type, loop_stop_addr);
-                            let f = builder.ins().load(types::I8, MemFlags::trusted(), fa, 0);
+                            let f = builder
+                                .ins()
+                                .load(types::I8, MemFlagsData::trusted(), fa, 0);
                             builder.ins().brif(f, ib, &[], target_b, &[]);
                         } else {
                             builder.ins().brif(nz, target_b, &[], fall_b, &[]);
@@ -1393,15 +1404,18 @@ mod enabled {
                             && nba_side_queue.is_some() =>
                     {
                         let (base_ptr, len_ptr, _cap) = nba_side_queue.unwrap();
-                        let v =
-                            builder
-                                .ins()
-                                .stack_load(types::I64, reg_slots[*val_reg as usize], 0);
+                        let v = builder.ins().stack_load(
+                            pointer_type,
+                            types::I64,
+                            reg_slots[*val_reg as usize],
+                            0,
+                        );
                         // Load current length (u32) from *len_ptr.
                         let len_addr = builder.ins().iconst(pointer_type, len_ptr as i64);
-                        let len = builder
-                            .ins()
-                            .load(types::I32, MemFlags::trusted(), len_addr, 0);
+                        let len =
+                            builder
+                                .ins()
+                                .load(types::I32, MemFlagsData::trusted(), len_addr, 0);
                         // Compute slot address: base + len * 16 (sizeof JitNbaSideEntry).
                         let base = builder.ins().iconst(pointer_type, base_ptr as i64);
                         let len64 = builder.ins().uextend(types::I64, len);
@@ -1410,16 +1424,16 @@ mod enabled {
                         let slot = builder.ins().iadd(base, offset);
                         // Write signal_id (u32) at offset 0.
                         let sid = builder.ins().iconst(types::I32, *sig_id as i64);
-                        builder.ins().store(MemFlags::trusted(), sid, slot, 0);
+                        builder.ins().store(MemFlagsData::trusted(), sid, slot, 0);
                         // Write val_bits (u64) at offset 8 (skip the 4-byte
                         // pad after signal_id).
-                        builder.ins().store(MemFlags::trusted(), v, slot, 8);
+                        builder.ins().store(MemFlagsData::trusted(), v, slot, 8);
                         // Increment len.
                         let one = builder.ins().iconst(types::I32, 1);
                         let new_len = builder.ins().iadd(len, one);
                         builder
                             .ins()
-                            .store(MemFlags::trusted(), new_len, len_addr, 0);
+                            .store(MemFlagsData::trusted(), new_len, len_addr, 0);
                     }
                     // JIT Stage 4 Tier A: when the Insn::NbaAssign's
                     // width matches the signal's declared width, emit
@@ -1434,10 +1448,12 @@ mod enabled {
                                 .get(*sig_id as usize)
                                 .map_or(false, |&w| w == *width) =>
                     {
-                        let v =
-                            builder
-                                .ins()
-                                .stack_load(types::I64, reg_slots[*val_reg as usize], 0);
+                        let v = builder.ins().stack_load(
+                            pointer_type,
+                            types::I64,
+                            reg_slots[*val_reg as usize],
+                            0,
+                        );
                         let id = builder.ins().iconst(types::I32, *sig_id as i64);
                         builder.ins().call(nba_fast_ref, &[sim_ptr, id, v]);
                     }
@@ -1463,13 +1479,16 @@ mod enabled {
                         // service in `FOUR_STATE_NBA_FAST_OK` above; the read
                         // path was missed at the time.
                         let offset = (*sig_id as i32) * 16;
-                        let val = builder
-                            .ins()
-                            .load(types::I64, MemFlags::trusted(), base, offset);
-                        let xzv =
+                        let val =
                             builder
                                 .ins()
-                                .load(types::I64, MemFlags::trusted(), base, offset + 8);
+                                .load(types::I64, MemFlagsData::trusted(), base, offset);
+                        let xzv = builder.ins().load(
+                            types::I64,
+                            MemFlagsData::trusted(),
+                            base,
+                            offset + 8,
+                        );
                         st2(
                             &mut builder,
                             pointer_type,
@@ -1541,16 +1560,26 @@ mod enabled {
                         if let Some((d, w)) = insn_result_width(other, &reg_widths, signal_widths) {
                             let mask = (1u64 << w) - 1;
                             let mc = builder.ins().iconst(types::I64, mask as i64);
-                            let v = builder
-                                .ins()
-                                .stack_load(types::I64, reg_slots[d as usize], 0);
+                            let v = builder.ins().stack_load(
+                                pointer_type,
+                                types::I64,
+                                reg_slots[d as usize],
+                                0,
+                            );
                             let mv = builder.ins().band(v, mc);
-                            builder.ins().stack_store(mv, reg_slots[d as usize], 0);
-                            let x = builder
+                            builder
                                 .ins()
-                                .stack_load(types::I64, xz_slots[d as usize], 0);
+                                .stack_store(pointer_type, mv, reg_slots[d as usize], 0);
+                            let x = builder.ins().stack_load(
+                                pointer_type,
+                                types::I64,
+                                xz_slots[d as usize],
+                                0,
+                            );
                             let mx = builder.ins().band(x, mc);
-                            builder.ins().stack_store(mx, xz_slots[d as usize], 0);
+                            builder
+                                .ins()
+                                .stack_store(pointer_type, mx, xz_slots[d as usize], 0);
                         }
                     }
                 }
@@ -1583,7 +1612,7 @@ mod enabled {
             let zero = builder.ins().iconst(types::I32, 0);
             builder.ins().return_(&[zero]);
             builder.seal_all_blocks();
-            builder.finalize();
+            builder.finalize(self.module.target_config());
             if std::env::var("XEZIM_JIT_CLIF").is_ok() {
                 eprintln!("[CLIF]\n{}", ctx.func.display());
             }
@@ -1864,8 +1893,12 @@ mod enabled {
                 let xb = builder.ins().iconst(pointer_type, xt.as_ptr() as i64);
                 let va = builder.ins().iadd(vb, off);
                 let xa = builder.ins().iadd(xb, off);
-                let out_v = builder.ins().load(types::I64, MemFlags::trusted(), va, 0);
-                let out_x = builder.ins().load(types::I64, MemFlags::trusted(), xa, 0);
+                let out_v = builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), va, 0);
+                let out_x = builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), xa, 0);
                 st2(builder, pointer_type, regs, xz, *d, out_v, out_x);
             }
             // Signedness lives in the compile-time reg_s table
@@ -2654,9 +2687,9 @@ mod enabled {
                 } else {
                     let (bv, bx) = ld2(builder, pointer_type, regs, xz, *base);
                     let one = builder.ins().iconst(types::I64, 1);
-                    let vs = builder.ins().ushr_imm(bv, *idx as i64);
+                    let vs = builder.ins().ushr_imm_s(bv, *idx as i64);
                     let vb = builder.ins().band(vs, one);
-                    let xs = builder.ins().ushr_imm(bx, *idx as i64);
+                    let xs = builder.ins().ushr_imm_s(bx, *idx as i64);
                     let xb = builder.ins().band(xs, one);
                     st2(builder, pointer_type, regs, xz, *dest, vb, xb);
                 }
@@ -2773,8 +2806,8 @@ mod enabled {
                     0
                 };
                 let (bv, bx) = ld2(builder, pointer_type, regs, xz, *base);
-                let vs = builder.ins().ushr_imm(bv, lsb as i64);
-                let xs = builder.ins().ushr_imm(bx, lsb as i64);
+                let vs = builder.ins().ushr_imm_s(bv, lsb as i64);
+                let xs = builder.ins().ushr_imm_s(bx, lsb as i64);
                 let keep = builder.ins().iconst(types::I64, (resm & !oor) as i64);
                 let out_v = builder.ins().band(vs, keep);
                 let xm = builder.ins().band(xs, keep);
@@ -2888,7 +2921,7 @@ mod enabled {
     /// in either operand yields 1'bx, not a 0/1 answer.
     fn emit_cmp(
         builder: &mut FunctionBuilder,
-        _pointer_type: Type,
+        pointer_type: Type,
         regs: &[StackSlot],
         xz: &[StackSlot],
         reg_w: &[u32],
@@ -2913,10 +2946,18 @@ mod enabled {
         } else {
             cc
         };
-        let mut lv = builder.ins().stack_load(types::I64, regs[l as usize], 0);
-        let mut rv = builder.ins().stack_load(types::I64, regs[r as usize], 0);
-        let mut lx = builder.ins().stack_load(types::I64, xz[l as usize], 0);
-        let mut rx = builder.ins().stack_load(types::I64, xz[r as usize], 0);
+        let mut lv = builder
+            .ins()
+            .stack_load(pointer_type, types::I64, regs[l as usize], 0);
+        let mut rv = builder
+            .ins()
+            .stack_load(pointer_type, types::I64, regs[r as usize], 0);
+        let mut lx = builder
+            .ins()
+            .stack_load(pointer_type, types::I64, xz[l as usize], 0);
+        let mut rx = builder
+            .ins()
+            .stack_load(pointer_type, types::I64, xz[r as usize], 0);
         if both_signed {
             let lw = reg_w.get(l as usize).copied().unwrap_or(0);
             let rw = reg_w.get(r as usize).copied().unwrap_or(0);
@@ -2965,8 +3006,12 @@ mod enabled {
         } else {
             (out_v, out_x)
         };
-        builder.ins().stack_store(out_v, regs[d as usize], 0);
-        builder.ins().stack_store(out_x, xz[d as usize], 0);
+        builder
+            .ins()
+            .stack_store(pointer_type, out_v, regs[d as usize], 0);
+        builder
+            .ins()
+            .stack_store(pointer_type, out_x, xz[d as usize], 0);
     }
 
     /// §11.4.5/§11.8.1: `===` compares the literal four-state encodings
@@ -3296,10 +3341,10 @@ mod enabled {
         let off = (sig_id as i32) * 16;
         let v = builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), base, off);
+            .load(types::I64, MemFlagsData::trusted(), base, off);
         let x = builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), base, off + 8);
+            .load(types::I64, MemFlagsData::trusted(), base, off + 8);
         Some((v, x))
     }
 
@@ -3316,8 +3361,12 @@ mod enabled {
         let sixteen = builder.ins().iconst(types::I64, 16);
         let off = builder.ins().imul(eid, sixteen);
         let addr = builder.ins().iadd(base, off);
-        let v = builder.ins().load(types::I64, MemFlags::trusted(), addr, 0);
-        let x = builder.ins().load(types::I64, MemFlags::trusted(), addr, 8);
+        let v = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), addr, 0);
+        let x = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), addr, 8);
         (v, x)
     }
 
@@ -3354,29 +3403,37 @@ mod enabled {
 
     fn ld2(
         builder: &mut FunctionBuilder,
-        _pointer_type: Type,
+        pointer_type: Type,
         regs: &[StackSlot],
         xz: &[StackSlot],
         r: u16,
     ) -> (Value, Value) {
         (
-            builder.ins().stack_load(types::I64, regs[r as usize], 0),
-            builder.ins().stack_load(types::I64, xz[r as usize], 0),
+            builder
+                .ins()
+                .stack_load(pointer_type, types::I64, regs[r as usize], 0),
+            builder
+                .ins()
+                .stack_load(pointer_type, types::I64, xz[r as usize], 0),
         )
     }
 
     /// Store both planes of a VM register.
     fn st2(
         builder: &mut FunctionBuilder,
-        _pointer_type: Type,
+        pointer_type: Type,
         regs: &[StackSlot],
         xz: &[StackSlot],
         d: u16,
         v: Value,
         x: Value,
     ) {
-        builder.ins().stack_store(v, regs[d as usize], 0);
-        builder.ins().stack_store(x, xz[d as usize], 0);
+        builder
+            .ins()
+            .stack_store(pointer_type, v, regs[d as usize], 0);
+        builder
+            .ins()
+            .stack_store(pointer_type, x, xz[d as usize], 0);
     }
 
     /// §11.4.10: a shift by a KNOWN amount shifts both planes — `4'bxxxx << 1`
@@ -3432,17 +3489,23 @@ mod enabled {
 
     fn emit_binop(
         builder: &mut FunctionBuilder,
-        _pointer_type: Type,
+        pointer_type: Type,
         regs: &[StackSlot],
         d: u16,
         l: u16,
         r: u16,
         op: impl FnOnce(&mut FunctionBuilder, Value, Value) -> Value,
     ) {
-        let lv = builder.ins().stack_load(types::I64, regs[l as usize], 0);
-        let rv = builder.ins().stack_load(types::I64, regs[r as usize], 0);
+        let lv = builder
+            .ins()
+            .stack_load(pointer_type, types::I64, regs[l as usize], 0);
+        let rv = builder
+            .ins()
+            .stack_load(pointer_type, types::I64, regs[r as usize], 0);
         let result = op(builder, lv, rv);
-        builder.ins().stack_store(result, regs[d as usize], 0);
+        builder
+            .ins()
+            .stack_store(pointer_type, result, regs[d as usize], 0);
     }
 
     /// Diagnostic: name of the first insn `is_supported` rejects, for the

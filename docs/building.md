@@ -9,7 +9,7 @@
 
 ## Requirements
 
-* **Rust 1.92 or newer** (the minimum supported version is checked in CI).
+* **Rust 1.99.1 or newer** (the minimum supported version is checked in CI).
   Install it from https://www.rust-lang.org/tools/install.
 * **Git access to GitHub.** The parser and elaborator live in a second
   repository, [xezim-core](https://github.com/aionhw/xezim-core), which Cargo

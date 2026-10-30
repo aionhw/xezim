@@ -18,7 +18,7 @@ cargo build --release --features jit     # the normal build (jit feature ≠ jit
 ./target/release/xezim -V                # version + git hash/date + release tag
 ```
 
-Rust ≥ 1.92. The `xezim-core` dependency is pinned by exact rev and fetched
+Rust ≥ 1.99.1. The `xezim-core` dependency is pinned by exact rev and fetched
 automatically; for local co-development of both repos run
 `./scripts/use-local-core.sh` once. A maximum-performance binary comes from
 profile-guided optimization: `./scripts/build-pgo.sh <training-command>`

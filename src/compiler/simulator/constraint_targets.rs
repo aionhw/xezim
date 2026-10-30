@@ -57,7 +57,7 @@ impl Simulator {
     /// permutation cycle, or the cycle stops being a permutation. So a pick
     /// made earlier in this same randomize() call is rolled back first.
     pub(super) fn pick_randc(&mut self, handle: usize, name: &str, domain: &[u64]) -> u64 {
-        use rand::Rng;
+        use rand::RngExt;
         let key = (handle, name.to_string());
         // Undo this call's earlier tentative pick for the same variable.
         self.randc_rollback(&key);
@@ -75,7 +75,7 @@ impl Simulator {
             used.clear();
             avail = domain.to_vec();
         }
-        let pick = avail[self.cur_rng().gen_range(0..avail.len())];
+        let pick = avail[self.cur_rng().random_range(0..avail.len())];
         self.randc_used.get_mut(&key).unwrap().insert(pick);
         self.randc_pending.insert(key, (pick, prev));
         pick
@@ -1045,7 +1045,7 @@ impl Simulator {
         row: Option<i64>,
         constraints: &[ClassConstraint],
     ) -> Option<u64> {
-        use rand::Rng;
+        use rand::RngExt;
         let mut exact: Option<u64> = None;
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         let mut lo_b: u64 = 0;
@@ -1074,12 +1074,12 @@ impl Simulator {
             return Some(n.min(1 << 16));
         }
         if !ranges.is_empty() {
-            let (l, h) = ranges[self.rng.gen_range(0..ranges.len())];
-            return Some(if h > l { self.rng.gen_range(l..=h) } else { l });
+            let (l, h) = ranges[self.rng.random_range(0..ranges.len())];
+            return Some(if h > l { self.rng.random_range(l..=h) } else { l });
         }
         if bounded && lo_b <= hi_b {
             return Some(if hi_b > lo_b {
-                self.rng.gen_range(lo_b..=hi_b)
+                self.rng.random_range(lo_b..=hi_b)
             } else {
                 lo_b
             });
@@ -1350,19 +1350,19 @@ impl Simulator {
     /// (§18.4), and a pre-seeded associative entry that came back identical is
     /// indistinguishable from "the solver never touched it".
     pub(super) fn draw_elem(&mut self, width: u32, prev: Option<u64>) -> Value {
-        use rand::Rng;
+        use rand::RngExt;
         let mask = if width >= 64 {
             u64::MAX
         } else {
             (1u64 << width) - 1
         };
-        let mut v = self.rng.r#gen::<u64>() & mask;
+        let mut v = self.rng.random::<u64>() & mask;
         if mask > 0 {
             for _ in 0..8 {
                 if Some(v) != prev {
                     break;
                 }
-                v = self.rng.r#gen::<u64>() & mask;
+                v = self.rng.random::<u64>() & mask;
             }
         }
         if width <= 64 {
@@ -1377,7 +1377,7 @@ impl Simulator {
         let mut acc = Value::from_u64(v, width);
         let mut bit = 64u32;
         while bit < width {
-            let chunk: u64 = self.rng.r#gen();
+            let chunk: u64 = self.rng.random();
             let n = (width - bit).min(64);
             for k in 0..n {
                 if (chunk >> k) & 1 == 1 {
@@ -1651,9 +1651,9 @@ impl Simulator {
             let cand = if allowed.is_empty() {
                 self.draw_elem(width, None)
             } else {
-                use rand::Rng;
-                let (l, h) = allowed[self.rng.gen_range(0..allowed.len())];
-                let v = if h > l { self.rng.gen_range(l..=h) } else { l };
+                use rand::RngExt;
+                let (l, h) = allowed[self.rng.random_range(0..allowed.len())];
+                let v = if h > l { self.rng.random_range(l..=h) } else { l };
                 Value::from_u64(v, width)
             };
             self.write_coll_elem(elem_key, cand);
@@ -1800,7 +1800,7 @@ impl Simulator {
                             true
                         }
                         BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq => {
-                            use rand::Rng;
+                            use rand::RngExt;
                             let b = self.eval_expr(other).to_i64().unwrap_or(0);
                             let cur = self
                                 .read_coll_elem(elem_key)
@@ -1827,7 +1827,7 @@ impl Simulator {
                             let p = if lo == hi {
                                 lo
                             } else {
-                                self.rng.gen_range(lo..=hi)
+                                self.rng.random_range(lo..=hi)
                             };
                             self.write_coll_elem(elem_key, Value::from_u64(p as u64, width));
                             false
@@ -2067,7 +2067,7 @@ impl Simulator {
         width: u32,
         pinned: &mut HashSet<String>,
     ) {
-        use rand::Rng;
+        use rand::RngExt;
         if keys.is_empty() {
             return;
         }
@@ -2099,7 +2099,7 @@ impl Simulator {
         let mut rem = want.saturating_sub(n.saturating_mul(lo)); // 0 ..= n*cap
         let mut order: Vec<usize> = (0..free.len()).collect();
         for i in (1..order.len()).rev() {
-            let j = self.cur_rng().gen_range(0..=i);
+            let j = self.cur_rng().random_range(0..=i);
             order.swap(i, j);
         }
         for (pos, &idx) in order.iter().enumerate() {
@@ -2115,7 +2115,7 @@ impl Simulator {
                 if hi_b <= lo_b {
                     lo_b
                 } else {
-                    lo_b + self.cur_rng().gen_range(0..=(hi_b - lo_b))
+                    lo_b + self.cur_rng().random_range(0..=(hi_b - lo_b))
                 }
             };
             rem -= give;
@@ -2336,7 +2336,7 @@ impl Simulator {
         constraints: &[ClassConstraint],
         pinned: &HashSet<String>,
     ) {
-        use rand::Rng;
+        use rand::RngExt;
         let keys = self.coll_elem_keys(c);
         if keys.len() < 2 {
             return;
@@ -2381,8 +2381,8 @@ impl Simulator {
             // sweep so a tight domain still converges.
             let mut pick: Option<u64> = None;
             for _ in 0..256 {
-                let (l, h) = domain[self.rng.gen_range(0..domain.len())];
-                let v = if h > l { self.rng.gen_range(l..=h) } else { l };
+                let (l, h) = domain[self.rng.random_range(0..domain.len())];
+                let v = if h > l { self.rng.random_range(l..=h) } else { l };
                 if !used.contains(&v) {
                     pick = Some(v);
                     break;

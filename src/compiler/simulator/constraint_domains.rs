@@ -1199,18 +1199,18 @@ impl Simulator {
     /// wide rand field at `Value::zero(width)` while `randomize()` still
     /// reported success (a `rand logic [127:0]` was always 0).
     pub(super) fn random_value_of_width(&mut self, width: u32) -> Value {
-        use rand::Rng;
+        use rand::RngExt;
         if width == 0 {
             return Value::zero(0);
         }
         if width <= 64 {
-            let r: u64 = self.cur_rng().r#gen();
+            let r: u64 = self.cur_rng().random();
             return Value::from_u64(r, width);
         }
         let mut acc = Value::zero(width);
         let mut bit = 0u32;
         while bit < width {
-            let chunk: u64 = self.cur_rng().r#gen();
+            let chunk: u64 = self.cur_rng().random();
             let n = (width - bit).min(64);
             for k in 0..n {
                 if (chunk >> k) & 1 == 1 {
@@ -1228,15 +1228,15 @@ impl Simulator {
         width: u32,
         signed: bool,
     ) -> Option<Value> {
-        use rand::Rng;
+        use rand::RngExt;
         let v = if let [(lo, hi)] = choices {
             // Retain the existing RNG calls for the common one-interval case.
             if lo > hi {
                 return None;
             }
-            let _ = self.cur_rng().gen_range(0..1usize);
+            let _ = self.cur_rng().random_range(0..1usize);
             if hi > lo {
-                self.cur_rng().gen_range(*lo..=*hi)
+                self.cur_rng().random_range(*lo..=*hi)
             } else {
                 *lo
             }
@@ -1266,9 +1266,9 @@ impl Simulator {
                 .iter()
                 .fold(0u128, |n, &(l, h)| n.wrapping_add(size(l, h)));
             let mut rank = if total == 0 {
-                self.cur_rng().r#gen::<u128>()
+                self.cur_rng().random::<u128>()
             } else {
-                self.cur_rng().gen_range(0..total)
+                self.cur_rng().random_range(0..total)
             };
             let mut chosen = None;
             for (l, h) in union {
@@ -1894,8 +1894,8 @@ impl Simulator {
             let v = if keep {
                 cur.unwrap() as i128
             } else {
-                use rand::Rng;
-                let v = self.cur_rng().gen_range(0..=cap as u64) as i128;
+                use rand::RngExt;
+                let v = self.cur_rng().random_range(0..=cap as u64) as i128;
                 let nv = Value::from_u64(v as u64, w);
                 changed |= match &terms[i] {
                     Term::Prop(n, _) => self.set_prop_if_changed(handle, n, nv),
@@ -2246,7 +2246,7 @@ impl Simulator {
                     if lv.to_u64() != rv.to_u64() {
                         return false; // already satisfied
                     }
-                    use rand::Rng;
+                    use rand::RngExt;
                     let avoid = lv.to_u64().unwrap_or(0);
                     // §18.5.5: a `unique {a, b, arr[0:2]}` pair may name an
                     // ARRAY ELEMENT. Re-picking the element leaves the scalar's
@@ -2279,9 +2279,9 @@ impl Simulator {
                         let domain = self.rand_elem_ranges.get(prop).cloned().unwrap_or_default();
                         if !domain.is_empty() {
                             for _try in 0..32 {
-                                let (lo, hi) = domain[self.cur_rng().gen_range(0..domain.len())];
+                                let (lo, hi) = domain[self.cur_rng().random_range(0..domain.len())];
                                 let v = if hi > lo {
-                                    self.cur_rng().gen_range(lo..=hi)
+                                    self.cur_rng().random_range(lo..=hi)
                                 } else {
                                     lo
                                 };
@@ -2294,7 +2294,7 @@ impl Simulator {
                             continue;
                         }
                         for _try in 0..32 {
-                            let cand = self.cur_rng().r#gen::<u64>() & mask;
+                            let cand = self.cur_rng().random::<u64>() & mask;
                             if cand != avoid {
                                 self.write_coll_elem(&key, Value::from_u64(cand, w));
                                 return true;
@@ -2325,7 +2325,7 @@ impl Simulator {
                         if members.is_empty() {
                             return false;
                         }
-                        let pick = members[self.cur_rng().gen_range(0..members.len())];
+                        let pick = members[self.cur_rng().random_range(0..members.len())];
                         return self.set_prop_if_changed(
                             handle,
                             &target,
@@ -2352,9 +2352,9 @@ impl Simulator {
                     }
                     for _try in 0..32 {
                         let cand = if width >= 64 {
-                            self.cur_rng().r#gen::<u64>()
+                            self.cur_rng().random::<u64>()
                         } else {
-                            self.cur_rng().r#gen::<u64>() & ((1u64 << width) - 1)
+                            self.cur_rng().random::<u64>() & ((1u64 << width) - 1)
                         };
                         if cand != avoid {
                             return self.set_prop_if_changed(
@@ -2712,7 +2712,7 @@ impl Simulator {
                         && !Self::constraint_unmodeled(body)
                         && !self.item_holds(handle, body)
                     {
-                        use rand::Rng;
+                        use rand::RngExt;
                         let mut ranges: Vec<(i64, i64)> = Vec::new();
                         self.body_inside_ranges(body, &arr_name, &mut ranges);
                         let scoped_key = format!("{}#{}{}", handle, arr_name, suffix);
@@ -2731,11 +2731,11 @@ impl Simulator {
                                 } else {
                                     (1u64 << elem_w) - 1
                                 };
-                                Value::from_u64(self.cur_rng().r#gen::<u64>() & mask, elem_w)
+                                Value::from_u64(self.cur_rng().random::<u64>() & mask, elem_w)
                             } else {
-                                let (l, h) = ranges[self.cur_rng().gen_range(0..ranges.len())];
+                                let (l, h) = ranges[self.cur_rng().random_range(0..ranges.len())];
                                 let v = if h > l {
-                                    self.cur_rng().gen_range(l..=h)
+                                    self.cur_rng().random_range(l..=h)
                                 } else {
                                     l
                                 };
@@ -2850,7 +2850,7 @@ impl Simulator {
                     .unwrap_or_default();
                 let mut used: HashSet<u64> = HashSet::default();
                 let mut changed = false;
-                use rand::Rng;
+                use rand::RngExt;
                 for sfx in &suffixes {
                     let cur = read_elem(self, sfx).and_then(|v| v.to_u64());
                     let needs_repick = match cur {
@@ -2872,11 +2872,11 @@ impl Simulator {
                         if avail.is_empty() {
                             continue; // domain exhausted — leave as-is
                         }
-                        Some(avail[self.cur_rng().gen_range(0..avail.len())])
+                        Some(avail[self.cur_rng().random_range(0..avail.len())])
                     } else {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
                         (0..64)
-                            .map(|_| self.cur_rng().r#gen::<u64>() & mask)
+                            .map(|_| self.cur_rng().random::<u64>() & mask)
                             .find(|c| !used.contains(c))
                     };
                     if let Some(p) = pick {
@@ -3071,7 +3071,7 @@ impl Simulator {
                             changed
                         }
                         BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq => {
-                            use rand::Rng;
+                            use rand::RngExt;
                             let b = self.eval_expr(bound_side).to_i64().unwrap_or(0);
                             let cur_i = cur.and_then(|v| v.to_i64()).unwrap_or(0);
                             // The element type's domain (§6.11): [0, 2^w - 1],
@@ -3137,7 +3137,7 @@ impl Simulator {
                                     _ => hi,
                                 }
                             } else {
-                                self.cur_rng().gen_range(lo..=hi)
+                                self.cur_rng().random_range(lo..=hi)
                             };
                             if p == cur_i {
                                 return false;

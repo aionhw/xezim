@@ -36,7 +36,6 @@ use fst_writer::{
 };
 use libffi::middle::{Arg, Cif, CodePtr, Type};
 use libloading::Library;
-use rand::SeedableRng;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString};
@@ -132,14 +131,16 @@ impl SvRng {
     }
 }
 
-impl rand::RngCore for SvRng {
-    fn next_u32(&mut self) -> u32 {
-        (self.next_state() >> 32) as u32
+impl rand::TryRng for SvRng {
+    type Error = std::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok((self.next_state() >> 32) as u32)
     }
-    fn next_u64(&mut self) -> u64 {
-        self.next_state()
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.next_state())
     }
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
         let mut i = 0;
         while i < dest.len() {
             let chunk = self.next_state().to_le_bytes();
@@ -147,9 +148,6 @@ impl rand::RngCore for SvRng {
             dest[i..i + n].copy_from_slice(&chunk[..n]);
             i += n;
         }
-    }
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
-        self.fill_bytes(dest);
         Ok(())
     }
 }

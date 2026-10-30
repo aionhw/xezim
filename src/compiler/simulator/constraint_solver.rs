@@ -457,8 +457,8 @@ impl Simulator {
         {
             return None;
         }
-        use rand::Rng;
-        let mut r: f64 = self.cur_rng().gen_range(0.0..sum);
+        use rand::RngExt;
+        let mut r: f64 = self.cur_rng().random_range(0.0..sum);
         let mut chosen = cands[cands.len() - 1];
         for (k, &c) in cands.iter().enumerate() {
             if r < weights[k] {
@@ -566,7 +566,7 @@ impl Simulator {
         // dropping the tentative record, so this call's trials only ever roll
         // back their OWN picks.
         self.randc_pending.clear();
-        use rand::Rng;
+        use rand::RngExt;
         let class_name = if let Some(Some(inst)) = self.heap.get(handle) {
             inst.class_name.clone()
         } else {
@@ -1011,11 +1011,11 @@ impl Simulator {
                         if members.is_empty() {
                             Value::zero(*width)
                         } else {
-                            let i = self.rng.gen_range(0..members.len());
+                            let i = self.rng.random_range(0..members.len());
                             Value::from_u64(members[i].1, *width)
                         }
                     } else if *width <= 64 {
-                        Value::from_u64(self.rng.r#gen(), *width)
+                        Value::from_u64(self.rng.random(), *width)
                     } else {
                         // A `rand` property wider than 64 bits (a packed
                         // multi-dimensional array such as `u7_t [4:0][1:0]`)
@@ -1024,7 +1024,7 @@ impl Simulator {
                         let mut acc = Value::zero(*width);
                         let mut bit = 0u32;
                         while bit < *width {
-                            let chunk: u64 = self.rng.r#gen();
+                            let chunk: u64 = self.rng.random();
                             let n = (*width - bit).min(64);
                             for k in 0..n {
                                 if (chunk >> k) & 1 == 1 {
@@ -1350,7 +1350,7 @@ impl Simulator {
                     let v = if *is_randc {
                         let domain = self.randc_domain(&key, *w, et.as_deref(), None);
                         if domain.is_empty() {
-                            Value::from_u64(self.rng.r#gen::<u64>(), *w)
+                            Value::from_u64(self.rng.random::<u64>(), *w)
                         } else {
                             let pick = self.pick_randc(handle, &key, &domain);
                             Value::from_u64(pick, *w)
@@ -1363,11 +1363,11 @@ impl Simulator {
                         if n == 0 {
                             Value::zero(*w)
                         } else {
-                            let mv = members[self.rng.gen_range(0..n)].1;
+                            let mv = members[self.rng.random_range(0..n)].1;
                             Value::from_u64(mv, *w)
                         }
                     } else if *w <= 64 {
-                        Value::from_u64(self.rng.r#gen::<u64>(), *w)
+                        Value::from_u64(self.rng.random::<u64>(), *w)
                     } else {
                         Value::zero(*w)
                     };
@@ -1791,7 +1791,7 @@ impl Simulator {
                                 (lo, hi)
                             };
                             let pick = if hi_e > lo_e {
-                                self.cur_rng().gen_range(lo_e..hi_e)
+                                self.cur_rng().random_range(lo_e..hi_e)
                             } else {
                                 lo_e
                             };
@@ -1873,7 +1873,7 @@ impl Simulator {
                             // Enum-typed rand field: pick a valid member.
                             let n = self.module.enum_members.get(et).map_or(0, |m| m.len());
                             if n > 0 {
-                                let idx = self.cur_rng().gen_range(0..n);
+                                let idx = self.cur_rng().random_range(0..n);
                                 let mv = self.module.enum_members.get(et).unwrap()[idx].1;
                                 val = Value::from_u64(mv, *width);
                             }
@@ -1922,12 +1922,12 @@ impl Simulator {
                 if let Some(et) = enum_prop_types.get(name) {
                     let n = self.module.enum_members.get(et).map_or(0, |m| m.len());
                     if n > 0 {
-                        let idx = self.cur_rng().gen_range(0..n);
+                        let idx = self.cur_rng().random_range(0..n);
                         let mv = self.module.enum_members.get(et).unwrap()[idx].1;
                         val = Value::from_u64(mv, *width);
                     }
                 } else if *width <= 64 {
-                    val = Value::from_u64(self.cur_rng().r#gen(), *width);
+                    val = Value::from_u64(self.cur_rng().random(), *width);
                 } else {
                     val = self.random_value_of_width(*width);
                 }
@@ -2175,7 +2175,7 @@ impl Simulator {
                                 })
                                 .unwrap_or_default();
                             if !members.is_empty() {
-                                let pick = members[self.cur_rng().gen_range(0..members.len())];
+                                let pick = members[self.cur_rng().random_range(0..members.len())];
                                 let w = self
                                     .heap
                                     .get(handle)
@@ -2225,7 +2225,7 @@ impl Simulator {
                         let avail: Vec<u64> =
                             pool.iter().copied().filter(|v| !used.contains(v)).collect();
                         let src = if avail.is_empty() { &pool } else { &avail };
-                        let pick = src[self.cur_rng().gen_range(0..src.len())];
+                        let pick = src[self.cur_rng().random_range(0..src.len())];
                         used.insert(pick);
                         pick
                     } else if *width <= 64 {
@@ -2234,7 +2234,7 @@ impl Simulator {
                         } else {
                             (1u64 << *width) - 1
                         };
-                        self.cur_rng().r#gen::<u64>() & mask
+                        self.cur_rng().random::<u64>() & mask
                     } else {
                         0
                     };
@@ -2265,7 +2265,7 @@ impl Simulator {
                         } else {
                             (1u64 << *width) - 1
                         };
-                        self.cur_rng().r#gen::<u64>() & mask
+                        self.cur_rng().random::<u64>() & mask
                     } else {
                         0
                     };

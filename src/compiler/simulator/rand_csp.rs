@@ -32,7 +32,7 @@
 use super::*;
 use crate::ast::decl::DistWeight;
 use crate::compiler::elaborate::{is_type_real, is_type_signed, resolve_type_width};
-use rand::Rng;
+use rand::RngExt;
 
 mod obj;
 
@@ -2183,7 +2183,7 @@ impl Simulator {
                 Some((br, bn, _)) if (rank, n) > (br, bn) => {}
                 Some((br, bn, _)) if (rank, n) == (br, bn) => {
                     ties += 1;
-                    if self.cur_rng().gen_range(0..=ties) == 0 {
+                    if self.cur_rng().random_range(0..=ties) == 0 {
                         best = Some((rank, n, v));
                     }
                 }
@@ -2246,7 +2246,7 @@ impl Simulator {
                     }
                 }
                 if total > 0.0 {
-                    let mut r = self.cur_rng().gen_range(0.0..total);
+                    let mut r = self.cur_rng().random_range(0.0..total);
                     let mut pick = live.len() - 1;
                     for (i, (_, w)) in live.iter().enumerate() {
                         if r < *w {
@@ -2256,7 +2256,7 @@ impl Simulator {
                         r -= w;
                     }
                     let part = &live[pick].0;
-                    let k = self.cur_rng().gen_range(0..dom_size(part));
+                    let k = self.cur_rng().random_range(0..dom_size(part));
                     return dom_nth(part, k);
                 }
             }
@@ -2300,7 +2300,7 @@ impl Simulator {
         if st.bounds(v).1 == SIZE_TOP && csp.sizes.values().any(|&sv| sv == v) {
             let lo = st.bounds(v).0;
             let part = dom_clip(&st.d[v], lo, lo + SIZE_OPEN - 1);
-            let k = self.cur_rng().gen_range(0..dom_size(&part));
+            let k = self.cur_rng().random_range(0..dom_size(&part));
             return dom_nth(&part, k);
         }
         let size = dom_size(&st.d[v]);
@@ -2309,7 +2309,7 @@ impl Simulator {
                 return x;
             }
         }
-        let k = self.cur_rng().gen_range(0..size);
+        let k = self.cur_rng().random_range(0..size);
         dom_nth(&st.d[v], k)
     }
 
@@ -2331,7 +2331,7 @@ impl Simulator {
         if cand.is_empty() || total <= 0.0 {
             return None;
         }
-        let mut r = self.cur_rng().gen_range(0.0..total);
+        let mut r = self.cur_rng().random_range(0.0..total);
         for &(n, wt) in &cand {
             if r < wt {
                 return Some(n);
@@ -2370,7 +2370,7 @@ impl Simulator {
         let mut pos: Vec<u32> = (0..span.min(w)).collect();
         let mut bits: u64 = 0;
         for k in 0..(n as usize).min(pos.len()) {
-            let j = self.cur_rng().gen_range(k..pos.len());
+            let j = self.cur_rng().random_range(k..pos.len());
             pos.swap(k, j);
             bits |= 1u64 << pos[k];
         }
@@ -2451,7 +2451,7 @@ impl Simulator {
         }
         let ws: Vec<f64> = logs.iter().map(|l| (l - top).exp2()).collect();
         let total: f64 = ws.iter().sum();
-        let mut r = self.cur_rng().gen_range(0.0..total);
+        let mut r = self.cur_rng().random_range(0.0..total);
         for (i, w) in ws.iter().enumerate() {
             if r < *w {
                 return Some(vals[i]);
@@ -10172,7 +10172,7 @@ impl Simulator {
             let mut acc = Value::zero(*w);
             let mut bit = 0u32;
             while bit < *w {
-                let chunk: u64 = self.cur_rng().r#gen();
+                let chunk: u64 = self.cur_rng().random();
                 let n = (*w - bit).min(64);
                 for k in 0..n {
                     if (chunk >> k) & 1 == 1 {

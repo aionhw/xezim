@@ -1193,7 +1193,7 @@ impl Simulator {
         targets: &[(String, Expression)],
     ) {
         use crate::ast::decl::ConstraintItem as CI;
-        use rand::Rng;
+        use rand::RngExt;
         let roots: HashSet<String> = targets
             .iter()
             .filter_map(|(_, lv)| Self::randomize_target_root(lv))
@@ -1331,7 +1331,7 @@ impl Simulator {
                 if total == 0 {
                     continue;
                 }
-                let mut k = self.cur_rng().gen_range(0..total);
+                let mut k = self.cur_rng().random_range(0..total);
                 for (l, h) in parts {
                     if k <= h - l {
                         self.resize_random_dyn_target(&arr, (l + k) as u64);
@@ -1344,7 +1344,7 @@ impl Simulator {
             // An open upper bound stays near the lower one: an unbounded
             // draw would build an enormous array.
             let hi = hi.min(lo.saturating_add(1024));
-            let n = self.cur_rng().gen_range(lo.max(0)..=hi.max(lo.max(0)));
+            let n = self.cur_rng().random_range(lo.max(0)..=hi.max(lo.max(0)));
             self.resize_random_dyn_target(&arr, n as u64);
         }
     }
@@ -1555,7 +1555,7 @@ impl Simulator {
     /// and draw a fresh random value for every element (they are rand and
     /// otherwise unconstrained; later constraint items may overwrite).
     pub(super) fn resize_random_dyn_target(&mut self, arr: &str, n: u64) {
-        use rand::Rng;
+        use rand::RngExt;
         let w = self
             .module
             .arrays
@@ -1565,7 +1565,7 @@ impl Simulator {
             .max(1);
         self.set_queue_size(arr, n);
         for i in 0..n {
-            let r: u64 = self.cur_rng().r#gen();
+            let r: u64 = self.cur_rng().random();
             let masked = if w >= 64 { r } else { r & ((1u64 << w) - 1) };
             self.set_signal_value_by_name(&format!("{}[{}]", arr, i), Value::from_u64(masked, w));
         }
@@ -1757,7 +1757,7 @@ impl Simulator {
         w: u32,
         used: &HashSet<u64>,
     ) -> Option<u64> {
-        use rand::Rng;
+        use rand::RngExt;
         let full: Vec<(u64, u64)> = if ranges.is_empty() {
             let max = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
             vec![(0, max)]
@@ -1765,14 +1765,14 @@ impl Simulator {
             ranges.to_vec()
         };
         for _ in 0..64 {
-            let (lo, hi) = full[self.rng.gen_range(0..full.len())];
+            let (lo, hi) = full[self.rng.random_range(0..full.len())];
             if hi < lo {
                 continue;
             }
             let v = if lo == hi {
                 lo
             } else {
-                self.rng.gen_range(lo..=hi)
+                self.rng.random_range(lo..=hi)
             };
             if !used.contains(&v) {
                 return Some(v);
@@ -1935,7 +1935,7 @@ impl Simulator {
         dims: &[(i64, i64)],
     ) {
         use crate::ast::decl::ConstraintItem as CI;
-        use rand::Rng;
+        use rand::RngExt;
         let names: Vec<Option<String>> = vars
             .iter()
             .map(|v| v.as_ref().map(|i| i.name.clone()))
@@ -2050,7 +2050,7 @@ impl Simulator {
                     let p = if lo == hi {
                         lo
                     } else {
-                        self.cur_rng().gen_range(lo..=hi)
+                        self.cur_rng().random_range(lo..=hi)
                     };
                     let e2 = elem.clone();
                     self.assign_value(&e2, &Value::from_u64(p as u64, w));
@@ -2063,7 +2063,7 @@ impl Simulator {
                     let ones = want.min(tw);
                     let mut bits: Vec<usize> = (0..tw).collect();
                     for i in (1..bits.len()).rev() {
-                        let j = self.cur_rng().gen_range(0..=i);
+                        let j = self.cur_rng().random_range(0..=i);
                         bits.swap(i, j);
                     }
                     let mut v = Value::zero(tw as u32);
@@ -2123,7 +2123,7 @@ impl Simulator {
         idx: i64,
         w: u32,
     ) {
-        use rand::Rng;
+        use rand::RngExt;
         let elem_name = format!("{}[{}]", arr, idx);
         // Phase 1: gather relational bounds (unsigned element domain).
         let (mut lo, mut hi) = (0i64, if w >= 63 { i64::MAX } else { (1i64 << w) - 1 });
@@ -2155,7 +2155,7 @@ impl Simulator {
             let p = if lo == hi {
                 lo
             } else {
-                self.cur_rng().gen_range(lo..=hi)
+                self.cur_rng().random_range(lo..=hi)
             };
             if !excl.contains(&p) {
                 self.set_signal_value_by_name(&elem_name, Value::from_u64(p as u64, w));
@@ -2987,7 +2987,7 @@ impl Simulator {
         attempt: usize,
         obj_handle: Option<usize>,
     ) -> Option<Vec<(usize, i128)>> {
-        use rand::Rng;
+        use rand::RngExt;
         let ncols = var_names.len();
         if ncols < 2 {
             return None;
@@ -3064,7 +3064,7 @@ impl Simulator {
         };
         if attempt > 0 && order.len() > 1 {
             for i in (1..order.len()).rev() {
-                let j = self.cur_rng().gen_range(0..=i);
+                let j = self.cur_rng().random_range(0..=i);
                 order.swap(i, j);
             }
         }
@@ -3120,7 +3120,7 @@ impl Simulator {
             let pick = if lo == hi {
                 lo
             } else {
-                self.cur_rng().gen_range(lo..=hi)
+                self.cur_rng().random_range(lo..=hi)
             };
             assigned.insert(col, pick);
         }
@@ -3232,7 +3232,7 @@ impl Simulator {
         weights: &[Option<crate::ast::decl::DistWeight>],
     ) -> Option<Value> {
         use crate::ast::decl::DistWeight;
-        use rand::Rng;
+        use rand::RngExt;
         // Fixed-point scaler: keeps `Total(w)` masses exact for small w.
         const SCALER: u128 = 1024;
 
@@ -3303,8 +3303,8 @@ impl Simulator {
                 // No stable identity for the target (a foreach element, say)
                 // or weights too fine to schedule: an independent draw.
                 let mut draw = match u64::try_from(total) {
-                    Ok(t) => (self.cur_rng().r#gen::<u64>() % t) as u128,
-                    Err(_) => self.cur_rng().gen_range(0..total),
+                    Ok(t) => (self.cur_rng().random::<u64>() % t) as u128,
+                    Err(_) => self.cur_rng().random_range(0..total),
                 };
                 let mut pick = masses.len() - 1;
                 for (i, m) in masses.iter().enumerate() {
@@ -3324,7 +3324,7 @@ impl Simulator {
                 // §18.5.4: the values inside one item are equiprobable under
                 // both `:=` and `:/`.
                 let v = if h > l {
-                    self.cur_rng().gen_range(l..=h)
+                    self.cur_rng().random_range(l..=h)
                 } else {
                     l
                 };
@@ -3383,7 +3383,7 @@ impl Simulator {
     /// entries are then randomly transposed so the dealt sequence is not a rigid
     /// repeating pattern while any window of it stays proportional.
     pub(super) fn build_dist_deck(&mut self, masses: &[u128]) -> Option<Vec<usize>> {
-        use rand::Rng;
+        use rand::RngExt;
         /// Longest schedule dealt; finer weights are drawn independently.
         const MAX_DECK: u128 = 4096;
         fn gcd(a: u128, b: u128) -> u128 {
@@ -3426,7 +3426,7 @@ impl Simulator {
             deck.push(best);
         }
         for i in 1..deck.len() {
-            if self.cur_rng().r#gen::<bool>() {
+            if self.cur_rng().random::<bool>() {
                 deck.swap(i - 1, i);
             }
         }
@@ -3438,7 +3438,7 @@ impl Simulator {
         ranges: &[Expression],
         target: &Value,
     ) -> Option<Value> {
-        use rand::Rng;
+        use rand::RngExt;
         // Numeric scope/foreach constraints share the class solver's joint
         // comparison and union sampler. Keep the legacy non-integral path
         // for strings, reals, X/Z and expressions outside the exact model.
@@ -3481,7 +3481,7 @@ impl Simulator {
                         // 32'he000_2000]` could never yield anything above
                         // 32'he000_0fff).
                         let span = (h as i128) - (l as i128) + 1;
-                        let pick = (l as i128) + (self.cur_rng().r#gen::<u64>() as i128) % span;
+                        let pick = (l as i128) + (self.cur_rng().random::<u64>() as i128) % span;
                         let w = lov.width.max(hiv.width).max(32);
                         candidates.push(Value::from_u64(pick as u64, w));
                     }
@@ -3512,7 +3512,7 @@ impl Simulator {
         if candidates.is_empty() {
             None
         } else {
-            Some(candidates[self.cur_rng().r#gen::<usize>() % candidates.len()].clone())
+            Some(candidates[self.cur_rng().random_range(0..candidates.len())].clone())
         }
     }
 

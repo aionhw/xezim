@@ -721,7 +721,7 @@ impl Simulator {
         };
         let cif = Cif::new(arg_types, ret_type);
         for lib in &self.dpi_libraries {
-            let sym = unsafe { lib.get::<*mut c_void>(&cname) };
+            let sym = unsafe { lib.get::<*mut c_void>(cname.as_slice()) };
             if let Ok(s) = sym {
                 self.dpi_bindings.insert(
                     sv_name.to_string(),
@@ -1295,15 +1295,22 @@ impl Simulator {
         let cif = binding.cif.clone();
         let fn_ptr = binding.fn_ptr;
 
-        let mut arg_refs = Vec::with_capacity(arg_kinds.len());
+        enum ArgSlot {
+            I32(usize),
+            U8(usize),
+            I64(usize),
+            F32(usize),
+            F64(usize),
+            Ptr(usize),
+        }
+        let mut arg_slots = Vec::with_capacity(arg_kinds.len());
         let mut i32_vals: Vec<Box<i32>> = Vec::with_capacity(arg_kinds.len());
         let mut u8_vals: Vec<Box<u8>> = Vec::with_capacity(arg_kinds.len());
         let mut i64_vals: Vec<Box<i64>> = Vec::with_capacity(arg_kinds.len());
         let mut f32_vals: Vec<Box<f32>> = Vec::with_capacity(arg_kinds.len());
         let mut f64_vals: Vec<Box<f64>> = Vec::with_capacity(arg_kinds.len());
-        // CRITICAL: ptr_vals, logic_aval must never reallocate
-        // after the loop, because arg_refs holds references into their Box
-        // contents. Pre-allocate capacity to prevent mid-loop reallocation.
+        // §35.5: assemble owned argument storage before borrowing it for the
+        // native call. Slot indices preserve formal order across typed buffers.
         let mut ptr_vals: Vec<Box<*mut c_void>> = Vec::with_capacity(arg_kinds.len());
         let mut string_ptr_cells: Vec<Box<*const std::ffi::c_char>> =
             Vec::with_capacity(arg_kinds.len());
@@ -1326,7 +1333,7 @@ impl Simulator {
                             .unwrap_or(0),
                     );
                     i32_vals.push(v);
-                    arg_refs.push(Arg::new(i32_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::I32(i32_vals.len() - 1));
                 }
                 DpiArgKind::LogicIn => {
                     let v = Box::new(
@@ -1335,7 +1342,7 @@ impl Simulator {
                             .unwrap_or(0),
                     );
                     u8_vals.push(v);
-                    arg_refs.push(Arg::new(u8_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::U8(u8_vals.len() - 1));
                 }
                 DpiArgKind::LogicOut => {
                     // An inout passes the actual's current x / z in; C writes
@@ -1349,7 +1356,7 @@ impl Simulator {
                     let p = Box::new((&*b as *const i32 as *mut i32).cast::<c_void>());
                     i32_vals.push(b);
                     ptr_vals.push(p);
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                     if let Some(expr) = args.get(i) {
                         writebacks.push((i32_vals.len() - 1, *kind, expr.clone()));
                     }
@@ -1366,7 +1373,7 @@ impl Simulator {
                             .unwrap_or(0),
                     );
                     u8_vals.push(v);
-                    arg_refs.push(Arg::new(u8_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::U8(u8_vals.len() - 1));
                 }
                 DpiArgKind::BitOut => {
                     // inout/out: seed byte 0 with the actual's bit 0; C writes
@@ -1380,7 +1387,7 @@ impl Simulator {
                     let p = Box::new((&*b as *const i32 as *mut i32).cast::<c_void>());
                     i32_vals.push(b);
                     ptr_vals.push(p);
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                     if let Some(expr) = args.get(i) {
                         writebacks.push((i32_vals.len() - 1, *kind, expr.clone()));
                     }
@@ -1392,7 +1399,7 @@ impl Simulator {
                             .unwrap_or(0),
                     );
                     i64_vals.push(v);
-                    arg_refs.push(Arg::new(i64_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::I64(i64_vals.len() - 1));
                 }
                 DpiArgKind::Real32In => {
                     let v = Box::new(
@@ -1401,7 +1408,7 @@ impl Simulator {
                             .unwrap_or(0.0),
                     );
                     f32_vals.push(v);
-                    arg_refs.push(Arg::new(f32_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::F32(f32_vals.len() - 1));
                 }
                 DpiArgKind::Real64In => {
                     let v = Box::new(
@@ -1410,7 +1417,7 @@ impl Simulator {
                             .unwrap_or(0.0),
                     );
                     f64_vals.push(v);
-                    arg_refs.push(Arg::new(f64_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::F64(f64_vals.len() - 1));
                 }
                 DpiArgKind::ChandleIn => {
                     let p = Box::new(
@@ -1421,7 +1428,7 @@ impl Simulator {
                             .unwrap_or(std::ptr::null_mut()),
                     );
                     ptr_vals.push(p);
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                 }
                 DpiArgKind::StringIn => {
                     let s = args
@@ -1438,7 +1445,7 @@ impl Simulator {
                     let p = Box::new(c.as_ptr() as *mut c_void);
                     cstrings.push(c);
                     ptr_vals.push(p);
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                 }
                 DpiArgKind::StringOut => {
                     let init_s = args
@@ -1466,7 +1473,7 @@ impl Simulator {
                     );
                     string_ptr_cells.push(cell);
                     ptr_vals.push(p);
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                     if let Some(expr) = args.get(i) {
                         writebacks.push((string_ptr_cells.len() - 1, *kind, expr.clone()));
                     }
@@ -1490,7 +1497,7 @@ impl Simulator {
                     let p = Box::new(oa.handle());
                     open_arrays.push(oa);
                     ptr_vals.push(p);
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                     if matches!(kind, DpiArgKind::OpenArrayOut(_)) {
                         if let Some(expr) = args.get(i) {
                             writebacks.push((open_arrays.len() - 1, *kind, expr.clone()));
@@ -1508,7 +1515,7 @@ impl Simulator {
                     logic_aval.push(buf);
                     let raw_ptr = logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>();
                     ptr_vals.push(Box::new(raw_ptr));
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                 }
                 DpiArgKind::VecLogicOut(width) => {
                     let init = args
@@ -1519,7 +1526,7 @@ impl Simulator {
                     logic_aval.push(buf);
                     let raw_ptr = logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>();
                     ptr_vals.push(Box::new(raw_ptr));
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                     if let Some(expr) = args.get(i) {
                         writebacks.push((logic_aval.len() - 1, *kind, expr.clone()));
                     }
@@ -1537,7 +1544,7 @@ impl Simulator {
                     let raw_ptr = logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>();
                     // Put the actual data pointer (not a pointer-to-pointer) in the Box.
                     ptr_vals.push(Box::new(raw_ptr));
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                 }
                 DpiArgKind::VecBitOut(width) => {
                     let init = args
@@ -1548,7 +1555,7 @@ impl Simulator {
                     logic_aval.push(aval);
                     let p = Box::new(logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>());
                     ptr_vals.push(p);
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                     if let Some(expr) = args.get(i) {
                         // Track which logical_aval slot to read back.
                         writebacks.push((logic_aval.len() - 1, *kind, expr.clone()));
@@ -1590,7 +1597,7 @@ impl Simulator {
                         .as_mut_ptr()
                         .cast::<c_void>();
                     ptr_vals.push(Box::new(p));
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                     if matches!(kind, DpiArgKind::StructOut) {
                         if let Some(expr) = args.get(i) {
                             writebacks.push((struct_bufs.len() - 1, *kind, expr.clone()));
@@ -1606,7 +1613,7 @@ impl Simulator {
                     let p = Box::new((&*b as *const i32 as *mut i32).cast::<c_void>());
                     i32_vals.push(b);
                     ptr_vals.push(p);
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                     if let Some(expr) = args.get(i) {
                         writebacks.push((i32_vals.len() - 1, *kind, expr.clone()));
                     }
@@ -1620,7 +1627,7 @@ impl Simulator {
                     let p = Box::new((&*b as *const i64 as *mut i64).cast::<c_void>());
                     i64_vals.push(b);
                     ptr_vals.push(p);
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                     if let Some(expr) = args.get(i) {
                         writebacks.push((i64_vals.len() - 1, *kind, expr.clone()));
                     }
@@ -1634,7 +1641,7 @@ impl Simulator {
                     let p = Box::new((&*b as *const f32 as *mut f32).cast::<c_void>());
                     f32_vals.push(b);
                     ptr_vals.push(p);
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                     if let Some(expr) = args.get(i) {
                         writebacks.push((f32_vals.len() - 1, *kind, expr.clone()));
                     }
@@ -1648,7 +1655,7 @@ impl Simulator {
                     let p = Box::new((&*b as *const f64 as *mut f64).cast::<c_void>());
                     f64_vals.push(b);
                     ptr_vals.push(p);
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                     if let Some(expr) = args.get(i) {
                         writebacks.push((f64_vals.len() - 1, *kind, expr.clone()));
                     }
@@ -1663,13 +1670,25 @@ impl Simulator {
                         Box::new((&*b as *const *mut c_void as *mut *mut c_void).cast::<c_void>());
                     ptr_vals.push(b);
                     ptr_vals.push(p);
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    arg_slots.push(ArgSlot::Ptr(ptr_vals.len() - 1));
                     if let Some(expr) = args.get(i) {
                         writebacks.push((ptr_vals.len() - 2, *kind, expr.clone()));
                     }
                 }
             }
         }
+
+        let arg_refs: Vec<_> = arg_slots
+            .iter()
+            .map(|slot| match *slot {
+                ArgSlot::I32(i) => Arg::new(i32_vals[i].as_ref()),
+                ArgSlot::U8(i) => Arg::new(u8_vals[i].as_ref()),
+                ArgSlot::I64(i) => Arg::new(i64_vals[i].as_ref()),
+                ArgSlot::F32(i) => Arg::new(f32_vals[i].as_ref()),
+                ArgSlot::F64(i) => Arg::new(f64_vals[i].as_ref()),
+                ArgSlot::Ptr(i) => Arg::new(ptr_vals[i].as_ref()),
+            })
+            .collect();
 
         // Set active simulator for VPI callbacks
         let self_ptr = self as *mut Simulator;

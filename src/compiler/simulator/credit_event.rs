@@ -29,7 +29,7 @@ impl EventCredits {
 
     pub(super) fn claim(&self) -> Option<Ticket<'_>> {
         self.next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 (next < self.total).then(|| next + 1)
             })
             .ok()

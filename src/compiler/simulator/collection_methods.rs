@@ -2759,13 +2759,13 @@ impl Simulator {
         // LRM §7.12.1 array `shuffle()` — Fisher-Yates in place using
         // the simulator's PRNG so seeded runs are reproducible.
         if bm == BuiltinM::Shuffle {
-            use rand::Rng;
+            use rand::RngExt;
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 1 {
                 let mut order: Vec<usize> = (0..cur_size).collect();
                 // Fisher-Yates over the index order, then move the elements.
                 for i in (1..cur_size).rev() {
-                    let j = self.cur_rng().gen_range(0..=i);
+                    let j = self.cur_rng().random_range(0..=i);
                     order.swap(i, j);
                 }
                 self.queue_permute(obj_name, &order);

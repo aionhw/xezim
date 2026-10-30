@@ -2733,7 +2733,7 @@ impl Simulator {
                 let s = match existing {
                     Some(s) => s,
                     None => {
-                        let fresh = SvRng::from_seed(rand::RngCore::next_u64(&mut self.rng));
+                        let fresh = SvRng::from_seed(rand::Rng::next_u64(&mut self.rng));
                         if is_process {
                             self.proc_rng.insert(key, fresh);
                         } else {
@@ -2767,15 +2767,15 @@ impl Simulator {
     /// `$urandom`/`$random` so riscv-dv's `$urandom_range`-driven choices
     /// (register dist, branch steps, illegal-instr injection, …) actually vary.
     pub(super) fn rng_u32(&mut self) -> u32 {
-        use rand::Rng;
-        self.cur_rng().r#gen()
+        use rand::RngExt;
+        self.cur_rng().random()
     }
 
     /// Inclusive random in [lo, hi] (lo>hi yields lo). Backs `$urandom_range`.
     pub(super) fn rng_range_u64(&mut self, lo: u64, hi: u64) -> u64 {
-        use rand::Rng;
+        use rand::RngExt;
         if hi >= lo {
-            self.cur_rng().gen_range(lo..=hi)
+            self.cur_rng().random_range(lo..=hi)
         } else {
             lo
         }
@@ -4148,11 +4148,11 @@ impl Simulator {
                                     }
                                     self.constraint_cmp_unsigned = false;
                                     if any && lo <= hi {
-                                        use rand::Rng;
+                                        use rand::RngExt;
                                         let pick = if lo == hi {
                                             lo
                                         } else {
-                                            self.cur_rng().gen_range(lo..=hi)
+                                            self.cur_rng().random_range(lo..=hi)
                                         };
                                         let masked = if width >= 64 {
                                             pick as u64
