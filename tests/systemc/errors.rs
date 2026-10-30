@@ -67,3 +67,13 @@ fn event_and_list() {
         "and_list.cpp:5:14: error: SystemC: waiting on an event AND-list is not supported",
     );
 }
+
+/// A destructor with statements: C++ runs it at the end of the object's
+/// lifetime, which simulation does not model.
+#[test]
+fn destructor_with_statements() {
+    rejects(
+        "destructor",
+        "destructor.cpp:5:5: error: SystemC: the destructor of 'tracker' has statements; destructors are not run in simulation",
+    );
+}

@@ -262,3 +262,21 @@ fn writers_and_names() {
 fn one_writer() {
     assert_eq!(check("e115"), Some(1));
 }
+
+/// §6.4.2/§6.23 a user struct as signal, port and FIFO payload: copies on
+/// write (later changes of the writer's object do not show), a write equal
+/// by `operator==` notifies nothing, `operator<<` prints it, a by-value
+/// local is a copy; member functions and constructors.
+#[test]
+fn class_payload() {
+    check("payload");
+}
+
+/// C++ classes in process bodies: initializer lists, a base-class
+/// constructor, virtual functions through base pointers, objects copied by
+/// value (assignment, by-value parameters) versus shared through pointers
+/// and references, a static member, `new` and `delete`.
+#[test]
+fn class_objects() {
+    check("objects");
+}

@@ -1,0 +1,10 @@
+0 s in={1,10}
+500 ps fifo {1,10} same
+1 ns in={2,10}
+1500 ps fifo {2,10} same
+2 ns in={3,10}
+2500 ps fifo {3,10} same
+4 ns p={4,10} q={4,99,last} sum 103
+4 ns in={4,99,last}
+4500 ps fifo {4,99,last} same
+final {4,99,last}

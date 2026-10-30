@@ -1,0 +1,7 @@
+rect r1 area 6
+square s1 area 16
+rect r2 area 5
+r 24 copy 600 count 3
+manhattan 7 a.x -3
+a 7,4 b 7,0
+1 ns done

@@ -103,6 +103,16 @@ match the SystemC 2.3 reference kernel:
 - **C++ in process bodies**: the usual statements (with `switch`
   fall-through), static locals, value-returning and reference-parameter
   member functions, free functions, `<cmath>` functions.
+- **User classes and structs**: as objects in process bodies and as signal,
+  port and FIFO payloads. Constructors (overloaded, with initializer lists
+  and base-class constructors), member functions (overloaded by their number
+  of arguments), inheritance and virtual functions, static members, `new`
+  and `delete`, and the operators a class defines (`operator==` decides
+  whether a signal write is a change; `operator<<` prints the object). C++
+  value semantics hold: an object is copied on assignment, initialization,
+  by-value parameters and returns, and signal and FIFO writes; pointers and
+  references share it. `std::ostringstream` collects text like `std::cout`
+  prints it. Classes become SystemVerilog classes in the package `sc_user`.
 
 ## Not supported
 
@@ -112,14 +122,11 @@ simulated approximately:
 - `sc_port`/`sc_export` with user interfaces (custom hierarchical channels),
   `sc_mutex`/`sc_semaphore`, approximately-timed TLM (`nb_transport`,
   payload event queues), `sc_spawn`, `SC_FORK`/`SC_JOIN`, `next_trigger`.
-- User classes and structs as data (including signal payloads with
-  `operator==`/`operator<<`), type template parameters of modules, pointers
-  other than byte/word data pointers and class handles.
+- Type template parameters of modules and classes, pointers other than
+  byte/word data pointers and pointers to objects, destructors with
+  statements in them (an empty destructor is fine).
 - C file I/O (`FILE*`), exceptions, `goto`, lambdas.
 - The SystemC 3.0 in-class process macros (`SC_METHOD_IMP`, …).
-
-C++ value semantics of class objects are not replicated: a TLM payload
-object assigned to another variable is shared, not copied.
 
 ## Verification
 
