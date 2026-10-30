@@ -1727,6 +1727,9 @@ const EDGE_HOLD: u8 = 2;
 struct NbaFast {
     signal_id: usize,
     value: Value,
+    /// Selected bits of a partial NBA; None means the complete destination.
+    /// Untouched bits are read at publication, after Active-region writes.
+    mask: Option<Box<Value>>,
     /// Source block index. Used by the parallel-dispatch merge to
     /// recover sequential block-evaluation order before applying NBAs;
     /// without it the partition path could re-order writes across
@@ -2565,6 +2568,8 @@ mod process_control;
 mod process_scopes;
 mod processes;
 mod profiling;
+mod parallel_word;
+mod parallel_workers;
 mod sensitivity;
 mod settling;
 mod setup;
@@ -5426,13 +5431,13 @@ fn splice_bits(dst: u64, src: u64, lo: u32, hi: u32) -> u64 {
 /// READ can yield x at the ELEMENT width. A 1-bit x zero-extends into a wider
 /// element (`0000000x`), which silently turns "unknown" into "almost all
 /// zero" — an AES S-box indexed by an uninitialized input must stay all-x.
-fn bytecode_array_elem_width(
+fn bytecode_array_elem_width<V: isolated_gates::IsolatedSignalView + ?Sized>(
     array: &super::bytecode::ArrayOperand,
     array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
-    signal_table: &[Value],
+    signal_table: &V,
 ) -> u32 {
     bytecode_array_first_id(array, array_first_id)
-        .and_then(|f| signal_table.get(f))
+        .and_then(|f| (f < signal_table.signal_len()).then(|| &signal_table[f]))
         .map(|v| v.width)
         .unwrap_or(1)
         .max(1)
@@ -9163,6 +9168,13 @@ pub struct Simulator {
     /// executed on worker threads and are NOT included in `insns=`.
     prof_par_ticks: u64,
     prof_par_blocks: u64,
+    multicore_on: bool,
+    multicore_threads: usize,
+    edge_workers: Option<parallel_workers::EdgeWorkers>,
+    prof_multicore_fast: u64,
+    prof_multicore_fallback: u64,
+    par_cal_warmup: u32,
+
     /// Zero-delay (delta) livelock detection: how many event-loop iterations
     /// have run at the CURRENT simulation time without it advancing. A design
     /// whose processes keep re-arming at the same timestamp (`forever #0;`, a

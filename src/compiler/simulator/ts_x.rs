@@ -120,48 +120,11 @@ impl Simulator {
     }
 
     fn ts_range_store_nba_xz(&mut self, id: usize, lo: u32, hi: u32, v: u64, x: u64) {
-        if let Some(i) = self.nba_fast_index.get(id) {
-            let target = &mut self.nba_fast[i].value;
-            let (base_v, base_x) = target.raw_bits();
-            let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, v, x, lo, hi);
-            target.set_inline_bits(new_v, new_x);
-            target.is_signed = self.signal_signed[id];
-        } else {
-            let (base_v, base_x) = self.signal_table[id].raw_bits();
-            let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, v, x, lo, hi);
-            if new_v == base_v && new_x == base_x {
-                self.prof_nba_elided += 1;
-            } else {
-                let mut nv = Value::from_inline(new_v, new_x, self.signal_widths[id]);
-                nv.is_signed = self.signal_signed[id];
-                self.nba_fast_index.insert(id, self.nba_fast.len());
-                self.nba_fast.push(NbaFast {
-                    block_index: 0,
-                    signal_id: id,
-                    value: nv,
-                });
-            }
-        }
+        self.queue_partial_nba(id, lo, Value::from_inline(v, x, hi - lo + 1));
     }
 
     fn ts_wide_range_store_nba_xz(&mut self, id: usize, lo: u32, hi: u32, v: u64, x: u64) {
-        let n = (hi - lo + 1) as usize;
-        if let Some(i) = self.nba_fast_index.get(id) {
-            self.nba_fast[i].value.splice_bits64(lo as usize, v, x, n);
-        } else {
-            let mut nv = self.signal_table[id].clone();
-            if !nv.splice_bits64(lo as usize, v, x, n) {
-                self.prof_nba_elided += 1;
-            } else {
-                nv.is_signed = self.signal_signed[id];
-                self.nba_fast_index.insert(id, self.nba_fast.len());
-                self.nba_fast.push(NbaFast {
-                    block_index: 0,
-                    signal_id: id,
-                    value: nv,
-                });
-            }
-        }
+        self.queue_partial_nba(id, lo, Value::from_inline(v, x, hi - lo + 1));
     }
 
     /// Run a narrow two-state stream on x-planes. Returns false only for

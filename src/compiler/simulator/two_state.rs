@@ -871,32 +871,18 @@ impl Simulator {
 
     /// Non-blocking twin of `ts_wide_range_store2`.
     pub(super) fn ts_wide_range_store2_nba(&mut self, id: usize, lo: u32, v: &[u64], w: u32) {
-        if let Some(i) = self.nba_fast_index.get(id) {
-            let t = &mut self.nba_fast[i].value;
-            Self::splice_words(t, lo, v, w);
-        } else {
-            let mut nv = self.signal_table[id].clone();
-            if !Self::splice_words(&mut nv, lo, v, w) {
-                self.prof_nba_elided += 1;
-            } else {
-                nv.is_signed = self.signal_signed[id];
-                self.nba_fast_index.insert(id, self.nba_fast.len());
-                self.nba_fast.push(NbaFast {
-                    block_index: 0,
-                    signal_id: id,
-                    value: nv,
-                });
-            }
-        }
+        self.queue_partial_nba(id, lo, Value::from_words(v, w));
     }
 
     pub(super) fn ts_store_nba_wide(&mut self, id: usize, v: &[u64], w: u32) {
         let val = Value::from_words(v, w);
         if let Some(i) = self.nba_fast_index.get(id) {
             self.nba_fast[i].value = val;
+            self.nba_fast[i].mask = None;
         } else if self.signal_table[id] != val {
             self.nba_fast_index.insert(id, self.nba_fast.len());
             self.nba_fast.push(NbaFast {
+                mask: None,
                 block_index: 0,
                 signal_id: id,
                 value: val,
@@ -1776,36 +1762,7 @@ impl Simulator {
                     s,
                     mask,
                 } => {
-                    // Mirror of the 4-state `NbaAssignRange` fast arm: merge
-                    // into the pending entry when one exists, else seed from
-                    // the signal, with eval-time elision. Plane-based, so an
-                    // X base composes instead of aborting.
-                    let id = *sig as usize;
-                    let (src_v, src_x) = (regs[*s as usize] & mask, 0u64);
-                    if let Some(i) = self.nba_fast_index.get(id) {
-                        let target = &mut self.nba_fast[i].value;
-                        let (base_v, base_x) = target.raw_bits();
-                        let (new_v, new_x) =
-                            Self::compose_inline_range_bits(base_v, base_x, src_v, src_x, *lo, *hi);
-                        target.set_inline_bits(new_v, new_x);
-                        target.is_signed = self.signal_signed[id];
-                    } else {
-                        let (base_v, base_x) = self.signal_table[id].raw_bits();
-                        let (new_v, new_x) =
-                            Self::compose_inline_range_bits(base_v, base_x, src_v, src_x, *lo, *hi);
-                        if new_v == base_v && new_x == base_x {
-                            self.prof_nba_elided += 1;
-                        } else {
-                            let mut nv = Value::from_inline(new_v, new_x, self.signal_widths[id]);
-                            nv.is_signed = self.signal_signed[id];
-                            self.nba_fast_index.insert(id, self.nba_fast.len());
-                            self.nba_fast.push(NbaFast {
-                                block_index: 0,
-                                signal_id: id,
-                                value: nv,
-                            });
-                        }
-                    }
+                    self.ts_range_store_nba(*sig as usize, *lo, *hi, regs[*s as usize] & mask);
                 }
                 // ---- wide bank ----
                 TsInsn::WLoadSig { d, sig } => {
@@ -2618,39 +2575,7 @@ impl Simulator {
                         s,
                         mask,
                     } => {
-                        // Mirror of the 4-state `NbaAssignRange` fast arm: merge
-                        // into the pending entry when one exists, else seed from
-                        // the signal, with eval-time elision. Plane-based, so an
-                        // X base composes instead of aborting.
-                        let id = *sig as usize;
-                        let (src_v, src_x) = (r!(*s) & mask, 0u64);
-                        if let Some(i) = self.nba_fast_index.get(id) {
-                            let target = &mut self.nba_fast[i].value;
-                            let (base_v, base_x) = target.raw_bits();
-                            let (new_v, new_x) = Self::compose_inline_range_bits(
-                                base_v, base_x, src_v, src_x, *lo, *hi,
-                            );
-                            target.set_inline_bits(new_v, new_x);
-                            target.is_signed = self.signal_signed[id];
-                        } else {
-                            let (base_v, base_x) = self.signal_table[id].raw_bits();
-                            let (new_v, new_x) = Self::compose_inline_range_bits(
-                                base_v, base_x, src_v, src_x, *lo, *hi,
-                            );
-                            if new_v == base_v && new_x == base_x {
-                                self.prof_nba_elided += 1;
-                            } else {
-                                let mut nv =
-                                    Value::from_inline(new_v, new_x, self.signal_widths[id]);
-                                nv.is_signed = self.signal_signed[id];
-                                self.nba_fast_index.insert(id, self.nba_fast.len());
-                                self.nba_fast.push(NbaFast {
-                                    block_index: 0,
-                                    signal_id: id,
-                                    value: nv,
-                                });
-                            }
-                        }
+                        self.ts_range_store_nba(*sig as usize, *lo, *hi, r!(*s) & mask);
                     }
                     TsInsn::WLoadSig { .. }
                     | TsInsn::WRangeStore { .. }
@@ -2997,9 +2922,11 @@ impl Simulator {
     pub(super) fn ts_store_nba_val(&mut self, id: usize, val: Value) {
         if let Some(i) = self.nba_fast_index.get(id) {
             self.nba_fast[i].value = val;
+            self.nba_fast[i].mask = None;
         } else if self.signal_table[id] != val {
             self.nba_fast_index.insert(id, self.nba_fast.len());
             self.nba_fast.push(NbaFast {
+                mask: None,
                 block_index: 0,
                 signal_id: id,
                 value: val,
@@ -3013,51 +2940,14 @@ impl Simulator {
     /// pending NBA entry when one exists, else seed from the signal with
     /// eval-time elision (mirrors `RangeStoreNba` for a one-bit window).
     pub(super) fn ts_bit_store_nba(&mut self, id: usize, idx: u32, bit: u64) {
-        if let Some(i) = self.nba_fast_index.get(id) {
-            let target = &mut self.nba_fast[i].value;
-            let (base_v, base_x) = target.raw_bits();
-            let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, bit, 0, idx, idx);
-            target.set_inline_bits(new_v, new_x);
-            target.is_signed = self.signal_signed[id];
-        } else {
-            let (base_v, base_x) = self.signal_table[id].raw_bits();
-            let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, bit, 0, idx, idx);
-            if new_v == base_v && new_x == base_x {
-                self.prof_nba_elided += 1;
-            } else {
-                let mut nv = Value::from_inline(new_v, new_x, self.signal_widths[id]);
-                nv.is_signed = self.signal_signed[id];
-                self.nba_fast_index.insert(id, self.nba_fast.len());
-                self.nba_fast.push(NbaFast {
-                    block_index: 0,
-                    signal_id: id,
-                    value: nv,
-                });
-            }
-        }
+        self.queue_partial_nba(id, idx, Value::from_u64(bit, 1));
     }
 
     /// `sig[hi:lo] <= v` for a destination wider than 64 bits: splice the
     /// window into the pending NBA value, seeding it from the signal with
     /// eval-time elision (the wide twin of `RangeStoreNba`).
     pub(super) fn ts_wide_range_store_nba(&mut self, id: usize, lo: u32, hi: u32, v: u64) {
-        let n = (hi - lo + 1) as usize;
-        if let Some(i) = self.nba_fast_index.get(id) {
-            self.nba_fast[i].value.splice_bits64(lo as usize, v, 0, n);
-        } else {
-            let mut nv = self.signal_table[id].clone();
-            if !nv.splice_bits64(lo as usize, v, 0, n) {
-                self.prof_nba_elided += 1;
-            } else {
-                nv.is_signed = self.signal_signed[id];
-                self.nba_fast_index.insert(id, self.nba_fast.len());
-                self.nba_fast.push(NbaFast {
-                    block_index: 0,
-                    signal_id: id,
-                    value: nv,
-                });
-            }
-        }
+        self.queue_partial_nba(id, lo, Value::from_u64(v, hi - lo + 1));
     }
 
     /// `sig[hi:lo] = {N{bit}}` for a destination of any width: fill the
@@ -3093,38 +2983,12 @@ impl Simulator {
     /// Non-blocking twin of `ts_wide_range_fill`: fill the window in the
     /// pending NBA value, seeding it from the signal with elision.
     pub(super) fn ts_wide_range_fill_nba(&mut self, id: usize, lo: u32, hi: u32, bit: u8) {
-        let fill = if bit != 0 { u64::MAX } else { 0 };
-        let end = hi as usize + 1;
-        if let Some(i) = self.nba_fast_index.get(id) {
-            let mut pos = lo as usize;
-            while pos < end {
-                let n = (end - pos).min(64);
-                self.nba_fast[i].value.splice_bits64(pos, fill, 0, n);
-                pos += n;
-            }
+        let part = if bit != 0 {
+            Value::ones(hi - lo + 1)
         } else {
-            let mut nv = self.signal_table[id].clone();
-            let mut changed = false;
-            let mut pos = lo as usize;
-            while pos < end {
-                let n = (end - pos).min(64);
-                if nv.splice_bits64(pos, fill, 0, n) {
-                    changed = true;
-                }
-                pos += n;
-            }
-            if !changed {
-                self.prof_nba_elided += 1;
-            } else {
-                nv.is_signed = self.signal_signed[id];
-                self.nba_fast_index.insert(id, self.nba_fast.len());
-                self.nba_fast.push(NbaFast {
-                    block_index: 0,
-                    signal_id: id,
-                    value: nv,
-                });
-            }
-        }
+            Value::zero(hi - lo + 1)
+        };
+        self.queue_partial_nba(id, lo, part);
     }
 
     /// `sig[hi:lo] <= v` (narrow destination): merge into the pending NBA
@@ -3271,37 +3135,18 @@ impl Simulator {
     }
 
     pub(crate) fn ts_range_store_nba(&mut self, id: usize, lo: u32, hi: u32, v: u64) {
-        if let Some(i) = self.nba_fast_index.get(id) {
-            let target = &mut self.nba_fast[i].value;
-            let (base_v, base_x) = target.raw_bits();
-            let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, v, 0, lo, hi);
-            target.set_inline_bits(new_v, new_x);
-            target.is_signed = self.signal_signed[id];
-        } else {
-            let (base_v, base_x) = self.signal_table[id].raw_bits();
-            let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, v, 0, lo, hi);
-            if new_v == base_v && new_x == base_x {
-                self.prof_nba_elided += 1;
-            } else {
-                let mut nv = Value::from_inline(new_v, new_x, self.signal_widths[id]);
-                nv.is_signed = self.signal_signed[id];
-                self.nba_fast_index.insert(id, self.nba_fast.len());
-                self.nba_fast.push(NbaFast {
-                    block_index: 0,
-                    signal_id: id,
-                    value: nv,
-                });
-            }
-        }
+        self.queue_partial_nba(id, lo, Value::from_u64(v, hi - lo + 1));
     }
 
     pub(crate) fn ts_store_nba(&mut self, id: usize, v: u64, w: u32) {
         let val = Value::from_u64(v, w);
         if let Some(i) = self.nba_fast_index.get(id) {
             self.nba_fast[i].value = val;
+            self.nba_fast[i].mask = None;
         } else if self.signal_table[id] != val {
             self.nba_fast_index.insert(id, self.nba_fast.len());
             self.nba_fast.push(NbaFast {
+                mask: None,
                 block_index: 0,
                 signal_id: id,
                 value: val,
@@ -4152,39 +3997,12 @@ impl Simulator {
                         s,
                         mask,
                     } => {
-                        // Mirror of the 4-state `NbaAssignRange` fast arm: merge
-                        // into the pending entry when one exists, else seed from
-                        // the signal, with eval-time elision. Plane-based, so an
-                        // X base composes instead of aborting.
-                        let id = *sig as usize;
-                        let (src_v, src_x) = ((*rp.add(*s as usize)) & mask, 0u64);
-                        if let Some(i) = self.nba_fast_index.get(id) {
-                            let target = &mut self.nba_fast[i].value;
-                            let (base_v, base_x) = target.raw_bits();
-                            let (new_v, new_x) = Self::compose_inline_range_bits(
-                                base_v, base_x, src_v, src_x, *lo, *hi,
-                            );
-                            target.set_inline_bits(new_v, new_x);
-                            target.is_signed = self.signal_signed[id];
-                        } else {
-                            let (base_v, base_x) = self.signal_table[id].raw_bits();
-                            let (new_v, new_x) = Self::compose_inline_range_bits(
-                                base_v, base_x, src_v, src_x, *lo, *hi,
-                            );
-                            if new_v == base_v && new_x == base_x {
-                                self.prof_nba_elided += 1;
-                            } else {
-                                let mut nv =
-                                    Value::from_inline(new_v, new_x, self.signal_widths[id]);
-                                nv.is_signed = self.signal_signed[id];
-                                self.nba_fast_index.insert(id, self.nba_fast.len());
-                                self.nba_fast.push(NbaFast {
-                                    block_index: 0,
-                                    signal_id: id,
-                                    value: nv,
-                                });
-                            }
-                        }
+                        self.ts_range_store_nba(
+                            *sig as usize,
+                            *lo,
+                            *hi,
+                            (*rp.add(*s as usize)) & mask,
+                        );
                     }
                     TsInsn::WLoadSig { .. }
                     | TsInsn::WRangeStore { .. }

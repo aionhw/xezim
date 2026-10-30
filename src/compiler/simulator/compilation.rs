@@ -1238,6 +1238,7 @@ impl Simulator {
             }
         }
         self.build_edge_sig_groups();
+        self.prepare_multicore();
         // C1 hot-signal-arena diagnostic (HOT-ARENA-NOTES.md falsification
         // check #2): compute the hot working set + how many hot signals
         // are array members.  Decides whether the arena remap can skip

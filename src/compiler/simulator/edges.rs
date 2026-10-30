@@ -2661,13 +2661,18 @@ impl Simulator {
             // XEZIM_NO_PARALLEL=1 forces sequential; XEZIM_FORCE_PARALLEL=1 skips
             // calibration and always threads (for A/B measurement).
             const PAR_CAL_TICKS: u32 = 64;
-            let parallel_disabled = parallel_disabled_by_env();
+            let parallel_disabled = parallel_disabled_by_env() || self.warn_x;
+            let forced = env_is_one_cached!("XEZIM_FORCE_PARALLEL");
             let qualifies = parallel_blocks.len() >= 2 && parallel_insn_count >= 10_000;
-            let use_parallel = if parallel_disabled {
+            let warming = self.multicore_on && self.par_cal_warmup < 16 && !forced;
+            if qualifies && !parallel_disabled && warming {
+                self.par_cal_warmup += 1;
+            }
+            let use_parallel = if parallel_disabled || warming {
                 false
             } else if !qualifies {
                 false
-            } else if env_is_one_cached!("XEZIM_FORCE_PARALLEL") {
+            } else if forced {
                 true
             } else {
                 match self.par_cal_phase {
@@ -2676,214 +2681,242 @@ impl Simulator {
                     _ => self.par_cal_use_parallel,
                 }
             };
-            let cal_t0 = if qualifies && !parallel_disabled && self.par_cal_phase < 2 {
+            // Pool creation and immutable plan lowering are setup costs. Warm
+            // that backend too before comparing steady-state dispatch windows.
+            let warming_parallel = self.multicore_on
+                && qualifies
+                && !parallel_disabled
+                && !forced
+                && self.par_cal_phase == 1
+                && self.par_cal_warmup < 20;
+            if warming_parallel {
+                self.par_cal_warmup += 1;
+            }
+            let cal_t0 = if qualifies
+                && !parallel_disabled
+                && !warming
+                && !warming_parallel
+                && !forced
+                && self.par_cal_phase < 2
+            {
                 Some(std::time::Instant::now())
             } else {
                 None
             };
             if use_parallel {
-                let signal_table = &self.signal_table;
-                let signal_signed = &self.signal_signed;
-                let signal_name_to_id = &self.signal_name_to_id;
-                let array_first_id = &self.array_first_id;
-                let packed = &self.packed;
-
-                // Phase-1 partition-aware grouping: if a partition file
-                // has been loaded (via --load-partition), bucket blocks
-                // by their partition id so each thread processes one
-                // partition worth of work. Falls back to the legacy
-                // chunk-by-range when no partition is present.
-                //
-                // The partition path REQUIRES parallel_blocks to be
-                // sorted by block_index — chunks bucket by partition id
-                // (independent of block index), and the post-dispatch
-                // k-way merge assumes each chunk's NBAs come out in
-                // block-index order. Sorting AFTER bucketing would still
-                // not satisfy that invariant. Without this sort, k=4 on
-                // c910 hangs after ~50K cycles.
-                //
-                // The chunk-by-range path must NOT sort: chunk-by-range
-                // chunks are contiguous slices of parallel_blocks, so
-                // flattening them back preserves whatever order
-                // `triggered` collected blocks in (sensitivity-fanout
-                // order). c910 sequential dispatch has block-order
-                // dependencies that break under index-sorted order
-                // (c910 t=1 k=0 hangs at iters=200040 if we sort here).
-                let use_partition =
-                    self.edge_block_partition_count > 0 && !self.edge_block_partition.is_empty();
-                if use_partition {
-                    parallel_blocks.sort_unstable();
-                }
-                let mut block_slices: Vec<(usize, ParallelBlockSlice)> =
-                    Vec::with_capacity(parallel_blocks.len());
-                for &bi in &parallel_blocks {
-                    if let Some(cb) = self.compiled_edge_blocks[bi].as_ref() {
-                        block_slices.push((
-                            bi,
-                            ParallelBlockSlice {
-                                ptr: cb.instructions.as_ptr(),
-                                len: cb.instructions.len(),
-                                num_regs: cb.num_regs as usize,
-                                nba_dup: cb.nba_dup_targets,
-                            },
-                        ));
+                if self.multicore_on {
+                    if let Err(error) = self.dispatch_multicore(&mut parallel_blocks) {
+                        self.emit_severity_text("Fatal", &error);
+                        self.fatal_finish_number = Some(1);
+                        self.finished = true;
+                        return;
                     }
-                }
-
-                let mut chunks: Vec<Vec<(usize, ParallelBlockSlice)>>;
-                if use_partition {
-                    self.prof_par_dispatch_partition += 1;
-                    let k = self.edge_block_partition_count as usize;
-                    chunks = (0..k).map(|_| Vec::new()).collect();
-                    for (bi, bs) in block_slices.into_iter() {
-                        let p = self.edge_block_partition.get(bi).copied().unwrap_or(0) as usize;
-                        let p = p.min(k - 1);
-                        chunks[p].push((bi, bs));
-                    }
-                    chunks.retain(|c| !c.is_empty());
                 } else {
-                    self.prof_par_dispatch_legacy += 1;
-                    let num_threads = std::thread::available_parallelism()
-                        .map(|n| n.get().min(block_slices.len()).min(8))
-                        .unwrap_or(2);
-                    let chunk_size = block_slices.len().div_ceil(num_threads);
-                    chunks = block_slices
-                        .chunks(chunk_size)
-                        .map(|c| c.to_vec())
-                        .collect();
-                }
+                    let signal_table = &self.signal_table;
+                    let signal_signed = &self.signal_signed;
+                    let signal_name_to_id = &self.signal_name_to_id;
+                    let array_first_id = &self.array_first_id;
+                    let packed = &self.packed;
 
-                let mut all_nba: Vec<Vec<NbaFast>> = Vec::new();
-                // XEZIM_PARALLEL_SERIALIZE=1: run exec_insns_isolated
-                // sequentially in the main thread (chunks processed in
-                // spawn order). Diagnoses whether the parallel-mode
-                // c910 stall is in exec_insns_isolated's behavior vs
-                // multi-thread scheduling. If it still fails with this
-                // set, the bug is in exec_insns_isolated itself.
-                let serialize = parallel_serialize_enabled();
-                if serialize {
-                    for chunk in chunks.iter() {
-                        let chunk = chunk.as_slice();
-                        let mut thread_nba: Vec<NbaFast> = Vec::new();
-                        let max_regs = chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
-                        let mut vm_regs = vec![Value::zero(1); max_regs];
-                        for (bi, bs) in chunk {
-                            if vm_regs.len() < bs.num_regs {
-                                vm_regs.resize(bs.num_regs, Value::zero(1));
-                            }
-                            let insns = unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
-                            let mut nba = Self::exec_insns_isolated(
-                                insns,
-                                signal_table,
-                                signal_signed,
-                                signal_name_to_id,
-                                array_first_id,
-                                Some(packed),
-                                &mut vm_regs,
-                                *bi as u32,
-                                bs.nba_dup,
-                            );
-                            thread_nba.append(&mut nba);
+                    // Phase-1 partition-aware grouping: if a partition file
+                    // has been loaded (via --load-partition), bucket blocks
+                    // by their partition id so each thread processes one
+                    // partition worth of work. Falls back to the legacy
+                    // chunk-by-range when no partition is present.
+                    //
+                    // The partition path REQUIRES parallel_blocks to be
+                    // sorted by block_index — chunks bucket by partition id
+                    // (independent of block index), and the post-dispatch
+                    // k-way merge assumes each chunk's NBAs come out in
+                    // block-index order. Sorting AFTER bucketing would still
+                    // not satisfy that invariant. Without this sort, k=4 on
+                    // c910 hangs after ~50K cycles.
+                    //
+                    // The chunk-by-range path must NOT sort: chunk-by-range
+                    // chunks are contiguous slices of parallel_blocks, so
+                    // flattening them back preserves whatever order
+                    // `triggered` collected blocks in (sensitivity-fanout
+                    // order). c910 sequential dispatch has block-order
+                    // dependencies that break under index-sorted order
+                    // (c910 t=1 k=0 hangs at iters=200040 if we sort here).
+                    let use_partition = self.edge_block_partition_count > 0
+                        && !self.edge_block_partition.is_empty();
+                    if use_partition {
+                        parallel_blocks.sort_unstable();
+                    }
+                    let mut block_slices: Vec<(usize, ParallelBlockSlice)> =
+                        Vec::with_capacity(parallel_blocks.len());
+                    for &bi in &parallel_blocks {
+                        if let Some(cb) = self.compiled_edge_blocks[bi].as_ref() {
+                            block_slices.push((
+                                bi,
+                                ParallelBlockSlice {
+                                    ptr: cb.instructions.as_ptr(),
+                                    len: cb.instructions.len(),
+                                    num_regs: cb.num_regs as usize,
+                                    nba_dup: cb.nba_dup_targets,
+                                },
+                            ));
                         }
-                        all_nba.push(thread_nba);
                     }
-                } else {
-                    std::thread::scope(|s| {
-                        let mut handles = Vec::new();
+
+                    let mut chunks: Vec<Vec<(usize, ParallelBlockSlice)>>;
+                    if use_partition {
+                        self.prof_par_dispatch_partition += 1;
+                        let k = self.edge_block_partition_count as usize;
+                        chunks = (0..k).map(|_| Vec::new()).collect();
+                        for (bi, bs) in block_slices.into_iter() {
+                            let p =
+                                self.edge_block_partition.get(bi).copied().unwrap_or(0) as usize;
+                            let p = p.min(k - 1);
+                            chunks[p].push((bi, bs));
+                        }
+                        chunks.retain(|c| !c.is_empty());
+                    } else {
+                        self.prof_par_dispatch_legacy += 1;
+                        let num_threads = std::thread::available_parallelism()
+                            .map(|n| n.get().min(block_slices.len()).min(8))
+                            .unwrap_or(2);
+                        let chunk_size = block_slices.len().div_ceil(num_threads);
+                        chunks = block_slices
+                            .chunks(chunk_size)
+                            .map(|c| c.to_vec())
+                            .collect();
+                    }
+
+                    let mut all_nba: Vec<Vec<NbaFast>> = Vec::new();
+                    // XEZIM_PARALLEL_SERIALIZE=1: run exec_insns_isolated
+                    // sequentially in the main thread (chunks processed in
+                    // spawn order). Diagnoses whether the parallel-mode
+                    // c910 stall is in exec_insns_isolated's behavior vs
+                    // multi-thread scheduling. If it still fails with this
+                    // set, the bug is in exec_insns_isolated itself.
+                    let serialize = parallel_serialize_enabled();
+                    if serialize {
                         for chunk in chunks.iter() {
                             let chunk = chunk.as_slice();
-                            let handle = s.spawn(move || {
-                                let mut thread_nba: Vec<NbaFast> = Vec::new();
-                                let max_regs =
-                                    chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
-                                let mut vm_regs = vec![Value::zero(1); max_regs];
-                                for (bi, bs) in chunk {
-                                    if vm_regs.len() < bs.num_regs {
-                                        vm_regs.resize(bs.num_regs, Value::zero(1));
-                                    }
-                                    let insns =
-                                        unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
-                                    let mut nba = Self::exec_insns_isolated(
-                                        insns,
-                                        signal_table,
-                                        signal_signed,
-                                        signal_name_to_id,
-                                        array_first_id,
-                                        Some(packed),
-                                        &mut vm_regs,
-                                        *bi as u32,
-                                        bs.nba_dup,
-                                    );
-                                    thread_nba.append(&mut nba);
+                            let mut thread_nba: Vec<NbaFast> = Vec::new();
+                            let max_regs =
+                                chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
+                            let mut vm_regs = vec![Value::zero(1); max_regs];
+                            for (bi, bs) in chunk {
+                                if vm_regs.len() < bs.num_regs {
+                                    vm_regs.resize(bs.num_regs, Value::zero(1));
                                 }
-                                thread_nba
-                            });
-                            handles.push(handle);
+                                let insns = unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
+                                let mut nba = Self::exec_insns_isolated(
+                                    insns,
+                                    signal_table,
+                                    signal_signed,
+                                    signal_name_to_id,
+                                    array_first_id,
+                                    Some(packed),
+                                    &mut vm_regs,
+                                    *bi as u32,
+                                    bs.nba_dup,
+                                );
+                                thread_nba.append(&mut nba);
+                            }
+                            all_nba.push(thread_nba);
                         }
-                        for h in handles {
-                            if let Ok(nba) = h.join() {
-                                all_nba.push(nba);
+                    } else {
+                        std::thread::scope(|s| {
+                            let mut handles = Vec::new();
+                            for chunk in chunks.iter() {
+                                let chunk = chunk.as_slice();
+                                let handle = s.spawn(move || {
+                                    let mut thread_nba: Vec<NbaFast> = Vec::new();
+                                    let max_regs =
+                                        chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
+                                    let mut vm_regs = vec![Value::zero(1); max_regs];
+                                    for (bi, bs) in chunk {
+                                        if vm_regs.len() < bs.num_regs {
+                                            vm_regs.resize(bs.num_regs, Value::zero(1));
+                                        }
+                                        let insns =
+                                            unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
+                                        let mut nba = Self::exec_insns_isolated(
+                                            insns,
+                                            signal_table,
+                                            signal_signed,
+                                            signal_name_to_id,
+                                            array_first_id,
+                                            Some(packed),
+                                            &mut vm_regs,
+                                            *bi as u32,
+                                            bs.nba_dup,
+                                        );
+                                        thread_nba.append(&mut nba);
+                                    }
+                                    thread_nba
+                                });
+                                handles.push(handle);
+                            }
+                            for h in handles {
+                                all_nba.push(
+                                    h.join().expect("parallel worker failed before publication"),
+                                );
+                            }
+                        });
+                    }
+                    // Apply NBAs.
+                    //
+                    // Chunk-by-range path: chunks are contiguous slices of
+                    // parallel_blocks (which is in `triggered` order), so a
+                    // simple flatten reproduces the order legacy sequential
+                    // dispatch would have used. c910 sequential block-order
+                    // dependencies require this exact order — k-way merging
+                    // by block_index here would change behavior and hang.
+                    //
+                    // Partition path: chunks are bucketed by partition id
+                    // (independent of block index), so flattening loses
+                    // global ordering and picks the wrong "last writer" for
+                    // signals written from different partitions. Each chunk
+                    // is already block-index sorted (parallel_blocks sorted
+                    // upstream when use_partition is true), so a k-way
+                    // min-heap merge reconstructs global block-index order
+                    // in O(N log k).
+                    if use_partition {
+                        let total: usize = all_nba.iter().map(Vec::len).sum();
+                        if total > 0 {
+                            self.nba_fast.reserve(total);
+                            let mut iters: Vec<std::vec::IntoIter<NbaFast>> =
+                                all_nba.into_iter().map(|v| v.into_iter()).collect();
+                            let mut head: Vec<Option<NbaFast>> =
+                                (0..iters.len()).map(|_| None).collect();
+                            for (i, it) in iters.iter_mut().enumerate() {
+                                if let Some(n) = it.next() {
+                                    head[i] = Some(n);
+                                }
+                            }
+                            use std::cmp::Reverse;
+                            use std::collections::BinaryHeap;
+                            let mut heap: BinaryHeap<(Reverse<u32>, usize)> =
+                                BinaryHeap::with_capacity(iters.len());
+                            for (ci, entry) in head.iter().enumerate() {
+                                if let Some(entry) = entry {
+                                    heap.push((Reverse(entry.block_index), ci));
+                                }
+                            }
+                            while let Some((_, ci)) = heap.pop() {
+                                if let Some(entry) = head[ci].take() {
+                                    self.nba_fast_index
+                                        .insert(entry.signal_id, self.nba_fast.len());
+                                    self.nba_fast.push(entry);
+                                }
+                                if let Some(n) = iters[ci].next() {
+                                    heap.push((Reverse(n.block_index), ci));
+                                    head[ci] = Some(n);
+                                }
                             }
                         }
-                    });
-                }
-                // Apply NBAs.
-                //
-                // Chunk-by-range path: chunks are contiguous slices of
-                // parallel_blocks (which is in `triggered` order), so a
-                // simple flatten reproduces the order legacy sequential
-                // dispatch would have used. c910 sequential block-order
-                // dependencies require this exact order — k-way merging
-                // by block_index here would change behavior and hang.
-                //
-                // Partition path: chunks are bucketed by partition id
-                // (independent of block index), so flattening loses
-                // global ordering and picks the wrong "last writer" for
-                // signals written from different partitions. Each chunk
-                // is already block-index sorted (parallel_blocks sorted
-                // upstream when use_partition is true), so a k-way
-                // min-heap merge reconstructs global block-index order
-                // in O(N log k).
-                if use_partition {
-                    let total: usize = all_nba.iter().map(Vec::len).sum();
-                    if total > 0 {
-                        self.nba_fast.reserve(total);
-                        let mut iters: Vec<std::vec::IntoIter<NbaFast>> =
-                            all_nba.into_iter().map(|v| v.into_iter()).collect();
-                        let mut head: Vec<Option<NbaFast>> =
-                            (0..iters.len()).map(|_| None).collect();
-                        for (i, it) in iters.iter_mut().enumerate() {
-                            if let Some(n) = it.next() {
-                                head[i] = Some(n);
-                            }
-                        }
-                        use std::cmp::Reverse;
-                        use std::collections::BinaryHeap;
-                        let mut heap: BinaryHeap<(Reverse<u32>, usize)> =
-                            BinaryHeap::with_capacity(iters.len());
-                        for (ci, entry) in head.iter().enumerate() {
-                            if let Some(entry) = entry {
-                                heap.push((Reverse(entry.block_index), ci));
-                            }
-                        }
-                        while let Some((_, ci)) = heap.pop() {
-                            if let Some(entry) = head[ci].take() {
+                    } else {
+                        for nba_batch in all_nba {
+                            for entry in nba_batch {
                                 self.nba_fast_index
                                     .insert(entry.signal_id, self.nba_fast.len());
                                 self.nba_fast.push(entry);
                             }
-                            if let Some(n) = iters[ci].next() {
-                                heap.push((Reverse(n.block_index), ci));
-                                head[ci] = Some(n);
-                            }
-                        }
-                    }
-                } else {
-                    for nba_batch in all_nba {
-                        for entry in nba_batch {
-                            self.nba_fast_index
-                                .insert(entry.signal_id, self.nba_fast.len());
-                            self.nba_fast.push(entry);
                         }
                     }
                 }
@@ -2979,6 +3012,24 @@ impl Simulator {
                             }
                         );
                     }
+                }
+            }
+
+            if self.multicore_on
+                && qualifies
+                && !parallel_disabled
+                && !forced
+                && self.par_cal_phase == 2
+            {
+                self.par_cal_ticks += 1;
+                if self.par_cal_ticks >= 4096 {
+                    self.par_cal_phase = 0;
+                    self.par_cal_warmup = 16;
+                    self.par_cal_ticks = 0;
+                    self.par_cal_seq_ns = 0;
+                    self.par_cal_par_ns = 0;
+                    self.par_cal_seq_insns = 0;
+                    self.par_cal_par_insns = 0;
                 }
             }
 

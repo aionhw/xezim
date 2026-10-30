@@ -167,6 +167,7 @@ impl Simulator {
         val.is_signed = self.signal_signed[id];
         self.nba_fast_index.insert(id, self.nba_fast.len());
         self.nba_fast.push(NbaFast {
+            mask: None,
             block_index: 0,
             signal_id: id,
             value: val,
@@ -186,6 +187,7 @@ impl Simulator {
         val.is_signed = self.signal_signed[id];
         self.nba_fast_index.insert(id, self.nba_fast.len());
         self.nba_fast.push(NbaFast {
+            mask: None,
             block_index: 0,
             signal_id: id,
             value: val,
@@ -204,6 +206,7 @@ impl Simulator {
         val.is_signed = self.signal_signed[id];
         self.nba_fast_index.insert(id, self.nba_fast.len());
         self.nba_fast.push(NbaFast {
+            mask: None,
             block_index: 0,
             signal_id: id,
             value: val,
@@ -211,9 +214,8 @@ impl Simulator {
     }
 
     /// JIT bridge: mirror `Insn::NbaAssignRange` / `Insn::NbaAssignRangeDyn`
-    /// — read-modify-write bits `[hi:lo]` of the target signal (or
-    /// the latest in-flight NbaFast entry) with `val_bits` occupying
-    /// the low `(hi-lo+1)` bits.
+    /// — retain the selected write mask until NBA publication, with
+    /// `val_bits` occupying the low `(hi-lo+1)` bits.
     #[inline]
     pub(crate) fn jit_schedule_nba_range(
         &mut self,
@@ -232,57 +234,21 @@ impl Simulator {
         // forced every JIT-stored unknown to 0 the moment the block ran
         // (the old 2-state pre-check masked this by never running on X).
         let val = Value::from_inline(val_bits, xz_bits, w);
-        // Compose onto latest nba_fast entry if any, else onto
-        // signal_table's current value — exactly matches the
-        // interpreter's NbaAssignRange read-modify-write pattern.
         let sig_w = self.signal_widths[id];
         let high_eff = high.min(sig_w.saturating_sub(1));
         if oob_write_discard(high as i64, low as i64, sig_w) {
             return;
         }
-        if let Some(i) = self.nba_fast_index.get(id) {
-            let target = &mut self.nba_fast[i].value;
-            for bit_pos in low..=high_eff {
-                target.set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
-            }
-            return;
-        }
-        let mut new_val = self.signal_table[id].clone();
-        for bit_pos in low..=high_eff {
-            new_val.set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
-        }
-        self.nba_fast_index.insert(id, self.nba_fast.len());
-        self.nba_fast.push(NbaFast {
-            block_index: 0,
-            signal_id: id,
-            value: new_val,
-        });
+        self.queue_partial_nba(id, low, val.resize(high_eff - low + 1));
     }
 
     /// JIT bridge: schedule non-blocking assignment to a dynamic bit-index.
     #[inline]
     pub(crate) fn jit_schedule_nba_bit(&mut self, id: usize, idx: usize, v: u64, x: u64) {
-        if id >= self.signal_table.len() {
+        if id >= self.signal_table.len() || idx >= self.signal_widths[id] as usize {
             return;
         }
-        let bit = match (v & 1, x & 1) {
-            (0, 0) => LogicBit::Zero,
-            (1, 0) => LogicBit::One,
-            (0, _) => LogicBit::X,
-            _ => LogicBit::Z,
-        };
-        if let Some(i) = self.nba_fast_index.get(id) {
-            self.nba_fast[i].value.set_bit(idx, bit);
-            return;
-        }
-        let mut new_val = self.signal_table[id].clone();
-        new_val.set_bit(idx, bit);
-        self.nba_fast_index.insert(id, self.nba_fast.len());
-        self.nba_fast.push(NbaFast {
-            block_index: 0,
-            signal_id: id,
-            value: new_val,
-        });
+        self.queue_partial_nba(id, idx as u32, Value::from_inline(v & 1, x & 1, 1));
     }
 
     /// JIT bridge: perform a blocking assign to a dynamic bit-range.
@@ -670,16 +636,8 @@ impl Simulator {
                     // exactly what joining the path with '.' and re-splitting it
                     // would yield, without the Vec and String allocation on a path
                     // this hot (`lrm_self_width` runs per operand per evaluation).
-                    let owner = h
-                        .path
-                        .first()
-                        .map(|s| s.name.name.as_str())
-                        .unwrap_or("");
-                    let prop = h
-                        .path
-                        .last()
-                        .map(|s| s.name.name.as_str())
-                        .unwrap_or("");
+                    let owner = h.path.first().map(|s| s.name.name.as_str()).unwrap_or("");
+                    let prop = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                     if !owner.is_empty() && !prop.is_empty() && owner != prop {
                         if let Some(w) = self
                             .class_prop_width_impl(owner, None, prop)
@@ -898,7 +856,10 @@ impl Simulator {
                 &self.module.typedefs,
                 &self.module.typedef_types,
             )?;
-            let rest: Vec<&str> = h.path[i + 1..].iter().map(|s| s.name.name.as_str()).collect();
+            let rest: Vec<&str> = h.path[i + 1..]
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect();
             if h.path[i + 1..].iter().any(|s| !s.selects.is_empty()) {
                 return None;
             }
@@ -907,7 +868,11 @@ impl Simulator {
             return fields
                 .iter()
                 .find(|(f, _, _)| f.trim_start_matches('.') == joined)
-                .or_else(|| fields.iter().find(|(f, _, _)| f.rsplit('.').next() == Some(leaf)))
+                .or_else(|| {
+                    fields
+                        .iter()
+                        .find(|(f, _, _)| f.rsplit('.').next() == Some(leaf))
+                })
                 .map(|(_, _, w)| *w)
                 .filter(|w| *w > 0);
         }
@@ -933,9 +898,10 @@ impl Simulator {
                     &self.module.typedefs,
                     &self.module.typedef_types,
                 ) {
-                    if let Some((_, _, w)) = fields.iter().find(|(f, _, _)| {
-                        f.rsplit('.').next() == Some(member.name.as_str())
-                    }) {
+                    if let Some((_, _, w)) = fields
+                        .iter()
+                        .find(|(f, _, _)| f.rsplit('.').next() == Some(member.name.as_str()))
+                    {
                         if *w > 0 {
                             return Some(*w);
                         }
@@ -997,11 +963,17 @@ impl Simulator {
             if owner.is_empty() || prop.is_empty() || owner == prop {
                 continue;
             }
-            if let Some(w) = self.class_prop_width_impl(owner, None, prop).filter(|w| *w > 0) {
+            if let Some(w) = self
+                .class_prop_width_impl(owner, None, prop)
+                .filter(|w| *w > 0)
+            {
                 return Some(w);
             }
             if let Some(Some(h)) = self.this_stack.last().copied() {
-                if let Some(w) = self.class_prop_width_impl(owner, Some(h), prop).filter(|w| *w > 0) {
+                if let Some(w) = self
+                    .class_prop_width_impl(owner, Some(h), prop)
+                    .filter(|w| *w > 0)
+                {
                     return Some(w);
                 }
             }
@@ -1035,31 +1007,28 @@ impl Simulator {
                 _ => None,
             };
             if let Some(recv_prop) = recv_prop {
-            if let Some(cls) = self
-                .declared_prop_chain_class(base)
-                .or_else(|| live_cls)
-            {
-                if self.class_vif_decl(&cls, &recv_prop).is_some() {
-                    if let Some(h) = self.this_stack.last().copied().flatten() {
-                        if let Some((bound, _mp)) = self
-                            .virtual_iface_bindings
-                            .get(&(h, recv_prop.clone()))
-                            .cloned()
-                        {
-                            let sig = format!("{}.{}", bound, member.name);
-                            if let Some(w) = self.lookup_signal_width(&sig).filter(|w| *w > 0) {
-                                return Some(w);
+                if let Some(cls) = self.declared_prop_chain_class(base).or_else(|| live_cls) {
+                    if self.class_vif_decl(&cls, &recv_prop).is_some() {
+                        if let Some(h) = self.this_stack.last().copied().flatten() {
+                            if let Some((bound, _mp)) = self
+                                .virtual_iface_bindings
+                                .get(&(h, recv_prop.clone()))
+                                .cloned()
+                            {
+                                let sig = format!("{}.{}", bound, member.name);
+                                if let Some(w) = self.lookup_signal_width(&sig).filter(|w| *w > 0) {
+                                    return Some(w);
+                                }
                             }
                         }
                     }
                 }
-            }
-            if let Some(bound) = self.iface_alias_for(&recv_prop) {
-                let sig = format!("{}.{}", bound, member.name);
-                if let Some(w) = self.lookup_signal_width(&sig).filter(|w| *w > 0) {
-                    return Some(w);
+                if let Some(bound) = self.iface_alias_for(&recv_prop) {
+                    let sig = format!("{}.{}", bound, member.name);
+                    if let Some(w) = self.lookup_signal_width(&sig).filter(|w| *w > 0) {
+                        return Some(w);
+                    }
                 }
-            }
             }
         }
         None

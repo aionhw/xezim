@@ -4595,6 +4595,18 @@ impl Simulator {
             par_cal_use_parallel: false,
             prof_par_ticks: 0,
             prof_par_blocks: 0,
+            multicore_on: std::env::var("XEZIM_MULTICORE").as_deref() == Ok("1"),
+            multicore_threads: std::env::var("XEZIM_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from))
+                .min(std::thread::available_parallelism().map_or(1, usize::from)),
+            edge_workers: None,
+            prof_multicore_fast: 0,
+            prof_multicore_fallback: 0,
+            par_cal_warmup: 0,
+
             forever_depth: 0,
             forever_cont_cache: HashMap::default(),
             settle_inject_bits: Vec::new(),

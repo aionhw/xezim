@@ -3199,23 +3199,7 @@ impl Simulator {
             return true;
         }
         let piece = val.resize_for_assign(elem_width);
-        if let Some(entry_index) = self.nba_fast_index.get(id) {
-            self.nba_fast[entry_index]
-                .value
-                .copy_bits_from(low, &piece, 0, elem_width as usize);
-            return true;
-        }
-        let mut pending = self.signal_table[id].clone();
-        if pending.copy_bits_from(low, &piece, 0, elem_width as usize) {
-            self.nba_fast_index.insert(id, self.nba_fast.len());
-            self.nba_fast.push(NbaFast {
-                block_index: 0,
-                signal_id: id,
-                value: pending,
-            });
-        } else {
-            self.prof_nba_elided += 1;
-        }
+        self.queue_partial_nba(id, low as u32, piece);
         true
     }
 
@@ -3238,6 +3222,7 @@ impl Simulator {
             let mut val = Value::from_u64(entry.val_bits, sig_w);
             val.is_signed = self.signal_signed[id];
             self.nba_fast.push(NbaFast {
+                mask: None,
                 block_index: 0,
                 signal_id: id,
                 value: val,
@@ -3461,7 +3446,42 @@ impl Simulator {
         }
     }
 
-    pub(super) fn apply_nba_entry(&mut self, entry: NbaFast) {
+    /// §10.4.2: sampling a partial NBA does not sample the untouched bits.
+    /// Queue even an equal selected value: a later blocking write can change it.
+    pub(super) fn queue_partial_nba(&mut self, id: usize, lo: u32, part: Value) {
+        if let Some(i) = self.nba_fast_index.get(id) {
+            let entry = &mut self.nba_fast[i];
+            entry
+                .value
+                .copy_bits_from(lo as usize, &part, 0, part.width as usize);
+            entry.include_range(lo, part.width);
+        } else {
+            let mut value = if is_packed_id(id) {
+                self.packed.read(id)
+            } else {
+                self.signal_table[id].clone()
+            };
+            value.copy_bits_from(lo as usize, &part, 0, part.width as usize);
+            self.nba_fast_index.insert(id, self.nba_fast.len());
+            self.nba_fast
+                .push(NbaFast::partial(id, value, lo, part.width, 0));
+        }
+    }
+
+    pub(super) fn apply_nba_entry(&mut self, mut entry: NbaFast) {
+        if let Some(mask) = entry.mask.take() {
+            let mut current = if is_packed_id(entry.signal_id) {
+                self.packed.read(entry.signal_id)
+            } else {
+                self.signal_table[entry.signal_id].clone()
+            };
+            for bit in 0..mask.width.min(current.width) {
+                if mask.get_bit(bit as usize) == LogicBit::One {
+                    current.set_bit(bit as usize, entry.value.get_bit(bit as usize));
+                }
+            }
+            entry.value = current;
+        }
         // Defensive landing for a packed-arena id: the per-signal table
         // indexing below cannot take one (it would index far out of bounds).
         if is_packed_id(entry.signal_id) {

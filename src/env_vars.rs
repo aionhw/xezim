@@ -655,6 +655,14 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Memory: packed arena storage for large integral arrays (on; 0 turns it off)",
     ),
     (
+        "XEZIM_MULTICORE",
+        "Parallel: opt-in persistent workers with guarded word execution (1)",
+    ),
+    (
+        "XEZIM_THREADS",
+        "Parallel: worker count for XEZIM_MULTICORE, bounded by available CPUs",
+    ),
+    (
         "XEZIM_PARALLEL_SERIALIZE",
         "Parallel: run parallel plan serially (debug determinism check)",
     ),

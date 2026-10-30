@@ -3418,8 +3418,24 @@ suppressed but the explicit SDF annotation still applies."
                             "[PHASE] compilation: {:.1}ms",
                             compilation_start.elapsed().as_secs_f64() * 1000.0
                         );
+                        xezim::prepare_parallel_run(
+                            &mut sim,
+                            emit_hypergraph.as_deref(),
+                            load_partition.as_deref(),
+                            profile_input.as_deref(),
+                            collapse_islands,
+                        );
                         let simulation_start = xezim::WallTimer::now();
                         sim.simulate();
+                        if let Some(path) = write_profile.as_deref() {
+                            match sim.write_phase2_profile(path) {
+                                Ok(()) => eprintln!("[PART] profile written to {}", path),
+                                Err(e) => {
+                                    eprintln!("[PART] failed to write profile to {}: {}", path, e)
+                                }
+                            }
+                        }
+
                         chatter!(
                             "[PHASE] simulation: {:.1}ms",
                             simulation_start.elapsed().as_secs_f64() * 1000.0

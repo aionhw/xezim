@@ -4,6 +4,56 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+impl NbaFast {
+    /// §10.4.2: retain exactly the selected bits until the NBA region.
+    pub(super) fn partial(
+        signal_id: usize,
+        value: Value,
+        lo: u32,
+        len: u32,
+        block_index: u32,
+    ) -> Self {
+        let mask = Box::new(Value::zero(value.width));
+        let mut entry = Self {
+            signal_id,
+            value,
+            mask: Some(mask),
+            block_index,
+        };
+        entry.include_range(lo, len);
+        entry
+    }
+
+    pub(super) fn include_range(&mut self, lo: u32, len: u32) {
+        if let Some(mask) = self.mask.as_mut() {
+            for bit in lo..lo.saturating_add(len).min(mask.width) {
+                mask.set_bit(bit as usize, LogicBit::One);
+            }
+        }
+    }
+
+    /// A worker owns this queue and only reads the shared input snapshot.
+    fn queue_partial(
+        out: &mut Vec<Self>,
+        base: &Value,
+        signal_id: usize,
+        lo: u32,
+        part: &Value,
+        block_index: u32,
+    ) {
+        if let Some(entry) = out.iter_mut().rev().find(|e| e.signal_id == signal_id) {
+            entry
+                .value
+                .copy_bits_from(lo as usize, part, 0, part.width as usize);
+            entry.include_range(lo, part.width);
+        } else {
+            let mut value = base.clone();
+            value.copy_bits_from(lo as usize, part, 0, part.width as usize);
+            out.push(Self::partial(signal_id, value, lo, part.width, block_index));
+        }
+    }
+}
+
 impl Simulator {
     /// Execute bytecode instructions in isolation (no &mut self).
     /// Returns NBA entries produced. Used for parallel edge block execution.
@@ -348,8 +398,10 @@ impl Simulator {
                         None
                     } {
                         nba_out[i].value = (**k).clone();
+                        nba_out[i].mask = None;
                     } else if signal_table[*sig_id] != **k {
                         nba_out.push(NbaFast {
+                            mask: None,
                             signal_id: *sig_id,
                             value: (**k).clone(),
                             block_index,
@@ -505,8 +557,10 @@ impl Simulator {
                         None
                     } {
                         nba_out[i].value = val;
+                        nba_out[i].mask = None;
                     } else if signal_table[*sig_id] != val {
                         nba_out.push(NbaFast {
+                            mask: None,
                             signal_id: *sig_id,
                             value: val,
                             block_index,
@@ -514,85 +568,37 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
-                    let sig_id = &(*sig_id as usize);
-                    let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
-                    if oob_write_discard(high as i64, low as i64, signal_table[*sig_id].width) {
+                    let id = *sig_id as usize;
+                    let (lo, hi) = ((*lo).min(*hi), (*lo).max(*hi));
+                    if oob_write_discard(hi as i64, lo as i64, signal_table[id].width) {
                         pc += 1;
                         continue;
                     }
-                    let w = high - low + 1;
-                    let val = vm_regs[*val_reg as usize].resize(w);
-                    let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
-                    if let Some(i) = existing {
-                        // In-flight queue entry — merge into it.  Don't try
-                        // to elide here: the original write was a real
-                        // change (else it would have been elided already);
-                        // this update may or may not return to no-op state
-                        // but apply_nba's slot check will catch it.
-                        let mut new_val = nba_out[i].value.clone();
-                        for bit_pos in low..=high {
-                            new_val
-                                .set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
-                        }
-                        nba_out[i].value = new_val;
-                    } else {
-                        // No queue entry: build the merged value from
-                        // signal_table and elide if the range bits already
-                        // match (the partial-range counterpart of the
-                        // simple NbaAssign eval-time elision).
-                        // Compare FIRST (no clone): flop reloads usually match, and
-                        // the unconditional clone of a wide signal (1 byte/bit Vec)
-                        // was a top allocator cost on c910. Clone + merge only from
-                        // the first differing bit.
-                        let mut first_diff = None;
-                        {
-                            let src = &signal_table[*sig_id];
-                            for bit_pos in low..=high {
-                                if src.get_bit(bit_pos as usize)
-                                    != val.get_bit((bit_pos - low) as usize)
-                                {
-                                    first_diff = Some(bit_pos);
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(start) = first_diff {
-                            let mut new_val = signal_table[*sig_id].clone();
-                            for bit_pos in start..=high {
-                                new_val.set_bit(
-                                    bit_pos as usize,
-                                    val.get_bit((bit_pos - low) as usize),
-                                );
-                            }
-                            nba_out.push(NbaFast {
-                                signal_id: *sig_id,
-                                value: new_val,
-                                block_index,
-                            });
-                        }
-                    }
+                    let hi = hi.min(signal_table[id].width.saturating_sub(1));
+                    let part = vm_regs[*val_reg as usize].resize(hi - lo + 1);
+                    NbaFast::queue_partial(
+                        &mut nba_out,
+                        &signal_table[id],
+                        id,
+                        lo,
+                        &part,
+                        block_index,
+                    );
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
-                    let sig_id = &(*sig_id as usize);
-                    // §11.5.1: an x/z index modifies no bits.
+                    let id = *sig_id as usize;
                     if let Some(idx) = dyn_bit_index(&vm_regs[*idx_reg as usize]) {
-                        let bit = vm_regs[*val_reg as usize].get_bit(0);
-                        let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
-                        if let Some(i) = existing {
-                            let mut new_val = nba_out[i].value.clone();
-                            new_val.set_bit(idx, bit);
-                            nba_out[i].value = new_val;
-                        } else {
-                            let cur = &signal_table[*sig_id];
-                            if cur.get_bit(idx) != bit {
-                                let mut new_val = cur.clone();
-                                new_val.set_bit(idx, bit);
-                                nba_out.push(NbaFast {
-                                    signal_id: *sig_id,
-                                    value: new_val,
-                                    block_index,
-                                });
-                            }
+                        if idx < signal_table[id].width as usize {
+                            let mut part = Value::zero(1);
+                            part.set_bit(0, vm_regs[*val_reg as usize].get_bit(0));
+                            NbaFast::queue_partial(
+                                &mut nba_out,
+                                &signal_table[id],
+                                id,
+                                idx as u32,
+                                &part,
+                                block_index,
+                            );
                         }
                     }
                 }
@@ -667,8 +673,10 @@ impl Simulator {
                             None
                         } {
                             nba_out[i].value = val;
+                            nba_out[i].mask = None;
                         } else if is_packed_id(eid) || signal_table[eid] != val {
                             nba_out.push(NbaFast {
+                                mask: None,
                                 signal_id: eid,
                                 value: val,
                                 block_index,
@@ -710,8 +718,10 @@ impl Simulator {
                         None
                     } {
                         nba_out[i].value = val;
+                        nba_out[i].mask = None;
                     } else if signal_table[*sig_id] != val {
                         nba_out.push(NbaFast {
+                            mask: None,
                             signal_id: *sig_id,
                             value: val,
                             block_index,
@@ -813,9 +823,11 @@ impl Simulator {
     /// Returns `(deferred_nbas, unsupported)`. `unsupported=true` means the
     /// block contains an insn this evaluator can't handle — the caller must
     /// run that entry on the main thread (the `ast_ca=6` / exotic cases).
-    pub(super) fn exec_comb_block_isolated(
+    pub(super) fn exec_comb_block_isolated<
+        V: super::isolated_gates::IsolatedSignalView + ?Sized,
+    >(
         insns: &[super::bytecode::Insn],
-        view: &mut [Value],
+        view: &mut V,
         signal_widths: &[u32],
         signal_signed: &[bool],
         signal_name_to_id: &NameMap,
@@ -1154,8 +1166,10 @@ impl Simulator {
                         None
                     } {
                         nba_out[i].value = (**k).clone();
+                        nba_out[i].mask = None;
                     } else if view[*sig_id] != **k {
                         nba_out.push(NbaFast {
+                            mask: None,
                             signal_id: *sig_id,
                             value: (**k).clone(),
                             block_index,
@@ -1530,8 +1544,10 @@ impl Simulator {
                         None
                     } {
                         nba_out[i].value = val;
+                        nba_out[i].mask = None;
                     } else if view[*sig_id] != val {
                         nba_out.push(NbaFast {
+                            mask: None,
                             signal_id: *sig_id,
                             value: val,
                             block_index,
@@ -1565,8 +1581,10 @@ impl Simulator {
                         None
                     } {
                         nba_out[i].value = val;
+                        nba_out[i].mask = None;
                     } else if view[*sig_id] != val {
                         nba_out.push(NbaFast {
+                            mask: None,
                             signal_id: *sig_id,
                             value: val,
                             block_index,
@@ -1574,73 +1592,30 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
-                    let sig_id = &(*sig_id as usize);
-                    let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
-                    if oob_write_discard(high as i64, low as i64, signal_widths[*sig_id]) {
+                    let id = *sig_id as usize;
+                    let (lo, hi) = ((*lo).min(*hi), (*lo).max(*hi));
+                    if oob_write_discard(hi as i64, lo as i64, view[id].width) {
                         pc += 1;
                         continue;
                     }
-                    let w = high - low + 1;
-                    let val = vm_regs[*val_reg as usize].resize(w);
-                    let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
-                    if let Some(i) = existing {
-                        let mut new_val = nba_out[i].value.clone();
-                        for bit_pos in low..=high {
-                            new_val
-                                .set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
-                        }
-                        nba_out[i].value = new_val;
-                    } else {
-                        // Compare FIRST (no clone): flop reloads usually match, and
-                        // the unconditional clone of a wide signal (1 byte/bit Vec)
-                        // was a top allocator cost on c910. Clone + merge only from
-                        // the first differing bit.
-                        let mut first_diff = None;
-                        {
-                            let src = &view[*sig_id];
-                            for bit_pos in low..=high {
-                                if src.get_bit(bit_pos as usize)
-                                    != val.get_bit((bit_pos - low) as usize)
-                                {
-                                    first_diff = Some(bit_pos);
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(start) = first_diff {
-                            let mut new_val = view[*sig_id].clone();
-                            for bit_pos in start..=high {
-                                new_val.set_bit(
-                                    bit_pos as usize,
-                                    val.get_bit((bit_pos - low) as usize),
-                                );
-                            }
-                            nba_out.push(NbaFast {
-                                signal_id: *sig_id,
-                                value: new_val,
-                                block_index,
-                            });
-                        }
-                    }
+                    let hi = hi.min(view[id].width.saturating_sub(1));
+                    let part = vm_regs[*val_reg as usize].resize(hi - lo + 1);
+                    NbaFast::queue_partial(&mut nba_out, &view[id], id, lo, &part, block_index);
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
-                    let sig_id = &(*sig_id as usize);
-                    // §11.5.1: an x/z index modifies no bits.
+                    let id = *sig_id as usize;
                     if let Some(idx) = dyn_bit_index(&vm_regs[*idx_reg as usize]) {
-                        let bit = vm_regs[*val_reg as usize].get_bit(0);
-                        let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
-                        if let Some(i) = existing {
-                            let mut new_val = nba_out[i].value.clone();
-                            new_val.set_bit(idx, bit);
-                            nba_out[i].value = new_val;
-                        } else if view[*sig_id].get_bit(idx) != bit {
-                            let mut new_val = view[*sig_id].clone();
-                            new_val.set_bit(idx, bit);
-                            nba_out.push(NbaFast {
-                                signal_id: *sig_id,
-                                value: new_val,
+                        if idx < view[id].width as usize {
+                            let mut part = Value::zero(1);
+                            part.set_bit(0, vm_regs[*val_reg as usize].get_bit(0));
+                            NbaFast::queue_partial(
+                                &mut nba_out,
+                                &view[id],
+                                id,
+                                idx as u32,
+                                &part,
                                 block_index,
-                            });
+                            );
                         }
                     }
                 }
@@ -1671,8 +1646,10 @@ impl Simulator {
                             None
                         } {
                             nba_out[i].value = val;
+                            nba_out[i].mask = None;
                         } else if view[eid] != val {
                             nba_out.push(NbaFast {
+                                mask: None,
                                 signal_id: eid,
                                 value: val,
                                 block_index,
@@ -3583,9 +3560,11 @@ impl Simulator {
                         // that happened to match the old value, which is how
                         // `x <= a; if (rst) {x,y} <= 0;` kept `a` under reset.
                         self.nba_fast[i].value = (**k).clone();
+                        self.nba_fast[i].mask = None;
                     } else if self.signal_table[*sig_id] != **k {
                         self.nba_fast_index.insert(*sig_id, self.nba_fast.len());
                         self.nba_fast.push(NbaFast {
+                            mask: None,
                             block_index: 0,
                             signal_id: *sig_id,
                             value: (**k).clone(),
@@ -3739,12 +3718,14 @@ impl Simulator {
                     // the queued entry instead.
                     if let Some(i) = self.nba_fast_index.get(*sig_id) {
                         self.nba_fast[i].value = val;
+                        self.nba_fast[i].mask = None;
                     } else if self.signal_table[*sig_id] != val {
                         // Update nba_fast_index too so a follow-up partial-range
                         // or bit NBA to the same signal merges into THIS new
                         // whole-value entry, not into a stale earlier partial.
                         self.nba_fast_index.insert(*sig_id, self.nba_fast.len());
                         self.nba_fast.push(NbaFast {
+                            mask: None,
                             block_index: 0,
                             signal_id: *sig_id,
                             value: val,
@@ -3773,9 +3754,11 @@ impl Simulator {
                         let sig_id = *sig_id as usize;
                         if let Some(i) = self.nba_fast_index.get(sig_id) {
                             self.nba_fast[i].value = val;
+                            self.nba_fast[i].mask = None;
                         } else if self.signal_table[sig_id] != val {
                             self.nba_fast_index.insert(sig_id, self.nba_fast.len());
                             self.nba_fast.push(NbaFast {
+                                mask: None,
                                 block_index: 0,
                                 signal_id: sig_id,
                                 value: val,
@@ -3800,9 +3783,11 @@ impl Simulator {
                     let sig_id = *sig_id as usize;
                     if let Some(i) = self.nba_fast_index.get(sig_id) {
                         self.nba_fast[i].value = val;
+                        self.nba_fast[i].mask = None;
                     } else if self.signal_table[sig_id] != val {
                         self.nba_fast_index.insert(sig_id, self.nba_fast.len());
                         self.nba_fast.push(NbaFast {
+                            mask: None,
                             block_index: 0,
                             signal_id: sig_id,
                             value: val,
@@ -3812,79 +3797,15 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
-                    let sig_id = &(*sig_id as usize);
-                    // O(1) lookup via nba_fast_index instead of the prior
-                    // O(N) `iter().rposition` scan. Mutate the existing
-                    // entry in-place (no clone) when we find one — falls
-                    // back to seeding from `signal_table[id].clone()` only
-                    // for the first NBA to a given signal in this window.
-                    //
-                    // Eval-time elision: when there's no existing queue
-                    // entry AND the merged result matches signal_table[id],
-                    // skip the push (apply_nba would drop it anyway).
-                    let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
-                    if oob_write_discard(high as i64, low as i64, self.signal_widths[*sig_id]) {
+                    let id = *sig_id as usize;
+                    let (lo, hi) = ((*lo).min(*hi), (*lo).max(*hi));
+                    if oob_write_discard(hi as i64, lo as i64, self.signal_widths[id]) {
                         pc += 1;
                         continue;
                     }
-                    // §11.5.1: labels above the MSB are outside the vector;
-                    // only the in-range window is composed (the blocking arm
-                    // clamps the same way — unclamped, `x[4:-1] <= v` put a
-                    // fifth bit into a 4-bit signal).
-                    let high = high.min(self.signal_widths[*sig_id].saturating_sub(1));
-                    if low > high {
-                        pc += 1;
-                        continue;
-                    }
-                    let w = high - low + 1;
-                    let val = self.vm_regs[*val_reg as usize].resize(w);
-                    let id = *sig_id;
-                    if self.signal_widths[id] <= 64 && !self.signal_real[id] {
-                        let (src_v, src_x) = val.raw_bits();
-                        if let Some(i) = self.nba_fast_index.get(id) {
-                            let target = &mut self.nba_fast[i].value;
-                            let (base_v, base_x) = target.raw_bits();
-                            let (new_v, new_x) = Self::compose_inline_range_bits(
-                                base_v, base_x, src_v, src_x, low, high,
-                            );
-                            target.set_inline_bits(new_v, new_x);
-                            target.is_signed = self.signal_signed[id];
-                        } else {
-                            let (base_v, base_x) = self.signal_table[id].raw_bits();
-                            let (new_v, new_x) = Self::compose_inline_range_bits(
-                                base_v, base_x, src_v, src_x, low, high,
-                            );
-                            if new_v == base_v && new_x == base_x {
-                                // No change — elide.
-                                self.prof_nba_elided += 1;
-                            } else {
-                                let mut new_val =
-                                    Value::from_inline(new_v, new_x, self.signal_widths[id]);
-                                new_val.is_signed = self.signal_signed[id];
-                                self.nba_fast_index.insert(id, self.nba_fast.len());
-                                self.nba_fast.push(NbaFast {
-                                    block_index: 0,
-                                    signal_id: id,
-                                    value: new_val,
-                                });
-                            }
-                        }
-                    } else if let Some(i) = self.nba_fast_index.get(id) {
-                        let target = &mut self.nba_fast[i].value;
-                        target.copy_bits_from(low as usize, &val, 0, w as usize);
-                    } else {
-                        let mut new_val = self.signal_table[id].clone();
-                        if new_val.copy_bits_from(low as usize, &val, 0, w as usize) {
-                            self.nba_fast_index.insert(id, self.nba_fast.len());
-                            self.nba_fast.push(NbaFast {
-                                block_index: 0,
-                                signal_id: id,
-                                value: new_val,
-                            });
-                        } else {
-                            self.prof_nba_elided += 1;
-                        }
-                    }
+                    let hi = hi.min(self.signal_widths[id].saturating_sub(1));
+                    let part = self.vm_regs[*val_reg as usize].resize(hi - lo + 1);
+                    self.queue_partial_nba(id, lo, part);
                 }
                 Insn::NbaAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
@@ -3921,91 +3842,15 @@ impl Simulator {
                     let high_eff = high.min(sig_w.saturating_sub(1));
                     let copy_count = high_eff.saturating_add(1).saturating_sub(low) as usize;
 
-                    if low == 0 && high_eff + 1 >= sig_w {
-                        // Whole-signal write — same elision as the simple
-                        // Insn::NbaAssign.
-                        let mut v = val.resize_for_assign(sig_w);
-                        v.is_signed = self.signal_signed[id];
-                        if self.signal_table[id] != v {
-                            self.nba_fast_index.insert(id, self.nba_fast.len());
-                            self.nba_fast.push(NbaFast {
-                                block_index: 0,
-                                signal_id: id,
-                                value: v,
-                            });
-                        } else {
-                            self.prof_nba_elided += 1;
-                        }
-                    } else if self.signal_widths[id] <= 64 && !self.signal_real[id] {
-                        let (src_v, src_x) = val.raw_bits();
-                        if let Some(i) = self.nba_fast_index.get(id) {
-                            let target = &mut self.nba_fast[i].value;
-                            let (base_v, base_x) = target.raw_bits();
-                            let (new_v, new_x) = Self::compose_inline_range_bits(
-                                base_v, base_x, src_v, src_x, low, high_eff,
-                            );
-                            target.set_inline_bits(new_v, new_x);
-                            target.is_signed = self.signal_signed[id];
-                        } else {
-                            let (base_v, base_x) = self.signal_table[id].raw_bits();
-                            let (new_v, new_x) = Self::compose_inline_range_bits(
-                                base_v, base_x, src_v, src_x, low, high_eff,
-                            );
-                            if new_v == base_v && new_x == base_x {
-                                self.prof_nba_elided += 1;
-                            } else {
-                                let mut new_val = Value::from_inline(new_v, new_x, sig_w);
-                                new_val.is_signed = self.signal_signed[id];
-                                self.nba_fast_index.insert(id, self.nba_fast.len());
-                                self.nba_fast.push(NbaFast {
-                                    block_index: 0,
-                                    signal_id: id,
-                                    value: new_val,
-                                });
-                            }
-                        }
-                    } else {
-                        if let Some(i) = self.nba_fast_index.get(id) {
-                            let target = &mut self.nba_fast[i].value;
-                            target.copy_bits_from(low as usize, &val, 0, copy_count);
-                        } else {
-                            let mut new_val = self.signal_table[id].clone();
-                            if new_val.copy_bits_from(low as usize, &val, 0, copy_count) {
-                                self.nba_fast_index.insert(id, self.nba_fast.len());
-                                self.nba_fast.push(NbaFast {
-                                    block_index: 0,
-                                    signal_id: id,
-                                    value: new_val,
-                                });
-                            } else {
-                                self.prof_nba_elided += 1;
-                            }
-                        }
-                    }
+                    self.queue_partial_nba(id, low, val.resize(copy_count as u32));
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
-                    let sig_id = &(*sig_id as usize);
-                    // §11.5.1: an x/z index modifies no bits.
+                    let id = *sig_id as usize;
                     if let Some(idx) = dyn_bit_index(&self.vm_regs[*idx_reg as usize]) {
-                        let bit = self.vm_regs[*val_reg as usize].get_bit(0);
-                        let id = *sig_id;
-                        if let Some(i) = self.nba_fast_index.get(id) {
-                            self.nba_fast[i].value.set_bit(idx, bit);
-                        } else {
-                            // Single-bit elision: if the bit is already what
-                            // we're about to write, skip the queue push.
-                            if self.signal_table[id].get_bit(idx) == bit {
-                                self.prof_nba_elided += 1;
-                            } else {
-                                let mut new_val = self.signal_table[id].clone();
-                                new_val.set_bit(idx, bit);
-                                self.nba_fast_index.insert(id, self.nba_fast.len());
-                                self.nba_fast.push(NbaFast {
-                                    block_index: 0,
-                                    signal_id: id,
-                                    value: new_val,
-                                });
-                            }
+                        if idx < self.signal_widths[id] as usize {
+                            let mut part = Value::zero(1);
+                            part.set_bit(0, self.vm_regs[*val_reg as usize].get_bit(0));
+                            self.queue_partial_nba(id, idx as u32, part);
                         }
                     }
                 }
@@ -4467,9 +4312,11 @@ impl Simulator {
                             self.queue_packed_nba(eid, bv, bx);
                         } else if let Some(i) = self.nba_fast_index.get(eid) {
                             self.nba_fast[i].value = val;
+                            self.nba_fast[i].mask = None;
                         } else if self.signal_table[eid] != val {
                             self.nba_fast_index.insert(eid, self.nba_fast.len());
                             self.nba_fast.push(NbaFast {
+                                mask: None,
                                 block_index: 0,
                                 signal_id: eid,
                                 value: val,
@@ -4567,72 +4414,7 @@ impl Simulator {
                             continue;
                         }
 
-                        if low == 0 && high_eff + 1 >= sig_w {
-                            // Whole-element write — §10.4.2 last-write-wins
-                            // against a pending entry FIRST, then elide if
-                            // same as the register. Same defect class as the
-                            // NbaAssignArray arm (issue #142): eliding on the
-                            // register alone dropped an override equal to the
-                            // current value while an earlier NBA sat queued.
-                            let mut v = val.resize_for_assign(sig_w);
-                            v.is_signed = self.signal_signed[eid];
-                            if let Some(i) = self.nba_fast_index.get(eid) {
-                                self.nba_fast[i].value = v;
-                            } else if self.signal_table[eid] != v {
-                                self.nba_fast_index.insert(eid, self.nba_fast.len());
-                                self.nba_fast.push(NbaFast {
-                                    block_index: 0,
-                                    signal_id: eid,
-                                    value: v,
-                                });
-                            } else {
-                                self.prof_nba_elided += 1;
-                            }
-                        } else {
-                            if let Some(i) = self.nba_fast_index.get(eid) {
-                                let target = &mut self.nba_fast[i].value;
-                                for bit_pos in low..=high_eff {
-                                    target.set_bit(
-                                        bit_pos as usize,
-                                        val.get_bit((bit_pos - low) as usize),
-                                    );
-                                }
-                            } else {
-                                // Compare FIRST (no clone): flop reloads usually match, and
-                                // the unconditional clone of a wide signal (1 byte/bit Vec)
-                                // was a top allocator cost on c910. Clone + merge only from
-                                // the first differing bit.
-                                let mut first_diff = None;
-                                {
-                                    let src = &self.signal_table[eid];
-                                    for bit_pos in low..=high_eff {
-                                        if src.get_bit(bit_pos as usize)
-                                            != val.get_bit((bit_pos - low) as usize)
-                                        {
-                                            first_diff = Some(bit_pos);
-                                            break;
-                                        }
-                                    }
-                                }
-                                if let Some(start) = first_diff {
-                                    let mut new_val = self.signal_table[eid].clone();
-                                    for bit_pos in start..=high_eff {
-                                        new_val.set_bit(
-                                            bit_pos as usize,
-                                            val.get_bit((bit_pos - low) as usize),
-                                        );
-                                    }
-                                    self.nba_fast_index.insert(eid, self.nba_fast.len());
-                                    self.nba_fast.push(NbaFast {
-                                        block_index: 0,
-                                        signal_id: eid,
-                                        value: new_val,
-                                    });
-                                } else {
-                                    self.prof_nba_elided += 1;
-                                }
-                            }
-                        }
+                        self.queue_partial_nba(eid, low, val.resize(high_eff - low + 1));
                     }
                 }
                 Insn::BlockingAssignArrayRange(array_name, idx_reg, hi_reg, lo_reg, val_reg) => {

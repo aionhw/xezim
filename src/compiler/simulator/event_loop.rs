@@ -2805,6 +2805,16 @@ impl Simulator {
                 }
             }
         }
+        if self.multicore_on {
+            chatter!(
+                "[PROF] multicore workers={} fast_blocks={} fallback_blocks={}",
+                self.edge_workers
+                    .as_ref()
+                    .map_or(0, |pool| pool.worker_count()),
+                self.prof_multicore_fast,
+                self.prof_multicore_fallback
+            );
+        }
         if self.prof_par_dispatch_partition + self.prof_par_dispatch_legacy > 0 {
             chatter!(
                 "[PROF] par_dispatch partition={} legacy={} (partition k={})",

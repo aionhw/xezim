@@ -423,3 +423,6 @@ mod clocking_select_clockvars;
 
 #[path = "scheduling/always_property.rs"]
 mod always_property;
+
+#[path = "scheduling/multicore_workers.rs"]
+mod multicore_workers;

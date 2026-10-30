@@ -156,6 +156,12 @@ See the [user guide](docs/user-guide.md) and the
 
 ## Performance
 
+Experimental multicore execution is enabled with `XEZIM_MULTICORE=1`.
+`XEZIM_THREADS=N` limits its persistent workers to available CPUs. It retains
+four-state fallback and ordered result publication; calibration keeps serial
+execution when threading does not pay. Compare steady-state timings and exact
+outputs on the intended workload before enabling it in a production flow.
+
 Whole-run wall-clock time on one machine (Intel Core i7-9800X, six logical
 CPUs, Linux). The Xezim 0.11.3 figures were measured with a plain release
 build and cold caches. Reference figures are from earlier verified runs on

@@ -51,6 +51,11 @@ impl Simulator {
             || self.has_timing_checks
             || self.proc_settle_defer
             || !self.deferred_proc_entries.is_empty()
+            || ((self.bsp_settle || self.bsp_shadow)
+                && (!self.forced_signals.is_empty()
+                    || !self.active_force_exprs.is_empty()
+                    || self.vpi_cb_mask != 0
+                    || self.value_trace_ids.is_some()))
         {
             self.settle_combinatorial_inner();
         } else if self.bsp_shadow {
@@ -265,13 +270,17 @@ impl Simulator {
                 if self.bsp_par && buckets[l].len() >= self.bsp_par_threshold {
                     par_scratch.clear();
                     for &eidx in &buckets[l] {
-                        if self.settle_triggered[eidx] && self.comb_par_safe[eidx] {
+                        if self.settle_triggered[eidx]
+                            && self.comb_par_safe[eidx]
+                            && super::isolated_gates::OwnedBspItem::supported(
+                                &self.comb_entries[eidx].item,
+                            )
+                        {
                             self.settle_triggered[eidx] = false;
                             par_scratch.push(eidx);
                         }
                     }
                     if par_scratch.len() >= self.bsp_par_threshold {
-                        self.entry_evals += par_scratch.len() as u64;
                         dirtied.clear();
                         let nthreads = std::thread::available_parallelism()
                             .map(|x| x.get().min(8))
@@ -279,107 +288,111 @@ impl Simulator {
                             .min(par_scratch.len())
                             .max(1);
                         let chunk = par_scratch.len().div_ceil(nthreads);
-                        let view_ptr = view.as_mut_ptr() as usize;
-                        let view_len = view.len();
                         let widths: &[u32] = &self.signal_widths;
                         let signed: &[bool] = &self.signal_signed;
                         let two_state: &[bool] = &self.signal_two_state;
                         let gate_driven: &[bool] = &self.signal_gate_driven;
                         let n2id = &self.signal_name_to_id;
                         let afi = &self.array_first_id;
-                        // comb_entries' AST variants hold Cell/OnceCell (not
-                        // Sync), so the slice can't cross threads by ref. Pass a
-                        // raw ptr: SAFE because threads only READ par_safe items
-                        // (Compiled/copy/gate — no Cell), and comb_entries is not
-                        // mutated during the scope.
-                        let entries_ptr = self.comb_entries.as_ptr() as usize;
-                        let entries_len = self.comb_entries.len();
-                        let scratch: &[usize] = &par_scratch;
-                        let results: Vec<Vec<u32>> = std::thread::scope(|s| {
+                        // Own each worker's instructions: AST cache cells make
+                        // CombItem non-Sync, but its owned clone is Send. All
+                        // workers share only an immutable signal snapshot.
+                        let input: &[Value] = &view;
+                        let jobs: Vec<Vec<super::isolated_gates::OwnedBspItem>> = par_scratch
+                            .chunks(chunk)
+                            .map(|part| {
+                                part.iter()
+                                    .map(|&eidx| {
+                                        super::isolated_gates::OwnedBspItem::new(
+                                            &self.comb_entries[eidx].item,
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .collect();
+                        let results: Vec<Option<Vec<(u32, Value)>>> = std::thread::scope(|s| {
                             let mut handles = Vec::new();
-                            let mut start = 0usize;
-                            while start < scratch.len() {
-                                let end = (start + chunk).min(scratch.len());
-                                let part = &scratch[start..end];
-                                start = end;
+                            for part in jobs {
                                 handles.push(s.spawn(move || {
-                                    // SAFETY: par_safe → single-writer, so the
-                                    // dst signals written by this thread's
-                                    // entries are disjoint from every other
-                                    // thread's. Reads hit lower, finalized
-                                    // levels. `view` outlives the scope.
-                                    let v = unsafe {
-                                        std::slice::from_raw_parts_mut(
-                                            view_ptr as *mut Value,
-                                            view_len,
-                                        )
-                                    };
-                                    let entries = unsafe {
-                                        std::slice::from_raw_parts(
-                                            entries_ptr as *const CombEntry,
-                                            entries_len,
-                                        )
-                                    };
+                                    let mut staged =
+                                        super::isolated_gates::StagedSignals::new(input);
                                     let mut vm: Vec<Value> = Vec::new();
-                                    let mut d: Vec<u32> = Vec::new();
-                                    for &eidx in part {
-                                        Self::eval_comb_item_isolated(
-                                            &entries[eidx].item,
+                                    let mut dirty: Vec<u32> = Vec::new();
+                                    for item in &part {
+                                        if !Self::eval_comb_item_isolated(
+                                            item.item(),
                                             widths,
                                             signed,
                                             two_state,
                                             gate_driven,
                                             n2id,
                                             afi,
-                                            v,
+                                            &mut staged,
                                             &mut vm,
-                                            &mut d,
-                                        );
+                                            &mut dirty,
+                                        ) {
+                                            return None;
+                                        }
                                     }
-                                    d
+                                    Some(staged.finish(dirty))
                                 }));
                             }
-                            handles.into_iter().map(|h| h.join().unwrap()).collect()
+                            handles
+                                .into_iter()
+                                .map(|h| h.join().expect("isolated settle worker failed"))
+                                .collect()
                         });
-                        for d in &results {
-                            dirtied.extend_from_slice(d);
-                        }
-                        // Bookkeeping for changed signals (isolated writes only
-                        // touched `view`).
-                        for &id_u in dirtied.iter() {
-                            let id = id_u as usize;
-                            let (vv, xx) = view[id].raw_bits();
-                            if id < self.signal_has_xz.len() {
-                                self.signal_has_xz[id] = if xx != 0 { 1 } else { 0 };
+                        if results.iter().any(Option::is_none) {
+                            // Discard the complete private batch on an admission
+                            // mismatch; replay every entry through the serial drain.
+                            for &eidx in &par_scratch {
+                                self.settle_triggered[eidx] = true;
                             }
-                            if id < self.signal_inline_bits.len() {
-                                self.signal_inline_bits[id] = [vv, xx];
+                        } else {
+                            self.entry_evals += par_scratch.len() as u64;
+                            for writes in results.into_iter().flatten() {
+                                for (id, value) in writes {
+                                    view[id as usize] = value;
+                                    dirtied.push(id);
+                                }
                             }
-                            if self.event_measure
-                                && !self.armed_edge
-                                && id < self.sig_last_change.len()
-                            {
-                                self.sig_last_change[id] = self.event_phase;
+                            // Bookkeeping for changed signals (isolated writes only
+                            // touched `view`).
+                            for &id_u in dirtied.iter() {
+                                let id = id_u as usize;
+                                let (vv, xx) = view[id].raw_bits();
+                                if id < self.signal_has_xz.len() {
+                                    self.signal_has_xz[id] = if xx != 0 { 1 } else { 0 };
+                                }
+                                if id < self.signal_inline_bits.len() {
+                                    self.signal_inline_bits[id] = [vv, xx];
+                                }
+                                if self.event_measure
+                                    && !self.armed_edge
+                                    && id < self.sig_last_change.len()
+                                {
+                                    self.sig_last_change[id] = self.event_phase;
+                                }
+                                self.note_armed_write(id);
+                                self.bsp_after_write(id);
                             }
-                            self.note_armed_write(id);
-                            self.bsp_after_write(id);
-                        }
-                        self.table_modified = true;
-                        // Propagate to dependents (serial, after the barrier).
-                        for &id_u in dirtied.iter() {
-                            let id = id_u as usize;
-                            if id + 1 < self.comb_dep_offsets.len() {
-                                let lo = self.comb_dep_offsets[id] as usize;
-                                let hi = self.comb_dep_offsets[id + 1] as usize;
-                                for k in lo..hi {
-                                    let dep = self.comb_dep_entries[k] as usize;
-                                    if !self.settle_triggered[dep] {
-                                        self.settle_triggered[dep] = true;
-                                        let dl = self.comb_level[dep] as usize;
-                                        if dl > l {
-                                            buckets[dl].push(dep);
-                                        } else {
-                                            next_seed.push(dep);
+                            self.table_modified = true;
+                            // Propagate to dependents (serial, after the barrier).
+                            for &id_u in dirtied.iter() {
+                                let id = id_u as usize;
+                                if id + 1 < self.comb_dep_offsets.len() {
+                                    let lo = self.comb_dep_offsets[id] as usize;
+                                    let hi = self.comb_dep_offsets[id + 1] as usize;
+                                    for k in lo..hi {
+                                        let dep = self.comb_dep_entries[k] as usize;
+                                        if !self.settle_triggered[dep] {
+                                            self.settle_triggered[dep] = true;
+                                            let dl = self.comb_level[dep] as usize;
+                                            if dl > l {
+                                                buckets[dl].push(dep);
+                                            } else {
+                                                next_seed.push(dep);
+                                            }
                                         }
                                     }
                                 }

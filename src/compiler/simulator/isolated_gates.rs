@@ -2,12 +2,111 @@
 
 use super::*;
 
+/// A signal view may publish in-place on the coordinator or stage writes in
+/// a worker-local overlay. No worker obtains a mutable reference to the base.
+pub(super) trait IsolatedSignalView:
+    std::ops::Index<usize, Output = Value> + std::ops::IndexMut<usize>
+{
+    fn signal_len(&self) -> usize;
+}
+impl IsolatedSignalView for [Value] {
+    fn signal_len(&self) -> usize {
+        self.len()
+    }
+}
+impl IsolatedSignalView for Vec<Value> {
+    fn signal_len(&self) -> usize {
+        self.len()
+    }
+}
+
+/// Owned worker instructions carry no shared mutable AST/cache payloads. The
+/// positive opcode check is also the transport contract of the edge workers.
+pub(super) struct OwnedBspItem(CombItem);
+// SAFETY: construction is private and rejects AST-bearing opcodes and mutable
+// class/collection operations. Allowed payloads are owned or immutable values.
+unsafe impl Send for OwnedBspItem {}
+impl OwnedBspItem {
+    pub(super) fn supported(item: &CombItem) -> bool {
+        use super::super::bytecode::Insn;
+        match item {
+            CombItem::Noop
+            | CombItem::FastDirectCopy { .. }
+            | CombItem::FastDirectFanout { .. }
+            | CombItem::DirectCopy { .. }
+            | CombItem::FusedGate { .. }
+            | CombItem::FusedBufFanout { .. }
+            | CombItem::FusedAndFanout { .. } => true,
+            CombItem::CompiledContAssign { compiled }
+            | CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                compiled.instructions.iter().all(|i| {
+                    Simulator::isolated_instruction_supported(i)
+                        || matches!(
+                            i,
+                            Insn::BlockingAssign(..)
+                                | Insn::BlockingAssignRange(..)
+                                | Insn::BlockingAssignBitDyn(..)
+                        )
+                })
+            }
+            _ => false,
+        }
+    }
+    pub(super) fn new(item: &CombItem) -> Self {
+        assert!(Self::supported(item));
+        Self(item.clone())
+    }
+    pub(super) fn item(&self) -> &CombItem {
+        &self.0
+    }
+}
+
+pub(super) struct StagedSignals<'a> {
+    base: &'a [Value],
+    writes: HashMap<usize, Value>,
+}
+impl<'a> StagedSignals<'a> {
+    pub(super) fn new(base: &'a [Value]) -> Self {
+        Self {
+            base,
+            writes: HashMap::default(),
+        }
+    }
+    pub(super) fn finish(mut self, dirtied: Vec<u32>) -> Vec<(u32, Value)> {
+        let mut result = Vec::with_capacity(self.writes.len());
+        for id in dirtied {
+            if let Some(value) = self.writes.remove(&(id as usize)) {
+                result.push((id, value));
+            }
+        }
+        result
+    }
+}
+impl IsolatedSignalView for StagedSignals<'_> {
+    fn signal_len(&self) -> usize {
+        self.base.len()
+    }
+}
+impl std::ops::Index<usize> for StagedSignals<'_> {
+    type Output = Value;
+    fn index(&self, index: usize) -> &Value {
+        self.writes.get(&index).unwrap_or(&self.base[index])
+    }
+}
+impl std::ops::IndexMut<usize> for StagedSignals<'_> {
+    fn index_mut(&mut self, index: usize) -> &mut Value {
+        self.writes
+            .entry(index)
+            .or_insert_with(|| self.base[index].clone())
+    }
+}
+
 impl Simulator {
     /// Isolated counterpart of `exec_fused_gate`: evaluates a fused 1-bit
     /// gate against a mutable signal `view`, recording the dirtied id.
-    pub(super) fn exec_fused_gate_isolated(
+    pub(super) fn exec_fused_gate_isolated<V: IsolatedSignalView + ?Sized>(
         op: &FusedGate,
-        view: &mut [Value],
+        view: &mut V,
         dirtied: &mut Vec<u32>,
         gate_driven: &[bool],
     ) {
@@ -127,11 +226,11 @@ impl Simulator {
     }
 
     #[inline]
-    pub(super) fn exec_fused_and_fanout_isolated(
+    pub(super) fn exec_fused_and_fanout_isolated<V: IsolatedSignalView + ?Sized>(
         common: BitRef,
         branches: &[FusedAndBranch],
         invert: bool,
-        view: &mut [Value],
+        view: &mut V,
         dirtied: &mut Vec<u32>,
     ) {
         let common_code = view[common.sig_id as usize].get_bit_code(common.bit as usize);
@@ -164,10 +263,10 @@ impl Simulator {
     /// the ids of any signals it changes to `dirtied`. Returns false if the
     /// entry is an AST-fallback variant the isolated path can't handle (the
     /// caller routes those to the main thread). Used by the BSP settle.
-    pub(super) fn eval_comb_entry_isolated(
+    pub(super) fn eval_comb_entry_isolated<V: IsolatedSignalView + ?Sized>(
         &self,
         eidx: usize,
-        view: &mut [Value],
+        view: &mut V,
         vm_regs: &mut Vec<Value>,
         dirtied: &mut Vec<u32>,
     ) -> bool {
@@ -316,13 +415,13 @@ impl Simulator {
 
     /// Fully-static (no `&self`) isolated comb-entry evaluator for the parallel
     /// BSP level dispatch — worker threads call this with shared refs to the
-    /// design arrays and a raw-aliased `view`, so it must not borrow the
+    /// design arrays and a private staged `view`, so it must not borrow the
     /// (non-Sync) Simulator. Only ever called for `comb_par_safe` items, so the
     /// AST / unsupported arms are unreachable (return false defensively).
     /// Pushes changed signal ids into `dirtied`; bookkeeping/propagation is done
     /// serially by the caller after the parallel join.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn eval_comb_item_isolated(
+    pub(super) fn eval_comb_item_isolated<V: IsolatedSignalView + ?Sized>(
         item: &CombItem,
         signal_widths: &[u32],
         signal_signed: &[bool],
@@ -330,7 +429,7 @@ impl Simulator {
         signal_gate_driven: &[bool],
         signal_name_to_id: &NameMap,
         array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
-        view: &mut [Value],
+        view: &mut V,
         vm_regs: &mut Vec<Value>,
         dirtied: &mut Vec<u32>,
     ) -> bool {
@@ -418,7 +517,7 @@ impl Simulator {
                 if vm_regs.len() < compiled.num_regs as usize {
                     vm_regs.resize(compiled.num_regs as usize, Value::zero(1));
                 }
-                let (_nba, unsupported) = Self::exec_comb_block_isolated(
+                let (nba, unsupported) = Self::exec_comb_block_isolated(
                     &compiled.instructions,
                     view,
                     signal_widths,
@@ -430,7 +529,7 @@ impl Simulator {
                     0,
                     compiled.nba_dup_targets,
                 );
-                !unsupported
+                !unsupported && nba.is_empty()
             }
             CombItem::FusedGate { op } => {
                 Self::exec_fused_gate_isolated(op, view, dirtied, signal_gate_driven);

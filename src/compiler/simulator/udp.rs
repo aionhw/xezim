@@ -823,6 +823,7 @@ impl Simulator {
                 v.set_bit_code(bit, new_code);
                 self.nba_fast_index.insert(id, self.nba_fast.len());
                 self.nba_fast.push(NbaFast {
+                    mask: None,
                     signal_id: id,
                     value: v,
                     block_index: 0,

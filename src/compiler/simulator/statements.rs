@@ -4414,6 +4414,7 @@ impl Simulator {
                         // NbaAssign Insn.
                         self.nba_fast_index.insert(id, self.nba_fast.len());
                         self.nba_fast.push(NbaFast {
+                            mask: None,
                             block_index: 0,
                             signal_id: id,
                             value: val.resize_for_assign(w),

@@ -1527,6 +1527,62 @@ fn simulate_multi_inner(
         std::process::exit(0);
     }
 
+    prepare_parallel_run(
+        &mut sim,
+        emit_hypergraph,
+        load_partition,
+        profile_input,
+        collapse_islands,
+    );
+
+    let simulation_start = WallTimer::now();
+    sim.simulate();
+    rss_trace("simulated");
+    if std::env::var_os("XEZIM_MEM_CENSUS").is_some() {
+        eprintln!(
+            "[MEM-CENSUS] end of run: runtime name->value map {} entries; {}",
+            sim.signals.len(),
+            sim.class_heap_census()
+        );
+    }
+    chatter!(
+        "[PHASE] simulation: {:.1}ms",
+        simulation_start.elapsed().as_secs_f64() * 1000.0
+    );
+
+    if let Some(path) = write_profile {
+        let t = std::time::Instant::now();
+        match sim.write_phase2_profile(path) {
+            Ok(()) => eprintln!(
+                "[PART] profile written to {} in {:.1}ms (set XEZIM_EDGE_BLOCK_STATS=1 to populate)",
+                path,
+                t.elapsed().as_secs_f64() * 1000.0
+            ),
+            Err(e) => eprintln!("[PART] failed to write profile to {}: {}", path, e),
+        }
+    }
+
+    let total_elapsed = total_start.elapsed();
+    chatter!(
+        "[PHASE] total: {:.1}ms",
+        total_elapsed.as_secs_f64() * 1000.0
+    );
+    chatter!("------------------------------");
+    // The result line itself is the CLI's to print, on stdout (main.rs). Printing
+    // it here too put it on BOTH streams, so it appeared twice in any terminal
+    // or merged log.
+    Ok(sim)
+}
+
+/// Apply the same partition/profile controls to source and artifact launches.
+/// The controls operate on compiled runtime blocks rather than serialized RTL.
+pub fn prepare_parallel_run(
+    sim: &mut compiler::Simulator,
+    emit_hypergraph: Option<&str>,
+    load_partition: Option<&str>,
+    profile_input: Option<&str>,
+    collapse_islands: bool,
+) {
     if let Some(path) = emit_hypergraph {
         let t = std::time::Instant::now();
         // Phase-2 profile-guided emission: --profile-input takes
@@ -1590,42 +1646,4 @@ fn simulate_multi_inner(
             Err(e) => eprintln!("[PART] failed to load partition from {}: {}", path, e),
         }
     }
-
-    let simulation_start = WallTimer::now();
-    sim.simulate();
-    rss_trace("simulated");
-    if std::env::var_os("XEZIM_MEM_CENSUS").is_some() {
-        eprintln!(
-            "[MEM-CENSUS] end of run: runtime name->value map {} entries; {}",
-            sim.signals.len(),
-            sim.class_heap_census()
-        );
-    }
-    chatter!(
-        "[PHASE] simulation: {:.1}ms",
-        simulation_start.elapsed().as_secs_f64() * 1000.0
-    );
-
-    if let Some(path) = write_profile {
-        let t = std::time::Instant::now();
-        match sim.write_phase2_profile(path) {
-            Ok(()) => eprintln!(
-                "[PART] profile written to {} in {:.1}ms (set XEZIM_EDGE_BLOCK_STATS=1 to populate)",
-                path,
-                t.elapsed().as_secs_f64() * 1000.0
-            ),
-            Err(e) => eprintln!("[PART] failed to write profile to {}: {}", path, e),
-        }
-    }
-
-    let total_elapsed = total_start.elapsed();
-    chatter!(
-        "[PHASE] total: {:.1}ms",
-        total_elapsed.as_secs_f64() * 1000.0
-    );
-    chatter!("------------------------------");
-    // The result line itself is the CLI's to print, on stdout (main.rs). Printing
-    // it here too put it on BOTH streams, so it appeared twice in any terminal
-    // or merged log.
-    Ok(sim)
 }
