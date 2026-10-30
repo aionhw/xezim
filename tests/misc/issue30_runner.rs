@@ -1,6 +1,7 @@
 //! GitHub issue #30 — the reporter's IEEE 1800-2017 §18 constrained-random
-//! compliance suite, run verbatim. Each file self-checks and prints TEST_PASS
-//! or TEST_FAIL count=N. Randomization is involved, so these also guard
+//! compliance suite. The array fixture constrains randomized values away
+//! from its sentinels so its overwrite check is deterministic. Each file
+//! prints TEST_PASS or TEST_FAIL count=N. Randomization is involved, so these also guard
 //! against flaky solving, not just outright breakage.
 
 use xezim::simulate;

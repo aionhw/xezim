@@ -56,6 +56,11 @@ class ArrayRandomizationBus;
   }
 
   constraint element_rules {
+    // IEEE 1800-2023 §18.5.8: exclude the pre_randomize sentinels so
+    // an unchanged element always fails the overwrite check below.
+    foreach (assoc_arr[key]) {
+      assoc_arr[key] inside {[0:127]};
+    }
     foreach (fixed_rand_arr[i]) {
       fixed_rand_arr[i] inside {[10:50]};
     }
