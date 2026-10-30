@@ -1,0 +1,25 @@
+running 0 status SC_ELABORATION
+outsig (sc_signal) base outsig
+t (sc_module) base t
+  t.signal_0 (sc_signal) base signal_0
+  t.port_0 (sc_out) base port_0
+  t.a (sc_module) base a
+    t.a.port_0 (sc_in) base port_0
+    t.a.signal_0 (sc_signal) base signal_0
+    t.a.m (sc_method_process) base m
+  t.fifo_0 (sc_fifo) base fifo_0
+  t.clk (sc_clock) base clk
+  t.ticker (sc_thread_process) base ticker
+  t.boss (sc_thread_process) base boss
+found none 1
+boss t.boss kind 2
+2 ns tick, running 1 status SC_RUNNING
+3 ns suspended
+7 ns resumed
+7 ns tick, running 1 status SC_RUNNING
+9 ns tick, running 1 status SC_RUNNING
+10 ns killed, terminated 1
+paused: running 1 status SC_PAUSED
+
+Info: /OSCI/SystemC: Simulation stopped by user.
+stopped: running 0 status SC_STOPPED

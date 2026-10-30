@@ -203,3 +203,5 @@ mod collection_returns_387;
 
 #[path = "collections/review_package_collection_aliases.rs"]
 mod review_package_collection_aliases;
+#[path = "collections/queue_member_actual_via_element.rs"]
+mod queue_member_actual_via_element;

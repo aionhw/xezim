@@ -4578,8 +4578,16 @@ impl Simulator {
                     // nested ternaries (each level probes a branch that itself
                     // probes both of its branches — two ivtest cases went from
                     // pass to TIMEOUT before this was narrowed).
-                    let other_is_cheap =
-                        matches!(&other.kind, ExprKind::Ident(_) | ExprKind::Number(_));
+                    // A dotted name is not probed: it may read through a
+                    // handle the condition just found null (`h != null ?
+                    // h.v : 0`), and reading it there is a null dereference
+                    // the program never makes. Its static type was used
+                    // above (`arms_unsigned`).
+                    let other_is_cheap = match &other.kind {
+                        ExprKind::Ident(h) => h.root.is_none() && h.path.len() == 1,
+                        ExprKind::Number(_) => true,
+                        _ => false,
+                    };
                     if !v.is_real && other_is_cheap {
                         let o = self.eval_expr_ctx(other, ctx_width);
                         if !o.is_real {

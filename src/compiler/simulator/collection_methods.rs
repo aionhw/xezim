@@ -1931,7 +1931,12 @@ impl Simulator {
                 self.handle_collection_name(handle, &leaf)?
             }
             ExprKind::MemberAccess { expr, member } => {
-                let handle = self.eval_handle_expr(expr)?;
+                // An element of a queue formal (`v[0].kids`) is found by
+                // evaluating it: the formal's storage is its per-call key.
+                let handle = match self.eval_handle_expr(expr) {
+                    Some(h) => h,
+                    None => self.eval_expr(expr).to_u64().filter(|&h| h != 0)? as usize,
+                };
                 self.handle_collection_name(handle, &member.name)?
             }
             _ => return None,

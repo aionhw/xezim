@@ -395,3 +395,11 @@ fn restart() {
 fn globals() {
     check("globals");
 }
+
+/// §5.6 process control on static processes (suspend, resume, kill),
+/// process names and kinds; §4.5.8 kernel status; §5.16 the object
+/// hierarchy walked recursively and searched by name.
+#[test]
+fn kernel_api() {
+    check("kernelapi");
+}
