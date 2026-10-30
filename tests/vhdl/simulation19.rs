@@ -108,3 +108,41 @@ fn tool_directives_are_reported() {
     );
     assert!(!text.contains("not taken"), "{}", text);
 }
+
+/// VHDL-2019 §6.5.2 mode views: record ports whose elements have their own
+/// modes (`view master`, `view master'converse`), a view of a record element,
+/// an array of views (`view (master) of bus_array`), a port's elements
+/// associated one by one with their own modes (in-port and out-port links of
+/// one port, in a loop through two instances), and a signal parameter with
+/// a view.
+#[test]
+fn views19() {
+    check("views19");
+}
+
+/// A VHDL port with a mode view cannot be connected to a SystemVerilog
+/// instance: a located error, not a silently wrong connection.
+#[test]
+fn view_port_at_the_sv_boundary_is_an_error() {
+    let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vhdl"))
+        .args([
+            "--no-cache",
+            "--std=19",
+            "errors19/view_boundary.vhd",
+            "errors19/view_boundary.sv",
+        ])
+        .output()
+        .expect("run xezim");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{}", text);
+    assert!(
+        text.contains("view_boundary.vhd:12:9: error: VHDL: port 'm' has a mode view"),
+        "{}",
+        text
+    );
+}

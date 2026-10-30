@@ -1,6 +1,7 @@
-# VHDL (IEEE 1076-2008)
+# VHDL (IEEE 1076-2008, 1076-2019)
 
-xezim simulates VHDL-2008 designs. Give it the `.vhd`/`.vhdl` files like
+xezim simulates VHDL-2008 designs, and VHDL-2019 designs with `--std=19`
+(in development, see [VHDL-2019](#vhdl-2019)). Give it the `.vhd`/`.vhdl` files like
 any other source:
 
     xezim tb.vhd
@@ -8,8 +9,8 @@ any other source:
 
 Each file is analysed into the library named by the last `--work=<lib>`
 before it (default `work`). The order of the files does not matter: design
-units are analysed when something refers to them. `--std=08` is accepted
-(VHDL-2008 is the only revision). The top is the last entity no other unit
+units are analysed when something refers to them. `--std=08` (the default)
+or `--std=19` selects the revision. The top is the last entity no other unit
 instantiates. Output, messages and exit status follow GHDL:
 
     tb.vhd:12:5:@10ns:(report note): hello
@@ -185,6 +186,27 @@ next VHDL cycle waits for SV's NBA region, so SV and VHDL registers on one
 clock edge sample each other's values from before the edge. Each SV
 instance of a VHDL entity is a separate elaboration: signals and shared
 variables of packages are per instance.
+
+## VHDL-2019
+
+With `--std=19` the VHDL-2019 keywords (`view`, `private`) are reserved and
+these VHDL-2019 additions work, checked against nvc 1.23 (`tests/vhdl/designs19/`):
+
+- conditional analysis (`` `if ``, `` `elsif ``, `` `else ``, `` `end ``,
+  `` `warning ``, `` `error ``) over `VHDL_VERSION`, `TOOL_TYPE`
+  (`"SIMULATION"`), `TOOL_VENDOR`, `TOOL_NAME` (`"xezim"`), `TOOL_EDITION`
+  and `TOOL_VERSION`;
+- `return x when c [else ...]`, `else unaffected` and `return when c`;
+- classes of generic types (`type t is (<>)`, `range <>`, `private`, ...;
+  the actual is not yet checked against the class);
+- mode views (`view v of rec_t is ... end view`, `'converse`, `view (v)`
+  for arrays) on ports and procedures' signal parameters, with a port's
+  elements associated together or one by one.
+
+Not yet (each a located error): conditional expressions
+(`a when c else b`), sequential `block` statements, generics and private
+variables of protected types, and a port with a mode view at the
+SystemVerilog boundary.
 
 ## Not supported yet
 

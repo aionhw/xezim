@@ -1,0 +1,6 @@
+t=6000000 fs b1 req='1' ack='U' got1=XX | r2='1' a2='U' got2=XX | pair en='1' fwd=5A bwd.ack='1' | arr '1'11 '1'22
+t=16000000 fs b1 req='1' ack='1' got1=10 | r2='1' a2='1' got2=40 | pair en='1' fwd=5A bwd.ack='1' | arr '1'11 '1'22
+t=26000000 fs b1 req='0' ack='1' got1=11 | r2='0' a2='1' got2=41 | pair en='1' fwd=5A bwd.ack='1' | arr '1'11 '1'22
+t=36000000 fs b1 req='0' ack='0' got1=11 | r2='0' a2='0' got2=41 | pair en='1' fwd=5A bwd.ack='1' | arr '1'11 '1'22
+t=46000000 fs b1 req='1' ack='0' got1=11 | r2='1' a2='0' got2=41 | pair en='1' fwd=5A bwd.ack='1' | arr '1'11 '1'22
+t=56000000 fs b1 req='1' ack='1' got1=12 | r2='1' a2='1' got2=42 | pair en='1' fwd=5A bwd.ack='1' | arr '1'11 '1'22
