@@ -3007,6 +3007,7 @@ impl Simulator {
             remaining_events: 1,
             is_clocking,
             value_ctx,
+            kicked: false,
         }
     }
 

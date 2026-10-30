@@ -1118,6 +1118,22 @@ impl Simulator {
         )
     }
 
+    /// Mark the parked waiters armed plainly on the event signal `sid` (no
+    /// `iff` guard, value expression or clocking event) as triggered; the
+    /// drain resumes them in its usual region and order.
+    fn kick_named_event_waiters(&mut self, sid: usize) {
+        for w in &mut self.event_waiters {
+            if !w.is_clocking
+                && w.remaining_events <= 1
+                && w.resolved_sensitivities
+                    .iter()
+                    .any(|s| s.signal_id == sid && s.iff.is_none() && s.value_of.is_none())
+            {
+                w.kicked = true;
+            }
+        }
+    }
+
     /// Fire a named event NOW: toggle its 1-bit signal (the edge `@(e)`
     /// waiters arm on) and stamp `event_triggered_time` for `.triggered`.
     /// Shared by the blocking `-> e` statement and the NBA-region flush of
@@ -1156,6 +1172,12 @@ impl Simulator {
             );
             self.fast_signal_write_id(target.signal_id, &new_val);
             self.event_triggered_time.mark(target.stamp, self.time);
+            // §15.5.1: every trigger wakes the processes waiting on the event
+            // at that moment. The toggle alone is judged later against each
+            // waiter's armed value, so a second trigger before the drain
+            // toggled the signal back and the wake was lost (an even number
+            // of `-> e` before the waiter ran never woke it).
+            self.kick_named_event_waiters(target.signal_id);
             if !self.cg_named_event_waiters.is_empty() {
                 let waiters = self.cg_named_event_waiters.get(&target.signal_id).cloned();
                 if let Some(waiters) = waiters {

@@ -289,3 +289,57 @@ fn class_objects() {
 fn templates() {
     check("templates");
 }
+
+/// §5.12–§5.15 interfaces, ports and exports: a hierarchical FIFO channel
+/// implementing two interfaces, bound through a parent's port and through
+/// an export of an export; a multiport (`size()`, `p[i]->`), static
+/// sensitivity to a port's default event, a call through an export from
+/// sc_main. The FIFO's last batch notifies an even number of times.
+#[test]
+fn channels() {
+    check("channels");
+}
+
+/// §5.15 a primitive channel: `request_update()` and one `update()` per
+/// delta cycle, reads seeing the new value only after it.
+#[test]
+fn prim_channel() {
+    check("primchan");
+}
+
+/// §6.27–§6.29 sc_mutex (owner-only unlock, trylock), sc_semaphore
+/// (trywait, post, wait) and sc_event_queue (several notifications,
+/// cancel_all).
+#[test]
+fn kernel_objects() {
+    check("kernelobj");
+}
+
+/// §6.23 sc_fifo: written values become readable, and freed space
+/// writable, only after the update phase; nb_read/nb_write/num_free.
+#[test]
+fn fifo_update_phase() {
+    check("fifoupd");
+}
+
+/// C++ destruction: sc_main's modules when it returns (last first), member
+/// modules after their parent's destructor body.
+#[test]
+fn destructors() {
+    check("dtors");
+}
+
+/// §4.2.1.3 `wait(SC_ZERO_TIME)` and `notify(SC_ZERO_TIME)` resume in the
+/// next delta cycle, after the update phase (signal writes visible).
+#[test]
+fn delta_wait() {
+    check("deltawait");
+}
+
+/// §5.10.7 event lists: `wait(e1 & e2)` (each notified, in any order),
+/// `wait(e1 | e2)`, and both with a timeout. Supersedes the error test
+/// `event_and_list`.
+#[test]
+fn event_lists() {
+    check("andlist");
+}

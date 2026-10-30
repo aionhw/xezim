@@ -1,0 +1,8 @@
+sc_main returns
+~node n2 count 3
+~leaf 2 n2.b
+~leaf 1 n2.a
+~leaf 0 l
+~node n1 count 3
+~leaf 2 n1.b
+~leaf 1 n1.a

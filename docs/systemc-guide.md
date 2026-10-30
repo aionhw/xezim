@@ -52,9 +52,11 @@ match the SystemC 2.3 reference kernel:
 |---|---|
 | Processes start at the first `sc_start` | each process waits for `sc_start` |
 | `SC_METHOD` (+ `dont_initialize`) | runs at initialization, then on its static sensitivity |
-| `SC_THREAD`, `wait()` / `wait(t)` / `wait(e)` / `wait(e1 \| e2)` / `wait(t, e)` | an `initial` process with event controls and delays |
+| `SC_THREAD`, `wait()` / `wait(t)` / `wait(e)` / `wait(e1 \| e2)` / `wait(e1 & e2)` / `wait(t, e)` | an `initial` process with event controls and delays |
 | `SC_CTHREAD` + `reset_signal_is` / `async_reset_signal_is`, `wait(n)` | first runs at its first clock edge; restarts on reset |
 | `sc_signal` / port writes | update phase (nonblocking); `sc_main` writes apply at the next `sc_start` |
+| `wait(SC_ZERO_TIME)`, `e.notify(SC_ZERO_TIME)` | the next delta cycle, after the update phase (a nonblocking `->>` trigger) |
+| primitive channel `request_update()` / `update()` | one `update()` per delta cycle, in the update phase |
 | `sc_start(t)` | stops before the events *at* `t` (they run in the next `sc_start`) |
 | `sc_start()` | returns at `sc_stop()` or when no events are left; the rest of `sc_main` then runs (in a `final` block, so it cannot call `sc_start` or `wait` again) |
 | `sc_stop()` | stops at the end of the delta cycle, with SystemC's message |
@@ -75,7 +77,25 @@ match the SystemC 2.3 reference kernel:
 - **Ports and channels**: `sc_in`/`sc_out`/`sc_inout` (an `sc_inout` is an
   output its owner also reads), `sc_signal`, `sc_buffer` (an event on every
   write, also through the ports bound to it), `sc_clock`, `sc_fifo` (with its
-  depth) with `sc_fifo_in`/`sc_fifo_out`, `sc_event`.
+  depth) with `sc_fifo_in`/`sc_fifo_out`, `sc_event`. An `sc_fifo` makes a
+  written value readable, and the space a read frees writable, in the
+  update phase, as the reference kernel does.
+- **Interfaces, ports and exports** (§5.12–§5.15): interfaces deriving from
+  `sc_interface`; `sc_port<IF>` and `sc_port<IF, N>` (multiports with
+  `size()` and `p[i]->`), `sc_export<IF>`; binding a port to a channel, to a
+  parent's port, or to an export, and an export to a channel or to a child's
+  export; `p->m(...)` calls, also from `sc_main` through an export; static
+  sensitivity to a port (`sensitive << p`, the channel's `default_event()`)
+  or to one of its event functions. A port or export left unbound stops the
+  run with SystemC's error E109. Channels are modules (`sc_channel`,
+  `sc_module`) or primitive channels (`sc_prim_channel`, with
+  `request_update()` and `update()`) implementing one or more interfaces.
+- **Kernel objects**: `sc_mutex` (`lock`, `trylock`, `unlock`, owner-only),
+  `sc_semaphore` (`wait`, `trywait`, `post`, `get_value`), `sc_event_queue`
+  (several pending notifications, `cancel_all`, as a sensitivity).
+- **Destruction**: module destructors run when `sc_main` returns, in C++
+  order (last constructed first; a module's member modules after its own
+  destructor body).
 - **Resolved signals**: `sc_signal_resolved`, `sc_signal_rv<W>` and the
   `sc_in`/`sc_out`/`sc_inout` `_resolved` and `_rv` ports. Every process
   writing one is a driver, through ports of any module or directly; the bits
@@ -123,12 +143,12 @@ match the SystemC 2.3 reference kernel:
 Each of these is reported as an error at its C++ source line, never
 simulated approximately:
 
-- `sc_port`/`sc_export` with user interfaces (custom hierarchical channels),
-  `sc_mutex`/`sc_semaphore`, approximately-timed TLM (`nb_transport`,
-  payload event queues), `sc_spawn`, `SC_FORK`/`SC_JOIN`, `next_trigger`.
+- Approximately-timed TLM (`nb_transport`, payload event queues),
+  `sc_spawn`, `SC_FORK`/`SC_JOIN`, `next_trigger`, `sc_event_and_list` /
+  `sc_event_or_list` objects (the `e1 & e2` / `e1 | e2` expressions work).
 - Function templates, pointers other than byte/word data pointers and
-  pointers to objects, destructors with statements in them (an empty
-  destructor is fine).
+  pointers to objects, destructors with statements in a class that is not a
+  module (an empty one is fine).
 - C file I/O (`FILE*`), exceptions, `goto`, lambdas.
 - The SystemC 3.0 in-class process macros (`SC_METHOD_IMP`, …).
 

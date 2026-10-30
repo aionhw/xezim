@@ -2009,6 +2009,10 @@ struct EventWaiter {
     is_clocking: bool,
     /// Set only for a waiter with expression terms (`SensitivityId::value_of`).
     value_ctx: Option<Box<WaiterValueCtx>>,
+    /// §15.5.1: a named event this waiter waits on (a plain term) was
+    /// triggered since it armed. The drain fires it even when a second
+    /// trigger toggled the event's signal back to the armed value.
+    kicked: bool,
 }
 
 /// §9.4.2: how a waiter re-evaluates its expression terms after it armed.

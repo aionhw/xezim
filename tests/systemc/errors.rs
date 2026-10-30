@@ -50,21 +50,13 @@ fn exceptions() {
     );
 }
 
-/// §5.12 sc_port with a user interface (hierarchical channels).
+/// §5.12.7 a port left unbound is error E109 at the end of elaboration, in
+/// the reference kernel's words (the run fails).
 #[test]
-fn custom_port() {
+fn unbound_port() {
     rejects(
         "custom_port",
-        "custom_port.cpp:7:21: error: SystemC: sc_port/sc_export/analysis ports are not supported in simulation yet",
-    );
-}
-
-/// §5.10.7 `wait(e1 & e2)`.
-#[test]
-fn event_and_list() {
-    rejects(
-        "and_list",
-        "and_list.cpp:5:14: error: SystemC: waiting on an event AND-list is not supported",
+        "Error: (E109) complete binding failed: port not bound: port 'x.port_0' (sc_port)",
     );
 }
 

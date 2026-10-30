@@ -2,8 +2,9 @@
 """Run the Accellera SystemC 2.3.4 examples under xezim and compare each with
 the same example built against the SystemC reference kernel (IEEE 1666).
 
-Prints one line per example: PASS, DIFF (first differing line), FAIL (first
-error) or TIMEOUT. Reference binaries and outputs are cached in the work
+Prints one line per example: PASS, ORDER (the same lines in a different
+order: processes woken in one delta cycle ran in another order), DIFF (first
+differing line), FAIL (first error) or TIMEOUT. Reference binaries and outputs are cached in the work
 directory; xezim's outputs land there too (`out/<name>.out`, `.err`).
 
 The examples come from the SystemC source release (`examples/` of
@@ -110,7 +111,9 @@ def run_xezim(xezim, name, e, timeout):
         r = subprocess.run(cmd, cwd=os.path.join(EX, e["dir"]), capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return None, "timeout"
-    out = "\n".join(l for l in r.stdout.split("\n") if not XEZ_NOISE.match(l)).lstrip("\n")
+    out = "\n".join(l for l in r.stdout.split("\n") if not XEZ_NOISE.match(l))
+    # xezim's summary line follows the program's last (unterminated) output.
+    out = re.sub(r"Simulation finished at time [^\n]*$", "", out)
     return out.rstrip() + f"\n[exit {r.returncode}]\n", r.stderr
 
 def norm(x):
@@ -138,6 +141,7 @@ def main():
     examples = manifest()
     names = a.names or list(examples)
     npass = 0
+    norder = 0
     for n in names:
         e = examples[n]
         try:
@@ -155,6 +159,12 @@ def main():
         elif norm(got) == norm(ref):
             npass += 1
             print(f"{n:24} PASS")
+        elif sorted(norm(got).split("\n")) == sorted(norm(ref).split("\n")):
+            # The same lines in another order: processes woken in the same
+            # delta cycle ran in a different order than in the reference
+            # kernel (that order is unspecified, IEEE 1666-2023 §4.2.1.2).
+            norder += 1
+            print(f"{n:24} ORDER  same output, different order of processes within a delta cycle")
         elif got.count("\n") <= 2:
             print(f"{n:24} FAIL   {first_error(err, got)}")
         else:
@@ -162,6 +172,6 @@ def main():
             k = next((i for i, (x, y) in enumerate(zip(rl, gl)) if x != y), min(len(rl), len(gl)))
             print(f"{n:24} DIFF   line {k + 1}: ref {rl[k][:70]!r} got {gl[k][:70] if k < len(gl) else '<eof>'!r}")
         sys.stdout.flush()
-    print(f"-- {npass}/{len(names)} pass")
+    print(f"-- {npass}/{len(names)} pass, {norder} with only a different same-delta order")
 
 main()

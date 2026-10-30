@@ -1,0 +1,6 @@
+after write: available 0 free 2
+next delta: available 1 free 2
+nb_read 1 v=1
+after read: available 0 free 2
+two writes: free 0 nb_write 0
+next delta: available 2 free 1

@@ -420,7 +420,8 @@ impl Simulator {
             for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
                 let (pv, px) = waiter.captured_prev[i];
                 let pw = waiter.captured_prev_wide[i].as_ref();
-                if !self.term_fires(sid, pv, px, pw) {
+                let kicked = waiter.kicked && sid.iff.is_none() && sid.value_of.is_none();
+                if !kicked && !self.term_fires(sid, pv, px, pw) {
                     continue;
                 }
                 moved = true;

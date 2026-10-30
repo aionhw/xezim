@@ -1,0 +1,9 @@
+sem 2 trywait 0 0 -> 0
+sem after post+wait 0
+1 ns t1 locked
+3 ns trylock -1 unlock by non-owner -1
+5 ns event queue fired
+11 ns t1 unlock 0
+11 ns t2 locked
+21 ns t2 unlock 0
+event queue fires 1

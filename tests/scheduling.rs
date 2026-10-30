@@ -261,6 +261,8 @@ mod class_event_member_wait;
 mod class_nonevent_prop_wait;
 #[path = "scheduling/handle_member_wait_process_forms.rs"]
 mod handle_member_wait_process_forms;
+#[path = "scheduling/named_event_double_trigger.rs"]
+mod named_event_double_trigger;
 #[path = "scheduling/clock_gen_dotted_target.rs"]
 mod clock_gen_dotted_target;
 #[path = "scheduling/clock_gen_fifo_rank.rs"]
