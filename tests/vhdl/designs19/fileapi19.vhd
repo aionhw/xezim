@@ -1,6 +1,6 @@
 -- VHDL-2019 §5.5.2 FILE_STATE, FILE_MODE, FILE_SIZE, FILE_POSITION,
 -- FILE_CANSEEK, FILE_SEEK (from the beginning, the current position and the
--- end) and FILE_REWIND of a file of INTEGER. Positions and sizes are in
+-- end), FILE_REWIND and FILE_TRUNCATE of a file of INTEGER. Positions and sizes are in
 -- bytes of the file's elements, as written (xezim writes GHDL's binary
 -- format: a 4-byte INTEGER after a header, not counted); the golden is
 -- written for that format (fileapi19.lrm).
@@ -38,6 +38,17 @@ begin
     file_seek(f, -4, file_origin_end);
     read(f, v);
     write(l, " end-4=" & integer'image(v) & " " & boolean'image(endfile(f)));
+    file_close(f);
+    writeline(output, l);
+    file_open(f, "data.bin", read_write_mode);
+    file_truncate(f, 8);
+    write(l, "trunc size=" & integer'image(file_size(f)) & " pos=" & integer'image(file_position(f)));
+    file_seek(f, 0, file_origin_end);
+    file_truncate(f, -4, file_origin_current);
+    write(l, " size=" & integer'image(file_size(f)));
+    file_rewind(f);
+    read(f, v);
+    write(l, " first=" & integer'image(v) & " " & boolean'image(endfile(f)));
     file_close(f);
     writeline(output, l);
     wait;

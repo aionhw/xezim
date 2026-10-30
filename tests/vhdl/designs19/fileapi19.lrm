@@ -5,4 +5,6 @@ nvc writes 8 bytes per INTEGER without a header, so its numbers differ.
 The golden is IEEE 1076-2019 §5.5.2 applied to xezim's format: the file
 holds 10, 20, 30, 40, 50 in 20 bytes (the header not counted); byte 8 is
 the third element, 4 bytes after position 12 the fifth, and the last 4
-bytes the fifth.
+bytes the fifth. FILE_TRUNCATE to 8 bytes leaves
+10 and 20 (the position, 0, stays); 4 bytes before the end (the current
+position after seeking to it) leaves 10 alone.

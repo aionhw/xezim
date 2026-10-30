@@ -1,0 +1,5 @@
+nvc 1.23.1 prints (1,2) for the image of ((1, 2, 3), (4, 5, 6)) of a
+two-dimensional array type. The golden follows IEEE 1076-2019 §16.2.2: the
+image of a composite value is an aggregate of its elements' images, here
+of the rows (a row of BIT, an array of character literals, as a string).
+'VALUE reads the same aggregates back (blanks ignored).

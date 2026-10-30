@@ -1,0 +1,5 @@
+nvc 1.23.1 does not support generic protected types. The golden follows
+IEEE 1076-2019 §5.6.2: INT_STACK and BIT_STACK are protected types with
+the generics bound; S pops 3 and 2 and keeps one element, B pops '0' and
+keeps one. The last push exceeds BIT_STACK's depth (2): the assertion of
+severity failure stops the simulation (exit 1).

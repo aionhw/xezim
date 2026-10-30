@@ -209,15 +209,17 @@ these VHDL-2019 additions work, checked against nvc 1.23 (`tests/vhdl/designs19/
   elements associated together or one by one;
 - empty record types, subtypes of variables and signals inferred from a
   static initial value, function return identifiers (`return r of t`), and
-  private variables of protected types (with aliases of their methods);
-- `'image`, `'value` and `TO_STRING` of records and one-dimensional arrays
-  (aggregates of the elements' images), and the type marks `t'base`,
+  private variables of protected types (with aliases of their methods),
+  and generic protected types (`type t is new pt generic map (...)`);
+- `'image`, `'value` and `TO_STRING` of records and arrays (aggregates of
+  the elements' images; of each dimension's), and the type marks `t'base`,
   `x'subtype`, `a'element`, `p'designated_subtype` and `a'index(n)`;
 - STD.ENV: `VHDL_VERSION`, `TOOL_*`, `GETENV`, `EPOCH`, `LOCALTIME`,
   `GMTIME` and the time-record conversions, `TIME_TO_SECONDS`,
   `SECONDS_TO_TIME`, `FILE_NAME`, `FILE_PATH`, `FILE_LINE`, `DIR_SEPARATOR`,
-  the directory functions (`DIR_ITEMEXISTS`, `DIR_WORKINGDIR`,
-  `DIR_CREATEDIR`, `DIR_DELETEDIR`, `DIR_DELETEFILE`, ...), and the
+  the directory functions (`DIR_OPEN`, `DIR_CLOSE`, `DIR_ITEMEXISTS`,
+  `DIR_WORKINGDIR`, `DIR_CREATEDIR`, `DIR_DELETEDIR`, `DIR_DELETEFILE`,
+  ...), and the
   assertion counts and enables (`GetVhdlAssertCount`, `SetVhdlAssertEnable`,
   ...);
 - STD.REFLECTION: `'reflect` of types (subtype mirrors) and objects (value
@@ -228,14 +230,13 @@ these VHDL-2019 additions work, checked against nvc 1.23 (`tests/vhdl/designs19/
 - access types of protected types (`new`, method calls through the access
   value);
 - the file operations `FILE_STATE`, `FILE_MODE`, `FILE_POSITION`,
-  `FILE_SIZE`, `FILE_CANSEEK`, `FILE_SEEK` and `FILE_REWIND` (positions in
-  bytes of xezim's GHDL-format files).
+  `FILE_SIZE`, `FILE_CANSEEK`, `FILE_SEEK`, `FILE_REWIND` and
+  `FILE_TRUNCATE` (positions in bytes of xezim's GHDL-format files).
 
-Not yet (each a located error): generics of protected types, a port with
-a mode view at the SystemVerilog boundary, `'image` of multi-dimensional
-arrays, `DIR_OPEN`/`DIR_CLOSE`, `GET_CALL_PATH`, the assertion formats
-(`SetVhdlAssertFormat`), `FILE_TRUNCATE`, and value mirrors of
-multi-dimensional arrays (and of cyclic access structures, which are
+Not yet (each a located error): a port with a mode view at the
+SystemVerilog boundary, `GET_CALL_PATH`, the assertion formats
+(`SetVhdlAssertFormat`), the function form of `DIR_OPEN`, and value mirrors
+of multi-dimensional arrays (and of cyclic access structures, which are
 mirrored eagerly).
 
 ## Not supported yet

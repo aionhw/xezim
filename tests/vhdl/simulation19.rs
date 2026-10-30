@@ -243,3 +243,24 @@ fn reflacc19() {
 fn protacc19() {
     check("protacc19");
 }
+
+/// VHDL-2019 §5.6.2, §5.6.4 generic protected types and their instances
+/// (LRM golden: nvc 1.23.1 has none).
+#[test]
+fn protgen19() {
+    check("protgen19");
+}
+
+/// VHDL-2019 §16.5 directories: DIR_CREATEDIR, DIR_OPEN and DIR_CLOSE,
+/// DIR_DELETEFILE, DIR_DELETEDIR, DIR_WORKINGDIR.
+#[test]
+fn dir19() {
+    check("dir19");
+}
+
+/// VHDL-2019 §16.2.2 'IMAGE, TO_STRING and 'VALUE of two-dimensional arrays (LRM
+/// golden: nvc 1.23.1 prints part of the first row).
+#[test]
+fn imgnd19() {
+    check("imgnd19");
+}
