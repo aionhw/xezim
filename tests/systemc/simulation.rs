@@ -51,7 +51,7 @@ fn check(name: &str) -> Option<i32> {
     let golden = std::fs::read_to_string(dir.join(format!("{}.golden", name))).expect("golden");
     assert_eq!(
         actual.trim_end(),
-        golden.trim_end(),
+        golden.trim_start_matches('\n').trim_end(),
         "{}.cpp differs from the SystemC 2.3.4 reference\nstderr:\n{}",
         name,
         stderr
@@ -372,4 +372,26 @@ fn callbacks() {
 #[test]
 fn asserts() {
     assert_eq!(check("asserts"), Some(134));
+}
+
+/// §8.3 sc_report_handler: actions per severity, id and (id, severity),
+/// suppress, stop_after, counts, new action ids, verbosity, a user handler
+/// calling the default one; an error thrown at the end (status 1).
+#[test]
+fn report_handler() {
+    assert_eq!(check("reports"), Some(1));
+}
+
+/// §4.5.7 an unbounded sc_start() returns when no events are left; sc_main
+/// notifies a child's event and starts again (unbounded, then bounded).
+#[test]
+fn restart() {
+    check("restart");
+}
+
+/// Namespace-scope variables, arrays, constants and references; free
+/// functions overloaded by parameter count, with default arguments.
+#[test]
+fn globals() {
+    check("globals");
 }

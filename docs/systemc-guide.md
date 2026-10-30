@@ -58,7 +58,7 @@ match the SystemC 2.3 reference kernel:
 | `wait(SC_ZERO_TIME)`, `e.notify(SC_ZERO_TIME)` | the next delta cycle, after the update phase (a nonblocking `->>` trigger) |
 | primitive channel `request_update()` / `update()` | one `update()` per delta cycle, in the update phase |
 | `sc_start(t)` | stops before the events *at* `t` (they run in the next `sc_start`) |
-| `sc_start()` | returns at `sc_stop()` or when no events are left; the rest of `sc_main` then runs (in a `final` block, so it cannot call `sc_start` or `wait` again) |
+| `sc_start()` | returns at `sc_stop()` or when no events are left (the simulator resumes `sc_main` instead of ending); `sc_main` may then start again |
 | `sc_stop()` | stops at the end of the delta cycle, with SystemC's message |
 | `next_trigger(...)` in an `SC_METHOD` | its next activation waits for that time, event, list or timeout, then for the static sensitivity again |
 | `sc_spawn(sc_bind(&f, args…))` | a `fork … join_none` thread (arguments copied at the spawn, `sc_ref`/`sc_cref` shared); `SC_FORK … SC_JOIN` a `fork … join` |
@@ -105,6 +105,19 @@ match the SystemC 2.3 reference kernel:
   enclosing module's own constructor parameters); a value computed at run
   time is an error.
 - **Checks**: `sc_assert` (SystemC's fatal error F4) and `assert`.
+- **Reports** (§8): `SC_REPORT_INFO/WARNING/ERROR/FATAL`,
+  `SC_REPORT_INFO_VERB` and `sc_report_handler::report`, with the
+  reference kernel's rules: `set_actions` per severity, id and (id,
+  severity), `suppress`/`force`, `stop_after`, `get_count`,
+  `get_new_action_id`, verbosity levels, and a handler of your own
+  (`set_handler(&f)`, which may call `default_handler`); `sc_report`'s
+  getters. An error's default action (throw) ends the run with status 1
+  after the report, as the uncaught exception does. The kernel's own
+  messages (sc_stop's) bypass a user handler.
+- **Namespace scope**: variables, arrays (sized by their initializer),
+  constants of any type and references, in a package all modules import
+  (user classes do not see them); free and member functions overloaded by
+  their number of parameters, default arguments.
 - **Kernel objects**: `sc_mutex` (`lock`, `trylock`, `unlock`, owner-only),
   `sc_semaphore` (`wait`, `trywait`, `post`, `get_value`), `sc_event_queue`
   (several pending notifications, `cancel_all`, as a sensitivity).
@@ -161,8 +174,8 @@ simulated approximately:
 - Approximately-timed TLM (`nb_transport`, payload event queues),
   `sc_event_and_list` / `sc_event_or_list` objects (the `e1 & e2` /
   `e1 | e2` expressions work), spawned method processes and lambdas,
-  `SC_CJOIN`, process control (`suspend`, `kill`, `reset`, …),
-  `sc_report_handler`.
+  `SC_CJOIN`, process control (`suspend`, `kill`, `reset`, …), report
+  log files (`SC_LOG`) and cached reports.
 - Function templates, pointers other than byte/word data pointers and
   pointers to objects, destructors with statements in a class that is not a
   module (an empty one is fine).

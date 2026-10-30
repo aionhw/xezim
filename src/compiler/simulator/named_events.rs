@@ -1118,6 +1118,33 @@ impl Simulator {
         )
     }
 
+    /// IEEE 1666-2023 §4.5.7: an unbounded `sc_start()` returns when no
+    /// events are left. The SystemC runtime's sc_main waits on the package
+    /// event `sc_rt::scrt_idle_ev`; once only blocked waiters remain, the
+    /// scheduler resumes those waiters (now) instead of ending the run.
+    pub(super) fn wake_idle_waiters(&mut self) -> bool {
+        let Some(key) = self.package_event_key("sc_rt::scrt_idle_ev") else {
+            return false;
+        };
+        let Some(&sid) = self.signal_name_to_id.get(key.as_str()) else {
+            return false;
+        };
+        let mut woken = Vec::new();
+        self.event_waiters.retain_mut(|w| {
+            let on = w.resolved_sensitivities.iter().any(|s| s.signal_id == sid);
+            if on {
+                woken.push((w.pid, std::mem::replace(&mut w.continuation, ProcCont::empty())));
+            }
+            !on
+        });
+        let now = self.time;
+        let any = !woken.is_empty();
+        for (pid, cont) in woken {
+            self.event_queue.schedule(now, pid, cont);
+        }
+        any
+    }
+
     /// The waiter key of a local event (see `fire_named_event`): no class
     /// instance has this handle id.
     pub(super) fn local_event_key(name: &str) -> (usize, String) {

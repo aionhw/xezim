@@ -265,6 +265,8 @@ mod handle_member_wait_process_forms;
 mod named_event_double_trigger;
 #[path = "scheduling/local_event_wait.rs"]
 mod local_event_wait;
+#[path = "scheduling/systemc_idle_resume.rs"]
+mod systemc_idle_resume;
 #[path = "scheduling/clock_gen_dotted_target.rs"]
 mod clock_gen_dotted_target;
 #[path = "scheduling/clock_gen_fifo_rank.rs"]

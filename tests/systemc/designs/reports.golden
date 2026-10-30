@@ -1,0 +1,43 @@
+
+Info: /top/a: plain info
+
+Warning: /top/a: plain warning
+In file: reports.cpp:29
+
+Warning: /top/b: id rule wins over severity
+In file: reports.cpp:33
+
+Error: /top/b: an error shown, not thrown
+In file: reports.cpp:36
+counts: warning 3 /top/b 4 /top/b error 2
+new action ids 256 512
+[handler] /m/warn sev 1 msg 'from a process' line 19 at 1 ns actions 8
+
+Warning: /m/warn: from a process
+In file: reports.cpp:19
+In process: u.run @ 1 ns
+[handler] /m/warn sev 1 msg 'from a process' line 19 at 2 ns actions 8
+
+Warning: /m/warn: from a process
+In file: reports.cpp:19
+In process: u.run @ 2 ns
+[handler] /m/warn sev 1 msg 'from a process' line 19 at 3 ns actions 72
+
+Warning: /m/warn: from a process
+In file: reports.cpp:19
+In process: u.run @ 3 ns
+[handler] /m/warn sev 1 msg 'from a process' line 19 at 4 ns actions 72
+
+Warning: /m/warn: from a process
+In file: reports.cpp:19
+In process: u.run @ 4 ns
+[handler] /m/info sev 0 msg 'high' line 21 at 4 ns actions 12
+
+Info: /m/info: high
+[handler] /m/info sev 0 msg 'low' line 22 at 4 ns actions 12
+
+Info: /m/info: low
+handled 6 at 10 ns
+
+Error: /top/end: thrown
+In file: file.cpp:7

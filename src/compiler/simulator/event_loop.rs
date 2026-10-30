@@ -2187,6 +2187,10 @@ impl Simulator {
                 if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
                     continue;
                 }
+                // A SystemC sc_main waiting for its sc_start() to return.
+                if self.wake_idle_waiters() {
+                    continue;
+                }
                 break;
             }
 
