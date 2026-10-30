@@ -6484,6 +6484,8 @@ pub struct Simulator {
     pub saw_fatal: bool,
     /// `$fatal`'s finish_number (0/1/2), for the exit status.
     pub fatal_finish_number: Option<i32>,
+    /// `$__sc_exit(n)`: the exit status of a SystemC design's kernel.
+    pub sc_exit_code: Option<i32>,
     /// Count of `$error` occurrences (see `--error-exit`).
     pub error_count: u64,
     /// Compile-time diagnostics that must prevent simulation (e.g. an illegal

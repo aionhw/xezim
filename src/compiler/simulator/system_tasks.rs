@@ -199,7 +199,7 @@ impl Simulator {
                 | "$value$plusargs" | "$test$plusargs"
                 | "$monitor" | "$monitorb" | "$monitorh" | "$monitoro"
                 | "$monitoron" | "$monitoroff"
-                | "$deposit" | "$finish" | "$stop" | "$exit"
+                | "$deposit" | "$finish" | "$stop" | "$exit" | "$__sc_exit"
                 | "$fopen" | "$fclose" | "$fflush" | "$fseek" | "$ftell"
                 | "$rewind" | "$ungetc" | "$fgets" | "$fgetc" | "$feof"
                 | "$ferror" | "$fscanf" | "$sscanf" | "$fread"
@@ -621,6 +621,20 @@ impl Simulator {
             // behaves as `$finish`. xezim models program blocks loosely (their
             // initial blocks run in the reactive region of the same event
             // loop), so plain `$finish` semantics are the accurate mapping.
+            // A SystemC design lowered by xezim-core (IEEE 1666) ends with
+            // its kernel's status: `$__sc_exit(n)` ends the run like
+            // `$finish` with exit status `n` — 1 after an error report or
+            // E115, 134 after a fatal one (the kernel aborts). It prints
+            // nothing.
+            "$__sc_exit" => {
+                let code = args
+                    .first()
+                    .and_then(|a| self.eval_expr(a).to_i64())
+                    .unwrap_or(0);
+                self.sc_exit_code = Some(code as i32);
+                self.flush_file_writes();
+                self.finished = true;
+            }
             "$finish" | "$stop" | "$exit" => {
                 // xezim has no interactive mode: `$stop` ends the run like
                 // `$finish`, reported to VPI as cbEnterInteractive.

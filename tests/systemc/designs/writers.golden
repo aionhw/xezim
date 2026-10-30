@@ -1,0 +1,4 @@
+u u.port_0 u.q u.signal_0 u.bee u.signal_1 u.fifo_0
+clk signal_0 signal_1 signal_0
+1 ns shared=1
+2 ns shared=2

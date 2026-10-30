@@ -3761,6 +3761,7 @@ impl Simulator {
             finished: false,
             saw_fatal: false,
             fatal_finish_number: None,
+            sc_exit_code: None,
             error_count: 0,
             compile_errors: Vec::new(),
             stuck_clock_aborted: false,

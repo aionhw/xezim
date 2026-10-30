@@ -33,15 +33,6 @@ fn rejects(name: &str, expected: &str) {
     );
 }
 
-/// §6.9: an sc_buffer's per-write events cannot pass through a port.
-#[test]
-fn buffer_bound_to_port() {
-    rejects(
-        "buffer_port",
-        "buffer_port.cpp:9:10: error: SystemC: binding an sc_buffer to a port is not supported in simulation",
-    );
-}
-
 /// §5.5 dynamic processes.
 #[test]
 fn sc_spawn() {

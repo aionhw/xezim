@@ -1,0 +1,10 @@
+init s=X bus=XXXX
+1 ns s=0 bus=0110 seen=X
+1 ns s=0 bus=0110 seen=0
+3 ns s=Z bus=ZZZZ seen=0
+3 ns s=Z bus=ZZZZ seen=Z
+4 ns s=1 bus=1ZZ0 seen=Z
+4 ns s=1 bus=1ZZ0 seen=1
+5 ns s=Z bus=1ZZ0 seen=1
+5 ns s=Z bus=1ZZ0 seen=Z
+end s=Z bus=1ZZ0 posedges=1

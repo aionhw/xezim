@@ -14,7 +14,8 @@ fn designs() -> PathBuf {
 /// Run `xezim` on `designs/<name>.cpp`, or on every `.cpp` of the
 /// directory `designs/<name>/` (from that directory, so reports name the
 /// file as the reference did), and compare with `designs/<name>.golden`.
-fn check(name: &str) {
+/// Returns the exit status (the reference kernel's: 1 after an error).
+fn check(name: &str) -> Option<i32> {
     let dir = designs();
     let (run_dir, files) = if dir.join(name).is_dir() {
         let mut cpps: Vec<String> = std::fs::read_dir(dir.join(name))
@@ -55,6 +56,7 @@ fn check(name: &str) {
         name,
         stderr
     );
+    out.status.code()
 }
 
 /// §5.2.9 SC_METHOD with edge sensitivity and `posedge()` (§6.8.4).
@@ -225,4 +227,38 @@ fn tlm_router() {
 #[test]
 fn multi_file() {
     check("multi");
+}
+
+/// §6.13–§6.18 resolved signals and ports: each process writing one is a
+/// driver (through ports of two modules and directly), bits resolve as
+/// sc_logic does (0/1 conflict → X, Z yields), X before any write;
+/// `posedge_event()` of a resolved signal; sc_in_resolved readers.
+#[test]
+fn resolved() {
+    check("resolved");
+}
+
+/// §6.9 an sc_buffer bound to ports: a reader's port sees every write, and
+/// so does a write of the same value through a writer's port (§6.4: a
+/// port's event is its channel's). Supersedes the error test that rejected
+/// binding a buffer to a port.
+#[test]
+fn buffer_port() {
+    check("buffer_port");
+}
+
+/// §6.4.4 SC_MANY_WRITERS lets two processes write one signal; §5.17 object
+/// names — given ones, generated `signal_0`/`port_0`/`fifo_0` per kind and
+/// parent, sc_main's top-level ones, `basename()`.
+#[test]
+fn writers_and_names() {
+    check("writers");
+}
+
+/// §6.4.4 SC_ONE_WRITER (the default): a second process writing a signal is
+/// error E115 at that write, in the reference kernel's words, and the run
+/// ends with exit status 1.
+#[test]
+fn one_writer() {
+    assert_eq!(check("e115"), Some(1));
 }

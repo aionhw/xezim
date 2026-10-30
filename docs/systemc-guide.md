@@ -70,8 +70,20 @@ match the SystemC 2.3 reference kernel:
   and signals.
 - **Ports and channels**: `sc_in`/`sc_out`/`sc_inout` (an `sc_inout` is an
   output its owner also reads), `sc_signal`, `sc_buffer` (an event on every
-  write), `sc_clock`, `sc_fifo` (with its depth) with
-  `sc_fifo_in`/`sc_fifo_out`, `sc_event`.
+  write, also through the ports bound to it), `sc_clock`, `sc_fifo` (with its
+  depth) with `sc_fifo_in`/`sc_fifo_out`, `sc_event`.
+- **Resolved signals**: `sc_signal_resolved`, `sc_signal_rv<W>` and the
+  `sc_in`/`sc_out`/`sc_inout` `_resolved` and `_rv` ports. Every process
+  writing one is a driver, through ports of any module or directly; the bits
+  resolve as `sc_logic` does (a `0`/`1` conflict gives `X`, `Z` yields), and
+  the signal reads `X` until a driver writes. They become nets of a
+  resolving nettype, so they cannot cross into SystemVerilog modules.
+- **Writer policy** (§6.4.4): with the default `SC_ONE_WRITER`, a second
+  process writing a signal stops the run with SystemC's error E115;
+  `sc_signal<T, SC_MANY_WRITERS>` allows several writers.
+- **Object names**: `name()` and `basename()` of modules, ports, signals and
+  the other channels, with SystemC's generated names (`signal_0`, `port_1`,
+  …) for objects constructed without one.
 - **Data types**: `bool`, `sc_uint`/`sc_int`/`sc_biguint`/`sc_bigint` (up to
   the width SystemVerilog vectors allow), `sc_bv`, `sc_lv`, `sc_logic` (and
   bit-string literals such as `"01XZ"`), the C++
@@ -79,7 +91,9 @@ match the SystemC 2.3 reference kernel:
   bit selects, `(a, b)` concatenation, reductions, `to_uint()` and friends.
 - **Output**: `std::cout` (with `hex`/`dec`/`setw`/`setfill`, printing
   SystemC types the way SystemC does), `printf`, `SC_REPORT_INFO/WARNING/
-  ERROR/FATAL` in SystemC's format, `sc_trace` to VCD.
+  ERROR/FATAL` in SystemC's format, `sc_trace` to VCD. The exit status is
+  the program's: `sc_main`'s return value, 1 after an error report, 134
+  after a fatal one (the kernel aborts).
 - **TLM-2.0 (loosely timed)**: `tlm_generic_payload`, `simple_initiator_socket`
   / `simple_target_socket` and `tlm_initiator_socket` / `tlm_target_socket`,
   `b_transport`, `transport_dbg`, `register_b_transport`, `socket.bind(*this)`.
@@ -96,7 +110,6 @@ Each of these is reported as an error at its C++ source line, never
 simulated approximately:
 
 - `sc_port`/`sc_export` with user interfaces (custom hierarchical channels),
-  an `sc_buffer` bound to a port (a port passes on value changes only),
   `sc_mutex`/`sc_semaphore`, approximately-timed TLM (`nb_transport`,
   payload event queues), `sc_spawn`, `SC_FORK`/`SC_JOIN`, `next_trigger`.
 - User classes and structs as data (including signal payloads with

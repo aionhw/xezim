@@ -1,0 +1,8 @@
+1 ns s=1
+
+Error: (E115) sc_signal<T> cannot have more than one driver: 
+ signal `t.signal_0' (sc_signal)
+ first driver `t.p1' (sc_thread_process)
+ second driver `t.p2' (sc_thread_process)
+In file: communication/sc_signal.cpp:67
+In process: t.p2 @ 2 ns

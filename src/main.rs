@@ -3879,6 +3879,9 @@ suppressed but the explicit SDF annotation still applies."
 /// user opts in with `--error-exit` (matching the "promote errors" switch other
 /// simulators provide), so existing flows that tolerate errors keep working.
 fn exit_status_for_severities(sim: &xezim::compiler::Simulator, error_exit: bool) -> i32 {
+    if let Some(code) = sim.sc_exit_code {
+        return code;
+    }
     if sim.saw_fatal {
         return 1;
     }
