@@ -1,0 +1,6 @@
+nvc 1.23.1 stops with an internal error ("variable and stored value do not
+have same type", lower_cond_value) on conditional expressions whose values
+are strings or bit vectors of different lengths. The golden follows
+IEEE 1076-2019 §9.1: the value of the conditional expression is the value
+of the selected expression, so w has the selected string's bounds and the
+actual of len its own length.

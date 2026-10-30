@@ -146,3 +146,33 @@ fn view_port_at_the_sv_boundary_is_an_error() {
         text
     );
 }
+
+/// VHDL-2019 §9.1 conditional expressions (scalars, vectors, records; only
+/// the selected value evaluated), sequential block statements (their
+/// objects initialised each time the block runs, nested blocks), empty
+/// record types, and variable and signal subtypes inferred from their
+/// initial values.
+#[test]
+fn lang19() {
+    check("lang19");
+}
+
+/// VHDL-2019 §9.1 conditional expressions whose values have different
+/// lengths (LRM golden: nvc 1.23.1 fails on them).
+#[test]
+fn condlen19() {
+    check("condlen19");
+}
+
+/// VHDL-2019 §5.6.2 private variables of protected types, of a scalar type
+/// and of another protected type, and an alias publishing a method of one.
+#[test]
+fn prot19() {
+    check("prot19");
+}
+
+/// VHDL-2019 §4.2.1 function return identifiers (`return r of bit_vector`).
+#[test]
+fn retid19() {
+    check("retid19");
+}

@@ -197,16 +197,21 @@ these VHDL-2019 additions work, checked against nvc 1.23 (`tests/vhdl/designs19/
   (`"SIMULATION"`), `TOOL_VENDOR`, `TOOL_NAME` (`"xezim"`), `TOOL_EDITION`
   and `TOOL_VERSION`;
 - `return x when c [else ...]`, `else unaffected` and `return when c`;
-- classes of generic types (`type t is (<>)`, `range <>`, `private`, ...;
-  the actual is not yet checked against the class);
+- conditional expressions (`a when c else b`) in initial values, actuals,
+  assignments and returns, only the selected value evaluated;
+- sequential `block` statements, their objects initialised each time the
+  block runs;
+- classes of generic types (`type t is (<>)`, `range <>`, `private`,
+  `array ... of ...`, ...), the actual checked against the class;
 - mode views (`view v of rec_t is ... end view`, `'converse`, `view (v)`
   for arrays) on ports and procedures' signal parameters, with a port's
-  elements associated together or one by one.
+  elements associated together or one by one;
+- empty record types, subtypes of variables and signals inferred from a
+  static initial value, function return identifiers (`return r of t`), and
+  private variables of protected types (with aliases of their methods).
 
-Not yet (each a located error): conditional expressions
-(`a when c else b`), sequential `block` statements, generics and private
-variables of protected types, and a port with a mode view at the
-SystemVerilog boundary.
+Not yet (each a located error): generics of protected types, and a port
+with a mode view at the SystemVerilog boundary.
 
 ## Not supported yet
 
