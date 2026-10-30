@@ -16,6 +16,8 @@ module array_cond_operands;
     $display("T|else %0d %0d %0d", w[0], w[1], w[2]);
     w = c ? u : (!c ? v : u);
     $display("T|nested %0d %0d %0d", w[0], w[1], w[2]);
+    w = ((c ? u : v));
+    $display("T|paren %0d %0d %0d", w[0], w[1], w[2]);
     a2 = '{'{1, 2}, '{3, 4}};
     b2 = '{'{5, 6}, '{7, 8}};
     m = !c ? b2 : a2;

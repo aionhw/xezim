@@ -1358,7 +1358,7 @@ impl Simulator {
         // §11.4.11/§7.2/§7.6: `s = c ? a : b` of unpacked structs or arrays
         // assigns the selected operand (dynamic members included; an array
         // whole, not evaluated as one value).
-        if matches!(rvalue.kind, ExprKind::Conditional { .. })
+        if Self::is_conditional(rvalue)
             && (self.root_may_hold_struct(lvalue) || self.expr_is_unpacked_coll(lvalue))
             && let Some(sel) = self.struct_cond_operand(rvalue)
         {

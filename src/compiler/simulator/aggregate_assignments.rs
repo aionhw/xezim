@@ -274,6 +274,14 @@ impl Simulator {
             })
     }
 
+    /// Whether `e` is a conditional expression, possibly parenthesized.
+    pub(super) fn is_conditional(mut e: &Expression) -> bool {
+        while let ExprKind::Paren(i) = &e.kind {
+            e = i;
+        }
+        matches!(e.kind, ExprKind::Conditional { .. })
+    }
+
     /// §11.4.11: the operand a conditional expression of unpacked-struct or
     /// unpacked-array type selects (through nested conditionals and
     /// parentheses), its conditions evaluated once. Neither has a single

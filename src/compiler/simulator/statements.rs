@@ -4975,7 +4975,7 @@ impl Simulator {
                 if let Some(e) = expr {
                     // §11.4.11/§13.4.1: `return c ? a : b` of unpacked structs
                     // returns the selected operand, dynamic members included.
-                    let e = if matches!(e.kind, ExprKind::Conditional { .. }) {
+                    let e = if Self::is_conditional(e) {
                         self.struct_cond_operand(e).unwrap_or(e)
                     } else {
                         e
