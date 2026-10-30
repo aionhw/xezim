@@ -5195,7 +5195,15 @@ impl Simulator {
                 // Nested-collection element read: `assoc_of_queue[key][i]`
                 // (e.g. `instr_category[cat][i]`). The base `assoc[key]` maps to
                 // a compound queue name; read its `[i]` element.
-                if let Some(cn) = self.nested_index_name(expr) {
+                if let Some(cn) = self
+                    .nested_index_name(expr)
+                    // A stored vector element (`m[k]` of `logic [3:0]
+                    // m[int]`) is not a collection: `[i]` selects a bit.
+                    .filter(|cn| {
+                        !self.signals.contains_key(cn.as_str())
+                            || self.module.dynamic_arrays.contains(cn)
+                    })
+                {
                     // §11.5.1: an x/z index reads x.
                     let Some(i) = self.eval_expr(index).to_index() else {
                         return Value::new(ctx_width.max(1));

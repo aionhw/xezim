@@ -712,6 +712,12 @@ impl Simulator {
         {
             return None;
         }
+        // §7.4.1/§11.5.1: `m[k][i]` on a ONE-dimensional array of vectors is
+        // a bit-select of the stored element `m[k]`, not the compound key
+        // `m[k][i]` (which a multidim array stores instead of `m[k]`).
+        if depth == 2 && self.signals.contains_key(first_elem.as_str()) {
+            return None;
+        }
         // Build the compound key inner→outer so it reads base[K1][K2]...[Kn].
         let mut key = base_name.clone();
         for idx in rev.iter().rev() {

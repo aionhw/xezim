@@ -30,6 +30,8 @@ mod array_of_queues;
 mod assoc_array_reductions;
 #[path = "collections/assoc_compliance.rs"]
 mod assoc_compliance;
+#[path = "collections/assoc_elem_bit_select.rs"]
+mod assoc_elem_bit_select;
 #[path = "collections/assoc_method_dispatch.rs"]
 mod assoc_method_dispatch;
 #[path = "collections/assoc_missing_key_default.rs"]
