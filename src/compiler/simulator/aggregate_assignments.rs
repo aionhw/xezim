@@ -274,13 +274,13 @@ impl Simulator {
             })
     }
 
-    /// §11.4.11: the operand a conditional expression of unpacked-struct type
-    /// selects (through nested conditionals and parentheses), its
-    /// conditions evaluated once. An unpacked struct has no single packed
-    /// value to carry its dynamic members, so a consumer treats the selected
-    /// operand as the source itself. `None` when `e` is no conditional, its
-    /// operands are not unpacked structs, or the first condition is x/z (the
-    /// caller's general path then evaluates it).
+    /// §11.4.11: the operand a conditional expression of unpacked-struct or
+    /// unpacked-array type selects (through nested conditionals and
+    /// parentheses), its conditions evaluated once. Neither has a single
+    /// packed value (a struct's dynamic members, an array's elements), so a
+    /// consumer treats the selected operand as the source itself. `None` when
+    /// `e` is no conditional, its operands are neither, or the first
+    /// condition is x/z (the caller's general path then evaluates it).
     pub(super) fn struct_cond_operand<'e>(&mut self, e: &'e Expression) -> Option<&'e Expression> {
         let mut leaf = e;
         loop {
@@ -290,7 +290,9 @@ impl Simulator {
                 _ => break,
             }
         }
-        if std::ptr::eq(leaf, e) || !self.expr_is_unpacked_struct(leaf) {
+        if std::ptr::eq(leaf, e)
+            || !(self.expr_is_unpacked_struct(leaf) || self.expr_is_unpacked_coll(leaf))
+        {
             return None;
         }
         let mut cur = e;
@@ -312,6 +314,31 @@ impl Simulator {
                 }
                 _ => return selected.then_some(cur),
             }
+        }
+    }
+
+    /// Whether `e` is a whole unpacked array or collection by its
+    /// declaration: a call of a function returning one, or array storage
+    /// named by an identifier. Evaluates nothing.
+    pub(super) fn expr_is_unpacked_coll(&mut self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Call { func, .. } => {
+                let ExprKind::Ident(h) = &func.kind else {
+                    return false;
+                };
+                h.path.len() == 1
+                    && self
+                        .module
+                        .functions
+                        .get(&h.path[0].name.name)
+                        .map(|fd| fd.return_type.clone())
+                        .is_some_and(|dt| self.type_is_unpacked_collection(&dt))
+            }
+            ExprKind::Ident(h) => {
+                let name = self.resolve_hier_name(h);
+                self.is_unpacked_array_storage(&name)
+            }
+            _ => false,
         }
     }
 

@@ -216,6 +216,8 @@ mod struct_nested_dyn_arrays;
 
 #[path = "collections/struct_cond_operands.rs"]
 mod struct_cond_operands;
+#[path = "collections/array_cond_operands.rs"]
+mod array_cond_operands;
 
 #[path = "collections/assoc_dyn_struct_delete.rs"]
 mod assoc_dyn_struct_delete;

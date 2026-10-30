@@ -1355,10 +1355,11 @@ impl Simulator {
         // §25.9: a static virtual-interface property binds by name before
         // any value path below stores (and returns).
         self.bind_static_vif(lvalue, rvalue);
-        // §11.4.11/§7.2: `s = c ? a : b` of unpacked structs assigns the
-        // selected operand, dynamic members included.
+        // §11.4.11/§7.2/§7.6: `s = c ? a : b` of unpacked structs or arrays
+        // assigns the selected operand (dynamic members included; an array
+        // whole, not evaluated as one value).
         if matches!(rvalue.kind, ExprKind::Conditional { .. })
-            && self.root_may_hold_struct(lvalue)
+            && (self.root_may_hold_struct(lvalue) || self.expr_is_unpacked_coll(lvalue))
             && let Some(sel) = self.struct_cond_operand(rvalue)
         {
             self.exec_stmt_blocking_assign_body(stmt, lvalue, sel);
