@@ -74,6 +74,8 @@ mod mailbox_handle_named_like_struct;
 mod member_off_handle_collection_elem;
 #[path = "classes/compiled_method_test_env.rs"]
 mod compiled_method_test_env;
+#[path = "collections/bits_dynamic_operand.rs"]
+mod bits_dynamic_operand;
 #[path = "collections/compiled_ret_coll_by_name.rs"]
 mod compiled_ret_coll_by_name;
 #[path = "collections/compiled_typedef_local_queue.rs"]

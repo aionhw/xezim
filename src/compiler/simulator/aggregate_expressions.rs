@@ -2307,6 +2307,55 @@ impl Simulator {
         sys_result
     }
 
+    /// §20.6.2: `$bits` of a class-member queue or dynamic array — bare in
+    /// a method of its class, or reached through a handle (`h.q`) — is its
+    /// element bits times its CURRENT size, 0 when empty. The bare form
+    /// returned one element's width and the dotted form sized a module
+    /// variable of the same leaf name. None for anything else (string
+    /// elements included).
+    fn member_dyn_coll_bits(&mut self, arg: &Expression) -> Option<u64> {
+        let (handle, field, key) = match &arg.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                let n = h.path[0].name.name.as_str();
+                if self.local_stack.last().is_some_and(|l| l.contains_key(n)) {
+                    return None;
+                }
+                let handle = self.this_stack.last().copied().flatten()?;
+                let key = self.instance_assoc_member(n)?;
+                (handle, n.to_string(), key)
+            }
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                let (handle, field) = self.expr_handle_prop_any(arg)?;
+                let key = Self::handle_member_key(handle, &field);
+                (handle, field, key)
+            }
+            _ => return None,
+        };
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        for _ in 0..64 {
+            let cd = self.module.classes.get(cur.as_deref()?)?;
+            if cd.string_properties.contains(&field) || cd.static_properties.contains(&field) {
+                return None;
+            }
+            if let Some(&(ew, _)) = cd.queue_properties.get(&field) {
+                // The object's specialization types a type-parameter element.
+                let ew = self.coll_elem_width(&key).unwrap_or(ew);
+                return Some(self.get_queue_size(&key) * ew as u64);
+            }
+            if cd.properties.contains_key(&field) {
+                return None;
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
     pub(super) fn eval_expr_system_call_body(
         &mut self,
         expr: &Expression,
@@ -2656,6 +2705,9 @@ impl Simulator {
                             }
                         }
                     }
+                    if let Some(bits) = self.member_dyn_coll_bits(arg) {
+                        return Value::from_u64(bits, 32);
+                    }
                     if let ExprKind::Ident(hier) = &arg.kind {
                         let name = self.resolve_hier_name(hier);
                         // A bare TYPE PARAMETER of the enclosing class
@@ -2688,6 +2740,12 @@ impl Simulator {
                                 .max(1);
                                 return Value::from_u64(w as u64, 32);
                             }
+                        }
+                        // §20.6.2: a string is sized by its current text —
+                        // 8 bits a character, 0 when empty.
+                        if self.expr_is_string_valued(arg) {
+                            let n = self.eval_expr(arg).to_sv_string().len() as u64;
+                            return Value::from_u64(8 * n, 32);
                         }
                         // IEEE 1800-2017 §23.8 name resolution: inside a
                         // class method, an unqualified identifier resolves
