@@ -757,9 +757,18 @@ impl Simulator {
         if name == "this" || name == "super" {
             return true;
         }
-        if self
-            .var_typedef_types
-            .get(name)
+        // The declared typedef of `name` in the ACTIVE frames: the flat
+        // `var_typedef_types` map keeps whatever an earlier, finished
+        // activation declared under the name (`uvm_severity s;` in a report
+        // method), which turned every later `s.f = v` through an unrelated
+        // class handle `s` into a dropped write.
+        let declared_td = if self.local_stack.is_empty() {
+            self.var_typedef_types.get(name).cloned()
+        } else {
+            self.local_typedef_type_of(name)
+        };
+        if declared_td
+            .as_ref()
             .is_some_and(|tn| self.module.enum_members.contains_key(tn))
         {
             return false;
@@ -775,7 +784,7 @@ impl Simulator {
         // module/package-scope variables are only in `var_decl_types`.
         // (id-collision-in-heap review regression 2 — resolved here, in
         // the classification helper, not in `class_of_var`.)
-        let declared_tn = self.var_typedef_types.get(name).cloned().or_else(|| {
+        let declared_tn = declared_td.or_else(|| {
             self.module
                 .var_decl_types
                 .get(name)
