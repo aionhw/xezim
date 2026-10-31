@@ -9768,6 +9768,95 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// May evaluating `e` have an effect beyond its value — a subroutine or
+    /// method call, an increment, an assignment, a randomizing system call?
+    fn expr_has_effect(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Call { .. } | ExprKind::AssignExpr { .. } => true,
+            ExprKind::Unary { op, operand } => {
+                matches!(
+                    op,
+                    UnaryOp::PreIncr | UnaryOp::PreDecr | UnaryOp::PostIncr | UnaryOp::PostDecr
+                ) || Self::expr_has_effect(operand)
+            }
+            ExprKind::SystemCall { name, args } => {
+                matches!(name.as_str(), "$urandom" | "$random" | "$urandom_range")
+                    || args.iter().any(Self::expr_has_effect)
+            }
+            ExprKind::Paren(x) | ExprKind::MemberAccess { expr: x, .. } => Self::expr_has_effect(x),
+            ExprKind::Binary { left, right, .. } => {
+                Self::expr_has_effect(left) || Self::expr_has_effect(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_has_effect(condition)
+                    || Self::expr_has_effect(then_expr)
+                    || Self::expr_has_effect(else_expr)
+            }
+            ExprKind::Index { expr, index } => {
+                Self::expr_has_effect(expr) || Self::expr_has_effect(index)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::expr_has_effect(expr)
+                    || Self::expr_has_effect(left)
+                    || Self::expr_has_effect(right)
+            }
+            ExprKind::Concatenation(parts) => parts.iter().any(Self::expr_has_effect),
+            ExprKind::Replication { count, exprs } => {
+                Self::expr_has_effect(count) || exprs.iter().any(Self::expr_has_effect)
+            }
+            ExprKind::Inside { expr, ranges } => {
+                Self::expr_has_effect(expr) || ranges.iter().any(Self::expr_has_effect)
+            }
+            _ => false,
+        }
+    }
+
+    /// §11.4.7: `left && right` / `left || right` with the right operand
+    /// evaluated only when the left does not decide the result: a left that
+    /// is exactly 0 (`&&`) or has a 1 bit (`||`) skips it. Otherwise the
+    /// result is computed exactly as the unconditional lowering does, X
+    /// operands included.
+    fn compile_short_circuit(
+        &mut self,
+        op: BinaryOp,
+        left: &Expression,
+        right: &Expression,
+    ) -> Option<RegId> {
+        let l = self.compile_expr(left, 0)?;
+        let dest = self.alloc_reg();
+        let (decides, init) = match op {
+            BinaryOp::LogAnd => (0, 0),
+            _ => (1, 1),
+        };
+        self.emit(Insn::LoadConst(dest, Box::new(Value::from_u64(init, 1))));
+        let red = self.alloc_reg();
+        self.emit(Insn::ReduceOr(red, l));
+        let k = self.alloc_reg();
+        self.emit(Insn::LoadConst(k, Box::new(Value::from_u64(decides, 1))));
+        let decided = self.alloc_reg();
+        self.emit(Insn::CaseEq(decided, red, k));
+        let undecided = self.alloc_reg();
+        self.emit(Insn::LogNot(undecided, decided));
+        let br = self.insns.len();
+        self.emit(Insn::BranchIfFalse(undecided, 0));
+        let r = self.compile_expr(right, 0)?;
+        match op {
+            BinaryOp::LogAnd => self.emit(Insn::LogAnd(dest, l, r)),
+            _ => self.emit(Insn::LogOr(dest, l, r)),
+        }
+        let end = self.insns.len() as u32;
+        if let Insn::BranchIfFalse(reg, _) = self.insns[br] {
+            self.insns[br] = Insn::BranchIfFalse(reg, end);
+        }
+        Some(dest)
+    }
+
     /// `expr_may_be_real`, also counting real casts and any subroutine call
     /// (whose return type is not tracked here).
     fn ret_expr_may_be_real(&self, e: &Expression) -> bool {
@@ -13779,6 +13868,15 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(dest)
             }
             ExprKind::Binary { op, left, right } => {
+                // §11.4.7: `&&` / `||` do not evaluate the right operand once
+                // the left decides the result. Matters when it has an effect
+                // (`h != null && h.f()` must not call through null).
+                if self.method_mode
+                    && matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr)
+                    && Self::expr_has_effect(right)
+                {
+                    return self.compile_short_circuit(*op, left, right);
+                }
                 // Step 8 (string formals): only equality/case-equality is
                 // byte-for-byte safe on string values — for pure-byte
                 // operands (no X/Z, byte-multiple widths, which is all a
@@ -14176,6 +14274,30 @@ impl<'a> BytecodeCompiler<'a> {
                 } else {
                     ctx_width
                 };
+                // §11.4.11: a known condition evaluates only the selected
+                // arm, which matters when an arm has an effect (`h == null ?
+                // "" : h.name()` must not call through null).
+                let short = self.method_mode
+                    && (Self::expr_has_effect(then_expr) || Self::expr_has_effect(else_expr));
+                let mut pick: Option<(usize, usize, RegId)> = None;
+                if short {
+                    let red = self.alloc_reg();
+                    self.emit(Insn::ReduceOr(red, cond));
+                    let branch_on = |c: &mut Self, v: u64| {
+                        let k = c.alloc_reg();
+                        c.emit(Insn::LoadConst(k, Box::new(Value::from_u64(v, 1))));
+                        let is = c.alloc_reg();
+                        c.emit(Insn::CaseEq(is, red, k));
+                        let not = c.alloc_reg();
+                        c.emit(Insn::LogNot(not, is));
+                        let at = c.insns.len();
+                        c.emit(Insn::BranchIfFalse(not, 0));
+                        at
+                    };
+                    let to_then = branch_on(self, 1);
+                    let to_else = branch_on(self, 0);
+                    pick = Some((to_then, to_else, self.alloc_reg()));
+                }
                 let then_reg = self.compile_expr_typed(then_expr, arm_ctx, arms_unsigned)?;
                 let else_reg = self.compile_expr_typed(else_expr, arm_ctx, arms_unsigned)?;
                 // §11.8.1: a ternary with ANY unsigned arm is unsigned — both
@@ -14198,8 +14320,39 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit(Insn::Resize(then_reg, ctx_width));
                     self.emit(Insn::Resize(else_reg, ctx_width));
                 }
-                let dest = self.alloc_reg();
+                let Some((to_then, to_else, dest)) = pick else {
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::Select(dest, cond, then_reg, else_reg));
+                    return Some(dest);
+                };
+                // X condition: both arms above, merged. A known one jumps to
+                // its own arm below, given the same fit as the merged one.
                 self.emit(Insn::Select(dest, cond, then_reg, else_reg));
+                let mut ends = vec![self.insns.len()];
+                self.emit(Insn::Jump(0));
+                let ts = self.expr_signedness(then_expr);
+                let es = self.expr_signedness(else_expr);
+                let mixed = ts == Some(false) || es == Some(false);
+                for (at, arm) in [(to_then, then_expr), (to_else, else_expr)] {
+                    let here = self.insns.len() as u32;
+                    if let Insn::BranchIfFalse(reg, _) = self.insns[at] {
+                        self.insns[at] = Insn::BranchIfFalse(reg, here);
+                    }
+                    let r = self.compile_expr_typed(arm, arm_ctx, arms_unsigned)?;
+                    if ctx_width > 0 {
+                        if mixed && !arms_unsigned && !self.operand_scrub_is_noop(arm) {
+                            self.emit(Insn::ClearSigned(r));
+                        }
+                        self.emit(Insn::Resize(r, ctx_width));
+                    }
+                    self.emit(Insn::Move(dest, r));
+                    ends.push(self.insns.len());
+                    self.emit(Insn::Jump(0));
+                }
+                let end = self.insns.len() as u32;
+                for at in ends {
+                    self.insns[at] = Insn::Jump(end);
+                }
                 Some(dest)
             }
             ExprKind::Paren(inner) => self.compile_expr_typed(inner, ctx_width, unsigned_context),

@@ -626,6 +626,9 @@ mod compiled_unpacked_formal;
 
 #[path = "classes/compiled_bare_member_store_width.rs"]
 mod compiled_bare_member_store_width;
+
+#[path = "classes/compiled_short_circuit.rs"]
+mod compiled_short_circuit;
 #[path = "classes/int_property_named_like_struct_property.rs"]
 mod int_property_named_like_struct_property;
 #[path = "classes/compiled_method_test_env.rs"]
