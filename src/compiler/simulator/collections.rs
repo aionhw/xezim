@@ -3198,6 +3198,121 @@ impl Simulator {
             })
     }
 
+    /// §12.7.3: a multi-variable `foreach` over the declared collection of
+    /// collections `name` (`foreach (d[i, k, j])` on `int d[][string][$]`)
+    /// walks each level as its declaration names it: a queue or dynamic
+    /// level by index below its size, an associative level by its keys in
+    /// §7.8.4 order, each loop variable taking that level's index type.
+    /// Returns false — leaving the loop to the other paths — for a store with
+    /// no such shape, one with fixed levels (iterated by their bounds), or a
+    /// level keyed by a named type (an enum or class key).
+    pub(super) fn foreach_shaped(
+        &mut self,
+        name: &str,
+        vars: &[Option<crate::ast::Identifier>],
+        body: &Statement,
+        iterations: &mut u64,
+    ) -> bool {
+        let Some((shape, 0)) = self.coll_shape_at(name) else {
+            return false;
+        };
+        let walkable = |d: &Dim| {
+            matches!(
+                d,
+                Dim::Queue
+                    | Dim::Dyn
+                    | Dim::Assoc(KeyKind::String | KeyKind::Integral { .. } | KeyKind::Wildcard)
+            )
+        };
+        if vars.len() > shape.dims.len() || !shape.dims.iter().all(walkable) {
+            return false;
+        }
+        let dims = shape.dims.clone();
+        self.foreach_shaped_level(name, &dims, vars, 0, body, iterations);
+        true
+    }
+
+    /// One level of [`foreach_shaped`]. Returns false once the loop is broken.
+    fn foreach_shaped_level(
+        &mut self,
+        prefix: &str,
+        dims: &[Dim],
+        vars: &[Option<crate::ast::Identifier>],
+        level: usize,
+        body: &Statement,
+        iterations: &mut u64,
+    ) -> bool {
+        // The keys of this level, and the loop variable's type: `None` for a
+        // string key, else (width, signed).
+        let (keys, ty): (Vec<String>, Option<(u32, bool)>) = match &dims[level] {
+            Dim::Assoc(KeyKind::String) => (self.assoc_top_level_keys(prefix), None),
+            Dim::Assoc(k) => {
+                let ty = match k {
+                    KeyKind::Integral { width, signed } => (*width, *signed),
+                    _ => (32, false),
+                };
+                let mut keys = self.assoc_top_level_keys(prefix);
+                keys.sort_by_key(|k| k.parse::<i128>().unwrap_or(0));
+                (keys, Some(ty))
+            }
+            // §7.8.6: a row past its parent's size does not exist.
+            _ => {
+                let n = match self.declared_dim(prefix) {
+                    Some(_) => self.get_queue_size(prefix),
+                    None => 0,
+                };
+                ((0..n).map(|i| i.to_string()).collect(), Some((32, true)))
+            }
+        };
+        // A string key variable renders as a string (§7.8.1).
+        let str_var = vars[level]
+            .as_ref()
+            .filter(|_| ty.is_none())
+            .map(|v| v.name.clone())
+            .filter(|n| self.string_signals.insert(n.clone()));
+        let mut live = true;
+        for key in keys {
+            if self.finished {
+                live = false;
+                break;
+            }
+            if let Some(v) = vars[level].as_ref() {
+                let kv = match ty {
+                    None => {
+                        self.widths.remove(&v.name);
+                        Value::from_string(&key)
+                    }
+                    Some((w, signed)) => {
+                        self.widths.insert(v.name.clone(), w);
+                        let mut kv = Value::from_u64(key.parse::<i128>().unwrap_or(0) as u64, w);
+                        kv.is_signed = signed;
+                        kv
+                    }
+                };
+                self.set_loop_var(&v.name, kv);
+            }
+            if level + 1 < vars.len() {
+                let row = format!("{prefix}[{key}]");
+                if !self.foreach_shaped_level(&row, dims, vars, level + 1, body, iterations) {
+                    live = false;
+                    break;
+                }
+            } else {
+                self.continue_flag = false;
+                *iterations = iterations.saturating_add(1);
+                self.exec_statement(body);
+                if self.break_flag {
+                    live = false;
+                    break;
+                }
+            }
+        }
+        if let Some(n) = str_var {
+            self.string_signals.remove(&n);
+        }
+        live
+    }
+
     /// One level of a multi-variable `foreach` over nested associative
     /// arrays: bind `vars[level]` to each key of `prefix` and descend, or run
     /// the body at the last variable (§12.7.3). The outer level takes the

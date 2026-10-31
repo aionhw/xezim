@@ -1214,6 +1214,16 @@ impl Simulator {
                 // array of associative arrays (`int m[int][string]`) walks
                 // each level's own keys. The single-var key scan below
                 // visited the outer keys only and left `j` unset.
+                // §12.7.3: a declared collection of collections walks each
+                // level as its declaration names it.
+                if vars.len() >= 2 && self.foreach_shaped(&an, vars, body, iterations) {
+                    self.auto_loop_vars.truncate(fe_auto_len);
+                    self.restore_loop_vars(&fe_saved);
+                    if !self.return_flag && self.disable_target.is_none() {
+                        self.break_flag = false;
+                    }
+                    return;
+                }
                 if vars.len() >= 2 && self.is_assoc_of_assoc(&an) {
                     self.foreach_assoc_levels(&an, &an, vars, 0, body, iterations);
                     self.auto_loop_vars.truncate(fe_auto_len);
@@ -1380,6 +1390,16 @@ impl Simulator {
                 } else if let Some(scoped) = self.instance_assoc_member(&name) {
                     name = std::borrow::Cow::Owned(scoped);
                 }
+            }
+            // §12.7.3: a declared collection of collections (see the
+            // member arm).
+            if vars.len() >= 2 && self.foreach_shaped(&name, vars, body, iterations) {
+                self.auto_loop_vars.truncate(fe_auto_len);
+                self.restore_loop_vars(&fe_saved);
+                if !self.return_flag && self.disable_target.is_none() {
+                    self.break_flag = false;
+                }
+                return;
             }
             // §7.8, §12.7.3: a multi-variable `foreach` over an
             // associative array of associative arrays (see the member arm).

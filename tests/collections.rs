@@ -239,3 +239,6 @@ mod lexical_value_parameter_specialization;
 
 #[path = "collections/coll_rows_typed_by_declaration.rs"]
 mod coll_rows_typed_by_declaration;
+
+#[path = "collections/coll_shape_iteration.rs"]
+mod coll_shape_iteration;

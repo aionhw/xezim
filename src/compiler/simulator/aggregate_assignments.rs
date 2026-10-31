@@ -4259,7 +4259,48 @@ impl Simulator {
                 .is_some()
     }
 
+    /// §21.2.1.7: a level of a declared collection of collections whose rows
+    /// are collections themselves (`d` and `d[i][k]` of `int d[][string][$]`,
+    /// not `d[i]`) prints each row as the collection its declaration names at
+    /// that depth; a declared associative row with no entries prints empty.
+    /// `None` leaves the level to the other renderers (an associative level,
+    /// a leaf row, or a shape with fixed levels, printed by their bounds).
+    fn render_p_shaped(&mut self, name: &str) -> Option<String> {
+        let (shape, depth) = self.coll_shape_at(name)?;
+        if shape.dims.contains(&Dim::Fixed) {
+            return None;
+        }
+        let rows_are_colls = depth + 1 < shape.dims.len();
+        match shape.dims.get(depth)? {
+            Dim::Queue | Dim::Dyn if rows_are_colls => {
+                self.p_top_level = false;
+                let n = match self.declared_dim(name) {
+                    Some(_) => self.get_queue_size(name),
+                    None => 0,
+                };
+                let parts: Vec<String> = (0..n)
+                    .map(|i| {
+                        let row = format!("{name}[{i}]");
+                        self.render_p_var(&row).unwrap_or_else(|| "'{}".to_string())
+                    })
+                    .collect();
+                Some(format!("'{{{}}}", parts.join(", ")))
+            }
+            Dim::Assoc(_)
+                if depth > 0
+                    && !self.module.associative_arrays.contains_key(name)
+                    && !self.signal_name_prefix_present(&format!("{name}[")) =>
+            {
+                Some("'{}".to_string())
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn render_p_var(&mut self, name: &str) -> Option<String> {
+        if let Some(s) = self.render_p_shaped(name) {
+            return Some(s);
+        }
         // Elements of a collection are nested leaves (`p_top_level`).
         if self.module.dynamic_arrays.contains(name)
             || self.module.associative_arrays.contains_key(name)
@@ -4361,8 +4402,11 @@ impl Simulator {
         // Associative array — handled before the type gate so a LOCAL assoc
         // (no `var_decl_types` entry) still renders instead of bailing to `x`.
         // Element type comes from the declared type when known, else each
-        // element renders from its raw value.
-        if self.module.associative_arrays.contains_key(name) {
+        // element renders from its raw value. A declared associative row
+        // (`d[0]` of `int d[][string][$]`) is one whether or not registered.
+        if self.module.associative_arrays.contains_key(name)
+            || matches!(self.declared_dim(name), Some(Dim::Assoc(_)))
+        {
             // A class member (`<h>#mem`) has its element type on its class;
             // without it the elements printed untyped, in decimal (§21.2.1.7).
             let dt = self
