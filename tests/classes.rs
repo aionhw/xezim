@@ -394,6 +394,8 @@ mod out_of_class_method_shadow;
 mod param_typedef_ctor_resolution;
 #[path = "classes/process_class_9_7.rs"]
 mod process_class_9_7;
+#[path = "classes/program_class_task_this_across_delay.rs"]
+mod program_class_task_this_across_delay;
 #[path = "classes/pure_sv_phase_objection.rs"]
 mod pure_sv_phase_objection;
 #[path = "classes/randomize_countones_count.rs"]
