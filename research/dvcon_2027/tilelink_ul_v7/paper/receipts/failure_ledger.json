@@ -1,0 +1,113 @@
+{
+  "scope": "Retained engineering and model failure categories; exact individual strict failures in strict_pilots.json; no original receipt modified",
+  "failures": [
+    {
+      "category": "initial_test",
+      "observed": "Missing fresh STATUS.json",
+      "evidence": "results/test.log",
+      "resolution": "Corrected; latest offline suite 20 PASS"
+    },
+    {
+      "category": "sandbox",
+      "observed": "AppArmor/bwrap namespace and runtime-root refusals",
+      "evidence": "results/mapper_after_host_fix_summary.json",
+      "resolution": "Resolved; strict read/symlink/write/network probes PASS"
+    },
+    {
+      "category": "transport",
+      "observed": "Workspace requirements invalid input parameter; multiple retained unsuccessful diagnostics",
+      "evidence": "results/mapper_restart_failures.json",
+      "resolution": "Resolved by default_permissions retained config; no remote outage inferred"
+    },
+    {
+      "category": "build",
+      "observed": "Workspace lock mismatch; offline missing crate; OpenSSL and multiarch includes",
+      "evidence": "paper/receipts/strict_runner_build.json",
+      "resolution": "Resolved with recorded local lock and extracted dev packages"
+    },
+    {
+      "category": "build005",
+      "observed": "Build ended without completion receipt; cause unknown",
+      "evidence": "results/codex_strict_build_005_interruption.json",
+      "resolution": "Original unknown termination preserved"
+    },
+    {
+      "category": "build006",
+      "observed": "Intentional cancellation of costly optimized CLI final build",
+      "evidence": "results/codex_strict_build_006_reconfiguration.json",
+      "resolution": "Build007 successful with final CLI opt-level=0"
+    },
+    {
+      "category": "tool_surface",
+      "observed": "Stock utilities advertised in all first20 pilots",
+      "evidence": "paper/receipts/development_pilots_v1.json",
+      "resolution": "All20 development-only; not pooled"
+    },
+    {
+      "category": "development_D",
+      "observed": "No non-target intervention effect / incomplete subject",
+      "evidence": "paper/receipts/development_pilots_v1.json",
+      "resolution": "One of20 development subjects FAILED, retained"
+    },
+    {
+      "category": "strict_qualification",
+      "observed": "Two real helper attempts exposed no tools",
+      "evidence": "results/tool_allowlist_live_strict_001/receipt.json",
+      "resolution": "Both retained; qualification003 PASS after direct-only config repair"
+    },
+    {
+      "category": "grading",
+      "observed": "Long packed stimulus path truncated",
+      "evidence": "results/grader_controls_001/positive_grade",
+      "resolution": "Failed positive retained; staged relative path passes in new output"
+    },
+    {
+      "category": "quota",
+      "observed": "13 of52 strict subjects exceeded12 tool calls",
+      "evidence": "paper/receipts/strict_pilots.json",
+      "resolution": "FAILED unchanged, no sourceII; after full52 numeric briefing corrected"
+    },
+    {
+      "category": "scheduler",
+      "observed": "Generic capability classifier stopped on expectedquota after21 cells",
+      "evidence": "results/strict_continuation_004/resume_receipt.json",
+      "resolution": "Append-only31 remaining cells completed; no outcome retry"
+    },
+    {
+      "category": "intervention",
+      "observed": "Two of14 strict physical experiments had no non-target difference",
+      "evidence": "paper/receipts/strict_pilots.json",
+      "resolution": "Both remain mechanical FAIL; subsequent allowed selections preserved"
+    },
+    {
+      "category": "prediction_miss",
+      "observed": "temporal03 D predicted alarm by24 under held stall; actual first alarm30",
+      "evidence": "paper/receipts/supplemental_cases.json",
+      "resolution": "Original prediction preserved; post-observation hypothesis refinement is separate, expert grade pending"
+    },
+    {
+      "category": "prediction_miss",
+      "observed": "temporal05 first D action too late; predicted cycle170 alarm removal did not occur",
+      "evidence": "paper/receipts/supplemental_cases.json",
+      "resolution": "Original action preserved; second permitted earlier selection removed170/172 but full run remained faulty"
+    },
+    {
+      "category": "validation_warning",
+      "observed": "make test clock-skew warning",
+      "evidence": "results/tests_showcase_final_001.log",
+      "resolution": "20 offline tests completed PASS; no build outcome inferred from warning"
+    },
+    {
+      "category": "post_campaign_helper",
+      "observed": "TypeError: dict object is not callable; a reference-run result shadowed the imported simulation function",
+      "evidence": "showcase_runs/review_waived_001/independent_verification_001_run.log",
+      "resolution": "New helper and independent_verification_002 output; all selected actual submissions pass9 reference schedules and12 registered control replays, plus1 repaired value-channel observation"
+    },
+    {
+      "category": "post_campaign_helper",
+      "observed": "Permission denied recopying identical readonly sealed receipts to top-level paper artifact directory",
+      "evidence": "showcase_runs/review_waived_001/report_render_001.log",
+      "resolution": "Renderer002 skips byte-identical files and atomically replaces changed generated artifacts; sealed source receipts remain readonly"
+    }
+  ]
+}

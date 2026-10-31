@@ -1,0 +1,25 @@
+{
+  "authentication": "Codex app-server using Sign in with ChatGPT (subscription)",
+  "no_openai_api_key_required": true,
+  "model": "gpt-6.1-sol",
+  "reasoning_effort": "medium",
+  "require_model_list_confirmation": true,
+  "require_chatgpt_account_type": true,
+  "provider_prompt_cache_control": "not_exposed_by_subscription; report telemetry only",
+  "zero_cached_token_requirement": false,
+  "require_new_codex_process_and_thread_per_trial": true,
+  "require_stage1_seal_before_source": true,
+  "max_tool_actions_per_trial": 12,
+  "max_returned_tool_evidence_bytes_per_trial": 131072,
+  "primary_cohort": {
+    "faults": 12,
+    "clean_controls": 2,
+    "modes": 4,
+    "repeats": 3,
+    "scheduled_sessions": 168
+  },
+  "stage1": "seal source-hidden hypothesis with host-issued citations",
+  "stage2": "reveal current permitted source and submit one independently graded repair",
+  "condition_c_starter": "external pin correlator ONLY, unscored until native observer is qualified",
+  "codex_cli_path": ".deps/codex_cli_strict/runtime/bin/codex"
+}

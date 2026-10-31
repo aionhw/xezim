@@ -340,6 +340,7 @@ impl Simulator {
         }
         match name {
             COV_HIT_TASK => self.cov_hit(args.first()),
+            "$dvcon_observe" => self.dvcon_observe(args),
             // §21.3.5 $timeformat(units, precision, suffix, min_width). All
             // arguments are optional in xezim's callers; missing ones keep the
             // prior/default value.

@@ -1,0 +1,11 @@
+# Case-only tool surface audit
+
+All twenty named pilot subjects using the stock Codex 0.166.0 runtime are development-only and excluded from strict protocol comparisons. Their immutable trial and runtime repair grades remain intact. No forbidden tool invocation was observed, but the configured flags did not establish the requested exposure boundary: stock built-in utility tools remained advertised. A clean working directory alone does not prove the absence of other information-bearing capabilities.
+
+The new local opt-in Codex patch supplies an existing core ToolPolicy allowlist at session initialization. It permits only `read_evidence` and `run_controlled_experiment`, denies other registered tools and hosted specifications, and validates the final model-facing specifications before inference. The Python runner verifies logged specifications against the tools registered for each thread, and binds subject authorization to the qualified runtime binary SHA256. Ordinary Codex installations and previous studies are unchanged.
+
+The new runtime must pass filesystem/symlink/write/network negative controls, exact ChatGPT account/model preflight, and a live dynamic-tool call before any replacement development schedule. All thirteen eligible pilot cases subsequently received a fresh A/B/C/D session uniformly. Failed outcomes remain in that new schedule. A failed exposure, identity or blinding check stops inference.
+
+These controls do not erase pretraining, disable provider-side caches, or establish an independent operating-system security proof. Cached tokens remain measured telemetry; nonzero values do not exclude trials.
+
+Status: STRICT RUNTIME QUALIFIED. Binary `d1e71993c2faa26252c3c46aa19ceb0f9051c95ee41219f7ae423a1b6a64baac` passed filesystem/network controls and live direct case-tool qualification. The first two live qualification attempts exposed no tools and failed; the supported `features.code_mode` direct-only namespace configuration repaired that over-restriction. Both failed attempts and their reported nonzero cache usage are preserved. All52 uniform fresh pilot subjects finished:39 completed repairs and13 quota failures, without observed forbidden capabilities. The original52 snapshot was preserved before post-calibration briefing corrections.

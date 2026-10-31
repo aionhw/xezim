@@ -1,0 +1,106 @@
+{
+  "scope": "Post-submission independent reference replay of exact two strict supplemental patches and all three registered faulty experiments. Not new model trials; prediction misses unchanged.",
+  "reference_compiler_sha256": "e559c446de9940b187b716badec6c62878a7a3ee108ce5ff588426d4bb9c4c9b",
+  "reference_runtime_sha256": "eaccd3914e5b0f87a56df958d11d0fb937b739090242034261d487cc9ea71809",
+  "cases": [
+    {
+      "case": "temporal_03",
+      "patched_source_sha256": "70291a2d447c7ada0279dd24a5d961164bf2789cdfbf9b492effff1b7f585d94",
+      "compile_exit": 0,
+      "three_schedules": [
+        {
+          "schedule": "original",
+          "exit": 0,
+          "oracle": "PASS",
+          "public_equal_to_research": true,
+          "stimulus_sha256": "4398ba65eecd72e1e8720be9595b921bb3652eb1c9b3b20914ba7e8af7eb4eb5"
+        },
+        {
+          "schedule": "unseen",
+          "exit": 0,
+          "oracle": "PASS",
+          "public_equal_to_research": true,
+          "stimulus_sha256": "73365ebad3388a11d2117272706a075cd66e79037dd871935f4ab7dd0af9121e"
+        },
+        {
+          "schedule": "adversarial",
+          "exit": 0,
+          "oracle": "PASS",
+          "public_equal_to_research": true,
+          "stimulus_sha256": "edd507d4f97f11d7658a2781ec13e961c74cbed4cc4456c8c59247ab05a2a3a3"
+        }
+      ],
+      "faulty_registered_controls": [
+        {
+          "experiment": "experiment_01",
+          "replay_exit": 0,
+          "mechanical_status": "PASS",
+          "all_public_traces_equal": {
+            "baseline": true,
+            "experiment": true,
+            "unrelated": true,
+            "idempotent": true
+          },
+          "scope": "Replay of prior agent prediction/action, no new model subject or prediction grade"
+        }
+      ],
+      "status": "PASS"
+    },
+    {
+      "case": "temporal_05",
+      "patched_source_sha256": "70291a2d447c7ada0279dd24a5d961164bf2789cdfbf9b492effff1b7f585d94",
+      "compile_exit": 0,
+      "three_schedules": [
+        {
+          "schedule": "original",
+          "exit": 0,
+          "oracle": "PASS",
+          "public_equal_to_research": true,
+          "stimulus_sha256": "4398ba65eecd72e1e8720be9595b921bb3652eb1c9b3b20914ba7e8af7eb4eb5"
+        },
+        {
+          "schedule": "unseen",
+          "exit": 0,
+          "oracle": "PASS",
+          "public_equal_to_research": true,
+          "stimulus_sha256": "73365ebad3388a11d2117272706a075cd66e79037dd871935f4ab7dd0af9121e"
+        },
+        {
+          "schedule": "adversarial",
+          "exit": 0,
+          "oracle": "PASS",
+          "public_equal_to_research": true,
+          "stimulus_sha256": "edd507d4f97f11d7658a2781ec13e961c74cbed4cc4456c8c59247ab05a2a3a3"
+        }
+      ],
+      "faulty_registered_controls": [
+        {
+          "experiment": "experiment_01",
+          "replay_exit": 0,
+          "mechanical_status": "PASS",
+          "all_public_traces_equal": {
+            "baseline": true,
+            "experiment": true,
+            "unrelated": true,
+            "idempotent": true
+          },
+          "scope": "Replay of prior agent prediction/action, no new model subject or prediction grade"
+        },
+        {
+          "experiment": "experiment_02",
+          "replay_exit": 0,
+          "mechanical_status": "PASS",
+          "all_public_traces_equal": {
+            "baseline": true,
+            "experiment": true,
+            "unrelated": true,
+            "idempotent": true
+          },
+          "scope": "Replay of prior agent prediction/action, no new model subject or prediction grade"
+        }
+      ],
+      "status": "PASS"
+    }
+  ],
+  "status": "PASS"
+}

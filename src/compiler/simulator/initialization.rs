@@ -4549,6 +4549,7 @@ impl Simulator {
             edge_fire_watch: Vec::new(),
             edge_fire_watch_init: false,
             edge_dispatch_phase: "active",
+            dvcon_observation: None,
             value_trace_ids: None,
             value_trace_pending: std::cell::RefCell::new(Vec::new()),
             value_trace_emitted: 0,

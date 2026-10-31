@@ -1,0 +1,60 @@
+{
+  "status": "PASS",
+  "scope": "New clean design,24 actual simulator runs:2 targets x3 simulators x4 conditions. No model selection or mutant admission.",
+  "targets": [
+    {
+      "target": "request_throttle",
+      "counter": 70,
+      "duration": 12,
+      "simulators": {
+        "stock": {
+          "mechanical_status": "PASS",
+          "all_oracles_pass": true
+        },
+        "research": {
+          "mechanical_status": "PASS",
+          "all_oracles_pass": true
+        },
+        "reference": {
+          "mechanical_status": "PASS",
+          "all_oracles_pass": true
+        }
+      },
+      "all_public_traces_equal": {
+        "baseline": true,
+        "experiment": true,
+        "unrelated": true,
+        "idempotent": true
+      },
+      "actual_runs": 12
+    },
+    {
+      "target": "response_backpressure",
+      "counter": 70,
+      "duration": 12,
+      "simulators": {
+        "stock": {
+          "mechanical_status": "PASS",
+          "all_oracles_pass": true
+        },
+        "research": {
+          "mechanical_status": "PASS",
+          "all_oracles_pass": true
+        },
+        "reference": {
+          "mechanical_status": "PASS",
+          "all_oracles_pass": true
+        }
+      },
+      "all_public_traces_equal": {
+        "baseline": true,
+        "experiment": true,
+        "unrelated": true,
+        "idempotent": true
+      },
+      "actual_runs": 12
+    }
+  ],
+  "primary_subjects": 0,
+  "mutant_instances": 0
+}

@@ -1,0 +1,137 @@
+{
+  "scope": "Selected showcase executable repairs, not primary outcomes or human expert grading",
+  "selection_rule": "First sorted completed and runtime-verified D fault per component; all cohort failures remain separately reported",
+  "selected_cases": [
+    {
+      "case_id": "case_2248fbe7ddf3b974",
+      "component": "endpoint",
+      "scope": "User-waived review showcase, post-submission runtime verification only",
+      "stage1_sha256": "020d3c3e5cacb86650a59d3fe6c633e3846713f66f64519e4f70e54c572f830e",
+      "patched_source_sha256": "2e796ae7eb0259d69826b04fb6bb416c964a607cc2bd985100aebec02f30e2a7",
+      "three_reference_schedules": [
+        {
+          "schedule": "original",
+          "exit_code": 0,
+          "oracle": "PASS",
+          "public_trace_equal_to_research": true
+        },
+        {
+          "schedule": "unseen",
+          "exit_code": 0,
+          "oracle": "PASS",
+          "public_trace_equal_to_research": true
+        },
+        {
+          "schedule": "adversarial",
+          "exit_code": 0,
+          "oracle": "PASS",
+          "public_trace_equal_to_research": true
+        }
+      ],
+      "registered_fault_experiments_reference_replay": [
+        {
+          "experiment": "experiment_01",
+          "all_four_runs_completed": true,
+          "public_traces_match": {
+            "baseline": true,
+            "experiment": true,
+            "unrelated": true,
+            "idempotent": true
+          },
+          "reference_mechanical_status": "PASS",
+          "research_mechanical_status": "PASS"
+        }
+      ],
+      "expert_mechanism_or_prediction_score": null,
+      "status": "PASS"
+    },
+    {
+      "case_id": "case_52507cae2630a60c",
+      "component": "monitor",
+      "scope": "User-waived review showcase, post-submission runtime verification only",
+      "stage1_sha256": "a5212f5a91b31fad033f296cee0627f11b0d6be55607253447b45e875aa7d498",
+      "patched_source_sha256": "bd5e414bc06b7a798a6e4553c59946055b46a16173ae84d9407a62ea3e301418",
+      "three_reference_schedules": [
+        {
+          "schedule": "original",
+          "exit_code": 0,
+          "oracle": "PASS",
+          "public_trace_equal_to_research": true
+        },
+        {
+          "schedule": "unseen",
+          "exit_code": 0,
+          "oracle": "PASS",
+          "public_trace_equal_to_research": true
+        },
+        {
+          "schedule": "adversarial",
+          "exit_code": 0,
+          "oracle": "PASS",
+          "public_trace_equal_to_research": true
+        }
+      ],
+      "registered_fault_experiments_reference_replay": [
+        {
+          "experiment": "experiment_01",
+          "all_four_runs_completed": true,
+          "public_traces_match": {
+            "baseline": true,
+            "experiment": true,
+            "unrelated": true,
+            "idempotent": true
+          },
+          "reference_mechanical_status": "PASS",
+          "research_mechanical_status": "PASS"
+        }
+      ],
+      "expert_mechanism_or_prediction_score": null,
+      "status": "PASS"
+    },
+    {
+      "case_id": "case_7d2add13c79822d8",
+      "component": "scoreboard",
+      "scope": "User-waived review showcase, post-submission runtime verification only",
+      "stage1_sha256": "e74218e255db647b95fad0356642870ee9ce6b41fa75a96897e45929902dbf6e",
+      "patched_source_sha256": "bd5e414bc06b7a798a6e4553c59946055b46a16173ae84d9407a62ea3e301418",
+      "three_reference_schedules": [
+        {
+          "schedule": "original",
+          "exit_code": 0,
+          "oracle": "PASS",
+          "public_trace_equal_to_research": true
+        },
+        {
+          "schedule": "unseen",
+          "exit_code": 0,
+          "oracle": "PASS",
+          "public_trace_equal_to_research": true
+        },
+        {
+          "schedule": "adversarial",
+          "exit_code": 0,
+          "oracle": "PASS",
+          "public_trace_equal_to_research": true
+        }
+      ],
+      "registered_fault_experiments_reference_replay": [
+        {
+          "experiment": "experiment_01",
+          "all_four_runs_completed": true,
+          "public_traces_match": {
+            "baseline": true,
+            "experiment": true,
+            "unrelated": true,
+            "idempotent": true
+          },
+          "reference_mechanical_status": "PASS",
+          "research_mechanical_status": "PASS"
+        }
+      ],
+      "expert_mechanism_or_prediction_score": null,
+      "status": "PASS"
+    }
+  ],
+  "missing_components": [],
+  "status": "PASS"
+}

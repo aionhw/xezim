@@ -1,0 +1,175 @@
+{
+  "status": "PASS_MATCHED_SAMPLED_COVERAGE",
+  "scope": "instrumented synthetic TB snapshot fields at posedge; not scheduler-wide provenance or production benchmark",
+  "binary_sha256": "690ce40f8f90c4971619e99b9de9c0cb95f10ef16416e85f1b6a1c5c47038341",
+  "runs": [
+    {
+      "repetition": 0,
+      "mode": "none",
+      "wall_seconds": 0.011963609838858247,
+      "peak_rss_kib": 34516,
+      "raw_recorder_bytes": 0,
+      "phase_records": [
+        "[PHASE] compilation: 3.0ms",
+        "[PHASE] simulation: 4.8ms",
+        "[PHASE] total: 7.8ms"
+      ],
+      "samples": 351,
+      "normalized_missing_fields": 0
+    },
+    {
+      "repetition": 0,
+      "mode": "vcd",
+      "wall_seconds": 0.011834017001092434,
+      "peak_rss_kib": 36588,
+      "raw_recorder_bytes": 12858,
+      "phase_records": [
+        "[PHASE] compilation: 2.7ms",
+        "[PHASE] simulation: 5.6ms",
+        "[PHASE] total: 8.3ms"
+      ],
+      "samples": 351,
+      "normalized_missing_fields": 0
+    },
+    {
+      "repetition": 0,
+      "mode": "value",
+      "wall_seconds": 0.015907895984128118,
+      "peak_rss_kib": 38756,
+      "raw_recorder_bytes": 87124,
+      "phase_records": [
+        "[PHASE] compilation: 3.0ms",
+        "[PHASE] simulation: 8.9ms",
+        "[PHASE] total: 11.9ms"
+      ],
+      "samples": 351,
+      "normalized_missing_fields": 0
+    },
+    {
+      "repetition": 0,
+      "mode": "native",
+      "wall_seconds": 0.02095662895590067,
+      "peak_rss_kib": 34820,
+      "raw_recorder_bytes": 1490185,
+      "phase_records": [
+        "[PHASE] compilation: 3.2ms",
+        "[PHASE] simulation: 13.8ms",
+        "[PHASE] total: 17.0ms"
+      ],
+      "samples": 351,
+      "normalized_missing_fields": 0
+    },
+    {
+      "repetition": 1,
+      "mode": "vcd",
+      "wall_seconds": 0.01259597111493349,
+      "peak_rss_kib": 36564,
+      "raw_recorder_bytes": 12858,
+      "phase_records": [
+        "[PHASE] compilation: 2.9ms",
+        "[PHASE] simulation: 5.7ms",
+        "[PHASE] total: 8.6ms"
+      ],
+      "samples": 351,
+      "normalized_missing_fields": 0
+    },
+    {
+      "repetition": 1,
+      "mode": "value",
+      "wall_seconds": 0.01550519117154181,
+      "peak_rss_kib": 38512,
+      "raw_recorder_bytes": 87124,
+      "phase_records": [
+        "[PHASE] compilation: 3.1ms",
+        "[PHASE] simulation: 8.6ms",
+        "[PHASE] total: 11.7ms"
+      ],
+      "samples": 351,
+      "normalized_missing_fields": 0
+    },
+    {
+      "repetition": 1,
+      "mode": "native",
+      "wall_seconds": 0.020060740178450942,
+      "peak_rss_kib": 34924,
+      "raw_recorder_bytes": 1490185,
+      "phase_records": [
+        "[PHASE] compilation: 3.0ms",
+        "[PHASE] simulation: 13.0ms",
+        "[PHASE] total: 16.0ms"
+      ],
+      "samples": 351,
+      "normalized_missing_fields": 0
+    },
+    {
+      "repetition": 1,
+      "mode": "none",
+      "wall_seconds": 0.012050074990838766,
+      "peak_rss_kib": 34700,
+      "raw_recorder_bytes": 0,
+      "phase_records": [
+        "[PHASE] compilation: 3.2ms",
+        "[PHASE] simulation: 4.9ms",
+        "[PHASE] total: 8.1ms"
+      ],
+      "samples": 351,
+      "normalized_missing_fields": 0
+    },
+    {
+      "repetition": 2,
+      "mode": "value",
+      "wall_seconds": 0.015317726181820035,
+      "peak_rss_kib": 38540,
+      "raw_recorder_bytes": 87124,
+      "phase_records": [
+        "[PHASE] compilation: 2.9ms",
+        "[PHASE] simulation: 8.7ms",
+        "[PHASE] total: 11.6ms"
+      ],
+      "samples": 351,
+      "normalized_missing_fields": 0
+    },
+    {
+      "repetition": 2,
+      "mode": "native",
+      "wall_seconds": 0.01958769396878779,
+      "peak_rss_kib": 35008,
+      "raw_recorder_bytes": 1490185,
+      "phase_records": [
+        "[PHASE] compilation: 3.0ms",
+        "[PHASE] simulation: 12.8ms",
+        "[PHASE] total: 15.8ms"
+      ],
+      "samples": 351,
+      "normalized_missing_fields": 0
+    },
+    {
+      "repetition": 2,
+      "mode": "none",
+      "wall_seconds": 0.011556986952200532,
+      "peak_rss_kib": 34264,
+      "raw_recorder_bytes": 0,
+      "phase_records": [
+        "[PHASE] compilation: 3.0ms",
+        "[PHASE] simulation: 4.8ms",
+        "[PHASE] total: 7.8ms"
+      ],
+      "samples": 351,
+      "normalized_missing_fields": 0
+    },
+    {
+      "repetition": 2,
+      "mode": "vcd",
+      "wall_seconds": 0.012095816899091005,
+      "peak_rss_kib": 36804,
+      "raw_recorder_bytes": 12858,
+      "phase_records": [
+        "[PHASE] compilation: 2.9ms",
+        "[PHASE] simulation: 5.6ms",
+        "[PHASE] total: 8.5ms"
+      ],
+      "samples": 351,
+      "normalized_missing_fields": 0
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "status": "EXPECTED_QUOTA_FAILURE_PRESERVED",
+  "trial_status_unchanged": "FAILED",
+  "original_error": "AppServerError: capability/model violation: ['case tool action limit exceeded']",
+  "stage1_sealed": false,
+  "source_disclosed": false,
+  "model_tools_observed": [
+    "read_evidence"
+  ],
+  "actual_tool_requests": 13,
+  "unexpected_capability_items": [],
+  "posthoc_surface_audit": {
+    "manifest_count": 15,
+    "allowed_tools": [
+      "read_evidence"
+    ]
+  },
+  "note": "This audit does not regrade or retry the failed subject. Remaining schedule cells continue once; only quota denial is exempted from generic scheduler capability-failure classification."
+}

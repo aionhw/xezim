@@ -1,0 +1,55 @@
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index a41f147..dcf3fa6 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -1068,6 +1068,22 @@ impl Session {
+                     Arc::default()
+                 }
+             });
++        // Opt-in study ceiling: applies to advertised and executable tools.
++        // Ordinary Codex sessions retain their original policy.
++        let tool_policy = if std::env::var("XEZIM_DVCON_CASE_TOOLS_ONLY").as_deref() == Ok("1") {
++            eprintln!("[dvcon-case-tools] allowed=read_evidence,run_controlled_experiment");
++            Arc::new(codex_extension_api::ToolPolicy {
++                allowed_tools: Some(vec![
++                    codex_extension_api::ToolName::plain("read_evidence"),
++                    codex_extension_api::ToolName::plain("run_controlled_experiment"),
++                ]),
++                require_managed_sandbox: true,
++                require_unified_exec: true,
++                expose_additional_permissions: false,
++            })
++        } else {
++            tool_policy
++        };
+         let mcp_thread_init = thread_extension_init.clone();
+         let thread_extension_data = codex_extension_api::ExtensionData::new_with_init(
+             thread_id.to_string(),
+diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
+index 2602fcb..7d7bbd3 100644
+--- a/codex-rs/core/src/tools/spec_plan.rs
++++ b/codex-rs/core/src/tools/spec_plan.rs
+@@ -537,6 +537,23 @@ pub(crate) fn finalize_tool_router(
+         &code_mode_tool_names,
+         hosted_specs,
+     );
++    if std::env::var("XEZIM_DVCON_CASE_TOOLS_ONLY").as_deref() == Ok("1") {
++        eprintln!("[dvcon-model-tools] {}", serde_json::to_string(&model_visible_specs)
++            .map_err(|error| CodexErrorDetails::InvalidRequest(error.to_string()))?);
++        let allowed_name = |name: &str| matches!(name, "read_evidence" | "run_controlled_experiment");
++        if model_visible_specs.iter().any(|spec| match spec {
++            ToolSpec::Function(tool) => !allowed_name(&tool.name),
++            ToolSpec::Namespace(namespace) if namespace.name == "functions" =>
++                namespace.tools.iter().any(|tool| match tool {
++                    ResponsesApiNamespaceTool::Function(tool) => !allowed_name(&tool.name),
++                    _ => true,
++                }),
++            _ => true,
++        }) {
++            return Err(CodexErrorDetails::InvalidRequest(
++                "DVCon case-only tool surface violated".to_string()).into());
++        }
++    }
+     let tool_namespaces_info = include_tool_namespaces_info
+         .then(|| {
+             collect_tool_namespaces_info(&registry, &code_mode_tool_names, &model_visible_specs)

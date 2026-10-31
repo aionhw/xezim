@@ -2556,6 +2556,7 @@ mod functions;
 mod initialization;
 mod inline_constraints;
 mod inspection;
+mod dvcon_observation;
 mod isolated_gates;
 mod jit_runtime;
 mod mailboxes;
@@ -9091,6 +9092,7 @@ pub struct Simulator {
     /// under disjoint-field borrow constraints, so hits are queued in a
     /// RefCell (same shape as warn_x_pending) and formatted at the drain.
     /// None = disabled, Some(ids) = resolved watch set.
+    dvcon_observation: Option<Box<dvcon_observation::Observer>>,
     value_trace_ids: Option<std::collections::HashSet<usize>>,
     value_trace_pending: std::cell::RefCell<Vec<(usize, u64, Value, Value, usize, &'static str)>>,
     value_trace_emitted: u64,

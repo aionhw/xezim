@@ -1,0 +1,21 @@
+{
+  "status": "USER_AUTHORIZED_SHOWCASE_ONLY",
+  "user_instruction_verbatim": "this is for showcases. skip human review",
+  "recorded_utc": "2026-10-31T03:22:39.766765+00:00",
+  "scope": "14 admitted cases x4 modes x1 repeat; descriptive showcases, not independently reviewed primary comparison",
+  "human_review": "WAIVED_BY_USER_FOR_SHOWCASES; no reviewer identity or approval invented",
+  "primary_subjects": 0,
+  "base_freeze_sha256": "d30fd0a1002fdc519f2362f5eac114bae9b8708463c948a41f5994d1b7f6b075",
+  "catalog_sha256": "c989b2488aeca1133b5f6fdfb40ce08dc6d1b3223639f7b33c356f92c3db3227",
+  "retained_requirements": [
+    "ChatGPT subscription auth and exact Sol/medium",
+    "fresh process and thread",
+    "case-only tool allowlist and empty model workspace",
+    "source-hidden StageI seal with valid issued IDs before source",
+    "D prewritten prediction plus actual intervention and2 negatives",
+    "independent-oracle grading on admitted3 schedules",
+    "preserve every failure and cache telemetry"
+  ],
+  "automated_admission_sha256": "1428c20730f6e560f7c81a2c6c477468a8c2d5e61916c49587fd6c69a6808178",
+  "admission_audit_sha256": "600c648ae6e0a83a8393072981533a9e7370f826e1dff5c880c9d31cc8d75900"
+}

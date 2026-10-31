@@ -1,0 +1,56 @@
+{
+  "status": "COMPLETE_SHOWCASE_ONLY",
+  "utc": "2026-10-31T04:29:04.091561+00:00",
+  "user_scope": "Human review explicitly waived for showcases",
+  "scheduled_subjects": 56,
+  "actual_subjects": 56,
+  "runtime_verified_fault_repairs": 48,
+  "runtime_verified_no_edit_clean": 8,
+  "failed_model_subjects": 0,
+  "human_expert_scores": null,
+  "independent_novelty_certification": null,
+  "primary_subjects": 0,
+  "automatic_audit": {
+    "status": "PASS",
+    "errors": [],
+    "fresh_python_processes": 56,
+    "fresh_codex_processes": 56,
+    "fresh_threads": 56,
+    "actual_rpc_methods": {
+      "initialize": 56,
+      "initialized": 56,
+      "account/read": 56,
+      "model/list": 56,
+      "thread/start": 56,
+      "turn/start": 112
+    },
+    "actual_dynamic_tools": {
+      "read_evidence": 644,
+      "run_controlled_experiment": 15
+    },
+    "uniform_overlay": true
+  },
+  "selected_reference_verified_patches": 3,
+  "reference_patch_schedule_runs": 9,
+  "registered_fault_control_reference_replays": 12,
+  "repaired_monitor_value_replay": 1,
+  "base_tests": 41,
+  "preexecution_overlay_scope_tests": 4,
+  "base_freeze_verification": "PASS",
+  "report_links": "PASS",
+  "model": "gpt-6.1-sol",
+  "effort": "medium",
+  "auth": "chatgpt",
+  "post_run_host_failures_preserved": 2,
+  "files_sha256": {
+    "paper/RESULTS_FOR_DVCON.md": "4f3f89af44f62a3d1fdb31458ae26ce6dfcee82d9e0c383acbf4ec157c25c75d",
+    "paper/SHOWCASES_REVIEW_WAIVED.md": "0972a0015355c1e1c8ac4ae9772b7b97e44c2a029561787851d327e642130543",
+    "paper/receipts/review_waived_showcases.json": "b81668b5f2c7bd926588c463861ea9f4a0b241a1548f282a60c62501d4550688",
+    "paper/receipts/review_waived_showcase_verification.json": "6b12356f385ad6fad112d5864c868654164442c6a6feaac696501fcb990d74d5",
+    "paper/figures/review_waived_monitor_data.json": "73330a30a0c0a0debf02b52b62b69b42a58081eff4537a7fe60c6c2deb3abcf6",
+    "showcase_runs/review_waived_001/OVERLAY_SEAL.json": "8996211c3f8887ae224f266ba0cc3321ac69bd58b1b458406455f3c0aded819a",
+    "config/freeze_receipt.json": "d30fd0a1002fdc519f2362f5eac114bae9b8708463c948a41f5994d1b7f6b075"
+  },
+  "original_local_receipt": true,
+  "note": "Historical original-study hashes refer to pre-export source artifacts. PUBLICATION_MANIFEST.json provides current public file hashes."
+}

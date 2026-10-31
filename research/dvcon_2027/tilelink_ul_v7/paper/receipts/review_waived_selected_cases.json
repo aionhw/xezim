@@ -1,0 +1,692 @@
+{
+  "scope": "Selected actual showcase final submissions, not model reasoning traces or primary grades",
+  "cases": [
+    {
+      "case_id": "case_2248fbe7ddf3b974",
+      "component": "endpoint",
+      "stage1_sha256": "020d3c3e5cacb86650a59d3fe6c633e3846713f66f64519e4f70e54c572f830e",
+      "sealed_assessment": "Accepted-response data errors are independently confirmed. Localization remains provisional. Concurrency, D stalls, and completion inversion are witnessed; an accepted partial write was not established in the queried evidence, so P1 is not satisfied.",
+      "sealed_mechanism": "Some reads return zero where accepted-request reference memory requires 2436350380. Extending D backpressure preserves the source-9 mismatch and all 65 issues while shifting their timing, supporting corruption before D retirement. The exact internal cause remains unresolved; native samples provide no writer provenance.",
+      "sealed_alternatives": [
+        "Read-response capture or source-to-data selection returns an incorrect pending value despite correct memory contents.",
+        "A traffic delivery adapter acknowledges requests without faithfully delivering their write effects."
+      ],
+      "issued_evidence_hashes": {
+        "tlul_ev_0001": "66ec4546cd1273f5ce5608bfe1809fa5e8d489a8a2ceb8ec1d49d9be3684387a",
+        "tlul_ev_0002": "30725e533b11340924c7b67eb2b68a2e1942929d40eb453e9d42ac3ebd38a85c",
+        "tlul_ev_0003": "c8418681cd817b374c67ab8f0257c0149d2888b48df2683798e9ba05b6fea198",
+        "tlul_ev_0004": "672ce8f1b49cba73fcba2cd7fae6dce849c00ed5b47c1e5440674eaf323f04b7",
+        "tlul_ev_0005": "d546e7481eab20b797e7a691025abe252e323bdeff5341cce3c5a99613c5d567",
+        "tlul_ev_0006": "6d7c8a94d90f743844933552b6a35ed5cfe29b79bd36cbc51437e83cf92d9a66",
+        "tlul_ev_0007": "be88290015bc4930a2aa7b83450fd41fadae998af607ec47141ef28d0cd0cee2",
+        "tlul_ev_0008": "a7b1e0fe1f80173cb7291d7813a166151d592815a06b2fa64ce48f2f08719143",
+        "tlul_ev_0009": "98da808260f467a679f745f3cabd74087cb8773455457643ea0cc310d40c3a55",
+        "tlul_ev_0010": "776a76fd24fc21ba10a7d07032d15dd53f0b3d66963078f3948d486dd44c9150",
+        "tlul_ev_0011": "e5705ead3cfef81428bc804aef638ee62d74f7b3ebf19e17b2e8f3bf085bed9a",
+        "tlul_ev_0012": "f3b70a806ea1a08ba0a75cd786a0c6dbfc79648c52bf1b6d8280c6a6ad9c7c68"
+      },
+      "registered_experiments": [
+        {
+          "registered_prediction": {
+            "target": "response_backpressure",
+            "at_cycle": 73,
+            "duration_cycles": 8,
+            "sealed_prediction": "Hold D acceptance across the baseline source-9 read response at cycle 76. If the zero read value originates in write storage or the read snapshot, accepted read-data mismatches should persist after release, although cycles may shift. If it originates in D retirement/reuse or a response correlation race, the mismatch pattern may change or disappear. Both the inert-wire and idempotent request-throttle-zero controls should reproduce baseline traffic and diagnostics."
+          },
+          "observed": {
+            "status": "PASS",
+            "all_simulator_runs_completed": true,
+            "control_comparator": "matched_sampled_cycle_not_formal_causality",
+            "prediction_timing": "submitted_before_execution",
+            "prediction_judged_by_expert": false,
+            "negative_controls_match": true,
+            "force_release_markers": true,
+            "first_non_target_difference": {
+              "cycle": 75,
+              "changed_pins": {
+                "dv": [
+                  0,
+                  1
+                ]
+              }
+            },
+            "other_differences": {
+              "experiment": {
+                "cycle": 75,
+                "changed_pins": {
+                  "dv": [
+                    0,
+                    1
+                  ]
+                }
+              },
+              "unrelated": null,
+              "idempotent": null
+            },
+            "independent_oracles": {
+              "baseline": "FAIL",
+              "experiment": "FAIL",
+              "unrelated": "FAIL",
+              "idempotent": "FAIL"
+            },
+            "oracle_observations": {
+              "baseline": {
+                "status": "FAIL",
+                "first_issues": [
+                  {
+                    "cycle": 76,
+                    "kind": "read_data_mismatch",
+                    "source": 9,
+                    "expected_data": 2436350380,
+                    "observed_data": 0,
+                    "request": 22
+                  },
+                  {
+                    "cycle": 81,
+                    "kind": "read_data_mismatch",
+                    "source": 0,
+                    "expected_data": 2436350380,
+                    "observed_data": 0,
+                    "request": 23
+                  },
+                  {
+                    "cycle": 96,
+                    "kind": "read_data_mismatch",
+                    "source": 7,
+                    "expected_data": 2436350380,
+                    "observed_data": 0,
+                    "request": 24
+                  }
+                ],
+                "total_issue_count": 65
+              },
+              "experiment": {
+                "status": "FAIL",
+                "first_issues": [
+                  {
+                    "cycle": 94,
+                    "kind": "read_data_mismatch",
+                    "source": 9,
+                    "expected_data": 2436350380,
+                    "observed_data": 0,
+                    "request": 22
+                  },
+                  {
+                    "cycle": 96,
+                    "kind": "read_data_mismatch",
+                    "source": 10,
+                    "expected_data": 2436350380,
+                    "observed_data": 0,
+                    "request": 29
+                  },
+                  {
+                    "cycle": 98,
+                    "kind": "read_data_mismatch",
+                    "source": 11,
+                    "expected_data": 2436350380,
+                    "observed_data": 0,
+                    "request": 20
+                  }
+                ],
+                "total_issue_count": 65
+              },
+              "unrelated": {
+                "status": "FAIL",
+                "first_issues": [
+                  {
+                    "cycle": 76,
+                    "kind": "read_data_mismatch",
+                    "source": 9,
+                    "expected_data": 2436350380,
+                    "observed_data": 0,
+                    "request": 22
+                  },
+                  {
+                    "cycle": 81,
+                    "kind": "read_data_mismatch",
+                    "source": 0,
+                    "expected_data": 2436350380,
+                    "observed_data": 0,
+                    "request": 23
+                  },
+                  {
+                    "cycle": 96,
+                    "kind": "read_data_mismatch",
+                    "source": 7,
+                    "expected_data": 2436350380,
+                    "observed_data": 0,
+                    "request": 24
+                  }
+                ],
+                "total_issue_count": 65
+              },
+              "idempotent": {
+                "status": "FAIL",
+                "first_issues": [
+                  {
+                    "cycle": 76,
+                    "kind": "read_data_mismatch",
+                    "source": 9,
+                    "expected_data": 2436350380,
+                    "observed_data": 0,
+                    "request": 22
+                  },
+                  {
+                    "cycle": 81,
+                    "kind": "read_data_mismatch",
+                    "source": 0,
+                    "expected_data": 2436350380,
+                    "observed_data": 0,
+                    "request": 23
+                  },
+                  {
+                    "cycle": 96,
+                    "kind": "read_data_mismatch",
+                    "source": 7,
+                    "expected_data": 2436350380,
+                    "observed_data": 0,
+                    "request": 24
+                  }
+                ],
+                "total_issue_count": 65
+              }
+            },
+            "actual_runs": 4
+          }
+        }
+      ],
+      "actual_submission": {
+        "path": "rtl/tlul_mem_endpoint.sv",
+        "old": "            if(pending_write_count<4) begin\n              memory[word_index] <= write_word;\n              memory_parity[word_index] <= ^write_word;\n            end",
+        "new": "            memory[word_index] <= write_word;\n            memory_parity[word_index] <= ^write_word;",
+        "explanation": "The endpoint accepts writes even when four or more write responses are outstanding, but this guard silently discards their memory effects. Remove the guard so accepted writes update memory and parity at their A handshake, preserving byte-mask handling and response behavior."
+      },
+      "verification": {
+        "case_id": "case_2248fbe7ddf3b974",
+        "component": "endpoint",
+        "scope": "User-waived review showcase, post-submission runtime verification only",
+        "stage1_sha256": "020d3c3e5cacb86650a59d3fe6c633e3846713f66f64519e4f70e54c572f830e",
+        "patched_source_sha256": "2e796ae7eb0259d69826b04fb6bb416c964a607cc2bd985100aebec02f30e2a7",
+        "three_reference_schedules": [
+          {
+            "schedule": "original",
+            "exit_code": 0,
+            "oracle": "PASS",
+            "public_trace_equal_to_research": true
+          },
+          {
+            "schedule": "unseen",
+            "exit_code": 0,
+            "oracle": "PASS",
+            "public_trace_equal_to_research": true
+          },
+          {
+            "schedule": "adversarial",
+            "exit_code": 0,
+            "oracle": "PASS",
+            "public_trace_equal_to_research": true
+          }
+        ],
+        "registered_fault_experiments_reference_replay": [
+          {
+            "experiment": "experiment_01",
+            "all_four_runs_completed": true,
+            "public_traces_match": {
+              "baseline": true,
+              "experiment": true,
+              "unrelated": true,
+              "idempotent": true
+            },
+            "reference_mechanical_status": "PASS",
+            "research_mechanical_status": "PASS"
+          }
+        ],
+        "expert_mechanism_or_prediction_score": null,
+        "status": "PASS"
+      },
+      "scope": "SHOWCASE_ONLY_USER_WAIVED_HUMAN_REVIEW"
+    },
+    {
+      "case_id": "case_52507cae2630a60c",
+      "component": "monitor",
+      "stage1_sha256": "a5212f5a91b31fad033f296cee0627f11b0d6be55607253447b45e875aa7d498",
+      "sealed_assessment": "Evidence supports a source-balance monitor false alarm. No endpoint protocol defect is established by the inspected records.",
+      "sealed_mechanism": "A single accepted D response can decrement pending_count by two while clearing only one pending source bit. At cycle 51 the count falls from 2 to 0; at cycle 53, the valid retirement of source 6 wraps it from 0 to 30 and source_alarm asserts. The evidence supports timing-dependent duplicate retirement accounting; the exact source expression remains unavailable.",
+      "sealed_alternatives": [
+        "Endpoint orphan or duplicate response: disfavored because source 6 was accepted at cycle 8 and remained pending until its cycle-53 response.",
+        "Monitor timeout under backpressure: disfavored by the directly observed two-count decrements and underflow coincident with the alarm."
+      ],
+      "issued_evidence_hashes": {
+        "tlul_ev_0001": "4af91abff83a515257f057ac0385526e08c3a2e59b0f0e76444b0325415aef96",
+        "tlul_ev_0002": "c9a784585808a112cbb4ce361c53608b2dd6b98731620ae719f15ce2d8c4928a",
+        "tlul_ev_0003": "b89f519d46177abd6017fcd62b43f1ace6bac34b9f2c8f21f1fae1d3471aa829",
+        "tlul_ev_0004": "0ae10bba23621406233c91570ee16e19b9e8f2abcd9ae2c1444294a2884efc53",
+        "tlul_ev_0005": "5770ffc13abf12514518a952ea0852c24226a3df9ef2ba8d5544cf24fa83c4ac",
+        "tlul_ev_0006": "89617cb1b6c60265aa98d323833c88b39a4c87f13478e2499b18376873c86190",
+        "tlul_ev_0007": "74747cd6c1405cead02a9700665973b7e9c1748d54bd5dc0cfee03ed476cdb23",
+        "tlul_ev_0008": "030c6e4b632a59c9f0cae2d86d354cedcd5a3bbf1495133622de4bb1291176f6",
+        "tlul_ev_0009": "95572e511e459b87870505b777e087109e985d3bfa30967700cfa2c8d7d42f9a",
+        "tlul_ev_0010": "88601179e8a3678d1d91e7c9661054b4e963d679ec2db72c52267a425a026dd4",
+        "tlul_ev_0011": "d32a16eef8a34d632410fd1000b3aa58d5e2ddef4f1143fb0b1bbe41510ed9e1",
+        "tlul_ev_0012": "b7832bc68ad728d9e75b657461083e7851933290b04102c5bf6a5f941e622811"
+      },
+      "registered_experiments": [
+        {
+          "registered_prediction": {
+            "target": "response_backpressure",
+            "at_cycle": 49,
+            "duration_cycles": 8,
+            "sealed_prediction": "The monitor appears to double-decrement pending_count on responses first observed with ready high. Forcing D backpressure near baseline source-4/source-5 completion should delay retirement and change the count/alarm trajectory (first alarm later than cycle 53), while accepted PIN traffic remains protocol-correct. Inert-wire and request-throttle-zero controls should preserve baseline first alarm at 53. A genuine orphan source would remain an independent PIN violation despite the timing change."
+          },
+          "observed": {
+            "status": "PASS",
+            "all_simulator_runs_completed": true,
+            "control_comparator": "matched_sampled_cycle_not_formal_causality",
+            "prediction_timing": "submitted_before_execution",
+            "prediction_judged_by_expert": false,
+            "negative_controls_match": true,
+            "force_release_markers": true,
+            "first_non_target_difference": {
+              "cycle": 52,
+              "changed_pins": {
+                "dv": [
+                  0,
+                  1
+                ]
+              }
+            },
+            "other_differences": {
+              "experiment": {
+                "cycle": 52,
+                "changed_pins": {
+                  "dv": [
+                    0,
+                    1
+                  ]
+                }
+              },
+              "unrelated": null,
+              "idempotent": null
+            },
+            "independent_oracles": {
+              "baseline": "FAIL",
+              "experiment": "FAIL",
+              "unrelated": "FAIL",
+              "idempotent": "FAIL"
+            },
+            "oracle_observations": {
+              "baseline": {
+                "status": "FAIL",
+                "first_issues": [
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 53,
+                    "component": "source_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 54,
+                    "component": "source_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 55,
+                    "component": "source_alarm",
+                    "observed_alarm": 1
+                  }
+                ],
+                "total_issue_count": 326
+              },
+              "experiment": {
+                "status": "FAIL",
+                "first_issues": [
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 70,
+                    "component": "source_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 71,
+                    "component": "source_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 72,
+                    "component": "source_alarm",
+                    "observed_alarm": 1
+                  }
+                ],
+                "total_issue_count": 281
+              },
+              "unrelated": {
+                "status": "FAIL",
+                "first_issues": [
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 53,
+                    "component": "source_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 54,
+                    "component": "source_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 55,
+                    "component": "source_alarm",
+                    "observed_alarm": 1
+                  }
+                ],
+                "total_issue_count": 326
+              },
+              "idempotent": {
+                "status": "FAIL",
+                "first_issues": [
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 53,
+                    "component": "source_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 54,
+                    "component": "source_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 55,
+                    "component": "source_alarm",
+                    "observed_alarm": 1
+                  }
+                ],
+                "total_issue_count": 326
+              }
+            },
+            "actual_runs": 4
+          }
+        }
+      ],
+      "actual_submission": {
+        "path": "rtl/tlul_components.sv",
+        "old": "delta=(av&&ar?1:0)-(dv&&dr?2:0);",
+        "new": "delta=(av&&ar?1:0)-(dv&&dr?1:0);",
+        "explanation": "Each accepted D response retires exactly one outstanding request. Subtracting two undercounts pending requests and causes wraparound and false alarms. Subtracting one restores correct accounting, including simultaneous A/D handshakes, while preserving all checks."
+      },
+      "verification": {
+        "case_id": "case_52507cae2630a60c",
+        "component": "monitor",
+        "scope": "User-waived review showcase, post-submission runtime verification only",
+        "stage1_sha256": "a5212f5a91b31fad033f296cee0627f11b0d6be55607253447b45e875aa7d498",
+        "patched_source_sha256": "bd5e414bc06b7a798a6e4553c59946055b46a16173ae84d9407a62ea3e301418",
+        "three_reference_schedules": [
+          {
+            "schedule": "original",
+            "exit_code": 0,
+            "oracle": "PASS",
+            "public_trace_equal_to_research": true
+          },
+          {
+            "schedule": "unseen",
+            "exit_code": 0,
+            "oracle": "PASS",
+            "public_trace_equal_to_research": true
+          },
+          {
+            "schedule": "adversarial",
+            "exit_code": 0,
+            "oracle": "PASS",
+            "public_trace_equal_to_research": true
+          }
+        ],
+        "registered_fault_experiments_reference_replay": [
+          {
+            "experiment": "experiment_01",
+            "all_four_runs_completed": true,
+            "public_traces_match": {
+              "baseline": true,
+              "experiment": true,
+              "unrelated": true,
+              "idempotent": true
+            },
+            "reference_mechanical_status": "PASS",
+            "research_mechanical_status": "PASS"
+          }
+        ],
+        "expert_mechanism_or_prediction_score": null,
+        "status": "PASS"
+      },
+      "scope": "SHOWCASE_ONLY_USER_WAIVED_HUMAN_REVIEW"
+    },
+    {
+      "case_id": "case_7d2add13c79822d8",
+      "component": "scoreboard",
+      "stage1_sha256": "e74218e255db647b95fad0356642870ee9ce6b41fa75a96897e45929902dbf6e",
+      "sealed_assessment": "Evidence supports shadow-scoreboard false alarms on correct read responses; no endpoint fault established.",
+      "sealed_mechanism": "Source 4 snapshots the correct expected value 0x91374e3e at A acceptance and returns that same value at cycle 72, yet data_alarm asserts. This indicates subsequent expectation corruption or incorrect response-to-expectation selection. History cursor activity suggests bounded-history bookkeeping as a candidate, but the exact mechanism remains unresolved.",
+      "sealed_alternatives": [
+        "A later request overwrites or invalidates an outstanding source's expected snapshot.",
+        "D comparison selects another history entry instead of the expectation indexed by d_source."
+      ],
+      "issued_evidence_hashes": {
+        "tlul_ev_0001": "22a74b7593c0e5bd3445a7bf6e470905d2909b5c81f6c2194e6af0e5e6751e93",
+        "tlul_ev_0002": "40f6930d2b805983d41a4d98505423f2dded9a6615450a65e2a5773d42c79502",
+        "tlul_ev_0003": "7e82cc2f0e353cf5bb35aeb0cb14e6f70bfa8b7513875787a51902b4a520ef40",
+        "tlul_ev_0004": "5d9102871d928e9b133192c79f50bfdd6f88f127f2a3ab1f8d4ea3974556366f",
+        "tlul_ev_0005": "bc0aa88b04ff2640b6a5064984e4511bac3cf05edb12a9a646be153aa5588a7e",
+        "tlul_ev_0006": "05c193c6d1730468d209c2432867375c2e5e2fef9e556f6f96e1cff6c9b325e8",
+        "tlul_ev_0007": "7bd6d55857569abc93f642529380ef590ab073bf81ba1ecb3cdaac8522cce244",
+        "tlul_ev_0008": "9852ea0bbb9eb54c2787f9541c08333f1f1de8379a6d41968273cd24becb5264",
+        "tlul_ev_0009": "ebc84d88c47b7b90e5c6014a4ea101fdbd2abb5893628db8196b701bb61591d6",
+        "tlul_ev_0010": "2c3e6e2cbc2369cbed40d8a1f7d8bb5ca2913f5a6a04687469327ae1e3aa720d",
+        "tlul_ev_0011": "ebfe2295a72cf7b5b60708b953dab5861d2358f966b7b60f55c38b4961926213",
+        "tlul_ev_0012": "6d0615166766b5857cfbd0f145de9c1deb30678b1b141ce6bc5885ff1e762c56"
+      },
+      "registered_experiments": [
+        {
+          "registered_prediction": {
+            "target": "response_backpressure",
+            "at_cycle": 70,
+            "duration_cycles": 10,
+            "sealed_prediction": "The source-4 read at baseline cycle 72 returns the correct previously accepted write value 2436320830, so suspect the shadow scoreboard expectation/correlation rather than endpoint data. Forcing response backpressure across this response should preserve its payload and defer a handshake-gated false data alarm until D acceptance; an alarm while stalled instead indicates valid-only comparison. Inert-wire and request-throttle-zero controls should retain the baseline cycle-72 false alarm and accepted traffic."
+          },
+          "observed": {
+            "status": "PASS",
+            "all_simulator_runs_completed": true,
+            "control_comparator": "matched_sampled_cycle_not_formal_causality",
+            "prediction_timing": "submitted_before_execution",
+            "prediction_judged_by_expert": false,
+            "negative_controls_match": true,
+            "force_release_markers": true,
+            "first_non_target_difference": {
+              "cycle": 73,
+              "changed_pins": {
+                "dv": [
+                  0,
+                  1
+                ]
+              }
+            },
+            "other_differences": {
+              "experiment": {
+                "cycle": 73,
+                "changed_pins": {
+                  "dv": [
+                    0,
+                    1
+                  ]
+                }
+              },
+              "unrelated": null,
+              "idempotent": null
+            },
+            "independent_oracles": {
+              "baseline": "FAIL",
+              "experiment": "FAIL",
+              "unrelated": "FAIL",
+              "idempotent": "FAIL"
+            },
+            "oracle_observations": {
+              "baseline": {
+                "status": "FAIL",
+                "first_issues": [
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 72,
+                    "component": "data_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 80,
+                    "component": "data_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 82,
+                    "component": "data_alarm",
+                    "observed_alarm": 1
+                  }
+                ],
+                "total_issue_count": 57
+              },
+              "experiment": {
+                "status": "FAIL",
+                "first_issues": [
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 81,
+                    "component": "data_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 100,
+                    "component": "data_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 102,
+                    "component": "data_alarm",
+                    "observed_alarm": 1
+                  }
+                ],
+                "total_issue_count": 58
+              },
+              "unrelated": {
+                "status": "FAIL",
+                "first_issues": [
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 72,
+                    "component": "data_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 80,
+                    "component": "data_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 82,
+                    "component": "data_alarm",
+                    "observed_alarm": 1
+                  }
+                ],
+                "total_issue_count": 57
+              },
+              "idempotent": {
+                "status": "FAIL",
+                "first_issues": [
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 72,
+                    "component": "data_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 80,
+                    "component": "data_alarm",
+                    "observed_alarm": 1
+                  },
+                  {
+                    "kind": "monitor_false_alarm",
+                    "cycle": 82,
+                    "component": "data_alarm",
+                    "observed_alarm": 1
+                  }
+                ],
+                "total_issue_count": 57
+              }
+            },
+            "actual_runs": 4
+          }
+        }
+      ],
+      "actual_submission": {
+        "path": "rtl/tlul_components.sv",
+        "old": "   if(pending_history_valid[pending_history_cursor]) pending_expected[pending_history_source[pending_history_cursor]]<=0;\n",
+        "new": "",
+        "explanation": "Remove history-ring eviction of source-indexed read expectations. Four later reads can otherwise erase a still-outstanding snapshot, producing false data alarms. Each expectation must remain intact until its source is legally reused; the next accepted Get then replaces it. The response comparison remains unchanged."
+      },
+      "verification": {
+        "case_id": "case_7d2add13c79822d8",
+        "component": "scoreboard",
+        "scope": "User-waived review showcase, post-submission runtime verification only",
+        "stage1_sha256": "e74218e255db647b95fad0356642870ee9ce6b41fa75a96897e45929902dbf6e",
+        "patched_source_sha256": "bd5e414bc06b7a798a6e4553c59946055b46a16173ae84d9407a62ea3e301418",
+        "three_reference_schedules": [
+          {
+            "schedule": "original",
+            "exit_code": 0,
+            "oracle": "PASS",
+            "public_trace_equal_to_research": true
+          },
+          {
+            "schedule": "unseen",
+            "exit_code": 0,
+            "oracle": "PASS",
+            "public_trace_equal_to_research": true
+          },
+          {
+            "schedule": "adversarial",
+            "exit_code": 0,
+            "oracle": "PASS",
+            "public_trace_equal_to_research": true
+          }
+        ],
+        "registered_fault_experiments_reference_replay": [
+          {
+            "experiment": "experiment_01",
+            "all_four_runs_completed": true,
+            "public_traces_match": {
+              "baseline": true,
+              "experiment": true,
+              "unrelated": true,
+              "idempotent": true
+            },
+            "reference_mechanical_status": "PASS",
+            "research_mechanical_status": "PASS"
+          }
+        ],
+        "expert_mechanism_or_prediction_score": null,
+        "status": "PASS"
+      },
+      "scope": "SHOWCASE_ONLY_USER_WAIVED_HUMAN_REVIEW"
+    }
+  ]
+}

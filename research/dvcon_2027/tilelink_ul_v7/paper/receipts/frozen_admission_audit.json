@@ -1,0 +1,14 @@
+{
+  "status": "PASS",
+  "scope": "Trusted-host recomputation, not independent human novelty/admission review or native postprocessing",
+  "freeze_sha256": "d30fd0a1002fdc519f2362f5eac114bae9b8708463c948a41f5994d1b7f6b075",
+  "catalog_sha256": "c989b2488aeca1133b5f6fdfb40ce08dc6d1b3223639f7b33c356f92c3db3227",
+  "actual_run_receipts": 252,
+  "expected_fault_oracle_rejections": 108,
+  "expected_clean_oracle_passes": 144,
+  "oracle_recomputation_mismatches": 0,
+  "unapproved_review_gate_denied": true,
+  "review_human_fields_all_null": true,
+  "all_public_traces_match": true,
+  "primary_subjects": 0
+}

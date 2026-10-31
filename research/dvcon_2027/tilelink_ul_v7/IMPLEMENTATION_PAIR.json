@@ -1,0 +1,15 @@
+{
+  "xezim_publication_base": "80f00d354fc68c436569b12b6d4e175ef105a652",
+  "xezim_core_branch_and_dependency_revision": "837725742ba9aaa3b3408f770b288cf85f020ef9",
+  "core_functional_changes": false,
+  "simulator_source_matches_measured_research_checkout": true,
+  "simulator_source_sha256": {
+    "Cargo.toml": "682e105dadc1621538c8b851f005b5e453fc0e1ec7a4ab7a0da8c73be70a0f0b",
+    "src/compiler/simulator.rs": "9ce8a39e6d1de89bb1390f1e74581e1492f59a365dc50c1543757b0f2512552b",
+    "src/compiler/simulator/dvcon_observation.rs": "38d6a60ed773c50cdd8f1925b66667ca1851bd9989b32ceb7f132821a2842883",
+    "src/compiler/simulator/initialization.rs": "610f66ec96547f3c4e89b8f8fce257d3dff99fc7a2bf9aa0fe198e28b0b03e7e",
+    "src/compiler/simulator/system_tasks.rs": "7127f85e7b44dec3c18bf790749beb826748b740ddaf104eb9d149a383212e72"
+  },
+  "measured_research_binary_sha256": "690ce40f8f90c4971619e99b9de9c0cb95f10ef16416e85f1b6a1c5c47038341",
+  "source_note": "Publication commit adds the identical tested opt-in observer source plus sanitized artifacts. It does not relabel the old measured binary as a rebuild of the publication commit."
+}

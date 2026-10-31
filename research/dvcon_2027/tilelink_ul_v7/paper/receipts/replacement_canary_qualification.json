@@ -1,0 +1,20 @@
+{
+  "status": "PASS",
+  "scope": "Known exposed endpoint canaries against new clean checking components and new common traffic, not primary fault instances or model trials",
+  "checks": [
+    {
+      "role": "monitor",
+      "exit_code": 0,
+      "oracle": "FAIL",
+      "required_alarm_found": true,
+      "status": "PASS"
+    },
+    {
+      "role": "scoreboard",
+      "exit_code": 0,
+      "oracle": "FAIL",
+      "required_alarm_found": true,
+      "status": "PASS"
+    }
+  ]
+}

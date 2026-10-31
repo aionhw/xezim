@@ -1,0 +1,71 @@
+{
+  "scope": "Actual recorded public alarms; empty row means no alarm in plotted window, not a full-run oracle result. Patch traces are separate grader runs, not model-selected interventions. No expert prediction score.",
+  "cases": {
+    "temporal_03": {
+      "field": "source_alarm",
+      "window": [
+        20,
+        33
+      ],
+      "records": {
+        "baseline + both negatives": {
+          "log_sha256": "2b08f8d5a0297b2be237fdedbdeef7244155e1fb6630f996e4ed13ef160938e9",
+          "alarm_cycles_in_window": [
+            24
+          ],
+          "sampled_cycles": 351
+        },
+        "first selected intervention": {
+          "log_sha256": "e9ba99ce5f7e951d09bfb40cead6bbfcc6d2ba514d43656542b1c1ab98463b91",
+          "alarm_cycles_in_window": [
+            30
+          ],
+          "sampled_cycles": 351
+        },
+        "submitted patch (original schedule)": {
+          "log_sha256": "6fd23b6ab0ff3f1afc07803cd34bc890a7543f34b8d29722ae036dd5cb5334c4",
+          "alarm_cycles_in_window": [],
+          "sampled_cycles": 351
+        }
+      }
+    },
+    "temporal_05": {
+      "field": "data_alarm",
+      "window": [
+        160,
+        220
+      ],
+      "records": {
+        "baseline + both negatives": {
+          "log_sha256": "b56aee15c60db551a5648cd4a90cdfac9b631f17c9f9f9f1ed50441b40490306",
+          "alarm_cycles_in_window": [
+            170,
+            172,
+            210
+          ],
+          "sampled_cycles": 351
+        },
+        "first selected intervention": {
+          "log_sha256": "99b5795e95bc6cdc7f50c4f1c45d08d7b49515c2ae5997a8cced99eac42f42f6",
+          "alarm_cycles_in_window": [
+            170,
+            210
+          ],
+          "sampled_cycles": 351
+        },
+        "submitted patch (original schedule)": {
+          "log_sha256": "6fd23b6ab0ff3f1afc07803cd34bc890a7543f34b8d29722ae036dd5cb5334c4",
+          "alarm_cycles_in_window": [],
+          "sampled_cycles": 351
+        },
+        "second selected intervention": {
+          "log_sha256": "1c4603a7bdc6446c01e921b4c73fb2e5cd06711e740ce43d2555d4b0a9f1d732",
+          "alarm_cycles_in_window": [
+            217
+          ],
+          "sampled_cycles": 355
+        }
+      }
+    }
+  }
+}

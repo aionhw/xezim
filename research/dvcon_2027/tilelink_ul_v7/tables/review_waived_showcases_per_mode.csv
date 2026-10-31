@@ -1,0 +1,5 @@
+mode,actual_tool_response_bytes,cached_input_tokens_reported,cached_usage_unknown_subjects,clean_subjects,clean_unnecessary_edits,failed_runtime_repairs,failed_subjects,fault_subjects,grading_simulations,grading_simulator_wall_seconds,input_tokens_reported,intervention_simulations,intervention_simulator_wall_seconds,mechanically_qualified_experiments,median_total_cell_wall_seconds,median_trial_wall_seconds,native_query_subjects,output_tokens_reported,physical_experiments,qualifying_intervention_subjects,recorded,runtime_verified_clean,runtime_verified_repairs,usage_unknown_subjects
+A,558183,3361792,0,2,0,0,0,12,48,0.863002922385931,3869497,0,0,0,67.88479957962409,59.333022188046016,0,20383,0,0,14,2,12,0
+B,573035,3258880,0,2,0,0,0,12,48,0.8670404010917991,3767508,0,0,0,54.83103234448936,46.260657106526196,0,15963,0,0,14,2,12,0
+C,846139,3786368,0,2,0,0,0,12,48,0.8659668245818466,4429668,0,0,0,54.14126902946737,45.56783506448846,14,16238,0,0,14,2,12,0
+D,770669,3667200,0,2,0,0,0,12,48,0.8687191095668823,4202261,60,0.9966368267778307,15,57.91573291050736,49.49736615200527,14,18597,15,14,14,2,12,0

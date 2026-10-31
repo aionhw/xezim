@@ -1,0 +1,39 @@
+{
+  "status": "INCOMPLETE_MODEL_TURN_FAILURE",
+  "model_requested": "gpt-6.1-sol",
+  "reasoning_effort": "medium",
+  "auth_type": "chatgpt",
+  "plan_type_reported": "prolite",
+  "host_sandbox_controls": {
+    "allowed": true,
+    "outside_denied": true,
+    "symlink_denied": true,
+    "write_denied": true,
+    "network_socket_denied": true
+  },
+  "actual_thread_empty_instruction_sources": true,
+  "codex_cli_version": "0.166.0",
+  "codex_native_binary_sha256": "b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8",
+  "npm_lock_sha256": "18cedae79c3cef5f99708dc6fc757ea433c7f834e87da74860e3db79d3129d9e",
+  "mapper_turn_attempts": 4,
+  "mapper_launch_refusals": 1,
+  "completed_mapper_answers": 0,
+  "failed_mapper_error": "failed to load workspace requirements: invalid input parameter",
+  "model_token_cache_usage": "unknown; no usage notifications",
+  "debugging_sessions": 0,
+  "primary_sessions": "NOT_RUN: 144 fault + 24 clean",
+  "native_observer_binary_sha256": "690ce40f8f90c4971619e99b9de9c0cb95f10ef16416e85f1b6a1c5c47038341",
+  "native_patch_sha256": "57450d6374403d817dd3760565fa0e8d07ae99d001772b42d2683c55c0e9e170",
+  "native_pretrigger_records": 64,
+  "native_posttrigger_records": 32,
+  "matched_pin_fields": 74,
+  "native_pin_mismatches": 0,
+  "four_state_and_truncation_probes": "PASS",
+  "byte_budget_probe": {
+    "max_bytes": 512,
+    "actual_bytes": 128,
+    "truncation_records": 1
+  },
+  "native_full_qualification": "NOT_COMPLETE; matched coverage cost study and model mapping outstanding",
+  "causal_case_and_repairs": "NOT_RUN"
+}

@@ -1,0 +1,72 @@
+{
+  "attempt": "sol_medium_restart_001",
+  "subject_model": "gpt-6.1-sol",
+  "reasoning_effort": "medium",
+  "auth_type": "chatgpt",
+  "availability": "PASS",
+  "test_suite": {
+    "passed": 14,
+    "initial_failure": "fresh STATUS.json missing; corrected and original failure preserved"
+  },
+  "xezim_commit": "80f00d354fc68c436569b12b6d4e175ef105a652",
+  "core_commit": "837725742ba9aaa3b3408f770b288cf85f020ef9",
+  "reference_commit": "7786fb67c30faf197689b3bc3369c828e59c8ae7",
+  "binary_sha256": "84c479c9e79579f21495b620087807a8928efd2daaa03a0a7b16f85649ae7d8b",
+  "reference_compiler_sha256": "e559c446de9940b187b716badec6c62878a7a3ee108ce5ff588426d4bb9c4c9b",
+  "reference_runtime_sha256": "eaccd3914e5b0f87a56df958d11d0fb937b739090242034261d487cc9ea71809",
+  "source_sha256": "6cbb5c1a4b660d8172e377020fa602f39561b8e1f830118d60544cb3f1bb9771",
+  "tb_sha256": "9fabd9d4d3e562fb00fffbbb81d01d8cc55f65901c31b484e8faea6ab1693643",
+  "clean_schedules": {
+    "seed_123": {
+      "xezim_status": "PASS",
+      "reference_status": "PASS",
+      "pin_equality": true,
+      "traffic_qualified": true
+    },
+    "seed_9876": {
+      "xezim_status": "PASS",
+      "reference_status": "PASS",
+      "pin_equality": true,
+      "traffic_qualified": true
+    },
+    "zero_2026": {
+      "xezim_status": "PASS",
+      "reference_status": "PASS",
+      "pin_equality": true,
+      "traffic_qualified": true
+    }
+  },
+  "checker_controls": {
+    "wrong_source": "FAIL",
+    "wrong_opcode": "FAIL",
+    "missing_d": "FAIL",
+    "byte_data": "FAIL",
+    "stall_payload": "FAIL"
+  },
+  "byte_mask_mutant": {
+    "xezim_oracle": "FAIL",
+    "xezim_exit": 0,
+    "reference_oracle": "FAIL",
+    "reference_exit": 0,
+    "source_sha256": "d4321165c1fdb22d02fbf8090854e5c1c71214efc9114474131f653cbfc2856f"
+  },
+  "original_traffic_witnesses": {
+    "status": "PASS",
+    "sample_count": 351,
+    "a_accepted": 96,
+    "d_accepted": 96,
+    "partial_writes": 25,
+    "max_outstanding": 16,
+    "d_stall_samples": 132,
+    "source_reuses_after_retirement": 80,
+    "distinct_reused_source_ids": 16,
+    "zero_data_writes": 3,
+    "cross_source_completion_inversions": 202,
+    "total_issue_count": 0
+  },
+  "model_turns": 0,
+  "primary_sessions": "NOT_RUN: 144 fault and 24 clean sessions; blinding gate failed",
+  "model_costs": "NOT_RUN",
+  "cache_tokens": "unknown; no inference",
+  "blocker": "Case-only named permissions profile thread creation fails in Bubblewrap: Failed RTM_NEWADDR: Operation not permitted"
+}

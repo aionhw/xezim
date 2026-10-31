@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/aionhw/xezim",
+  "branch_resolved": "main",
+  "resolved_date": "2026-10-30",
+  "xezim_commit": "80f00d354fc68c436569b12b6d4e175ef105a652",
+  "xezim_core_commit": "837725742ba9aaa3b3408f770b288cf85f020ef9",
+  "source": "GitHub main branch REST API and Cargo.toml at resolution time",
+  "local_clone_performed_in_creation_environment": false,
+  "local_build_performed_in_creation_environment": false,
+  "native_dvcon_observer_present_at_archived_source_path": false,
+  "base_isolation": "fresh detached checkout inside .deps/xezim; NEVER modify earlier studies"
+}

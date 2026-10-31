@@ -1,0 +1,7 @@
+# Case-only Codex runtime provenance
+
+Upstream: https://github.com/openai/codex, tag `rust-v0.166.0`, commit `6ff1e1ca3b30fc8b914720681fcf5fe62e95f856`. Included upstream Apache-2.0 LICENSE/NOTICE apply to this patch context. Apply `case_tools_only.patch` at the upstream repository root. The patch is opt-in via `XEZIM_DVCON_CASE_TOOLS_ONLY=1` and preserves ordinary tool policy when unset.
+
+Build provenance, package hashes, final `-C opt-level=0` CLI override, matching bwrap helper hashes and live qualification are recorded in [the build receipt](../../paper/receipts/strict_runner_build.json). The normalized resolved lock is [included](../locks/codex-resolved.lock); workspace version normalization changed no external dependency versions, sources or checksums. No compiled Codex binary or sandbox helper is redistributed.
+
+The runner also requires retained `default_permissions=dvcon_case` and the supported direct-only `features.code_mode` namespace configuration. Ordinary feature toggles alone did not prove case-only tool exposure; those earlier twenty subjects are development-only. Rebuild and requalify actual account/model, empty workspace, filesystem/symlink/write/network negatives and model-facing tool specifications on the destination host before new inference. Do not silently use an unpatched stock runtime, API-key auth or a different model. This package is not a formal OS security proof or guarantee about provider caches/pretraining.

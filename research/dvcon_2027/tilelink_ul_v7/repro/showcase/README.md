@@ -1,0 +1,3 @@
+# Historical sealed showcase overlay
+
+These four source files are the executed overlay snapshot; their original study layout is `attempts/sol_medium_restart_001/showcase_runs/review_waived_001/src`. Their parent-depth imports intentionally preserve that original layout. They are provenance exhibits, not a standalone runner in this public directory. Private case catalog, answer mappings, seeds, original freeze dependencies and raw conversations are excluded. Use the public clean harness instructions in the package README for an executable replay. Do not invent an approved review or relabel the showcase as primary.

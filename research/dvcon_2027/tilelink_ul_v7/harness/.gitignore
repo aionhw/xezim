@@ -1,0 +1,10 @@
+.deps/
+private/
+results/*
+!results/STATUS.json
+!results/.gitkeep
+**/__pycache__/
+*.pyc
+.env
+*.pem
+*.key

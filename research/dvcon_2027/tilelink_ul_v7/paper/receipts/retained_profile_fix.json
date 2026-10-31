@@ -1,0 +1,25 @@
+{
+  "status": "MODEL_TRANSPORT_FIX_VERIFIED",
+  "fix": {
+    "default_permissions": "dvcon_case"
+  },
+  "reason": "retained config reload does not retain the request-only profile selection; custom permissions table requires a config default",
+  "cli_version": "0.166.0",
+  "auth_type": "chatgpt",
+  "model": "gpt-6.1-sol",
+  "effort": "medium",
+  "turn_id": "01a18edc-31be-78c0-ab20-e46878ac139b",
+  "response_sha256": "55eff78d0e00990dc7a7c6f7b871380b6bde75e8b04bec09545a6cc54f170941",
+  "token_usage": {
+    "totalTokens": 13551,
+    "inputTokens": 12319,
+    "cachedInputTokens": 0,
+    "cacheWriteInputTokens": 0,
+    "outputTokens": 1232,
+    "reasoningOutputTokens": 313
+  },
+  "scope": "independent mapper; not a debugging subject; mapping not yet independently evaluated",
+  "cache_policy": "reported zero applies only to this call; no zero-cache guarantee",
+  "debugging_trials": 0,
+  "tests_passed": 15
+}

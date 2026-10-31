@@ -1,0 +1,101 @@
+{
+  "status": "PASS",
+  "scope": "Version2 clean prototype and legal-traffic opportunities only; zero proposed mutants instantiated, no holdout admission or model inference",
+  "schedules": [
+    {
+      "schedule": "original",
+      "runs": {
+        "stock": {
+          "exit_code": 0,
+          "oracle": "PASS"
+        },
+        "research": {
+          "exit_code": 0,
+          "oracle": "PASS"
+        },
+        "reference": {
+          "exit_code": 0,
+          "oracle": "PASS"
+        }
+      },
+      "all_public_traces_equal": true,
+      "clean_opportunity_witnesses": {
+        "maximum_outstanding_writes": 16,
+        "maximum_outstanding_reads": 14,
+        "four_entry_history_evictions_of_live_reads": 65,
+        "maximum_read_age_at_first_offer_cycles": 68,
+        "responses_accepted_on_first_sampled_valid": 160,
+        "noncontiguous_partial_writes": 15,
+        "repeated_write_payload_at_different_addresses": 32
+      }
+    },
+    {
+      "schedule": "unseen",
+      "runs": {
+        "stock": {
+          "exit_code": 0,
+          "oracle": "PASS"
+        },
+        "research": {
+          "exit_code": 0,
+          "oracle": "PASS"
+        },
+        "reference": {
+          "exit_code": 0,
+          "oracle": "PASS"
+        }
+      },
+      "all_public_traces_equal": true,
+      "clean_opportunity_witnesses": {
+        "maximum_outstanding_writes": 16,
+        "maximum_outstanding_reads": 12,
+        "four_entry_history_evictions_of_live_reads": 72,
+        "maximum_read_age_at_first_offer_cycles": 64,
+        "responses_accepted_on_first_sampled_valid": 159,
+        "noncontiguous_partial_writes": 16,
+        "repeated_write_payload_at_different_addresses": 32
+      }
+    },
+    {
+      "schedule": "adversarial",
+      "runs": {
+        "stock": {
+          "exit_code": 0,
+          "oracle": "PASS"
+        },
+        "research": {
+          "exit_code": 0,
+          "oracle": "PASS"
+        },
+        "reference": {
+          "exit_code": 0,
+          "oracle": "PASS"
+        }
+      },
+      "all_public_traces_equal": true,
+      "clean_opportunity_witnesses": {
+        "maximum_outstanding_writes": 16,
+        "maximum_outstanding_reads": 13,
+        "four_entry_history_evictions_of_live_reads": 72,
+        "maximum_read_age_at_first_offer_cycles": 66,
+        "responses_accepted_on_first_sampled_valid": 161,
+        "noncontiguous_partial_writes": 21,
+        "repeated_write_payload_at_different_addresses": 32
+      }
+    }
+  ],
+  "native_capture": {
+    "oracle": "PASS",
+    "public_trace_equal": true,
+    "native": true,
+    "value": true,
+    "vcd": true
+  },
+  "mutant_instances": 0,
+  "primary_subjects": 0,
+  "template_sha256": {
+    "clean_endpoint.sv": "2e796ae7eb0259d69826b04fb6bb416c964a607cc2bd985100aebec02f30e2a7",
+    "clean_components.sv": "bd5e414bc06b7a798a6e4553c59946055b46a16173ae84d9407a62ea3e301418",
+    "tb_primary.sv": "f79581ddac778d9874fc1176de9639a90d75670fcb43722df14dff6315ab801f"
+  }
+}

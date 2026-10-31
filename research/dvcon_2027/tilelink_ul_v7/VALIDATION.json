@@ -1,0 +1,17 @@
+{
+  "status": "PASS",
+  "scope": "Publication validation only; no new model inference or experiment regrading",
+  "utc": "2026-10-31T05:26:48.305697+00:00",
+  "files_checked": 151,
+  "relative_links_checked": 48,
+  "public_harness_tests": 41,
+  "public_clean_replay": "PASS",
+  "simulator_source_identity": "Byte-identical to previously qualified research source; no new Rust full-suite/build claim",
+  "private_case_seed_transcript_export": "NONE",
+  "outcome_aggregates_preserved": true,
+  "issues": [],
+  "manifest_hashes": "PASS",
+  "archive_integrity": "PASS",
+  "staged_whitespace": "PASS",
+  "fresh_Rust_rebuild_or_full_suite": "NOT_RUN; source identity matches previously qualified build"
+}

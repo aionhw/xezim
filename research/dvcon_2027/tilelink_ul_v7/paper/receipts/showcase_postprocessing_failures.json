@@ -1,0 +1,18 @@
+{
+  "scope": "Post-campaign engineering only; original56 model outcomes, sources, controls and grades unchanged",
+  "failures": [
+    {
+      "stage": "independent_verification_001",
+      "actual_error": "TypeError: dict object is not callable; a reference-run result shadowed the imported simulation function",
+      "failure_log": "showcase_runs/review_waived_001/independent_verification_001_run.log",
+      "retained_outputs": "showcase_runs/review_waived_001/independent_verification_001",
+      "correction": "New helper and independent_verification_002 output; all selected actual submissions pass9 reference schedules and12 registered control replays, plus1 repaired value-channel observation"
+    },
+    {
+      "stage": "report_render_001",
+      "actual_error": "Permission denied recopying identical readonly sealed receipts to top-level paper artifact directory",
+      "failure_log": "showcase_runs/review_waived_001/report_render_001.log",
+      "correction": "Renderer002 skips byte-identical files and atomically replaces changed generated artifacts; sealed source receipts remain readonly"
+    }
+  ]
+}

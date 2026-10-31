@@ -1,0 +1,462 @@
+{
+  "scope": "Strict tool-qualified pilot showcase; not an independent held-out primary subject; expert mechanism/prediction grades pending",
+  "model": "gpt-6.1-sol",
+  "effort": "medium",
+  "auth": {
+    "auth_type": "chatgpt",
+    "reported_plan_type": "prolite",
+    "model": "gpt-6.1-sol",
+    "effort": "medium",
+    "hidden": false
+  },
+  "model_workspace_initial_inventory": [],
+  "tool_surface": {
+    "manifest_count": 10,
+    "allowed_tools": [
+      "read_evidence",
+      "run_controlled_experiment"
+    ]
+  },
+  "codex_sha256": "d1e71993c2faa26252c3c46aa19ceb0f9051c95ee41219f7ae423a1b6a64baac",
+  "source_hidden_seal_sha256": "fb6c67e4f15074d8bd4bdfd5bd41581d8c641bf36fef3f13444a066fc538f707",
+  "issued_evidence_hashes": {
+    "tlul_ev_0001": "66e272301428a92df0740e820ebada8a46ed967bed5e7da3e94b285d8ff4b810",
+    "tlul_ev_0002": "0bd00628b187af75e79b0bffc2be5002a8ab499b265de34e35529b2d0715b60e",
+    "tlul_ev_0003": "73206283e0c6935f6dea9a3f67c9c0b99e2732dae37970239c59c172c72f5dc0",
+    "tlul_ev_0004": "d6d32ae8c60ec666908857a0785ff774d6d8fb57ee5dded5b7d2dfa9f5772d66",
+    "tlul_ev_0005": "0947f415932b696267a1c9e3a21b4efe9bf7cea893940f48536117780700e03d",
+    "tlul_ev_0006": "f53e5c7345c6759ea9380fda96280b40217245ce9f351f68cd57df8cdaeaa5a0",
+    "tlul_ev_0007": "4f0cac5f7c985bfc8f37de1ec6c089f3c673da4dc7e43807ab7756d847d61db5"
+  },
+  "sealed_assessment": "A D-channel protocol violation is confirmed: source 7 is valid but stalled at cycle 23, then d_valid drops at cycle 24 without acceptance. Baseline pins also demonstrate concurrent outstanding requests, a D stall, an accepted partial write, and cross-source completion inversion. No passing clean run was established.",
+  "sealed_mechanism": "Evidence supports clearing response validity and retiring pending state without requiring d_valid && d_ready. The value trace shows pending[7] clearing despite its unaccepted response. Exact RTL logic remains unverified.",
+  "prediction_submitted_before_execution": {
+    "at_cycle": 23,
+    "duration_cycles": 8,
+    "prediction": "With response_backpressure asserted during cycles 23\u201330, source 7's response will lose d_valid before any D handshake, and other responses may appear during the same continuous stall. This supports response retirement/valid clearing independent of d_ready; correct retention would keep d_valid and source 7 stable until release. Inert-wire and idempotent request-throttle-zero controls should preserve the baseline cycle-24 failure.",
+    "target": "response_backpressure"
+  },
+  "intervention_receipt": {
+    "status": "PASS",
+    "all_simulator_runs_completed": true,
+    "control_comparator": "matched_sampled_cycle_not_formal_causality",
+    "prediction_timing": "submitted_before_execution",
+    "prediction_judged_by_expert": false,
+    "negative_controls_match": true,
+    "force_release_markers": true,
+    "first_non_target_difference": {
+      "cycle": 28,
+      "changed_pins": {
+        "av": [
+          1,
+          0
+        ],
+        "ar": [
+          1,
+          0
+        ],
+        "aop": [
+          1,
+          0
+        ],
+        "asrc": [
+          11,
+          4
+        ],
+        "addr": [
+          92,
+          44
+        ],
+        "mask": [
+          1,
+          15
+        ],
+        "adata": [
+          685744792,
+          1463717239
+        ]
+      }
+    },
+    "other_differences": {
+      "experiment": {
+        "cycle": 28,
+        "changed_pins": {
+          "av": [
+            1,
+            0
+          ],
+          "ar": [
+            1,
+            0
+          ],
+          "aop": [
+            1,
+            0
+          ],
+          "asrc": [
+            11,
+            4
+          ],
+          "addr": [
+            92,
+            44
+          ],
+          "mask": [
+            1,
+            15
+          ],
+          "adata": [
+            685744792,
+            1463717239
+          ]
+        }
+      },
+      "unrelated": null,
+      "idempotent": null
+    },
+    "independent_oracles": {
+      "baseline": "FAIL",
+      "experiment": "FAIL",
+      "unrelated": "FAIL",
+      "idempotent": "FAIL"
+    },
+    "oracle_observations": {
+      "baseline": {
+        "status": "FAIL",
+        "first_issues": [
+          {
+            "cycle": 24,
+            "kind": "d_stall_payload_instability"
+          },
+          {
+            "cycle": 39,
+            "kind": "d_stall_payload_instability"
+          },
+          {
+            "cycle": 41,
+            "kind": "d_stall_payload_instability"
+          }
+        ],
+        "total_issue_count": 12
+      },
+      "experiment": {
+        "status": "FAIL",
+        "first_issues": [
+          {
+            "cycle": 24,
+            "kind": "d_stall_payload_instability"
+          },
+          {
+            "cycle": 26,
+            "kind": "d_stall_payload_instability"
+          },
+          {
+            "cycle": 28,
+            "kind": "d_stall_payload_instability"
+          }
+        ],
+        "total_issue_count": 11
+      },
+      "unrelated": {
+        "status": "FAIL",
+        "first_issues": [
+          {
+            "cycle": 24,
+            "kind": "d_stall_payload_instability"
+          },
+          {
+            "cycle": 39,
+            "kind": "d_stall_payload_instability"
+          },
+          {
+            "cycle": 41,
+            "kind": "d_stall_payload_instability"
+          }
+        ],
+        "total_issue_count": 12
+      },
+      "idempotent": {
+        "status": "FAIL",
+        "first_issues": [
+          {
+            "cycle": 24,
+            "kind": "d_stall_payload_instability"
+          },
+          {
+            "cycle": 39,
+            "kind": "d_stall_payload_instability"
+          },
+          {
+            "cycle": 41,
+            "kind": "d_stall_payload_instability"
+          }
+        ],
+        "total_issue_count": 12
+      }
+    },
+    "actual_runs": 4
+  },
+  "repair_grade": "VERIFIED_REPAIR",
+  "patched_source_sha256": "6cbb5c1a4b660d8172e377020fa602f39561b8e1f830118d60544cb3f1bb9771",
+  "independent_reference_replay_of_this_strict_submission": "PASS: performed after strict submission; exact three-schedule and four-run intervention comparisons",
+  "usage": {
+    "totalTokens": 134864,
+    "inputTokens": 133878,
+    "cachedInputTokens": 96768,
+    "cacheWriteInputTokens": 0,
+    "outputTokens": 986,
+    "reasoningOutputTokens": 71
+  },
+  "wall_seconds": 35.588899231981486,
+  "sealed_alternative_hypotheses": [
+    "Response arbitration overwrites or withdraws a stalled response; premature pending retirement may be a related consequence.",
+    "A simulator scheduling or pin-sampling discrepancy creates apparent handshake loss; agreement between baseline, controlled experiment, and both negative controls makes this less likely."
+  ],
+  "native_evidence_scope": {
+    "C_subject": "Separate fresh C subject received native records from 235000 to 285000 ps, including d_valid sampled 0->1 at 275000 ps and 1->0 at 285000 ps, before the accepted-D trigger at 295000 ps.",
+    "C_seal_sha256": "feba4c4552678c5c4a9de0e9e2a45d97806e35fefff269eba906a839f996ea59",
+    "C_native_citation": "tlul_ev_0003",
+    "D_subject": "D queried only initial native context 235000\u2013245000 ps. Its final citations use PIN, writer/value and intervention evidence; do not attribute the later native transition to D or claim incremental native benefit.",
+    "cross_subject_context_transfer": false
+  },
+  "independent_verification": {
+    "scope": "Post-submission independent verification of strict pilot D; no new model subject, no expert prediction score",
+    "strict_stage1_sha256": "fb6c67e4f15074d8bd4bdfd5bd41581d8c641bf36fef3f13444a066fc538f707",
+    "fault_source_sha256": "4905c50c7c7a351fc194174709387e801d0b7108f0ab02d0d44d77cb38759de5",
+    "patched_source_sha256": "6cbb5c1a4b660d8172e377020fa602f39561b8e1f830118d60544cb3f1bb9771",
+    "registered_agent_action": {
+      "at_cycle": 23,
+      "duration_cycles": 8,
+      "prediction": "With response_backpressure asserted during cycles 23\u201330, source 7's response will lose d_valid before any D handshake, and other responses may appear during the same continuous stall. This supports response retirement/valid clearing independent of d_ready; correct retention would keep d_valid and source 7 stable until release. Inert-wire and idempotent request-throttle-zero controls should preserve the baseline cycle-24 failure.",
+      "target": "response_backpressure"
+    },
+    "reference_compiler_sha256": "e559c446de9940b187b716badec6c62878a7a3ee108ce5ff588426d4bb9c4c9b",
+    "reference_runtime_sha256": "eaccd3914e5b0f87a56df958d11d0fb937b739090242034261d487cc9ea71809",
+    "research_binary_sha256": "690ce40f8f90c4971619e99b9de9c0cb95f10ef16416e85f1b6a1c5c47038341",
+    "fault_controls_reference_status": "PASS",
+    "fault_controls_all_public_traces_match": {
+      "baseline": true,
+      "experiment": true,
+      "unrelated": true,
+      "idempotent": true
+    },
+    "patched_three_reference_schedules": [
+      {
+        "schedule": "original",
+        "exit_code": 0,
+        "oracle": "PASS",
+        "public_trace_equal_to_research": true,
+        "stimulus_sha256": "4398ba65eecd72e1e8720be9595b921bb3652eb1c9b3b20914ba7e8af7eb4eb5"
+      },
+      {
+        "schedule": "unseen",
+        "exit_code": 0,
+        "oracle": "PASS",
+        "public_trace_equal_to_research": true,
+        "stimulus_sha256": "73365ebad3388a11d2117272706a075cd66e79037dd871935f4ab7dd0af9121e"
+      },
+      {
+        "schedule": "adversarial",
+        "exit_code": 0,
+        "oracle": "PASS",
+        "public_trace_equal_to_research": true,
+        "stimulus_sha256": "edd507d4f97f11d7658a2781ec13e961c74cbed4cc4456c8c59247ab05a2a3a3"
+      }
+    ],
+    "patched_control_status": {
+      "research": "PASS",
+      "reference": "PASS"
+    },
+    "patched_all_eight_control_oracles_pass": true,
+    "patched_control_public_traces_match": {
+      "baseline": true,
+      "experiment": true,
+      "unrelated": true,
+      "idempotent": true
+    },
+    "patched_selected_stall_holds_source7": true,
+    "patched_selected_stall_samples": [
+      {
+        "cycle": 23,
+        "av": 0,
+        "ar": 0,
+        "aop": 0,
+        "asz": 2,
+        "asrc": 4,
+        "addr": 44,
+        "mask": 15,
+        "adata": 1463717239,
+        "dv": 1,
+        "dr": 0,
+        "dop": 0,
+        "dsz": 2,
+        "dsrc": 7,
+        "ddata": 0,
+        "derr": 0
+      },
+      {
+        "cycle": 24,
+        "av": 0,
+        "ar": 0,
+        "aop": 0,
+        "asz": 2,
+        "asrc": 4,
+        "addr": 44,
+        "mask": 15,
+        "adata": 1463717239,
+        "dv": 1,
+        "dr": 0,
+        "dop": 0,
+        "dsz": 2,
+        "dsrc": 7,
+        "ddata": 0,
+        "derr": 0
+      },
+      {
+        "cycle": 25,
+        "av": 0,
+        "ar": 0,
+        "aop": 0,
+        "asz": 2,
+        "asrc": 4,
+        "addr": 44,
+        "mask": 15,
+        "adata": 1463717239,
+        "dv": 1,
+        "dr": 0,
+        "dop": 0,
+        "dsz": 2,
+        "dsrc": 7,
+        "ddata": 0,
+        "derr": 0
+      },
+      {
+        "cycle": 26,
+        "av": 0,
+        "ar": 0,
+        "aop": 0,
+        "asz": 2,
+        "asrc": 4,
+        "addr": 44,
+        "mask": 15,
+        "adata": 1463717239,
+        "dv": 1,
+        "dr": 0,
+        "dop": 0,
+        "dsz": 2,
+        "dsrc": 7,
+        "ddata": 0,
+        "derr": 0
+      },
+      {
+        "cycle": 27,
+        "av": 0,
+        "ar": 0,
+        "aop": 0,
+        "asz": 2,
+        "asrc": 4,
+        "addr": 44,
+        "mask": 15,
+        "adata": 1463717239,
+        "dv": 1,
+        "dr": 0,
+        "dop": 0,
+        "dsz": 2,
+        "dsrc": 7,
+        "ddata": 0,
+        "derr": 0
+      },
+      {
+        "cycle": 28,
+        "av": 0,
+        "ar": 0,
+        "aop": 0,
+        "asz": 2,
+        "asrc": 4,
+        "addr": 44,
+        "mask": 15,
+        "adata": 1463717239,
+        "dv": 1,
+        "dr": 0,
+        "dop": 0,
+        "dsz": 2,
+        "dsrc": 7,
+        "ddata": 0,
+        "derr": 0
+      },
+      {
+        "cycle": 29,
+        "av": 0,
+        "ar": 0,
+        "aop": 0,
+        "asz": 2,
+        "asrc": 4,
+        "addr": 44,
+        "mask": 15,
+        "adata": 1463717239,
+        "dv": 1,
+        "dr": 0,
+        "dop": 0,
+        "dsz": 2,
+        "dsrc": 7,
+        "ddata": 0,
+        "derr": 0
+      },
+      {
+        "cycle": 30,
+        "av": 0,
+        "ar": 0,
+        "aop": 0,
+        "asz": 2,
+        "asrc": 4,
+        "addr": 44,
+        "mask": 15,
+        "adata": 1463717239,
+        "dv": 1,
+        "dr": 0,
+        "dop": 0,
+        "dsz": 2,
+        "dsrc": 7,
+        "ddata": 0,
+        "derr": 0
+      },
+      {
+        "cycle": 31,
+        "av": 0,
+        "ar": 0,
+        "aop": 0,
+        "asz": 2,
+        "asrc": 4,
+        "addr": 44,
+        "mask": 15,
+        "adata": 1463717239,
+        "dv": 1,
+        "dr": 0,
+        "dop": 0,
+        "dsz": 2,
+        "dsrc": 7,
+        "ddata": 0,
+        "derr": 0
+      },
+      {
+        "cycle": 32,
+        "av": 0,
+        "ar": 0,
+        "aop": 0,
+        "asz": 2,
+        "asrc": 4,
+        "addr": 44,
+        "mask": 15,
+        "adata": 1463717239,
+        "dv": 1,
+        "dr": 1,
+        "dop": 0,
+        "dsz": 2,
+        "dsrc": 7,
+        "ddata": 0,
+        "derr": 0
+      }
+    ],
+    "status": "PASS"
+  }
+}

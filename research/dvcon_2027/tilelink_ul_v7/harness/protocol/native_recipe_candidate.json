@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "name": "tlul_bounded_response_context",
+  "trigger": {
+    "type": "testbench_event",
+    "event": "accepted_d",
+    "correlation_key": "txn_id"
+  },
+  "watch": [
+    "dut.cycle_count",
+    "dut.next_pick",
+    "a_valid",
+    "a_ready",
+    "a_source",
+    "a_address",
+    "d_valid",
+    "d_ready",
+    "d_source",
+    "d_data"
+  ],
+  "capture": {
+    "fields": [
+      "time",
+      "phase",
+      "object",
+      "old",
+      "new",
+      "writer",
+      "source",
+      "txn_id"
+    ],
+    "pretrigger_events": 64,
+    "posttrigger_events": 32,
+    "max_events": 256,
+    "max_bytes": 65536
+  },
+  "policy": {
+    "unknown_field": "null_with_reason",
+    "on_budget_exhaustion": "emit_truncation_record"
+  }
+}

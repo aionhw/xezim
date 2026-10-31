@@ -1,0 +1,57 @@
+{
+  "status": "BUILT_AND_LIVE_QUALIFIED",
+  "codex_tag": "rust-v0.166.0",
+  "codex_commit": "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856",
+  "policy_environment_flag": "XEZIM_DVCON_CASE_TOOLS_ONLY=1",
+  "allowed_dynamic_functions": [
+    "read_evidence",
+    "run_controlled_experiment"
+  ],
+  "external_dependency_versions_sources_checksums_changed": false,
+  "local_workspace_version_resolution": "0.0.0 lock entries normalized to published 0.166.0 workspace version",
+  "source_patch_sha256": "37c3a5996b43589aed8688ac7cde3735ecf6f5fd8cddb76dd531c95aa503a8e5",
+  "resolved_cargo_lock_sha256": "360ea1e0ec391255ffc153a73548be524aa5d50c3476f247631cec184c21d4cb",
+  "build_packages": {
+    "libprotobuf-dev_3.21.12-8.2ubuntu0.4_amd64.deb": "acc0ec3dee7e496451656170e0210c56efd49ffcff243df8ce9893aa55f44e24",
+    "protobuf-compiler_3.21.12-8.2ubuntu0.4_amd64.deb": "10dc45fcc354dcddb50f35b73ec11ed67f55053476ddc8d3f520e2bfcfbc8016",
+    "libdbus-1-dev_1.14.10-4ubuntu4.1_amd64.deb": "ec30a44d0ae84b15ff5e50c3481b61d21d560626ce52326446135841e4cda1a5",
+    "libssl3t64_3.0.13-0ubuntu3.16_amd64.deb": "219f43b1cd836a4da550938db5fda93160d269d39a4edcf1f1ce698a470db797",
+    "libasound2-dev_1.2.11-1ubuntu0.3_amd64.deb": "b83795b1ba0e40cfa8363359fd17a06260838d8ae0f315531771a62f7c7e215a",
+    "libssl-dev_3.0.13-0ubuntu3.16_amd64.deb": "2b4734df0475e305ac03abb0a2cc5659651ed37ef02d967a1c4033a154cf714b",
+    "libprotoc32t64_3.21.12-8.2ubuntu0.4_amd64.deb": "a135645fed6c3c766cc0cf23f49e1fdf766a5611a3c80ac6f2e62f8ed6a17e45",
+    "libasound2t64_1.2.11-1ubuntu0.3_amd64.deb": "5d17bfb5683eb99f1be951fe48e1be5bf3c52391913b6b74a8aecf9b4f5e779f",
+    "libprotobuf32t64_3.21.12-8.2ubuntu0.4_amd64.deb": "765aec7fc6c7c14aea8d10677c17617d71acc5103ad580f0e97bff903acccdaf",
+    "libdbus-1-3_1.14.10-4ubuntu4.1_amd64.deb": "5d630480f04b4b442300ce847a3fa705ea4d14d80ba6de91f99b51a4e4953b08"
+  },
+  "runtime_contains": "compiled binary and matching bundled bwrap only; source patches and study artifacts excluded",
+  "raw_logs": [
+    "results/codex_strict_build_001.log",
+    "results/codex_strict_build_002.log",
+    "results/codex_strict_build_003.log",
+    "results/codex_strict_build_004.log",
+    "results/codex_strict_build_005.log",
+    "results/codex_strict_build_006.log",
+    "results/codex_strict_build_007.log"
+  ],
+  "build_attempts": {
+    "001": "FAILED: published lock workspace version mismatch",
+    "002": "FAILED: offline crate unavailable",
+    "003": "FAILED: missing OpenSSL development headers",
+    "004": "FAILED: missing multiarch header include path",
+    "005": "INTERRUPTED: cause unknown; completion receipt absent",
+    "006": "CANCELLED intentionally after long final opt-level 3 ThinLTO; observed Cargo exit 101, SIGTERM reason recorded",
+    "007": "PASS: Cargo exit 0; exact runtime binary filesystem and live case-tool qualification passed"
+  },
+  "final_cli_rustc_override": "-C opt-level=0",
+  "model_and_reasoning_change": false,
+  "codex_version": "codex-cli 0.166.0",
+  "runtime_files": {
+    "bin/codex": "d1e71993c2faa26252c3c46aa19ceb0f9051c95ee41219f7ae423a1b6a64baac",
+    "codex-resources/bwrap": "77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c"
+  },
+  "qualification_receipt": "results/tool_allowlist_live_strict_003/receipt.json",
+  "tool_presentation": "features.code_mode config with enabled=false and direct_only_tool_namespaces=[functions]",
+  "qualified_tool_surface": [
+    "read_evidence"
+  ]
+}

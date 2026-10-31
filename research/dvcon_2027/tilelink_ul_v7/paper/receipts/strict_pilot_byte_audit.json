@@ -1,0 +1,371 @@
+{
+  "scope": "Completed original52 wire audit, not retroactive regrading. Original host canonical JSON and transmitted whitespace differ; future transport is compact.",
+  "registered_limit": 131072,
+  "maximum_actual_text_bytes": 48804,
+  "subjects": [
+    {
+      "case": "named_01",
+      "mode": "A",
+      "host_canonical_bytes": 15658,
+      "actual_tool_response_text_bytes": 15807,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_01",
+      "mode": "B",
+      "host_canonical_bytes": 24077,
+      "actual_tool_response_text_bytes": 24582,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_01",
+      "mode": "C",
+      "host_canonical_bytes": 31527,
+      "actual_tool_response_text_bytes": 32539,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_01",
+      "mode": "D",
+      "host_canonical_bytes": 44821,
+      "actual_tool_response_text_bytes": 47367,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_02",
+      "mode": "A",
+      "host_canonical_bytes": 11199,
+      "actual_tool_response_text_bytes": 11400,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_02",
+      "mode": "B",
+      "host_canonical_bytes": 13381,
+      "actual_tool_response_text_bytes": 13834,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_02",
+      "mode": "C",
+      "host_canonical_bytes": 30532,
+      "actual_tool_response_text_bytes": 32531,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_02",
+      "mode": "D",
+      "host_canonical_bytes": 17161,
+      "actual_tool_response_text_bytes": 18058,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_03",
+      "mode": "A",
+      "host_canonical_bytes": 15551,
+      "actual_tool_response_text_bytes": 15701,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_03",
+      "mode": "B",
+      "host_canonical_bytes": 25889,
+      "actual_tool_response_text_bytes": 26614,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_03",
+      "mode": "C",
+      "host_canonical_bytes": 43920,
+      "actual_tool_response_text_bytes": 46101,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_03",
+      "mode": "D",
+      "host_canonical_bytes": 41612,
+      "actual_tool_response_text_bytes": 44140,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_04",
+      "mode": "A",
+      "host_canonical_bytes": 7852,
+      "actual_tool_response_text_bytes": 7928,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_04",
+      "mode": "B",
+      "host_canonical_bytes": 14570,
+      "actual_tool_response_text_bytes": 15033,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_04",
+      "mode": "C",
+      "host_canonical_bytes": 30590,
+      "actual_tool_response_text_bytes": 32628,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_04",
+      "mode": "D",
+      "host_canonical_bytes": 24689,
+      "actual_tool_response_text_bytes": 26172,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_05",
+      "mode": "A",
+      "host_canonical_bytes": 11235,
+      "actual_tool_response_text_bytes": 11344,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_05",
+      "mode": "B",
+      "host_canonical_bytes": 25085,
+      "actual_tool_response_text_bytes": 25706,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_05",
+      "mode": "C",
+      "host_canonical_bytes": 38367,
+      "actual_tool_response_text_bytes": 40379,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "named_05",
+      "mode": "D",
+      "host_canonical_bytes": 25306,
+      "actual_tool_response_text_bytes": 26474,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_01",
+      "mode": "A",
+      "host_canonical_bytes": 35462,
+      "actual_tool_response_text_bytes": 36001,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_01",
+      "mode": "B",
+      "host_canonical_bytes": 36507,
+      "actual_tool_response_text_bytes": 37496,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_01",
+      "mode": "C",
+      "host_canonical_bytes": 37484,
+      "actual_tool_response_text_bytes": 38823,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_01",
+      "mode": "D",
+      "host_canonical_bytes": 35416,
+      "actual_tool_response_text_bytes": 36611,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_02",
+      "mode": "A",
+      "host_canonical_bytes": 20558,
+      "actual_tool_response_text_bytes": 20841,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_02",
+      "mode": "B",
+      "host_canonical_bytes": 31914,
+      "actual_tool_response_text_bytes": 32781,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_02",
+      "mode": "C",
+      "host_canonical_bytes": 44727,
+      "actual_tool_response_text_bytes": 46820,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_02",
+      "mode": "D",
+      "host_canonical_bytes": 46341,
+      "actual_tool_response_text_bytes": 48804,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_03",
+      "mode": "A",
+      "host_canonical_bytes": 10066,
+      "actual_tool_response_text_bytes": 10205,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_03",
+      "mode": "B",
+      "host_canonical_bytes": 18193,
+      "actual_tool_response_text_bytes": 18880,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_03",
+      "mode": "C",
+      "host_canonical_bytes": 35731,
+      "actual_tool_response_text_bytes": 37874,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_03",
+      "mode": "D",
+      "host_canonical_bytes": 27026,
+      "actual_tool_response_text_bytes": 28323,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_04",
+      "mode": "A",
+      "host_canonical_bytes": 10066,
+      "actual_tool_response_text_bytes": 10205,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_04",
+      "mode": "B",
+      "host_canonical_bytes": 24460,
+      "actual_tool_response_text_bytes": 25239,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_04",
+      "mode": "C",
+      "host_canonical_bytes": 34081,
+      "actual_tool_response_text_bytes": 35596,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_04",
+      "mode": "D",
+      "host_canonical_bytes": 24525,
+      "actual_tool_response_text_bytes": 25588,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_05",
+      "mode": "A",
+      "host_canonical_bytes": 30983,
+      "actual_tool_response_text_bytes": 31404,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_05",
+      "mode": "B",
+      "host_canonical_bytes": 30224,
+      "actual_tool_response_text_bytes": 30865,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_05",
+      "mode": "C",
+      "host_canonical_bytes": 45304,
+      "actual_tool_response_text_bytes": 47443,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_05",
+      "mode": "D",
+      "host_canonical_bytes": 27472,
+      "actual_tool_response_text_bytes": 28737,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_06",
+      "mode": "A",
+      "host_canonical_bytes": 23471,
+      "actual_tool_response_text_bytes": 24022,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_06",
+      "mode": "B",
+      "host_canonical_bytes": 38277,
+      "actual_tool_response_text_bytes": 39236,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_06",
+      "mode": "C",
+      "host_canonical_bytes": 30962,
+      "actual_tool_response_text_bytes": 31953,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_06",
+      "mode": "D",
+      "host_canonical_bytes": 46059,
+      "actual_tool_response_text_bytes": 48522,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_07",
+      "mode": "A",
+      "host_canonical_bytes": 36311,
+      "actual_tool_response_text_bytes": 37226,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_07",
+      "mode": "B",
+      "host_canonical_bytes": 33808,
+      "actual_tool_response_text_bytes": 34339,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_07",
+      "mode": "C",
+      "host_canonical_bytes": 37351,
+      "actual_tool_response_text_bytes": 38720,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_07",
+      "mode": "D",
+      "host_canonical_bytes": 35062,
+      "actual_tool_response_text_bytes": 36257,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_08",
+      "mode": "A",
+      "host_canonical_bytes": 26784,
+      "actual_tool_response_text_bytes": 27577,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_08",
+      "mode": "B",
+      "host_canonical_bytes": 35926,
+      "actual_tool_response_text_bytes": 36921,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_08",
+      "mode": "C",
+      "host_canonical_bytes": 30925,
+      "actual_tool_response_text_bytes": 32020,
+      "above_registered_byte_limit": false
+    },
+    {
+      "case": "temporal_08",
+      "mode": "D",
+      "host_canonical_bytes": 34871,
+      "actual_tool_response_text_bytes": 36374,
+      "above_registered_byte_limit": false
+    }
+  ]
+}

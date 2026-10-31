@@ -1,0 +1,10 @@
+{
+  "status": "PUBLISHED_SANITIZED_SHOWCASE",
+  "real_model_subscription_sessions": 128,
+  "scope": "Operational debug-subject count only:20 excluded development +52 calibration +56 showcases. No pooled efficacy denominator.",
+  "showcase_subjects": 56,
+  "verified_fault_repairs": 48,
+  "verified_no_edit_clean": 8,
+  "primary_subjects": 0,
+  "human_review": "WAIVED_BY_USER_FOR_SHOWCASES"
+}

@@ -1,0 +1,41 @@
+{
+  "status": "PASS",
+  "purpose": "Post-calibration briefing and compact transport qualification; not a debugging trial or outcome retry",
+  "preflight": {
+    "auth_type": "chatgpt",
+    "reported_plan_type": "prolite",
+    "model": "gpt-6.1-sol",
+    "effort": "medium",
+    "hidden": false
+  },
+  "surface": {
+    "manifest_count": 3,
+    "allowed_tools": [
+      "read_evidence"
+    ]
+  },
+  "limits_recalled": {
+    "max_tool_calls": 12,
+    "max_evidence_bytes": 131072,
+    "max_trial_seconds": 1200,
+    "read_count_min": 1,
+    "read_count_max": 40,
+    "read_start_min": 0,
+    "control_at_min": 4,
+    "control_at_max": 2000,
+    "control_duration_min": 1,
+    "control_duration_max": 32
+  },
+  "actual_case_query_count": 1,
+  "valid_issued_citation": true,
+  "codex_sha256": "d1e71993c2faa26252c3c46aa19ceb0f9051c95ee41219f7ae423a1b6a64baac",
+  "briefing_code_sha256": "93575f144d1d8f2c3352f0b328b970a999843dde5df694e7ecdb8ddb1fe3e3aa",
+  "usage_final": {
+    "totalTokens": 18775,
+    "inputTokens": 18642,
+    "cachedInputTokens": 9088,
+    "cacheWriteInputTokens": 0,
+    "outputTokens": 133,
+    "reasoningOutputTokens": 0
+  }
+}

@@ -1,5 +1,7 @@
 <h1 align="center">Xezim</h1>
 
+DVCon 2027: [TileLink-UL showcases, measured results and reproduction artifacts](research/dvcon_2027/tilelink_ul_v7/README.md).
+
 <p align="center">
   <b>Xezim — Extensible SystemVerilog Simulator. Zero lock-in.</b>
 </p>

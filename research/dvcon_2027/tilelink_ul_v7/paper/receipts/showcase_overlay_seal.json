@@ -1,0 +1,13 @@
+{
+  "status": "SEALED_SHOWCASE_OVERLAY",
+  "utc": "2026-10-31T03:24:46.634999+00:00",
+  "scope": "User-authorized showcase-only deviation; no independent human review or primary efficacy claim",
+  "base_freeze_sha256": "d30fd0a1002fdc519f2362f5eac114bae9b8708463c948a41f5994d1b7f6b075",
+  "scope_amendment_sha256": "19c17b8be66d1b4fe1dff9ab33138f33eae6142a09679d1ed2f36539288c459f",
+  "source_sha256": {
+    "src/run_showcases.py": "a5010686665ebb1b5b18d3e11381d6ff341bf54cd3af2dee175becb4c821bbc4",
+    "src/showcase_grade.py": "6405161a650ed34a5b3e83da03428386a05b58b891050a62ad8838557f922ca9",
+    "src/showcase_policy.py": "8f427a96738c915ea7b8ba83b324a9e4b90c36e09737b67b9be550b46eee3fc6",
+    "src/showcase_trial.py": "22b7898fdd375eec6fc1f54a67bce332a5f88ec85dbe5e103d1d7f03494a1451"
+  }
+}

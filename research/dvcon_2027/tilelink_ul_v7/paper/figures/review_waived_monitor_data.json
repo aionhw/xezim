@@ -1,0 +1,39 @@
+{
+  "scope": "Measured value-channel NBA commits plus external PIN ledger; not native writer provenance or an expert diagnosis score. Lines include trusted-log context not all seen by the model; circles mark actually delivered values.",
+  "case_id": "case_52507cae2630a60c",
+  "stage1_sha256": "a5212f5a91b31fad033f296cee0627f11b0d6be55607253447b45e875aa7d498",
+  "model_delivered_count_points_in_plot": [
+    [
+      51,
+      0
+    ],
+    [
+      53,
+      30
+    ],
+    [
+      57,
+      26
+    ],
+    [
+      59,
+      24
+    ]
+  ],
+  "native_model_delivered_time_ps_range": [
+    225000,
+    265000
+  ],
+  "note": "Native records are a separate early sampled channel; no late count values are backfilled as native.",
+  "value_trace_log_sha256": {
+    "fault": "756f9259f5f954d907020284cd61dc106f6f59d7d8ffaf011d41b1975cc39256",
+    "submitted_patch": "cf95f9f223aa5bb2a6e76af00deaff3cbbc22f9514a71265794642720ae45afb"
+  },
+  "first_alarm_cycles": {
+    "baseline": 53,
+    "experiment": 70,
+    "unrelated": 53,
+    "idempotent": 53
+  },
+  "fixed_counts_equal_independent_ledger": true
+}
