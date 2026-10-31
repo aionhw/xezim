@@ -3641,7 +3641,16 @@ impl Simulator {
             if !scope.is_empty() {
                 self.process_scope_hint.insert(pid, scope);
             }
-            self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
+            let saved = std::mem::replace(&mut self.in_reactive_drain, true);
+            // §9.3.2: route program-initial processes through the scheduled-
+            // process wrapper so a process that suspends inside a class task
+            // (`c.run()` with a `#delay`/`fork..join` in its body) parks its
+            // `this`/local context for the resume. A bare `run_process_stmts`
+            // call left that context on the simulator, the next process cleared
+            // it, and the resumed method body read every member through a null
+            // `this`.
+            self.run_scheduled_process(pid, &ProcCont::from_vec(stmts));
+            self.in_reactive_drain = saved;
             if !self.is_pid_suspended(pid) {
                 ended.push(pid);
             }
