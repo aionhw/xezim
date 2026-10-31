@@ -2642,8 +2642,13 @@ impl Simulator {
         // `assign_value`, which maps the base to its instance-
         // scoped store.
         if let ExprKind::Index { expr: base, .. } = &lvalue.kind {
-            if self.expr_assoc_name(base).is_some() {
-                let v = self.eval_expr(rvalue);
+            if let Some(an) = self.expr_assoc_name(base) {
+                // §11.6.1: the element's declared width is the context of
+                // the right-hand side (`aa[k] = (1 << 70) - 1`).
+                let v = match self.assoc_elem_width(&an) {
+                    Some(w) if w > 0 => self.eval_expr_ctx(rvalue, w),
+                    _ => self.eval_expr(rvalue),
+                };
                 self.assign_value(lvalue, &v);
                 self.settle_after_proc_write();
                 return;

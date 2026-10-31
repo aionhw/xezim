@@ -518,6 +518,15 @@ impl Simulator {
                         if let Some((_, _, w)) = self.module.arrays.get(&*n) {
                             return *w;
                         }
+                        // §7.8: an associative element has the declared
+                        // element width (`ma[k] = (1 << 69) - 1`).
+                        let scoped = self.dyn_name_lookup(&n).map(|s| s.to_string());
+                        let an = scoped.as_deref().unwrap_or(&n);
+                        if self.is_associative_array(an)
+                            && let Some(w) = self.assoc_elem_width(an).filter(|&w| w > 0)
+                        {
+                            return w;
+                        }
                     }
                     if depth == 2 {
                         if let Some((_, _, w)) = self.module.arrays_2d.get(&*n) {
