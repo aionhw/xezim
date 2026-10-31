@@ -2570,10 +2570,18 @@ impl Simulator {
                         );
                     }
                 }
+                // A block with no result register is declined. Cache that,
+                // or every later call re-plans and re-lowers the whole body
+                // only to fall back to the interpreter again.
+                let Some(result_reg) = result_reg else {
+                    self.compiled_method_block_cache
+                        .insert(key, super::bytecode::CompiledMethodOutcome::Nil);
+                    return None;
+                };
                 let entry = super::bytecode::CompiledMethodEntry {
                     block: std::rc::Rc::new(block),
                     this_reg,
-                    result_reg: result_reg?,
+                    result_reg,
                 };
                 let rc = std::rc::Rc::new(entry);
                 self.compiled_method_block_cache.insert(
