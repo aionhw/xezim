@@ -14,7 +14,7 @@ Open an issue on [GitHub](https://github.com/aionhw/xezim/issues) with:
   or another simulator's result. When you checked against a commercial
   simulator, say "the reference simulator" rather than naming a product.
 * **The xezim version or commit.** `--verbose` prints the version banner
-  (`=== xezim 0.11.3 ===`).
+  (`=== xezim 0.11.4 ===`).
 
 ## Pull requests
 
@@ -39,22 +39,22 @@ Open an issue on [GitHub](https://github.com/aionhw/xezim/issues) with:
 ## Test suites
 
 Each suite is one test binary, `tests/<suite>.rs`, with its cases in
-`tests/<suite>/`. In 0.11.3, the default suite passes 5,412 tests: 5,323
-integration tests in eleven suites, 88 unit tests and one documentation test.
+`tests/<suite>/`. In 0.11.4, the default suite passes 5,838 tests: 5,728
+integration tests in eleven suites, 109 unit tests and one documentation test.
 One additional scheduling test is marked `#[ignore]`:
 
 | Suite | Tests | Covers |
 |---|---:|---|
-| `classes` | 1,132 | classes, UVM, randomization, covergroups |
-| `collections` | 331 | queues, dynamic and associative arrays, array methods |
-| `gates` | 189 | gate primitives, UDPs, drive strengths, waveform dumps |
-| `hierarchy` | 595 | instances, ports, interfaces, binds, hierarchical references |
-| `lrm` | 173 | IEEE 1800-2023 conformance cases |
-| `misc` | 1,187 | CLI, lint, elaboration, assignments and other cases |
+| `classes` | 1,287 | classes, UVM, randomization, covergroups |
+| `collections` | 374 | queues, dynamic and associative arrays, array methods |
+| `gates` | 195 | gate primitives, UDPs, drive strengths, waveform dumps |
+| `hierarchy` | 614 | instances, ports, interfaces, binds, hierarchical references |
+| `lrm` | 177 | IEEE 1800-2023 conformance cases |
+| `misc` | 1,260 | CLI, lint, elaboration, assignments and other cases |
 | `perf` | 48 | deterministic work counters that catch performance regressions |
-| `scheduling` | 678 | event regions, sensitivity, timing, assertions |
-| `strings` | 252 | strings, formatting, DPI and VPI |
-| `types` | 734 | data types, widths, selects, operators |
+| `scheduling` | 710 | event regions, sensitivity, timing, assertions |
+| `strings` | 261 | strings, formatting, DPI and VPI |
+| `types` | 798 | data types, widths, selects, operators |
 | `upf` | 4 | power intent (`--upf`) |
 
 The xezim-core repository has its own tests for the parser and elaboration.

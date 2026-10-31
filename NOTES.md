@@ -8,6 +8,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+**Performance**
+
+* An instance is elaborated against only the package parameters its
+  definition can name, not a copy of the whole package, `$unit` and top
+  parameter table (§23.10, §26.3, #740): with 4,000 package parameters no
+  module names, compiling 1,000 instances took 375.6 G instructions before
+  and 5.7 G after, and 250 instances 96.6 G and 4.0 G. The elaborated design
+  is unchanged for every design under tests/ and examples/. Reported by
+  git-hevangel.
+
+### 0.11.4 — class-object reclamation, linear elaboration, class and randomization correctness (October 2026)
+
 **Correctness**
 
 * Package type identity survives artifact reloads; nested specializations
@@ -470,6 +482,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   bincode 1.x (RUSTSEC-2025-0141). Artifacts written by earlier versions are
   refused with the usual "recompile with current xezim" message; the caches
   are rebuilt (#531, core #87).
+* The same design writes the same artifact bytes on every run: the module
+  timescale table was filled from a randomly ordered map, so one design
+  wrote two to four distinct artifacts in six runs, and three serialized
+  name sets were randomly ordered too.
 
 **Performance**
 
@@ -503,6 +519,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 * A bare top name inside a `-f` argument file names a top, as on the
   command line (#601, reported by amal-khailtash).
+* A compiled artifact named beside source files, or under `--compile`, is
+  refused with an error; it was read as source text and panicked (#738,
+  reported by git-hevangel).
 * `--fst-repack` repacks a dump path that is a symbolic link into its
   target, and removes its temporary file when the rename fails (#598,
   reported by akashlevy).
@@ -512,6 +531,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   1.5x smaller on top of the per-block LZ4, at the cost of one pass over
   the file at close and an inflate on open. A run that dies earlier leaves
   the unwrapped, crash-safe dump as before.
+
+**Validation**
+
+* xezim `fec70d6e`, pinned to xezim-core `8ebdf4a`, passes 5,838 default
+  tests with one existing ignored test, plus the two JIT smoke tests. Core
+  and parser pass 176 and 186 tests. Both repositories pass their minimum
+  supported Rust version checks.
+* Artifacts written by 0.11.3 or earlier are refused with the "recompile
+  with current xezim" message (the format is now bincode 2); recompile saved
+  designs.
 
 ### 0.11.3 — hierarchy, interfaces, assertions and collection correctness (October 2026)
 

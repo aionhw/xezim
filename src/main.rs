@@ -3367,6 +3367,26 @@ suppressed but the explicit SDF annotation still applies."
         xezim::set_design_cache(None);
     }
 
+    // An artifact is a whole elaborated design: nothing can be added to it,
+    // and it is not source text, so it must be the only file of a run.
+    if source_files.len() > 1 || mode != Mode::Simulate {
+        for sf in &source_files {
+            let mut head = [0u8; 8];
+            let is_artifact = std::fs::File::open(sf)
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
+                .is_ok()
+                && head[..7] == xezim::XEZIM_BYTECODE_MAGIC[..7];
+            if is_artifact {
+                eprintln!(
+                    "Error: '{}' is a compiled artifact: it can only be run, as the \
+                     one file on the command line; sources cannot be added to it",
+                    sf
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Fast path: if the only source file is a xezim compiled artifact, load
     // it and jump straight to simulation (skip parse + elaborate).
     if source_files.len() == 1 && mode == Mode::Simulate {

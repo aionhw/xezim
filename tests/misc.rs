@@ -578,3 +578,5 @@ mod macro_empty_actual;
 mod package_ref_signature;
 #[path = "misc/always_star_spacing.rs"]
 mod always_star_spacing;
+#[path = "misc/artifact_with_sources_738.rs"]
+mod artifact_with_sources_738;
