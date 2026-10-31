@@ -308,6 +308,7 @@ impl Simulator {
                 LocalKind::Real => (Some(64), false, true, false),
                 // Text is exempt from width fitting; leave `widths` alone.
                 LocalKind::Str => (cur.0, false, false, true),
+                LocalKind::Handle => cur,
             };
             if cur != want {
                 self.fb_meta_saves
@@ -421,6 +422,7 @@ impl Simulator {
                 }
             }
             LocalKind::Str => v,
+            LocalKind::Handle => v,
         }
     }
 

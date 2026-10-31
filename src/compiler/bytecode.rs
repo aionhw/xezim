@@ -330,6 +330,9 @@ pub enum LocalKind {
     },
     Real,
     Str,
+    /// A class handle (method mode only): carried as its value; the
+    /// interpreter types it by name from the activation's recorded metadata.
+    Handle,
 }
 
 /// One register-backed local an AST fallback reads or writes. The executor
@@ -1799,6 +1802,11 @@ pub struct BytecodeCompiler<'a> {
     /// it in a register until its epilogue, so a statement fallback carries
     /// it with that redirection set aside (`via_binding`).
     method_writeback_names: HashSet<String>,
+    /// Method mode: names whose declared type the activation records before
+    /// the body runs — formals, top-level body declarations and the result
+    /// cell. A carried class handle must be one of these, so a fallback's
+    /// member access and dispatch see its declared class.
+    method_bound_names: HashSet<String>,
     /// Step 9g: WRITABLE static-property names (bare) of the enclosing
     /// class chain — reads AND stores lower to Load/StoreClassStatic.
     static_member_names: HashSet<String>,
@@ -2199,6 +2207,7 @@ impl<'a> BytecodeCompiler<'a> {
             static_bare_targets: HashMap::default(),
             method_formal_widths: HashMap::default(),
             method_writeback_names: HashSet::default(),
+            method_bound_names: HashSet::default(),
             static_member_names: HashSet::default(),
             class_const_names: HashSet::default(),
             new_type_map: HashMap::default(),
@@ -4645,7 +4654,16 @@ impl<'a> BytecodeCompiler<'a> {
             if !is_local(self, name) {
                 continue;
             }
-            if flags & (HIER | NBA) != 0 {
+            let handle_local = self.method_mode
+                && self.method_handle_names.contains(name)
+                && self.method_bound_names.contains(name)
+                && self
+                    .local_var_regs
+                    .get(name)
+                    .is_some_and(|(r, _)| !self.local_kinds.contains_key(r));
+            // A carried handle is the base of its member accesses: the
+            // interpreter reads it from the carried frame.
+            if flags & NBA != 0 || (flags & HIER != 0 && !handle_local) {
                 return Err("fb_local_by_path");
             }
             if flags & DEFER != 0 {
@@ -4668,8 +4686,10 @@ impl<'a> BytecodeCompiler<'a> {
             let Some(&(reg, _)) = self.local_var_regs.get(name) else {
                 return Err("fb_local_array");
             };
-            let Some(&kind) = self.local_kinds.get(&reg) else {
-                return Err("fb_local_untyped");
+            let kind = match self.local_kinds.get(&reg) {
+                Some(&kind) => kind,
+                None if handle_local => LocalKind::Handle,
+                None => return Err("fb_local_untyped"),
             };
             if flags & SEL != 0
                 && (!matches!(kind, LocalKind::Int { .. })
@@ -19811,6 +19831,16 @@ impl<'a> BytecodeCompiler<'a> {
         // to the interpreter. `XEZIM_METHOD_STMT_FALLBACK=0` restores that.
         self.allow_ast_fallback = method_stmt_fallback_enabled();
         self.method_writeback_names = writeback_formals.iter().cloned().collect();
+        self.method_bound_names = formals.iter().map(|(n, _)| n.clone()).collect();
+        if let Some((rname, ..)) = result {
+            self.method_bound_names.insert(rname.to_string());
+        }
+        for st in body {
+            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+                self.method_bound_names
+                    .extend(declarators.iter().map(|d| d.name.name.clone()));
+            }
+        }
         self.allow_expr_fallback = false;
         self.allow_waits = false;
         self.method_ret_is_collection = ret_is_collection;
