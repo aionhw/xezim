@@ -5,6 +5,32 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// Isolated whole-NBA elision cannot see an earlier global pending write.
+    /// Keep that target on the canonical path, which consults the global index.
+    #[cold]
+    fn edge_overlaps_pending_nba(&self, block: usize) -> bool {
+        use super::bytecode::Insn;
+        let Some(cb) = self
+            .compiled_edge_blocks
+            .get(block)
+            .and_then(Option::as_ref)
+        else {
+            return true;
+        };
+        cb.instructions.iter().any(|insn| match insn {
+            Insn::NbaAssign(id, ..)
+            | Insn::NbaAssignConst(id, ..)
+            | Insn::NbaAssignRange(id, ..)
+            | Insn::NbaAssignRangeDyn(id, ..)
+            | Insn::NbaAssignBitDyn(id, ..)
+            | Insn::NbaAssignArrayRead(id, ..) => self.nba_fast_index.get(*id as usize).is_some(),
+            // Dynamic array targets have no fixed footprint. They are also
+            // excluded by admission; keep this boundary conservative.
+            Insn::NbaAssignArray(..) | Insn::NbaAssignArrayRange(..) => true,
+            _ => false,
+        })
+    }
+
     /// Group edge-sensitive signals that are exact copies of the same driver.
     ///
     /// A flattened netlist replicates the clock tree into per-module buffered
@@ -2636,8 +2662,17 @@ impl Simulator {
             parallel_blocks.clear();
             sequential_blocks.clear();
             let mut parallel_insn_count = 0usize;
+            let pending_unresolved = !self.nba_queue.is_empty()
+                || !self.packed_nba.is_empty()
+                || self.jit_nba_side_len != 0
+                || self.delayed_nba_due();
+            let pending_fast = !self.nba_fast.is_empty();
             for &bi in &triggered {
-                if bi < self.edge_block_parallel.len() && self.edge_block_parallel[bi] {
+                if bi < self.edge_block_parallel.len()
+                    && self.edge_block_parallel[bi]
+                    && !pending_unresolved
+                    && (!pending_fast || !self.edge_overlaps_pending_nba(bi))
+                {
                     parallel_insn_count +=
                         self.edge_block_insn_len.get(bi).copied().unwrap_or(0) as usize;
                     parallel_blocks.push(bi);

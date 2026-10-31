@@ -1328,6 +1328,44 @@ impl Simulator {
         }
     }
 
+    fn run_deferred_time0_active_work(&mut self) {
+        // IEEE 1800-2017 §9.2.2.2: an always_comb with an empty inferred
+        // sensitivity list triggers exactly once at time zero, AFTER all
+        // initial/always procedures have started (run to their first delay).
+        // We deferred these out of the pre-initial settle; fire them now — at
+        // the end of the time-0 active region, once the initial blocks above
+        // have run and suspended — so a same-time pre-delay read of the output
+        // still observes X (matches a reference simulator).
+        if self.time == 0 && !self.comb_time0_deferred_done && !self.comb_time0_deferred.is_empty()
+        {
+            self.comb_time0_deferred_done = true;
+            let deferred = std::mem::take(&mut self.comb_time0_deferred);
+            for entry in &deferred {
+                self.eval_comb_entry_full(entry);
+            }
+            self.comb_time0_deferred = deferred;
+        }
+        // Deliver `-> ev` triggers that fired during the pre-process settle
+        // now that every process has started and parked its waiters.
+        if self.time == 0 && !self.pending_t0_triggers.is_empty() {
+            let evs = std::mem::take(&mut self.pending_t0_triggers);
+            for ev in evs {
+                self.fire_named_event(&ev);
+            }
+        }
+    }
+
+    #[inline]
+    fn has_pending_nba_region_work(&self) -> bool {
+        !self.nba_fast.is_empty()
+            || self.jit_nba_side_len != 0
+            || !self.nba_queue.is_empty()
+            || !self.pending_nba_triggers.is_empty()
+            || !self.packed_nba.is_empty()
+            || !self.pending_nba_instance_triggers.is_empty()
+            || self.delayed_nba_due()
+    }
+
     // Kept out of line: inlined into the event loop, it pushed the loop's
     // other callees out of line, which cost instructions on designs without
     // assertions.
@@ -1517,6 +1555,26 @@ impl Simulator {
             // The end-of-tick fixpoint alone is too late: the `#0` resume has
             // already committed the overwrite by then.
             self.drain_condition_waiters(true, false);
+            if self.has_pending_nba_region_work() {
+                // §4.4.2 / §4.5: a blocking clock write creates Active work.
+                // Sample its edge bodies before queued NBA values become
+                // visible, including when the RHS reads its own destination.
+                self.run_deferred_time0_active_work();
+                if self.dirty_any {
+                    self.settle_combinatorial();
+                }
+                self.check_edges();
+                if self.finished || self.zero_delay_defer_pending {
+                    break;
+                }
+                // An edge body may spawn another Active process. Run it
+                // through the ordinary wheel before advancing to Inactive/NBA.
+                if self.event_queue.next_time() == Some(self.time)
+                    || !self.ready_condition_waiters.is_empty()
+                {
+                    continue;
+                }
+            }
             if self.promote_inactive_to_active() && self.event_queue.next_time() == Some(self.time)
             {
                 // Cont-assign propagation and edge-sensitive blocks are
@@ -1540,30 +1598,7 @@ impl Simulator {
         if self.finished {
             return;
         }
-        // IEEE 1800-2017 §9.2.2.2: an always_comb with an empty inferred
-        // sensitivity list triggers exactly once at time zero, AFTER all
-        // initial/always procedures have started (run to their first delay).
-        // We deferred these out of the pre-initial settle; fire them now — at
-        // the end of the time-0 active region, once the initial blocks above
-        // have run and suspended — so a same-time pre-delay read of the output
-        // still observes X (matches a reference simulator).
-        if self.time == 0 && !self.comb_time0_deferred_done && !self.comb_time0_deferred.is_empty()
-        {
-            self.comb_time0_deferred_done = true;
-            let deferred = std::mem::take(&mut self.comb_time0_deferred);
-            for entry in &deferred {
-                self.eval_comb_entry_full(entry);
-            }
-            self.comb_time0_deferred = deferred;
-        }
-        // Deliver `-> ev` triggers that fired during the pre-process settle
-        // now that every process has started and parked its waiters.
-        if self.time == 0 && !self.pending_t0_triggers.is_empty() {
-            let evs = std::mem::take(&mut self.pending_t0_triggers);
-            for ev in evs {
-                self.fire_named_event(&ev);
-            }
-        }
+        self.run_deferred_time0_active_work();
 
         let _t = profile_timing.then(std::time::Instant::now);
         // §4.5: inactive (`#0`) continuations run before this slot's NBAs.

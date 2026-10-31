@@ -440,3 +440,6 @@ mod class_or_value_change;
 
 #[path = "scheduling/preprocessor_linear_join.rs"]
 mod preprocessor_linear_join;
+
+#[path = "scheduling/active_edges_before_nba.rs"]
+mod active_edges_before_nba;
