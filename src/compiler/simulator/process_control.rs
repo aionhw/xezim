@@ -549,14 +549,16 @@ impl Simulator {
         // higher up must still see grandchildren whose intermediate parent has
         // finished). Without this, completing `X` would orphan its child `G`.
         if let Some(&grandparent) = self.process_parents.get(&child_pid) {
-            let regrandkids: Vec<usize> = self
-                .process_parents
-                .iter()
-                .filter(|&(_, &p)| p == child_pid)
-                .map(|(&c, _)| c)
-                .collect();
-            for c in regrandkids {
-                self.process_parents.insert(c, grandparent);
+            if self.process_parents.values().any(|&p| p == child_pid) {
+                let regrandkids: Vec<usize> = self
+                    .process_parents
+                    .iter()
+                    .filter(|&(_, &p)| p == child_pid)
+                    .map(|(&c, _)| c)
+                    .collect();
+                for c in regrandkids {
+                    self.process_parents.insert(c, grandparent);
+                }
             }
         }
         self.process_parents.remove(&child_pid);

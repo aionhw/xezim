@@ -3243,6 +3243,9 @@ impl Simulator {
                 {
                     return Some(Value::from_u64(1, 1));
                 }
+                if self.assoc_elem_decl_type(obj_name).is_some() {
+                    return Some(Value::from_u64(0, 1));
+                }
                 // A multidimensional associative array (`m[K1][K2]`, IEEE
                 // 1800-2023 §7.8.1) stores elements under the compound key
                 // `m[K1][K2]`; the bare `m[K1]` is never a direct entry. So a
