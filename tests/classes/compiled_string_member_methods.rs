@@ -132,3 +132,17 @@ fn string_methods_on_member_fields_compile() {
         );
     }
 }
+
+/// §8.23: another class's enum literal (`pdata::NONE`, also named through a
+/// subclass, `sub::DEEP`) folds to a constant in a compiled method; it made
+/// the whole method decline.
+#[test]
+fn class_scoped_enum_literals_compile() {
+    let log = run("1");
+    for m in ["item.owned", "item.deep", "item.as_int", "item.cnt"] {
+        assert!(
+            log.contains(&format!("runs-compiled scope={m}")),
+            "{m} did not run compiled:\n{log}"
+        );
+    }
+}

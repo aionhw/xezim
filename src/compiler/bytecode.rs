@@ -1703,6 +1703,8 @@ pub struct BytecodeCompiler<'a> {
     pkg_enum_consts_ref: Option<&'a HashMap<String, (u64, u32)>>,
     /// Enum literals visible in the method's lexical class (before global names).
     pub(crate) method_enum_constants: HashMap<String, Value>,
+    /// `Class::MEMBER` enum literals of every class (method mode).
+    pub(crate) class_scoped_enums: Option<std::rc::Rc<HashMap<String, Value>>>,
     /// Process-FSM mode (roadmap 11-12): statement-level `#delay` and
     /// `@(event)` compile to WaitDelayReg / WaitEdge instead of bailing.
     /// Never set for edge or comb blocks.
@@ -2206,6 +2208,7 @@ impl<'a> BytecodeCompiler<'a> {
             scope_hint: None,
             pkg_enum_consts_ref: None,
             method_enum_constants: HashMap::default(),
+            class_scoped_enums: None,
             allow_waits: false,
             wait_specs: Vec::new(),
             for_loop_var_ids: std::collections::HashMap::default(),
@@ -10292,6 +10295,34 @@ impl<'a> BytecodeCompiler<'a> {
         self.method_enum_constants.get(name).cloned()
     }
 
+    /// Method mode: `C::M` naming an enum literal of class `C` — parsed as
+    /// a member access on the bare name `C`, which no local, member or
+    /// signal of that name may claim.
+    fn class_scoped_enum(&self, base: &Expression, member: &str) -> Option<Value> {
+        if !self.method_mode {
+            return None;
+        }
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let class = h.path[0].name.name.as_str();
+        if self.local_var_regs.contains_key(class)
+            || self.method_handle_names.contains(class)
+            || self.bare_member_names.contains(class)
+            || self.string_member_names.contains(class)
+            || self.lookup_signal_id(h).is_some()
+        {
+            return None;
+        }
+        self.class_scoped_enums
+            .as_ref()?
+            .get(&format!("{class}::{member}"))
+            .cloned()
+    }
+
     fn lookup_param_value(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
         if let Some(value) = self.method_enum_constant(hier) {
             return Some(value);
@@ -15837,6 +15868,11 @@ impl<'a> BytecodeCompiler<'a> {
                 // signal. Only the literal `this` keyword or a method-local
                 // bound as a CLASS HANDLE qualifies; anything else keeps the
                 // pre-existing (signal/struct) paths below.
+                if let Some(v) = self.class_scoped_enum(base, &member.name) {
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::LoadConst(dest, Box::new(v)));
+                    return Some(dest);
+                }
                 if self.method_mode {
                     // class-perf: a member read rooted at an ELEMENT of a
                     // class-handle member collection (`m[k].data`,
@@ -19688,9 +19724,10 @@ impl<'a> BytecodeCompiler<'a> {
                 // both sides) at one bit and truncated the shift.
                 .or_else(|| self.bare_member_width(hier))
                 .unwrap_or(0),
-            ExprKind::MemberAccess { expr: base, member } if self.method_mode => {
-                self.handle_member_width(base, &member.name).unwrap_or(0)
-            }
+            ExprKind::MemberAccess { expr: base, member } if self.method_mode => self
+                .handle_member_width(base, &member.name)
+                .or_else(|| self.class_scoped_enum(base, &member.name).map(|v| v.width))
+                .unwrap_or(0),
             ExprKind::Number(n) => self.eval_number_static(n).map(|v| v.width).unwrap_or(32),
             ExprKind::Binary { op, left, right } => {
                 // Relational, equality, and logical operators always

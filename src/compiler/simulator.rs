@@ -8812,6 +8812,10 @@ pub struct Simulator {
     /// compiles; cleared with `compiled_method_admission` when a class is
     /// added.
     class_handle_member_types_cache: Option<std::rc::Rc<HashMap<String, HashMap<String, String>>>>,
+    /// Every class-scoped enum literal as `Class::MEMBER` -> value
+    /// (`class_enum_member`), for compiled method bodies that name another
+    /// class's literal (`pdata::NONE`). Built on first use.
+    class_scoped_enum_cache: Option<std::rc::Rc<HashMap<String, Value>>>,
     /// DPI import function prototypes by SV name, built once on the first
     /// method compile (see `dpi_import_fd_table`).
     dpi_import_fds: Option<std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>>>,

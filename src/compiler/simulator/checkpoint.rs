@@ -1143,6 +1143,7 @@ checkpoint_state!(
     class_param_arrays,
     class_prop_dim_cache,
     class_prop_struct_neg,
+    class_scoped_enum_cache,
     class_statics,
     class_string_props,
     clock_generators,

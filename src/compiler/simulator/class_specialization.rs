@@ -800,6 +800,7 @@ impl Simulator {
         self.class_member_names_cell = std::cell::OnceCell::new();
         self.compiled_method_admission = None;
         self.class_handle_member_types_cache = None;
+        self.class_scoped_enum_cache = None;
         self.persisted_method_context_hash = None;
         self.module.classes.get(&name).cloned()
     }
@@ -913,6 +914,7 @@ impl Simulator {
         // and the design context used by subsequent persistent cache probes.
         self.compiled_method_admission = None;
         self.class_handle_member_types_cache = None;
+        self.class_scoped_enum_cache = None;
         self.persisted_method_context_hash = None;
         self.spec_clone_origin
             .insert(name.clone(), cname.to_string());
@@ -3253,15 +3255,43 @@ impl Simulator {
     }
 
     pub(super) fn class_scoped_const(&mut self, start_class: &str, member: &str) -> Option<Value> {
-        // Collect the inheritance chain and its enum-typedef names + widths
-        // under an immutable borrow, then resolve under separate borrows so
-        // the later `class_static_get` (&mut self) doesn't conflict.
+        if let Some(v) = self.class_scoped_enum_literal(start_class, member) {
+            return Some(v);
+        }
+        // §8.25: a parameter of the active specialization of this class.
+        if let Some(v) = self.active_spec_param_value(start_class, member) {
+            return Some(v);
+        }
+        // Static property / localparam fallback.
         let mut chain_classes: Vec<String> = Vec::new();
+        let mut cur: Option<&str> = Some(start_class);
+        while let Some(cn) = cur {
+            chain_classes.push(cn.to_string());
+            cur = self
+                .module
+                .classes
+                .get(cn)
+                .and_then(|cd| cd.extends.as_deref());
+        }
+        for cn in &chain_classes {
+            if let Some(v) = self.class_static_get(cn, member) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// The enum literal `member` of the nearest class on `start_class`'s
+    /// chain that declares one — the first step of `class_scoped_const`.
+    pub(super) fn class_scoped_enum_literal(
+        &self,
+        start_class: &str,
+        member: &str,
+    ) -> Option<Value> {
         let mut enum_tds: Vec<(String, u32)> = Vec::new();
         {
             let mut cur: Option<&str> = Some(start_class);
             while let Some(cn) = cur {
-                chain_classes.push(cn.to_string());
                 match self.module.classes.get(cn) {
                     Some(cd) => {
                         for (td_name, dt) in &cd.typedef_targets {
@@ -3282,22 +3312,11 @@ impl Simulator {
                 }
             }
         }
-        // Enum literal lookup.
         for (td_name, w) in &enum_tds {
             if let Some(members) = self.module.enum_members.get(td_name) {
                 if let Some((_, val)) = members.iter().find(|(n, _)| n == member) {
                     return Some(Value::from_u64(*val, *w));
                 }
-            }
-        }
-        // §8.25: a parameter of the active specialization of this class.
-        if let Some(v) = self.active_spec_param_value(start_class, member) {
-            return Some(v);
-        }
-        // Static property / localparam fallback.
-        for cn in &chain_classes {
-            if let Some(v) = self.class_static_get(cn, member) {
-                return Some(v);
             }
         }
         None

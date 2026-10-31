@@ -402,6 +402,39 @@ impl Simulator {
             .collect()
     }
 
+    /// See `class_scoped_enum_cache`.
+    pub(super) fn class_scoped_enums(&self) -> HashMap<String, Value> {
+        let mut out: HashMap<String, Value> = HashMap::default();
+        for cn in self.module.classes.keys() {
+            let mut seen = HashSet::default();
+            let mut cur = Some(cn.clone());
+            while let Some(c) = cur {
+                if !seen.insert(c.clone()) {
+                    break;
+                }
+                let Some(cd) = self.module.classes.get(&c) else {
+                    break;
+                };
+                for (td_name, dt) in &cd.typedef_targets {
+                    if !matches!(dt, DataType::Enum(_)) {
+                        continue;
+                    }
+                    for (member, _) in self.module.enum_members.get(td_name).into_iter().flatten() {
+                        let key = format!("{cn}::{member}");
+                        if out.contains_key(&key) {
+                            continue;
+                        }
+                        if let Some(v) = self.class_scoped_enum_literal(cn, member) {
+                            out.insert(key, v);
+                        }
+                    }
+                }
+                cur = cd.extends.clone();
+            }
+        }
+        out
+    }
+
     pub(super) fn class_handle_member_types(&self) -> HashMap<String, HashMap<String, String>> {
         let mut out: HashMap<String, HashMap<String, String>> = HashMap::default();
         for (cn, _) in self.module.classes.iter() {
@@ -2511,6 +2544,14 @@ impl Simulator {
                     compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                     compiler.set_typedef_types(&self.module.typedef_types);
                     compiler.method_enum_constants = method_enum_constants;
+                    compiler.class_scoped_enums = Some(match &self.class_scoped_enum_cache {
+                        Some(rc) => rc.clone(),
+                        None => {
+                            let rc = std::rc::Rc::new(self.class_scoped_enums());
+                            self.class_scoped_enum_cache = Some(rc.clone());
+                            rc
+                        }
+                    });
                     compiler.set_method_formal_types(ports);
                     if let CompiledBodyKind::Function(function) = kind {
                         compiler.set_method_return_type(&function.return_type);
