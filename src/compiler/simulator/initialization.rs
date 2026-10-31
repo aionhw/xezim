@@ -4299,6 +4299,7 @@ impl Simulator {
             compiled_method_boost_qual: HashMap::default(),
             compiled_method_heat_stack: Vec::new(),
             compiled_method_loop_heat: HashMap::default(),
+            compiled_method_has_loop: HashMap::default(),
             compiled_fast_calls: HashMap::default(),
             compiled_fast_static_calls: HashMap::default(),
             compiled_spec_intern: HashMap::default(),

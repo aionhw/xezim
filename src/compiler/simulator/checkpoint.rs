@@ -1171,6 +1171,7 @@ checkpoint_state!(
     compiled_method_block_cache,
     compiled_method_boost_qual,
     compiled_method_call_counts,
+    compiled_method_has_loop,
     compiled_method_loop_heat,
     compiled_method_plans,
     compiled_method_skip,

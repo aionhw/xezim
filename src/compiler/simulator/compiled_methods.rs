@@ -590,6 +590,33 @@ impl Simulator {
     /// `lhs = new` target map (`ctxt = new;` inside `else begin…end`,
     /// uvm_objection::m_drop). VarDecls at ANY statement nesting depth
     /// count (if/else/case/loop/timing-control bodies included).
+    /// Does any statement of `body`, at any nesting depth, loop?
+    fn stmts_have_loop(body: &[Statement]) -> bool {
+        fn walk(st: &Statement) -> bool {
+            use crate::ast::stmt::StatementKind as SK;
+            match &st.kind {
+                SK::For { .. }
+                | SK::Foreach { .. }
+                | SK::ForeachTail { .. }
+                | SK::While { .. }
+                | SK::DoWhile { .. }
+                | SK::Repeat { .. }
+                | SK::Forever { .. }
+                | SK::ForeverTail { .. } => true,
+                SK::If {
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => walk(then_stmt) || else_stmt.as_deref().is_some_and(walk),
+                SK::Case { items, .. } => items.iter().any(|it| walk(&it.stmt)),
+                SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => stmts.iter().any(walk),
+                SK::TimingControl { stmt, .. } | SK::Wait { stmt, .. } => walk(stmt),
+                _ => false,
+            }
+        }
+        body.iter().any(walk)
+    }
+
     pub(super) fn class_typed_local_types(&self, body: &[Statement]) -> Vec<(String, String)> {
         fn walk(st: &Statement, sim: &Simulator, out: &mut Vec<(String, String)>) {
             use crate::ast::stmt::StatementKind as SK;
@@ -1461,7 +1488,12 @@ impl Simulator {
                 .copied()
                 .unwrap_or(0)
                 >= tier as u64;
-        if tier > 0 && !loop_hot {
+        let has_loop = method_tier_default()
+            && *self
+                .compiled_method_has_loop
+                .entry((cid, mid, spec_id))
+                .or_insert_with(|| Self::stmts_have_loop(body));
+        if tier > 0 && !loop_hot && !has_loop {
             let calls = self
                 .compiled_method_call_counts
                 .entry((cid, mid, spec_id))

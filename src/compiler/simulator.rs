@@ -317,6 +317,11 @@ fn method_tier_threshold() -> u32 {
 /// attempts compilation after that heat reaches the threshold. Unsupported
 /// bodies remain interpreted, and an unset tier retains call-count admission.
 #[inline]
+/// The tier threshold was left at its default (no `XEZIM_METHOD_TIER`).
+fn method_tier_default() -> bool {
+    !method_boost_enabled()
+}
+
 fn method_boost_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("XEZIM_METHOD_TIER").is_some())
@@ -8461,6 +8466,10 @@ pub struct Simulator {
     /// -> treated as loop-hot (compiles) instead of compiling any short loop
     /// on first call.
     compiled_method_loop_heat: HashMap<(u32, u32, u32), u64>,
+    /// Per (class, method, spec): does the body contain a loop? Such a
+    /// method compiles on its first call under the default tier: one call
+    /// can run many iterations, so a call count says little about its cost.
+    compiled_method_has_loop: HashMap<(u32, u32, u32), bool>,
     /// class-perf P3: direct VM->VM dispatch entries for `CallMethod`,
     /// keyed (cid, mid) of the DEFINING class. `Pending` re-probes after
     /// the plan / block caches fill; `Never` is a permanent decline
