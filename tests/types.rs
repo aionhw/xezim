@@ -534,6 +534,8 @@ mod arithmetic_shift_xz;
 
 #[path = "types/child_param_packed_elem_width.rs"]
 mod child_param_packed_elem_width;
+#[path = "types/packed_localparam_element_select.rs"]
+mod packed_localparam_element_select;
 
 #[path = "types/unsigned_context_501.rs"]
 mod unsigned_context_501;
