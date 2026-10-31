@@ -3544,7 +3544,7 @@ impl Simulator {
             if guard > 128 {
                 break;
             }
-            if c == entry {
+            if c == entry || self.same_class_id(c, entry) {
                 return true;
             }
             cur = self
@@ -3554,6 +3554,47 @@ impl Simulator {
                 .and_then(|cd| cd.extends.as_deref());
         }
         false
+    }
+
+    /// Do `a` and `b` name the SAME class declaration (under possibly
+    /// different scoped spellings) with the SAME specialization suffix?
+    ///
+    /// A class declared inside a scoped unit can be referred to as its scoped
+    /// name (`test.wrap_c`) or its bare leaf (`wrap_c`), and the elaborator
+    /// dually-keys both to an `ElaboratedClass` whose canonical `name` is the
+    /// same. This node check lets a specialization-identity walk (used by the
+    /// `$cast` dep-class and dep-typedef checks) join those spellings the way
+    /// `class_is_a` already does, while preserving the specialization
+    /// distinction: names with different `#(...)`/`<...>` suffixes stay
+    /// distinct (a `wrap_c#(1)` is never the same class as `wrap_c#(2)`).
+    fn same_class_id(&self, a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        let split = |s: &str| {
+            if let Some(i) = s.find('#') {
+                (s[..i].to_string(), Some(s[i..].to_string()))
+            } else if let Some(i) = s.find('<') {
+                let rest = &s[i..];
+                let inner = rest
+                    .strip_suffix('>')
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| rest.to_string());
+                (s[..i].to_string(), Some(inner))
+            } else {
+                (s.to_string(), None)
+            }
+        };
+        let (ba, sa) = split(a);
+        let (bb, sb) = split(b);
+        if sa != sb {
+            return false;
+        }
+        match (self.module.classes.get(&ba).map(|x| x.name.clone()),
+               self.module.classes.get(&bb).map(|x| x.name.clone())) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
     }
 
     /// Parse a value-parameter spec fragment (decimal or based literal)
