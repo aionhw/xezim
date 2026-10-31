@@ -979,6 +979,12 @@ impl Simulator {
                 let i = self.eval_expr(index).to_i64().unwrap_or(0);
                 return Some(format!("{}[{}]", row, i));
             }
+            // §7.8: a row of a multidimensional associative array
+            // (`o.p["k"][3]` of `int p[string][int][$]`) is keyed by value.
+            if self.is_associative_array(&row) {
+                let kv = self.eval_expr(index);
+                return Some(format!("{}[{}]", row, self.assoc_key_str(&row, &kv)));
+            }
             return None;
         }
         let bn = match self.strip_rand_receiver_prefix(base) {

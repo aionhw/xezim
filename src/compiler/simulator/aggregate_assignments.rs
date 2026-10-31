@@ -683,6 +683,15 @@ impl Simulator {
             })
             .collect();
         let any = !entries.is_empty();
+        // §7.4.5: each copied row is a collection of its own; create it as
+        // declared (creating empties it, so before its cells land).
+        for (k, _) in &entries {
+            if let Some(row) = k.strip_suffix(".size")
+                && self.is_declared_row(row)
+            {
+                self.ensure_row(row);
+            }
+        }
         for (k, v) in entries {
             self.signals.insert(k, v);
         }

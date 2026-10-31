@@ -2237,6 +2237,8 @@ impl Simulator {
         // running each time, as an automatic one would.
         let explicit_static = matches!(lifetime, Some(crate::ast::types::Lifetime::Static));
         for d in declarators {
+            // Set below for an unpacked collection; never carried over.
+            self.pending_local_shape = None;
             if explicit_static
                 && !self.static_local_syncs.is_empty()
                 && self.hoisted_sub_static_names.contains(&d.name.name)
@@ -2627,6 +2629,16 @@ impl Simulator {
                     None
                 };
             let dims = scope_sized.as_ref().unwrap_or(dims);
+            // §7.4.5: its declared shape, for a per-call storage key. A
+            // block-scope local keeps its bare name, recorded at elaboration.
+            self.pending_local_shape = CollShape::of(dims, |kdt| {
+                super::elaborate::coll_key_kind(
+                    kdt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                    Some(&self.module.typedef_types),
+                )
+            });
             // §7.4.5 / §7.8: a local unpacked array whose ELEMENT is a
             // collection (`int q[3][$]`, `int v[2][string][string]`), as a
             // module-scope one is registered in elaboration: the fixed outer
@@ -2677,6 +2689,7 @@ impl Simulator {
                     } else {
                         bare
                     };
+                    self.adopt_local_shape(&name);
                     match shape.len() {
                         2 => {
                             self.module
@@ -2795,6 +2808,7 @@ impl Simulator {
                         } else {
                             bare.clone()
                         };
+                        self.adopt_local_shape(&name);
                         self.module.arrays.insert(name.clone(), (0, -1, w));
                         self.module.dynamic_arrays.insert(name.clone());
                         if name != bare {
@@ -2941,6 +2955,7 @@ impl Simulator {
                         } else {
                             self.declare_local_dyn(&bare)
                         };
+                        self.adopt_local_shape(&name);
                         let is_string_key = key_dt.as_ref().is_some_and(|dt| {
                             matches!(
                                 dt.as_ref(),
@@ -3137,6 +3152,7 @@ impl Simulator {
                 } else {
                     bare.clone()
                 };
+                self.adopt_local_shape(&name);
                 if name == bare
                     && let Some(frame) = self.local_dyn.last_mut()
                     && !frame.iter().any(|(local, _)| local == &bare)
@@ -6422,6 +6438,7 @@ impl Simulator {
         } else {
             self.declare_local_dyn(&bare)
         };
+        self.adopt_local_shape(&name);
         match shape.len() {
             1 => {
                 self.module

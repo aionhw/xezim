@@ -379,12 +379,201 @@ impl Simulator {
     /// a CYCLIC object graph depends on. An empty nested sub-array can't be
     /// proven from a stored key, but `first`/`num`/`size` on an empty array
     /// return 0 anyway.
+    ///
+    /// §7.4.4: a declared collection answers from its declaration — the
+    /// queue row `m[0]` of `int m[int][$]` is no associative array however
+    /// many `m[0][i]` cells it holds (a pop leaves its vacated cell, #765).
+    /// The stored-key proof remains for undeclared stores.
     pub(super) fn is_nested_assoc_elem(&self, name: &str) -> bool {
+        if let Some(dim) = self.declared_dim(name) {
+            return matches!(dim, Dim::Assoc(_));
+        }
         if self.assoc_registered_prefix(name).is_none() {
             return false;
         }
         let nested_prefix = format!("{name}[");
         self.signal_name_prefix_present(&nested_prefix)
+    }
+
+    /// §7.4.4: the kind of the collection stored as `name` — its declared
+    /// dimension at the depth `name` selects to (`m[k]` of `int m[int][$]`
+    /// is the queue `dims[1]`). `None` for an undeclared store, or a select
+    /// past the unpacked dimensions (a bit select, §11.5.1).
+    pub(super) fn declared_dim(&self, name: &str) -> Option<&Dim> {
+        let (shape, depth) = self.coll_shape_at(name)?;
+        let dim = shape.dims.get(depth)?;
+        // §7.8.6 Table 7-1: a row past the size of a queue or dynamic array
+        // above it does not exist, so has no kind (`v[1]` of a one-row
+        // `int v[][string]` reads as an empty array).
+        let mut row = name;
+        for parent_dim in shape.dims[..depth].iter().rev() {
+            let p = row.rfind('[')?;
+            if matches!(parent_dim, Dim::Queue | Dim::Dyn) {
+                let idx = row[p + 1..row.len() - 1].parse::<u64>().ok()?;
+                if idx >= self.get_queue_size(&row[..p]) {
+                    return None;
+                }
+            }
+            row = &row[..p];
+        }
+        Some(dim)
+    }
+
+    /// The declared [`CollShape`] of the collection `name` belongs to, and
+    /// how many selects `name` applies below its root: a root `m`, a row
+    /// `m[k1]..[kn]`, an object's `<h>#m[..]`, a class static `C::m` /
+    /// `C#spec::m`, a package `p::m`, or a local `@m#n`. Borrowed lookups
+    /// only, one per level.
+    pub(super) fn coll_shape_at(&self, name: &str) -> Option<(&CollShape, usize)> {
+        let mut root = name;
+        let mut depth = 0;
+        loop {
+            if let Some(shape) = self.root_coll_shape(root) {
+                return Some((shape, depth));
+            }
+            if !root.ends_with(']') {
+                return None;
+            }
+            root = &root[..root.rfind('[')?];
+            depth += 1;
+        }
+    }
+
+    /// The declared shape stored under the unselected name `root`.
+    fn root_coll_shape(&self, root: &str) -> Option<&CollShape> {
+        if let Some(shape) = self.module.coll_shapes.get(root) {
+            return Some(shape);
+        }
+        if root.starts_with('@') {
+            return self.local_coll_shapes.get(root);
+        }
+        // Most stores are plain names: one byte scan each rules out the
+        // static/package and object-property forms below.
+        let bytes = root.as_bytes();
+        // A class static (`C::m`, `C#spec::m`) or a package item (`p::m`,
+        // recorded under its bare name).
+        if bytes.contains(&b':')
+            && let Some((owner, member)) = root.rsplit_once("::")
+        {
+            let class = owner.split('#').next().unwrap_or(owner);
+            return self
+                .class_prop_shape(class, member)
+                .or_else(|| self.module.coll_shapes.get(member));
+        }
+        // An object's property `<h>#m`.
+        if !bytes.contains(&b'#') {
+            return None;
+        }
+        let (h, member) = root.split_once('#')?;
+        if !self.class_member_names().shaped_props.contains(member) {
+            return None;
+        }
+        let handle = h.parse::<usize>().ok()?;
+        let class = self.heap.get(handle)?.as_ref()?.class_name.as_str();
+        self.class_prop_shape(class, member)
+    }
+
+    /// The shape of property `member` as declared by `class` or the nearest
+    /// class it extends.
+    /// Make the declared row `name` (`m[k1]..[kn]`) exist for a write — an
+    /// assignment to it or a mutating method on it — creating each absent
+    /// level of its path as its declared kind. The parent's kind decides
+    /// whether an absent row may be created: an associative array allocates
+    /// the entry (§7.8.7), a queue grows only at `$+1` (§7.10.1), and a
+    /// dynamic or fixed array must already hold the index — writing past it
+    /// is ignored (§7.4.5, §7.5.1). The keys come from `name`, so no index
+    /// is evaluated again (§11.4.1). Returns false when the write must be
+    /// ignored; true for an undeclared store, which the legacy paths own.
+    pub(super) fn ensure_row(&mut self, name: &str) -> bool {
+        let Some((shape, depth)) = self.coll_shape_at(name) else {
+            return true;
+        };
+        if depth == 0 || depth > shape.dims.len() {
+            return true;
+        }
+        let dims = shape.dims.clone();
+        // The path's prefixes, outermost first: `m`, `m[k1]`, ..., `name`.
+        let mut ends = Vec::with_capacity(depth + 1);
+        let mut end = name.len();
+        ends.push(end);
+        for _ in 0..depth {
+            end = match name[..end].rfind('[') {
+                Some(p) => p,
+                None => return true,
+            };
+            ends.push(end);
+        }
+        ends.reverse();
+        let root = &name[..ends[0]];
+        let w = self
+            .module
+            .assoc_elem_widths
+            .get(root)
+            .or_else(|| self.module.arrays.get(root).map(|t| &t.2))
+            .copied()
+            .unwrap_or(32);
+        for level in 1..=depth {
+            let (parent, row) = (&name[..ends[level - 1]], &name[..ends[level]]);
+            let mut registered = self.module.dynamic_arrays.contains(row)
+                || self.module.associative_arrays.contains_key(row);
+            // A queue or dynamic parent holds the rows below its size, however
+            // many it has registered (elaboration registers placeholders).
+            match &dims[level - 1] {
+                Dim::Queue | Dim::Dyn => {
+                    let idx = row[parent.len() + 1..row.len() - 1].parse::<u64>();
+                    let size = self.get_queue_size(parent);
+                    match idx {
+                        Ok(i) if i < size => {}
+                        Ok(i) if i == size && dims[level - 1] == Dim::Queue => {
+                            // A new row starts empty, whatever an earlier row
+                            // at this index left behind.
+                            self.set_queue_size(parent, size + 1);
+                            registered = false;
+                        }
+                        _ => return false,
+                    }
+                }
+                Dim::Assoc(_) | Dim::Fixed => {}
+            }
+            if registered {
+                continue;
+            }
+            match dims.get(level) {
+                Some(Dim::Queue | Dim::Dyn) => {
+                    self.module.dynamic_arrays.insert(row.to_string());
+                    self.module
+                        .arrays
+                        .entry(row.to_string())
+                        .or_insert((0, 63, w));
+                    if !registered
+                        || !self
+                            .signals
+                            .contains_key(&Self::name_with_suffix(row, ".size"))
+                    {
+                        self.set_queue_size(row, 0);
+                    }
+                }
+                Some(Dim::Assoc(k)) => {
+                    let is_str = *k == KeyKind::String;
+                    self.module
+                        .associative_arrays
+                        .insert(row.to_string(), is_str);
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    fn class_prop_shape(&self, class: &str, member: &str) -> Option<&CollShape> {
+        let mut cd = self.module.classes.get(class)?;
+        for _ in 0..64 {
+            if let Some(shape) = cd.prop_coll_shapes.get(member) {
+                return Some(shape);
+            }
+            cd = self.module.classes.get(cd.extends.as_deref()?)?;
+        }
+        None
     }
 
     /// True if any stored signal name starts with `prefix`. Mirrors the prefix
@@ -1413,8 +1602,19 @@ impl Simulator {
             // the array its compound key starts at (see
             // `multidim_assoc_elem`), so `v[0]["A"].exists("B")` looks up the
             // key the write stored.
-            None if name.ends_with(']') && !name.contains('#') => {
-                if let Some(base) = self.assoc_registered_prefix(name)
+            None if name.ends_with(']') => {
+                // §7.8.1: a declared level has its own key type, not its
+                // ancestor's (`x["a"]` of `int x[string][int][$]` is keyed
+                // by `int`). A named key type falls through.
+                match self.declared_dim(name) {
+                    Some(Dim::Assoc(KeyKind::String)) => return true,
+                    Some(Dim::Assoc(KeyKind::Integral { .. } | KeyKind::Wildcard)) => {
+                        return false;
+                    }
+                    _ => {}
+                }
+                if !name.contains('#')
+                    && let Some(base) = self.assoc_registered_prefix(name)
                     && let Some(&is_str) = self.module.associative_arrays.get(base)
                 {
                     return is_str;
@@ -3579,13 +3779,45 @@ impl Simulator {
     /// LRM semantics where each automatic-variable declaration gets fresh
     /// storage. (Nested block-scope shadowing of the same name is not fully
     /// modelled by a flat per-frame map; it is rare in practice.)
+    /// §7.4.5: record the pending declared shape of the local just declared
+    /// under the storage name `name` it was given, unless `declare_local_dyn`
+    /// already did (a block local outside any subroutine keeps its bare name).
+    pub(super) fn adopt_local_shape(&mut self, name: &str) {
+        if let Some(shape) = self.pending_local_shape.take() {
+            self.register_local_shape(name, shape);
+        }
+    }
+
+    /// Record a local's declared shape under its storage name: a per-call
+    /// key (`@l#n`) replaces any earlier one; a bare name never overrides a
+    /// same-named module-scope collection's own shape.
+    fn register_local_shape(&mut self, name: &str, shape: CollShape) {
+        // A one-dimensional local (`int q[$]`) has no rows to type.
+        if shape.dims.len() < 2 {
+            return;
+        }
+        self.local_coll_rows_live |= Self::has_queue_rows(&shape);
+        self.has_coll_rows = true;
+        if name.starts_with('@') {
+            self.local_coll_shapes.insert(name.to_string(), shape);
+        } else {
+            self.module
+                .coll_shapes
+                .entry(name.to_string())
+                .or_insert(shape);
+        }
+    }
+
     pub(super) fn declare_local_dyn(&mut self, bare: &str) -> String {
         // Kill-switch for debugging the per-process local-dyn-array rename.
         static NO_DYN_RENAME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *NO_DYN_RENAME.get_or_init(|| std::env::var_os("XEZIM_NO_DYN_RENAME").is_some()) {
-            return bare.to_string();
-        }
-        if self.local_dyn.is_empty() {
+        let shape = self.pending_local_shape.take();
+        if *NO_DYN_RENAME.get_or_init(|| std::env::var_os("XEZIM_NO_DYN_RENAME").is_some())
+            || self.local_dyn.is_empty()
+        {
+            if let Some(shape) = shape {
+                self.register_local_shape(bare, shape);
+            }
             return bare.to_string();
         }
         // Clean up a prior same-frame declaration so the new one starts fresh.
@@ -3604,6 +3836,9 @@ impl Simulator {
         key.push_str(bare);
         key.push('#');
         Self::push_i64(&mut key, id as i64);
+        if let Some(shape) = shape {
+            self.register_local_shape(&key, shape);
+        }
         let frame = self.local_dyn.last_mut().unwrap();
         if let Some(slot) = frame.iter_mut().find(|(k, _)| k == bare) {
             slot.1 = key.clone();
@@ -3711,6 +3946,9 @@ impl Simulator {
         self.module.arrays_2d.remove(key);
         self.module.arrays_nd.remove(key);
         self.module.associative_arrays.remove(key);
+        if !self.local_coll_shapes.is_empty() {
+            self.local_coll_shapes.remove(key);
+        }
         self.module.assoc_index_widths.remove(key);
         self.module.queue_max_sizes.remove(key);
         self.module.descending_arrays.remove(key);

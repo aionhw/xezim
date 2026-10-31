@@ -5227,9 +5227,13 @@ impl Simulator {
                 // Element of an unpacked array of ASSOCIATIVE arrays:
                 // `a[i][key]` looks the key up in the assoc array `a[i]`.
                 if let Some(elem) = self.indexed_assoc_elem(expr, index) {
-                    return self
-                        .get_signal_value_by_name(&elem)
-                        .unwrap_or_else(|| Value::new(32));
+                    return self.get_signal_value_by_name(&elem).unwrap_or_else(|| {
+                        // §7.8.6: a missing key reads the element type's
+                        // default (0 for a 2-state type), not x.
+                        let base = elem.rfind('[').map_or(elem.as_str(), |p| &elem[..p]);
+                        self.assoc_missing_elem_value(base)
+                            .unwrap_or_else(|| Value::new(32))
+                    });
                 }
                 // Multidimensional associative-array read `m[k1][k2]...[kn]`:
                 // look up the flat compound key `m[K1][K2]...[Kn]`. Mirrors

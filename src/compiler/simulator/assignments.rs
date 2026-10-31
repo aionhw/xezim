@@ -2310,115 +2310,19 @@ impl Simulator {
     /// `a["p"][7]`, each keyed by its own declared key type.
     /// Returns the innermost row when it is a QUEUE, for the append rule.
     fn ensure_assoc_row(&mut self, row_expr: &Expression) -> Option<String> {
-        use crate::ast::types::UnpackedDimension as UD;
-        // The key selects, outermost first, down to the array's name.
-        let mut keys: Vec<&Expression> = Vec::new();
-        let mut cur = row_expr;
-        while let ExprKind::Index { expr, index } = &cur.kind {
-            keys.push(index);
-            cur = expr;
-        }
-        keys.reverse();
-        if keys.is_empty() {
+        // A row is a select (`m[k]`); a plain `a[i] = v` has none to create.
+        if !matches!(row_expr.kind, ExprKind::Index { .. }) {
             return None;
         }
-        let Some((name, dims)) = self.assoc_row_owner(cur) else {
-            return None;
-        };
-        if !self.is_associative_array(&name) || keys.len() > dims.len() {
-            return None;
-        }
-        let w = self.assoc_elem_width(&name).unwrap_or(32);
-        let depth = keys.len();
-        let mut parent = name;
-        for (level, key) in keys.into_iter().enumerate() {
-            // Only an associative parent is keyed by value here; a row
-            // below a queue or fixed dimension has its own paths.
-            if !self.is_associative_array(&parent) {
-                return None;
-            }
-            let kv = self.eval_expr(key);
-            if kv.has_xz() && !kv.is_real && !self.is_string_keyed_array(&parent) {
-                return None;
-            }
-            let row = format!("{}[{}]", parent, self.assoc_key_str(&parent, &kv));
-            let exists = self.module.dynamic_arrays.contains(&row)
-                || self.module.associative_arrays.contains_key(&row)
-                || self
-                    .get_signal_value_by_name(&Self::name_with_suffix(&row, ".size"))
-                    .is_some();
-            if !exists {
-                match &dims[level] {
-                    UD::Queue { .. } | UD::Unsized(_) => {
-                        self.module.dynamic_arrays.insert(row.clone());
-                        self.module.arrays.entry(row.clone()).or_insert((0, 63, w));
-                        self.set_queue_size(&row, 0);
-                    }
-                    UD::Associative { data_type, .. } => {
-                        let is_str = data_type.as_ref().is_some_and(|dt| {
-                            matches!(
-                                dt.as_ref(),
-                                crate::ast::types::DataType::Simple {
-                                    kind: crate::ast::types::SimpleType::String,
-                                    ..
-                                }
-                            )
-                        });
-                        self.module.associative_arrays.insert(row.clone(), is_str);
-                    }
-                    _ => return None,
-                }
-            }
-            parent = row;
-        }
-        matches!(dims.get(depth - 1), Some(UD::Queue { .. })).then_some(parent)
-    }
-
-    /// The store of an associative array of collections named by `base`
-    /// and its row dimensions: a module-scope or block-local array
-    /// (`assoc_row_dims`), or an object's member (`this.m`, `h.m`, a bare `m`
-    /// in a method) whose class records them (`assoc_row_property_dims`).
-    fn assoc_row_owner(
-        &mut self,
-        base: &Expression,
-    ) -> Option<(String, Vec<crate::ast::types::UnpackedDimension>)> {
-        if let ExprKind::Ident(hier) = &base.kind
-            && hier.path.len() == 1
-            && hier.path[0].selects.is_empty()
-        {
-            let name = self.resolve_hier_name(hier).into_owned();
-            if let Some(d) = self
-                .module
-                .assoc_row_dims
-                .get(&name)
-                .or_else(|| self.module.assoc_row_dims.get(&hier.path[0].name.name))
-            {
-                return Some((name, d.clone()));
-            }
-            if self.no_class_objects() {
-                return None;
-            }
-            let store = self.instance_assoc_member(&name)?;
-            return self.class_assoc_row_dims(&store).map(|d| (store, d));
-        }
-        if self.no_class_objects() {
+        // An associative root names its keys by level; any other root (a
+        // queue of associative arrays, a local's `@l#n`) by its flat name.
+        let row = self
+            .nested_index_name(row_expr)
+            .or_else(|| self.flat_member_name(row_expr))?;
+        if !self.is_declared_row(&row) || !self.ensure_row(&row) {
             return None;
         }
-        let store = self.expr_assoc_name(base)?;
-        self.class_assoc_row_dims(&store).map(|d| (store, d))
-    }
-
-    /// `assoc_row_property_dims` of the member stored at `<handle>#prop`.
-    fn class_assoc_row_dims(
-        &self,
-        store: &str,
-    ) -> Option<Vec<crate::ast::types::UnpackedDimension>> {
-        let (h, prop) = store.split_once('#')?;
-        let handle = h.parse::<usize>().ok()?;
-        self.class_prop_declarer(handle, prop)?
-            .assoc_row_property_dims
-            .get(prop)
-            .cloned()
+        matches!(self.declared_dim(&row), Some(Dim::Queue)).then_some(row)
     }
 
     fn assoc_elem_bit_write(
@@ -2501,7 +2405,7 @@ impl Simulator {
         if let Some(r) = self.assoc_elem_bit_write(expr, index, val) {
             return r;
         }
-        if self.has_assoc_rows
+        if self.has_coll_rows
             && let Some(row) = self.ensure_assoc_row(expr)
         {
             // §7.10.1: a write at index == size APPENDS to a queue row

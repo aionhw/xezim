@@ -88,6 +88,23 @@ impl Simulator {
     }
 
     pub(super) fn eval_call_inner(&mut self, func: &Expression, args: &[Expression]) -> Value {
+        // §11.4.1, §7.8.7: a receiver's selects (`m[f()].push_back(x)`) are
+        // evaluated once; the dispatch below resolves the receiver several
+        // times, so a side-effecting select is folded to its value first.
+        if let ExprKind::MemberAccess { expr: recv, member } = &func.kind
+            && matches!(recv.kind, ExprKind::Index { .. })
+            && Self::lvalue_has_incdec_index(recv)
+            && let Some(frozen) = self.rewrite_lvalue_index_side_effects(recv)
+        {
+            let func = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(frozen),
+                    member: member.clone(),
+                },
+                func.span,
+            );
+            return self.eval_call_inner(&func, args);
+        }
         if let Some(key) = self.package_dpi_call_key(func) {
             if let Some(value) = self.exec_dpi_import_call(&key, args) {
                 return value;
@@ -1236,7 +1253,10 @@ impl Simulator {
                     if let Some(cn) = self.nested_index_name(expr) {
                         // Ensure the nested queue is registered so later
                         // index/foreach/concat reads resolve it.
-                        if matches!(mname, "push_back" | "push_front" | "insert") {
+                        // (A declared row is created by `eval_builtin_method`.)
+                        if matches!(mname, "push_back" | "push_front" | "insert")
+                            && !self.is_declared_row(&cn)
+                        {
                             self.module.dynamic_arrays.insert(cn.clone());
                             self.module.arrays.entry(cn.clone()).or_insert((0, 63, 32));
                         }

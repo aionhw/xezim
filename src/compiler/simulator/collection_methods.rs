@@ -2646,6 +2646,18 @@ impl Simulator {
                 }
             }
         }
+        // §7.8.7, §7.10.1: a mutating method writes its receiver: a declared
+        // row it selects is created first if its parent allows, else the
+        // write is ignored (§7.4.5).
+        if matches!(
+            bm,
+            BuiltinM::PushBack | BuiltinM::PushFront | BuiltinM::Insert
+        ) && obj_name.ends_with(']')
+            && self.is_declared_row(obj_name)
+            && !self.ensure_row(obj_name)
+        {
+            return Some(Value::zero(32));
+        }
         if bm == BuiltinM::PushBack {
             if let Some(arg) = args.first() {
                 // LRM §8.4: if the queue's element type is a class and

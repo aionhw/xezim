@@ -202,6 +202,7 @@ impl Simulator {
             let mut static_methods: HashSet<String> = HashSet::default();
             let mut params: HashSet<String> = HashSet::default();
             let mut assoc_props: HashSet<String> = HashSet::default();
+            let mut shaped_props: HashSet<String> = HashSet::default();
             let mut string_props: HashSet<String> = HashSet::default();
             let mut static_or_param: HashSet<String> = HashSet::default();
             let mut constant_arrays: HashSet<String> = HashSet::default();
@@ -248,6 +249,11 @@ impl Simulator {
                 params.extend(cd.type_param_names.iter().cloned());
                 params.extend(cd.param_order.iter().cloned());
                 assoc_props.extend(cd.assoc_properties.keys().cloned());
+                shaped_props.extend(
+                    (cd.prop_coll_shapes.iter())
+                        .filter(|(_, shape)| shape.dims.len() >= 2)
+                        .map(|(n, _)| n.clone()),
+                );
                 static_or_param.extend(cd.static_properties.iter().cloned());
                 static_or_param.extend(cd.param_defaults.iter().map(|(n, _)| n.clone()));
                 static_or_param.extend(cd.array_properties.keys().filter(|name| {
@@ -359,6 +365,7 @@ impl Simulator {
                 param_first,
                 params,
                 assoc_props,
+                shaped_props,
                 string_props,
                 static_or_param,
                 constant_arrays,

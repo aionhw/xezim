@@ -576,8 +576,14 @@ impl Simulator {
     /// array rooted at `root`: a row registered as an associative array of
     /// its own (`ensure_assoc_row`) uses its declared key type, a queue or
     /// dynamic row takes an element index, and an unregistered level (a row
-    /// a whole copy made) is keyed like the root.
+    /// a whole copy made) is keyed like the root. §7.4.4: a declared level
+    /// is keyed as declared, whether or not it is registered yet.
     fn nested_level_key(&self, level: &str, root: &str, kv: &Value) -> String {
+        match self.declared_dim(level) {
+            Some(Dim::Assoc(_)) => return self.assoc_key_str(level, kv),
+            Some(_) => return kv.to_i64().unwrap_or(0).to_string(),
+            None => {}
+        }
         if self.module.associative_arrays.contains_key(level) {
             self.assoc_key_str(level, kv)
         } else if level != root && self.module.dynamic_arrays.contains(level) {

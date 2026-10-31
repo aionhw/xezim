@@ -190,3 +190,63 @@ I '{1:'{"a":2}, 3:'{"b":4}} '{"x":'{5:'{7, 8}}} 2"#;
     let got = shown(src, &["A ", "B ", "C ", "D ", "E ", "F ", "G ", "H ", "I "]);
     assert_eq!(got.join("\n"), want, "{got:#?}");
 }
+
+/// §7.10.2.4-§7.10.2.5: `pop_front`/`pop_back` on a queue row remove the
+/// element, and the row's `size`, `sum` and `delete` see only the elements
+/// left — for integer- and string-keyed rows, a block-local array, a row
+/// two keys deep, a row made by an element write and a class-member row
+/// reached through `this` and through a handle. A row declared associative
+/// (`int g[int][int]`) keeps its key count (#765).
+#[test]
+fn popped_queue_rows_shrink() {
+    let src = r#"module tb;
+  int m [int][$];
+  int s [string][$];
+  int e [string][int][$];
+  int g [int][int];
+  int x;
+  class C;
+    int q [int][$];
+    function int pop_own(); void'(q[4].pop_back()); return q[4].size(); endfunction
+  endclass
+  C o;
+  initial begin
+    m[0].push_back(1); void'(m[0].pop_front()); $display("A %0d", m[0].size());
+    m[1].push_back(1); m[1].push_back(2); m[1].push_back(3);
+    void'(m[1].pop_front()); $display("B %0d %0d %p", m[1].size(), m[1].sum(), m);
+    x = m[1].pop_back(); $display("C %0d %0d %0d", x, m[1].size(), m[1].sum());
+    m[1].delete(); $display("D %0d %0d", m[1].size(), m.num());
+    m[2][0] = 7; void'(m[2].pop_front()); $display("E %0d", m[2].size());
+    s["a"].push_back(5); void'(s["a"].pop_front()); $display("F %0d", s["a"].size());
+    e["k"][3].push_back(1); void'(e["k"][3].pop_back()); $display("G %0d %0d", e["k"][3].size(), e["k"].num());
+    begin
+      int l [int][$];
+      l[7].push_back(1); void'(l[7].pop_front()); $display("H %0d", l[7].size());
+    end
+    o = new; o.q[3].push_back(1); void'(o.q[3].pop_front());
+    o.q[4].push_back(1); o.q[4].push_back(2);
+    $display("I %0d %0d", o.q[3].size(), o.pop_own());
+    g[1][2] = 5; g[1][7] = 6; $display("J %0d", g[1].num());
+    g[1].delete(2); $display("K %0d %0d", g[1].num(), g[1].size());
+  end
+endmodule
+"#;
+    let want = r#"A 0
+B 2 5 '{0:'{}, 1:'{2, 3}}
+C 3 1 2
+D 0 2
+E 0
+F 0
+G 0 1
+H 0
+I 0 1
+J 2
+K 1 1"#;
+    let got = shown(
+        src,
+        &[
+            "A ", "B ", "C ", "D ", "E ", "F ", "G ", "H ", "I ", "J ", "K ",
+        ],
+    );
+    assert_eq!(got.join("\n"), want, "{got:#?}");
+}

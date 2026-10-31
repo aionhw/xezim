@@ -15,7 +15,9 @@ use super::{
     bytecode, dispatch, elaborate, fst_sink, interrupt, jit, sdf, stdout_sink, value, vcd_sink,
 };
 
-use super::elaborate::{AlwaysBlock, DpiImportSpec, ElaboratedModule, Signal};
+use super::elaborate::{
+    AlwaysBlock, CollShape, Dim, DpiImportSpec, ElaboratedModule, KeyKind, Signal,
+};
 use super::value::{LogicBit, Value};
 use crate::ast::decl::{
     AlwaysKind, ClassConstraint, ConstraintItem, ConstraintRange, CovergroupDeclaration,
@@ -3469,6 +3471,10 @@ struct ClassMemberNames {
     params: HashSet<String>,
     /// Every associative-array property name.
     assoc_props: HashSet<String>,
+    /// Every property some class records a multidimensional collection
+    /// shape for (`prop_coll_shapes`): a prefilter for the declared-shape
+    /// lookup, which a one-dimensional property never needs.
+    shaped_props: HashSet<String>,
     /// Every `string` property name.
     string_props: HashSet<String>,
     /// Every static property and class `localparam` name: the only names
@@ -6266,9 +6272,10 @@ pub struct Simulator {
     forced_signals: HashMap<usize, Value>,
     /// Annex N seed of a no-seed `$random` (§20.15.1); starts at 0.
     annex_n_seed: i32,
-    /// Whether any module array or class member is an associative array
-    /// of collections with recorded rows (see `ensure_assoc_row`).
-    has_assoc_rows: bool,
+    /// Whether any collection of collections is declared (a recorded
+    /// [`CollShape`], or a local registering one at runtime): the one-load
+    /// gate in front of row creation on an element write.
+    has_coll_rows: bool,
     /// §10.6.2 bit/part-select forces on nets, by signal id. Each id is
     /// also in `forced_signals` (so ordinary writes drop) and has a
     /// `partial` `active_force_exprs` entry that re-merges the drivers.
@@ -8236,6 +8243,16 @@ pub struct Simulator {
     /// collections, keyed by the local's storage; dropped with it (see
     /// `declare_local_coll_array`, `cleanup_dyn_storage`).
     local_coll_elems: HashMap<String, Vec<String>>,
+    /// §7.4.5: the declared shape of the local being declared, registered
+    /// under the per-call storage key `declare_local_dyn` gives it.
+    pending_local_shape: Option<CollShape>,
+    /// Whether a subroutine-local collection of collections was declared,
+    /// which the indexed-collection gates then also look up per frame.
+    local_coll_rows_live: bool,
+    /// Declared shapes of subroutine locals under their per-call keys
+    /// (`@l#n`), apart from `module.coll_shapes`: one entry per call comes
+    /// and goes, which in the large module table forced rehashes.
+    local_coll_shapes: HashMap<String, CollShape>,
     /// Declared associative tails of dynamic roots and their scoped rows.
     dynamic_assoc_dims: HashMap<String, Vec<crate::ast::types::UnpackedDimension>>,
     /// `(callee member, caller member)` collection copy-backs of the dynamic

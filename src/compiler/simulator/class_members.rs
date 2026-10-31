@@ -1642,12 +1642,28 @@ impl Simulator {
                     }
                 }
             }
+            // §7.4.5: a declared collection of collections, whatever its
+            // outer kind. Its rows are registered only as they are created,
+            // so the scan above misses one that has none yet.
+            for (n, shape) in &self.module.coll_shapes {
+                if Self::has_queue_rows(shape) {
+                    set.insert(n.clone());
+                    if let Some((_, leaf)) = n.rsplit_once('.') {
+                        set.insert(leaf.to_string());
+                    }
+                }
+            }
             let mut work: Vec<DataType> = Vec::new();
             for cd in self.module.classes.values() {
                 // A class property that is itself a fixed array of
                 // collections (`int q[3][$]`): its elements are stored
                 // per object (see `class_array_of_coll_key`).
                 set.extend(cd.array_of_coll_properties.keys().cloned());
+                set.extend(
+                    (cd.prop_coll_shapes.iter())
+                        .filter(|(_, shape)| Self::has_queue_rows(shape))
+                        .map(|(n, _)| n.clone()),
+                );
                 work.extend(cd.property_types.values().cloned());
             }
             work.extend(self.module.typedef_types.values().cloned());
@@ -1684,7 +1700,9 @@ impl Simulator {
     /// every indexed-collection probe.
     #[inline(always)]
     pub(super) fn indexed_colls_live(&self) -> bool {
-        self.indexed_coll_mask.get() != 0 || self.indexed_coll_roots.get().is_none()
+        self.indexed_coll_mask.get() != 0
+            || self.indexed_coll_roots.get().is_none()
+            || self.local_coll_rows_live
     }
 
     /// Whether `name` may be one of [`indexed_coll_roots`]: the length
@@ -1706,7 +1724,10 @@ impl Simulator {
         let ExprKind::Index { expr: base, .. } = &e.kind else {
             return false;
         };
-        if self.indexed_coll_mask.get() == 0 && self.indexed_coll_roots.get().is_some() {
+        if self.indexed_coll_mask.get() == 0
+            && self.indexed_coll_roots.get().is_some()
+            && !self.local_coll_rows_live
+        {
             return false;
         }
         let mut cur = base.as_ref();
@@ -1721,7 +1742,17 @@ impl Simulator {
             ExprKind::MemberAccess { member, .. } => member.name.as_str(),
             _ => return false,
         };
-        self.indexed_coll_root(name)
+        self.indexed_coll_root(name) || (self.local_coll_rows_live && self.local_coll_root(name))
+    }
+
+    /// Whether `bare` names a subroutine-local collection of collections,
+    /// stored under its per-call key with a declared shape (§7.4.5).
+    fn local_coll_root(&self, bare: &str) -> bool {
+        let shape = match self.dyn_name_lookup(bare) {
+            Some(key) if key.starts_with('@') => self.local_coll_shapes.get(key),
+            _ => self.module.coll_shapes.get(bare),
+        };
+        shape.is_some_and(Self::has_queue_rows)
     }
 
     /// §7.4.5/§7.6/§7.10: `q3[0] = q3[1]`, `s.sp[3] = '{..}`, `r = q3[1]` —
@@ -1739,6 +1770,10 @@ impl Simulator {
             let Some(name) = self.indexed_coll_name(lvalue) else {
                 return false;
             };
+            // §7.8.7, §7.4.5: create the target row, or ignore the write.
+            if !self.ensure_row(&name) {
+                return true;
+            }
             let dt = self
                 .struct_member_coll_of(&name)
                 .map(|(_, dt, _)| dt)
@@ -1808,13 +1843,62 @@ impl Simulator {
         if let Some(n) = self.flat_member_name(e)
             && (self.module.dynamic_arrays.contains(&n)
                 || self.module.associative_arrays.contains_key(&n)
+                || self.is_existing_row(&n)
                 || (self.struct_colls_possible() && self.ensure_struct_member_coll(&n)))
         {
             return Some(n);
         }
         // An element of a class property that is a fixed array of
-        // collections lives under the object-scoped key `<h>#q[i]`.
-        self.class_fixed_array_of_coll_key(e)
+        // collections lives under the object-scoped key `<h>#q[i]`; a row
+        // of any other collection property under `<h>#m[k]`.
+        self.class_fixed_array_of_coll_key(e).or_else(|| {
+            self.coll_elem_expr_key(e)
+                .filter(|k| self.is_existing_row(k))
+        })
+    }
+
+    /// A declared row (see [`is_declared_row`]) that exists — one past the
+    /// size of a queue or dynamic array above it does not (§7.8.6) — or the
+    /// `$+1` slot of a queue, which a write creates (§7.10.1).
+    pub(super) fn is_existing_row(&self, name: &str) -> bool {
+        self.is_declared_row(name)
+            && (self.declared_dim(name).is_some() || self.is_queue_append_slot(name))
+    }
+
+    /// Whether `name` (`q[i]`) selects index `q.size()` of the queue of
+    /// collections `q`.
+    fn is_queue_append_slot(&self, name: &str) -> bool {
+        let Some((shape, depth)) = self.coll_shape_at(name) else {
+            return false;
+        };
+        let Some(p) = name.rfind('[') else {
+            return false;
+        };
+        depth >= 1
+            && shape.dims[depth - 1] == Dim::Queue
+            && name[p + 1..name.len() - 1].parse::<u64>().ok()
+                == Some(self.get_queue_size(&name[..p]))
+    }
+
+    /// §7.4.5: whether `name` is a row of a declared collection of
+    /// collections — selected below its root, above its leaf elements —
+    /// whether or not it exists yet.
+    pub(super) fn is_declared_row(&self, name: &str) -> bool {
+        self.coll_shape_at(name).is_some_and(|(shape, depth)| {
+            depth >= 1 && shape.dims.get(depth).is_some_and(|d| *d != Dim::Fixed)
+        })
+    }
+
+    /// Whether `shape` has a row that is a queue or dynamic array, which a
+    /// whole assignment (`m[k] = q`) builds element by element. A fixed row
+    /// is laid out by its bounds, and an associative row by the
+    /// multidimensional associative paths.
+    pub(super) fn has_queue_rows(shape: &CollShape) -> bool {
+        shape
+            .dims
+            .iter()
+            .skip(1)
+            .any(|d| matches!(d, Dim::Queue | Dim::Dyn))
     }
 
     /// Evaluate a scalar expression to an i64 in a `&self` context (literals,
