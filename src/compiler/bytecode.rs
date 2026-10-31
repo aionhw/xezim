@@ -19146,6 +19146,41 @@ impl<'a> BytecodeCompiler<'a> {
         self.local_var_regs.get(name).map(|&(r, _)| r)
     }
 
+    /// Method mode: the declared width of the bare instance member `hier`
+    /// names (not a local or formal), when it is a fixed-width integral.
+    fn bare_member_width(&self, hier: &HierarchicalIdentifier) -> Option<u32> {
+        if !self.method_mode
+            || hier.root.is_some()
+            || hier.path.len() != 1
+            || !hier.path[0].selects.is_empty()
+        {
+            return None;
+        }
+        let name = hier.path[0].name.name.as_str();
+        if self.local_var_regs.contains_key(name) || !self.bare_member_names.contains(name) {
+            return None;
+        }
+        self.class_field_width(self.method_class.as_deref()?, name)
+    }
+
+    /// Method mode: the declared width of `base.member` through an admitted
+    /// handle chain, when it is a fixed-width integral.
+    fn handle_member_width(&self, base: &Expression, member: &str) -> Option<u32> {
+        if !self.method_handle_chain_ok(base) || !self.method_instance_field_ok(base, member) {
+            return None;
+        }
+        self.class_field_width(&self.method_handle_chain_class(base)?, member)
+    }
+
+    fn class_field_width(&self, class: &str, field: &str) -> Option<u32> {
+        self.method_admission
+            .as_ref()?
+            .instance_field_widths
+            .get(class)?
+            .get(field)
+            .copied()
+    }
+
     fn expr_max_width(&self, expr: &Expression) -> u32 {
         match &expr.kind {
             ExprKind::Ident(hier) => self
@@ -19167,7 +19202,14 @@ impl<'a> BytecodeCompiler<'a> {
                 // masked the result away: every iteration read `arr[off]`.
                 // `local_var_regs` already carries the declared width.
                 .or_else(|| self.local_var_reg_of(hier).map(|(_, w)| w))
+                // A bare instance member in a method body has its declared
+                // width too; 0 here sized `(burst << 3) != line` (members on
+                // both sides) at one bit and truncated the shift.
+                .or_else(|| self.bare_member_width(hier))
                 .unwrap_or(0),
+            ExprKind::MemberAccess { expr: base, member } if self.method_mode => {
+                self.handle_member_width(base, &member.name).unwrap_or(0)
+            }
             ExprKind::Number(n) => self.eval_number_static(n).map(|v| v.width).unwrap_or(32),
             ExprKind::Binary { op, left, right } => {
                 // Relational, equality, and logical operators always

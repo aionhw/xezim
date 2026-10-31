@@ -615,6 +615,8 @@ mod compiled_collection_return_store;
 mod compiled_string_local_byte;
 #[path = "classes/compiled_member_redeclared.rs"]
 mod compiled_member_redeclared;
+#[path = "classes/compiled_member_operand_width.rs"]
+mod compiled_member_operand_width;
 #[path = "classes/int_property_named_like_struct_property.rs"]
 mod int_property_named_like_struct_property;
 #[path = "classes/compiled_method_test_env.rs"]
