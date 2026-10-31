@@ -61,6 +61,31 @@ simulator".
   builds without `UVM_NO_DPI` — xezim provides the UVM DPI-C helpers
   natively, no shared library needed).
 
+## Activity profiles
+
+`XEZIM_ACTIVITY_PROFILE=activity.json xezim --simulate --no-cache design.sv`
+writes diagnostic activity data without requiring `--profile` or timing
+instrumentation. `XEZIM_ACTIVITY_STRIDE=N` selects approximately one in N
+settle invocations for the correlation sketch (default 64; use 1 for all).
+Selection hashes invocation IDs to avoid aliasing periodic clock activity.
+
+The versioned JSON contains fingerprints of the elaborated input, final
+ordered entry layout and running executable; runtime options, plusargs and
+tick precision; exact evaluation and distinct-invocation counts; and 16-word
+MinHash sketches. Separate invocations at the same timestamp have different
+IDs; repeated passes within one invocation share an ID. A null sketch means
+no sampled observations. Instruction counts are static and byte footprints
+are logical signal widths, not measured execution costs or memory traffic.
+
+Collection covers the canonical combinational worklist, disables its gate
+lane, and excludes eager clock-tree and direct port-negedge evaluations.
+BSP collection is rejected. These profiles therefore describe an
+instrumented path; measure collection overhead separately. Fingerprints are
+noncryptographic content keys; external firmware, input files and libraries
+still require their own frozen receipts. Output is replaced atomically.
+Profiles currently supply observations only: they do not change scheduling,
+fusion, partitioning or admission, and are not consumed by `XEZIM_COACT_FILE`.
+
 ## Scheduler A/B switches
 
 Same-edge process ordering is reference-verified (always blocks first, then

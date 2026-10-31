@@ -2571,6 +2571,7 @@ impl NbaFastIndex {
 }
 
 mod aggregate_assignments;
+mod activity_profile;
 mod annex_n;
 mod aggregate_expressions;
 mod aggregate_members;
@@ -8815,6 +8816,8 @@ pub struct Simulator {
     coact_edge_count: Vec<u64>,
     coact_epoch: Vec<u64>,
     coact_enabled: bool,
+    /// Optional diagnostic collector; never consulted for execution admission.
+    activity_profile: Option<Box<activity_profile::ActivityProfile>>,
     /// Precomputed indices of comb_entries that should fire unconditionally
     /// at time=0: entries with empty read_signal_ids, or always_comb blocks.
     /// Avoids an O(num_entries) scan on every settle call while time=0.

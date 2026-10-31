@@ -20,6 +20,14 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Scheduling: force active-region semantics for edge continuations (0/1)",
     ),
     (
+        "XEZIM_ACTIVITY_PROFILE",
+        "Profiling: write canonical comb activity counts, identity and sampled sketches as JSON",
+    ),
+    (
+        "XEZIM_ACTIVITY_STRIDE",
+        "Profiling: inverse activity-sketch sampling rate (positive integer, default 64)",
+    ),
+    (
         "XEZIM_ALLOW_IMPLICIT_STATIC",
         "Elab: accept static-lifetime locals with initializers without warning",
     ),

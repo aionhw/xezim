@@ -1651,6 +1651,9 @@ impl Simulator {
 
     pub fn new(mut module: ElaboratedModule, max_time: u64) -> Self {
         let phase_total = std::time::Instant::now();
+        // Fingerprint the elaborated input before initialization or compilation
+        // mutates it. No serialization work when profiling is disabled.
+        let activity_profile = activity_profile::ActivityProfile::requested(&module).map(Box::new);
         // The simulator counts ticks of `module.tick_s` (the finest timescale
         // precision; 1 ns by default). Delays were pre-scaled to ticks at
         // elaboration. `max_time` is supplied in nanoseconds, so convert it to
@@ -4419,6 +4422,7 @@ impl Simulator {
             coact_edge_count: Vec::new(),
             coact_epoch: Vec::new(),
             coact_enabled: false,
+            activity_profile,
             comb_time0_idx: Vec::new(),
             comb_time0_fired: false,
             comb_time0_deferred: Vec::new(),

@@ -1055,6 +1055,7 @@ impl Simulator {
         }
         mark_compile_phase("structural delay setup", &mut compile_phase_start);
         self.build_comb_entries();
+        self.prepare_activity_profile();
         self.dump_comb_graph();
         #[cfg(feature = "jit")]
         self.jit_compile_comb_entries();

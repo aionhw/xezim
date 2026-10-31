@@ -2629,6 +2629,7 @@ impl Simulator {
         self.dump_cycle_census();
         self.dump_chain_census();
         self.dump_coact_census();
+        self.dump_activity_profile();
         chatter!(
             "[PROF] edge_detect={:.1}ms edge_exec={:.1}ms edges_fired={} insns={} ns_per_insn={:.1} fallbacks={}",
             self.prof_edge_detect as f64 / 1e6,

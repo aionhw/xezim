@@ -3,6 +3,9 @@
 //! Guards against PERFORMANCE regressions using deterministic work counters
 //! rather than wall-clock, which would flake. See the module below.
 
+#[path = "perf/activity_profile.rs"]
+mod activity_profile;
+
 #[path = "perf/work_counters.rs"]
 mod work_counters;
 

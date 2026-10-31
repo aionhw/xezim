@@ -1305,6 +1305,10 @@ impl Simulator {
         self.settling = true;
         self.settle_calls += 1;
 
+        if let Some(profile) = self.activity_profile.as_mut() {
+            profile.begin_epoch(self.time, self.proc_settle_defer);
+        }
+
         // Edges first: picking the controlling-value gates changes which
         // entries the gate lane may take.
         if self.comb_dep_edges.len() != self.comb_dep_entries.len()
@@ -1365,6 +1369,7 @@ impl Simulator {
         // The lane bypasses the per-entry hooks (activity monitor, trace,
         // per-entry profile, path census), so it is off while any is armed.
         let lane_on = !self.activity_mon
+            && self.activity_profile.is_none()
             && self.trace_always.is_none()
             && !self.profile_report
             && !self.trace_comb_paths
@@ -1581,6 +1586,7 @@ impl Simulator {
         // or CLI modes, fixed for the settle, so a normal run tests one bool
         // per evaluation instead of six.
         let diag_on = self.trace_comb_paths
+            || self.activity_profile.is_some()
             || self.coact_enabled
             || prof_on
             || mon_on
@@ -2007,6 +2013,9 @@ impl Simulator {
                     n_repass += 1;
                 }
                 if diag_on {
+                    if let Some(profile) = self.activity_profile.as_mut() {
+                        profile.record(eidx);
+                    }
                     if self.trace_comb_paths {
                         if eidx >= self.comb_eval_counts.len() {
                             self.comb_eval_counts.resize(eidx + 1, [0; 2]);
