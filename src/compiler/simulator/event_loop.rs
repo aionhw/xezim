@@ -2580,6 +2580,11 @@ impl Simulator {
             .filter(|e| e.has_unresolved_reads)
             .count();
         chatter!(
+            "[PROF] condition_waiter_rechecks={}",
+            self.cond_waiter_rechecks
+        );
+        chatter!("[PROF] vm_direct_calls={}", self.vm_direct_calls);
+        chatter!(
             "[PROF] edge_waiters={:.1}ms edge_cg={:.1}ms waiter_iters={}",
             self.prof_edge_waiters as f64 / 1e6,
             self.prof_edge_cg as f64 / 1e6,

@@ -2139,6 +2139,14 @@ impl Simulator {
                 // time (§8.15 super / §8.20 non-virtual bare call): run
                 // the body via the hierarchy walk from that class —
                 // non-virtual, ctor chaining included.
+                if let Some(v) =
+                    self.vm_try_direct_call_from(handle, Some(start_class), method, base, n)
+                {
+                    self.vm_regs[*dest as usize] = v;
+                    self.vm_ret_coll = self.pending_ret_collection.clone();
+                    local_count += 1;
+                    return local_count;
+                }
                 let (args, temps) = self.vm_args_with_writeback(start_class, method, base, n);
                 let result = if handle == 0 {
                     // Null receiver (unreachable for instance frames;

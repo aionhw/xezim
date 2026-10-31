@@ -8529,6 +8529,12 @@ pub struct Simulator {
     /// proceeds). The condition-waiter fixpoint uses it to detect "no progress
     /// this round" and stop (genuine stall).
     cond_progress: u64,
+    /// Parked `wait(cond)` waiters a drain rescheduled to re-evaluate
+    /// (`[PROF] condition_waiter_rechecks`).
+    cond_waiter_rechecks: u64,
+    /// Compiled-to-compiled calls dispatched directly (`vm_try_direct_call_from`),
+    /// without the interpreter's binding (`[PROF] vm_direct_calls`).
+    vm_direct_calls: u64,
     /// SV-2023: blocked mailbox `get`/`peek` proxies keyed by mailbox handle.
     /// Each waiter records the suspended process pid, the destination lvalue
     /// expression to receive the value, and the post-get continuation

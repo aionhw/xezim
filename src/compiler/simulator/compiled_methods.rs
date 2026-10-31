@@ -3734,6 +3734,21 @@ impl Simulator {
         arg_base: usize,
         n: usize,
     ) -> Option<Value> {
+        self.vm_try_direct_call_from(handle, None, method, arg_base, n)
+    }
+
+    /// `vm_try_direct_call` for a call bound at compile time to start at
+    /// `start` (`CallScopedMethod`: a bare call of the class's own method,
+    /// §8.20 non-virtual, or `super.m()`, §8.15) — the body is the one
+    /// declared at or above `start`, not the object's virtual override.
+    pub(super) fn vm_try_direct_call_from(
+        &mut self,
+        handle: usize,
+        start: Option<&str>,
+        method: &str,
+        arg_base: usize,
+        n: usize,
+    ) -> Option<Value> {
         if !fast_calls_enabled() || handle == 0 || method == "new" {
             return None;
         }
@@ -3771,7 +3786,10 @@ impl Simulator {
         // non-virtual method that a subclass redeclares never reaches here:
         // the compiler lowers such a call to `CallScopedMethod` starting at
         // the receiver's declared class (`MethodAdmission::nonvirtual_targets`).
-        let leaf = inst.class_name.clone();
+        let leaf = match start {
+            Some(s) => s.to_string(),
+            None => inst.class_name.clone(),
+        };
         if Self::proc_handle_to_pid(handle as u64).is_some() {
             return None;
         }
@@ -3903,6 +3921,7 @@ impl Simulator {
             args.push(v);
         }
         // --- every guard passed; state changes from here on ---
+        self.vm_direct_calls += 1;
         self.push_queue_frame();
         self.this_stack.push(Some(handle));
         self.class_context_stack.push(Some((*md.class).clone()));

@@ -1563,6 +1563,7 @@ checkpoint_state!(
     vif_tokens_stored,
     viface_var_aliases,
     virtual_iface_bindings,
+    vm_direct_calls,
     vm_regs,
     vpi_slot_started,
     wake_rank_buf,
