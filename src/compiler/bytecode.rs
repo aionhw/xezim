@@ -18361,7 +18361,9 @@ impl<'a> BytecodeCompiler<'a> {
                 // (0), exactly like the interpreter's heap store — the module
                 // widths fallback said 32 and truncated
                 // uvm_tlm_generic_payload::set_address's 64-bit `bit [63:0]`
-                // actual to 32 (20extfunc printed 'h90abcdef).
+                // actual to 32 (20extfunc printed 'h90abcdef). §11.6.1: a
+                // field of fixed declared width is the context, as for
+                // `this.m = rhs`, so `m = (1 << n) - 1` keeps the carry.
                 if self.method_mode
                     && hier.root.is_none()
                     && hier.path.len() == 1
@@ -18371,7 +18373,7 @@ impl<'a> BytecodeCompiler<'a> {
                     if !self.local_var_regs.contains_key(bare)
                         && self.bare_member_names.contains(bare)
                     {
-                        return 0;
+                        return self.bare_member_width(hier).unwrap_or(0);
                     }
                     // Step 9g: a bare STATIC-property store evaluates its
                     // RHS self-determined — class_static_set stores the
