@@ -639,6 +639,8 @@ mod stale_enum_local_name;
 mod compiled_method_stmt_fallback;
 #[path = "classes/compiled_method_handle_carry.rs"]
 mod compiled_method_handle_carry;
+#[path = "classes/compiled_fallback_member_named_local.rs"]
+mod compiled_fallback_member_named_local;
 #[path = "classes/int_property_named_like_struct_property.rs"]
 mod int_property_named_like_struct_property;
 #[path = "classes/compiled_method_test_env.rs"]

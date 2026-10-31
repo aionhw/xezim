@@ -204,10 +204,11 @@ impl FbScan<'_> {
             let seg = &h.path[0];
             let sel = if seg.selects.is_empty() { 0 } else { SEL };
             self.note(&seg.name.name, flags | sel);
-        } else {
-            for seg in &h.path {
-                self.note(&seg.name.name, flags | HIER);
-            }
+        } else if let Some(head) = h.path.first() {
+            // Only the head of a dotted name can be a local: the later
+            // segments are members of what it names (`this.name`, `h.f`),
+            // so a register local that shares a member's name is not used.
+            self.note(&head.name.name, flags | HIER);
         }
         for seg in &h.path {
             for s in &seg.selects {
@@ -231,8 +232,7 @@ impl FbScan<'_> {
                 self.expr(left);
                 self.expr(right);
             }
-            ExprKind::MemberAccess { expr, member } => {
-                self.note(&member.name, WRITE | HIER | flags);
+            ExprKind::MemberAccess { expr, .. } => {
                 self.lvalue(expr, HIER | flags);
             }
             ExprKind::Paren(inner) => self.lvalue(inner, flags),
@@ -343,9 +343,7 @@ impl FbScan<'_> {
                 match &func.kind {
                     ExprKind::Ident(h) => {
                         if h.path.len() > 1 {
-                            for seg in &h.path[..h.path.len() - 1] {
-                                self.note(&seg.name.name, HIER);
-                            }
+                            self.note(&h.path[0].name.name, HIER);
                             let m = &h.path[h.path.len() - 1].name.name;
                             if method_reads_args(m) {
                                 inputs = Some(vec![true; args.len()]);
@@ -418,8 +416,7 @@ impl FbScan<'_> {
                     self.expr(r);
                 }
             }
-            ExprKind::MemberAccess { expr, member } => {
-                self.note(&member.name, HIER);
+            ExprKind::MemberAccess { expr, .. } => {
                 self.expr_with(expr, HIER);
             }
             ExprKind::Specialization { base, .. } => self.expr_with(base, HIER),
