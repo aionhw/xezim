@@ -580,16 +580,17 @@ impl Simulator {
     /// is keyed as declared, whether or not it is registered yet.
     fn nested_level_key(&self, level: &str, root: &str, kv: &Value) -> String {
         match self.declared_dim(level) {
-            Some(Dim::Assoc(_)) => return self.assoc_key_str(level, kv),
-            Some(_) => return kv.to_i64().unwrap_or(0).to_string(),
-            None => {}
-        }
-        if self.module.associative_arrays.contains_key(level) {
-            self.assoc_key_str(level, kv)
-        } else if level != root && self.module.dynamic_arrays.contains(level) {
-            kv.to_i64().unwrap_or(0).to_string()
-        } else {
-            self.assoc_key_str(root, kv)
+            Some(Dim::Assoc(_)) => self.assoc_key_str(level, kv),
+            Some(_) => kv.to_i64().unwrap_or(0).to_string(),
+            // No declared shape (a level past a row's size): keyed as
+            // registered, else as the root it hangs from.
+            None if level != root && self.module.dynamic_arrays.contains(level) => {
+                kv.to_i64().unwrap_or(0).to_string()
+            }
+            None if self.module.associative_arrays.contains_key(level) => {
+                self.assoc_key_str(level, kv)
+            }
+            None => self.assoc_key_str(root, kv),
         }
     }
 

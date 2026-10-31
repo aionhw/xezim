@@ -4172,14 +4172,22 @@ impl Simulator {
                     .get(name)
                     .map(|(sh, _)| sh[1..].to_vec())
             });
+        // §7.4.5: the rows are queues or dynamic arrays as declared.
         let dyn_rows = inner.is_none()
-            && (0..sz).any(|i| {
-                let row = format!("{}[{}]", name, i);
-                self.module.dynamic_arrays.contains(&row)
-                    || self
-                        .signals
-                        .contains_key(&Self::name_with_suffix(&row, ".size"))
-            });
+            && match self.coll_shape_at(name) {
+                Some((shape, depth)) => {
+                    matches!(shape.dims.get(depth + 1), Some(Dim::Queue | Dim::Dyn))
+                }
+                // No declared shape (a returned or copied queue of queues):
+                // its stored rows tell.
+                None => (0..sz).any(|i| {
+                    let row = format!("{}[{}]", name, i);
+                    self.module.dynamic_arrays.contains(&row)
+                        || self
+                            .signals
+                            .contains_key(&Self::name_with_suffix(&row, ".size"))
+                }),
+            };
         if inner.is_none() && !dyn_rows {
             return None;
         }

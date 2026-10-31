@@ -347,28 +347,6 @@ impl Simulator {
         false
     }
 
-    /// The associative array a possibly-indexed storage name selects into:
-    /// strip trailing `[key]` segments (`h#m[1][2]` -> `h#m[1]` -> `h#m`) down
-    /// to the DEEPEST prefix registered as an associative array.
-    ///
-    /// §7.4.5: that is the declaration root for a multidimensional
-    /// associative array, and an element (`v[0]` of `int
-    /// v[2][string][string]`) under a non-associative outer dimension.
-    pub(super) fn assoc_registered_prefix<'a>(&self, name: &'a str) -> Option<&'a str> {
-        let mut b = name;
-        loop {
-            match b.rfind('[') {
-                Some(p) if b[p + 1..].ends_with(']') => {
-                    b = &b[..p];
-                    if self.module.associative_arrays.contains_key(b) {
-                        return Some(b);
-                    }
-                }
-                _ => return None,
-            }
-        }
-    }
-
     /// Nested associative-array receiver: `name` is `base[K1]...[Kn]` (n >= 1),
     /// `base` is a registered associative array, and the selected element is
     /// ITSELF an associative array (a multidimensional assoc, IEEE 1800 §7.8.1)
@@ -385,14 +363,7 @@ impl Simulator {
     /// many `m[0][i]` cells it holds (a pop leaves its vacated cell, #765).
     /// The stored-key proof remains for undeclared stores.
     pub(super) fn is_nested_assoc_elem(&self, name: &str) -> bool {
-        if let Some(dim) = self.declared_dim(name) {
-            return matches!(dim, Dim::Assoc(_));
-        }
-        if self.assoc_registered_prefix(name).is_none() {
-            return false;
-        }
-        let nested_prefix = format!("{name}[");
-        self.signal_name_prefix_present(&nested_prefix)
+        matches!(self.declared_dim(name), Some(Dim::Assoc(_)))
     }
 
     /// §7.4.4: the kind of the collection stored as `name` — its declared
@@ -1612,12 +1583,6 @@ impl Simulator {
                         return false;
                     }
                     _ => {}
-                }
-                if !name.contains('#')
-                    && let Some(base) = self.assoc_registered_prefix(name)
-                    && let Some(&is_str) = self.module.associative_arrays.get(base)
-                {
-                    return is_str;
                 }
             }
             _ => {}
@@ -3328,17 +3293,13 @@ impl Simulator {
         iterations: &mut u64,
     ) -> bool {
         let keys = self.assoc_top_level_keys(prefix);
-        // An inner level's declared key type, when known: a string key
-        // stored by value is turned back into its text (§7.8.1).
-        let declared_str = (level > 0)
-            .then(|| {
-                let lv = self.module.assoc_inner_string_keys.get(root).or_else(|| {
-                    let leaf = root.rsplit("::").next()?;
-                    self.module.assoc_inner_string_keys.get(leaf)
-                })?;
-                lv.get(level - 1).copied()
-            })
-            .flatten();
+        // An inner level's declared key type: a string key stored by value
+        // is turned back into its text (§7.8.1).
+        let declared_str = match self.declared_dim(prefix).filter(|_| level > 0) {
+            Some(Dim::Assoc(KeyKind::String)) => Some(true),
+            Some(Dim::Assoc(KeyKind::Integral { .. } | KeyKind::Wildcard)) => Some(false),
+            _ => None,
+        };
         let (is_str, kw, ksign) = if level == 0 {
             let is_str = self
                 .module
@@ -3355,6 +3316,8 @@ impl Simulator {
             let (kw, ks) = self.assoc_index_width_for(prefix).unwrap_or((32, true));
             (row_str || declared_str.unwrap_or(false), kw, ks)
         } else {
+            // No declared shape, or a named key type (enum, class, a type
+            // parameter bound per specialization): the stored keys tell.
             (
                 declared_str.unwrap_or_else(|| keys.iter().any(|k| k.parse::<i128>().is_err())),
                 32,

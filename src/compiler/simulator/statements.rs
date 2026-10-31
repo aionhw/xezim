@@ -222,11 +222,6 @@ impl Simulator {
             .insert(name.to_string(), dt.clone());
         self.dynamic_assoc_dims
             .insert(name.to_string(), tail.to_vec());
-        if let Some(levels) = super::elaborate::assoc_inner_string_levels(tail) {
-            self.module
-                .assoc_inner_string_keys
-                .insert(name.to_string(), levels);
-        }
     }
 
     /// Discard rows outside the retained prefix, including every nested key
@@ -257,9 +252,6 @@ impl Simulator {
             .retain(|key, _| !discard(key));
         self.module
             .assoc_key_type_names
-            .retain(|key, _| !discard(key));
-        self.module
-            .assoc_inner_string_keys
             .retain(|key, _| !discard(key));
         self.module.assoc_elem_widths.retain(|key, _| !discard(key));
         self.module.var_decl_types.retain(|key, _| !discard(key));
@@ -2996,9 +2988,6 @@ impl Simulator {
                         self.module
                             .associative_arrays
                             .insert(name.clone(), is_string_key);
-                        if let Some(lv) = super::elaborate::assoc_inner_string_levels(dims) {
-                            self.module.assoc_inner_string_keys.insert(name.clone(), lv);
-                        }
                         self.widths.insert(name.clone(), w);
                         // §7.8.2 / §7.9: the key's width and signedness, as
                         // elaboration records them for a module-scope array.

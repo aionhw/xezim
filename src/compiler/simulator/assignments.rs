@@ -2279,19 +2279,12 @@ impl Simulator {
     }
 
     /// Whether the associative array stored at `name` has collections for
-    /// elements: a module-scope or block-local declaration recorded by core,
-    /// or an object's member (`<h>#m`) whose class records it.
+    /// elements (§7.4.5): its declared shape has more dimensions below the
+    /// associative one, at any scope (`<h>#m` too).
     fn assoc_has_coll_elems(&self, name: &str) -> bool {
-        if self.module.assoc_coll_elems.contains(name) {
-            return true;
-        }
-        if let Some((h, prop)) = name.split_once('#')
-            && let Ok(handle) = h.parse::<usize>()
-            && let Some(cd) = self.class_prop_declarer(handle, prop)
-        {
-            return cd.assoc_coll_properties.contains(prop);
-        }
-        false
+        self.coll_shape_at(name).is_some_and(|(shape, depth)| {
+            depth == 0 && shape.dims.len() >= 2 && matches!(shape.dims[0], Dim::Assoc(_))
+        })
     }
 
     /// §7.8.6/§11.5.1: a bit write into an associative element whose

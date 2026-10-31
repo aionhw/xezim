@@ -1621,32 +1621,12 @@ impl Simulator {
     pub(super) fn indexed_coll_roots(&self) -> &HashSet<String> {
         self.indexed_coll_roots.get_or_init(|| {
             let mut set: HashSet<String> = HashSet::default();
-            let names = self
-                .module
-                .dynamic_arrays
-                .iter()
-                .chain(self.module.associative_arrays.keys());
-            for n in names {
-                if let Some((root, _)) = n.split_once('[')
-                    && !root.contains('#')
-                    && (self.module.var_decl_types.contains_key(root)
-                        || self.module.arrays.contains_key(root)
-                        || self.module.arrays_2d.contains_key(root)
-                        || self.module.arrays_nd.contains_key(root))
-                {
-                    // §12.7.3 / §23.8: a hierarchical module array is a
-                    // declared root too; leaf names are only probe hints.
-                    set.insert(root.to_string());
-                    if let Some((_, leaf)) = root.rsplit_once('.') {
-                        set.insert(leaf.to_string());
-                    }
-                }
-            }
-            // §7.4.5: a declared collection of collections, whatever its
-            // outer kind. Its rows are registered only as they are created,
-            // so the scan above misses one that has none yet.
+            // §7.4.5, §12.7.3, §23.8: every declared collection of
+            // collections whose rows are built row by row: queue or dynamic
+            // rows, or any rows under a fixed, dynamic or queue outer
+            // dimension. Hierarchical names add their leaf as a probe hint.
             for (n, shape) in &self.module.coll_shapes {
-                if Self::has_queue_rows(shape) {
+                if Self::has_queue_rows(shape) || !matches!(shape.dims[0], Dim::Assoc(_)) {
                     set.insert(n.clone());
                     if let Some((_, leaf)) = n.rsplit_once('.') {
                         set.insert(leaf.to_string());

@@ -384,8 +384,6 @@ impl Simulator {
             assoc_elem_widths,
             assoc_index_widths,
             assoc_key_type_names,
-            assoc_inner_string_keys,
-            assoc_row_dims,
             assoc_defaults,
             queue_max_sizes,
             var_decl_types,
@@ -402,7 +400,6 @@ impl Simulator {
             dynamic_arrays,
             descending_arrays,
             queue_vars,
-            assoc_coll_elems,
             string_signals,
             two_state_signals
         );
