@@ -40,5 +40,8 @@ mod named_event_intern;
 #[path = "perf/direct_scoped_calls.rs"]
 mod direct_scoped_calls;
 
+#[path = "perf/direct_ref_formal_calls.rs"]
+mod direct_ref_formal_calls;
+
 #[path = "perf/eqc_branch.rs"]
 mod eqc_branch;

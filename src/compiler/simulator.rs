@@ -407,6 +407,10 @@ struct FastCallEntry {
     is_class_result: bool,
     is_void_result: bool,
     accessor: FastAccessor,
+    /// `ref` / `inout` scalar formal positions: their final register value
+    /// is copied back into the caller's argument slot, as the interpreter
+    /// route's write-back temps (`vm_drain_arg_temps`) would.
+    writeback: Box<[usize]>,
 }
 
 /// class-perf P3: is the direct VM->VM dispatch enabled? (XEZIM_FAST_CALLS=0

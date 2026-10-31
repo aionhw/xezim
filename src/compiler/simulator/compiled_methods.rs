@@ -2934,13 +2934,35 @@ impl Simulator {
         // already compiled and runs it), so the block is specialization-correct.
         // The body/instruction guards below (static locals, fallback insns)
         // are what genuinely forbid a frame-free run.
-        if !pre.writeback_formals.is_empty()
-            || pre.param_able_result
-            || self.is_static_method(dclass, method)
-        {
+        if pre.param_able_result || self.is_static_method(dclass, method) {
             never(self);
             return None;
         }
+        // §13.5.2: a `ref` / `inout` scalar formal is copied in from the
+        // caller's argument slot and its final value copied back out — the
+        // write-back the interpreter route performs through arg temps. An
+        // `output` formal starts at its type's default instead, and a real
+        // or aggregate one is coerced on the way back; those keep that route.
+        let writeback: Box<[usize]> = if pre.writeback_formals.is_empty() {
+            Box::new([])
+        } else {
+            use crate::ast::types::PortDirection;
+            let scalar = self.vm_writeback_scalar_positions(dclass, method);
+            let mut pos = Vec::new();
+            for (i, port) in f.ports.iter().enumerate() {
+                if !pre.writeback_formals.iter().any(|n| n == &port.name.name) {
+                    continue;
+                }
+                let copy_in = matches!(port.direction, PortDirection::Ref | PortDirection::Inout);
+                let real = matches!(port.data_type, crate::ast::types::DataType::Real { .. });
+                if !copy_in || real || !scalar.contains(&i) {
+                    never(self);
+                    return None;
+                }
+                pos.push(i);
+            }
+            pos.into_boxed_slice()
+        };
         // class-perf collection-return: the callee returns via the
         // `pending_ret_collection` / `vm_ret_vals` side channel. A VM->VM
         // direct call CAN carry this when `vm_try_direct_call` re-stashes the
@@ -3116,7 +3138,9 @@ impl Simulator {
         } else {
             None
         };
-        let accessor = if let Some(f) = getter_field {
+        let accessor = if !writeback.is_empty() {
+            FastAccessor::None
+        } else if let Some(f) = getter_field {
             FastAccessor::Getter(Box::from(f))
         } else if let Some(f) = setter_field {
             FastAccessor::Setter(Box::from(f))
@@ -3134,6 +3158,7 @@ impl Simulator {
             is_class_result: pre.is_class_result,
             is_void_result: pre.is_void_result,
             accessor,
+            writeback,
         });
         self.compiled_fast_calls
             .insert((cid, mid, spec_id), FastCallState::Entry(entry.clone()));
@@ -3294,6 +3319,7 @@ impl Simulator {
             is_class_result: pre.is_class_result,
             is_void_result: pre.is_void_result,
             accessor: FastAccessor::None,
+            writeback: Box::new([]),
         });
         self.compiled_fast_calls
             .insert((cid, mid, 0), FastCallState::Entry(entry.clone()));
@@ -3515,6 +3541,7 @@ impl Simulator {
             is_class_result: pre.is_class_result,
             is_void_result: pre.is_void_result,
             accessor: FastAccessor::None,
+            writeback: Box::new([]),
         });
         self.compiled_fast_static_calls
             .insert((cid, mid, 0), FastCallState::Entry(entry.clone()));
@@ -3977,7 +4004,20 @@ impl Simulator {
             .get(entry.result_reg as usize)
             .cloned()
             .unwrap_or_else(|| Value::zero(32));
+        let written_back: Vec<(usize, Value)> = entry
+            .writeback
+            .iter()
+            .filter_map(|&i| {
+                let v = self.vm_regs.get(entry.this_reg as usize + 1 + i)?.clone();
+                Some((arg_base + i, v))
+            })
+            .collect();
         self.vm_regs = caller_regs;
+        for (slot, v) in written_back {
+            if let Some(r) = self.vm_regs.get_mut(slot) {
+                *r = v;
+            }
+        }
         self.foreach_arena = saved_foreach_arena;
         if let Some(prev) = _prev_meth {
             CUR_METHOD_HASH.store(prev, std::sync::atomic::Ordering::Relaxed);
