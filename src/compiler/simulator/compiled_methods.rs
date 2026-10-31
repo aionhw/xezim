@@ -252,6 +252,41 @@ impl Simulator {
         bad
     }
 
+    /// §8.25: when `dt` names a TYPE parameter of `cname` (`KEY`, `T`), what
+    /// the active specialization binds it to — a `string` or a class — or
+    /// None (unbound, integral, or not a type parameter). A compiled-method
+    /// plan is keyed by specialization, so the binding is fixed for it.
+    pub(super) fn type_param_binding_kind(
+        &self,
+        cname: &str,
+        dt: &DataType,
+    ) -> Option<TypeParamKind> {
+        let DataType::TypeReference {
+            name, dimensions, ..
+        } = dt
+        else {
+            return None;
+        };
+        if !dimensions.is_empty() || !name.scopes.is_empty() {
+            return None;
+        }
+        let base = cname.split('#').next().unwrap_or(cname);
+        let cd = self.module.classes.get(base)?;
+        if !cd.type_param_names.iter().any(|t| *t == name.name.name) {
+            return None;
+        }
+        let bound = self.resolve_type_param_binding(&name.name.name)?;
+        let bound = bound.trim();
+        if bound == "string" {
+            return Some(TypeParamKind::Str);
+        }
+        let class = bound.split('#').next().unwrap_or(bound).trim();
+        self.module
+            .classes
+            .contains_key(class)
+            .then_some(TypeParamKind::Class)
+    }
+
     /// class-perf: does `dt` (a TypeReference, possibly through a typedef
     /// chain) name a CLASS in `module.classes`? Unlike `resolve_dt_ref` + a
     /// TypeReference test, this survives FORWARD typedefs (`typedef class
@@ -1551,7 +1586,9 @@ impl Simulator {
             // or a bail. A class-handle return must NOT be resized or signedness-
             // stamped — the interpreter never touches a non-`plainly_integral`
             // (Typeref) return, so a handle must round-trip unchanged.
-            let is_class_result = self.typeref_names_class(&_f.return_type);
+            let is_class_result = self.typeref_names_class(&_f.return_type)
+                || self.type_param_binding_kind(cname, &_f.return_type)
+                    == Some(TypeParamKind::Class);
             // class-perf collection-return: the return type resolves to a
             // queue / unsized dynamic array. The body returns via the
             // `pending_ret_collection` side channel (the compiler admits
@@ -1604,12 +1641,17 @@ impl Simulator {
                 // resolve_dt_ref erase the class identity, so the OLD check saw
                 // every UVM class formal as non-class and skip-cached the method
                 // as non-scalar. The walk checks the class table first.
-                let is_class = self.typeref_names_class(&port.data_type);
+                // A TYPE-PARAMETER formal (`KEY key`) takes the binding of the
+                // specialization this plan is keyed by.
+                let tp = self.type_param_binding_kind(cname, &port.data_type);
+                let is_class =
+                    self.typeref_names_class(&port.data_type) || tp == Some(TypeParamKind::Class);
                 // Step 8: a STRING formal binds the actual UNRESIZED in the
                 // interpreter (no branch of the binding matches Simple{String})
                 // — seed width 0 (keep source) and record the name so the
                 // compiler bails on every non-pass-through use.
-                let is_string = Self::is_string_data_type(&port.data_type);
+                let is_string =
+                    Self::is_string_data_type(&port.data_type) || tp == Some(TypeParamKind::Str);
                 if is_string {
                     string_formals.insert(port.name.name.clone());
                 }

@@ -333,6 +333,14 @@ const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3065;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
+/// `Simulator::type_param_binding_kind`: a type parameter bound to `string`
+/// or to a class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TypeParamKind {
+    Str,
+    Class,
+}
+
 /// What `Simulator::method_string_frame_begin` added to `string_signals`.
 struct MethodStringFrame {
     signals: Vec<String>,
