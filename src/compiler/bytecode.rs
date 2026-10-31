@@ -17379,8 +17379,9 @@ impl<'a> BytecodeCompiler<'a> {
     /// (`m_leaf_name = name`) or a dotted handle-chain leaf
     /// (`obj.m_name = s`). Only admits names in `string_member_names`
     /// (the P1 load universe — bare-key stable, instance members); the
-    /// RHS has already been checked string-valued by the caller. The
-    /// dotted form mirrors the integral chain store's shadow guard.
+    /// RHS has already been checked string-valued by the caller. Unlike
+    /// the integral chain store, the dotted form needs no shadow guard (see
+    /// the arm below).
     fn method_string_store_target(&mut self, lhs: &Expression, val_reg: RegId) -> bool {
         if let ExprKind::Ident(h) = &lhs.kind
             && self.method_mode
@@ -17402,13 +17403,14 @@ impl<'a> BytecodeCompiler<'a> {
             }
             return false;
         }
+        // Like the dotted string READ (Step 9a), a string member's heap slot
+        // holds the text verbatim under its bare key, so `this.name = name`
+        // (a formal shadowing the member) stores faithfully too.
         if let ExprKind::MemberAccess { expr: base, member } = &lhs.kind
             && self.method_mode
             && self.method_handle_chain_ok(base)
             && self.method_instance_field_ok(base, &member.name)
             && self.string_member_names.contains(member.name.as_str())
-            && !(self.class_shadow_names.contains(member.name.as_str())
-                && !self.member_safe_names.contains(member.name.as_str()))
         {
             let handle_reg = match self.method_member_handle_reg(base) {
                 Some(r) => r,

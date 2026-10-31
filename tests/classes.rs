@@ -617,6 +617,8 @@ mod compiled_string_local_byte;
 mod compiled_string_formal_byte;
 #[path = "classes/compiled_member_redeclared.rs"]
 mod compiled_member_redeclared;
+#[path = "classes/compiled_string_member_shadow_store.rs"]
+mod compiled_string_member_shadow_store;
 #[path = "classes/compiled_member_operand_width.rs"]
 mod compiled_member_operand_width;
 
