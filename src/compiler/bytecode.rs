@@ -60,6 +60,9 @@ pub(crate) struct ClassColls {
     pub members: HashSet<String>,
     /// Queues and dynamic arrays: a `foreach` index is a plain integer.
     pub dense: HashSet<String>,
+    /// Collections of integral elements, by the elements' declared sign.
+    pub signed_elems: HashSet<String>,
+    pub unsigned_elems: HashSet<String>,
 }
 
 /// Memoized free-function facts (see `MethodAdmission::fn_facts`).
@@ -14597,9 +14600,24 @@ impl<'a> BytecodeCompiler<'a> {
                 // BEFORE the assoc-elem bail (which would keep the read on
                 // the AST path) and before every module-scope arm, which
                 // cannot resolve a member collection receiver.
+                // §11.8.2: in an unsigned context a signed element is
+                // converted BEFORE it is widened, so the read must not
+                // sign-extend it to the context itself.
+                let typed = self.method_mode
+                    && unsigned_context
+                    && ctx_width > 0
+                    && self.expr_signedness(whole).is_some();
                 if self.method_mode
-                    && let Some(dest) = self.compile_member_coll_elem_read(expr, index, ctx_width)
+                    && let Some(dest) = self.compile_member_coll_elem_read(
+                        expr,
+                        index,
+                        if typed { 0 } else { ctx_width },
+                    )
                 {
+                    if typed {
+                        self.emit(Insn::ClearSigned(dest));
+                        self.emit(Insn::Resize(dest, ctx_width));
+                    }
                     return Some(dest);
                 }
                 // issue-301: a select INTO a member-collection element
@@ -19364,6 +19382,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // the base's own flag — unless the "select" is really a
                 // container-element load.
                 !root_is_container(expr)
+                    && !(self.method_mode && self.member_coll_elem_target(expr).is_some())
             }
             ExprKind::Ident(h) => plain_unsigned_signal(h),
             _ => false,
@@ -19423,6 +19442,21 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     let first = self.array_first_id?.get(name.as_str())?.0;
                     return self.signal_signed.get(first).copied();
+                }
+                // A class member collection element (`d[0]` of `int d[]`)
+                // has the element type's sign (§7.4).
+                if self.method_mode
+                    && let Some((coll, _, recv)) = self.member_coll_elem_target(expr)
+                {
+                    let class = self.coll_owner_class(recv.as_ref())?;
+                    let colls = self.method_admission.as_ref()?.instance_colls.get(&class)?;
+                    return if colls.signed_elems.contains(&coll) {
+                        Some(true)
+                    } else if colls.unsigned_elems.contains(&coll) {
+                        Some(false)
+                    } else {
+                        None
+                    };
                 }
                 self.operand_scrub_is_noop(e).then_some(false)
             }

@@ -2260,6 +2260,26 @@ impl Simulator {
                                 break;
                             };
                             colls.dense.extend(cd.queue_properties.keys().cloned());
+                            for m in cd.queue_properties.keys().chain(cd.assoc_properties.keys()) {
+                                if colls.signed_elems.contains(m) || colls.unsigned_elems.contains(m) {
+                                    continue;
+                                }
+                                let (Some(sig), Some(dt)) =
+                                    (cd.properties.get(m), self.class_prop_decl_type(cd, m))
+                                else {
+                                    continue;
+                                };
+                                let type_param = matches!(dt, DataType::TypeReference { name, .. }
+                                    if !name.has_scope() && cd.type_param_names.contains(&name.name.name));
+                                if type_param || !Self::integral_dt(self.resolve_dt_ref(dt)) {
+                                    continue;
+                                }
+                                if sig.is_signed {
+                                    colls.signed_elems.insert(m.clone());
+                                } else {
+                                    colls.unsigned_elems.insert(m.clone());
+                                }
+                            }
                             cur = cd.extends.clone();
                         }
                         facts.instance_colls.insert(class.clone(), colls);
@@ -2324,6 +2344,8 @@ impl Simulator {
                                     for p in cd.queue_properties.keys().chain(cd.assoc_properties.keys()) {
                                         colls.members.remove(p);
                                         colls.dense.remove(p);
+                                        colls.signed_elems.remove(p);
+                                        colls.unsigned_elems.remove(p);
                                     }
                                 }
                             }
