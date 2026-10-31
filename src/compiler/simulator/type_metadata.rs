@@ -318,6 +318,11 @@ impl Simulator {
         }
         self.fb_frame_depths.push(depth);
         self.push_local_frame(f);
+        for l in locals {
+            if let Some(class) = &l.class {
+                self.record_local_class_type(&l.name, class);
+            }
+        }
         (depth, mark)
     }
 

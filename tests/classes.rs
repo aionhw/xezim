@@ -656,6 +656,9 @@ mod compiled_coll_elem_store_width;
 #[path = "classes/compiled_ctor_decl_init.rs"]
 mod compiled_ctor_decl_init;
 
+#[path = "classes/compiled_fallback_nested_handle.rs"]
+mod compiled_fallback_nested_handle;
+
 #[path = "classes/int_property_named_like_struct_property.rs"]
 mod int_property_named_like_struct_property;
 #[path = "classes/compiled_method_test_env.rs"]

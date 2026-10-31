@@ -370,6 +370,11 @@ pub struct FbLocal {
     /// method epilogue writes the register back).
     #[serde(default)]
     pub via_binding: bool,
+    /// A class handle declared in a nested block: its declared class, which
+    /// the carried frame records (the activation records only formals and
+    /// top-level declarations).
+    #[serde(default)]
+    pub class: Option<Arc<str>>,
 }
 
 /// The locals a fallback carries; empty for the ordinary fallback, which
@@ -4678,13 +4683,21 @@ impl<'a> BytecodeCompiler<'a> {
             if !is_local(self, name) {
                 continue;
             }
+            let unkinded = self
+                .local_var_regs
+                .get(name)
+                .is_some_and(|(r, _)| !self.local_kinds.contains_key(r));
+            let bound = self.method_bound_names.contains(name);
+            // A nested-block handle carries its declared class instead.
+            let nested_class = (!bound)
+                .then(|| self.method_handle_local_types.get(name))
+                .flatten()
+                .filter(|c| !c.contains('#'))
+                .map(|c| Arc::<str>::from(c.as_str()));
             let handle_local = self.method_mode
                 && self.method_handle_names.contains(name)
-                && self.method_bound_names.contains(name)
-                && self
-                    .local_var_regs
-                    .get(name)
-                    .is_some_and(|(r, _)| !self.local_kinds.contains_key(r));
+                && (bound || nested_class.is_some())
+                && unkinded;
             // A carried handle is the base of its member accesses: the
             // interpreter reads it from the carried frame.
             if flags & NBA != 0 || (flags & HIER != 0 && !handle_local) {
@@ -4731,6 +4744,7 @@ impl<'a> BytecodeCompiler<'a> {
                 reg,
                 kind,
                 via_binding: self.method_mode && self.method_writeback_names.contains(name),
+                class: if handle_local { nested_class } else { None },
             });
         }
         for (name, v, kind) in consts {
@@ -4741,6 +4755,7 @@ impl<'a> BytecodeCompiler<'a> {
                 reg: r,
                 kind,
                 via_binding: false,
+                class: None,
             });
         }
         Ok(out.into_boxed_slice())
@@ -23953,6 +23968,7 @@ mod tests {
                     two_state: false,
                 },
                 via_binding: false,
+                class: None,
             }]
             .into_boxed_slice(),
             None => FbLocals::default(),

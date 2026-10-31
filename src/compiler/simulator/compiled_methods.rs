@@ -1915,8 +1915,23 @@ impl Simulator {
                             m.insert(port.name.name.clone(), cls);
                         }
                     }
+                    // A name declared with two classes in different blocks
+                    // has no single static type; leave it untyped.
+                    let mut conflict: HashSet<String> = HashSet::default();
+                    let ports_typed: HashSet<String> = m.keys().cloned().collect();
                     for (n, t) in self.class_typed_local_types(body) {
-                        m.entry(n).or_insert(t);
+                        match m.get(&n) {
+                            Some(prev) if *prev != t && !ports_typed.contains(&n) => {
+                                conflict.insert(n);
+                            }
+                            Some(_) => {}
+                            None => {
+                                m.insert(n, t);
+                            }
+                        }
+                    }
+                    for n in conflict {
+                        m.remove(&n);
                     }
                     m
                 };
