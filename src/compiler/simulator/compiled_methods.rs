@@ -637,7 +637,9 @@ impl Simulator {
     /// interpreter's dotted read passes it through verbatim (`fit_class_prop`
     /// never resizes — `class_prop_width_impl` returns None for strings), so
     /// a bare/dotted READ lowers to LoadClassMember like an integral member.
-    /// Statics are excluded (per-class cells).
+    /// Statics are excluded (per-class cells), and so are names some class
+    /// redeclares (§8.14): a base class's copy is stored under a qualified
+    /// key the bare `StoreClassMember`/`LoadClassMember` spelling misses.
     pub(super) fn class_string_member_names(&self, cname: &str) -> HashSet<String> {
         let mut out = HashSet::default();
         let mut seen = HashSet::default();
@@ -647,7 +649,7 @@ impl Simulator {
                 break;
             }
             for p in cd.string_properties.iter() {
-                if !cd.static_properties.contains(p) {
+                if !cd.static_properties.contains(p) && !self.shadowed_prop_names.contains(p) {
                     out.insert(p.clone());
                 }
             }
