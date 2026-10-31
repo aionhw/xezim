@@ -208,7 +208,10 @@ impl FbScan<'_> {
             // Only the head of a dotted name can be a local: the later
             // segments are members of what it names (`this.name`, `h.f`),
             // so a register local that shares a member's name is not used.
-            self.note(&head.name.name, flags | HIER);
+            // A select applied to the name (`foreach (p.q[i])`) selects
+            // the last segment, not the head.
+            let sel = if head.selects.is_empty() { 0 } else { SEL };
+            self.note(&head.name.name, (flags & !SEL) | sel | HIER);
         }
         for seg in &h.path {
             for s in &seg.selects {

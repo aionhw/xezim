@@ -2242,6 +2242,27 @@ impl Simulator {
                         facts.instance_field_signed.insert(class.clone(), signed);
                         facts.instance_field_widths.insert(class.clone(), widths);
                         facts.instance_fields.insert(class.clone(), fields);
+                        let strings = self.class_string_coll_member_names(class);
+                        let packed = self.class_coll_elem_packed_dims(class);
+                        let mut colls = super::bytecode::ClassColls::default();
+                        colls.members = self
+                            .class_coll_member_names(class)
+                            .into_iter()
+                            .filter(|m| !strings.contains(m) && !packed.contains_key(m))
+                            .collect();
+                        let mut cur = Some(class.clone());
+                        let mut guard = 0;
+                        while let Some(c) = cur
+                            && guard < 64
+                        {
+                            guard += 1;
+                            let Some(cd) = self.module.classes.get(&c) else {
+                                break;
+                            };
+                            colls.dense.extend(cd.queue_properties.keys().cloned());
+                            cur = cd.extends.clone();
+                        }
+                        facts.instance_colls.insert(class.clone(), colls);
                         // Direct superclass (spec args stripped): the
                         // writeback-hierarchy walk in
                         // `emit_arg_slot_writeback` climbs this chain.
@@ -2297,6 +2318,12 @@ impl Simulator {
                                 if let Some(fields) = facts.instance_fields.get_mut(key) {
                                     for p in cd.properties.keys() {
                                         fields.remove(p);
+                                    }
+                                }
+                                if let Some(colls) = facts.instance_colls.get_mut(key) {
+                                    for p in cd.queue_properties.keys().chain(cd.assoc_properties.keys()) {
+                                        colls.members.remove(p);
+                                        colls.dense.remove(p);
                                     }
                                 }
                             }

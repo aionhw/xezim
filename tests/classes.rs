@@ -643,6 +643,8 @@ mod compiled_method_handle_carry;
 mod compiled_fallback_member_named_local;
 #[path = "classes/compiled_type_param_formals.rs"]
 mod compiled_type_param_formals;
+#[path = "classes/compiled_foreach_handle_member.rs"]
+mod compiled_foreach_handle_member;
 #[path = "classes/int_property_named_like_struct_property.rs"]
 mod int_property_named_like_struct_property;
 #[path = "classes/compiled_method_test_env.rs"]

@@ -44,9 +44,22 @@ pub(crate) struct MethodAdmission {
     /// NON-virtual method that some subclass redeclares (the only case where
     /// the object's dynamic class would pick a different body).
     pub nonvirtual_targets: HashMap<String, HashMap<String, String>>,
+    /// Instance collection members per declared class, for element access
+    /// through a handle of that class (`p.contents[i]`). Only members whose
+    /// elements load as one plain value join: string and multi-dimensional
+    /// packed elements need facts the compiler keeps for `this` alone.
+    pub instance_colls: HashMap<String, ClassColls>,
     /// Free-function facts the method compiles keep asking for; the function
     /// table they come from is the same for every method compile.
     pub fn_facts: FnFacts,
+}
+
+/// See `MethodAdmission::instance_colls`.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ClassColls {
+    pub members: HashSet<String>,
+    /// Queues and dynamic arrays: a `foreach` index is a plain integer.
+    pub dense: HashSet<String>,
 }
 
 /// Memoized free-function facts (see `MethodAdmission::fn_facts`).
@@ -5122,7 +5135,7 @@ impl<'a> BytecodeCompiler<'a> {
         let handle_reg = if bare {
             0
         } else {
-            let inner = base_expr.expect("dotted base present");
+            let inner = base_expr.clone().expect("dotted base present");
             match self.method_member_handle_reg(&inner) {
                 Some(r) => r,
                 None => self.compile_expr(&inner, 0)?,
@@ -5135,6 +5148,24 @@ impl<'a> BytecodeCompiler<'a> {
         let slot = self.next_foreach_slot();
         let var_reg = self.alloc_reg();
         let ok = self.alloc_reg();
+        // A queue or dynamic array index is the 32-bit unsigned Value
+        // ForeachKeys makes for a store without key facts; typed, a
+        // statement fallback in the body can carry it.
+        let dense = !Self::split_local_coll_key(&coll).is_some()
+            && self
+                .coll_owner_class(base_expr.as_ref())
+                .and_then(|cls| self.method_admission.as_ref()?.instance_colls.get(&cls))
+                .is_some_and(|colls| colls.dense.contains(&coll));
+        if dense {
+            self.local_kinds.insert(
+                var_reg,
+                LocalKind::Int {
+                    width: 32,
+                    signed: false,
+                    two_state: true,
+                },
+            );
+        }
 
         // Bind the loop var BEFORE the key materialization: the snapshot
         // conversion only stores into the var register, but body reads of
@@ -5379,10 +5410,10 @@ impl<'a> BytecodeCompiler<'a> {
         // Resolve the indexed base to a class-member collection and its
         // element class (`handle_member_types[method_class][coll]` is the
         // STORED element type — Some iff the collection holds handles).
-        let (coll, _bare, _) = self.member_coll_elem_target(coll_base)?;
-        let elem_class = self.method_class.as_deref().and_then(|cls| {
+        let (coll, _bare, coll_recv) = self.member_coll_elem_target(coll_base)?;
+        let elem_class = self.coll_owner_class(coll_recv.as_ref()).and_then(|cls| {
             self.handle_member_types?
-                .get(cls)?
+                .get(&cls)?
                 .get(coll.as_str())
                 .cloned()
         })?;
@@ -5496,6 +5527,9 @@ impl<'a> BytecodeCompiler<'a> {
                 let loadable =
                     !(self.class_shadow_names.contains(m) && !self.member_safe_names.contains(m));
                 loadable && self.method_handle_chain_ok(inner)
+            }
+            crate::ast::expr::ExprKind::Index { .. } => {
+                self.method_handle_chain_class(expr).is_some()
             }
             _ => false,
         }
@@ -5616,6 +5650,22 @@ impl<'a> BytecodeCompiler<'a> {
                     return None;
                 }
                 self.handle_member_types?.get(&cur)?.get(mname).cloned()
+            }
+            // An ELEMENT of a member collection of handles (`p.contents[i]`,
+            // `q[i]`) is typed by the collection's element class.
+            crate::ast::expr::ExprKind::Index {
+                expr: coll_base,
+                index,
+            } => {
+                if matches!(index.kind, crate::ast::expr::ExprKind::Dollar) {
+                    return None;
+                }
+                let (coll, _, recv) = self.member_coll_elem_target(coll_base)?;
+                let owner = self.coll_owner_class(recv.as_ref())?;
+                self.handle_member_types?
+                    .get(&owner)?
+                    .get(coll.as_str())
+                    .cloned()
             }
             _ => None,
         }
@@ -5876,7 +5926,13 @@ impl<'a> BytecodeCompiler<'a> {
     /// plan carries multi-dim packed dims for the member. Feeds
     /// `expr_max_width` (self-determined compare/shift contexts).
     fn member_coll_elem_index_width(&self, root: &crate::ast::expr::Expression) -> Option<u32> {
-        let (coll, ..) = self.member_coll_elem_target(root)?;
+        let (coll, _, recv) = self.member_coll_elem_target(root)?;
+        if recv
+            .as_ref()
+            .is_some_and(|b| self.foreign_colls(b).is_some())
+        {
+            return None;
+        }
         let dims = self.coll_elem_packed_dims.get(&coll)?;
         if dims.len() != 2 {
             return None;
@@ -5940,14 +5996,65 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 Some((name.to_string(), true, None))
             }
-            crate::ast::expr::ExprKind::MemberAccess { expr: base, member }
-                if self.method_handle_chain_class(base).is_some()
-                    && self.coll_member_names.contains(member.name.as_str()) =>
+            crate::ast::expr::ExprKind::MemberAccess { expr: base, member } => {
+                let m = member.name.as_str();
+                // A receiver of another declared class (`p.contents` with
+                // `pattern p`) is admitted by THAT class's collections.
+                let admitted = match self.foreign_colls(base) {
+                    Some(colls) => colls.members.contains(m),
+                    None => {
+                        self.method_handle_chain_class(base).is_some()
+                            && self.coll_member_names.contains(m)
+                    }
+                };
+                admitted.then(|| (member.name.clone(), false, Some((**base).clone())))
+            }
+            // The parser's spelling of a dotted foreach array: `p.contents`.
+            crate::ast::expr::ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 2
+                    && h.path.iter().all(|seg| seg.selects.is_empty()) =>
             {
-                Some((member.name.clone(), false, Some((**base).clone())))
+                let base = Self::dotted_head_expr(h);
+                let m = h.path[1].name.name.as_str();
+                self.foreign_colls(&base)?
+                    .members
+                    .contains(m)
+                    .then(|| (m.to_string(), false, Some(base)))
             }
             _ => None,
         }
+    }
+
+    /// `h` without its last segment, as the expression a member access
+    /// on it would have for its base.
+    fn dotted_head_expr(h: &crate::ast::expr::HierarchicalIdentifier) -> Expression {
+        let mut head = h.clone();
+        head.path.truncate(1);
+        Expression::new(ExprKind::Ident(head), h.span)
+    }
+
+    /// The collection facts of a dotted receiver's declared class, when
+    /// that class is known and is not the method's own class (whose facts
+    /// the plan sets already carry).
+    fn foreign_colls(&self, base: &Expression) -> Option<&ClassColls> {
+        let class = self.method_handle_chain_class(base)?;
+        if class == UNTYPED || self.method_class.as_deref() == Some(class.as_str()) {
+            return None;
+        }
+        self.method_admission.as_ref()?.instance_colls.get(&class)
+    }
+
+    /// The class whose declaration describes a member collection target
+    /// from `member_coll_elem_target`: the receiver's declared class for a
+    /// foreign receiver, else the method's class.
+    fn coll_owner_class(&self, base: Option<&Expression>) -> Option<String> {
+        if let Some(b) = base
+            && self.foreign_colls(b).is_some()
+        {
+            return self.method_handle_chain_class(b);
+        }
+        self.method_class.clone()
     }
 
     /// class-perf Step 9b-ii: lower an ELEMENT READ of a class member
@@ -5996,6 +6103,15 @@ impl<'a> BytecodeCompiler<'a> {
         // Dotted receiver: the handle register must be live BEFORE the
         // consumer insn is emitted. A base-compile failure fails the whole
         // read (the statement-level rollback cleans up).
+        let elem_is_class = self
+            .coll_owner_class(base_expr.as_ref())
+            .and_then(|cls| {
+                self.handle_member_types?
+                    .get(&cls)?
+                    .get(coll.as_str())
+                    .map(|_| true)
+            })
+            .unwrap_or(false);
         let handle_reg = if bare {
             0
         } else {
@@ -6008,16 +6124,6 @@ impl<'a> BytecodeCompiler<'a> {
         let idx_reg = self.compile_expr(index, 0)?;
         let elem_is_string =
             Self::split_local_coll_key(&coll).is_some_and(|n| self.local_coll_strings.contains(n));
-        let elem_is_class = self
-            .method_class
-            .as_deref()
-            .and_then(|cls| {
-                self.handle_member_types?
-                    .get(cls)?
-                    .get(coll.as_str())
-                    .map(|_| true)
-            })
-            .unwrap_or(false);
         let dest = self.alloc_reg();
         self.emit(Insn::LoadCollElem(
             dest,
@@ -6067,7 +6173,13 @@ impl<'a> BytecodeCompiler<'a> {
         };
         // Same admission as the element read itself (bare member in the
         // plan's collision-excluded set, or a dotted `this.aa`/`obj.aa`).
-        let (coll, ..) = self.member_coll_elem_target(root)?;
+        let (coll, _, recv) = self.member_coll_elem_target(root)?;
+        if recv
+            .as_ref()
+            .is_some_and(|b| self.foreign_colls(b).is_some())
+        {
+            return None;
+        }
         let dims = self.coll_elem_packed_dims.get(&coll)?.clone();
         if dims.len() != 2 {
             // Deeper packed chains: the remaining selects compound — bail
