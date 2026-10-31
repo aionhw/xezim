@@ -4064,6 +4064,7 @@ impl Simulator {
             vm_ret_vals: None,
             fn_ret_collection_stack: Vec::new(),
             fn_ret_assoc_stack: Vec::new(),
+            fn_ret_ctx_stack: Vec::new(),
             current_scope: String::new(),
             m_block_scope: String::new(),
             m_block_active: false,

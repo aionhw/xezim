@@ -2282,6 +2282,13 @@ impl Simulator {
                     _ => false,
                 };
                 self.fn_ret_assoc_stack.push(method_ret_assoc);
+                let method_ret_ctx = match &method.kind {
+                    ClassMethodKind::Function(f) => self
+                        .scalar_formal_integral(&f.return_type)
+                        .map_or(0, |(w, _)| w),
+                    _ => 0,
+                };
+                self.fn_ret_ctx_stack.push(method_ret_ctx);
                 // §13.4.1: a method returning a queue, dynamic or associative
                 // array has a return VARIABLE of that type, which the body may
                 // fill in place (`build[k] = v`); declare it as a collection
@@ -2483,6 +2490,7 @@ impl Simulator {
                 self.sync_static_locals();
                 self.fn_ret_collection_stack.pop();
                 self.fn_ret_assoc_stack.pop();
+                self.fn_ret_ctx_stack.pop();
                 // Declaration snapshots describe this activation's string
                 // flags. Restore them before reinstating the caller's flags
                 // (§6.21/§23.8), or an integral shadow can erase the caller's

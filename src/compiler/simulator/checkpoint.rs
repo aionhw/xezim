@@ -1255,6 +1255,7 @@ checkpoint_state!(
     flop_last_fire,
     fn_decl_cache,
     fn_pure_cache,
+    fn_ret_ctx_stack,
     force_epoch_gen,
     force_refresh_done_gen,
     forced_names,

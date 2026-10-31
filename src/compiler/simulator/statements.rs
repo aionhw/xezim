@@ -5556,7 +5556,13 @@ impl Simulator {
                                 Some((name, su)) => self
                                     .pack_unpacked_struct(&name, &su)
                                     .unwrap_or_else(|| self.eval_expr(e)),
-                                None => self.eval_expr(e),
+                                // §13.4.1: in the return variable's context,
+                                // like `f = e` (`return b + u` with a byte b
+                                // and 8-bit u in an int function is 9 bits).
+                                None => match self.fn_ret_ctx_stack.last() {
+                                    Some(&w) if w > 0 => self.eval_expr_ctx(e, w),
+                                    _ => self.eval_expr(e),
+                                },
                             },
                         }
                     };

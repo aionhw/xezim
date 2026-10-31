@@ -7499,6 +7499,10 @@ pub struct Simulator {
     /// Parallel to `fn_ret_collection_stack`: the running function returns
     /// an associative array (§13.4).
     fn_ret_assoc_stack: Vec<bool>,
+    /// Parallel to `fn_ret_collection_stack`: the declared width of an
+    /// integral return, the context `return e` evaluates `e` in (§13.4.1:
+    /// as if assigned to the return variable); 0 for other types.
+    fn_ret_ctx_stack: Vec<u32>,
     /// Stable instance scope of the process currently running (for `%m`).
     /// Unlike `name_resolve_hint`, this is not mutated by name resolution.
     current_scope: String,

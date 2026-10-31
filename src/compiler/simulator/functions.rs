@@ -679,6 +679,10 @@ impl Simulator {
         // ordered.
         self.fn_ret_collection_stack
             .push(self.fn_returns_collection(&fd.return_type));
+        let ret_ctx = self
+            .scalar_formal_integral(&fd.return_type)
+            .map_or(0, |(w, _)| w);
+        self.fn_ret_ctx_stack.push(ret_ctx);
         // §13.4.1: a function returning a queue, dynamic or associative
         // array (through a typedef) has a return VARIABLE of that type: the
         // body may fill it in place (`f.push_back(v)`, `f[k] = v`, `f = new[n]`,
@@ -804,6 +808,7 @@ impl Simulator {
         self.func_call_stack.pop();
         self.fn_ret_collection_stack.pop();
         self.fn_ret_assoc_stack.pop();
+        self.fn_ret_ctx_stack.pop();
         self.pkg_scope_stack.pop();
         self.m_scope_stack = saved_m_scope_fn;
         self.this_stack.pop();
