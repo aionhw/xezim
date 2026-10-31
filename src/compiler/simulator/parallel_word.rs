@@ -4,6 +4,31 @@ use super::*;
 
 #[derive(Clone, Copy)]
 enum WordOp {
+    Repl {
+        d: u16,
+        s: u16,
+        mask: u64,
+        factor: u64,
+    },
+    LoadSigRepl {
+        dl: u16,
+        sig: u32,
+        d: u16,
+        mask: u64,
+        factor: u64,
+    },
+    WRepl {
+        d: usize,
+        s: u16,
+        w: u8,
+        count: u16,
+    },
+    WSigRange {
+        d: usize,
+        sig: u32,
+        lo: u16,
+        w: u16,
+    },
     LoadSig {
         d: u16,
         sig: u32,
@@ -21,6 +46,13 @@ enum WordOp {
         d: u16,
         sig: u32,
         lo: u16,
+        mask: u64,
+    },
+    SigSlice {
+        d: u16,
+        sig: u32,
+        lo: u16,
+        w: u16,
         mask: u64,
     },
     Bit {
@@ -307,6 +339,45 @@ enum WordOp {
         b: u16,
         mask: u64,
     },
+    BrFalse {
+        s: u16,
+        t: u32,
+    },
+    BrNz {
+        s: u16,
+        t: u32,
+    },
+    BrSigFalse {
+        sig: u32,
+        bit: u32,
+        t: u32,
+    },
+    Jmp {
+        t: u32,
+    },
+    LoadSigBrNz {
+        dl: u16,
+        sig: u32,
+        t: u32,
+    },
+    BrFalseLoadSig {
+        s: u16,
+        t: u32,
+        dl: u16,
+        sig: u32,
+    },
+    EqBrFalse {
+        d: u16,
+        a: u16,
+        b: u16,
+        t: u32,
+    },
+    EqCBrFalse {
+        d: u16,
+        s: u16,
+        k: u64,
+        t: u32,
+    },
     StoreNba {
         sig: u32,
         s: u16,
@@ -318,20 +389,268 @@ enum WordOp {
         v: u64,
         w: u32,
     },
+    RangeStoreNba {
+        sig: u32,
+        hi: u32,
+        lo: u32,
+        s: u16,
+        mask: u64,
+    },
+    RangeFillNba {
+        sig: u32,
+        hi: u32,
+        lo: u32,
+        bit: u8,
+    },
+    WLoadSig {
+        d: usize,
+        sig: u32,
+    },
+    WConst {
+        d: usize,
+        k: usize,
+    },
+    WStoreNba {
+        sig: u32,
+        s: usize,
+        w: u32,
+    },
+    WRangeStoreNba {
+        sig: u32,
+        lo: u32,
+        s: usize,
+        w: u32,
+    },
+    WMask {
+        d: usize,
+        w: u16,
+    },
+    WFromN {
+        r: u16,
+        d: usize,
+    },
+    NFromW {
+        r: u16,
+        s: usize,
+        mask: u64,
+    },
+}
+
+// Stop Debug formatting at the variant boundary, before any operand payload.
+#[derive(Default)]
+struct LowerVariantName(String);
+impl std::fmt::Write for LowerVariantName {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let end = text.find(['{', '(']).unwrap_or(text.len());
+        self.0.push_str(&text[..end]);
+        if end < text.len() {
+            Err(std::fmt::Error)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub(super) struct WordProgram {
     ops: Vec<WordOp>,
     regs: usize,
+    wide_words: usize,
+    scratch: usize,
+    constants: Vec<Box<[u64]>>,
 }
 impl WordProgram {
+    fn reject_lower(insn: Option<&TsInsn>, reason: &str) -> Option<Self> {
+        if env_is_one_cached!("XEZIM_MULTICORE_LOWER_CENSUS") {
+            use std::fmt::Write;
+            let mut name = LowerVariantName::default();
+            if let Some(insn) = insn {
+                let _ = write!(&mut name, "{insn:?}");
+            }
+            eprintln!(
+                "[PROF] multicore_word_reject reason={} insn={}",
+                reason,
+                name.0.trim()
+            );
+        }
+        None
+    }
+
     pub(super) fn lower(ts: TwoStateBlock) -> Option<Self> {
-        if ts.has_ctrl || ts.has_wide || ts.has_wait {
+        Self::lower_with_options(
+            ts,
+            env_is_one_cached!("XEZIM_MULTICORE_REPLICATION"),
+            env_is_one_cached!("XEZIM_MULTICORE_WIDE_RANGE"),
+        )
+    }
+
+    fn replication_factor(w: u8, count: u8) -> Option<(u64, u64)> {
+        if w == 0 || w > 64 || count == 0 || u32::from(w) * u32::from(count) > 64 {
             return None;
         }
+        let mask = u64::MAX >> (64 - w);
+        let factor =
+            (0..u32::from(count)).fold(0, |factor, i| factor | (1u64 << (i * u32::from(w))));
+        Some((mask, factor))
+    }
+
+    fn lower_with_options(ts: TwoStateBlock, replication: bool, wide_range: bool) -> Option<Self> {
+        if ts.has_wait {
+            return Self::reject_lower(None, "wait");
+        }
+        let wide_words = match (ts.has_wide, ts.wide_words) {
+            (false, 0) => 0,
+            (true, n @ 1..=8) if ts.num_regs <= u16::MAX as u32 + 1 => n as usize,
+            _ => return Self::reject_lower(None, "wide_bank"),
+        };
+        let regs = ts.num_regs as usize;
+        let Some(scratch) = regs.checked_mul(wide_words + 1) else {
+            return Self::reject_lower(None, "scratch_capacity");
+        };
+        let wide_offset = |r: u16| {
+            (wide_words != 0 && (r as usize) < regs).then_some(regs + r as usize * wide_words)
+        };
+        let fits_wide = |w: u32| w != 0 && w as usize <= wide_words * 64;
+        let mut constants = Vec::new();
         let mut ops = Vec::with_capacity(ts.insns.len());
-        for insn in &ts.insns {
+        for (pc, insn) in ts.insns.iter().enumerate() {
+            let target = match insn {
+                TsInsn::BrFalse { t, .. }
+                | TsInsn::BrNz { t, .. }
+                | TsInsn::BrSigFalse { t, .. }
+                | TsInsn::Jmp { t }
+                | TsInsn::LoadSigBrNz { t, .. }
+                | TsInsn::BrFalseLoadSig { t, .. }
+                | TsInsn::EqBrFalse { t, .. }
+                | TsInsn::EqCBrFalse { t, .. } => Some(*t as usize),
+                _ => None,
+            };
+            if target.is_some_and(|t| t <= pc || t > ts.insns.len()) {
+                return Self::reject_lower(Some(insn), "branch_target");
+            }
+            // Keep one operation per instruction: fused branch targets already
+            // refer to this stream, including its one-past-the-end exit.
             ops.push(match insn {
+                TsInsn::Repl { d, s, w, count } if replication => {
+                    let Some((mask, factor)) = Self::replication_factor(*w, *count) else {
+                        return Self::reject_lower(Some(insn), "replication_shape");
+                    };
+                    WordOp::Repl {
+                        d: *d,
+                        s: *s,
+                        mask,
+                        factor,
+                    }
+                }
+                TsInsn::LoadSigRepl {
+                    dl,
+                    sig,
+                    d,
+                    w,
+                    count,
+                } if replication => {
+                    let Some((mask, factor)) = Self::replication_factor(*w, *count) else {
+                        return Self::reject_lower(Some(insn), "replication_shape");
+                    };
+                    WordOp::LoadSigRepl {
+                        dl: *dl,
+                        sig: *sig,
+                        d: *d,
+                        mask,
+                        factor,
+                    }
+                }
+                TsInsn::WRepl { d, s, w, count } if replication => {
+                    let total = u32::from(*w) * u32::from(*count);
+                    if *w == 0 || *w > 64 || *count == 0 || total <= 64 || !fits_wide(total) {
+                        return Self::reject_lower(Some(insn), "replication_shape");
+                    }
+                    WordOp::WRepl {
+                        d: wide_offset(*d)?,
+                        s: *s,
+                        w: *w,
+                        count: *count,
+                    }
+                }
+                TsInsn::WSigRange { d, sig, lo, w }
+                    if wide_range
+                        && *w > 64
+                        && fits_wide(u32::from(*w))
+                        && lo.checked_add(*w - 1).is_some() =>
+                {
+                    WordOp::WSigRange {
+                        d: wide_offset(*d)?,
+                        sig: *sig,
+                        lo: *lo,
+                        w: *w,
+                    }
+                }
+                TsInsn::WLoadSig { d, sig } => WordOp::WLoadSig {
+                    d: wide_offset(*d)?,
+                    sig: *sig,
+                },
+                TsInsn::WConst { d, v } if !v.is_empty() && v.len() <= wide_words => {
+                    let d = wide_offset(*d)?;
+                    let k = constants.len();
+                    constants.push(v.clone());
+                    WordOp::WConst { d, k }
+                }
+                TsInsn::WStoreNba { sig, s, w } if fits_wide(*w) => WordOp::WStoreNba {
+                    sig: *sig,
+                    s: wide_offset(*s)?,
+                    w: *w,
+                },
+                TsInsn::WRangeStoreNba { sig, lo, s, w } if fits_wide(*w) => {
+                    WordOp::WRangeStoreNba {
+                        sig: *sig,
+                        lo: *lo,
+                        s: wide_offset(*s)?,
+                        w: *w,
+                    }
+                }
+                TsInsn::WMask { d, w } if fits_wide(u32::from(*w)) => WordOp::WMask {
+                    d: wide_offset(*d)?,
+                    w: *w,
+                },
+                TsInsn::WFromN { r } => WordOp::WFromN {
+                    r: *r,
+                    d: wide_offset(*r)?,
+                },
+                TsInsn::NFromW { r, mask } => WordOp::NFromW {
+                    r: *r,
+                    s: wide_offset(*r)?,
+                    mask: *mask,
+                },
+                TsInsn::BrFalse { s, t } => WordOp::BrFalse { s: *s, t: *t },
+                TsInsn::BrNz { s, t } => WordOp::BrNz { s: *s, t: *t },
+                TsInsn::BrSigFalse { sig, bit, t } => WordOp::BrSigFalse {
+                    sig: *sig,
+                    bit: *bit,
+                    t: *t,
+                },
+                TsInsn::Jmp { t } => WordOp::Jmp { t: *t },
+                TsInsn::LoadSigBrNz { dl, sig, t } => WordOp::LoadSigBrNz {
+                    dl: *dl,
+                    sig: *sig,
+                    t: *t,
+                },
+                TsInsn::BrFalseLoadSig { s, t, dl, sig } => WordOp::BrFalseLoadSig {
+                    s: *s,
+                    t: *t,
+                    dl: *dl,
+                    sig: *sig,
+                },
+                TsInsn::EqBrFalse { d, a, b, t } => WordOp::EqBrFalse {
+                    d: *d,
+                    a: *a,
+                    b: *b,
+                    t: *t,
+                },
+                TsInsn::EqCBrFalse { d, s, k, t } => WordOp::EqCBrFalse {
+                    d: *d,
+                    s: *s,
+                    k: *k,
+                    t: *t,
+                },
                 TsInsn::LoadSig { d, sig } => WordOp::LoadSig { d: *d, sig: *sig },
                 TsInsn::Const { d, v } => WordOp::Const { d: *d, v: *v },
                 TsInsn::SigBit { d, sig, bit } => WordOp::SigBit {
@@ -343,6 +662,26 @@ impl WordProgram {
                     d: *d,
                     sig: *sig,
                     lo: *lo,
+                    mask: *mask,
+                },
+                TsInsn::SigBitW { d, sig, bit } => WordOp::SigSlice {
+                    d: *d,
+                    sig: *sig,
+                    lo: *bit,
+                    w: 1,
+                    mask: 1,
+                },
+                TsInsn::SigRangeW {
+                    d,
+                    sig,
+                    lo,
+                    w,
+                    mask,
+                } if (1..=64).contains(w) => WordOp::SigSlice {
+                    d: *d,
+                    sig: *sig,
+                    lo: *lo,
+                    w: *w,
                     mask: *mask,
                 },
                 TsInsn::Bit { d, s, bit } => WordOp::Bit {
@@ -690,12 +1029,43 @@ impl WordProgram {
                     v: *v,
                     w: *w,
                 },
-                _ => return None,
+                TsInsn::RangeStoreNba {
+                    sig,
+                    hi,
+                    lo,
+                    s,
+                    mask,
+                }
+                | TsInsn::RangeStoreNbaW {
+                    sig,
+                    hi,
+                    lo,
+                    s,
+                    mask,
+                } if hi.checked_sub(*lo).is_some_and(|n| n < 64) => WordOp::RangeStoreNba {
+                    sig: *sig,
+                    hi: *hi,
+                    lo: *lo,
+                    s: *s,
+                    mask: *mask,
+                },
+                TsInsn::RangeFillNbaW { sig, hi, lo, bit } if *hi >= *lo && *bit <= 1 => {
+                    WordOp::RangeFillNba {
+                        sig: *sig,
+                        hi: *hi,
+                        lo: *lo,
+                        bit: *bit,
+                    }
+                }
+                _ => return Self::reject_lower(Some(insn), "unsupported_or_guard"),
             });
         }
         Some(Self {
             ops,
-            regs: ts.num_regs as usize,
+            regs,
+            wide_words,
+            scratch,
+            constants,
         })
     }
     pub(super) fn execute(
@@ -707,8 +1077,9 @@ impl WordProgram {
         bi: u32,
         duplicates: bool,
     ) -> bool {
-        if regs.len() < self.regs {
-            regs.resize(self.regs, 0);
+        debug_assert_eq!(self.scratch, self.regs * (self.wide_words + 1));
+        if regs.len() < self.scratch {
+            regs.resize(self.scratch, 0);
         }
         let base = out.len();
         macro_rules! r {
@@ -727,8 +1098,170 @@ impl WordProgram {
                 return false;
             }};
         }
-        for insn in &self.ops {
+        let mut stream = self.ops.iter();
+        while let Some(insn) = stream.next() {
             match insn {
+                WordOp::Repl { d, s, mask, factor } => {
+                    r!(*d) = (r!(*s) & mask).wrapping_mul(*factor);
+                }
+                WordOp::LoadSigRepl {
+                    dl,
+                    sig,
+                    d,
+                    mask,
+                    factor,
+                } => {
+                    let (v, x) = planes!(*sig as usize);
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*dl) = v;
+                    r!(*d) = (v & mask).wrapping_mul(*factor);
+                }
+                WordOp::WRepl { d, s, w, count } => {
+                    // Capture the narrow source before writing an aliased wide bank.
+                    let part = r!(*s) & (u64::MAX >> (64 - u32::from(*w)));
+                    let words = &mut regs[*d..*d + self.wide_words];
+                    words.fill(0);
+                    if *w == 1 {
+                        if part != 0 {
+                            words.fill(u64::MAX);
+                        }
+                    } else {
+                        for i in 0..usize::from(*count) {
+                            let bit = i * usize::from(*w);
+                            let word = bit / 64;
+                            let shift = bit % 64;
+                            words[word] |= part << shift;
+                            if shift != 0 && usize::from(*w) > 64 - shift {
+                                words[word + 1] |= part >> (64 - shift);
+                            }
+                        }
+                    }
+                    let total = usize::from(*w) * usize::from(*count);
+                    let top = (total - 1) / 64;
+                    words[top] &= u64::MAX >> (63 - ((total - 1) % 64));
+                    words[top + 1..].fill(0);
+                }
+                WordOp::WSigRange { d, sig, lo, w } => {
+                    let signal = &signals[*sig as usize];
+                    if u32::from(*lo) + u32::from(*w) > signal.width {
+                        xbail!();
+                    }
+                    let words = &mut regs[*d..*d + self.wide_words];
+                    words.fill(0);
+                    for off in (0..usize::from(*w)).step_by(64) {
+                        let width = (usize::from(*w) - off).min(64) as u16;
+                        let (v, x) = Simulator::raw_bits_slice(signal, *lo + off as u16, width);
+                        if x != 0 {
+                            xbail!();
+                        }
+                        words[off / 64] = v;
+                    }
+                }
+                WordOp::WLoadSig { d, sig } => {
+                    if !signals[*sig as usize].words_if_clean(&mut regs[*d..*d + self.wide_words]) {
+                        xbail!();
+                    }
+                }
+                WordOp::WConst { d, k } => {
+                    let words = &mut regs[*d..*d + self.wide_words];
+                    words.fill(0);
+                    let value = &self.constants[*k];
+                    words[..value.len()].copy_from_slice(value);
+                }
+                WordOp::WStoreNba { sig, s, w } => {
+                    let id = *sig as usize;
+                    if *w != signals[id].width {
+                        xbail!();
+                    }
+                    let mut value = Value::from_words(&regs[*s..*s + self.wide_words], *w);
+                    value.is_signed = signed[id];
+                    Self::store(out, base, id, value, bi, duplicates);
+                }
+                WordOp::WRangeStoreNba { sig, lo, s, w } => {
+                    let id = *sig as usize;
+                    let current = &signals[id];
+                    if lo.checked_add(*w).is_none_or(|end| end > current.width) {
+                        xbail!();
+                    }
+                    let part = Value::from_words(&regs[*s..*s + self.wide_words], *w);
+                    NbaFast::queue_partial_from(out, base, current, id, *lo, &part, bi);
+                }
+                WordOp::WMask { d, w } => {
+                    let words = &mut regs[*d..*d + self.wide_words];
+                    let top = (*w as usize - 1) / 64;
+                    let count = (*w as usize - 1) % 64 + 1;
+                    words[top] &= u64::MAX >> (64 - count);
+                    words[top + 1..].fill(0);
+                }
+                WordOp::WFromN { r, d } => {
+                    let value = r!(*r);
+                    let words = &mut regs[*d..*d + self.wide_words];
+                    words.fill(0);
+                    words[0] = value;
+                }
+                WordOp::NFromW { r, s, mask } => r!(*r) = regs[*s] & mask,
+                WordOp::BrFalse { s, t } => {
+                    if r!(*s) == 0 {
+                        stream = self.ops[*t as usize..].iter();
+                    }
+                }
+                WordOp::BrNz { s, t } => {
+                    if r!(*s) != 0 {
+                        stream = self.ops[*t as usize..].iter();
+                    }
+                }
+                WordOp::Jmp { t } => stream = self.ops[*t as usize..].iter(),
+                WordOp::BrSigFalse { sig, bit, t } => {
+                    let signal = &signals[*sig as usize];
+                    let (v, x) = if *bit == u32::MAX {
+                        signal.raw_bits()
+                    } else if (*bit as usize) < signal.width as usize {
+                        signal.slice_bits_swar(*bit as usize, 1)
+                    } else {
+                        xbail!();
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    if v == 0 {
+                        stream = self.ops[*t as usize..].iter();
+                    }
+                }
+                WordOp::LoadSigBrNz { dl, sig, t } => {
+                    let (v, x) = planes!(*sig as usize);
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*dl) = v;
+                    if v != 0 {
+                        stream = self.ops[*t as usize..].iter();
+                    }
+                }
+                WordOp::BrFalseLoadSig { s, t, dl, sig } => {
+                    if r!(*s) == 0 {
+                        stream = self.ops[*t as usize..].iter();
+                    } else {
+                        let (v, x) = planes!(*sig as usize);
+                        if x != 0 {
+                            xbail!();
+                        }
+                        r!(*dl) = v;
+                    }
+                }
+                WordOp::EqBrFalse { d, a, b, t } => {
+                    r!(*d) = (r!(*a) == r!(*b)) as u64;
+                    if r!(*d) == 0 {
+                        stream = self.ops[*t as usize..].iter();
+                    }
+                }
+                WordOp::EqCBrFalse { d, s, k, t } => {
+                    r!(*d) = (r!(*s) == *k) as u64;
+                    if r!(*d) == 0 {
+                        stream = self.ops[*t as usize..].iter();
+                    }
+                }
                 WordOp::LoadSig { d, sig } => {
                     // Read only the immutable epoch; unknowns retry privately.
                     let (v, x) = planes!(*sig as usize);
@@ -751,6 +1284,23 @@ impl WordProgram {
                         xbail!();
                     }
                     r!(*d) = (v >> lo) & mask;
+                }
+                WordOp::SigSlice {
+                    d,
+                    sig,
+                    lo,
+                    w,
+                    mask,
+                } => {
+                    let signal = &signals[*sig as usize];
+                    if u32::from(*lo) + u32::from(*w) > signal.width {
+                        xbail!();
+                    }
+                    let (v, x) = signal.slice_bits_swar(*lo as usize, *w as usize);
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*d) = v & mask;
                 }
                 WordOp::Bit { d, s, bit } => {
                     r!(*d) = (r!(*s) >> bit) & 1;
@@ -829,7 +1379,7 @@ impl WordProgram {
                 WordOp::BitDyn { d, s, i, w } => {
                     let idx = r!(*i);
                     if idx >= *w as u64 {
-                        return false;
+                        xbail!();
                     }
                     r!(*d) = (r!(*s) >> idx) & 1;
                 }
@@ -1049,6 +1599,35 @@ impl WordProgram {
                     value.is_signed = signed[id];
                     Self::store(out, base, id, value, bi, duplicates);
                 }
+                WordOp::RangeStoreNba {
+                    sig,
+                    hi,
+                    lo,
+                    s,
+                    mask,
+                } => {
+                    let id = *sig as usize;
+                    let current = &signals[id];
+                    if *hi >= current.width {
+                        xbail!();
+                    }
+                    let part = Value::from_u64(r!(*s) & mask, hi - lo + 1);
+                    NbaFast::queue_partial_from(out, base, current, id, *lo, &part, bi);
+                }
+                WordOp::RangeFillNba { sig, hi, lo, bit } => {
+                    let id = *sig as usize;
+                    let current = &signals[id];
+                    if *hi >= current.width {
+                        xbail!();
+                    }
+                    let width = hi - lo + 1;
+                    let part = if *bit == 0 {
+                        Value::zero(width)
+                    } else {
+                        Value::ones(width)
+                    };
+                    NbaFast::queue_partial_from(out, base, current, id, *lo, &part, bi);
+                }
             }
         }
         true
@@ -1074,3 +1653,7 @@ impl WordProgram {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "parallel_word_tests.rs"]
+mod tests;

@@ -13,6 +13,65 @@ struct BlockPlan {
     duplicate_nba: bool,
     word: Option<WordProgram>,
 }
+
+// Partition ids express locality, not a publication boundary: every task reads
+// the same immutable event, and all writes are merged after credit quiescence.
+// Split a large locality group before packing chunks, so one clock domain or
+// scope cannot leave all but one execution lane idle. Sparse ids cost no space.
+#[cfg(test)]
+fn partition_tasks(blocks: Vec<(usize, u32, usize)>, lanes: usize) -> Vec<Vec<usize>> {
+    partition_tasks_with_grain(blocks, lanes, 4)
+}
+
+fn partition_tasks_with_grain(
+    mut blocks: Vec<(usize, u32, usize)>,
+    lanes: usize,
+    tasks_per_lane: usize,
+) -> Vec<Vec<usize>> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    let tasks = blocks
+        .len()
+        .min(lanes.max(1).saturating_mul(tasks_per_lane.clamp(1, 16)));
+    let total: u128 = blocks.iter().map(|b| b.2.max(1) as u128).sum();
+    let target = total.div_ceil(tasks as u128);
+    // Stable order within each locality group keeps neighboring blocks close.
+    blocks.sort_by_key(|b| b.1);
+    let mut chunks = Vec::new();
+    let mut chunk = Vec::new();
+    let mut cost = 0u128;
+    let mut locality = blocks[0].1;
+    for (bi, part, weight) in blocks {
+        let weight = weight.max(1) as u128;
+        if !chunk.is_empty() && (part != locality || cost + weight > target) {
+            chunks.push((cost, std::mem::take(&mut chunk)));
+            cost = 0;
+        }
+        locality = part;
+        chunk.push(bi);
+        cost += weight;
+    }
+    if !chunk.is_empty() {
+        chunks.push((cost, chunk));
+    }
+    chunks.sort_by_key(|c| std::cmp::Reverse(c.0));
+    let mut groups: Vec<Vec<usize>> = (0..tasks).map(|_| Vec::new()).collect();
+    let mut costs = vec![0u128; tasks];
+    for (cost, mut chunk) in chunks {
+        let task = (0..tasks).min_by_key(|&i| (costs[i], i)).unwrap();
+        costs[task] += cost;
+        groups[task].append(&mut chunk);
+    }
+    // The shared credit cursor exposes the longest tasks first.
+    let mut groups: Vec<_> = groups
+        .into_iter()
+        .zip(costs)
+        .filter(|g| !g.0.is_empty())
+        .collect();
+    groups.sort_by_key(|g| std::cmp::Reverse(g.1));
+    groups.into_iter().map(|g| g.0).collect()
+}
 // Plans contain only positively admitted immutable instructions. Their backing
 // allocations stay alive until all event credits retire; no AST fallback runs.
 unsafe impl Send for BlockPlan {}
@@ -40,13 +99,79 @@ struct TaskOutput {
     writes: Vec<NbaFast>,
     fast: u64,
     fallback: u64,
+    executing_lane: usize,
+    // Elapsed evaluator wall time, including descheduling; not CPU time.
+    busy_ns: u128,
 }
+
+#[derive(Clone, Default)]
+struct LaneParticipation {
+    tasks: u64,
+    blocks: u64,
+    nba_entries: u64,
+    busy_ns: u128,
+}
+
+fn record_lane_outputs(
+    outputs: &[std::sync::MutexGuard<'_, TaskOutput>],
+    lanes: &mut [LaneParticipation],
+) {
+    for output in outputs {
+        let lane = &mut lanes[output.executing_lane];
+        lane.tasks += 1;
+        lane.blocks += output.fast + output.fallback;
+        lane.nba_entries += output.writes.len() as u64;
+        lane.busy_ns += output.busy_ns;
+    }
+}
+
 struct Task {
     blocks: Vec<Arc<BlockPlan>>,
     // A claimed task has one writer. The slot retains capacity across events;
     // the coordinator takes ownership of results only after credit quiescence.
     output: Mutex<TaskOutput>,
 }
+// Every task is ordered by the global block rank. Heap ties prefer the
+// lower task index, so a consecutive run from one block can drain intact.
+fn merge_task_outputs<const BATCH: bool, const COUNT: bool>(
+    outputs: &mut [std::sync::MutexGuard<'_, TaskOutput>],
+    order: &[usize],
+    nba: &mut Vec<NbaFast>,
+    index: &mut NbaFastIndex,
+) -> u64 {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let mut drains: Vec<_> = outputs.iter_mut().map(|o| o.writes.drain(..)).collect();
+    let mut heads: Vec<_> = drains.iter_mut().map(Iterator::next).collect();
+    let mut ready = BinaryHeap::new();
+    let mut pops = 0;
+    for (i, head) in heads.iter().enumerate() {
+        if let Some(n) = head {
+            ready.push(Reverse((order[n.block_index as usize], i)));
+        }
+    }
+    while let Some(Reverse((_, i))) = ready.pop() {
+        if COUNT {
+            pops += 1;
+        }
+        let block = heads[i].as_ref().unwrap().block_index;
+        loop {
+            let entry = heads[i].take().unwrap();
+            index.insert(entry.signal_id, nba.len());
+            nba.push(entry);
+            heads[i] = drains[i].next();
+            if BATCH && heads[i].as_ref().is_some_and(|n| n.block_index == block) {
+                continue;
+            }
+            if let Some(n) = &heads[i] {
+                ready.push(Reverse((order[n.block_index as usize], i)));
+            }
+            break;
+        }
+    }
+    pops
+}
+
 struct EventWork {
     epoch: Epoch,
     tasks: Arc<Vec<Task>>,
@@ -118,11 +243,30 @@ fn evaluate(
 }
 
 fn consume(work: &EventWork, vm: &mut Vec<Value>, words: &mut Vec<u64>) {
+    consume_lane::<false>(work, vm, words, 0);
+}
+
+fn consume_lane<const DIAGNOSTICS: bool>(
+    work: &EventWork,
+    vm: &mut Vec<Value>,
+    words: &mut Vec<u64>,
+    lane: usize,
+) {
     while let Some(ticket) = work.credits.claim() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let task = &work.tasks[ticket.index()];
             let mut output = task.output.lock().unwrap_or_else(|e| e.into_inner());
+            let started = if DIAGNOSTICS {
+                output.executing_lane = lane;
+                output.busy_ns = 0;
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             evaluate(work.epoch, &task.blocks, &mut output, vm, words);
+            if let Some(started) = started {
+                output.busy_ns = started.elapsed().as_nanos();
+            }
         }));
         if result.is_err() {
             // Publish failure and cancel queued work BEFORE retiring this
@@ -184,6 +328,25 @@ struct Worker {
     handle: Option<JoinHandle<()>>,
 }
 
+fn multicore_diagnostics_enabled() -> bool {
+    env_is_one_cached!("XEZIM_MULTICORE_DIAGNOSTICS")
+}
+
+#[derive(Default)]
+struct DispatchDiagnostics {
+    epochs: u64,
+    replans: u64,
+    blocks: u64,
+    nba_entries: u64,
+    prepare_ns: u128,
+    execute_ns: u128,
+    merge_ns: u128,
+    plan_lowerings: u64,
+    ts_lower_failed: u64,
+    word_lower_failed: u64,
+    merge_heap_pops: u64,
+}
+
 #[derive(Default)]
 struct CreditStats {
     epochs: u64,
@@ -200,31 +363,89 @@ pub(super) struct EdgeWorkers {
     last_blocks: Vec<usize>,
     last_partitions: Vec<u32>,
     tasks: Arc<Vec<Task>>,
+    merge_runs: bool,
+    tasks_per_lane: usize,
     order: Vec<usize>,
     serial_vm: Vec<Value>,
     serial_words: Vec<u64>,
     stats: CreditStats,
+    diagnostics: DispatchDiagnostics,
+    lane_participation: Vec<LaneParticipation>,
 }
 impl EdgeWorkers {
     pub(super) fn worker_count(&self) -> usize {
-        self.workers.len()
+        self.workers.len() + 1
     }
     pub(super) fn report_credits(&self) {
         let s = &self.stats;
         chatter!(
-            "[PROF] multicore credits_issued={} credits_retired={} credits_cancelled={} credit_pending={} credit_epochs={} worker_wakes={} credit_wait_ms={:.1}",
+            "[PROF] multicore credits_issued={} credits_retired={} credits_cancelled={} credit_pending={} credit_epochs={} worker_wakes={} credit_wait_ms={:.1} tasks_per_lane={}",
             s.issued,
             s.retired,
             s.cancelled,
             s.issued - s.retired - s.cancelled,
             s.epochs,
             s.wakes,
-            s.wait_ns as f64 / 1_000_000.0
+            s.wait_ns as f64 / 1_000_000.0,
+            self.tasks_per_lane
         );
+        if multicore_diagnostics_enabled() {
+            let d = &self.diagnostics;
+            chatter!(
+                "[PROF] multicore_dispatch epochs={} replans={} blocks={} nba_entries={} prepare_ms={:.3} execute_ms={:.3} merge_ms={:.3} plan_lowerings={} ts_lower_failed={} word_lower_failed={} merge_heap_pops={}",
+                d.epochs,
+                d.replans,
+                d.blocks,
+                d.nba_entries,
+                d.prepare_ns as f64 / 1_000_000.0,
+                d.execute_ns as f64 / 1_000_000.0,
+                d.merge_ns as f64 / 1_000_000.0,
+                d.plan_lowerings,
+                d.ts_lower_failed,
+                d.word_lower_failed,
+                d.merge_heap_pops
+            );
+            let tasks: u64 = self.lane_participation.iter().map(|lane| lane.tasks).sum();
+            let blocks: u64 = self.lane_participation.iter().map(|lane| lane.blocks).sum();
+            let background_tasks: u64 = self
+                .lane_participation
+                .iter()
+                .skip(1)
+                .map(|lane| lane.tasks)
+                .sum();
+            let background_blocks: u64 = self
+                .lane_participation
+                .iter()
+                .skip(1)
+                .map(|lane| lane.blocks)
+                .sum();
+            chatter!(
+                "[PROF] multicore_participation tasks={} background_tasks={} background_task_fraction={:.6} blocks={} background_blocks={} background_block_fraction={:.6}",
+                tasks,
+                background_tasks,
+                background_tasks as f64 / tasks.max(1) as f64,
+                blocks,
+                background_blocks,
+                background_blocks as f64 / blocks.max(1) as f64
+            );
+            for (lane, participation) in self.lane_participation.iter().enumerate() {
+                chatter!(
+                    "[PROF] multicore_lane lane={} tasks={} blocks={} nba_entries={} busy_ms={:.3}",
+                    lane,
+                    participation.tasks,
+                    participation.blocks,
+                    participation.nba_entries,
+                    participation.busy_ns as f64 / 1_000_000.0
+                );
+            }
+        }
     }
     fn new(count: usize) -> Self {
+        let diagnostics = multicore_diagnostics_enabled();
         let mut workers = Vec::with_capacity(count);
-        for worker in 0..count {
+        // The coordinator is an execution lane too; configured CPU capacity
+        // includes it instead of adding an idle coordinator to N workers.
+        for worker in 0..count.saturating_sub(1) {
             let mailbox = Arc::new(Mailbox::default());
             let receiver = mailbox.clone();
             let handle = std::thread::Builder::new()
@@ -234,7 +455,11 @@ impl EdgeWorkers {
                     let mut vm = Vec::new();
                     let mut words = Vec::new();
                     while let Some(work) = receiver.receive() {
-                        consume(&work, &mut vm, &mut words);
+                        if diagnostics {
+                            consume_lane::<true>(&work, &mut vm, &mut words, worker + 1);
+                        } else {
+                            consume(&work, &mut vm, &mut words);
+                        }
                     }
                 })
                 .expect("start simulation worker");
@@ -249,10 +474,22 @@ impl EdgeWorkers {
             last_blocks: Vec::new(),
             last_partitions: Vec::new(),
             tasks: Arc::new(Vec::new()),
+            merge_runs: env_is_one_cached!("XEZIM_MULTICORE_MERGE_RUNS"),
+            tasks_per_lane: std::env::var("XEZIM_MULTICORE_TASKS_PER_LANE")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| (1..=16).contains(value))
+                .unwrap_or(4),
             order: Vec::new(),
             serial_vm: Vec::new(),
             serial_words: Vec::new(),
             stats: CreditStats::default(),
+            diagnostics: DispatchDiagnostics::default(),
+            lane_participation: if diagnostics {
+                vec![LaneParticipation::default(); count]
+            } else {
+                Vec::new()
+            },
         }
     }
 }
@@ -296,6 +533,8 @@ impl Simulator {
         if blocks.is_empty() {
             return Ok(());
         }
+        let diagnostics = multicore_diagnostics_enabled();
+        let prepare_start = diagnostics.then(std::time::Instant::now);
         let partitioned =
             self.edge_block_partition_count > 0 && !self.edge_block_partition.is_empty();
         if partitioned {
@@ -304,20 +543,15 @@ impl Simulator {
         } else {
             self.prof_par_dispatch_legacy += 1;
         }
-        let count = self
-            .multicore_threads
-            .min(if partitioned {
-                self.edge_block_partition_count as usize
-            } else {
-                self.multicore_threads
-            })
-            .max(1);
+        // Keep the pool stable as clock populations change. Only queued task
+        // credits determine participation in a small event.
+        let count = self.multicore_threads.max(1);
         let mut pool = self
             .edge_workers
             .take()
-            .filter(|p| p.workers.len() == count)
+            .filter(|p| p.worker_count() == count)
             .unwrap_or_else(|| EdgeWorkers::new(count));
-        if pool.plans.len() < self.compiled_edge_blocks.len() {
+        if pool.plans.len() != self.compiled_edge_blocks.len() {
             pool.plans
                 .resize_with(self.compiled_edge_blocks.len(), || None);
         }
@@ -345,14 +579,24 @@ impl Simulator {
                 {
                     return Err("unsupported parallel instruction".into());
                 }
-                let word = super::super::bytecode::lower_two_state(
+                let ts = super::super::bytecode::lower_two_state(
                     block,
                     &self.signal_widths,
                     &self.signal_signed,
                     &self.signal_real,
                     &self.array_first_id,
-                )
-                .and_then(WordProgram::lower);
+                );
+                if diagnostics {
+                    pool.diagnostics.plan_lowerings += 1;
+                    pool.diagnostics.ts_lower_failed += u64::from(ts.is_none());
+                }
+                let word = ts.and_then(|ts| {
+                    let word = WordProgram::lower(ts);
+                    if diagnostics {
+                        pool.diagnostics.word_lower_failed += u64::from(word.is_none());
+                    }
+                    word
+                });
                 pool.plans[bi] = Some(Arc::new(BlockPlan {
                     index: bi as u32,
                     ptr: block.instructions.as_ptr(),
@@ -365,43 +609,29 @@ impl Simulator {
             }
         }
         if changed {
+            if diagnostics {
+                pool.diagnostics.replans += 1;
+            }
             pool.order
                 .resize(self.compiled_edge_blocks.len(), usize::MAX);
             for (rank, &bi) in blocks.iter().enumerate() {
                 pool.order[bi] = rank;
             }
-            // A logical partition is one indivisible task. Otherwise create
-            // several balanced tasks per worker, allowing any free worker to
-            // claim the next task instead of waiting for a fixed peer batch.
-            let mut groups: Vec<Vec<usize>> = if partitioned {
-                let mut units: Vec<Vec<usize>> = (0..self.edge_block_partition_count)
-                    .map(|_| Vec::new())
-                    .collect();
-                for &bi in blocks.iter() {
-                    units[self.edge_block_partition[bi] as usize].push(bi);
-                }
-                units.into_iter().filter(|u| !u.is_empty()).collect()
-            } else {
-                let tasks = blocks.len().min(count.saturating_mul(4)).max(1);
-                let mut groups: Vec<Vec<usize>> = (0..tasks).map(|_| Vec::new()).collect();
-                let mut costs = vec![0usize; tasks];
-                let mut ranked = blocks.to_vec();
-                ranked.sort_by_key(|&i| std::cmp::Reverse(pool.plans[i].as_ref().unwrap().len));
-                for bi in ranked {
-                    let task = (0..tasks).min_by_key(|&i| (costs[i], i)).unwrap();
-                    costs[task] += pool.plans[bi].as_ref().unwrap().len;
-                    groups[task].push(bi);
-                }
-                groups
-            };
-            groups.sort_by_key(|group| {
-                std::cmp::Reverse(
-                    group
-                        .iter()
-                        .map(|&i| pool.plans[i].as_ref().unwrap().len)
-                        .sum::<usize>(),
-                )
-            });
+            let groups = partition_tasks_with_grain(
+                blocks
+                    .iter()
+                    .map(|&bi| {
+                        let locality = if partitioned {
+                            self.edge_block_partition[bi]
+                        } else {
+                            self.edge_block_scope_id.get(bi).copied().unwrap_or(0)
+                        };
+                        (bi, locality, pool.plans[bi].as_ref().unwrap().len)
+                    })
+                    .collect(),
+                count,
+                pool.tasks_per_lane,
+            );
             pool.tasks = Arc::new(
                 groups
                     .into_iter()
@@ -443,11 +673,15 @@ impl Simulator {
             tasks: pool.tasks.clone(),
             error: Mutex::new(None),
         });
+        if let Some(start) = prepare_start {
+            pool.diagnostics.prepare_ns += start.elapsed().as_nanos();
+            pool.diagnostics.epochs += 1;
+            pool.diagnostics.blocks += blocks.len() as u64;
+        }
+        let execute_start = diagnostics.then(std::time::Instant::now);
         pool.stats.epochs += 1;
         pool.stats.issued += work.tasks.len() as u64;
-        if parallel_serialize_enabled() {
-            consume(&work, &mut pool.serial_vm, &mut pool.serial_words);
-        } else {
+        if !parallel_serialize_enabled() {
             for worker in pool.workers.iter().take(work.tasks.len()) {
                 if let Err(error) = worker.mailbox.notify(work.clone()) {
                     work.fail(error);
@@ -457,7 +691,12 @@ impl Simulator {
             }
         }
         work.credits.seal();
-        let wait = self.profile_report.then(std::time::Instant::now);
+        if diagnostics {
+            consume_lane::<true>(&work, &mut pool.serial_vm, &mut pool.serial_words, 0);
+        } else {
+            consume(&work, &mut pool.serial_vm, &mut pool.serial_words);
+        }
+        let wait = (self.profile_report || diagnostics).then(std::time::Instant::now);
         // Event quiescence depends on actual queued/in-flight work credits,
         // not on acknowledgements or arrivals from every configured worker.
         work.credits.wait();
@@ -470,10 +709,15 @@ impl Simulator {
             work.tasks.len(),
             work.credits.completed() + work.credits.cancelled()
         );
+        if let Some(start) = execute_start {
+            pool.diagnostics.execute_ns += start.elapsed().as_nanos();
+        }
         let error = *work.error.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(error) = error {
             return Err(error.into());
         }
+        let merge_start = diagnostics.then(std::time::Instant::now);
+        let nba_start = self.nba_fast.len();
         // Credit zero proves every task output and input borrow is complete.
         // Draining retains task-local vector capacity for the next event.
         let mut outputs: Vec<_> = work
@@ -481,32 +725,45 @@ impl Simulator {
             .iter()
             .map(|task| task.output.lock().unwrap_or_else(|e| e.into_inner()))
             .collect();
+        if diagnostics {
+            record_lane_outputs(&outputs, &mut pool.lane_participation);
+        }
         for output in &outputs {
             self.prof_multicore_fast += output.fast;
             self.prof_multicore_fallback += output.fallback;
         }
-        use std::cmp::Reverse;
-        use std::collections::BinaryHeap;
-        let mut drains: Vec<_> = outputs.iter_mut().map(|o| o.writes.drain(..)).collect();
-        let mut heads: Vec<_> = drains.iter_mut().map(Iterator::next).collect();
-        let mut ready = BinaryHeap::new();
-        for (i, head) in heads.iter().enumerate() {
-            if let Some(n) = head {
-                ready.push(Reverse((pool.order[n.block_index as usize], i)));
-            }
-        }
-        while let Some(Reverse((_, i))) = ready.pop() {
-            let entry = heads[i].take().unwrap();
-            self.nba_fast_index
-                .insert(entry.signal_id, self.nba_fast.len());
-            self.nba_fast.push(entry);
-            heads[i] = drains[i].next();
-            if let Some(n) = &heads[i] {
-                ready.push(Reverse((pool.order[n.block_index as usize], i)));
-            }
-        }
-        drop(drains);
+        let heap_pops = match (pool.merge_runs, diagnostics) {
+            (false, false) => merge_task_outputs::<false, false>(
+                &mut outputs,
+                &pool.order,
+                &mut self.nba_fast,
+                &mut self.nba_fast_index,
+            ),
+            (false, true) => merge_task_outputs::<false, true>(
+                &mut outputs,
+                &pool.order,
+                &mut self.nba_fast,
+                &mut self.nba_fast_index,
+            ),
+            (true, false) => merge_task_outputs::<true, false>(
+                &mut outputs,
+                &pool.order,
+                &mut self.nba_fast,
+                &mut self.nba_fast_index,
+            ),
+            (true, true) => merge_task_outputs::<true, true>(
+                &mut outputs,
+                &pool.order,
+                &mut self.nba_fast,
+                &mut self.nba_fast_index,
+            ),
+        };
         drop(outputs);
+        if let Some(start) = merge_start {
+            pool.diagnostics.merge_ns += start.elapsed().as_nanos();
+            pool.diagnostics.merge_heap_pops += heap_pops;
+            pool.diagnostics.nba_entries += (self.nba_fast.len() - nba_start) as u64;
+        }
         self.edge_workers = Some(pool);
         Ok(())
     }

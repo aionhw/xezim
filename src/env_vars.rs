@@ -607,6 +607,30 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Parallel: opt-in persistent workers with guarded word execution (1)",
     ),
     (
+        "XEZIM_MULTICORE_DIAGNOSTICS",
+        "Parallel: report dispatch preparation, execution, merge and plan counters (1)",
+    ),
+    (
+        "XEZIM_MULTICORE_LOWER_CENSUS",
+        "Parallel: print the first guarded-word lowering rejection per plan (1; diagnostic)",
+    ),
+    (
+        "XEZIM_MULTICORE_MERGE_RUNS",
+        "Parallel: merge consecutive writes from the same block as one heap run (1; experimental)",
+    ),
+    (
+        "XEZIM_MULTICORE_REPLICATION",
+        "Parallel: admit guarded scalar and wide replication operations (1; experimental)",
+    ),
+    (
+        "XEZIM_MULTICORE_TASKS_PER_LANE",
+        "Parallel: bound task fanout per execution lane (1..16; default 4)",
+    ),
+    (
+        "XEZIM_MULTICORE_WIDE_RANGE",
+        "Parallel: admit guarded wide signal slices up to 512 bits (1; experimental)",
+    ),
+    (
         "XEZIM_NAME_STATS",
         "Count string-keyed name lookups per site (UVM runtime-ID investigation)",
     ),
