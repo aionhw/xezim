@@ -63,13 +63,28 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   randomization, static subroutine randomization targets, class
   specializations keyed by argument type however it is spelled, static
   methods called through a null specialization handle, call actuals sized by
-  the callee's formal, the time-zero port handshake between instances, and
+  the callee's formal, the time-zero port handshake between instances, wide
+  `rand` draws and `sum()` targets at full width (§18.4, §7.12.3), packed-struct
+  patterns laid out into class properties and array elements (§10.9.2), and
   detailed self-checking bug reports for struct and class member access.
 - **eenky** — declared defaults for parameters a class leaves out when it
   extends a parameterized class, and virtual-interface reads through
   class-handle chains (`cfg.vif.data`).
 - **Francesco Urbani** — `+incdir+` directories in `-F` args files resolved
-  against the args file's own directory.
+  against the args file's own directory, and macro arguments kept after a
+  token paste that ends the macro's name (§22.5.1).
+- **[Adam Auten](https://github.com/auty1395)** — elaboration fixes in the core
+  with a simulator test for each: array parameters whose dimensions name
+  imported parameters or other array parameters, element selects of packed
+  multi-dimensional package parameters, a body struct localparam in a
+  module's first instance, constant concatenations in integer constant
+  contexts, `always` as a property operator, continuous assigns of one row of
+  a 2-D array or of a whole array with a hierarchical side, relative instance
+  references inside nested generate scopes, package delays under a
+  command-line timescale, bind actuals the target does not declare, class
+  associative-array keys sized per specialization, and specialization
+  arguments written as expressions of package parameters keyed by their
+  value (§8.25).
 - **Taichi Ishitani** — constrained-random fixes (members of rand object array
   elements, `pre_randomize` before the rand and constraint modes are read,
   `this.` member paths in the joint solver, and `XEZIM_RAND_DIAG` reports of
@@ -82,7 +97,17 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   compiler or hang the caller's loop), and nested type arguments kept in
   static-call specializations, so `uvm_config_db#(cfg#(AW,DW))::get` reaches
   the configuration that was set, and factory `type_id::create` through chains
-  of class typedefs.
+  of class typedefs; reclaiming class objects no handle reaches (§8.7), with
+  the fixtures for every place a handle can hide; virtual interfaces bound
+  through inherited and forwarded type parameters, own-definition-name paths
+  and indexed receivers (§8.25, §25.9); class events, clocking blocks and
+  `@vif.cb` waits (§14, §15.5); fork-child state shared only within its
+  activation and released on every disable path (§9.3.2, §9.6.2); a broad set
+  of constrained-random fixes for `inside`, `foreach`, enum domains and
+  context widths (§18); extern-method linking through package class aliases
+  and linear macro line joining in the core (§8.24, §22.5.1); and the
+  execution-cache releases and associative-array key caching that keep long
+  runs fast.
 - **[Hern](https://github.com/hernloh)** — labelled assertion and cover sites
   named in the coverage results file.
 - **[opensource-elearning](https://github.com/opensource-elearning)** — reads
@@ -99,6 +124,7 @@ work. Thank you in particular to
 [AaronKel](https://github.com/AaronKel),
 [akashlevy](https://github.com/akashlevy),
 [amal-khailtash](https://github.com/amal-khailtash),
+[auty1395](https://github.com/auty1395),
 [bharathnaruto-spec](https://github.com/bharathnaruto-spec),
 [chenbhil](https://github.com/chenbhil),
 [davekeeshan](https://github.com/davekeeshan),

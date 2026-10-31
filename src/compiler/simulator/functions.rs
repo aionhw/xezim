@@ -394,7 +394,7 @@ impl Simulator {
                 // evaluated bare, `a` was unknown and the default was x.
                 self.in_subroutine_default_scope(None, None, |sim| {
                     sim.push_local_frame_typed(locals.clone(), frame_types.clone());
-                    let value = sim.eval_expr(def);
+                    let value = sim.eval_formal_default(port, def);
                     let value = sim.vif_argument_value(port, def, value);
                     sim.pop_local_frame();
                     value
@@ -2044,6 +2044,20 @@ impl Simulator {
                 is_vif.then_some(i)
             })
             .collect();
+        // Resolve output handle types in the callee's specialization before
+        // restoring the caller's context. Automatic formals start null.
+        let output_class_indices: Vec<usize> = td
+            .ports
+            .iter()
+            .enumerate()
+            .filter_map(|(i, port)| {
+                (port.direction == PortDirection::Output
+                    && (method_ctx.is_some()
+                        || matches!(td.lifetime, Some(crate::ast::types::Lifetime::Automatic)))
+                    && self.port_class_ref(port).is_some())
+                .then_some(i)
+            })
+            .collect();
         if let Some(saved) = saved_type_context {
             self.current_spec = saved;
         }
@@ -2294,7 +2308,7 @@ impl Simulator {
                     // binds the default as its actual, so `output o = a`
                     // copies `o` back to `a` on return.
                     let val = if port.direction == PortDirection::Output
-                        && vif_formal_indices.contains(&i)
+                        && (vif_formal_indices.contains(&i) || output_class_indices.contains(&i))
                     {
                         Value::zero(32)
                     } else {
@@ -2387,7 +2401,7 @@ impl Simulator {
                             default_spec.clone(),
                             |sim| {
                                 sim.push_local_frame_typed(locals.clone(), frame_types.clone());
-                                let value = sim.eval_expr(def);
+                                let value = sim.eval_formal_default(port, def);
                                 let value = sim.vif_argument_value(port, def, value);
                                 sim.pop_local_frame();
                                 value

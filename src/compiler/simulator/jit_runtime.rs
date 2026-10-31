@@ -1310,8 +1310,9 @@ impl Simulator {
             return None;
         }
         let own = self.lrm_self_width(expr)?;
-        if own == 64 {
-            // possibly real (§11.8.2): leave it to the per-item compare
+        // §11.4.13: 64-bit integers still supply context to narrower
+        // range expressions. Width alone does not make an operand real.
+        if self.expr_is_real_static(expr) || self.call_returns_real(expr) {
             return None;
         }
         let mut w = own;
@@ -1331,7 +1332,10 @@ impl Simulator {
                 }
                 continue;
             }
-            if self.operand_is_string(b) {
+            if self.operand_is_string(b)
+                || self.expr_is_real_static(b)
+                || self.call_returns_real(b)
+            {
                 return None;
             }
             let bw = self.lrm_self_width(b)?;
@@ -1473,6 +1477,13 @@ impl Simulator {
                 // the rvalue at the right bit boundaries.
                 if let Some(w) = self.packed_field_width(&n) {
                     return (w, stable);
+                }
+                // Class properties have no signal entry. In particular a
+                // concatenation lvalue must split its RHS using each declared
+                // property width, not the one-bit unknown-name fallback.
+                // Receiver/parameter-dependent widths cannot be node-cached.
+                if let Some(w) = self.lrm_self_width(expr) {
+                    return (w, false);
                 }
                 (1, false)
             }

@@ -234,7 +234,13 @@ impl Simulator {
                     // Unknown type (missing property_types entry): assume the
                     // safe side and refuse to lower.
                     .unwrap_or(false);
-                if unpacked || !integral_or_handle {
+                // Virtual interfaces carry an instance-name binding outside
+                // the heap Value. A typedef or type parameter may hide that
+                // shape; copying the numeric cell alone loses the binding.
+                // This admission set is shared across specializations, so a
+                // type parameter that may carry a vif must keep the AST path.
+                let vif_capable = Self::static_is_vif_capable(cd, p);
+                if unpacked || vif_capable || !integral_or_handle {
                     bad.insert(p.clone());
                 }
             }
@@ -269,6 +275,12 @@ impl Simulator {
             let crate::ast::types::DataType::TypeReference { name: tn, .. } = cur else {
                 return None;
             };
+            // A typedef of an unpacked collection of class handles is a
+            // collection, not a handle to its element class. Following only
+            // typedef_types discards those unpacked dimensions.
+            if self.fn_ret_coll_dims(cur).is_some() {
+                return None;
+            }
             if self.module.classes.contains_key(&tn.name.name) {
                 return Some(tn.name.name.clone());
             }
@@ -2068,6 +2080,14 @@ impl Simulator {
                     for (class, declaration) in &self.module.classes {
                         let mut fields = self.class_member_access_safe_names(class);
                         fields.extend(self.class_string_member_names(class));
+                        let widths = fields
+                            .iter()
+                            .filter_map(|f| match self.class_prop_width_fixed(class, f) {
+                                Some(Some(w)) if w > 0 => Some((f.clone(), w)),
+                                _ => None,
+                            })
+                            .collect();
+                        facts.instance_field_widths.insert(class.clone(), widths);
                         facts.instance_fields.insert(class.clone(), fields);
                         // Direct superclass (spec args stripped): the
                         // writeback-hierarchy walk in
@@ -2200,6 +2220,7 @@ impl Simulator {
                     // parameters against this receiver's specialization.
                     let mut local_typedef_types = HashMap::default();
                     let mut unresolved_type_names = HashSet::default();
+                    let mut method_enum_constants = HashMap::default();
                     let mut cur = Some(cname.to_string());
                     let mut seen = HashSet::default();
                     while let Some(cn) = cur {
@@ -2224,6 +2245,19 @@ impl Simulator {
                             }
                         }
                         for (name, dt) in &cd.typedef_targets {
+                            if matches!(dt, DataType::Enum(_)) {
+                                if let Some(members) = self.module.enum_members.get(name) {
+                                    for (member, _) in members {
+                                        if !instance_props.contains(member)
+                                            && !static_members.contains(member)
+                                            && !const_names.contains(member)
+                                            && let Some(value) = self.class_enum_member(cname, member)
+                                        {
+                                            method_enum_constants.entry(member.clone()).or_insert(value);
+                                        }
+                                    }
+                                }
+                            }
                             // Keep the declaring class when an inherited alias
                             // is reached by a bare name from a derived method.
                             local_typedef_types.entry(name.clone()).or_insert_with(|| {
@@ -2261,6 +2295,7 @@ impl Simulator {
                     );
                     compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                     compiler.set_typedef_types(&self.module.typedef_types);
+                    compiler.method_enum_constants = method_enum_constants;
                     compiler.set_method_formal_types(ports);
                     if let CompiledBodyKind::Function(function) = kind {
                         compiler.set_method_return_type(&function.return_type);

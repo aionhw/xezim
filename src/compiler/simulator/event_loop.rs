@@ -2308,6 +2308,9 @@ impl Simulator {
             }
             if next_time > self.time {
                 self.dump_slot_end();
+                // The slot is complete and every process is parked in traced
+                // scheduler state: a safe point for class reclamation.
+                self.maybe_collect_class_heap();
                 self.time = next_time;
                 publish_sim_time(next_time);
                 // Lines printed near the end of a burst stay buffered until the

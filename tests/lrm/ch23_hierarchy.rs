@@ -450,3 +450,22 @@ fn c23_hierarchy_more() {
         &["T|23.6e|", "T|23.6h|"],
     );
 }
+
+// §23.11, §6.10: a bind port actual the target does not declare is an implicit
+// net in the target, not the bind scope's signal of that name
+#[test]
+fn c23_11_bind_connection_implicit_net() {
+    // The bound instances print from their own initial blocks at time 30; IEEE 1800 §4.7 leaves their order open.
+    check(
+        "23.11_bind_connection_implicit_net",
+        include_str!("sv/23.11_bind_connection_implicit_net.sv"),
+        "bcin",
+        Order::Multiset,
+        &[
+            "T|23.11|bcin.bare.mon edges=0",
+            "T|23.11|bcin.own.mon edges=1",
+            "T|23.11|bcin.far.mon edges=0",
+        ],
+        &[],
+    );
+}

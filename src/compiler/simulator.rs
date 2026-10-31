@@ -301,7 +301,7 @@ fn method_boost_enabled() -> bool {
 /// salt hash to different keys and are simply recompiled; the safety net is
 /// the suite-level ON == OFF parity run against a warm cache.
 // §6.16 / §6.24.3: string casts emit conversion rather than width resizing.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_304f;
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3064;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -327,6 +327,7 @@ impl<'a> CompiledBodyKind<'a> {
 
 /// class-perf P3: direct-call eligibility for a compiled (cid, mid).
 #[derive(Clone)]
+#[derive(serde::Serialize)]
 enum FastCallState {
     /// Not yet decided (no map entry): the plan or compiled block may not
     /// exist yet — the call runs the interpreter route, which builds them;
@@ -341,6 +342,7 @@ enum FastCallState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize)]
 pub(crate) enum FastAccessor {
     None,
     Getter(Box<str>),
@@ -352,6 +354,7 @@ pub(crate) enum FastAccessor {
 /// interpreter's binding loop. Mirrors `try_run_compiled_method`'s seeding
 /// and result clamping, but sources formals from the CALLER's argument
 /// registers.
+#[derive(serde::Serialize)]
 struct FastCallEntry {
     block: std::rc::Rc<super::bytecode::CompiledBlock>,
     this_reg: super::bytecode::RegId,
@@ -1608,6 +1611,7 @@ pub struct SimOutput {
 }
 
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct NbaEntry {
     lhs: Option<Expression>,
     value: Value,
@@ -1649,6 +1653,7 @@ struct NbaEntry {
 }
 
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct JoinWaiter {
     parent_pid: usize,
     child_pids: HashSet<usize>,
@@ -1670,6 +1675,7 @@ struct JoinWaiter {
 /// via `process::suspend()`. The process is removed from whatever queue it
 /// was parked in; `resume()` uses this to re-schedule it.
 #[derive(Clone)]
+#[derive(serde::Serialize)]
 struct SuspendedProc {
     /// Continuation statements to run when the process resumes.
     continuation: ProcCont,
@@ -1681,6 +1687,7 @@ struct SuspendedProc {
 }
 
 /// §9.7 `process::await()`: a process blocked waiting for another's termination.
+#[derive(serde::Serialize)]
 struct AwaitWaiter {
     target_pid: usize,
     waiter_pid: usize,
@@ -1829,6 +1836,7 @@ enum DeferredAlways {
 }
 
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct SensitivityId {
     signal_id: usize,
     edge: EdgeKind,
@@ -1857,6 +1865,7 @@ struct SensitivityId {
 }
 
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct Sensitivity {
     signal_name: String,
     edge: EdgeKind,
@@ -1877,6 +1886,7 @@ struct EdgeFanout {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(serde::Serialize)]
 enum EdgeKind {
     Posedge,
     Negedge,
@@ -1910,6 +1920,7 @@ impl EdgeKind {
 #[derive(Debug, Clone)]
 /// A process blocked in `semaphore.get(n)` because the count was below `n`
 /// (IEEE 1800-2017 §15.3.3). Woken by a `put` that raises the count enough.
+#[derive(serde::Serialize)]
 struct SemGetWaiter {
     pid: usize,
     /// Keys still required.
@@ -1917,6 +1928,7 @@ struct SemGetWaiter {
     cont: ProcCont,
 }
 
+#[derive(serde::Serialize)]
 struct MailboxGetWaiter {
     pid: usize,
     lvalue: Expression,
@@ -1930,6 +1942,7 @@ struct MailboxGetWaiter {
 /// §15.4.1 — a process blocked on `mailbox.put(v)` because a BOUNDED mailbox is
 /// full. The value is captured at the (blocking) call; when a `get`/`try_get`
 /// frees a slot the value is stored and `cont` is rescheduled.
+#[derive(serde::Serialize)]
 struct MailboxPutWaiter {
     pid: usize,
     value: Value,
@@ -1973,6 +1986,7 @@ enum EventListShape {
 }
 
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct EventWaiter {
     pid: usize,
     /// Simulation time when this waiter parked. Drives the hang report:
@@ -2025,6 +2039,7 @@ struct EventWaiter {
 
 /// §9.4.2: how a waiter re-evaluates its expression terms after it armed.
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct WaiterValueCtx {
     /// The name-resolution scope the waiting process armed in. The drain runs
     /// outside that process, and a bare `mem[i]` in a sub-module instance
@@ -2044,6 +2059,7 @@ struct WaiterValueCtx {
 /// raw `(this_handle, field_name)`; `->`/`@` inside a method both resolve to
 /// the same `this`, so a trigger and a wait on the same object match.
 #[derive(Clone)]
+#[derive(serde::Serialize)]
 enum InstanceEventKeys {
     One((usize, String)),
     Any(Vec<(usize, String)>),
@@ -2059,6 +2075,7 @@ impl InstanceEventKeys {
 }
 
 #[derive(Clone)]
+#[derive(serde::Serialize)]
 struct InstanceEventWaiter {
     key: InstanceEventKeys,
     pid: usize,
@@ -2083,6 +2100,7 @@ const CB_SKEW_1STEP: u64 = u64::MAX;
 /// ticks. `changes` holds `(slot, value at the end of that slot)` in time
 /// order, `init` the value before the first recorded slot.
 #[derive(Default)]
+#[derive(serde::Serialize)]
 struct ClockingHist {
     init: Option<Value>,
     changes: VecDeque<(u64, Value)>,
@@ -2139,6 +2157,9 @@ struct ProcCont {
     // `ForeachTail`/`ForeverTail` kinds, so their base kind is never
     // ambiguous and is never a flag consumer.
     loop_tail_at: Option<usize>,
+    /// Remaining iterations of a suspended repeat at loop_tail_at. The body
+    /// frame stays immutable and shared instead of being cloned per iteration.
+    repeat_remaining: Option<u64>,
 }
 
 /// Defense in depth for the chain length: the derived drop for a linked list
@@ -2165,6 +2186,7 @@ impl ProcCont {
             start: 0,
             next: None,
             loop_tail_at: None,
+            repeat_remaining: None,
         }
     }
 
@@ -2175,6 +2197,7 @@ impl ProcCont {
             start: 0,
             next: None,
             loop_tail_at: None,
+            repeat_remaining: None,
         }
     }
 
@@ -2188,6 +2211,7 @@ impl ProcCont {
             start: 0,
             next: None,
             loop_tail_at: None,
+            repeat_remaining: None,
         }
     }
 
@@ -2201,6 +2225,7 @@ impl ProcCont {
             start: idx.min(self.stmts.len()),
             next: self.next.clone(),
             loop_tail_at: self.loop_tail_at,
+            repeat_remaining: self.repeat_remaining,
         }
     }
 
@@ -2227,6 +2252,7 @@ impl ProcCont {
             start: 0,
             next,
             loop_tail_at: None,
+            repeat_remaining: None,
         }
     }
 
@@ -2253,6 +2279,7 @@ impl ProcCont {
                 start: 0,
                 next: None,
                 loop_tail_at: None,
+                repeat_remaining: None,
             };
         }
         self.pushed(vec![body.clone()], resume_at)
@@ -2280,6 +2307,7 @@ impl ProcCont {
             start: 0,
             next,
             loop_tail_at: None,
+            repeat_remaining: None,
         }
     }
 
@@ -2338,16 +2366,40 @@ impl ProcCont {
         None
     }
 
-    /// Flatten the chain. Diagnostics / snapshot paths only.
+    /// Flatten the chain. Diagnostics / snapshot paths only. Materialize
+    /// repeat counters that live outside the shared AST while executing.
     fn to_vec(&self) -> Vec<Statement> {
-        let mut out: Vec<Statement> = self.frame().to_vec();
-        let mut cur = self.next.clone();
-        while let Some(f) = cur {
-            out.extend_from_slice(f.frame());
-            cur = f.next.clone();
+        fn append(frame: &ProcCont, out: &mut Vec<Statement>) {
+            let offset = out.len();
+            out.extend_from_slice(frame.frame());
+            if let (Some(tail), Some(remaining)) =
+                (frame.loop_tail_at, frame.repeat_remaining)
+                && tail >= frame.start
+                && let Some(stmt) = out.get_mut(offset + tail - frame.start)
+                && let StatementKind::Repeat { count, .. } = &mut stmt.kind
+            {
+                *count = Expression::new(
+                    ExprKind::Number(NumberLiteral::Integer {
+                        size: Some(64),
+                        signed: false,
+                        base: NumberBase::Decimal,
+                        value: remaining.to_string(),
+                        cached_val: Cell::new(None),
+                    }),
+                    count.span,
+                );
+            }
+        }
+        let mut out = Vec::new();
+        append(self, &mut out);
+        let mut cur = self.next.as_ref();
+        while let Some(frame) = cur {
+            append(frame, &mut out);
+            cur = frame.next.as_ref();
         }
         out
     }
+
 }
 
 impl From<Vec<Statement>> for ProcCont {
@@ -3521,6 +3573,7 @@ struct DeferredReport {
 /// place; no producer wires probes up. M9 (SVA elaboration) is the
 /// consumer-side follow-up.
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct ObservedProbe {
     /// The site's `assertion_stats` key, location and kind tag, so its
     /// outcome lands on the same entry the other assertion paths use.
@@ -3536,6 +3589,7 @@ struct ObservedProbe {
 /// §9.4.2: one term in an assertion clocking event, including its last
 /// value. A simple signal keeps its resolved name for the common fast path.
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct SvaClockEvent {
     event: EventExpr,
     signal: Option<String>,
@@ -3687,6 +3741,7 @@ type SvaEnv = Vec<Value>;
 
 /// A §16.10 / §16.11 sequence match item.
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct SvaMatchItem {
     /// The assigned local `(slot, width, signed)`; `None` for a subroutine
     /// call run for its side effect.
@@ -3698,6 +3753,7 @@ struct SvaMatchItem {
 /// is followed within the cycle. The accept state is reached at the cycle a
 /// match ends.
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct SvaNfa {
     states: Vec<Vec<SvaEdge>>,
     start: usize,
@@ -3705,6 +3761,7 @@ struct SvaNfa {
 }
 
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 enum SvaEdge {
     Eps(usize),
     /// Follow when the boolean holds at this cycle.
@@ -3718,6 +3775,7 @@ enum SvaEdge {
 }
 
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 enum SvaCompound {
     /// Both match; ends when the later one ends (§16.9.5).
     And(SvaNfa, SvaNfa),
@@ -3740,6 +3798,7 @@ enum SvaCompound {
 /// A sequence in flight: `pcs` are the states waiting for the next cycle,
 /// `subs` the compound edges being followed.
 #[derive(Debug, Clone, Default)]
+#[derive(serde::Serialize)]
 struct SvaRun {
     started: bool,
     /// The states waiting for the next cycle, each with its thread's local
@@ -3760,6 +3819,7 @@ impl SvaRun {
 }
 
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct SvaSubRun {
     /// `(state, edge)` of the `Sub` edge in the enclosing automaton.
     at: (usize, usize),
@@ -3777,6 +3837,7 @@ struct SvaSubRun {
 
 /// A property body compiled for evaluation (§16.12).
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 enum SvaNode {
     /// A sequence used as a property: holds iff it has a match. `strong`
     /// (§16.12.2): an attempt still in flight at the end of simulation fails.
@@ -3812,6 +3873,7 @@ enum SvaNode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize)]
 enum SvaOutcome {
     Pass,
     /// A vacuous success (§16.14.8), including an implication whose
@@ -3822,6 +3884,7 @@ enum SvaOutcome {
 
 /// Per-attempt evaluation state mirroring `SvaNode`.
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 enum SvaState {
     Seq(SvaRun),
     Not(Box<SvaState>),
@@ -3869,6 +3932,7 @@ enum SvaState {
 
 /// One candidate start point of a property-valued until operand.
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct SvaUntilTick {
     left: SvaState,
     right: SvaState,
@@ -4115,6 +4179,7 @@ impl SvaNfaBuilder {
 const CG_HANDLE_TAG: usize = 1 << 30;
 
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct CovergroupInstance {
     cg_name: String,
     /// The object whose constructor ran `cg = new` (a class-body
@@ -4299,6 +4364,7 @@ struct ClockingTick {
 type FormalDynSetup = (usize, Vec<(String, String)>, Vec<(String, String)>);
 
 #[derive(Debug, Clone, Default)]
+#[derive(serde::Serialize)]
 struct ProcessContext {
     this_stack: Vec<Option<usize>>,
     local_stack: Vec<HashMap<String, Value>>,
@@ -4370,6 +4436,7 @@ struct ProcessContext {
 /// Frame-local string classifications for task formals and scalar locals.
 /// They remain authoritative while other processes change global metadata.
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct TaskFrameStrings {
     /// `local_gen_stack` generation of the task's frame.
     fgen: u64,
@@ -4381,6 +4448,7 @@ struct TaskFrameStrings {
 }
 
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct FormalMetadataSnapshot {
     name: String,
     parts: FormalMetaParts,
@@ -4389,6 +4457,7 @@ struct FormalMetadataSnapshot {
 /// The name-keyed type metadata of one formal or local (see
 /// `snapshot_formal_parts`).
 #[derive(Debug, Clone, Default)]
+#[derive(serde::Serialize)]
 struct FormalMetaParts {
     declared_type: Option<DataType>,
     packed_fields: Option<Vec<(String, u32, u32)>>,
@@ -4561,6 +4630,7 @@ struct RetPlan {
 /// The name-keyed type metadata a subroutine-local declaration displaced
 /// (see `decl_shadow_log`).
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct DeclShadow {
     width: Option<u32>,
     signed: bool,
@@ -4591,6 +4661,7 @@ enum DeclaredStaticAccess {
 /// returns. `frame_gen` is the activation's local-frame generation; `epoch` the
 /// `nested_run_epoch` at entry.
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize)]
 struct DeclShadowFrame {
     frame_gen: u64,
     epoch: u64,
@@ -4606,7 +4677,11 @@ struct DeclShadowFrame {
 /// the block declared are removed again and any enclosing variable they
 /// shadowed is put back. Only shadowed names cost a copy.
 #[derive(Debug, Clone, Default)]
+#[derive(serde::Serialize)]
 struct BlockScopeSave {
+    /// Distinguishes repeated activations of flattened block declarations.
+    scope_gen: u64,
+    declared_names: Vec<String>,
     /// `frame_key` of the flattened block's frame (blocking path); 0 for a
     /// synchronous block.
     frame_key: usize,
@@ -4646,6 +4721,7 @@ struct BlockScopeSave {
 /// `exec_task_call` would normally run synchronously after the body, replayed
 /// at the body's `ScopePop` sentinel so the process can suspend in between.
 #[derive(Debug, Clone, Default)]
+#[derive(serde::Serialize)]
 struct TaskCleanup {
     /// Instance scope an inlined HIERARCHICAL/interface task body resolves
     /// bare names under (`bus.snoop()` → "bus"). Installed at bind and on
@@ -5965,6 +6041,7 @@ enum VcdVarKind {
 /// conservative fallback so class/runtime-map expressions keep their prior
 /// semantics.
 #[derive(Clone)]
+#[derive(serde::Serialize)]
 struct ActiveForceExpr {
     key: String,
     lvalue: Expression,
@@ -5982,6 +6059,7 @@ struct ActiveForceExpr {
 /// IEEE 1800-2023 §10.6.2: the forced bits of a net under bit/part-select
 /// `force`. `bits[i]` names the piece (forcing expression) and the bit
 /// within it that bit `i` takes; `None` bits follow the net's drivers.
+#[derive(serde::Serialize)]
 struct PartialForce {
     bits: Vec<Option<(usize, u32)>>,
     /// (rvalue, select width, resolution hint) per `force` statement.
@@ -6017,6 +6095,11 @@ impl VcdVarKind {
 pub struct SignalMap {
     map: HashMap<String, Value>,
     elems: HashMap<String, std::collections::HashSet<String>>,
+    /// Per base name, a stamp that changes whenever an element key is added
+    /// to or removed from `elems[base]` (absent = no element keys), so a
+    /// derived view of a base's key set can be cached until it changes.
+    elem_gens: HashMap<String, u64>,
+    elem_gen_counter: u64,
 }
 
 impl SignalMap {
@@ -6032,6 +6115,8 @@ impl SignalMap {
                     .entry(b.to_string())
                     .or_default()
                     .insert(k.clone());
+                self.elem_gen_counter += 1;
+                self.elem_gens.insert(b.to_string(), self.elem_gen_counter);
             }
         }
         self.map.insert(k, v)
@@ -6046,6 +6131,10 @@ impl SignalMap {
                     set.remove(k);
                     if set.is_empty() {
                         self.elems.remove(b);
+                        self.elem_gens.remove(b);
+                    } else {
+                        self.elem_gen_counter += 1;
+                        self.elem_gens.insert(b.to_string(), self.elem_gen_counter);
                     }
                 }
             }
@@ -6093,6 +6182,14 @@ impl SignalMap {
             .into_iter()
             .flat_map(|set| set.iter().map(|k| k.as_str()))
             .filter(move |k| k.starts_with(prefix))
+    }
+
+    /// The element-key stamp of the outermost base of `prefix` (which ends
+    /// in `[`): equal stamps mean an unchanged key set under that base.
+    pub fn elem_gen_for_prefix(&self, prefix: &str) -> u64 {
+        let base = &prefix[..prefix.len().saturating_sub(1)];
+        let outer = Self::base_of(base).unwrap_or(base);
+        self.elem_gens.get(outer).copied().unwrap_or(0)
     }
 
     /// Is any key under the outermost base of `prefix` prefixed by it?
@@ -6198,6 +6295,11 @@ pub struct Simulator {
     /// `unpacked_struct_leaf_keys`); gates `frame_leaf_key_of`'s per-eval
     /// probe.
     any_struct_formal_markers: bool,
+    /// Scratch structs a pattern actual is spread into before its leaves bind
+    /// to an unpacked-struct formal (`struct_pattern_leaf_values`). Recycled
+    /// like the mailbox shadows.
+    pattern_scratch_seq: u64,
+    pattern_scratch_free: Vec<u64>,
     /// Recycled subroutine-frame maps: every call built a fresh
     /// `HashMap<String, Value>` and dropped it on return — at UVM call rates
     /// the table alloc/free was pure allocator churn. `clear()` keeps the
@@ -6891,7 +6993,13 @@ pub struct Simulator {
     /// State of the built-in UVM DPI-C helpers (`uvm_dpi.rs`).
     uvm_dpi: uvm_dpi::UvmDpiState,
     /// Class instance heap (index 0 is null).
-    heap: Vec<Option<ClassInstance>>,
+    heap: Vec<Option<Box<ClassInstance>>>,
+    /// Class reclamation bookkeeping (`heap_gc`): heap length at the last
+    /// collection, live objects it left, and running totals.
+    class_gc_heap_len: usize,
+    class_gc_live: usize,
+    class_gc_released: usize,
+    class_gc_runs: usize,
     /// LRM §25.8 virtual-interface bindings.
     /// Key: `(class_instance_handle, property_name)`.
     /// Value: `(bound_iface_inst_name, modport_opt)`. The modport is
@@ -7147,6 +7255,11 @@ pub struct Simulator {
     /// rather than growing with every message put.
     mbx_msg_seq: u64,
     mbx_free_ids: Vec<u64>,
+    /// A message `put` as an assignment pattern (`m.put('{a: 1, b: 2})`),
+    /// keyed by the tagged token queued in its place. The box does not know
+    /// its element type, so the pattern is kept with every item already
+    /// evaluated and assigned to the `get`/`peek` destination on delivery.
+    mbx_patterns: HashMap<u64, Vec<AssignmentPatternItem>>,
     /// §15.4.1 bounded-mailbox capacity (handle -> bound). Absent or 0 means
     /// UNBOUNDED — `try_put` never fails and `put` never blocks. `new(N)` with
     /// N>0 records N here; a full box rejects `try_put` and parks `put`.
@@ -7197,6 +7310,13 @@ pub struct Simulator {
     /// SUCCESSFUL randomize(). `Some(prev)` records the pre-reset used-set of
     /// a pick that wrapped the cycle, so the rollback can restore it.
     randc_pending: HashMap<(usize, String), (u64, Option<HashSet<u64>>)>,
+    /// §18.4.2 randc wider than 16 bits (to 32): the cycle is a keyed
+    /// bijection over `[0, 2^w)` walked by a counter, so it needs no set of
+    /// drawn values. Per (instance, prop): (key, next index, width).
+    randc_wide: HashMap<(usize, String), (u64, u64, u32)>,
+    /// The `randc_wide` state before this call's tentative pick, for
+    /// `randc_rollback` (None: the variable had no cycle yet).
+    randc_wide_pending: HashMap<(usize, String), Option<(u64, u64, u32)>>,
     /// §18.5.4/§18.10 dist schedules, keyed by (instance handle, variable):
     /// one (weight signature, item schedule, next slot) per weight set. See
     /// `pick_dist_value`.
@@ -7999,6 +8119,10 @@ pub struct Simulator {
     /// Bytecode cached for non-suspending process loops after their enclosing
     /// local frame is known.
     process_loop_bytecode: HashMap<(usize, usize, usize), Option<super::bytecode::CompiledBlock>>,
+    /// Processes owning an entry in the four per-process execution caches
+    /// (`process_loop_bytecode`, `process_cond_bytecode`, `forever_cont_cache`,
+    /// `forever_sens_cache`), so releasing one that owns none skips the scan.
+    exec_cache_pids: HashSet<usize>,
     /// Bytecode cached for the CONDITION of a per-cycle self-check `if` whose
     /// statement as a whole cannot compile (e.g. its fail branch touches a
     /// name-keyed initial-scope variable). The condition — typically a wide
@@ -8340,7 +8464,20 @@ pub struct Simulator {
     /// merges the child's frames back. To avoid clobbering a parent variable
     /// that the child only INHERITED (never wrote) — which the parent may have
     /// child CHANGED relative to this baseline.
-    fork_baselines: HashMap<usize, Vec<HashMap<String, Value>>>,
+    /// Immutable fork-time snapshots are shared across process resumptions.
+    fork_baselines: HashMap<usize, Arc<Vec<HashMap<String, Value>>>>,
+    /// Automatic collection storage retained by surviving fork children.
+    fork_collection_captures: HashMap<usize, HashSet<String>>,
+    /// Number of live children capturing each key in
+    /// `fork_collection_captures`, so a cleanup check is one lookup.
+    fork_capture_refs: HashMap<String, usize>,
+    /// Live fork children holding each activation (frame generation), and
+    /// the generations each child was indexed under.
+    fork_gen_pids: HashMap<u64, HashSet<usize>>,
+    fork_pid_gens: HashMap<usize, Vec<u64>>,
+    /// Lexical block identities of each child's captured locals.
+    fork_local_scopes: HashMap<usize, HashMap<u64, HashMap<String, u64>>>,
+    deferred_collection_cleanup: HashSet<String>,
     /// IEEE 1800-2023 §6.21/§9.3.2: automatic variables declared in a
     /// procedural block (`initial`/`always`) with NO enclosing call frame live
     /// in the global `self.signals` map (not a `local_stack` frame). At fork
@@ -9463,6 +9600,9 @@ pub struct Simulator {
     /// call-graph profile). The live half of the enumeration (elements
     /// in `self.signals`) is NOT cached — that map mutates at runtime.
     assoc_static_keys_cache: RefCell<HashMap<String, Arc<Vec<Arc<str>>>>>,
+    /// `assoc_top_level_keys` results, valid while the array's element-key
+    /// stamp (`SignalMap::elem_gen_for_prefix`) is unchanged.
+    assoc_keys_cache: RefCell<HashMap<String, (u64, Arc<Vec<String>>)>>,
     /// §16.9.3 sampled-value function watches: per call site, a history of
     /// the operand sampled (preponed) at each matching clock edge. hist[0]
     /// is the sample at the most recent edge, hist[1] one edge earlier, …
@@ -9502,6 +9642,7 @@ pub struct Simulator {
 }
 
 /// One `$rose/$fell/$stable/$changed/$past(x, @(edge clk))` call site.
+#[derive(serde::Serialize)]
 struct SampledWatch {
     /// A simple clock id, or usize::MAX when `clock_events` supplies it.
     clk_id: usize,
@@ -9605,6 +9746,7 @@ where
 /// nested call returns, so its later `delete()` and element reads become
 /// silent no-ops (IEEE 1800-2023 §6.21 automatic-variable per-invocation storage).
 #[derive(Clone, Default, Debug)]
+#[derive(serde::Serialize)]
 struct QueueLocalSave {
     signals: Vec<(String, Value)>,
     arrays_entry: Option<(i64, i64, u32)>,
@@ -13593,3 +13735,13 @@ impl PatCmp {
 
 #[cfg(test)]
 mod event_name_tests;
+
+#[cfg(test)]
+mod process_cache_lifetime_tests;
+
+#[cfg(test)]
+mod class_heap_lifetime_tests;
+
+mod heap_trace;
+
+mod heap_gc;

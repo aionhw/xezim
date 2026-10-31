@@ -572,3 +572,9 @@ mod undef_followed_by_text_619;
 mod opt_in_relaxations;
 #[path = "misc/parser_gaps_651_658.rs"]
 mod parser_gaps_651_658;
+#[path = "misc/macro_empty_actual.rs"]
+mod macro_empty_actual;
+#[path = "misc/package_ref_signature.rs"]
+mod package_ref_signature;
+#[path = "misc/always_star_spacing.rs"]
+mod always_star_spacing;

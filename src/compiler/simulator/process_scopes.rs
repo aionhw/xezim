@@ -1270,6 +1270,7 @@ impl Simulator {
             return None;
         }
         let mut sv = BlockScopeSave {
+            scope_gen: self.next_frame_gen(),
             frame_gen: self.local_gen_stack.last().copied().unwrap_or(0),
             pid_mark: self.next_pid,
             ..Default::default()
@@ -1325,6 +1326,7 @@ impl Simulator {
             let plain = Self::type_is_plain_scalar(data_type);
             for d in declarators {
                 let nm = d.name.name.as_str();
+                sv.declared_names.push(nm.to_string());
                 if d.dimensions.is_empty() && self.is_virtual_iface_type(data_type) {
                     // §6.21 / §25.9: hiding a variable also hides its binding.
                     // Values alone cannot restore the enclosing vif after a
@@ -2265,6 +2267,7 @@ impl Simulator {
             body.span,
         ));
         let cont: Arc<[Statement]> = Arc::from(cont);
+        self.exec_cache_pids.insert(key.0);
         self.forever_cont_cache.insert(key, cont.clone());
         cont
     }
@@ -2352,6 +2355,7 @@ impl Simulator {
                                 let is_clk_ev = self.is_clocking_event(event);
                                 let resolved = self.resolve_sens_ids(&sens);
                                 if !sens.is_empty() && resolved.len() == sens.len() {
+                                    self.exec_cache_pids.insert(pid);
                                     self.forever_sens_cache
                                         .insert(key, (resolved.clone(), is_clk_ev));
                                 }
@@ -2524,6 +2528,14 @@ impl Simulator {
     /// that collection (§11.4.12). None when the base is not an indexable
     /// collection, in which case there is no bound to install.
     pub(super) fn dollar_bound_for_base(&mut self, base: &Expression) -> Option<i64> {
+        // §7.10.1: an object's queue is stored under its handle, not the
+        // source spelling (`list.contents`). Resolve that store before
+        // looking up the last index, including for a class-handle formal.
+        if let Some(n) = self.expr_assoc_name(base) {
+            if self.module.dynamic_arrays.contains(&n) {
+                return Some(self.get_queue_size(&n) as i64 - 1);
+            }
+        }
         let n = match &base.kind {
             ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
             _ => self.flat_member_name(base).map(std::borrow::Cow::Owned),
@@ -2639,6 +2651,21 @@ impl Simulator {
                     e.span,
                 )
             }
+            // §7.10.1/§11.4.12: the queue select may be the receiver of
+            // a property write (`list.contents[$].flags = v`). The scan
+            // above detects it; descend here too so the bound is installed
+            // before the assignment paths evaluate the object handle.
+            ExprKind::MemberAccess { expr, member } => Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(self.resolve_dollar_in_lvalue(expr)),
+                    member: member.clone(),
+                },
+                e.span,
+            ),
+            ExprKind::Paren(expr) => Expression::new(
+                ExprKind::Paren(Box::new(self.resolve_dollar_in_lvalue(expr))),
+                e.span,
+            ),
             _ => e.clone(),
         }
     }

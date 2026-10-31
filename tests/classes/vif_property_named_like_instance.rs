@@ -88,3 +88,45 @@ fn vif_property_named_unlike_instance_still_redirects() {
     let sim = simulate(DIFF_NAME, 1000).expect("simulate failed");
     assert_eq!(get(&sim, "the_if.rload"), 7);
 }
+
+/// §25.9: a bound nested instance is absolute even when its first segment
+/// matches the virtual property. Includes a 128-bit whole write and slices.
+#[test]
+fn vif_property_matches_nested_instance_root() {
+    let sim = simulate(
+        include_str!("../fixtures/vif_nested_instance_collision.sv"),
+        1000,
+    )
+    .expect("simulate failed");
+    let output = sim
+        .output
+        .iter()
+        .map(|o| o.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        output.contains("PASS nested instance name collision"),
+        "{output}"
+    );
+    assert!(!output.contains("Fatal"), "{output}");
+}
+
+/// §25.9: a resolved interface call must not reapply a same-named alias.
+#[test]
+fn vif_nested_return_through_colliding_property() {
+    let sim = simulate(
+        include_str!("../fixtures/vif_nested_return_collision.sv"),
+        1000,
+    )
+    .expect("simulate failed");
+    let output = sim
+        .output
+        .iter()
+        .map(|o| o.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        output.contains("PASS") && !output.contains("Fatal"),
+        "{output}"
+    );
+}

@@ -237,13 +237,13 @@ impl Simulator {
             .and_then(|(head, _)| head.split_once('#'))
             .map(|(b, sig)| (b.to_string(), sig.to_string()));
         let h = self.heap.len();
-        self.heap.push(Some(ClassInstance {
+        self.heap.push(Some(Box::new(ClassInstance {
             class_name: decl,
             properties: PropMap::default(),
             type_bindings: HashMap::default(),
             spec,
             creation_scope: String::new(),
-        }));
+        })));
         self.seed_class_struct_cells(h, prop, &su);
         self.static_struct_holders.insert(key, h);
         Some(h)

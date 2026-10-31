@@ -2453,10 +2453,12 @@ fn package_decls(defs: &[&SourceDefinition]) -> HashMap<String, HashSet<String>>
                         out.extend(et.members.iter().map(|m| m.name.name.clone()));
                     }
                 }
-                PackageItem::Function(f) => {
+                // §8.24 / §26.3: an out-of-block class method belongs to
+                // its class, not to the package's imported namespace.
+                PackageItem::Function(f) if f.name.scopes.is_empty() => {
                     out.insert(f.name.name.name.clone());
                 }
-                PackageItem::Task(t) => {
+                PackageItem::Task(t) if t.name.scopes.is_empty() => {
                     out.insert(t.name.name.name.clone());
                 }
                 PackageItem::Class(c) => {

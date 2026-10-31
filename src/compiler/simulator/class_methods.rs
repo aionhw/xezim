@@ -902,7 +902,7 @@ impl Simulator {
                 let class_ref = self.port_class_ref(port);
                 let dt = &port.data_type;
                 let fixed_width = (matches!(dt, DataType::IntegerAtom { .. })
-                    || Self::packed_dims_are_literal(dt))
+                    || Self::packed_dims_are_constant(dt))
                 .then(|| {
                     super::elaborate::resolve_type_width(
                         dt,
@@ -1672,7 +1672,12 @@ impl Simulator {
                     } else {
                         None
                     };
-                    let mut val = if arg_supplied(i) {
+                    // Class methods have automatic lifetime. An output handle
+                    // starts null on every call; it never copies in the caller's
+                    // previous object (including when the actual is a default).
+                    let mut val = if plain_class && port.direction == PortDirection::Output {
+                        Value::zero(32)
+                    } else if arg_supplied(i) {
                         let value = match actual_ctx {
                             Some(w) => self.eval_expr_ctx(&args[i], w),
                             None => self.eval_expr(&args[i]),
@@ -1698,7 +1703,7 @@ impl Simulator {
                         self.this_stack.push(Some(handle));
                         self.class_context_stack.push(Some(cname.clone()));
                         self.push_local_frame_typed(locals.clone(), frame_types.clone());
-                        let v = self.eval_expr(def);
+                        let v = self.eval_formal_default(port, def);
                         let v = self.vif_argument_value(port, def, v);
                         self.pop_local_frame();
                         self.class_context_stack.pop();

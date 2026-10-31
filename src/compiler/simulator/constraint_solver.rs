@@ -566,6 +566,7 @@ impl Simulator {
         // dropping the tentative record, so this call's trials only ever roll
         // back their OWN picks.
         self.randc_pending.clear();
+        self.randc_wide_pending.clear();
         use rand::RngExt;
         let class_name = if let Some(Some(inst)) = self.heap.get(handle) {
             inst.class_name.clone()
@@ -795,7 +796,7 @@ impl Simulator {
 
         // §18.5.5: expand the array SLICE of a `unique {…}` list into the
         // element-wise inequalities it denotes.
-        Self::expand_unique_slices(&mut constraints, &self.module.parameters);
+        self.expand_unique_slices(handle, &mut constraints, &self.module.parameters);
 
         // §18.3: a constraint may read a state variable of the module the
         // class is declared in. Statements get instance-qualified when the
@@ -1138,9 +1139,18 @@ impl Simulator {
         let sub_objs = sub_objs.unwrap_or_default();
         let mut csp_runs = 0u32;
         let mut rand_diag = rand_diag::rand_diag_enabled().then(rand_diag::RandDiag::default);
-        let array_enums: HashMap<String, String> = rand_arrays
+        // Enum domains apply to every unpacked collection, not only fixed
+        // arrays. A packed enum's unused bit patterns are not legal draws.
+        let array_enums: HashMap<String, String> = rand_colls
             .iter()
-            .filter_map(|a| a.5.clone().map(|t| (a.0.clone(), t)))
+            .filter_map(|c| {
+                let prop = c.nd_base.as_ref().map_or(c.prop.as_str(), |(p, _)| p);
+                let tn = self.class_prop_type_name(handle, prop)?;
+                self.module
+                    .enum_members
+                    .contains_key(&tn)
+                    .then(|| (c.prop.clone(), tn))
+            })
             .collect();
         // §18.5.4/§18.5.10: a set whose DISTRIBUTION the per-variable trials
         // below cannot honour (see `rand_order_sensitive`) goes to the joint
@@ -1813,8 +1823,28 @@ impl Simulator {
                                 enum_prop_types.get(name).map(|s| s.as_str()),
                                 prop_allowed_ranges.get(name).map(|v| v.as_slice()),
                             );
-                            if !domain.is_empty() {
-                                let pick = self.pick_randc(handle, name, &domain);
+                            let pick = if !domain.is_empty() {
+                                Some(self.pick_randc(handle, name, &domain))
+                            } else if (17..=32).contains(width)
+                                && !enum_prop_types.contains_key(name)
+                            {
+                                self.pick_randc_wide(
+                                    handle,
+                                    name,
+                                    *width,
+                                    prop_allowed_ranges.get(name).map(|v| v.as_slice()),
+                                )
+                            } else {
+                                if *width > 32 {
+                                    self.warn_system_task_once(
+                                        "randc>32",
+                                        "Warning: a randc variable wider than 32 bits is \
+                                         randomized as rand (IEEE 1800-2017 §18.4.2)",
+                                    );
+                                }
+                                None
+                            };
+                            if let Some(pick) = pick {
                                 val = Value::from_u64(pick, *width);
                                 solved_props.insert(name.clone(), val.clone());
                                 if let Some(Some(inst)) = self.heap.get_mut(handle) {
@@ -2364,7 +2394,17 @@ impl Simulator {
                     }
                     for key in self.coll_elem_keys(c) {
                         let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
-                        let v = self.draw_elem(c.width, prev);
+                        let members = array_enums
+                            .get(&c.prop)
+                            .and_then(|tn| self.module.enum_members.get(tn))
+                            .filter(|m| !m.is_empty());
+                        let v = if let Some(members) = members {
+                            let values: Vec<u64> = members.iter().map(|m| m.1).collect();
+                            let i = self.cur_rng().random_range(0..values.len());
+                            Value::from_u64(values[i], c.width)
+                        } else {
+                            self.draw_elem(c.width, prev)
+                        };
                         self.write_coll_elem(&key, v);
                     }
                 }
@@ -2448,6 +2488,26 @@ impl Simulator {
             let mut fe_failed = false;
             let mut all_ok =
                 self.rand_items_accept(handle, &constraints, &rand_colls, &mut fe_failed);
+            // Repairs can overwrite the baseline. Check the implicit enum
+            // domain too, including when all explicit constraints are off.
+            for c in &rand_colls {
+                if let Some(tn) = array_enums.get(&c.prop) {
+                    let values: Vec<u64> = self.module.enum_members[tn]
+                        .iter()
+                        .map(|m| m.1)
+                        .collect();
+                    for key in self.coll_elem_keys(c) {
+                        if !self
+                            .read_coll_elem(&key)
+                            .and_then(|v| v.to_u64())
+                            .is_some_and(|v| values.contains(&v))
+                        {
+                            all_ok = false;
+                            fe_failed = true;
+                        }
+                    }
+                }
+            }
             if !all_ok && let Some(diag) = rand_diag.as_mut() {
                 self.rand_diag_tally(handle, &constraints, diag);
             }
@@ -3352,6 +3412,41 @@ impl Simulator {
                 _ => None,
             })
             .collect()
+    }
+
+    /// §8.25: packed width of the key type `dt` under the parameter
+    /// bindings `instance` carries; `None` when a range does not evaluate.
+    pub(super) fn param_sized_key_width(
+        &self,
+        dt: &DataType,
+        instance: &ClassInstance,
+        chain: &[std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>],
+    ) -> Option<u32> {
+        let (DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. }) = dt
+        else {
+            return None;
+        };
+        let mut m = self.module.parameters.clone();
+        let mut bound: HashSet<&str> = HashSet::default();
+        for c in chain {
+            for (pn, _) in &c.param_defaults {
+                if let Some(v) = instance.properties.get(pn)
+                    && bound.insert(pn.as_str())
+                {
+                    m.insert(pn.clone(), v.clone());
+                }
+            }
+        }
+        let mut w: u64 = 1;
+        for d in dimensions {
+            let crate::ast::types::PackedDimension::Range { left, right, .. } = d else {
+                return None;
+            };
+            let l = super::elaborate::const_eval_i64_with_params(left, Some(&m))?;
+            let r = super::elaborate::const_eval_i64_with_params(right, Some(&m))?;
+            w = w.checked_mul(l.abs_diff(r) + 1)?;
+        }
+        u32::try_from(w).ok().filter(|&w| w > 0)
     }
 
     /// §8.25: bounds of the 1-D fixed-array member `prop` of the object

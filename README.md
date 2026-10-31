@@ -196,7 +196,7 @@ with few, very hot blocks, so measure it on yours.
 - **UVM:** the mbits-mirafra AVIP base tests for AXI4, APB, I3C, SPI and
   AXI4-Lite print the same UVM messages as a commercial reference simulator,
   and 32 of 35 UVM 1800.2-2017 example testbenches pass.
-- **Regression suite:** 5,634 default tests and two JIT smoke tests run in CI. Many are differential tests whose expected values were measured on a
+- **Regression suite:** 5,837 default tests and two JIT smoke tests run in CI. Many are differential tests whose expected values were measured on a
   commercial reference simulator; see [CONTRIBUTING.md](CONTRIBUTING.md#test-suites).
 
 ## Documentation

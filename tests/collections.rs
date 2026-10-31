@@ -220,3 +220,19 @@ mod row_of_2d_array_assign;
 
 #[path = "collections/conditional_aggregate_659.rs"]
 mod conditional_aggregate_659;
+
+#[path = "collections/assoc_key_enumeration_cache.rs"]
+mod assoc_key_enumeration_cache;
+#[path = "collections/hierarchical_whole_array_assign.rs"]
+mod hierarchical_whole_array_assign;
+#[path = "collections/inside_associative_values.rs"]
+mod inside_associative_values;
+
+#[path = "collections/foreach_indexed_receiver.rs"]
+mod foreach_indexed_receiver;
+
+#[path = "collections/enclosing_value_parameter_specialization.rs"]
+mod enclosing_value_parameter_specialization;
+
+#[path = "collections/lexical_value_parameter_specialization.rs"]
+mod lexical_value_parameter_specialization;

@@ -853,7 +853,22 @@ impl Simulator {
                     // §11.4.10: the amount is always read as unsigned.
                     let (a, aw, _) = self.exact_int(right)?;
                     let r = Self::bits_at(a, aw);
-                    if r >= 64 {
+                    // §11.4.10: an oversized shift is defined, not an
+                    // unsupported bound. Logical shifts fill with zero;
+                    // signed arithmetic right shifts fill with the sign bit.
+                    if r >= u128::from(w) {
+                        return Some(
+                            if *op == BinaryOp::ArithShiftRight
+                                && s
+                                && Self::as_ctx(l, w, true) < 0
+                            {
+                                -1
+                            } else {
+                                0
+                            },
+                        );
+                    }
+                    if r >= 128 {
                         return None;
                     }
                     return Some(match op {
@@ -977,6 +992,18 @@ impl Simulator {
         ranges: &[ConstraintRange],
         ctx_w: u32,
     ) -> (Vec<(i128, i128)>, Option<(u32, bool)>) {
+        self.cons_ranges_i128_typed(ranges, ctx_w, true)
+    }
+
+    /// §11.4.13: the tested operand also participates in the comparison
+    /// signedness. Compute bounds in that joint type before rejecting a
+    /// reversed range (`unsigned64 inside {[0:(1<<64)-1]}`).
+    pub(super) fn cons_ranges_i128_typed(
+        &mut self,
+        ranges: &[ConstraintRange],
+        ctx_w: u32,
+        ctx_signed: bool,
+    ) -> (Vec<(i128, i128)>, Option<(u32, bool)>) {
         struct Bound<'a> {
             expr: Option<&'a Expression>,
             leaves: Vec<(u64, u32, bool)>,
@@ -998,7 +1025,7 @@ impl Simulator {
             })
         }
         let mut bounds: Vec<(Bound<'_>, Option<Bound<'_>>)> = Vec::new();
-        let mut ws: Option<(u32, bool)> = Some((1, true));
+        let mut ws: Option<(u32, bool)> = Some((1, ctx_signed));
         let note = |ws: &mut Option<(u32, bool)>, b: &Bound<'_>| {
             if !b.dollar
                 && let Some((aw, as_)) = ws
@@ -1013,10 +1040,9 @@ impl Simulator {
         for r in ranges {
             match r {
                 ConstraintRange::Value(e) => {
-                    if let Some(nm) = self.array_operand_name(e) {
-                        for i in 0..self.get_queue_size(&nm) {
-                            if let Some(ev) =
-                                self.get_signal_value_by_name(&format!("{}[{}]", nm, i))
+                    if let Some(keys) = self.inside_operand_keys(e) {
+                        for key in keys {
+                            if let Some(ev) = self.get_signal_value_by_name(&key)
                                 && let Some(raw) = ev.to_u64()
                             {
                                 let b = Bound {
@@ -1096,7 +1122,7 @@ impl Simulator {
         width: u32,
         signed: bool,
     ) -> Vec<(i128, i128)> {
-        let (rs, items_ws) = self.cons_ranges_i128_ws(ranges, width);
+        let (rs, items_ws) = self.cons_ranges_i128_typed(ranges, width, signed);
         Self::fit_cons_ranges_for_target(rs, items_ws, width, signed)
     }
 
@@ -1149,7 +1175,7 @@ impl Simulator {
 
     /// Exact-signed membership test used by every `inside`/`dist` solve path.
     pub(super) fn value_in_ranges(&mut self, val: &Value, ranges: &[ConstraintRange]) -> bool {
-        let (rs, items_ws) = self.cons_ranges_i128_ws(ranges, val.width);
+        let (rs, items_ws) = self.cons_ranges_i128_typed(ranges, val.width, val.is_signed);
         let Some(raw) = val.to_u64() else {
             return false;
         };
@@ -1394,7 +1420,7 @@ impl Simulator {
         }
         // Gather the operand expressions to exclude.
         let mut to_eval: Vec<Expression> = Vec::new();
-        fn walk(item: &ConstraintItem, field: &str, out: &mut Vec<Expression>) {
+        fn walk(sim: &mut Simulator, item: &ConstraintItem, field: &str, out: &mut Vec<Expression>) {
             match item {
                 ConstraintItem::Expr(e) => match &e.kind {
                     ExprKind::Unary {
@@ -1430,16 +1456,39 @@ impl Simulator {
                 },
                 ConstraintItem::Block(items) => {
                     for it in items {
-                        walk(it, field, out);
+                        walk(sim, it, field, out);
                     }
                 }
-                ConstraintItem::Soft(inner) => walk(inner, field, out),
+                ConstraintItem::Soft(inner) => walk(sim, inner, field, out),
+                // §18.5.6/§18.5.7: only the currently active branch excludes
+                // values. The outer repair loop rechecks after scalar changes.
+                ConstraintItem::IfElse {
+                    condition,
+                    then_item,
+                    else_item,
+                    ..
+                } => {
+                    if sim.cons_expr_true(condition) {
+                        walk(sim, then_item, field, out);
+                    } else if let Some(other) = else_item {
+                        walk(sim, other, field, out);
+                    }
+                }
+                ConstraintItem::Implication {
+                    condition,
+                    constraint,
+                    ..
+                } => {
+                    if sim.cons_expr_true(condition) {
+                        walk(sim, constraint, field, out);
+                    }
+                }
                 _ => {}
             }
         }
         for con in constraints {
             for item in &con.items {
-                walk(item, field, &mut to_eval);
+                walk(self, item, field, &mut to_eval);
             }
         }
         let mut excluded: HashSet<u64> = HashSet::default();
@@ -2169,11 +2218,11 @@ impl Simulator {
                     // are solved simultaneously per the LRM; here the enclosing
                     // object's variables are already drawn, so the sub-object's
                     // variable takes the implied value.
-                    if let Some((sub, field)) = self.cross_obj_lvalue(left) {
+                    if let Some((sub, field)) = self.cross_obj_lvalue(left, rand_set) {
                         let val = self.eval_expr(right);
                         return self.set_prop_if_changed(sub, &field, val);
                     }
-                    if let Some((sub, field)) = self.cross_obj_lvalue(right) {
+                    if let Some((sub, field)) = self.cross_obj_lvalue(right, rand_set) {
                         let val = self.eval_expr(left);
                         return self.set_prop_if_changed(sub, &field, val);
                     }
@@ -3533,6 +3582,20 @@ impl Simulator {
         if !matches!(self.heap.get(h), Some(Some(_))) {
             return None;
         }
+        // Dynamic arrays and queues of a referenced configuration object
+        // have runtime bounds; they are not fixed or packed properties.
+        if let [last] = rest {
+            let mut cn = self.heap.get(h)?.as_ref()?.class_name.clone();
+            loop {
+                let cd = self.module.classes.get(&cn)?;
+                if cd.queue_properties.contains_key(last) {
+                    let len = self.get_queue_size(&format!("{h}#{last}")) as i64;
+                    return Some(vec![(0, len - 1)]);
+                }
+                let Some(parent) = &cd.extends else { break };
+                cn = parent.clone();
+            }
+        }
         match rest {
             [last] => self
                 .fixed_foreach_dims(h, last)
@@ -4305,9 +4368,38 @@ impl Simulator {
     }
 
     pub(super) fn expand_unique_slices(
+        &self,
+        handle: usize,
         constraints: &mut [ClassConstraint],
         params: &HashMap<String, Value>,
     ) {
+        // Only unpacked collections represent the array-uniqueness form.
+        // A packed part-select is one integral value, not distinct bits.
+        let mut arrays = HashSet::default();
+        let mut seen_members = HashSet::default();
+        let mut cls = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|o| o.class_name.as_str());
+        while let Some(name) = cls {
+            let Some(def) = self.module.classes.get(name) else {
+                break;
+            };
+            for prop in def
+                .array_properties
+                .keys()
+                .chain(def.array_nd_properties.keys())
+                .chain(def.queue_properties.keys())
+                .chain(def.assoc_properties.keys())
+            {
+                if !seen_members.contains(prop) {
+                    arrays.insert(prop.clone());
+                }
+            }
+            seen_members.extend(def.properties.keys().cloned());
+            cls = def.extends.as_deref();
+        }
         fn idx_expr(i: i64, span: crate::ast::Span) -> Expression {
             Expression::new(
                 ExprKind::Number(NumberLiteral::Integer {
@@ -4343,15 +4435,16 @@ impl Simulator {
         fn walk(
             item: &mut ConstraintItem,
             params: &HashMap<String, Value>,
+            arrays: &HashSet<String>,
             seen: &mut HashSet<(String, i64, i64)>,
         ) {
             match item {
                 ConstraintItem::Block(items) => {
                     for it in items.iter_mut() {
-                        walk(it, params, seen);
+                        walk(it, params, arrays, seen);
                     }
                 }
-                ConstraintItem::Soft(inner) => walk(inner, params, seen),
+                ConstraintItem::Soft(inner) => walk(inner, params, arrays, seen),
                 ConstraintItem::Expr(e) => {
                     let ExprKind::Binary {
                         op: BinaryOp::Neq,
@@ -4372,7 +4465,7 @@ impl Simulator {
                         let ExprKind::Ident(h) = &expr.kind else {
                             return None;
                         };
-                        if h.path.len() != 1 {
+                        if h.path.len() != 1 || !arrays.contains(&h.path[0].name.name) {
                             return None;
                         }
                         let lo = Simulator::const_expr_u64(left, params)? as i64;
@@ -4412,7 +4505,7 @@ impl Simulator {
         let mut seen: HashSet<(String, i64, i64)> = HashSet::default();
         for con in constraints.iter_mut() {
             for it in con.items.iter_mut() {
-                walk(it, params, &mut seen);
+                walk(it, params, &arrays, &mut seen);
             }
         }
     }
@@ -4812,14 +4905,15 @@ impl Simulator {
         let Some(name) = Self::foreach_base_name(array) else {
             return true;
         };
-        // Only a plain member (`m`, `this.m`): `state_foreach_dims` checks
-        // that, and a fixed array must pass the same test.
+        // Plain members (`m`, `this.m`) use their local shape. Nested
+        // foreach loops can also name an array on another class object.
         let Some(dims) = (match self.state_foreach_dims(handle, array, &name, vars.len()) {
             Some(d) => Some(d),
             None if Self::foreach_plain_member(array) => {
                 self.fixed_foreach_dims(handle, &name).map(|d| d.0)
             }
-            None => None,
+            None => Self::foreach_member_chain(array)
+                .and_then(|(root, members)| self.sub_member_foreach_dims(handle, &root, &members)),
         }) else {
             return true;
         };

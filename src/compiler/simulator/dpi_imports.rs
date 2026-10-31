@@ -787,6 +787,14 @@ impl Simulator {
         (aval, bval)
     }
 
+    /// Value -> svBitVecVal words for a two-state `bit [N]` formal: the actual
+    /// converts as by assignment (IEEE 1800-2017 §35.6.1, §6.11.2), so X and Z
+    /// bits read as 0. The aval plane alone carries X as 1.
+    pub(super) fn dpi_value_to_bit_words(v: &Value, width: u32) -> Vec<u32> {
+        let (aval, bval) = Self::dpi_value_to_logic_words(v, width);
+        aval.iter().zip(&bval).map(|(a, b)| a & !b).collect()
+    }
+
     /// Value -> the STANDARD svLogicVecVal buffer: an array of `s_vpi_vecval`
     /// {aval, bval} pairs, i.e. INTERLEAVED u32 words [a0, b0, a1, b1, ...]
     /// (§35.5.5 / Annex H.10.2). This is the layout xezim's shipped svdpi.h
@@ -1538,7 +1546,7 @@ impl Simulator {
                         .get(i)
                         .map(|e| self.dpi_int_actual_w(e, *width))
                         .unwrap_or_else(|| Value::zero(*width));
-                    let (aval, _bval) = Self::dpi_value_to_logic_words(&vv, *width);
+                    let aval = Self::dpi_value_to_bit_words(&vv, *width);
                     // Store in a dedicated Vec<Vec<u32>> to keep storage stable.
                     logic_aval.push(aval);
                     let raw_ptr = logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>();
@@ -1551,7 +1559,7 @@ impl Simulator {
                         .get(i)
                         .map(|e| self.dpi_int_actual_w(e, *width))
                         .unwrap_or_else(|| Value::zero(*width));
-                    let (aval, _bval) = Self::dpi_value_to_logic_words(&init, *width);
+                    let aval = Self::dpi_value_to_bit_words(&init, *width);
                     logic_aval.push(aval);
                     let p = Box::new(logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>());
                     ptr_vals.push(p);

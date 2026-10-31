@@ -62,9 +62,9 @@ impl Simulator {
         self.class_has_method(&cn, mname)
     }
 
-    pub(super) fn eval_call_inner(&mut self, func: &Expression, args: &[Expression]) -> Value {
-        // §26.3 / §35.5.4: package-local DPI names have qualified entries,
-        // just like ordinary package functions. Preserve the declaring scope.
+    /// §26.3 / §35.5.4: preserve a package import's declaring scope while
+    /// ordinary objects and local declarations retain their receiver meaning.
+    pub(super) fn package_dpi_call_key(&self, func: &Expression) -> Option<String> {
         let package_dpi = match &func.kind {
             ExprKind::MemberAccess { expr, member } => match &expr.kind {
                 ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() =>
@@ -82,7 +82,13 @@ impl Simulator {
             && !self.local_stack.last().is_some_and(|m| m.contains_key(pkg))
             && !self.signal_name_to_id.contains_key(pkg)
         {
-            let key = format!("{pkg}::{name}");
+            return Some(format!("{pkg}::{name}"));
+        }
+        None
+    }
+
+    pub(super) fn eval_call_inner(&mut self, func: &Expression, args: &[Expression]) -> Value {
+        if let Some(key) = self.package_dpi_call_key(func) {
             if let Some(value) = self.exec_dpi_import_call(&key, args) {
                 return value;
             }
@@ -663,31 +669,7 @@ impl Simulator {
                     } else {
                         self.eval_expr(&args[0]).to_u64().unwrap_or(0) != 0
                     };
-                    let table = if mname == "rand_mode" {
-                        &mut self.rand_mode_disabled
-                    } else {
-                        &mut self.constraint_mode_disabled
-                    };
-                    if enable {
-                        if let Some(set) = table.get_mut(&h) {
-                            if let Some(n) = &target_name {
-                                set.remove(n);
-                            } else {
-                                set.clear();
-                            }
-                        }
-                    } else {
-                        let set = table.entry(h).or_insert_with(HashSet::default);
-                        if let Some(n) = target_name {
-                            set.insert(n);
-                        }
-                        // For whole-object disable, we'd need the full list of
-                        // rand props / constraint names; insert a sentinel that
-                        // exec_randomize recognises.
-                        else {
-                            set.insert("*".to_string());
-                        }
-                    }
+                    self.set_object_random_mode(h, mname == "rand_mode", target_name.as_deref(), enable);
                     return Value::zero(32);
                 }
             }
@@ -2692,27 +2674,7 @@ impl Simulator {
                             return Value::from_u64(if disabled { 0 } else { 1 }, 32);
                         }
                         let enable = self.eval_expr(&args[0]).to_u64().unwrap_or(0) != 0;
-                        let table = if mname == "rand_mode" {
-                            &mut self.rand_mode_disabled
-                        } else {
-                            &mut self.constraint_mode_disabled
-                        };
-                        if enable {
-                            if let Some(set) = table.get_mut(&h_val) {
-                                if let Some(n) = &target_name {
-                                    set.remove(n);
-                                } else {
-                                    set.clear();
-                                }
-                            }
-                        } else {
-                            let set = table.entry(h_val).or_insert_with(HashSet::default);
-                            if let Some(n) = target_name {
-                                set.insert(n);
-                            } else {
-                                set.insert("*".to_string());
-                            }
-                        }
+                        self.set_object_random_mode(h_val, mname == "rand_mode", target_name.as_deref(), enable);
                         return Value::zero(32);
                     }
                 }
@@ -3268,9 +3230,15 @@ impl Simulator {
             // dispatch when the vif is re-bound.
             if hier.path.len() >= 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
                 let head = hier.path[0].name.name.as_str();
-                let head_owned = self
-                    .iface_alias_for(head)
-                    .unwrap_or_else(|| head.to_string());
+                // §25.9: rebase has already resolved a rooted interface
+                // receiver. Reapplying a same-named class alias would expand
+                // `sys_if.port.get_tx()` to `sys_if.port.port.get_tx()`.
+                let head_owned = if hier.root.is_none() {
+                    self.iface_alias_for(head)
+                } else {
+                    None
+                }
+                .unwrap_or_else(|| head.to_string());
                 let mut segs: Vec<&str> = vec![head_owned.as_str()];
                 segs.extend(hier.path[1..].iter().map(|s| s.name.name.as_str()));
                 let full = segs.join(".");

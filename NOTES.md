@@ -10,6 +10,66 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* Package type identity survives artifact reloads; nested specializations
+  retain lexical value parameters and inherited type defaults. Collection,
+  struct and mailbox patterns preserve member values and object lifetimes;
+  foreign-function vector arguments and string results use the appropriate
+  conversions and formatting (PRs #744–#762).
+
+* Constants of a module's first instance see the struct typedefs the module
+  declares in its body: a constant function's struct formal, local and
+  result, a struct localparam's members, and a pattern actual of a struct
+  formal read 0 or were packed by position there (§6.18, §7.2.1, #680,
+  reported by git-hevangel); a subroutine local or associative key sized
+  by a class parameter (`bit [N-1:0] x;` in `C #(N)`) takes the
+  specialization's width (§8.25, #681, reported by Ganesh-TNL); a `randc`
+  variable of up to 32 bits cycles, and a wider one warns that it is
+  randomized as `rand` (§18.4.2, #699, reported by Ganesh-TNL); a second
+  elaboration in the same thread no longer reads the previous one's
+  constant-evaluation tables (#739, reported by git-hevangel).
+* Class objects no handle reaches are reclaimed with their storage at a
+  time advance, on by default (`XEZIM_CLASS_GC=0` turns it off), with
+  collections spaced so their total cost stays linear in the objects
+  allocated (§8.7, #722, PR #724, contributed by AaronKel).
+* A class specialization argument written as an expression of package
+  parameters (`.D(cfg_pkg::N + cfg_pkg::K)`) names the same type as the value
+  it folds to, so a static or virtual-interface table set through one
+  spelling is seen through the others (§8.25, #741, PR #742, contributed by
+  auty1395).
+
+* Randomization, arguments, compiled methods, fork state, interfaces and
+  process memory (#698-#719, PR #720, contributed by AaronKel):
+  associative-array values in `inside` constraints, fallback repairs of
+  conditional and collection constraints, enum domains of rand dynamic
+  collections, `$` subscripts through queue element member writes, formal
+  widths for default and constant-bound arguments (`bit [64-1:0]`),
+  selected array actuals and class-handle output formals (null at entry),
+  caller collections and automatic variables shared by fork children,
+  lexical enums and full object fields in compiled methods, `randomize`
+  with inline constraints and no parentheses, `@(s.a or s.b)` on class
+  properties, a user method named like a queue builtin in a `wait`,
+  class field widths in a concatenation assignment, definition-qualified
+  interface accesses in methods, and the execution caches and captured
+  state of finished or killed processes released (memory no longer grows
+  per process or per suspended `repeat` iteration). A whole-object
+  `constraint_mode(0)` also turns off static blocks.
+* Out-of-block methods and package scopes (xezim-core #115-#122, PR #123,
+  contributed by AaronKel): an empty macro actual counts as one when the
+  macro has formals, `ref` actuals are checked against the callee's own
+  package signature, spaced implicit event controls survive attribute
+  stripping, extern methods link through every package-class alias (now
+  in place, not by copying the class per body), and macro line joining
+  stays linear with backticks in strings ignored.
+* Associative-array `first`/`next`/`last`/`prev`/`num` reuse the sorted
+  key list until a key is added or removed, instead of rebuilding it per
+  call (#723, PR #725, contributed by AaronKel).
+* A relative instance reference inside nested generate scopes (#726), a
+  directive-less package delay under `-timescale` (#728), a whole-array
+  continuous assign with a hierarchical side (#730), a bind actual the
+  target does not declare, an implicit net of the target (#732), and an
+  associative array keyed by a class typedef over a class parameter
+  (#734) (xezim-core #124-#128 and PRs #727-#735, contributed by auty1395).
+
 * A bit-select of a subroutine formal or local declared with a range that
   does not start at zero (`input logic [12:1] a; a[i]`) reads the bit its
   label names: a compiled hot function read bit `i` of the storage, and a
@@ -410,6 +470,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   bincode 1.x (RUSTSEC-2025-0141). Artifacts written by earlier versions are
   refused with the usual "recompile with current xezim" message; the caches
   are rebuilt (#531, core #87).
+
+**Performance**
+
+* Elaboration cost is linear in the number of instances for `bind`
+  directives in a replicated module (§23.11, #679), interface-port formals
+  (§25.10, #736) and constant-function calls (§13.4.3, #737); each copied or
+  scanned the design-wide parameter table per instance (4,000 instances
+  with a bind: 49.3 G instructions before, 1.6 G after). Reported by
+  git-hevangel.
 
 **Command line**
 

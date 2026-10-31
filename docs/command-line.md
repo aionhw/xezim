@@ -82,6 +82,7 @@ unless noted.
 |---|---|
 | `XEZIM_EVENT_EDGE=0` | On by default: clocked flop fires whose data inputs have not changed are skipped (1.13–1.30× wall on the C910/C906 benchmarks). `0` turns it off |
 | `XEZIM_PACKED_MEM=0` | On by default: large integral memories (elements up to 64 bits, arrays of more than 100,000 cells) live in a packed arena. `0` turns it off |
+| `XEZIM_CLASS_GC=0` | On by default: class objects that no handle reaches are reclaimed, with their owned storage, at a time advance once 20,000 objects (or the previous live count, or half the objects ever allocated, if larger) have been allocated since the last collection, and never while a DPI task is suspended (its C stack cannot be traced). `0` turns it off; `stress` collects at every time advance that allocated an object |
 | `XEZIM_COMPILE_METHODS=1` | On by default (see `XEZIM_METHOD_TIER`): compile class methods, wait-free class tasks and package or module functions to bytecode and execute them. `0` forces the AST interpreter |
 | `XEZIM_METHOD_TIER=N` | Compile a class method (function or wait-free task) or a package/module function only after N calls (default 1000; `0` compiles on the first call). A subroutine that never crosses the threshold stays on the interpreter with no compilation overhead |
 | `XEZIM_FAST_CALLS=1` | On by default: direct VM-to-VM dispatch of compiled methods without re-entering the interpreter's formal binding loop. `0` disables it |

@@ -2114,7 +2114,14 @@ impl Simulator {
         let tp_width = tp_concrete
             .as_deref()
             .and_then(|c| self.concrete_type_width(c));
-        let w0 = match tp_width.or_else(|| self.bound_agg_width(data_type)) {
+        // §8.25: a local sized by a class parameter or localparam
+        // (`bit [N-1:0] x;` in a method of `C #(N)`) takes the executing
+        // specialization's value; the module's parameter table has no `N`
+        // (#681).
+        let w0 = match tp_width
+            .or_else(|| self.bound_agg_width(data_type))
+            .or_else(|| self.class_param_sized_width(data_type))
+        {
             Some(w) => w,
             None => self.resolve_type_width_in_process_scope(data_type),
         };
@@ -2963,14 +2970,29 @@ impl Simulator {
                         // Without them a `foreach` over a local `int a[int]`
                         // bound the negative key -5 as 4294967291, and the
                         // element read through it missed.
-                        match super::elaborate::assoc_key_type_info(
-                            key_dt.as_deref(),
-                            &self.module.parameters,
-                            &self.module.typedefs,
-                            &self.module.typedef_types,
-                        )
-                        .0
-                        {
+                        // §8.25: a key sized by a class parameter
+                        // (`bit seen[bit [N-1:0]]` in a method of `C #(N)`)
+                        // takes the executing specialization's width (#681).
+                        let class_key = key_dt.as_deref().and_then(|k| {
+                            let w = self.class_param_sized_width(k)?;
+                            let signed = matches!(
+                                k,
+                                crate::ast::types::DataType::IntegerVector {
+                                    signing: Some(crate::ast::types::Signing::Signed),
+                                    ..
+                                }
+                            );
+                            Some((w, signed))
+                        });
+                        match class_key.or_else(|| {
+                            super::elaborate::assoc_key_type_info(
+                                key_dt.as_deref(),
+                                &self.module.parameters,
+                                &self.module.typedefs,
+                                &self.module.typedef_types,
+                            )
+                            .0
+                        }) {
                             Some(iw) => {
                                 self.module.assoc_index_widths.insert(name.clone(), iw);
                             }
@@ -5348,6 +5370,10 @@ impl Simulator {
                 }
 
                 if let Some(e) = expr {
+                    // Parentheses do not change an unpacked return's shape.
+                    // Recognize the collection before falling back to a
+                    // scalar Value (which would turn an empty queue into {0}).
+                    let e = Self::unparen(e);
                     // One call for a receiver call in the returned chain
                     // (`return me().o.x;`), shared by the probes below.
                     let pinned = Self::recv_chain_call(e)
@@ -5577,6 +5603,7 @@ impl Simulator {
                     {
                         for &pid in &to_kill {
                             self.killed_pids.insert(pid);
+                            self.release_killed_process_state(pid);
                             self.vc_cancel_process(pid);
                             self.process_parents.remove(&pid);
                             self.process_contexts.remove(&pid);
@@ -5611,6 +5638,7 @@ impl Simulator {
                 if let Some(&pid) = self.disable_labels.get(&name.name) {
                     if pid != self.current_pid {
                         self.killed_pids.insert(pid);
+                        self.release_killed_process_state(pid);
                         self.vc_cancel_process(pid);
                         self.process_parents.remove(&pid);
                         self.process_contexts.remove(&pid);
@@ -5660,6 +5688,7 @@ impl Simulator {
                     if !to_kill.is_empty() {
                         for &pid in &to_kill {
                             self.killed_pids.insert(pid);
+                            self.release_killed_process_state(pid);
                             self.vc_cancel_process(pid);
                             self.process_parents.remove(&pid);
                             self.process_contexts.remove(&pid);
@@ -5708,6 +5737,7 @@ impl Simulator {
                     // at dispatch, and purge every place the process can be
                     // parked so it never resumes and never satisfies a join.
                     self.killed_pids.insert(pid);
+                    self.release_killed_process_state(pid);
                     self.vc_cancel_process(pid);
                     self.process_parents.remove(&pid);
                     self.process_contexts.remove(&pid);

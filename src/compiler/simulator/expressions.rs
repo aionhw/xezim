@@ -1222,8 +1222,15 @@ impl Simulator {
             None
         };
         if let Some(cn) = static_class {
-            if let Some(v) = self.class_static_get(&cn, &member.name) {
-                return v;
+            // Header value parameters are per instance. They also sit in
+            // `param_defaults`, so `class_static_get` answers them from the
+            // elaborated default (`int D = H` is 32) and used to hide the
+            // specialization stored on the object. Localparams and `static`
+            // members are in `static_properties` and stay on the shared cell.
+            if self.member_is_static_prop(&cn, &member.name) {
+                if let Some(v) = self.class_static_get(&cn, &member.name) {
+                    return v;
+                }
             }
         }
         if handle == 0 || handle >= self.heap.len() {
@@ -6334,12 +6341,9 @@ impl Simulator {
                             // A queue/array operand means set membership: the
                             // value matches any element (e.g. `group inside
                             // {supported_isa}`). Scalars compare directly.
-                            if let Some(nm) = self.array_operand_name(r) {
-                                let sz = self.get_queue_size(&nm);
-                                for i in 0..sz {
-                                    if let Some(ev) =
-                                        self.get_signal_value_by_name(&format!("{}[{}]", nm, i))
-                                    {
+                            if let Some(keys) = self.inside_operand_keys(r) {
+                                for key in keys {
+                                    if let Some(ev) = self.get_signal_value_by_name(&key) {
                                         if val.wildcard_eq(&ev).is_true() {
                                             return Value::from_u64(1, 1);
                                         }

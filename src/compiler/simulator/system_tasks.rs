@@ -2378,6 +2378,19 @@ impl Simulator {
     pub(super) fn call_returns_string(&self, func: &Expression) -> bool {
         use crate::ast::decl::ClassMethodKind;
         use crate::ast::types::{DataType, SimpleType};
+        // Use the same ownership rules as execution. A local SV declaration
+        // can hide a bare imported alias while an explicit package stays bound.
+        let dpi_key = self.package_dpi_call_key(func).map(std::borrow::Cow::Owned)
+            .or_else(|| match &func.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 =>
+                    self.resolve_dpi_call_name(&h.path[0].name.name, None),
+                _ => None,
+            });
+        if let Some(spec) = dpi_key.and_then(|key| self.module.dpi_imports.get(key.as_ref())) {
+            return matches!(&spec.proto, crate::ast::decl::DPIProto::Function(fd)
+                if matches!(self.dpi_resolve_typedef(&fd.return_type),
+                    DataType::Simple { kind: SimpleType::String, .. }));
+        }
         // A plain module/package FUNCTION with a `string` return type
         // (`$display("%s", where_am_i())`) — not a class method at all.
         if let ExprKind::Ident(h) = &func.kind {

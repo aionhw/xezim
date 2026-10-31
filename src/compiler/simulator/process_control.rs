@@ -182,15 +182,13 @@ impl Simulator {
         to_kill.extend(self.collect_fork_descendants(pid));
         for &p in &to_kill {
             self.killed_pids.insert(p);
+            self.release_killed_process_state(p);
             self.vc_cancel_process(p);
             self.finished_pids.remove(&p);
             self.suspended_pids.remove(&p);
             self.suspended_proc_info.remove(&p);
             self.process_parents.remove(&p);
             self.process_contexts.remove(&p);
-            self.fork_baselines.remove(&p);
-            self.fork_signal_captures.remove(&p);
-            self.suspended_loop_frames.remove(&p);
         }
         // Purge from every scheduling structure — every DESCENDANT's
         // future-time #delay too, or the wheel keeps reporting activity
@@ -447,8 +445,32 @@ impl Simulator {
         }
     }
 
+    /// Process ids are never reused. Compiled loops and prepared forever
+    /// continuations belonging to a terminated process cannot run again.
+    /// Per-process state a killed process (`kill()`, `disable fork`,
+    /// `disable <label>`) never releases through `child_finished`.
+    pub(super) fn release_killed_process_state(&mut self, pid: usize) {
+        self.release_process_execution_caches(pid);
+        self.fork_baselines.remove(&pid);
+        self.fork_local_scopes.remove(&pid);
+        self.release_fork_collections(pid);
+        self.fork_signal_captures.remove(&pid);
+        self.suspended_loop_frames.remove(&pid);
+    }
+
+    fn release_process_execution_caches(&mut self, pid: usize) {
+        if !self.exec_cache_pids.remove(&pid) {
+            return;
+        }
+        self.process_loop_bytecode.retain(|&(p, _, _), _| p != pid);
+        self.process_cond_bytecode.retain(|&(p, _, _), _| p != pid);
+        self.forever_cont_cache.retain(|&(p, _, _, _, _), _| p != pid);
+        self.forever_sens_cache.retain(|&(p, _), _| p != pid);
+    }
+
     pub(super) fn child_finished(&mut self, child_pid: usize) {
         self.finished_pids.insert(child_pid);
+        self.release_process_execution_caches(child_pid);
         // A fork child's inherited `%m` chain (`inherit_fork_m_scope`) is
         // never unwound by its own statements.
         if !self.process_m_scope.is_empty() {
@@ -462,6 +484,8 @@ impl Simulator {
         }
         self.suspended_loop_frames.remove(&child_pid);
         self.fork_baselines.remove(&child_pid);
+        self.fork_local_scopes.remove(&child_pid);
+        self.release_fork_collections(child_pid);
         self.fork_signal_captures.remove(&child_pid);
         self.process_contexts.remove(&child_pid);
         // §9.7: wake any process awaiting this one's termination.

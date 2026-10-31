@@ -308,6 +308,8 @@ mod nested_delay_slot_servicing;
 mod object_event_paths;
 #[path = "scheduling/package_and_unit_delays_scale_by_timescale.rs"]
 mod package_and_unit_delays_scale_by_timescale;
+#[path = "scheduling/package_cli_timescale_delay.rs"]
+mod package_cli_timescale_delay;
 #[path = "scheduling/phase_jump_static_latch.rs"]
 mod phase_jump_static_latch;
 #[path = "scheduling/release_from_level_sensitive_block.rs"]
@@ -429,3 +431,12 @@ mod multicore_workers;
 
 #[path = "scheduling/multicore_credits.rs"]
 mod multicore_credits;
+
+#[path = "scheduling/class_collection_named_wait.rs"]
+mod class_collection_named_wait;
+
+#[path = "scheduling/class_or_value_change.rs"]
+mod class_or_value_change;
+
+#[path = "scheduling/preprocessor_linear_join.rs"]
+mod preprocessor_linear_join;

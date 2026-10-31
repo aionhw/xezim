@@ -58,3 +58,28 @@ endmodule
         msgs
     );
 }
+
+/// §5.6.1: an escaped port name may contain a dot. `\foo.bar ` bound to the
+/// parent's `bar` still collides with the child's own `bar`; it is not a
+/// generate rename that keeps the leaf.
+#[test]
+fn escaped_dotted_port_resolves_to_parent_net() {
+    let src = r#"
+module child (input logic \foo.bar , output logic bar);
+  assign bar = ~\foo.bar ;
+  initial #1 $display("CHILD %b %b", \foo.bar , bar);
+endmodule
+module top;
+  logic bar = 1'b1;
+  logic y;
+  child u (.\foo.bar (bar), .bar(y));
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        msgs.iter().any(|m| m == "CHILD 1 0"),
+        "child read its own output instead of the parent actual: {:?}",
+        msgs
+    );
+}

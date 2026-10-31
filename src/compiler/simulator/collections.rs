@@ -923,6 +923,25 @@ impl Simulator {
                     None
                 }
             }
+            // §8.25: a value argument matches by value. A constant expression
+            // of literals and package parameters (`pkg::N + pkg::K`) is
+            // keyed by the number it folds to, like the literal itself.
+            ExprKind::Binary { .. }
+            | ExprKind::Unary { .. }
+            | ExprKind::Paren(_)
+            | ExprKind::Conditional { .. }
+            | ExprKind::MemberAccess { .. } => self.fold_package_const_expr(e),
+            ExprKind::Ident(hier)
+                if hier.path.len() == 2
+                    && self
+                        .package_param_key(&format!(
+                            "{}::{}",
+                            hier.path[0].name.name, hier.path[1].name.name
+                        ))
+                        .is_some_and(|k| self.module.parameters.contains_key(k)) =>
+            {
+                self.fold_package_const_expr(e)
+            }
             ExprKind::Ident(hier) => {
                 let nm = &hier.path.last()?.name.name;
                 // Resolve a type/class alias (e.g. `this_type`) to the
@@ -1574,18 +1593,60 @@ impl Simulator {
         k: usize,
         name: &str,
     ) -> Option<String> {
+        Self::carried_type_binding_rec(bindings, chain, k, name, &[])
+    }
+
+    /// Defaults may name several earlier parameters. Track their declaration
+    /// path to reject a cycle without cutting off a valid long alias chain.
+    fn carried_type_binding_rec(
+        bindings: &HashMap<String, String>,
+        chain: &[&super::elaborate::ElaboratedClass],
+        k: usize,
+        name: &str,
+        path: &[(usize, String)],
+    ) -> Option<String> {
+        if path
+            .iter()
+            .any(|(level, param)| *level == k && param == name)
+        {
+            return None;
+        }
         if k == 0 {
             return bindings.get(name).cloned();
         }
+        let mut path = path.to_vec();
+        path.push((k, name.to_string()));
         let child = chain[k - 1];
-        let i = chain[k].param_order.iter().position(|p| p == name)?;
-        let a = child.extends_type_args.get(i)?.trim();
-        if Self::spec_projection(a).is_some() {
-            return Self::carry_extends_arg(a, &|p| {
-                Self::carried_type_binding(bindings, chain, k - 1, p)
+        let parent = chain[k];
+        let i = parent.param_order.iter().position(|p| p == name)?;
+        // An argument the child's `extends` omits is absent or empty in
+        // `extends_type_args` and takes the parameter's default (§8.25).
+        let written = child
+            .extends_type_args
+            .get(i)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let a = match written {
+            Some(w) => w,
+            None => {
+                let def = parent
+                    .type_param_defaults
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, d)| d.clone())?;
+                if parent.type_param_names.iter().any(|p| p == &def) {
+                    return Self::carried_type_binding_rec(bindings, chain, k, &def, &path);
+                }
+                // A default is written in the parent's scope, not the child's.
+                return Some(def);
+            }
+        };
+        if Self::spec_projection(&a).is_some() {
+            return Self::carry_extends_arg(&a, &|p| {
+                Self::carried_type_binding_rec(bindings, chain, k - 1, p, &path)
             });
         }
-        Some(Self::carried_type_binding(bindings, chain, k - 1, a).unwrap_or_else(|| a.to_string()))
+        Some(Self::carried_type_binding_rec(bindings, chain, k - 1, &a, &path).unwrap_or(a))
     }
 
     /// The per-instance part of `is_string_keyed_array` for `member` of an
@@ -1857,7 +1918,31 @@ impl Simulator {
     }
 
     pub(super) fn assoc_top_level_keys(&self, obj_name: &str) -> Vec<String> {
+        self.assoc_top_level_keys_shared(obj_name).as_ref().clone()
+    }
+
+    /// `assoc_top_level_keys`, shared and cached: `first`/`next`/`num` in a
+    /// loop over an unchanged array no longer rescan and re-sort every key.
+    pub(super) fn assoc_top_level_keys_shared(&self, obj_name: &str) -> Arc<Vec<String>> {
         let prefix = format!("{}[", obj_name);
+        let stamp = self.signals.elem_gen_for_prefix(&prefix);
+        if let Some((s, keys)) = self.assoc_keys_cache.borrow().get(obj_name) {
+            if *s == stamp {
+                return Arc::clone(keys);
+            }
+        }
+        let keys = Arc::new(self.assoc_top_level_keys_uncached(obj_name, &prefix));
+        let mut cache = self.assoc_keys_cache.borrow_mut();
+        // Per-call and per-object array names come and go; bound the cache
+        // rather than track every name's lifetime.
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(obj_name.to_string(), (stamp, Arc::clone(&keys)));
+        keys
+    }
+
+    fn assoc_top_level_keys_uncached(&self, obj_name: &str, prefix: &str) -> Vec<String> {
         // A STRUCT element stores member-wise leaves (`sa[k].id`), which do
         // not end in `]` — accept any entry whose key bracket closes, else
         // struct-element assoc arrays enumerate as empty (num()/foreach).
@@ -3557,6 +3642,34 @@ impl Simulator {
         key
     }
 
+    /// Release a terminating child's captures (cleaning storage once no child
+    /// needs it) and its entries in the activation index `fork_gen_pids`.
+    pub(super) fn release_fork_collections(&mut self, pid: usize) {
+        if let Some(gens) = self.fork_pid_gens.remove(&pid) {
+            for g in gens {
+                if let Some(pids) = self.fork_gen_pids.get_mut(&g) {
+                    pids.remove(&pid);
+                    if pids.is_empty() {
+                        self.fork_gen_pids.remove(&g);
+                    }
+                }
+            }
+        }
+        if let Some(keys) = self.fork_collection_captures.remove(&pid) {
+            for key in keys {
+                if let Some(n) = self.fork_capture_refs.get_mut(&key) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.fork_capture_refs.remove(&key);
+                    }
+                }
+                if self.deferred_collection_cleanup.remove(&key) {
+                    self.cleanup_dyn_storage(&key);
+                }
+            }
+        }
+    }
+
     /// Remove all runtime signal/registration bookkeeping for a renamed
     /// local-dyn-array storage key (its `.size`, its `[i]` elements, and the
     /// `module.*` collection registrations). Used when a declaration is
@@ -3567,6 +3680,10 @@ impl Simulator {
         // removing them here would corrupt a concurrent process's queue.
         // (Identity-mapped formals and module-level arrays are bare.)
         if !key.starts_with('@') {
+            return;
+        }
+        if self.fork_capture_refs.contains_key(key) {
+            self.deferred_collection_cleanup.insert(key.to_string());
             return;
         }
         let mut size_key = std::mem::take(&mut self.dyn_key_scratch);
@@ -3920,6 +4037,19 @@ impl Simulator {
         call: &Expression,
         constraints: &[crate::ast::decl::ConstraintItem],
     ) -> Value {
+        // §18.7: the empty argument parentheses may be omitted. The parser
+        // then retains the method reference rather than a Call node; falling
+        // through to eval_expr executes randomize but discards its with block.
+        if !matches!(call.kind, ExprKind::Call { .. }) {
+            let call = Expression::new(
+                ExprKind::Call {
+                    func: Box::new(call.clone()),
+                    args: Vec::new(),
+                },
+                call.span,
+            );
+            return self.eval_randomize_with(&call, constraints);
+        }
         if let ExprKind::Call { func, args } = &call.kind {
             if let ExprKind::MemberAccess { expr, member } = &func.kind {
                 if member.name == "randomize" {
@@ -4333,7 +4463,14 @@ impl Simulator {
         while let Some(cn) = cur {
             if let Some(cd) = self.module.classes.get(&cn) {
                 for (nm, con) in cd.constraints.iter() {
-                    if all_off || disabled.contains(nm) {
+                    // §18.5.11: a static block's mode is the class-wide flag
+                    // a whole-object `constraint_mode(0)` also clears.
+                    let static_off = con.is_static
+                        && !self.static_constraint_disabled.is_empty()
+                        && self
+                            .static_constraint_disabled
+                            .contains(&(cn.clone(), nm.clone()));
+                    if all_off || static_off || disabled.contains(nm) {
                         seen.insert(nm.clone());
                         continue;
                     }

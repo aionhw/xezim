@@ -1880,6 +1880,11 @@ impl Simulator {
 
     pub(super) fn canonicalize_spec_frag(&self, frag: &str) -> String {
         let frag_norm = frag.trim();
+        // §6.22.1: `pkg::T` and the imported `T` are one type, so they
+        // key one specialization.
+        if let Some(leaf) = self.package_type_leaf(frag_norm) {
+            return self.canonicalize_spec_frag(leaf);
+        }
         if let Some((inner_base, inner_sig)) = self.extract_spec_from_string(frag_norm) {
             let canon_inner_sig = self.canonicalize_spec_sig(&inner_base, &inner_sig);
             if !canon_inner_sig.is_empty() {
@@ -1943,8 +1948,8 @@ impl Simulator {
     /// to the same `Arc<ElaboratedClass>`; the DECLARING spelling
     /// (`name`, or `enclosing::name` for a class nested in another) is
     /// the canonical one. A leaf name taken by a DIFFERENT class (two
-    /// packages each declaring `Cfg`, a second nested `Inner`) is told
-    /// apart by `Arc` identity and left unmerged.
+    /// packages each declaring `Cfg`, a second nested `Inner`) keeps its
+    /// distinct declaring name and remains a separate specialization.
     /// The class a plain type-argument fragment names. A direct key hit
     /// first; a `pkg::A::B` that is not a key falls back to `A::B`. The
     /// pkg_scope collision pass renames a nested class whose leaf name is
@@ -1983,19 +1988,11 @@ impl Simulator {
         if declared == frag {
             return None; // already the declaring spelling
         }
-        // Merge only when the declaring spelling names the SAME class.
-        // `Arc::ptr_eq` on the class itself is not enough: specialization
-        // bookkeeping mutates entries through `classes.get_mut(..).map(
-        // Arc::make_mut)`, which — the key being aliased — swaps ONE of the
-        // spellings to a fresh Arc and splits pointer identity although
-        // both entries still name the same class. Such a split clones the
-        // class struct but SHARES its `methods` table, so pointer identity
-        // there is the stable same-class test; two genuinely different
-        // classes that happen to share a leaf name never share one.
+        // Artifact decoding reconstructs separate Arcs even for aliases.
+        // The elaborator's declaring name (qualified on package collisions),
+        // enclosing class and declaring module retain declaration identity.
         let declared_arc = self.module.classes.get(&declared)?;
-        let same_class = std::sync::Arc::ptr_eq(&arc, declared_arc)
-            || std::sync::Arc::ptr_eq(&arc.methods, &declared_arc.methods);
-        if !same_class {
+        if !Self::same_class_declaration(&arc, declared_arc) {
             return None;
         }
         // A parameterized class keeps the default-argument completion the
@@ -2007,6 +2004,13 @@ impl Simulator {
             }
         }
         Some(declared)
+    }
+
+    fn same_class_declaration(
+        a: &crate::compiler::elaborate::ElaboratedClass,
+        b: &crate::compiler::elaborate::ElaboratedClass,
+    ) -> bool {
+        a.name == b.name && a.enclosing == b.enclosing && a.declaring_module == b.declaring_module
     }
 
     /// §8.25: specializations match when their value arguments have the SAME
@@ -2040,6 +2044,12 @@ impl Simulator {
             }
             return v.to_i64().map(|n| n.to_string());
         }
+        // A package parameter named through its package (`P#(pkg::W)`) is
+        // the same value as the imported `P#(W)`; a package type or enum
+        // name keeps its spelling.
+        if let Some(key) = self.package_param_key(frag) {
+            return self.module.parameters.get(key)?.to_i64().map(|n| n.to_string());
+        }
         // Already canonical: a plain decimal.
         let digits = b.strip_prefix(b"-").unwrap_or(b);
         if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) {
@@ -2067,12 +2077,10 @@ impl Simulator {
         {
             return None;
         }
-        if b.iter().any(|&c| {
-            matches!(
-                c,
-                b'.' | b'"' | b'$' | b'x' | b'X' | b'z' | b'Z' | b'?' | b'#' | b'[' | b'{'
-            )
-        }) {
+        if b.iter()
+            .any(|&c| matches!(c, b'.' | b'"' | b'$' | b'?' | b'#' | b'[' | b'{'))
+            || Self::has_xz_literal(b)
+        {
             return None;
         }
         if !typed {
@@ -2143,11 +2151,8 @@ impl Simulator {
                 match &e.kind {
                     ExprKind::Number(NumberLiteral::Integer { .. })
                     | ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => true,
-                    ExprKind::Ident(h) => {
-                        h.root.is_none()
-                            && h.path.len() == 1
-                            && h.path[0].selects.is_empty()
-                            && ok_name(&h.path[0].name.name)
+                    ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                        spec_operand_name(e).is_some_and(|n| ok_name(&n))
                     }
                     ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => walk(x, ok_name),
                     ExprKind::Binary { left, right, .. } => {
@@ -2165,10 +2170,35 @@ impl Simulator {
                     _ => false,
                 }
             }
-            walk(e, &|n: &str| {
-                !names.params.contains(n) && self.scoped_param_value(n).is_some()
+            walk(e, &|n: &str| match self.package_param_key(n) {
+                Some(key) => self.module.parameters.contains_key(key),
+                None => !names.params.contains(n) && self.scoped_param_value(n).is_some(),
             })
         };
+        // `W`, or `pkg::W` (an identifier path or, in some contexts, a
+        // member access); a longer path is rejected by `package_param_key`.
+        fn spec_operand_name(e: &Expression) -> Option<String> {
+            match &e.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) =>
+                {
+                    Some(
+                        h.path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("::"),
+                    )
+                }
+                ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                    ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
+                        Some(format!("{}::{}", h.path[0].name.name, member.name))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
         let src = format!(
             "module __xezim_spec_arg; localparam __xezim_v = {};\nendmodule\n",
             text
@@ -2203,7 +2233,9 @@ impl Simulator {
         let mut ptab: HashMap<String, Value> = HashMap::default();
         fn names_in(e: &Expression, out: &mut Vec<String>) {
             match &e.kind {
-                ExprKind::Ident(h) => out.push(h.path[0].name.name.clone()),
+                ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                    out.extend(spec_operand_name(e))
+                }
                 ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => names_in(x, out),
                 ExprKind::Binary { left, right, .. } => {
                     names_in(left, out);
@@ -2224,10 +2256,104 @@ impl Simulator {
         let mut ids = Vec::new();
         names_in(&init, &mut ids);
         for n in ids {
-            ptab.insert(n.clone(), self.scoped_param_value(&n)?);
+            let v = match self.package_param_key(&n) {
+                Some(key) => self.module.parameters.get(key)?.clone(),
+                None => self.scoped_param_value(&n)?,
+            };
+            ptab.insert(n, v);
         }
         let v = super::elaborate::const_eval_i64_with_params(&init, Some(&ptab))?;
         Some(v.to_string())
+    }
+
+    /// The decimal value of a constant expression whose only names are
+    /// package parameters (`pkg::N + pkg::K`); None when it reads anything
+    /// else.
+    pub(super) fn fold_package_const_expr(&self, e: &Expression) -> Option<String> {
+        let mut ptab: HashMap<String, Value> = HashMap::default();
+        if !self.bind_default_operands(e, &[], &[], &mut ptab) {
+            return None;
+        }
+        super::elaborate::const_eval_i64_with_params(e, Some(&ptab)).map(|n| n.to_string())
+    }
+
+    /// `pkg::NAME` when `pkg` is a package of the design: the key
+    /// `module.parameters` holds that package's parameter under. None for a
+    /// bare name or any other scope.
+    pub(super) fn package_param_key<'a>(&self, text: &'a str) -> Option<&'a str> {
+        let (pkg, leaf) = text.split_once("::")?;
+        let ident = |s: &str| {
+            s.as_bytes()
+                .first()
+                .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+                && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        };
+        (ident(pkg) && ident(leaf) && self.module.packages.contains(pkg)).then_some(text)
+    }
+
+    /// Whether specialization-argument text holds an x/z/? digit: a based
+    /// literal (`4'bx01`, `'hz`) or an unbased unsized `'x`/`'z`. Letters
+    /// of names (`cfg_pkg::W`) are not digits.
+    pub(super) fn has_xz_literal(b: &[u8]) -> bool {
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'\'' {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            if i < b.len() && matches!(b[i], b's' | b'S') {
+                i += 1;
+            }
+            if i < b.len() && matches!(b[i], b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H') {
+                i += 1;
+                while i < b.len() && b[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            }
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'?') {
+                if matches!(b[i], b'x' | b'X' | b'z' | b'Z' | b'?') {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+        false
+    }
+
+    /// `T[#(...)]` of a type argument spelled `pkg::T[#(...)]`, when the bare
+    /// name `T` is tabled as that same package class or typedef (package
+    /// members also live in the flat design namespace under their bare
+    /// names). None when the bare name is some other declaration.
+    pub(super) fn package_type_leaf<'a>(&self, frag: &'a str) -> Option<&'a str> {
+        let (pkg, rest) = frag.split_once("::")?;
+        if !self.module.packages.contains(pkg.trim()) {
+            return None;
+        }
+        let rest = rest.trim();
+        let head = rest[..rest.find(['#', ' ']).unwrap_or(rest.len())].trim();
+        if head.is_empty() || !head.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+            return None;
+        }
+        let qualified = format!("{}::{}", pkg.trim(), head);
+        let same_class = match (
+            self.module.classes.get(&qualified),
+            self.module.classes.get(head),
+        ) {
+            (Some(q), Some(b)) => Self::same_class_declaration(q, b),
+            _ => false,
+        };
+        let same_typedef = !same_class
+            && !rest.contains('#')
+            && self.module.typedef_types.contains_key(&qualified)
+            && self.module.typedef_types.contains_key(head)
+            // register_scoped_typedef_alias stores `pkg::declared_name`.
+            // A collision-qualified declaration `pkg::T` therefore ALSO
+            // has `pkg::pkg::T`; it is not an alias of an unrelated bare T.
+            // Structural equality cannot distinguish nominal enum types,
+            // especially when different files have identical byte spans.
+            && !self.module.typedef_types.contains_key(&format!("{}::{}", pkg.trim(), qualified));
+        (same_class || same_typedef).then_some(rest)
     }
 
     /// IEEE 1800-2017 §6.20.2: the DECLARED DEFAULT of parameter
@@ -2386,6 +2512,20 @@ impl Simulator {
                     _ => false,
                 }
             }
+            // `pkg::P` in a type's argument list parses as a member access.
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    let key = format!("{}::{}", h.path[0].name.name, member.name);
+                    match self.module.parameters.get(&key) {
+                        Some(v) => {
+                            ptab.insert(key, v.clone());
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -2417,6 +2557,10 @@ impl Simulator {
             .into_iter()
             .map(|s| s.trim().to_string())
             .collect();
+        // A slot filled with the parameter's own name because the named
+        // list omitted it. That spelling is the default, not a reference
+        // to an enclosing parameter of the same name.
+        let mut omitted_slot = vec![false; frags.len()];
         // §8.25 named assignments (`.W(5)`) bind by NAME: move each to its
         // parameter's slot. A slot no argument names keeps its default,
         // spelled as the parameter's own name for the loop below to fill; a
@@ -2438,6 +2582,7 @@ impl Simulator {
                 }
             }
             let used = slots.iter().rposition(|s| s.is_some()).map_or(0, |i| i + 1);
+            omitted_slot = slots.iter().take(used).map(|s| s.is_none()).collect();
             frags = slots
                 .into_iter()
                 .take(used)
@@ -2450,7 +2595,20 @@ impl Simulator {
         // substitute the default.
         for i in 0..frags.len() {
             if order.get(i).is_some_and(|p| frags[i] == *p) {
-                if let Some(d) = self.param_default_fragment(cd, i, &frags[..i]) {
+                // The fragment is this parameter's own name. An omitted
+                // argument is recorded that way and takes the default.
+                // The same spelling is a real argument when an enclosing
+                // specialization binds the name (`item#(H, D)` inside
+                // `seq#(int H, int D)`). That binding wins over the default,
+                // which would otherwise collapse `D` to `H` (32).
+                let enclosing = if omitted_slot.get(i).copied().unwrap_or(false) {
+                    None
+                } else {
+                    self.enclosing_value_param_fragment(&frags[i])
+                };
+                if let Some(v) = enclosing {
+                    frags[i] = v;
+                } else if let Some(d) = self.param_default_fragment(cd, i, &frags[..i]) {
                     frags[i] = d;
                 }
             }
@@ -2493,6 +2651,43 @@ impl Simulator {
             })
             .collect();
         canon_frags.join(",")
+    }
+
+    /// The active method's lexical specialization, including an inherited
+    /// method's ancestor arguments. A free-function frame is a boundary.
+    pub(super) fn lexical_value_spec(&self) -> Option<(String, String)> {
+        let lexical = self.class_context_stack.last()?.as_ref()?;
+        let (base, sig) = self
+            .lexical_spec()
+            .or_else(|| self.inherited_param_spec(lexical))
+            .unwrap_or_else(|| (lexical.clone(), String::new()));
+        if base != *lexical && self.class_is_a(&base, lexical) {
+            Some((lexical.clone(), self.ancestor_spec(&base, &sig, lexical)?))
+        } else {
+            Some((base, sig))
+        }
+    }
+
+    /// A value-parameter binding in the lexical enclosing specialization.
+    ///
+    /// `canonicalize_spec_sig` treats a fragment equal to the parameter's
+    /// own name as an omitted argument. `item#(H, D)` written inside
+    /// `seq#(int H, int D)` is that same spelling and means the outer
+    /// parameter, not item's default.
+    pub(super) fn enclosing_value_param_fragment(&self, pname: &str) -> Option<String> {
+        let (base, sig) = self.lexical_value_spec()?;
+        let cd = self.module.classes.get(&base)?;
+        if cd.type_param_names.iter().any(|t| t == pname) {
+            return None;
+        }
+        let idx = cd.param_order.iter().position(|p| p == pname)?;
+        if Self::spec_arg_at(&sig, idx).is_some_and(|v| v.trim() == pname) {
+            return None;
+        }
+        let sig = self.canonicalize_spec_sig(&base, &sig);
+        let value = Self::spec_arg_at(&sig, idx)?;
+        let value = value.trim();
+        (!value.is_empty() && value != pname).then(|| value.to_string())
     }
 
     /// For a STATIC queue/associative/dynamic-array property of a
@@ -2972,6 +3167,13 @@ impl Simulator {
                 break;
             }
             let cd = self.module.classes.get(cn)?;
+            // A nearer static/property parameter hides an ancestor's enum
+            // literal. Let the ordinary class-static lookup resolve it.
+            if cd.static_properties.contains(member)
+                || cd.param_defaults.iter().any(|(name, _)| name == member)
+            {
+                return None;
+            }
             for (td_name, dt) in &cd.typedef_targets {
                 if !matches!(dt, DataType::Enum(_)) {
                     continue;

@@ -618,6 +618,40 @@ impl Simulator {
         &mut self,
         event: &EventControl,
     ) -> Option<Expression> {
+        let exprs = if let EventControl::EventExpr(terms) = event
+            && terms.len() > 1
+        {
+            if terms.iter().any(|t| t.edge.is_some() || t.iff.is_some()) {
+                return None;
+            }
+            // Validate all terms before allocating any saved values. Each
+            // field needs its own snapshot: a change to a can leave (a | b)
+            // unchanged, but must still trigger @(a or b).
+            terms
+                .iter()
+                .map(|term| {
+                    self.class_prop_value_change_expr(&EventControl::EventExpr(vec![term.clone()]))
+                })
+                .collect::<Option<Vec<_>>>()?
+        } else {
+            vec![self.class_prop_value_change_expr(event)?]
+        };
+        let mut conds = exprs.into_iter().map(|expr| self.value_change_cond(expr));
+        let first = conds.next()?;
+        Some(conds.fold(first, |left, right| {
+            let span = left.span;
+            Expression::new(
+                ExprKind::Binary {
+                    op: BinaryOp::LogOr,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            )
+        }))
+    }
+
+    fn class_prop_value_change_expr(&mut self, event: &EventControl) -> Option<Expression> {
         let expr = Self::event_control_single_expr(event)?;
         let on_class_prop = if let Some(fname) = self.event_control_field_name(event)
             && !self.method_local_shadows(&fname)
@@ -626,6 +660,7 @@ impl Simulator {
                 .last()
                 .copied()
                 .flatten()
+                .filter(|&h| !self.class_prop_is_event(h, &fname))
                 .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
                 .is_some_and(|inst| inst.properties.contains_key(fname.as_str()))
         } else {
@@ -636,7 +671,7 @@ impl Simulator {
         if !on_class_prop {
             return None;
         }
-        Some(self.value_change_cond(expr))
+        Some(expr)
     }
 
     pub(super) fn value_change_cond(&mut self, expr: Expression) -> Expression {
@@ -668,6 +703,16 @@ impl Simulator {
 
     /// Drop the armed value of a resumed value-change wait.
     pub(super) fn vc_release(&mut self, cond: &Expression) {
+        if let ExprKind::Binary {
+            op: BinaryOp::LogOr,
+            left,
+            right,
+        } = &cond.kind
+        {
+            // Release even snapshots skipped by short-circuit evaluation.
+            self.vc_release(left);
+            self.vc_release(right);
+        }
         if let ExprKind::SystemCall { name, args } = &cond.kind {
             if name == VC_CHANGED_MARKER {
                 if let Some(ExprKind::Number(NumberLiteral::Integer { value, .. })) =

@@ -1936,13 +1936,13 @@ impl Simulator {
                 // Allocate here, before the class walk.
                 if let Some(kind) = self.lvalue_container_kind(lvalue) {
                     let handle = self.heap.len();
-                    self.heap.push(Some(ClassInstance {
+                    self.heap.push(Some(Box::new(ClassInstance {
                         class_name: kind.to_string(),
                         properties: PropMap::default(),
                         type_bindings: HashMap::default(),
                         spec: None,
                         creation_scope: self.active_instance_scope(),
-                    }));
+                    })));
                     let cargs: &[Expression] = match &rvalue.kind {
                         ExprKind::Call { args, .. } => args,
                         _ => &[],
@@ -2590,8 +2590,12 @@ impl Simulator {
             // A string QUEUE is in `string_signals` too (so its
             // elements render as strings), but `q = {...}` on it is a
             // QUEUE assignment — `q = {}` clears it — not a byte concat.
+            let in_frame = matches!(self.local_stack.last(), Some(f) if f.contains_key(&*lname));
             let lhs_is_queue = self.module.dynamic_arrays.contains(&*lname)
-                || self.module.arrays.contains_key(&*lname);
+                || self.module.arrays.contains_key(&*lname)
+                || self
+                    .instance_assoc_member(&lname)
+                    .is_some_and(|scoped| !in_frame && self.class_queue_prop(&scoped));
             if !lhs_is_queue
                 && (self.string_signals.contains(&*lname)
                     || self.string_signals.contains(
@@ -2722,8 +2726,15 @@ impl Simulator {
                     for i in sz..old_sz {
                         self.signals.remove(&format!("{}[{}]", dst, i));
                     }
+                    // An unpacked-struct element has no `<src>[i]` signal,
+                    // only its member leaves.
+                    let member_wise = self.queue_elem_struct(&src).is_some();
                     for i in 0..sz {
-                        if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", src, i)) {
+                        if member_wise {
+                            self.queue_copy_elem(&src, i, &dst, i);
+                        } else if let Some(v) =
+                            self.get_signal_value_by_name(&format!("{}[{}]", src, i))
+                        {
                             self.set_signal_value_by_name(&format!("{}[{}]", dst, i), v);
                         }
                     }
@@ -3639,13 +3650,13 @@ impl Simulator {
                     if let Some(tname) = type_name {
                         if tname == "semaphore" {
                             let handle = self.heap.len();
-                            self.heap.push(Some(ClassInstance {
+                            self.heap.push(Some(Box::new(ClassInstance {
                                 class_name: tname.clone(),
                                 properties: PropMap::default(),
                                 type_bindings: HashMap::default(),
                                 spec: None,
                                 creation_scope: self.active_instance_scope(),
-                            }));
+                            })));
                             let initial_count = args
                                 .first()
                                 .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64)
@@ -3654,13 +3665,13 @@ impl Simulator {
                             Value::from_u64(handle as u64, 32)
                         } else if tname == "mailbox" {
                             let handle = self.heap.len();
-                            self.heap.push(Some(ClassInstance {
+                            self.heap.push(Some(Box::new(ClassInstance {
                                 class_name: tname.clone(),
                                 properties: PropMap::default(),
                                 type_bindings: HashMap::default(),
                                 spec: None,
                                 creation_scope: self.active_instance_scope(),
-                            }));
+                            })));
                             self.mailboxes
                                 .insert(handle, std::collections::VecDeque::new());
                             self.record_mailbox_bound(handle, args);
@@ -3718,13 +3729,13 @@ impl Simulator {
                                 // (`id_actions = new();`) recurses
                                 // new -> initialize -> new … forever.
                                 let h = self.heap.len();
-                                self.heap.push(Some(ClassInstance {
+                                self.heap.push(Some(Box::new(ClassInstance {
                                     class_name: tname.clone(),
                                     properties: PropMap::default(),
                                     type_bindings: HashMap::default(),
                                     spec: None,
                                     creation_scope: self.active_instance_scope(),
-                                }));
+                                })));
                                 Value::from_u64(h as u64, 32)
                             }
                         }
@@ -3745,13 +3756,13 @@ impl Simulator {
                             // enclosing class's constructor and
                             // recurses.
                             let h = self.heap.len();
-                            self.heap.push(Some(ClassInstance {
+                            self.heap.push(Some(Box::new(ClassInstance {
                                 class_name: String::new(),
                                 properties: PropMap::default(),
                                 type_bindings: HashMap::default(),
                                 spec: None,
                                 creation_scope: self.active_instance_scope(),
-                            }));
+                            })));
                             Value::from_u64(h as u64, 32)
                         }
                     }

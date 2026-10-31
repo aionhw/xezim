@@ -1962,7 +1962,9 @@ impl Simulator {
                 self.handle_collection_name(handle, &leaf)?
             }
             ExprKind::MemberAccess { expr, member } => {
-                let handle = self.eval_handle_expr(expr)?;
+                // Actuals are evaluated in the caller, including selected
+                // handles in local/formal collections (`q[i].data`).
+                let handle = self.eval_live_object_receiver(expr)?;
                 self.handle_collection_name(handle, &member.name)?
             }
             _ => return None,
@@ -2818,7 +2820,7 @@ impl Simulator {
             // first-`]` extraction + dedup is uniform across plain assoc,
             // assoc-of-queue, queues, and dynamic arrays.
             return Some(Self::int_count(
-                self.assoc_top_level_keys(obj_name).len() as u64
+                self.assoc_top_level_keys_shared(obj_name).len() as u64
             ));
         }
         if matches!(bm, BuiltinM::Sum | BuiltinM::Product) {
@@ -3133,7 +3135,7 @@ impl Simulator {
             || bm == BuiltinM::Prev)
             && self.is_associative_array(obj_name)
         {
-            let keys = self.assoc_top_level_keys(obj_name);
+            let keys = self.assoc_top_level_keys_shared(obj_name);
             // i128, not i64: a full-range unsigned 64-bit key
             // (18446744073709551615) is numeric too — treating it as a
             // string wrote the key's ASCII bytes into the ref arg.

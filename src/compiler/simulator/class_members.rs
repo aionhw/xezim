@@ -1571,16 +1571,23 @@ impl Simulator {
             }
             // Flattened nested OBJECT handle: `a.mid.base` (path.len() >= 3).
             // The receiver is an object chain (`a.mid`), not a static handle.
-            // Evaluate the receiver to a handle and scope the leaf member to it.
+            // Evaluate the complete receiver, including intermediate selects
+            // (`sys.targets[i].ports`), and scope the leaf collection to it.
+            // §12.7.3: foreach must use that collection's bounds, not the
+            // bounds of an earlier array in the receiver chain.
             ExprKind::Ident(h)
                 if h.path.len() >= 3
                     && !self.module.classes.contains_key(&h.path[0].name.name)
-                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+                    && h.path.last().is_some_and(|s| s.selects.is_empty()) =>
             {
                 let n = h.path.len();
                 let member = h.path[n - 1].name.name.clone();
                 let recv = hier_prefix(h);
-                let recv_expr = Expression::new(ExprKind::Ident(recv), h.span);
+                let recv_expr = if recv.path.iter().any(|s| !s.selects.is_empty()) {
+                    Self::hier_select_chain(&recv, h.span)
+                } else {
+                    Expression::new(ExprKind::Ident(recv), h.span)
+                };
                 let hh = self.eval_handle_expr(&recv_expr).unwrap_or(0);
                 if hh != 0 {
                     if let Some(cn) = self

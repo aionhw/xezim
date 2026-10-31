@@ -140,6 +140,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Phase 2: size the single-fanout chain clustering opportunity (count, lengths, dynamic coverage)",
     ),
     (
+        "XEZIM_CLASS_GC",
+        "Class objects: reclaim unreachable objects between time slots (default on; 0 disables, stress collects at every time advance)",
+    ),
+    (
         "XEZIM_CLKTREE_PROBE",
         "Clock tree: print the detected clock-tree roots and gating structure",
     ),

@@ -369,42 +369,51 @@ impl Simulator {
     /// reaches the resolver (`parent.children`, under the same select); read as
     /// written it named no interface instance and bound nothing.
     pub(super) fn strip_own_definition_name(&self, e: &Expression) -> Option<Expression> {
-        let (h, index) = match &e.kind {
-            ExprKind::Ident(h) => (h, None),
-            ExprKind::Index { expr, index } => match &expr.kind {
-                ExprKind::Ident(h) => (h, Some(index)),
-                _ => return None,
-            },
-            _ => return None,
-        };
+        fn base(e: &Expression) -> Option<&HierarchicalIdentifier> {
+            match &e.kind {
+                ExprKind::Ident(h) => Some(h),
+                ExprKind::MemberAccess { expr, .. }
+                | ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. } => base(expr),
+                ExprKind::Call { func, .. } => base(func),
+                _ => None,
+            }
+        }
+        let h = base(e)?;
+        // Only `defname.member...` names the instance: a bare `defname` is a
+        // local, port or variable that happens to share the definition's name
+        // (`int sub;` inside `module sub`).
         if h.root.is_some() || h.path.len() < 2 || !h.path[0].selects.is_empty() {
             return None;
         }
-        let scope = self.name_resolve_hint.borrow().clone()?;
         let head = h.path[0].name.name.as_str();
+        if self.local_stack.last().is_some_and(|l| l.contains_key(head)) {
+            return None;
+        }
+        let scope_hint = self.name_resolve_hint.borrow();
+        let scope = scope_hint.as_deref()?;
         if self.is_interface_instance(head)
             || !self
-                .instance_by_path(&scope)
+                .instance_by_path(scope)
                 .is_some_and(|i| i.def_name == head)
         {
             return None;
         }
-        let mut local = h.clone();
-        local.path.remove(0);
-        local.path[0].name.name = format!("{}.{}", scope, local.path[0].name.name);
-        local.cached_signal_id = std::cell::Cell::new(None);
-        local.cached_resolved_name = std::cell::OnceCell::new();
-        let local = Expression::new(ExprKind::Ident(local), e.span);
-        Some(match index {
-            Some(index) => Expression::new(
-                ExprKind::Index {
-                    expr: Box::new(local),
-                    index: index.clone(),
-                },
-                e.span,
-            ),
-            None => local,
-        })
+        let mut path = Self::iface_path_segs(scope, e.span);
+        path.extend(h.path[1..].iter().cloned());
+        let replacement = Self::resolved_iface_expr(path, e.span);
+        fn replace_base(e: &mut Expression, replacement: Expression) {
+            match &mut e.kind {
+                ExprKind::MemberAccess { expr, .. }
+                | ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. } => replace_base(expr, replacement),
+                ExprKind::Call { func, .. } => replace_base(func, replacement),
+                _ => *e = replacement,
+            }
+        }
+        let mut rewritten = e.clone();
+        replace_base(&mut rewritten, replacement);
+        Some(rewritten)
     }
 
     /// `vif_operand`, then a receiver with an element select
@@ -3075,6 +3084,20 @@ impl Simulator {
         )
     }
 
+    /// §25.9: a resolved virtual interface denotes a physical instance, not
+    /// another class property. Root the rewritten path so a matching property
+    /// name cannot rebind it again (e.g. `vif` bound to `vif.child`).
+    fn resolved_iface_expr(
+        path: Vec<crate::ast::expr::HierPathSegment>,
+        span: crate::ast::Span,
+    ) -> Expression {
+        let mut expr = Self::hier_ident_expr(path, span);
+        if let ExprKind::Ident(h) = &mut expr.kind {
+            h.root = Some("$root".to_string());
+        }
+        expr
+    }
+
     /// The path segments of interface instance `bound` (`bus`, `top.u.bus`,
     /// `INT[1]`).
     pub(super) fn iface_path_segs(
@@ -3154,6 +3177,12 @@ impl Simulator {
     /// when no receiver in the chain is a bound vif — the common case, gated
     /// to a few emptiness and name checks.
     pub(super) fn vif_rebase_expr(&self, e: &Expression) -> Option<Expression> {
+        // A definition-qualified self reference is an instance access even
+        // without a virtual handle. Normalize the whole selected chain so
+        // writes, reads and calls use the same instance as vif returns do.
+        if let Some(local) = self.strip_own_definition_name(e) {
+            return Some(local);
+        }
         let alias_possible = self.iface_alias_possible();
         // Returned handles live in the current receiver memo. They must not
         // enable collection-token lookup on every later member expression.
@@ -3221,7 +3250,7 @@ impl Simulator {
             }
             let mut segs = Self::iface_path_segs(&bound, span);
             segs.extend(h.path[i + 1..].iter().cloned());
-            return Some(Self::hier_ident_expr(segs, span));
+            return Some(Self::resolved_iface_expr(segs, span));
         }
         None
     }
@@ -3252,7 +3281,7 @@ impl Simulator {
                         name: member.clone(),
                         selects: Vec::new(),
                     });
-                    return Some(Self::hier_ident_expr(segs, e.span));
+                    return Some(Self::resolved_iface_expr(segs, e.span));
                 }
                 let nb = self.vif_rebase_chain(recv)?;
                 // A plain member of a rebased instance path stays flat too
@@ -3263,7 +3292,7 @@ impl Simulator {
                         name: member.clone(),
                         selects: Vec::new(),
                     });
-                    return Some(Self::hier_ident_expr(path, e.span));
+                    return Some(Self::resolved_iface_expr(path, e.span));
                 }
                 Some(Expression::new(
                     ExprKind::MemberAccess {

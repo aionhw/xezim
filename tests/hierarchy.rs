@@ -350,3 +350,6 @@ mod nonansi_child_port_width_572;
 mod nested_iface_vif_612;
 #[path = "hierarchy/own_definition_name_assign_target.rs"]
 mod own_definition_name_assign_target;
+
+#[path = "hierarchy/generate_nested_instance_port.rs"]
+mod generate_nested_instance_port;

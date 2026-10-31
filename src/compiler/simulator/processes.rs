@@ -258,6 +258,10 @@ impl Simulator {
         let mut ctx = self.snapshot_process_context();
         // The parent's open block scopes close in the parent's stream, never
         // in the child's.
+        let mut local_scopes = self.fork_local_scopes.get(&self.current_pid)
+            .cloned().unwrap_or_default();
+        Self::overlay_fork_local_scopes(&mut local_scopes, &ctx.block_scope_saves);
+        self.fork_local_scopes.insert(pid, local_scopes);
         ctx.block_scope_saves.clear();
         // §6.21/§9.3.2: automatic block-locals (no call frame) live in
         // `self.signals` and are listed in `auto_loop_vars`. Copy their
@@ -295,6 +299,26 @@ impl Simulator {
                 }
             }
         }
+        let collections: HashSet<String> = ctx
+            .local_dyn
+            .iter()
+            .chain(ctx.formal_dyn.iter())
+            .flat_map(|frame| frame.iter().map(|(_, key)| key))
+            .filter(|key| key.starts_with('@'))
+            .cloned()
+            .collect();
+        // Index the child under every activation it holds, for the sibling
+        // write broadcast in `run_scheduled_process_inner`.
+        for &g in &ctx.local_gen_stack {
+            self.fork_gen_pids.entry(g).or_default().insert(pid);
+        }
+        self.fork_pid_gens.insert(pid, ctx.local_gen_stack.clone());
+        if !collections.is_empty() {
+            for key in &collections {
+                *self.fork_capture_refs.entry(key.clone()).or_default() += 1;
+            }
+            self.fork_collection_captures.insert(pid, collections);
+        }
         let trivial = ctx.this_stack.is_empty()
             && ctx.local_stack.is_empty()
             && ctx.class_context_stack.is_empty()
@@ -314,7 +338,8 @@ impl Simulator {
             // child later WRITES (value changes), not keys it merely inherited
             // (which the parent may have modified in the meantime — e.g. a
             // mailbox-get delivery into `phase` while this child runs).
-            self.fork_baselines.insert(pid, ctx.local_stack.clone());
+            self.fork_baselines
+                .insert(pid, Arc::new(ctx.local_stack.clone()));
             self.fork_signal_captures.insert(pid, signal_caps);
             self.process_contexts.insert(pid, ctx);
         }
@@ -1158,6 +1183,9 @@ impl Simulator {
         // every field, so a clone bought nothing) and moved back at the end.
         let mut saved = self.take_process_context();
         let ctx = self.process_contexts.remove(&pid).unwrap_or_default();
+        let sibling_baseline = self.fork_baselines.get(&pid).cloned();
+        let mut sibling_scopes = self.fork_local_scopes.get(&pid).cloned().unwrap_or_default();
+        let fork_parent = self.process_parents.get(&pid).copied();
         self.restore_process_context(ctx);
         self.run_process_payload(pid, stmts);
         let suspended = self.is_pid_suspended(pid);
@@ -1183,7 +1211,7 @@ impl Simulator {
         //       into `self.signals`, which is what the parent reads from.
         let child_frames: &[HashMap<String, Value>] = &child_ctx.local_stack;
         let child_frames_gen: &[u64] = &child_ctx.local_gen_stack;
-        let baseline = self.fork_baselines.get(&pid);
+        let baseline = self.fork_baselines.get(&pid).map(Arc::as_ref);
         let signal_caps = self.fork_signal_captures.get(&pid);
         // Parent-frame keys the child's writes reached, for the wake below.
         let mut written: Vec<String> = Vec::new();
@@ -1226,6 +1254,57 @@ impl Simulator {
                     .is_some_and(|old| old == v);
                 if !inherited_unchanged {
                     self.signals.insert(nm.clone(), v.clone());
+                }
+            }
+        }
+        // Match both task activation and lexical block activation. Repeated
+        // loop-block declarations share a flattened frame but not storage.
+        if let Some(sibling_baseline) = &sibling_baseline {
+            Self::overlay_fork_local_scopes(&mut sibling_scopes, &child_ctx.block_scope_saves);
+            let changes: Vec<HashMap<String, Value>> = child_frames.iter().enumerate()
+                .map(|(i, frame)| frame.iter().filter(|(k, v)| {
+                    sibling_baseline.get(i).and_then(|base| base.get(*k))
+                        .is_some_and(|old| old != *v)
+                }).map(|(k, v)| (k.clone(), v.clone())).collect()).collect();
+            if changes.iter().any(|frame| !frame.is_empty()) {
+                // Only a fork child holding one of the changed frames' own
+                // activations can receive a write (`merge_fork_writes`
+                // matches frames by generation), so visit just those, not
+                // every parked process.
+                let mut candidates: Vec<usize> = changes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, frame)| !frame.is_empty())
+                    .filter_map(|(i, _)| self.fork_gen_pids.get(child_frames_gen.get(i)?))
+                    .flatten()
+                    .copied()
+                    .filter(|&p| p != pid && Some(p) != fork_parent)
+                    .collect();
+                candidates.sort_unstable();
+                candidates.dedup();
+                for other_pid in candidates {
+                    let Some(other) = self.process_contexts.get_mut(&other_pid) else {
+                        continue;
+                    };
+                    if !self.fork_baselines.contains_key(&other_pid) {
+                        continue;
+                    }
+                    let other_pid = &other_pid;
+                    let mut other_scopes = self.fork_local_scopes.get(other_pid).cloned().unwrap_or_default();
+                    Self::overlay_fork_local_scopes(&mut other_scopes, &other.block_scope_saves);
+                    let mut visible = changes.clone();
+                    for (i, frame) in visible.iter_mut().enumerate() {
+                        let frame_generation = child_frames_gen.get(i).copied().unwrap_or(0);
+                        frame.retain(|key, _| {
+                            sibling_scopes.get(&frame_generation).and_then(|m| m.get(key))
+                                == other_scopes.get(&frame_generation).and_then(|m| m.get(key))
+                        });
+                    }
+                    let updates = Self::merge_fork_writes(
+                        &mut other.local_stack, &other.local_gen_stack,
+                        &visible, child_frames_gen, None,
+                    );
+                    written.extend(updates);
                 }
             }
         }
@@ -1915,6 +1994,19 @@ impl Simulator {
         self.fast_delay_always.insert(pid, fast);
     }
 
+    /// Track lexical declarations separately from flattened frame slots.
+    fn overlay_fork_local_scopes(
+        scopes: &mut HashMap<u64, HashMap<String, u64>>,
+        blocks: &[BlockScopeSave],
+    ) {
+        for block in blocks {
+            for name in &block.declared_names {
+                scopes.entry(block.frame_gen).or_default()
+                    .insert(name.clone(), block.scope_gen);
+            }
+        }
+    }
+
     /// Merge a fork child's local-frame writes into a parent's `local_stack`.
     ///
     /// §9.3.2 baseline: only the keys the child WROTE (its value now differs
@@ -2337,6 +2429,7 @@ impl Simulator {
                 );
             }
             let compiled = ok.then(|| compiler.finish());
+            self.exec_cache_pids.insert(key.0);
             self.process_loop_bytecode.insert(key, compiled);
         }
         let Some(Some(compiled)) = self.process_loop_bytecode.remove(&key) else {
@@ -2506,6 +2599,7 @@ impl Simulator {
         }
         let key = (pid, cond.span.start, cond.span.end);
         if !self.process_cond_bytecode.contains_key(&key) {
+            self.exec_cache_pids.insert(pid);
             // Side effects would DOUBLE-FIRE during the self-audit below —
             // only cache conditions that provably have none.
             if !Self::cond_expr_is_effect_free(cond, true) {
@@ -4408,7 +4502,13 @@ impl Simulator {
 
             // Check for repeat with event waits inside
             if let StatementKind::Repeat { count, body } = &stmt.kind {
-                let n = self.repeat_count(count);
+                let reentry = pc.loop_tail_at == Some(pc.start + i)
+                    && pc.repeat_remaining.is_some();
+                let n = if reentry {
+                    pc.repeat_remaining.unwrap()
+                } else {
+                    self.repeat_count(count)
+                };
                 // Mirror the While/For arms: unroll not only when the body has
                 // a direct `@event`/`#delay`, but also when it blocks via a
                 // CALL to a task whose own body contains a `wait`/`#delay`/
@@ -4418,7 +4518,7 @@ impl Simulator {
                 // inlined (Stage 1b), and their nested `wait`s fall through
                 // (IEEE 1800-2023 §9.7.4: a false `wait(cond)` must suspend)
                 // instead of parking the process, busy-spinning the loop.
-                if self.stmt_has_event_wait(body) || self.stmt_is_blocking(body) {
+                if reentry || self.stmt_has_event_wait(body) || self.stmt_is_blocking(body) {
                     // n == 0 (initial count zero, or the natural-exhaustion
                     // sentinel re-entering after the final iteration's body):
                     // clear any loop-control flag left by that body — a
@@ -4504,37 +4604,21 @@ impl Simulator {
                             }
                         }
                     }
-                    // Unroll: execute body once, then schedule rest
-                    let remaining_n = n - 1;
-                    let mut cont = Vec::new();
-                    // Expand body (may contain @event)
-                    let body_stmts = Self::spliced_body(body);
-                    cont.extend(body_stmts);
-                    // Always re-schedule a Repeat tail — at remaining 0 it
-                    // becomes the exhaustion sentinel whose n==0 arm above
-                    // clears a trailing continue/break before `after` runs.
-                    cont.push(Statement::new(
-                        StatementKind::Repeat {
-                            count: Expression::new(
-                                ExprKind::Number(NumberLiteral::Integer {
-                                    size: None,
-                                    signed: false,
-                                    base: NumberBase::Decimal,
-                                    value: remaining_n.to_string(),
-                                    cached_val: Cell::new(None),
-                                }),
-                                body.span,
-                            ),
-                            body: body.clone(),
-                        },
-                        stmt.span,
-                    ));
-                    // Chain the caller's tail rather than copying it (ProcCont::pushed).
-                    // The just-appended Repeat IS this frame's genuine re-entry
-                    // tail (see `loop_tail_at`'s doc comment) — it sits at the
-                    // last index of `cont`.
-                    let tail_idx = cont.len() - 1;
-                    let cont = pc.pushed_with_tail(cont, pc.start + i + 1, tail_idx);
+                    // Keep one immutable body/tail frame per loop activation.
+                    // Re-cloning the body on each resume gives its statements
+                    // fresh addresses, so address-keyed execution caches retain
+                    // every iteration's AST. Only the remaining count changes.
+                    let mut cont = if reentry {
+                        pc.resume_at(0)
+                    } else {
+                        let mut frame = Self::spliced_body(body);
+                        frame.push(stmt.clone());
+                        let tail_idx = frame.len() - 1;
+                        pc.pushed_with_tail(frame, pc.start + i + 1, tail_idx)
+                    };
+                    // Zero is an exhaustion sentinel: it still clears a final
+                    // continue/break before the caller's continuation executes.
+                    cont.repeat_remaining = Some(n - 1);
                     self.continue_stmts_or_trampoline(pid, cont);
                     return;
                 }

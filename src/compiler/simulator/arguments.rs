@@ -752,7 +752,7 @@ impl Simulator {
     ///
     /// `None` — keep the self-determined path — whenever the rule does not
     /// cover the port or the width tables cannot answer it statically: bounds
-    /// that are not literals (`[W-1:0]`, whose width needs the specialization
+    /// that depend on parameters (`[W-1:0]`, whose width needs the specialization
     /// to be known) or a type whose width is not a plain integral one.
     pub(super) fn actual_context_width(
         &self,
@@ -762,7 +762,7 @@ impl Simulator {
             return None;
         }
         let dt = &port.data_type;
-        let fixed = matches!(dt, DataType::IntegerAtom { .. }) || Self::packed_dims_are_literal(dt);
+        let fixed = matches!(dt, DataType::IntegerAtom { .. }) || Self::packed_dims_are_constant(dt);
         fixed
             .then(|| {
                 super::elaborate::resolve_type_width(
@@ -772,6 +772,68 @@ impl Simulator {
                 )
             })
             .filter(|w| *w > 0)
+    }
+
+    /// Parameter-free arithmetic bounds (including macro-expanded `[64-1:0]`)
+    /// have a fixed width just like literal bounds.
+    pub(super) fn packed_dims_are_constant(dt: &DataType) -> bool {
+        use crate::ast::types::PackedDimension;
+        // A name in a bound may be a class or callee parameter that the
+        // global evaluator would resolve to a same-named package parameter.
+        fn name_free(e: &Expression) -> bool {
+            match &e.kind {
+                ExprKind::Number(_) => true,
+                ExprKind::Paren(inner) => name_free(inner),
+                ExprKind::Unary { operand, .. } => name_free(operand),
+                ExprKind::Binary { left, right, .. } => name_free(left) && name_free(right),
+                ExprKind::Conditional { condition, then_expr, else_expr } => {
+                    name_free(condition) && name_free(then_expr) && name_free(else_expr)
+                }
+                _ => false,
+            }
+        }
+        match dt {
+            DataType::IntegerVector { dimensions, .. } => dimensions.iter().all(|d| match d {
+                PackedDimension::Range { left, right, .. } => {
+                    name_free(left)
+                        && name_free(right)
+                        && crate::elaborate::const_eval_i64_with_params(left, None).is_some()
+                        && crate::elaborate::const_eval_i64_with_params(right, None).is_some()
+                }
+                PackedDimension::Unsized(_) => false,
+            }),
+            _ => false,
+        }
+    }
+
+    /// Defaults are assignment-context expressions too. Called with the
+    /// callee's scope active so parameterized packed bounds resolve there.
+    pub(super) fn eval_formal_default(
+        &mut self,
+        port: &crate::ast::decl::FunctionPort,
+        default: &Expression,
+    ) -> Value {
+        let mut width = self.actual_context_width(port);
+        if width.is_none() && Self::actual_ctx_shape(port) {
+            if let DataType::IntegerVector { dimensions, .. } = &port.data_type {
+                if let [crate::ast::types::PackedDimension::Range { left, right, .. }] =
+                    dimensions.as_slice()
+                {
+                    let left = self.eval_expr(left);
+                    let right = self.eval_expr(right);
+                    if let (Some(left), Some(right)) = (left.to_i64(), right.to_i64()) {
+                        width = left
+                            .abs_diff(right)
+                            .checked_add(1)
+                            .and_then(|w| u32::try_from(w).ok());
+                    }
+                }
+            }
+        }
+        match width {
+            Some(w) if w > 0 => self.eval_expr_ctx(default, w),
+            _ => self.eval_expr(default),
+        }
     }
 
     /// A declared type with no packed-array, struct, enum or typedef layout
@@ -909,7 +971,7 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            let is_real = super::elaborate::is_type_real(&m.data_type);
+            let is_real = super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type));
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
@@ -1345,7 +1407,13 @@ impl Simulator {
                 )
             })
             .count();
-        let pattern_vals = self.eval_flat_struct_pattern(arg, leaf_count);
+        let widths: Vec<_> = leaves.iter().map(|l| l.2).collect();
+        let pattern_vals = self
+            .eval_flat_struct_pattern(arg, leaf_count, &widths)
+            .or_else(|| {
+                let keys: Vec<_> = leaves.iter().map(|l| (l.0.clone(), l.2, l.3)).collect();
+                self.struct_pattern_leaf_values(port_name, &su, arg, &keys)
+            });
         let call_vals = if copies_in && pattern_vals.is_none() {
             self.call_struct_leaf_values(port_name, &su, arg)
         } else {
@@ -1541,6 +1609,7 @@ impl Simulator {
         &mut self,
         arg: &Expression,
         n: usize,
+        widths: &[u32],
     ) -> Option<Vec<Value>> {
         let ExprKind::AssignmentPattern(parts) = &arg.kind else {
             return None;
@@ -1549,16 +1618,64 @@ impl Simulator {
             return None;
         }
         let mut out = Vec::with_capacity(n);
-        for p in parts.iter() {
+        for (pos, p) in parts.iter().enumerate() {
             // Positional only; keyed (`'{"name": v}`) and `default:` forms are
             // not positionally ordinal.
             if let crate::ast::expr::AssignmentPatternItem::Ordered(e) = p {
-                out.push(self.eval_expr(e));
+                // §10.8: a formal member supplies expression width before
+                // evaluation, including carry bits in a narrow addition.
+                out.push(self.eval_expr_ctx(e, widths.get(pos).copied().unwrap_or(0)));
             } else {
                 return None;
             }
         }
         Some(out)
+    }
+
+    /// The values a struct ASSIGNMENT-PATTERN actual gives the formal leaves
+    /// `keys` (each `<port_name>.<member path>`), for the patterns
+    /// `eval_flat_struct_pattern` does not take: `name:` items, `default:`,
+    /// and nested member patterns (§10.9.2). The pattern is spread into a
+    /// scratch struct exactly as `x = '{...}` would be, then each leaf is read
+    /// back. `None` when `arg` is not a pattern.
+    pub(super) fn struct_pattern_leaf_values(
+        &mut self,
+        port_name: &str,
+        su: &crate::ast::types::StructUnionType,
+        arg: &Expression,
+        keys: &[(String, u32, bool)],
+    ) -> Option<Vec<Value>> {
+        let ExprKind::AssignmentPattern(items) = &arg.kind else {
+            return None;
+        };
+        if items.is_empty() {
+            return None;
+        }
+        let id = match self.pattern_scratch_free.pop() {
+            Some(id) => id,
+            None => {
+                self.pattern_scratch_seq += 1;
+                self.pattern_scratch_seq
+            }
+        };
+        let scratch = format!("\u{2}pat_arg_{id}");
+        self.assign_pattern_into_struct(&scratch, su, items);
+        let vals = keys
+            .iter()
+            .map(|(key, w, real)| {
+                let leaf = format!("{}{}", scratch, &key[port_name.len()..]);
+                let v = self.get_signal_value_by_name(&leaf);
+                // The returned clone owns the bound value; recycled scratch
+                // storage must not keep class handles alive after the call.
+                self.signals.remove(&leaf);
+                match v.unwrap_or_else(|| Value::new(*w)) {
+                    v if v.is_real && !real => Self::real_to_int(v.to_f64(), *w),
+                    v => v,
+                }
+            })
+            .collect();
+        self.pattern_scratch_free.push(id);
+        Some(vals)
     }
 
     pub(super) fn bind_unpacked_struct_arg(
@@ -1648,7 +1765,13 @@ impl Simulator {
             self.any_struct_formal_markers = true;
             self.note_struct_root(port_name);
             locals.insert(format!("{}.", port_name), Value::zero(1));
-            let pattern_vals = self.eval_flat_struct_pattern(arg, leaves.len());
+            let widths: Vec<_> = leaves.iter().map(|l| l.2).collect();
+            let pattern_vals = self
+                .eval_flat_struct_pattern(arg, leaves.len(), &widths)
+                .or_else(|| {
+                    let keys: Vec<_> = leaves.iter().map(|l| (l.0.clone(), l.2, l.3)).collect();
+                    self.struct_pattern_leaf_values(port_name, &su, arg, &keys)
+                });
             let call_vals = if pattern_vals.is_none() {
                 self.call_struct_leaf_values(port_name, &su, arg)
             } else {
@@ -1675,7 +1798,35 @@ impl Simulator {
             }
             return Some(entries);
         }
-        let pattern_vals = self.eval_flat_struct_pattern(arg, flat_names.len());
+        let widths: Vec<_> = su
+            .members
+            .iter()
+            .flat_map(|m| {
+                let width = super::elaborate::resolve_type_width(
+                    &m.data_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                m.declarators.iter().map(move |_| width)
+            })
+            .collect();
+        let pattern_vals = self
+            .eval_flat_struct_pattern(arg, flat_names.len(), &widths)
+            .or_else(|| {
+                let mut keys = Vec::new();
+                for m in &su.members {
+                    let w = super::elaborate::resolve_type_width(
+                        &m.data_type,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    );
+                    let r = super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type));
+                    for md in &m.declarators {
+                        keys.push((format!("{}.{}", port_name, md.name.name), w, r));
+                    }
+                }
+                self.struct_pattern_leaf_values(port_name, &su, arg, &keys)
+            });
         let call_vals = if pattern_vals.is_none() {
             self.call_struct_leaf_values(port_name, &su, arg)
         } else {
@@ -1803,7 +1954,9 @@ impl Simulator {
             let ExprKind::MemberAccess { expr, member } = &arg.kind else {
                 return None;
             };
-            let handle = self.eval_handle_expr(expr)?;
+            // Actuals are evaluated in the caller, including selected
+            // handles in local/formal collections (`q[i].data`).
+            let handle = self.eval_live_object_receiver(expr)?;
             let cname = self.handle_collection_name(handle, &member.name)?;
             return self.is_unpacked_array_storage(&cname).then_some(cname);
         };
@@ -3221,3 +3374,7 @@ impl Simulator {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "struct_pattern_scratch_tests.rs"]
+mod struct_pattern_scratch_tests;

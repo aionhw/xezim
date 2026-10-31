@@ -3834,7 +3834,10 @@ impl Simulator {
                 self.cond_operand_gated(expr, this_h, this_cls)
                     && obj_prop(self.eval_handle_expr(expr).unwrap_or(0), &member.name)
             }
-            // A collection builtin on a gated operand (`m_q.size()`).
+            // A collection builtin on a gated operand (`m_q.size()`). A
+            // user-defined method with the same name can read other fields;
+            // gating only on its receiver misses those dependencies and can
+            // repeatedly resume a false wait when call setup notes writes.
             ExprKind::Call { func, args } => {
                 let ExprKind::MemberAccess { expr, member } = &func.kind else {
                     return false;
@@ -3842,7 +3845,8 @@ impl Simulator {
                 matches!(
                     member.name.as_str(),
                     "size" | "num" | "exists" | "first" | "last" | "next" | "prev"
-                ) && self.cond_operand_gated(expr, this_h, this_cls)
+                ) && !self.class_expr_has_method(expr, &member.name)
+                    && self.cond_operand_gated(expr, this_h, this_cls)
                     && args
                         .iter()
                         .all(|a| self.cond_operand_gated(a, this_h, this_cls))
