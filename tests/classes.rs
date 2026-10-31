@@ -612,6 +612,8 @@ mod assoc_wide_packed_struct_key;
 mod caller_local_shadows_this_cast;
 #[path = "classes/cast_dest_specialization.rs"]
 mod cast_dest_specialization;
+#[path = "classes/cast_scoped_class_names.rs"]
+mod cast_scoped_class_names;
 #[path = "classes/class_array_property_select.rs"]
 mod class_array_property_select;
 #[path = "classes/class_covergroups.rs"]
