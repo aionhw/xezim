@@ -2220,7 +2220,9 @@ impl Simulator {
                     let mut facts = super::bytecode::MethodAdmission::default();
                     for (class, declaration) in &self.module.classes {
                         let mut fields = self.class_member_access_safe_names(class);
-                        fields.extend(self.class_string_member_names(class));
+                        let string_fields = self.class_string_member_names(class);
+                        fields.extend(string_fields.iter().cloned());
+                        facts.instance_string_fields.insert(class.clone(), string_fields);
                         let widths: HashMap<String, u32> = fields
                             .iter()
                             .filter_map(|f| match self.class_prop_width_fixed(class, f) {

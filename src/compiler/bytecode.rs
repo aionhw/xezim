@@ -39,6 +39,9 @@ pub(crate) struct MethodAdmission {
     /// The `instance_field_widths` fields declared signed (§11.8.1: a
     /// member operand's signedness types the expression it is in).
     pub instance_field_signed: HashMap<String, HashSet<String>>,
+    /// The `instance_fields` that are strings (§6.16), so a dotted read
+    /// through a handle of that class is a string operand.
+    pub instance_string_fields: HashMap<String, HashSet<String>>,
     /// §8.20: declared class -> method -> the class whose body a call
     /// through a handle of that declared type binds to, for every
     /// NON-virtual method that some subclass redeclares (the only case where
@@ -7490,9 +7493,21 @@ impl<'a> BytecodeCompiler<'a> {
                 "$__xz_type_cast" | "$__xz_named_cast" => self.cast_arg_targets_string(args),
                 _ => false,
             },
+            ExprKind::MemberAccess { expr: base, member } if self.method_mode => {
+                self.dotted_string_member(base, &member.name)
+            }
             ExprKind::Ident(h) => {
                 let raw = Self::hier_raw_name(h);
                 if self.local_var_is_string.contains(&raw) {
+                    return true;
+                }
+                // `d.name` spelled as one dotted identifier.
+                if self.method_mode
+                    && h.root.is_none()
+                    && h.path.len() == 2
+                    && h.path.iter().all(|seg| seg.selects.is_empty())
+                    && self.dotted_string_member(&Self::dotted_head_expr(h), &h.path[1].name.name)
+                {
                     return true;
                 }
                 // class-perf P2: a bare STRING MEMBER read is a string
@@ -7536,6 +7551,11 @@ impl<'a> BytecodeCompiler<'a> {
                         return true;
                     }
                 }
+                // `recv.substr(..)` on a member-access receiver.
+                if let ExprKind::MemberAccess { expr: recv, member } = &func.kind {
+                    return matches!(member.name.as_str(), "substr" | "toupper" | "tolower")
+                        && self.expr_is_string_static(recv);
+                }
                 let ExprKind::Ident(h) = &func.kind else {
                     return false;
                 };
@@ -7571,6 +7591,22 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Method mode: is `base.member` a string field of `base`'s declared
+    /// class, read through an admitted handle chain?
+    fn dotted_string_member(&self, base: &Expression, member: &str) -> bool {
+        if !self.method_handle_chain_ok(base) || !self.method_instance_field_ok(base, member) {
+            return false;
+        }
+        self.method_handle_chain_class(base).is_some_and(|class| {
+            self.method_admission.as_ref().is_some_and(|admission| {
+                admission
+                    .instance_string_fields
+                    .get(&class)
+                    .is_some_and(|fields| fields.contains(member))
+            })
+        })
+    }
+
     /// `recv.method(args)` where the receiver is a statically-known STRING
     /// (dotted-Ident call shape). Returns the receiver as its own Ident
     /// expression plus the method leaf, or None when the shape/typing does
@@ -7604,8 +7640,20 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::MemberAccess { expr: recv, member } => {
                 let recv_expr = (**recv).clone();
-                // The receiver must resolve as a bare string object (a
-                // string signal/local/formal), not a dotted handle chain.
+                // A string field read through a handle (`d.name`,
+                // `p.q[i].name`) is a string receiver too.
+                if let ExprKind::MemberAccess {
+                    expr: base,
+                    member: field,
+                } = &recv_expr.kind
+                {
+                    if !self.dotted_string_member(base, &field.name) {
+                        return None;
+                    }
+                    return Some((recv_expr, member.name.as_str()));
+                }
+                // Otherwise it must resolve as a bare string object (a
+                // string signal/local/formal).
                 let ExprKind::Ident(h) = &recv_expr.kind else {
                     return None;
                 };

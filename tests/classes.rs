@@ -648,6 +648,8 @@ mod compiled_coll_elem_signed_compare;
 #[path = "classes/compiled_foreach_handle_member.rs"]
 mod compiled_foreach_handle_member;
 
+#[path = "classes/compiled_string_member_methods.rs"]
+mod compiled_string_member_methods;
 #[path = "classes/int_property_named_like_struct_property.rs"]
 mod int_property_named_like_struct_property;
 #[path = "classes/compiled_method_test_env.rs"]
