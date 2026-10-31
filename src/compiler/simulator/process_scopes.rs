@@ -3457,19 +3457,13 @@ impl Simulator {
     }
 
     #[inline]
-    /// Queue an NBA into a packed-arena cell: §10.4.2 last-write-wins against
-    /// the pending entry first, then eval-time elision against the cell.
+    /// Queue a packed-cell NBA until its region, retaining even an equal value.
     pub(super) fn queue_packed_nba(&mut self, eid: usize, v: u64, x: u64) {
         if let Some(e) = self.packed_nba.iter_mut().find(|(i, _, _)| *i == eid) {
             e.1 = v;
             e.2 = x;
         } else {
-            let (cv, cx, _) = self.packed.raw(eid);
-            if cv != v || cx != x {
-                self.packed_nba.push((eid, v, x));
-            } else {
-                self.prof_nba_elided += 1;
-            }
+            self.packed_nba.push((eid, v, x));
         }
     }
 
@@ -3502,11 +3496,7 @@ impl Simulator {
             } else {
                 self.signal_table[entry.signal_id].clone()
             };
-            for bit in 0..mask.width.min(current.width) {
-                if mask.get_bit(bit as usize) == LogicBit::One {
-                    current.set_bit(bit as usize, entry.value.get_bit(bit as usize));
-                }
-            }
+            NbaFast::merge_masked(&mut current, &entry.value, &mask);
             entry.value = current;
         }
         // Defensive landing for a packed-arena id: the per-signal table

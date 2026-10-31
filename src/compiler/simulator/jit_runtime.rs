@@ -118,7 +118,7 @@ impl Simulator {
     }
 
     /// JIT bridge: mirror `Insn::NbaAssign` — push an `NbaFast` entry.
-    /// `apply_nba` later commits to `signal_table` at the end-of-cycle.
+    /// `apply_nba` later commits to `signal_table` in the NBA region.
     #[inline]
     /// JIT bridge: 4-STATE non-blocking schedule. Mirrors `jit_schedule_nba`
     /// but carries the X/Z plane. Without it the JIT dropped every unknown on
@@ -139,27 +139,8 @@ impl Simulator {
         let sig_w = self.signal_widths[id];
         let w = if width == 0 { sig_w } else { width };
         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-        // Unchanged-elision, mirroring the interpreter's NbaAssign arm: a
-        // value already equal to the signal is not queued — UNLESS an entry
-        // for this id is already pending, where §10.4.2 last-write-wins
-        // requires superseding it.
-        if w == sig_w {
-            if let Some([ov, ox]) = self.signal_inline_bits.get(id) {
-                if *ov == val_bits & mask
-                    && *ox == xz_bits & mask
-                    && self.nba_fast_index.get(id).is_none()
-                {
-                    return;
-                }
-            } else if let Some((ov, ox)) = self.signal_table[id].inline_planes() {
-                if ov == val_bits & mask
-                    && ox == xz_bits & mask
-                    && self.nba_fast_index.get(id).is_none()
-                {
-                    return;
-                }
-            }
-        }
+        // Retain the captured value: later Active code can change the cell
+        // before this nonblocking assignment commits.
         let mut val = Value::from_inline(val_bits & mask, xz_bits & mask, w);
         if w != sig_w {
             val = val.resize(sig_w);

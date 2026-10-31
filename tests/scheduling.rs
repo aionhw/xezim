@@ -443,3 +443,6 @@ mod preprocessor_linear_join;
 
 #[path = "scheduling/active_edges_before_nba.rs"]
 mod active_edges_before_nba;
+
+#[path = "scheduling/retain_active_nba_intents.rs"]
+mod retain_active_nba_intents;

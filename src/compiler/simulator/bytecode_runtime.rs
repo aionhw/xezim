@@ -26,9 +26,50 @@ impl NbaFast {
 
     pub(super) fn include_range(&mut self, lo: u32, len: u32) {
         if let Some(mask) = self.mask.as_mut() {
-            for bit in lo..lo.saturating_add(len).min(mask.width) {
-                mask.set_bit(bit as usize, LogicBit::One);
+            let end = lo.saturating_add(len).min(mask.width) as usize;
+            for start in (lo as usize..end).step_by(64) {
+                let count = (end - start).min(64);
+                let ones = u64::MAX >> (64 - count);
+                mask.splice_bits64(start, ones, 0, count);
             }
+        }
+    }
+
+    /// §10.4.2: merge sampled bits into the value at NBA application time.
+    /// Only known-one mask bits select; untouched bits retain both planes.
+    // Keep the masked merge out of the common whole-signal NBA drain.
+    #[inline(never)]
+    pub(super) fn merge_masked(current: &mut Value, value: &Value, mask: &Value) {
+        let end = mask.width.min(current.width) as usize;
+        // A short unbased literal extends its fill bit, unlike an ordinary
+        // short value. Partial queues normally hold full-width snapshots.
+        if value.is_fill && (value.width as usize) < end {
+            for bit in 0..end {
+                if mask.get_bit(bit) == LogicBit::One {
+                    current.set_bit(bit, value.get_bit(bit));
+                }
+            }
+            return;
+        }
+        for start in (0..end).step_by(64) {
+            let count = (end - start).min(64);
+            let (mv, mx) = mask.slice_bits_swar(start, count);
+            let selected = mv & !mx;
+            if selected == 0 {
+                continue;
+            }
+            let (v, x) = if start < value.width as usize {
+                value.slice_bits_swar(start, count.min(value.width as usize - start))
+            } else {
+                (0, 0)
+            };
+            let (cv, cx) = current.slice_bits_swar(start, count);
+            current.splice_bits64(
+                start,
+                (cv & !selected) | (v & selected),
+                (cx & !selected) | (x & selected),
+                count,
+            );
         }
     }
 
@@ -41,7 +82,24 @@ impl NbaFast {
         part: &Value,
         block_index: u32,
     ) {
-        if let Some(entry) = out.iter_mut().rev().find(|e| e.signal_id == signal_id) {
+        Self::queue_partial_from(out, 0, base, signal_id, lo, part, block_index);
+    }
+
+    /// Keep one block's partial writes separate from earlier blocks' output.
+    pub(super) fn queue_partial_from(
+        out: &mut Vec<Self>,
+        start: usize,
+        base: &Value,
+        signal_id: usize,
+        lo: u32,
+        part: &Value,
+        block_index: u32,
+    ) {
+        if let Some(entry) = out[start..]
+            .iter_mut()
+            .rev()
+            .find(|e| e.signal_id == signal_id)
+        {
             entry
                 .value
                 .copy_bits_from(lo as usize, part, 0, part.width as usize);
@@ -388,10 +446,9 @@ impl Simulator {
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
                     let sig_id = &(*sig_id as usize);
-                    // Const pre-resized at fuse time: compare, clone only on change.
-                    // §10.4.2 last-write-wins: an entry already queued for this
-                    // signal supersedes signal_table, so compare against it
-                    // rather than eliding against a stale current value.
+                    // Const pre-resized at fuse time; capture it for the NBA region.
+                    // §10.4.2: replace an earlier local intent first; otherwise
+                    // retain this value even when it matches the current cell.
                     if let Some(i) = if nba_dup {
                         nba_out.iter().rposition(|n| n.signal_id == *sig_id)
                     } else {
@@ -399,7 +456,7 @@ impl Simulator {
                     } {
                         nba_out[i].value = (**k).clone();
                         nba_out[i].mask = None;
-                    } else if signal_table[*sig_id] != **k {
+                    } else {
                         nba_out.push(NbaFast {
                             mask: None,
                             signal_id: *sig_id,
@@ -524,32 +581,10 @@ impl Simulator {
                 }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let sig_id = &(*sig_id as usize);
-                    // Unchanged-value elision BEFORE the resize: an equal-width,
-                    // non-fill, non-real register resizes to an exact copy of
-                    // itself, so comparing the register against the signal table
-                    // decides the elision without cloning the value first (flop
-                    // outputs reload the same value most cycles — the clone was
-                    // made only to be dropped).
-                    {
-                        let reg = &vm_regs[*val_reg as usize];
-                        if !nba_dup
-                            && *width != 0
-                            && reg.width == *width
-                            && !reg.is_fill
-                            && !reg.is_real
-                            && signal_table[*sig_id] == *reg
-                        {
-                            pc += 1;
-                            continue;
-                        }
-                    }
+                    // A later Active write may change this signal before NBA.
+                    // Retain the captured intent even when it equals the snapshot.
                     let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
-                    // Eval-time elision: skip the queue push when the
-                    // value already matches signal_table.  apply_nba_entry
-                    // would do the same check at apply time and drop the
-                    // entry; doing it here saves the push + queue traversal
-                    // + ~70% of apply_nba's per-entry work on c910 (flop Q
-                    // outputs reload the same value most cycles).
+                    // Equality is checked only when the queued NBA commits.
                     // §10.4.2 last-write-wins: see the NbaAssignConst arm.
                     if let Some(i) = if nba_dup {
                         nba_out.iter().rposition(|n| n.signal_id == *sig_id)
@@ -558,7 +593,7 @@ impl Simulator {
                     } {
                         nba_out[i].value = val;
                         nba_out[i].mask = None;
-                    } else if signal_table[*sig_id] != val {
+                    } else {
                         nba_out.push(NbaFast {
                             mask: None,
                             signal_id: *sig_id,
@@ -674,7 +709,7 @@ impl Simulator {
                         } {
                             nba_out[i].value = val;
                             nba_out[i].mask = None;
-                        } else if is_packed_id(eid) || signal_table[eid] != val {
+                        } else {
                             nba_out.push(NbaFast {
                                 mask: None,
                                 signal_id: eid,
@@ -719,7 +754,7 @@ impl Simulator {
                     } {
                         nba_out[i].value = val;
                         nba_out[i].mask = None;
-                    } else if signal_table[*sig_id] != val {
+                    } else {
                         nba_out.push(NbaFast {
                             mask: None,
                             signal_id: *sig_id,
@@ -1157,7 +1192,7 @@ impl Simulator {
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
                     let sig_id = &(*sig_id as usize);
-                    // Const pre-resized at fuse time: compare, clone only on change.
+                    // Const pre-resized at fuse time; capture it for the NBA region.
                     // §10.4.2 last-write-wins: an entry already queued for this
                     // signal supersedes the snapshot view.
                     if let Some(i) = if nba_dup {
@@ -1167,7 +1202,7 @@ impl Simulator {
                     } {
                         nba_out[i].value = (**k).clone();
                         nba_out[i].mask = None;
-                    } else if view[*sig_id] != **k {
+                    } else {
                         nba_out.push(NbaFast {
                             mask: None,
                             signal_id: *sig_id,
@@ -1545,7 +1580,7 @@ impl Simulator {
                     } {
                         nba_out[i].value = val;
                         nba_out[i].mask = None;
-                    } else if view[*sig_id] != val {
+                    } else {
                         nba_out.push(NbaFast {
                             mask: None,
                             signal_id: *sig_id,
@@ -1582,7 +1617,7 @@ impl Simulator {
                     } {
                         nba_out[i].value = val;
                         nba_out[i].mask = None;
-                    } else if view[*sig_id] != val {
+                    } else {
                         nba_out.push(NbaFast {
                             mask: None,
                             signal_id: *sig_id,
@@ -1647,7 +1682,7 @@ impl Simulator {
                         } {
                             nba_out[i].value = val;
                             nba_out[i].mask = None;
-                        } else if view[eid] != val {
+                        } else {
                             nba_out.push(NbaFast {
                                 mask: None,
                                 signal_id: eid,
@@ -3550,18 +3585,14 @@ impl Simulator {
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
                     let sig_id = &(*sig_id as usize);
-                    // Const pre-resized at fuse time: compare, clone only on change.
+                    // Const pre-resized at fuse time; capture it for the NBA region.
                     if let Some(i) = self.nba_fast_index.get(*sig_id) {
-                        // §10.4.2 last-write-wins. A value already QUEUED for
-                        // this signal in this time step is what it will become,
-                        // so the elision below must not compare against
-                        // signal_table — that is the stale pre-update value.
-                        // Eliding here let an earlier NBA survive a later one
-                        // that happened to match the old value, which is how
-                        // `x <= a; if (rst) {x,y} <= 0;` kept `a` under reset.
+                        // §10.4.2: replace the earlier captured intent, even if
+                        // this value equals the currently visible cell. Later
+                        // Active code may still change it before NBA apply.
                         self.nba_fast[i].value = (**k).clone();
                         self.nba_fast[i].mask = None;
-                    } else if self.signal_table[*sig_id] != **k {
+                    } else {
                         self.nba_fast_index.insert(*sig_id, self.nba_fast.len());
                         self.nba_fast.push(NbaFast {
                             mask: None,
@@ -3569,8 +3600,6 @@ impl Simulator {
                             signal_id: *sig_id,
                             value: (**k).clone(),
                         });
-                    } else {
-                        self.prof_nba_elided += 1;
                     }
                 }
                 Insn::BranchUnlessZero(reg, target) => {
@@ -3708,18 +3737,14 @@ impl Simulator {
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let sig_id = &(*sig_id as usize);
                     let val = self.vm_regs[*val_reg as usize].resize_for_assign(*width);
-                    // Eval-time elision: skip the queue push when the
-                    // value already matches signal_table.  See the
-                    // exec_insns_isolated sibling.  Bumps prof_nba_elided.
-                    //
-                    // §10.4.2 last-write-wins: an entry already QUEUED for this
-                    // signal is what it will become, so the elision must not
-                    // compare against the stale signal_table value — overwrite
-                    // the queued entry instead.
+                    // A later Active write can change even an equal target.
+                    // Keep its captured NBA value until publication.
+                    // §10.4.2: supersede an earlier intent or retain this first
+                    // one. Only NBA apply compares against the then-current cell.
                     if let Some(i) = self.nba_fast_index.get(*sig_id) {
                         self.nba_fast[i].value = val;
                         self.nba_fast[i].mask = None;
-                    } else if self.signal_table[*sig_id] != val {
+                    } else {
                         // Update nba_fast_index too so a follow-up partial-range
                         // or bit NBA to the same signal merges into THIS new
                         // whole-value entry, not into a stale earlier partial.
@@ -3730,8 +3755,6 @@ impl Simulator {
                             signal_id: *sig_id,
                             value: val,
                         });
-                    } else {
-                        self.prof_nba_elided += 1;
                     }
                 }
                 // Fused `LoadSignal ; LoadArrayElem ; NbaAssign` — an RTL
@@ -3741,7 +3764,7 @@ impl Simulator {
                 // index is read from signal_table (what `LoadSignal` copied
                 // into a register), the element value is resized for assign
                 // straight from signal_table (what `LoadArrayElem` copied),
-                // and the queue/elision logic is the `NbaAssign` arm verbatim.
+                // and the queue logic is the `NbaAssign` arm verbatim.
                 // The unresolved-element fallback reproduces `LoadArrayElem`'s
                 // 1-bit X. The SoA (`XEZIM_INLINE_BITS`) read shortcut is
                 // deliberately not replicated — `soa_read_ok` only ever holds
@@ -3755,7 +3778,7 @@ impl Simulator {
                         if let Some(i) = self.nba_fast_index.get(sig_id) {
                             self.nba_fast[i].value = val;
                             self.nba_fast[i].mask = None;
-                        } else if self.signal_table[sig_id] != val {
+                        } else {
                             self.nba_fast_index.insert(sig_id, self.nba_fast.len());
                             self.nba_fast.push(NbaFast {
                                 mask: None,
@@ -3784,7 +3807,7 @@ impl Simulator {
                     if let Some(i) = self.nba_fast_index.get(sig_id) {
                         self.nba_fast[i].value = val;
                         self.nba_fast[i].mask = None;
-                    } else if self.signal_table[sig_id] != val {
+                    } else {
                         self.nba_fast_index.insert(sig_id, self.nba_fast.len());
                         self.nba_fast.push(NbaFast {
                             mask: None,
@@ -3792,8 +3815,6 @@ impl Simulator {
                             signal_id: sig_id,
                             value: val,
                         });
-                    } else {
-                        self.prof_nba_elided += 1;
                     }
                 }
                 Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
@@ -4294,15 +4315,8 @@ impl Simulator {
                         &self.signal_name_to_id,
                     ) {
                         let val = self.vm_regs[*val_reg as usize].resize(*width);
-                        // §10.4.2 last-write-wins, THEN eval-time elision: an
-                        // earlier NBA in this evaluation must be OVERWRITTEN,
-                        // and the elision may only compare against the
-                        // register when nothing is pending. Eliding on the
-                        // register alone dropped a conditional override whose
-                        // value happened to equal the CURRENT value while the
-                        // unconditional default sat in the queue — a taken
-                        // branch-to-self on the 4004 committed pc+2 (issue
-                        // #142; every sibling arm already had this guard).
+                        // Preserve the latest captured value through NBA, even
+                        // if a later Active write changes the destination.
                         if is_packed_id(eid) {
                             // Issue #147: queue, do not commit — an NBA into
                             // a packed RAM must mature in the NBA region like
@@ -4313,7 +4327,7 @@ impl Simulator {
                         } else if let Some(i) = self.nba_fast_index.get(eid) {
                             self.nba_fast[i].value = val;
                             self.nba_fast[i].mask = None;
-                        } else if self.signal_table[eid] != val {
+                        } else {
                             self.nba_fast_index.insert(eid, self.nba_fast.len());
                             self.nba_fast.push(NbaFast {
                                 mask: None,
@@ -4321,8 +4335,6 @@ impl Simulator {
                                 signal_id: eid,
                                 value: val,
                             });
-                        } else {
-                            self.prof_nba_elided += 1;
                         }
                     }
                 }

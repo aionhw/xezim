@@ -6419,8 +6419,8 @@ pub struct Simulator {
     /// JIT-generated code writes `(signal_id, val_bits)` u32+u64 pairs
     /// directly via a baked-in pointer + the length counter below.
     /// Before `apply_nba` runs, `drain_jit_nba_side_queue` copies the
-    /// entries into the canonical `nba_fast` Vec via the existing
-    /// elision-and-resize logic.  Pre-allocated to 1M slots × 16
+    /// entries into the canonical `nba_fast` Vec, fitting declared widths.
+    /// Equality is checked at NBA apply. Pre-allocated to 1M slots × 16
     /// bytes = 16 MB; never resized so the JIT's baked pointer
     /// stays valid for the simulator's lifetime.  Allocated only
     /// when `XEZIM_INLINE_BITS=1`.
@@ -9118,12 +9118,9 @@ pub struct Simulator {
     /// each `event_loop` iter; read just before check_edges to decide
     /// between the full scan and the clocks-only fast path.
     nba_touched_edge_non_clock: bool,
-    /// Counter — number of `Insn::NbaAssign` evaluations whose value
-    /// already matched `signal_table[sig_id]` and were therefore not
-    /// pushed to `nba_fast`.  Captures the no-op fraction of NBA writes
-    /// (~70% on c910 flop-heavy workloads) before they incur queue/apply
-    /// overhead.  Counted in the main interpreter path only; the
-    /// parallel `exec_insns_isolated` path also elides but doesn't bump.
+    /// Legacy count of scheduling-time whole-NBA elisions, retained for
+    /// profiler compatibility. Immediate procedural NBA intents now survive
+    /// until their region; equality is checked against the cell at NBA apply.
     prof_nba_elided: u64,
     // O1 event-driven-edge MEASUREMENT (XEZIM_EVENT_EDGE_MEASURE=1, no
     // behavior change): per-edge-block static DATA-read set (LoadSignal sids
@@ -9190,9 +9187,9 @@ pub struct Simulator {
     /// Self-heal for the flop-fire skip: consecutive SKIPPED clock edges per
     /// gateable block. After XEZIM_EVENT_EDGE_HEAL consecutive skips (default
     /// 16, 0 disables) the block is force-executed once and its snapshot
-    /// rebuilt. For a correctly-idle flop the forced execution changes nothing
-    /// (inputs unchanged ⇒ same outputs, NBA elided), so this is semantically
-    /// invisible — but it BOUNDS the damage of any skip-bookkeeping wedge
+    /// rebuilt. For a correctly idle flop, forced execution queues the same
+    /// intent and NBA apply finds the destination unchanged, preserving the
+    /// final state. This BOUNDS the damage of any skip-bookkeeping wedge
     /// (e.g. a divider flop frozen for a dozen cycles while its clock toggles,
     /// as seen on a customer PLL model) to at most HEAL clock edges.
     edge_block_skip_streak: Vec<u16>,
@@ -13745,3 +13742,6 @@ mod class_heap_lifetime_tests;
 mod heap_trace;
 
 mod heap_gc;
+
+#[cfg(test)]
+mod partial_nba_tests;

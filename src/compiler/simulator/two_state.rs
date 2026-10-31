@@ -879,7 +879,7 @@ impl Simulator {
         if let Some(i) = self.nba_fast_index.get(id) {
             self.nba_fast[i].value = val;
             self.nba_fast[i].mask = None;
-        } else if self.signal_table[id] != val {
+        } else {
             self.nba_fast_index.insert(id, self.nba_fast.len());
             self.nba_fast.push(NbaFast {
                 mask: None,
@@ -887,8 +887,6 @@ impl Simulator {
                 signal_id: id,
                 value: val,
             });
-        } else {
-            self.prof_nba_elided += 1;
         }
     }
 
@@ -2914,7 +2912,7 @@ impl Simulator {
     }
 
     /// NBA writeback: exact mirror of the `NbaAssign` exec arm — §10.4.2
-    /// last-write-wins via nba_fast_index, eval-time elision otherwise.
+    /// last-write-wins via nba_fast_index, then equality at NBA commit.
     #[inline]
     /// `ts_store_nba` for an already-built (possibly 4-STATE) Value — the
     /// NBA queue holds full Values, so an X element read by a two-state
@@ -2923,7 +2921,7 @@ impl Simulator {
         if let Some(i) = self.nba_fast_index.get(id) {
             self.nba_fast[i].value = val;
             self.nba_fast[i].mask = None;
-        } else if self.signal_table[id] != val {
+        } else {
             self.nba_fast_index.insert(id, self.nba_fast.len());
             self.nba_fast.push(NbaFast {
                 mask: None,
@@ -2931,21 +2929,17 @@ impl Simulator {
                 signal_id: id,
                 value: val,
             });
-        } else {
-            self.prof_nba_elided += 1;
         }
     }
 
-    /// `sig[idx] <= bit` from the two-state executors: merge into the
-    /// pending NBA entry when one exists, else seed from the signal with
-    /// eval-time elision (mirrors `RangeStoreNba` for a one-bit window).
+    /// `sig[idx] <= bit`: merge into the pending entry or retain a masked
+    /// intent, even when the selected bit matches its current value.
     pub(super) fn ts_bit_store_nba(&mut self, id: usize, idx: u32, bit: u64) {
         self.queue_partial_nba(id, idx, Value::from_u64(bit, 1));
     }
 
-    /// `sig[hi:lo] <= v` for a destination wider than 64 bits: splice the
-    /// window into the pending NBA value, seeding it from the signal with
-    /// eval-time elision (the wide twin of `RangeStoreNba`).
+    /// `sig[hi:lo] <= v` for a wide destination: merge a masked intent
+    /// without discarding equal selected bits.
     pub(super) fn ts_wide_range_store_nba(&mut self, id: usize, lo: u32, hi: u32, v: u64) {
         self.queue_partial_nba(id, lo, Value::from_u64(v, hi - lo + 1));
     }
@@ -2981,7 +2975,7 @@ impl Simulator {
     }
 
     /// Non-blocking twin of `ts_wide_range_fill`: fill the window in the
-    /// pending NBA value, seeding it from the signal with elision.
+    /// pending NBA value, retaining the selected-bit mask until apply.
     pub(super) fn ts_wide_range_fill_nba(&mut self, id: usize, lo: u32, hi: u32, bit: u8) {
         let part = if bit != 0 {
             Value::ones(hi - lo + 1)
@@ -2992,7 +2986,7 @@ impl Simulator {
     }
 
     /// `sig[hi:lo] <= v` (narrow destination): merge into the pending NBA
-    /// entry when one exists, else seed from the signal with elision — the
+    /// entry when one exists, otherwise queue a masked intent — the
     /// `RangeStoreNba` executor arm as a callable.
     /// The dynamic-offset two-state instructions, executed out of line on
     /// a raw view of the register file: 0 = done, 1 = abort (slice past
@@ -3143,7 +3137,7 @@ impl Simulator {
         if let Some(i) = self.nba_fast_index.get(id) {
             self.nba_fast[i].value = val;
             self.nba_fast[i].mask = None;
-        } else if self.signal_table[id] != val {
+        } else {
             self.nba_fast_index.insert(id, self.nba_fast.len());
             self.nba_fast.push(NbaFast {
                 mask: None,
@@ -3151,8 +3145,6 @@ impl Simulator {
                 signal_id: id,
                 value: val,
             });
-        } else {
-            self.prof_nba_elided += 1;
         }
     }
 
