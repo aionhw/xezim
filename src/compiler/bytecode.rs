@@ -7686,6 +7686,30 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Is every string-formal use in the integral expression `e` a length
+    /// query (`s[s.len()-1]`)? The length is an `int`, so such an index
+    /// needs none of the string-to-integral coercion a formal's text would.
+    fn string_formal_len_only(&self, e: &Expression) -> bool {
+        use crate::ast::expr::ExprKind;
+        match &e.kind {
+            ExprKind::Call { func, args } if args.is_empty() => match &func.kind {
+                ExprKind::MemberAccess { expr, member } if member.name == "len" => {
+                    matches!(&expr.kind, ExprKind::Ident(h)
+                        if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty())
+                        || !self.touches_string_formal(e)
+                }
+                _ => !self.touches_string_formal(e),
+            },
+            ExprKind::Binary { left, right, .. } => {
+                self.string_formal_len_only(left) && self.string_formal_len_only(right)
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                self.string_formal_len_only(operand)
+            }
+            _ => !self.touches_string_formal(e),
+        }
+    }
+
     fn touches_string_formal(&self, e: &Expression) -> bool {
         if self.string_formal_names.is_empty() {
             return false;
@@ -14404,6 +14428,22 @@ impl<'a> BytecodeCompiler<'a> {
                 let relaxed_formal_index = self.method_mode
                     && !self.touches_string_formal(expr)
                     && self.index_is_whole_string_formal(index);
+                // §6.16: `s[i]` READ on a bare string formal is byte i of the
+                // bound text, 0 out of range — exactly a string local's
+                // `GetC` (the formal's register holds the text the
+                // interpreter's frame binds).
+                if self.method_mode
+                    && self.string_formal_len_only(index)
+                    && matches!(&expr.kind, ExprKind::Ident(h)
+                        if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty()
+                            && self.string_formal_names.contains(h.path[0].name.name.as_str()))
+                    && let Some(src) = self.string_local_reg(expr)
+                {
+                    let i = self.compile_expr(index, 32)?;
+                    let dst = self.alloc_reg();
+                    self.emit(Insn::StrOp(dst, StrOpKind::GetC, Box::new(vec![src, i])));
+                    return Some(dst);
+                }
                 if !relaxed_formal_index
                     && (self.touches_string_formal(expr) || self.touches_string_formal(index))
                 {

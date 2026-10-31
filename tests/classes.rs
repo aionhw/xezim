@@ -613,6 +613,8 @@ mod compiled_task_and_free_fn_chain;
 mod compiled_collection_return_store;
 #[path = "classes/compiled_string_local_byte.rs"]
 mod compiled_string_local_byte;
+#[path = "classes/compiled_string_formal_byte.rs"]
+mod compiled_string_formal_byte;
 #[path = "classes/compiled_member_redeclared.rs"]
 mod compiled_member_redeclared;
 #[path = "classes/compiled_member_operand_width.rs"]
