@@ -1137,6 +1137,7 @@ checkpoint_state!(
     class_gc_live,
     class_gc_released,
     class_gc_runs,
+    class_handle_member_types_cache,
     class_has_method_memo,
     class_method_cache,
     class_param_arrays,

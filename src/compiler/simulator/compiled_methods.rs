@@ -1983,7 +1983,15 @@ impl Simulator {
                     self.free_fn_table = Some(rc.clone());
                     rc
                 });
-                let handle_member_types = self.class_handle_member_types();
+                // Walks every class: built once, not per method compile.
+                let handle_member_types = match &self.class_handle_member_types_cache {
+                    Some(rc) => rc.clone(),
+                    None => {
+                        let rc = std::rc::Rc::new(self.class_handle_member_types());
+                        self.class_handle_member_types_cache = Some(rc.clone());
+                        rc
+                    }
+                };
                 // class-perf P2: FOREACH loop variables over a collection
                 // MEMBER whose element is a class handle (`foreach
                 // (m_successors[succ])` — uvm_phase::m_find_successor_by_name)

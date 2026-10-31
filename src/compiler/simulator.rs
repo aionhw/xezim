@@ -8779,6 +8779,10 @@ pub struct Simulator {
     /// method compiler (free-function calls). Built lazily on the first
     /// class-method compile; cloned per call site by Rc only.
     free_fn_table: Option<std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>>>,
+    /// `class_handle_member_types` over every class, shared by method
+    /// compiles; cleared with `compiled_method_admission` when a class is
+    /// added.
+    class_handle_member_types_cache: Option<std::rc::Rc<HashMap<String, HashMap<String, String>>>>,
     /// DPI import function prototypes by SV name, built once on the first
     /// method compile (see `dpi_import_fd_table`).
     dpi_import_fds: Option<std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>>>,

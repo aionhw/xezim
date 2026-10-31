@@ -4389,6 +4389,7 @@ impl Simulator {
             cast_widths,
             fn_decl_cache: HashMap::default(),
             free_fn_table: None,
+            class_handle_member_types_cache: None,
             dpi_import_fds: None,
             free_fn_class_names: HashMap::default(),
             free_call_pkgs: HashMap::default(),

@@ -799,6 +799,7 @@ impl Simulator {
             .insert(name.clone(), base.to_string());
         self.class_member_names_cell = std::cell::OnceCell::new();
         self.compiled_method_admission = None;
+        self.class_handle_member_types_cache = None;
         self.persisted_method_context_hash = None;
         self.module.classes.get(&name).cloned()
     }
@@ -911,6 +912,7 @@ impl Simulator {
         // A newly materialized inheritance chain changes compile-time facts
         // and the design context used by subsequent persistent cache probes.
         self.compiled_method_admission = None;
+        self.class_handle_member_types_cache = None;
         self.persisted_method_context_hash = None;
         self.spec_clone_origin
             .insert(name.clone(), cname.to_string());
