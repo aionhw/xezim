@@ -3227,9 +3227,33 @@ impl Simulator {
     pub(super) fn class_is_a(&self, derived: &str, base: &str) -> bool {
         // Class names are keyed bare (the parser keeps only the leaf segment
         // of a scoped name), so the comparison strips just the `#(params)`
-        // specialization suffix, not a package prefix.
+        // specialization suffix, not a package prefix. An object built from a
+        // class declared inside a scoped unit can record its `class_name`
+        // under a DIFFERENT spelling than a `$cast` destination resolves to
+        // (e.g. object `test.reg_rw` vs dest `reg_rw`, or a nested
+        // `transaction` vs `UVC::transaction`). Those are the SAME class, but
+        // the ancestor walk below (which only follows `extends`) can never
+        // join a class to its own other-spelled name.
+        //
+        // Detect that sameness from the DECLARATION NAME: every registry key
+        // that aliases one class (the dual bare/scoped keys the elaborator
+        // inserts) resolves to an `ElaboratedClass` whose canonical `name`
+        // string is the SAME, even when the entries are separate Arc copies.
+        // Two genuinely different same-named classes in different scopes
+        // (`pkg1::Foo` / `pkg2::Foo`) resolve to entries whose `name` strings
+        // differ, so they stay distinct (a legal downcast must not conflate
+        // cross-scope classes). This joins only declaration-identical
+        // classes, never coincidentally same-named ones.
+        let canon = |s: &str| {
+            self.module
+                .classes
+                .get(s.split('#').next().unwrap_or(s))
+                .map(|a| a.name.clone())
+        };
         let strip = |s: &str| s.split('#').next().unwrap_or(s).to_string();
-        let base = strip(base);
+        let base_d = self.typedef_unroll(&base);
+        let base = strip(base_d.as_str());
+        let base_canon = canon(&base).or_else(|| canon(&base_d));
         let mut cur = Some(self.typedef_unroll(derived));
         let mut guard = 0;
         // §8.26: a class is also every interface class it or a base class
@@ -3240,14 +3264,19 @@ impl Simulator {
             if guard > 128 {
                 break;
             }
-            if strip(&c) == base || self.class_origin(&c) == base {
+            let c_stripped = strip(&c);
+            let same_entry = base_canon.is_some()
+                && (canon(&c) == base_canon
+                    || canon(&c_stripped) == base_canon
+                    || canon(&self.typedef_unroll(&c)) == base_canon);
+            if c_stripped == base || self.class_origin(&c) == base || same_entry {
                 return true;
             }
             let cd = self
                 .module
                 .classes
                 .get(&c)
-                .or_else(|| self.module.classes.get(&strip(&c)));
+                .or_else(|| self.module.classes.get(&c_stripped));
             if let Some(cd) = cd {
                 ifaces.extend(cd.implements.iter().cloned());
             }
