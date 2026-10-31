@@ -62,10 +62,12 @@ impl EventStampStore {
     /// Compatibility with name-based callers, including dynamic event stamps.
     pub(super) fn insert(&mut self, name: String, time: u64) -> Option<u64> {
         let id = self.intern(&name);
+        super::note_event_trigger();
         self.times[id.0].replace(time)
     }
 
     pub(super) fn mark(&mut self, id: EventId, time: u64) {
+        super::note_event_trigger();
         self.times[id.0] = Some(time);
     }
 

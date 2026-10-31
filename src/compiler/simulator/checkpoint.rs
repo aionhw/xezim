@@ -1184,6 +1184,7 @@ checkpoint_state!(
     cond_waiter_conditions,
     cond_waiter_gate,
     cond_waiter_reads,
+    cond_waiter_rechecks,
     condition_waiters,
     constraint_mode_disabled,
     cross_block_wakeup_count,

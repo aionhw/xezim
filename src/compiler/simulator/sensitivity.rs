@@ -3752,10 +3752,55 @@ impl Simulator {
                 .clone(),
             None => self.class_context_stack.last().cloned().flatten()?,
         };
-        if !self.cond_operand_gated(cond, handle.unwrap_or(0), &cls) {
+        if !Self::cond_triggered_monotone(cond)
+            || !self.cond_operand_gated(cond, handle.unwrap_or(0), &cls)
+        {
             return None;
         }
         Some(reads.iter().map(|n| name_bit(n)).collect())
+    }
+
+    /// `<ev>.triggered` as a whole operand: a two-or-more segment name ending
+    /// in `triggered`, or a member access of it. Returns the event operand.
+    fn cond_triggered_event(e: &Expression) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Ident(h)
+                if h.path.len() >= 2
+                    && h.path
+                        .last()
+                        .is_some_and(|s| s.name.name == "triggered" && s.selects.is_empty()) =>
+            {
+                Some(Expression::new(ExprKind::Ident(hier_prefix(h)), e.span))
+            }
+            ExprKind::MemberAccess { expr, member } if member.name == "triggered" => {
+                Some((**expr).clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// §15.5.3: `.triggered` turns false at the end of its time slot with no
+    /// write anyone could note, so a gated waiter may only depend on it where
+    /// that change cannot make the condition true: as an operand of `&&`,
+    /// `||` or parentheses. A trigger, which can, notes `triggered`.
+    fn cond_triggered_monotone(e: &Expression) -> bool {
+        fn mentions_triggered(e: &Expression) -> bool {
+            let mut names = HashSet::default();
+            Simulator::collect_condition_read_names(e, &mut names);
+            names.contains("triggered")
+        }
+        if Self::cond_triggered_event(e).is_some() {
+            return true;
+        }
+        match &e.kind {
+            ExprKind::Binary {
+                op: BinaryOp::LogAnd | BinaryOp::LogOr,
+                left,
+                right,
+            } => Self::cond_triggered_monotone(left) && Self::cond_triggered_monotone(right),
+            ExprKind::Paren(inner) => Self::cond_triggered_monotone(inner),
+            _ => !mentions_triggered(e),
+        }
     }
 
     /// `cond_gate_for`'s operand check.
@@ -3794,6 +3839,11 @@ impl Simulator {
                     .and_then(|o| o.as_ref())
                     .is_some_and(|i| i.properties.contains_key(n))
         };
+        // `ev.triggered` re-checks on every trigger (`note_event_trigger`)
+        // and on writes to the names reaching the event.
+        if let Some(ev) = Self::cond_triggered_event(e) {
+            return self.cond_operand_gated(&ev, this_h, this_cls);
+        }
         match &e.kind {
             ExprKind::Number(_) | ExprKind::StringLiteral(_) | ExprKind::This => true,
             ExprKind::Ident(h) => {

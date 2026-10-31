@@ -3370,6 +3370,16 @@ fn note_store_write(bits: u64) {
     STORE_WRITE_MASK.with(|m| m.set(m.get() | bits));
 }
 
+/// An event was triggered or re-bound, so every `<event>.triggered` read may
+/// have changed. A stamp is not a property write, so without this a gated
+/// `wait(ev.triggered)` would never re-check; the waiters read the name
+/// `triggered`, which every trigger notes whatever the event's spelling or
+/// alias.
+#[inline]
+fn note_event_trigger() {
+    note_store_write(name_bit("triggered"));
+}
+
 /// A write to the string-keyed stores that does not name its target.
 #[inline]
 fn bump_store_gen() {

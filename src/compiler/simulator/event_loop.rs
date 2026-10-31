@@ -1307,6 +1307,7 @@ impl Simulator {
                 self.cond_waiter_reads.remove(&cpid);
                 self.cond_read_union_dirty = true;
                 self.cond_waiter_conditions.remove(&cpid);
+                self.cond_waiter_rechecks += 1;
                 self.event_queue.schedule(self.time, cpid, cont);
             }
             let newly = std::mem::take(&mut self.condition_waiters);

@@ -294,6 +294,8 @@ impl Simulator {
         let Some(lkey) = self.event_ref_key(lvalue) else {
             return false;
         };
+        // A re-bound event reads the target's `.triggered` stamp from now on.
+        note_event_trigger();
         if matches!(rvalue.kind, ExprKind::Null) {
             self.event_aliases
                 .insert(lkey, Self::EVENT_NULL_KEY.to_string());
@@ -1368,6 +1370,7 @@ impl Simulator {
             }
         }
         self.event_obj_slots.entry(id).or_default().push(slot);
+        note_event_trigger();
     }
 
     /// Is `field` of the object `handle` declared `event` (`class_prop_is_event`
