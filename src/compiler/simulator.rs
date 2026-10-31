@@ -3380,6 +3380,45 @@ fn note_event_trigger() {
     note_store_write(name_bit("triggered"));
 }
 
+/// The `STORE_WRITE_MASK` bits of a runtime signal-map key: those of each
+/// name it is spelled from outside its index brackets (`top.blk.acc`,
+/// `12#m_q[3]`, `Cls::count`), so a write to a module variable does not
+/// re-check every gated waiter. A key with a compiler-generated part
+/// (`__vif_local__x`) or an escaped identifier names no source spelling the
+/// waiters could share, so it notes every bit.
+fn signal_key_bits(k: &str) -> u64 {
+    if k.contains('\\') {
+        return u64::MAX;
+    }
+    let b = k.as_bytes();
+    let mut bits = 0u64;
+    let mut depth = 0u32;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'[' {
+            depth += 1;
+            i += 1;
+        } else if c == b']' {
+            depth = depth.saturating_sub(1);
+            i += 1;
+        } else if depth == 0 && (c.is_ascii_alphanumeric() || c == b'_' || c == b'$') {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                i += 1;
+            }
+            let run = &k[start..i];
+            if run.starts_with("__") {
+                return u64::MAX;
+            }
+            bits |= name_bit(run);
+        } else {
+            i += 1;
+        }
+    }
+    if bits == 0 { u64::MAX } else { bits }
+}
+
 /// A write to the string-keyed stores that does not name its target.
 #[inline]
 fn bump_store_gen() {
@@ -6162,7 +6201,7 @@ impl SignalMap {
     }
 
     pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
-        bump_store_gen();
+        note_store_write(signal_key_bits(&k));
         if let Some(b) = Self::base_of(&k) {
             if !self.map.contains_key(&k) {
                 self.elems
@@ -6177,7 +6216,7 @@ impl SignalMap {
     }
 
     pub fn remove(&mut self, k: &str) -> Option<Value> {
-        bump_store_gen();
+        note_store_write(signal_key_bits(k));
         let r = self.map.remove(k);
         if r.is_some() {
             if let Some(b) = Self::base_of(k) {
@@ -6194,6 +6233,13 @@ impl SignalMap {
             }
         }
         r
+    }
+
+    /// An in-place edit of one stored value, noted under its key's names
+    /// (other `&mut` access through `DerefMut` notes every name).
+    pub fn get_mut(&mut self, k: &str) -> Option<&mut Value> {
+        note_store_write(signal_key_bits(k));
+        self.map.get_mut(k)
     }
 
     /// All stored keys beginning with `prefix`, which must end with `[`.

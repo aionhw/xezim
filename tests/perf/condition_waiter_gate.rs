@@ -139,3 +139,74 @@ fn triggered_waits_recheck_only_on_triggers() {
     // Ungated, every idle waiter was re-checked on each drain (~30500).
     assert!(rechecks <= 1000, "condition_waiter_rechecks={rechecks}");
 }
+
+/// Fifty idle class waiters on a queue property, an int property and a
+/// static queue, while a module loop writes block variables on every step.
+const MODULE_WRITES_DESIGN: &str = r#"
+`timescale 1ns/1ns
+class watcher;
+  int m_q[$];
+  int count;
+  static int sq[$];
+  int woke_q, woke_count, woke_static;
+  task automatic watch();
+    fork
+      begin wait (m_q.size() != 0); woke_q = $time; end
+      begin wait (count == 3); woke_count = $time; end
+      begin wait (sq.size() > 1); woke_static = $time; end
+    join_none
+  endtask
+endclass
+module top;
+  watcher idle[$];
+  watcher w = new();
+  int steps;
+  initial begin
+    for (int i = 0; i < 50; i++) begin
+      automatic watcher x = new();
+      idle.push_back(x);
+      x.watch();
+    end
+    w.watch();
+  end
+  initial begin
+    longint acc;
+    int last;
+    acc = 0;
+    for (steps = 0; steps < 200; steps++) begin
+      acc += steps;
+      last = steps;
+      #1;
+    end
+    $display("T|end acc=%0d last=%0d", acc, last);
+    $finish;
+  end
+  initial begin
+    #20 w.m_q.push_back(7);
+    #0 $display("T|t=%0t q=%0d", $time, w.woke_q);
+    #10 w.count = 2;
+    #10 w.count++;
+    #0 $display("T|t=%0t count=%0d", $time, w.woke_count);
+    #10 watcher::sq.push_back(1);
+    #0 $display("T|t=%0t static one=%0d", $time, w.woke_static);
+    #10 watcher::sq.push_back(2);
+    #0 $display("T|t=%0t static two=%0d idle0=%0d", $time, w.woke_static, idle[0].woke_static);
+  end
+endmodule
+"#;
+
+const MODULE_WRITES_EXPECTED: &str = "\
+T|t=20 q=20
+T|t=40 count=40
+T|t=50 static one=0
+T|t=60 static two=60 idle0=60
+T|end acc=19900 last=199";
+
+#[test]
+fn module_variable_writes_do_not_recheck_class_waiters() {
+    let (lines, rechecks) = run(MODULE_WRITES_DESIGN);
+    assert_eq!(lines, expected(MODULE_WRITES_EXPECTED));
+    // Each module write noted every name: every idle waiter re-checked on
+    // every step (~13500).
+    assert!(rechecks <= 1500, "condition_waiter_rechecks={rechecks}");
+}
