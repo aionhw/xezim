@@ -1883,6 +1883,9 @@ pub struct BytecodeCompiler<'a> {
     /// The `typedef_coll_dims` keys whose ELEMENT type is `string`
     /// (`typedef string q_t[$]`): such locals join `local_coll_strings`.
     pub typedef_coll_strings: HashSet<String>,
+    /// Method mode: instance-member collections whose ELEMENT type is
+    /// `string` (`Simulator::class_string_coll_member_names`).
+    pub member_coll_strings: HashSet<String>,
     /// class-perf Step 9c: names whose `$cast` destination may take the
     /// register route — formals, the result cell, and TOP-LEVEL body
     /// locals. A nested-block local is register-backed too, but its
@@ -2198,6 +2201,7 @@ impl<'a> BytecodeCompiler<'a> {
             coll_elem_packed_dims: HashMap::default(),
             typedef_coll_dims: HashMap::default(),
             typedef_coll_strings: HashSet::default(),
+            member_coll_strings: HashSet::default(),
             cast_reg_ok_locals: HashSet::default(),
             method_ret_jumps: Vec::new(),
             decl_local_regs: std::collections::HashSet::default(),
@@ -5789,6 +5793,22 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Is `base` (select-free) a bare instance-member queue / dynamic /
+    /// associative array of `string` elements (`string m_q[$];` read as
+    /// `m_q[i]` in a method body) that no local or formal shadows?
+    fn member_string_coll(&self, base: &Expression) -> bool {
+        match &base.kind {
+            ExprKind::Ident(h) if self.method_mode && h.root.is_none() && h.path.len() == 1 => {
+                let n = h.path[0].name.name.as_str();
+                h.path[0].selects.is_empty()
+                    && !self.local_var_regs.contains_key(n)
+                    && self.member_coll_strings.contains(n)
+                    && self.coll_elem_member_names.contains(n)
+            }
+            _ => false,
+        }
+    }
+
     fn dt_is_string(dt: &crate::ast::types::DataType) -> bool {
         matches!(
             dt,
@@ -7290,9 +7310,12 @@ impl<'a> BytecodeCompiler<'a> {
     fn expr_is_string_static(&self, e: &Expression) -> bool {
         match &e.kind {
             ExprKind::StringLiteral(_) => true,
-            // §7.10 / §6.16: an element of a LOCAL string queue / dynamic
-            // array (`q[0]` on `string q[$]`) is a string.
-            ExprKind::Index { expr: base, .. } => self.local_string_coll(base),
+            // §7.10 / §6.16: an element of a string queue / dynamic array
+            // (`q[0]` on `string q[$]`), local or instance member, is a
+            // string.
+            ExprKind::Index { expr: base, .. } => {
+                self.local_string_coll(base) || self.member_string_coll(base)
+            }
             ExprKind::Paren(inner) => self.expr_is_string_static(inner),
             ExprKind::SystemCall { name, args } => match name.as_str() {
                 "$sformatf" | "$psprintf" => true,

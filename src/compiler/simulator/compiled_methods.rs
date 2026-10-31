@@ -661,6 +661,66 @@ impl Simulator {
         out
     }
 
+    /// §6.16 / §7.10: instance-member queues, dynamic and associative arrays
+    /// of `cname`'s chain whose ELEMENT type is `string` — declared
+    /// `string m[$]` or through a typedef (`typedef string q_t[$]; q_t m;`).
+    /// An element read (`m[i]`) is a string operand in a compiled body.
+    /// Statics and names some class redeclares are left out, as in
+    /// `class_string_member_names`.
+    pub(super) fn class_string_coll_member_names(&self, cname: &str) -> HashSet<String> {
+        let mut out = HashSet::default();
+        let mut seen = HashSet::default();
+        let mut cur = cname.to_string();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            for p in cd.queue_properties.keys().chain(cd.assoc_properties.keys()) {
+                if cd.static_properties.contains(p) || self.shadowed_prop_names.contains(p) {
+                    continue;
+                }
+                if cd.string_properties.contains(p)
+                    || cd
+                        .property_types
+                        .get(p)
+                        .is_some_and(|dt| self.dt_names_string(dt, cd))
+                {
+                    out.insert(p.clone());
+                }
+            }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// Is `dt` `string`, directly or through a typedef chain (the class's
+    /// own typedefs first)?
+    fn dt_names_string(&self, dt: &DataType, cd: &super::elaborate::ElaboratedClass) -> bool {
+        let mut cur = dt;
+        for _ in 0..16 {
+            match cur {
+                DataType::Simple {
+                    kind: crate::ast::types::SimpleType::String,
+                    ..
+                } => return true,
+                DataType::TypeReference { name: tn, .. } => {
+                    let next = cd.typedef_targets.get(&tn.name.name).or_else(|| {
+                        super::elaborate::lookup_scoped_type(tn, &self.module.typedef_types)
+                    });
+                    match next {
+                        Some(n) => cur = n,
+                        None => return false,
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// class-perf Step 9b: member-collection names callable with a value-
     /// arg builtin in a method body of `cname`. The UNION of
     /// `assoc_properties`/`queue_properties` keys over the extends chain —
@@ -2328,6 +2388,7 @@ impl Simulator {
                     compiler.method_admission = Some(admission);
                     // issue-301 plan fact: multi-dim packed coll elements.
                     compiler.coll_elem_packed_dims = (*pre.coll_elem_packed_dims).clone();
+                    compiler.member_coll_strings = self.class_string_coll_member_names(cname);
                     compiler.typedef_coll_dims = self.local_typedef_coll_dims(
                         cname,
                         body,
