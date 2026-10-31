@@ -1,0 +1,13 @@
+0 s target fw BEGIN_REQ addr 0 delay 5 ns
+0 s fw returned 1 phase END_REQ delay 0 s
+15 ns initiator bw BEGIN_RESP delay 1 ns data 100
+15 ns bw returned 2 phase END_RESP
+16 ns done 0 TLM_OK_RESPONSE data 100
+16 ns target fw BEGIN_REQ addr 4 delay 5 ns
+16 ns fw returned 1 phase END_REQ delay 0 s
+31 ns initiator bw BEGIN_RESP delay 1 ns data 101
+31 ns bw returned 2 phase END_RESP
+32 ns done 1 TLM_OK_RESPONSE data 101
+32 ns target fw BEGIN_REQ addr 8 delay 5 ns
+32 ns fw returned 2 phase END_RESP delay 7 ns
+39 ns done 2 TLM_OK_RESPONSE data 0

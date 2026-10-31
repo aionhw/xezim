@@ -1,0 +1,18 @@
+1 ns router from 0 to 0
+1 ns t.m0 read 4
+2 ns router from 1 to 0
+2 ns t.m0 read 8
+3 ns hub from 0 of 1
+3 ns t.m2 read 12
+11 ns t.c0 got 1004
+11 ns router from 0 to 1
+11 ns t.w1.mem read 4
+12 ns t.c1 got 1008
+12 ns router from 1 to 1
+12 ns t.w1.mem read 8
+13 ns t.c2 got 3012
+13 ns hub from 0 of 1
+13 ns t.m2 read 268
+21 ns t.c0 got 2004
+22 ns t.c1 got 2008
+23 ns t.c2 got 3268

@@ -1,0 +1,8 @@
+20 ns read 8 dmi allowed 1
+20 ns dmi request at 8
+dmi 1 range 0..63 rw 1 latency 5 ns
+27 ns wrote mem[9] = 19
+74 ns wrote mem[9] = 29
+100 ns invalidating 8..15, mem[9] = 29
+100 ns invalidated 8..15
+114 ns dmi valid 0

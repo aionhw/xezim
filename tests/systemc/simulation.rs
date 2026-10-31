@@ -403,3 +403,40 @@ fn globals() {
 fn kernel_api() {
     check("kernelapi");
 }
+
+/// TLM-2.0 non-blocking transport (§11, §15): nb_transport_fw/bw with the
+/// base protocol phases through simple sockets; TLM_UPDATED, TLM_COMPLETED,
+/// a response on the backward path; phases print by name.
+#[test]
+fn tlm_nonblocking() {
+    check("tlm_nb");
+}
+
+/// TLM-2.0 sockets (§13, §16): tagged sockets in arrays, multi-passthrough
+/// sockets (an id per binding), hierarchical binding, and modules
+/// implementing the transport interfaces themselves (`bind(*this)`).
+#[test]
+fn tlm_sockets() {
+    check("tlm_sockets");
+}
+
+/// TLM-2.0 DMI (§11.2): tlm_dmi, access through the pointer, latencies,
+/// invalidate_direct_mem_ptr on the backward path.
+#[test]
+fn tlm_dmi() {
+    check("tlm_dmi");
+}
+
+/// peq_with_get, peq_with_cb_and_phase (§16.3) and the quantum keeper with
+/// the global quantum (§12.2).
+#[test]
+fn tlm_peq_and_quantum() {
+    check("tlm_peq");
+}
+
+/// Payload extensions (§14.21), memory management (§14.5), deep copies,
+/// and analysis ports with subscribers (§17).
+#[test]
+fn tlm_extensions() {
+    check("tlm_ext");
+}

@@ -1,0 +1,11 @@
+has mm 1 refs 1
+extension id 7
+copied extension id 7 distinct
+after clear absent
+refs 1
+freed addr 64, frees 1
+a saw 3
+b saw 3
+a saw 4
+b saw 4
+sums 7 7

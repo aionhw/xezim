@@ -157,9 +157,21 @@ match the SystemC 2.3 reference kernel:
   ERROR/FATAL` in SystemC's format, `sc_trace` to VCD. The exit status is
   the program's: `sc_main`'s return value, 1 after an error report, 134
   after a fatal one (the kernel aborts).
-- **TLM-2.0 (loosely timed)**: `tlm_generic_payload`, `simple_initiator_socket`
-  / `simple_target_socket` and `tlm_initiator_socket` / `tlm_target_socket`,
-  `b_transport`, `transport_dbg`, `register_b_transport`, `socket.bind(*this)`.
+- **TLM-2.0** (§10–§17): `tlm_generic_payload`; blocking and non-blocking
+  transport (`b_transport`, `nb_transport_fw`/`nb_transport_bw` with the
+  base protocol phases, which print by name), `transport_dbg`, and DMI
+  (`get_direct_mem_ptr` with `tlm_dmi`, access through its pointer,
+  `invalidate_direct_mem_ptr`). Sockets: `tlm_initiator_socket` /
+  `tlm_target_socket` with a module implementing the interfaces
+  (`bind(*this)`), the `simple_*` and `simple_*_tagged` sockets with
+  `register_*` callbacks (a tag per socket), `multi_passthrough_*` sockets
+  (an index per binding, `size()`, `s[i]->`), arrays of sockets, and
+  hierarchical binding of a parent's socket to a child's.
+  `peq_with_get`, `peq_with_cb_and_phase`, `tlm_quantumkeeper` with
+  `tlm_global_quantum`; payload extensions (`set_extension`,
+  `get_extension`, `clear_extension`, `deep_copy_from`), memory management
+  (`tlm_mm_interface`, `acquire`/`release`), analysis ports and
+  subscribers (`tlm_analysis_port`, `tlm_analysis_if`).
   C data pointers (`set_data_ptr(&x)`, `memcpy`, `memset`, pointer indexing and
   `reinterpret_cast` between byte and word pointers) work through a byte-level
   memory model in the runtime package `sc_rt`.
@@ -182,7 +194,8 @@ match the SystemC 2.3 reference kernel:
 Each of these is reported as an error at its C++ source line, never
 simulated approximately:
 
-- Approximately-timed TLM (`nb_transport`, payload event queues),
+- A simple target socket's automatic conversion between blocking and
+  non-blocking transport (register the kind the initiators use),
   `sc_event_and_list` / `sc_event_or_list` objects (the `e1 & e2` /
   `e1 | e2` expressions work), spawned method processes and lambdas,
   `SC_CJOIN`, `disable`/`enable` and `reset` of a process handle, report
@@ -224,5 +237,6 @@ Seven of them simulate with identical output (`pipe`, `fir`,
 script reports it as ORDER). `rsa` and `pkt_switch` seed their random
 numbers from the wall clock, so even the reference output differs between
 runs; `simple_perf` passes a run-time value to a module constructor; the
-rest need the features listed as not supported (approximately-timed TLM,
-C file I/O, fixed-point types and more of the C++ library).
+rest need the features listed as not supported: the TLM examples their
+C++ library containers (`std::queue`, `std::list`, `std::map`) and pointers
+to pointers, others C file I/O and fixed-point types.

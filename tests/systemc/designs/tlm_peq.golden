@@ -1,0 +1,13 @@
+quantum 10 ns
+0 s local 4 ns current 4 ns need sync 0
+0 s local 8 ns current 8 ns need sync 0
+0 s local 12 ns current 12 ns need sync 1
+1 ns callback addr 20 END_RESP
+2 ns peq got addr 10
+3 ns callback addr 10 BEGIN_REQ
+5 ns peq got addr 0
+5 ns peq got addr 20
+12 ns local 4 ns current 16 ns need sync 0
+12 ns local 8 ns current 20 ns need sync 1
+20 ns local 4 ns current 24 ns need sync 0
+21 ns callback addr 0 BEGIN_RESP
