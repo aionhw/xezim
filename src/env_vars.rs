@@ -604,7 +604,11 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_METHOD_PROFILE",
-        "class-perf: sample class-method execution (in-process sampling profiler)",
+        "class-perf: scoped calls, compilation decisions and wall samples during the event loop",
+    ),
+    (
+        "XEZIM_METHOD_PROFILE_JSON",
+        "class-perf: write complete scoped method diagnostics as JSON to this path (also enables collection)",
     ),
     (
         "XEZIM_METHOD_TIER",

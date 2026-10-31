@@ -116,6 +116,14 @@ impl Simulator {
             .pending_pkg_scope
             .take()
             .or_else(|| self.module.func_decl_scope.get(&fd.name.name.name).cloned());
+        let profile_id = if SAMPLER_READY.load(Ordering::Relaxed) {
+            let class = self.free_fn_class_name(pkg_scope.as_deref());
+            method_profile::identity(&class, &fd.name.name.name, None)
+        } else {
+            0
+        };
+        let _profile_call =
+            method_profile::Scope::enter(profile_id, method_profile::Path::Setup, true);
         let normalized = Self::normalize_call_args(&fd.ports, args);
         let supplied = normalized
             .as_ref()
@@ -752,6 +760,11 @@ impl Simulator {
         if let Some(cval) = compiled {
             self.return_value = Some(cval);
         } else {
+            if !compiled_methods_enabled() {
+                method_profile::decision(profile_id, method_profile::Decision::Disabled);
+            }
+            let _profile_ast =
+                method_profile::Scope::enter(profile_id, method_profile::Path::Ast, false);
             // Execute function body
             for stmt in &fd.items {
                 self.exec_statement(stmt);
@@ -989,7 +1002,7 @@ impl Simulator {
             .pending_pkg_scope
             .take()
             .or_else(|| self.module.func_decl_scope.get(&td.name.name.name).cloned());
-        let mut cleanup = self.bind_task_frame(td, args, None);
+        let mut cleanup = self.bind_task_frame(td, args, None, pkg_scope.as_deref());
         self.enter_free_task_scope(td, &mut cleanup);
         self.open_decl_shadow_frame();
         // §23.8/§13.3.2: an instance or free task body resolves names
@@ -1002,6 +1015,11 @@ impl Simulator {
         self.push_instance_task_context(&mut cleanup);
         self.pkg_scope_stack.push(pkg_scope);
         // Execute task body
+        let _profile_ast = method_profile::Scope::enter(
+            cleanup.method_profile_id,
+            method_profile::Path::Ast,
+            false,
+        );
         for stmt in &td.items {
             self.exec_statement(stmt);
             if self.return_value.is_some() || self.return_flag || self.break_flag {
@@ -1051,6 +1069,8 @@ impl Simulator {
     /// the work that `exec_task_call` runs after the body. Mirrors the original
     /// inline cleanup exactly.
     pub(super) fn unwind_task_frame(&mut self, mut c: TaskCleanup) {
+        let _profile_cleanup =
+            method_profile::Scope::enter(c.method_profile_id, method_profile::Path::Setup, false);
         // §13.5.3: a default may name an earlier formal; update it before
         // capturing supplied outputs or popping the declaration's scope.
         self.apply_default_formal_outputs(&c.default_output_bindings);
@@ -1980,8 +2000,51 @@ impl Simulator {
         td: &TaskDeclaration,
         args: &[Expression],
         method_ctx: Option<(Option<(String, String)>, Option<usize>, String)>,
+        profile_pkg: Option<&str>,
     ) -> TaskCleanup {
         use crate::ast::types::PortDirection;
+        let method_profile_id = if SAMPLER_READY.load(Ordering::Relaxed) {
+            if let Some((spec, handle, class)) = &method_ctx {
+                // Resolve the declaring ancestor's specialization rather than
+                // attributing inherited bodies to the receiver's leaf class.
+                if let Some(handle) = handle {
+                    self.method_profile_id(*handle, class, &td.name.name.name)
+                } else {
+                    let origin = self.class_origin(class);
+                    let spec = spec.as_ref().and_then(|(base, sig)| {
+                        if self.class_origin(base) == origin {
+                            Some((origin.to_string(), sig.clone()))
+                        } else {
+                            self.ancestor_spec(base, sig, origin).map(|sig| {
+                                (origin.to_string(), self.canonicalize_spec_sig(origin, &sig))
+                            })
+                        }
+                    });
+                    method_profile::identity(class, &td.name.name.name, spec.as_ref())
+                }
+            } else {
+                let pkg = profile_pkg
+                    .or(self.pending_pkg_scope.as_deref())
+                    .or_else(|| {
+                        self.module
+                            .func_decl_scope
+                            .get(&td.name.name.name)
+                            .map(String::as_str)
+                    });
+                let class = format!("__task__{}", pkg.unwrap_or(""));
+                method_profile::identity(&class, &td.name.name.name, None)
+            }
+        } else {
+            0
+        };
+        let _profile_call =
+            method_profile::Scope::enter(method_profile_id, method_profile::Path::Setup, true);
+        if method_ctx.is_none() {
+            method_profile::decision(
+                method_profile_id,
+                method_profile::Decision::Bypassed("free_task_dispatch"),
+            );
+        }
         let type_ctx = method_ctx.as_ref().map(|(spec, _, _)| spec.clone());
         let default_spec = type_ctx.clone().flatten();
         let default_receiver = method_ctx
@@ -2594,6 +2657,7 @@ impl Simulator {
         let m_entry = self.subroutine_m_entry(&tname, td.span, self.pending_pkg_scope.as_deref());
         let saved_m_scope = std::mem::replace(&mut self.m_scope_stack, m_entry);
         TaskCleanup {
+            method_profile_id,
             frame_scope_hint: None,
             prev_hint: None,
             caller_body_scope: None,

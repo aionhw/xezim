@@ -2745,6 +2745,9 @@ impl Simulator {
             .map(|(scope, _)| scope.as_str())
             .or_else(|| self.process_scope_hint.get(&pid).map(String::as_str))
             .unwrap_or("");
+        let _profile_process = method_profile::Scope::process(
+            self.task_cleanup.last().map_or(0, |c| c.method_profile_id),
+        );
         let same_scope = self.activation_scope.borrow().as_deref() == Some(scope);
         if same_scope {
             return self.run_process_stmts_inner(pid, pc);
@@ -2834,8 +2837,15 @@ impl Simulator {
             stmts.len(),
             self.time
         );
+        let method_profiling = SAMPLER_READY.load(Ordering::Relaxed);
         let mut i = 0;
         while i < stmts.len() && !self.finished {
+            if method_profiling {
+                // ScopePop can restore a caller inside this same activation.
+                method_profile::process_method(
+                    self.task_cleanup.last().map_or(0, |c| c.method_profile_id),
+                );
+            }
             // `resolve_hier_name` installs the parent scope as the resolution
             // hint whenever it resolves a DOTTED name, and nothing restored it.
             // So after a testbench statement read `u_dut.sig`, the hint stayed
@@ -3188,7 +3198,7 @@ impl Simulator {
                                         .static_class_context()
                                         .is_some_and(|cls| self.class_has_method(&cls, tname));
                                 if !is_this_method && self.stmts_have_blocking(&td.items) {
-                                    let mut cleanup = self.bind_task_frame(&td, args, None);
+                                    let mut cleanup = self.bind_task_frame(&td, args, None, None);
                                     // §13.4/§13.3.2: a free task body must NOT
                                     // see the caller's class context — task-scope
                                     // `static` locals key off
@@ -3201,6 +3211,7 @@ impl Simulator {
                                     // the caller actually has a `this`.
                                     self.push_instance_task_context(&mut cleanup);
                                     self.enter_free_task_scope(&td, &mut cleanup);
+                                    method_profile::ast_entry(cleanup.method_profile_id);
                                     self.task_cleanup.push(cleanup);
                                     let mut cont: Vec<Statement> = td.items.clone();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -3227,10 +3238,16 @@ impl Simulator {
                 if let ExprKind::Call { func, args } = &expr.kind {
                     if let Some(td) = self.package_task_target(func) {
                         if self.stmts_have_blocking(&td.items) {
-                            let mut cleanup = self.bind_task_frame(&td, args, None);
+                            let mut cleanup = self.bind_task_frame(
+                                &td,
+                                args,
+                                None,
+                                method_profile::task_package(func),
+                            );
                             // §13.4/§13.3.2 class-context shield — see the
                             // bare free-task arm above (Stage 1).
                             self.push_instance_task_context(&mut cleanup);
+                            method_profile::ast_entry(cleanup.method_profile_id);
                             self.task_cleanup.push(cleanup);
                             let mut cont: Vec<Statement> = td.items.clone();
                             cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -3263,9 +3280,10 @@ impl Simulator {
                             if let Some(full) = full {
                                 let td = self.task_decl_rc(&full).unwrap();
                                 if self.stmts_have_blocking(&td.items) {
-                                    let mut cleanup = self.bind_task_frame(&td, args, None);
+                                    let mut cleanup = self.bind_task_frame(&td, args, None, None);
                                     self.push_instance_task_context(&mut cleanup);
                                     self.enter_free_task_scope(&td, &mut cleanup);
+                                    method_profile::ast_entry(cleanup.method_profile_id);
                                     self.task_cleanup.push(cleanup);
                                     let mut cont: Vec<Statement> = td.items.clone();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -3424,6 +3442,7 @@ impl Simulator {
                                             td,
                                             args,
                                             Some((spec, Some(rh), mclass.clone())),
+                                            None,
                                         );
                                         // Even a same-object bare call changes
                                         // the defining-class context used by
@@ -3455,6 +3474,11 @@ impl Simulator {
                                             i += 1;
                                             continue;
                                         }
+                                        method_profile::ast_entry(
+                                            self.task_cleanup
+                                                .last()
+                                                .map_or(0, |c| c.method_profile_id),
+                                        );
                                         self.refresh_bound_task_string_kinds(&td.ports);
                                         let frame = self.class_task_body_frame(&tm, stmt.span);
                                         // Chain the caller's tail instead of copying it onto the end of
@@ -3643,6 +3667,7 @@ impl Simulator {
                                     td,
                                     args,
                                     Some((spec, None, mclass.clone())),
+                                    None,
                                 );
                                 // Static context: push the declaring class for
                                 // member/static resolution, with a null `this`.
@@ -3661,6 +3686,15 @@ impl Simulator {
                                     self.current_spec = Some((sb, ss));
                                 }
                                 self.refresh_bound_task_string_kinds(&td.ports);
+                                method_profile::decision(
+                                    cleanup.method_profile_id,
+                                    if compiled_methods_enabled() {
+                                        method_profile::Decision::Bypassed("scheduled_static_task")
+                                    } else {
+                                        method_profile::Decision::Disabled
+                                    },
+                                );
+                                method_profile::ast_entry(cleanup.method_profile_id);
                                 self.task_cleanup.push(cleanup);
                                 let frame = self.class_task_body_frame(&tm, stmt.span);
                                 // Chain the caller's tail instead of copying it onto the end of

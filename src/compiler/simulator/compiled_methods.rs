@@ -1074,7 +1074,11 @@ impl Simulator {
         mname: &str,
         td: &TaskDeclaration,
     ) -> Option<Value> {
+        let profile_id = self.method_profile_id(handle, mclass, mname);
         if !compiled_methods_enabled() || handle == 0 {
+            if !compiled_methods_enabled() {
+                method_profile::decision(profile_id, method_profile::Decision::Disabled);
+            }
             return None;
         }
         // A task already known never to compile (it can suspend, or its body
@@ -1084,21 +1088,13 @@ impl Simulator {
         if let (Some(&cid), Some(&mid)) = (ids.get(mclass), ids.get(mname))
             && self.compiled_method_skip.contains(&(cid, mid, spec_id))
         {
+            method_profile::decision(profile_id, method_profile::Decision::CachedRejection);
             return None;
         }
         let sync_name = self.sync_frame_name(mname);
         self.static_local_syncs.push((sync_name, Vec::new()));
-        let saved_meth = if SAMPLER_READY.load(std::sync::atomic::Ordering::Relaxed) {
-            sampler_register_name(fnv_name(mname), mname);
-            Some(CUR_METHOD_HASH.swap(fnv_name(mname), std::sync::atomic::Ordering::Relaxed))
-        } else {
-            None
-        };
-        let saved_compiled = if SAMPLER_READY.load(std::sync::atomic::Ordering::Relaxed) {
-            Some(CUR_METHOD_COMPILED.swap(false, std::sync::atomic::Ordering::Relaxed))
-        } else {
-            None
-        };
+        let _profile_attempt =
+            method_profile::Scope::enter(profile_id, method_profile::Path::Setup, false);
         let r = self.try_run_compiled_method(
             handle,
             mclass,
@@ -1109,12 +1105,6 @@ impl Simulator {
             false,
             CompiledBodyKind::Task(td),
         );
-        if let Some(prev) = saved_meth {
-            CUR_METHOD_HASH.store(prev, std::sync::atomic::Ordering::Relaxed);
-        }
-        if let Some(prev) = saved_compiled {
-            CUR_METHOD_COMPILED.store(prev, std::sync::atomic::Ordering::Relaxed);
-        }
         if r.is_some() {
             // Persist static locals seeded by the block (mirrors the
             // interpreter epilogue's sync pass).
@@ -1254,6 +1244,7 @@ impl Simulator {
     ) -> Option<Value> {
         use super::bytecode::BytecodeCompiler;
         use crate::ast::types::PortDirection;
+        let profile_id = self.method_profile_id(handle, cname, method_name);
         // COLD-PATH FIRST (class-perf P0 + adaptive tiering): the tier
         // counter used to run before the skip cache — every class-function
         // call paid an inline FNV hash + HashMap probe even for the ~90% of
@@ -1301,6 +1292,7 @@ impl Simulator {
         // dominant cost on the hier-gen perf workload even though the block
         // cache hits).
         if self.compiled_method_skip.contains(&(cid, mid, spec_id)) {
+            method_profile::decision(profile_id, method_profile::Decision::CachedRejection);
             return None;
         }
         // Adaptive tier counter: only reached by methods that passed the skip
@@ -1338,6 +1330,7 @@ impl Simulator {
                 .or_insert(0);
             if *calls < tier {
                 *calls += 1;
+                method_profile::decision(profile_id, method_profile::Decision::TierPending);
                 return None;
             }
         }
@@ -1352,7 +1345,8 @@ impl Simulator {
             // Census aid: XEZIM_FALLBACK_SITES=1 also prints PLAN-phase
             // declines (these never reach BytecodeCompiler's tracer), so a
             // hot decliner can be attributed by method name.
-            let trace_decline = |reason: &str| -> bool {
+            let trace_decline = |reason: &'static str| -> bool {
+                method_profile::decision(profile_id, method_profile::Decision::Decline(reason));
                 method_trace_enabled() && {
                     eprintln!(
                         "[FALLBACK] plan-decline reason={reason} scope={cname}.{method_name}"
@@ -1668,6 +1662,7 @@ impl Simulator {
             Some(super::bytecode::CompiledMethodOutcome::Block(e)) => e.clone(),
             // Negative-cached as non-compilable: skip straight to AST.
             Some(super::bytecode::CompiledMethodOutcome::Nil) => {
+                method_profile::decision(profile_id, method_profile::Decision::CachedBodyRejection);
                 return None;
             }
             None => 'disk: {
@@ -1703,9 +1698,17 @@ impl Simulator {
                                 key,
                                 super::bytecode::CompiledMethodOutcome::Block(rc.clone()),
                             );
+                            method_profile::decision(
+                                profile_id,
+                                method_profile::Decision::PersistedBlock,
+                            );
                             break 'disk rc;
                         }
                         Some(super::bytecode::PersistedMethodOutcome::Nil) => {
+                            method_profile::decision(
+                                profile_id,
+                                method_profile::Decision::Decline("persisted_body_rejection"),
+                            );
                             self.compiled_method_block_cache
                                 .insert(key, super::bytecode::CompiledMethodOutcome::Nil);
                             return None;
@@ -1713,6 +1716,7 @@ impl Simulator {
                         None => {} // miss: compile below
                     }
                 }
+                method_profile::decision(profile_id, method_profile::Decision::CompileAttempt);
                 // Compile all-or-nothing. On any lowering failure, none the
                 // key (so it is not retried per call) and fall to AST.
                 let mut shadow_names = self.class_scoping_shadow_names(cname);
@@ -2251,9 +2255,12 @@ impl Simulator {
                                         if !instance_props.contains(member)
                                             && !static_members.contains(member)
                                             && !const_names.contains(member)
-                                            && let Some(value) = self.class_enum_member(cname, member)
+                                            && let Some(value) =
+                                                self.class_enum_member(cname, member)
                                         {
-                                            method_enum_constants.entry(member.clone()).or_insert(value);
+                                            method_enum_constants
+                                                .entry(member.clone())
+                                                .or_insert(value);
                                         }
                                     }
                                 }
@@ -2393,6 +2400,10 @@ impl Simulator {
                 // package globals, e.g. `set_default`) still compile.
                 let is_static = self.is_static_method(cname, method_name);
                 let Some((block, this_reg, result_reg, _rv_reg)) = compiled else {
+                    method_profile::decision(
+                        profile_id,
+                        method_profile::Decision::Decline("body_not_lowered"),
+                    );
                     self.compiled_method_block_cache
                         .insert(key, super::bytecode::CompiledMethodOutcome::Nil);
                     if let Some(k) = disk_key {
@@ -2437,6 +2448,14 @@ impl Simulator {
                 let reentrant_static =
                     !block.static_locals.is_empty() && block.instructions.iter().any(calls_out);
                 if (is_static && block.instructions.iter().any(uses_this)) || reentrant_static {
+                    method_profile::decision(
+                        profile_id,
+                        method_profile::Decision::Decline(if reentrant_static {
+                            "reentrant_static_local"
+                        } else {
+                            "static_uses_this"
+                        }),
+                    );
                     self.compiled_method_block_cache
                         .insert(key, super::bytecode::CompiledMethodOutcome::Nil);
                     if let Some(k) = disk_key {
@@ -2472,6 +2491,7 @@ impl Simulator {
                     result_reg: result_reg?,
                 };
                 let rc = std::rc::Rc::new(entry);
+                method_profile::decision(profile_id, method_profile::Decision::CompileSuccess);
                 self.compiled_method_block_cache.insert(
                     key,
                     super::bytecode::CompiledMethodOutcome::Block(rc.clone()),
@@ -2626,14 +2646,13 @@ impl Simulator {
                 self.var_class_types.insert(rn, cn);
             }
         }
-        let _prev_comp = if SAMPLER_READY.load(Ordering::Relaxed) {
-            Some(CUR_METHOD_COMPILED.swap(true, Ordering::Relaxed))
-        } else {
-            None
-        };
         // Run the block.
         self.return_flag = false;
-        self.exec_insns(&block.instructions);
+        {
+            let _profile_vm =
+                method_profile::Scope::enter(profile_id, method_profile::Path::Vm, false);
+            self.exec_insns(&block.instructions);
+        }
         // A StmtFallback for a `return …` statement executed through the
         // interpreter sets `return_value` — the compiled block's result
         // register never sees it (the compiler only bakes the Move for
@@ -2645,9 +2664,6 @@ impl Simulator {
             if (result_reg as usize) < self.vm_regs.len() {
                 self.vm_regs[result_reg as usize] = rv;
             }
-        }
-        if let Some(prev) = _prev_comp {
-            CUR_METHOD_COMPILED.store(prev, Ordering::Relaxed);
         }
         let result = self
             .vm_regs
@@ -3209,6 +3225,9 @@ impl Simulator {
             }
             args.push(v);
         }
+        let profile_id = method_profile::identity(&cname, fname, None);
+        let _profile_call =
+            method_profile::Scope::enter(profile_id, method_profile::Path::Setup, true);
         self.push_queue_frame();
         self.this_stack.push(None);
         self.class_context_stack.push(None);
@@ -3219,11 +3238,6 @@ impl Simulator {
         self.push_local_frame(locals);
         self.pkg_scope_stack.push(pkg.map(str::to_string));
         self.func_call_stack.push(fd.name.name.name.clone());
-        let _prev_compiled = if SAMPLER_READY.load(std::sync::atomic::Ordering::Relaxed) {
-            Some(CUR_METHOD_COMPILED.swap(true, std::sync::atomic::Ordering::Relaxed))
-        } else {
-            None
-        };
         let caller_regs = std::mem::take(&mut self.vm_regs);
         let saved_foreach_arena = std::mem::take(&mut self.foreach_arena);
         let saved_return = self.return_flag;
@@ -3242,7 +3256,11 @@ impl Simulator {
             regs[entry.result_reg as usize] = entry.seed.clone();
         }
         self.vm_regs = regs;
-        self.exec_insns(&entry.block.instructions);
+        {
+            let _profile_vm =
+                method_profile::Scope::enter(profile_id, method_profile::Path::Vm, false);
+            self.exec_insns(&entry.block.instructions);
+        }
         let result = self
             .vm_regs
             .get(entry.result_reg as usize)
@@ -3250,9 +3268,6 @@ impl Simulator {
             .unwrap_or_else(|| Value::zero(32));
         self.vm_regs = caller_regs;
         self.foreach_arena = saved_foreach_arena;
-        if let Some(prev) = _prev_compiled {
-            CUR_METHOD_COMPILED.store(prev, std::sync::atomic::Ordering::Relaxed);
-        }
         self.return_flag = saved_return;
         self.func_call_stack.pop();
         self.pkg_scope_stack.pop();
@@ -3443,6 +3458,9 @@ impl Simulator {
         let mdef = md.method.clone();
         let cname = md.class.to_string();
         let entry = self.vm_fast_static_entry_for(&cname, method, &mdef)?;
+        let profile_id = self.method_profile_id(0, &cname, method);
+        let _profile_call =
+            method_profile::Scope::enter(profile_id, method_profile::Path::Setup, true);
         // --- every guard passed; state changes from here on ---
         let caller_regs = std::mem::take(&mut self.vm_regs);
         let saved_foreach_arena = std::mem::take(&mut self.foreach_arena);
@@ -3506,14 +3524,13 @@ impl Simulator {
                 }
             }
         }
-        let _prev_compiled = if SAMPLER_READY.load(std::sync::atomic::Ordering::Relaxed) {
-            Some(CUR_METHOD_COMPILED.swap(true, std::sync::atomic::Ordering::Relaxed))
-        } else {
-            None
-        };
         let saved_return = self.return_flag;
         self.return_flag = false;
-        self.exec_insns(&entry.block.instructions);
+        {
+            let _profile_vm =
+                method_profile::Scope::enter(profile_id, method_profile::Path::Vm, false);
+            self.exec_insns(&entry.block.instructions);
+        }
         let result = self
             .vm_regs
             .get(entry.result_reg as usize)
@@ -3556,9 +3573,6 @@ impl Simulator {
         }
         self.vm_regs = caller_regs;
         self.foreach_arena = saved_foreach_arena;
-        if let Some(prev) = _prev_compiled {
-            CUR_METHOD_COMPILED.store(prev, std::sync::atomic::Ordering::Relaxed);
-        }
         self.return_flag = saved_return;
         self.static_local_syncs.pop();
         self.pop_local_frame();
@@ -3655,6 +3669,11 @@ impl Simulator {
         if let Some(entry) = self.vm_fast_entry_for(&md.class, method, &md.method, spec_id) {
             match &entry.accessor {
                 FastAccessor::Getter(field) if n == 0 => {
+                    let _profile_call = method_profile::Scope::enter(
+                        self.method_profile_id(handle, &md.class, method),
+                        method_profile::Path::Accessor,
+                        true,
+                    );
                     let value = self
                         .heap
                         .get(handle)
@@ -3688,6 +3707,11 @@ impl Simulator {
                         }
                         self.fit_class_prop(handle, field.as_ref(), &v)
                     };
+                    let _profile_call = method_profile::Scope::enter(
+                        self.method_profile_id(handle, &md.class, method),
+                        method_profile::Path::Accessor,
+                        true,
+                    );
                     if let Some(o) = self.heap.get_mut(handle).and_then(|o| o.as_mut()) {
                         o.properties.insert(field.to_string(), fitted);
                     }
@@ -3768,6 +3792,9 @@ impl Simulator {
             }
             args.push(v);
         }
+        let profile_id = self.method_profile_id(handle, &md.class, method);
+        let _profile_call =
+            method_profile::Scope::enter(profile_id, method_profile::Path::Setup, true);
         // --- every guard passed; state changes from here on ---
         self.push_queue_frame();
         self.this_stack.push(Some(handle));
@@ -3789,17 +3816,6 @@ impl Simulator {
         let saved_break = self.break_flag;
         let saved_continue = self.continue_flag;
         let saved_return = self.return_flag;
-        let _prev_meth = if SAMPLER_READY.load(std::sync::atomic::Ordering::Relaxed) {
-            sampler_register_name(fnv_name(method), method);
-            Some(CUR_METHOD_HASH.swap(fnv_name(method), std::sync::atomic::Ordering::Relaxed))
-        } else {
-            None
-        };
-        let _prev_compiled = if SAMPLER_READY.load(std::sync::atomic::Ordering::Relaxed) {
-            Some(CUR_METHOD_COMPILED.swap(true, std::sync::atomic::Ordering::Relaxed))
-        } else {
-            None
-        };
         // Fresh register file for the callee (the caller's is swapped out,
         // exactly like `try_run_compiled_method`).
         let caller_regs = std::mem::take(&mut self.vm_regs);
@@ -3818,7 +3834,11 @@ impl Simulator {
             regs[entry.result_reg as usize] = entry.seed.clone();
         }
         self.vm_regs = regs;
-        self.exec_insns(&entry.block.instructions);
+        {
+            let _profile_vm =
+                method_profile::Scope::enter(profile_id, method_profile::Path::Vm, false);
+            self.exec_insns(&entry.block.instructions);
+        }
         let result = self
             .vm_regs
             .get(entry.result_reg as usize)
@@ -3826,12 +3846,6 @@ impl Simulator {
             .unwrap_or_else(|| Value::zero(32));
         self.vm_regs = caller_regs;
         self.foreach_arena = saved_foreach_arena;
-        if let Some(prev) = _prev_meth {
-            CUR_METHOD_HASH.store(prev, std::sync::atomic::Ordering::Relaxed);
-        }
-        if let Some(prev) = _prev_compiled {
-            CUR_METHOD_COMPILED.store(prev, std::sync::atomic::Ordering::Relaxed);
-        }
         self.m_scope_stack = saved_m_scope;
         self.break_flag = saved_break;
         self.continue_flag = saved_continue;

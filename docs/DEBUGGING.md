@@ -61,6 +61,32 @@ simulator".
   builds without `UVM_NO_DPI` — xezim provides the UVM DPI-C helpers
   natively, no shared library needed).
 
+## Method profiles
+
+`XEZIM_METHOD_PROFILE=1 xezim --simulate ...` reports declared method calls,
+AST and bytecode body entries, successful accessor calls, and compilation
+decisions. `XEZIM_METHOD_PROFILE_JSON=methods.json` also enables collection
+and atomically writes all rows, including rows outside the text report's
+first 200. Identities include the declaring class and parameter specialization;
+free functions and tasks use synthetic scope names. Builtins and implicit
+constructors are excluded. Collection covers the event-loop window only.
+
+The approximately 5 ms samples measure wall residency, including host
+descheduling. Setup, AST, bytecode and accessors have separate sample buckets;
+zero VM samples do not prove zero bytecode executions. Exact body-entry
+counts provide that distinction. Task bindings count once; scheduled segments
+count activations, including recursive continuations, rather than calls. A
+parked task's label is restored when its process resumes and removed when it
+parks or returns.
+
+Tier-pending, compilation-disabled and cached rejections are separate from
+compilation attempts. Decline reasons report the existing admission decision;
+`body_not_lowered` does not identify a specific unsupported construct. A
+body-cache rejection may cover an argument-width variant; an unknown cached
+reason means the original decision occurred outside the collection window.
+These diagnostics do not change admission, tier thresholds or scheduling.
+Measure collection overhead separately from normal runs.
+
 ## Activity profiles
 
 `XEZIM_ACTIVITY_PROFILE=activity.json xezim --simulate --no-cache design.sv`

@@ -161,51 +161,9 @@ thread_local! {
     static RPS_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
-/// ---- Sampled method profiler (in-process, no perf_event access) ----
-///
-/// The simulator's hot path is class-method dispatch + body execution
-/// (`exec_method_in_class_hierarchy`), and UVM makes it by far the dominant
-/// cost of a testbench run. To target optimizations we need an exact
-/// wall-time-by-method histogram. `perf` is unavailable in this sandbox
-/// (perf_event_paranoid) and gdb sampling is fragile under optimization, so
-/// this tiny sampler lives in-process: the hot thread publishes the FNV hash
-/// of the currently-running method name into `CUR_METHOD_HASH` (a single
-/// relaxed store — no lock), and a sampler thread reads it every ~5 ms and
-/// bumps a per-hash counter. First-seen hashes are resolved to full names
-/// at report time via a name registry keyed by hash. Collisions in a 64-bit
-/// FNV over a handful of method names are impossible in practice.
-/// NB: this MUST be a process-global atomic (not a thread-local): the
-/// background sampler thread reads it while the hot thread writes it. And to
-/// keep the interpreter's critical path zero-cost when profiling is off, the
-/// per-dispatch store below is gated by `SAMPLER_READY` (set once when the
-/// sampler thread is spawned), which stays `false` in normal runs so the hot
-/// path takes at most one predicted branch.
-static CUR_METHOD_HASH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static SAMPLER_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Planner split: 1 while the innermost method runs its COMPILED block,
-/// 0 while it runs the AST interpreter. Sampled alongside the hash so the
-/// histogram can answer "of the time spent in method X, how much is already
-/// bytecode" — the input that ranks admission-expansion rows by heat.
-static CUR_METHOD_COMPILED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static METHOD_SAMPLES: std::sync::OnceLock<Mutex<std::collections::HashMap<u64, u64>>> =
-    std::sync::OnceLock::new();
-static METHOD_SAMPLES_VM: std::sync::OnceLock<Mutex<std::collections::HashMap<u64, u64>>> =
-    std::sync::OnceLock::new();
-static METHOD_NAMES: std::sync::OnceLock<Mutex<std::collections::HashMap<u64, String>>> =
-    std::sync::OnceLock::new();
-
-/// FNV-1a 64-bit over the method name (cheap; the store below is the only
-/// cross-thread write on the hot path).
-#[inline]
-fn fnv_name(s: &str) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in s.as_bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
+// Profiling observes execution without changing admission or scheduler state.
+use method_profile::SAMPLER_READY;
+pub use method_profile::{sampler_report, sampler_reset, sampler_sample};
 
 /// class-perf gate: class-function body bytecode compilation+execution is
 /// ON by default; set `XEZIM_COMPILE_METHODS=0` to force every run onto
@@ -411,73 +369,6 @@ fn method_cache_dir() -> Option<&'static std::path::Path> {
     })
     .as_deref()
 }
-/// Sampler thread: read the hot thread's current hash and bump.
-pub fn sampler_sample() {
-    let h = CUR_METHOD_HASH.load(Ordering::Relaxed);
-    if h == 0 {
-        return;
-    }
-    let bucket = if CUR_METHOD_COMPILED.load(Ordering::Relaxed) {
-        METHOD_SAMPLES_VM.get_or_init(Default::default)
-    } else {
-        METHOD_SAMPLES.get_or_init(Default::default)
-    };
-    *bucket.lock().unwrap().entry(h).or_insert(0) += 1;
-}
-
-/// After the run, resolve hashes to names and print the histogram.
-pub fn sampler_report(top: usize) {
-    let samples = METHOD_SAMPLES.get_or_init(Default::default).lock().unwrap();
-    let vm = METHOD_SAMPLES_VM
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap();
-    let names = METHOD_NAMES.get_or_init(Default::default).lock().unwrap();
-    let mut v: Vec<u64> = samples.keys().chain(vm.keys()).copied().collect();
-    v.sort_by_key(|&h| {
-        std::cmp::Reverse(samples.get(&h).copied().unwrap_or(0) + vm.get(&h).copied().unwrap_or(0))
-    });
-    eprintln!("===== METHOD SAMPLE HISTOGRAM (top {}) =====", top);
-    for k in v.iter().take(top) {
-        let ast = samples.get(k).copied().unwrap_or(0);
-        let bytecode = vm.get(k).copied().unwrap_or(0);
-        let name = names.get(k).map(|s| s.as_str()).unwrap_or("?");
-        eprintln!("{:>8} AST {:>8} VM  {}", ast, bytecode, name);
-    }
-}
-
-/// Report-time registry: record that `hash` corresponds to `name`. Only called
-/// for the handful of distinct methods a testbench actually runs (off hot path).
-#[inline]
-pub fn sampler_register_name(hash: u64, name: &str) {
-    let mut n = METHOD_NAMES.get_or_init(Default::default).lock().unwrap();
-    if !n.contains_key(&hash) {
-        n.insert(hash, name.to_string());
-    }
-}
-
-/// Clear state between simulator runs in the same process.
-pub fn sampler_reset() {
-    SAMPLER_READY.store(false, Ordering::Relaxed);
-    CUR_METHOD_COMPILED.store(false, Ordering::Relaxed);
-    METHOD_SAMPLES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .clear();
-    METHOD_SAMPLES_VM
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .clear();
-    METHOD_NAMES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .clear();
-    CUR_METHOD_HASH.store(0, Ordering::Relaxed);
-}
-
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near
 /// ~2800; 300 leaves a wide margin while keeping normal (shallow) loops on the
@@ -2572,6 +2463,7 @@ impl NbaFastIndex {
 
 mod aggregate_assignments;
 mod activity_profile;
+mod method_profile;
 mod annex_n;
 mod aggregate_expressions;
 mod aggregate_members;
@@ -4724,6 +4616,10 @@ struct BlockScopeSave {
 #[derive(Debug, Clone, Default)]
 #[derive(serde::Serialize)]
 struct TaskCleanup {
+    /// Runtime-only diagnostic identity, copied with a parked activation.
+    /// It is not a new invocation when the process resumes or forks.
+    #[serde(skip)]
+    method_profile_id: u64,
     /// Instance scope an inlined HIERARCHICAL/interface task body resolves
     /// bare names under (`bus.snoop()` → "bus"). Installed at bind and on
     /// every process RESUME while this frame is on top (a suspend inside the

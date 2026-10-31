@@ -1835,9 +1835,9 @@ impl Simulator {
         let sim_start_rt = crate::WallTimer::now();
         // Sampled method profiler: spawn a low-rate sampler thread that
         // records whatever method the hot thread is executing. Gated by
-        // XEZIM_METHOD_PROFILE=1 so production runs pay nothing.
+        // XEZIM_METHOD_PROFILE or XEZIM_METHOD_PROFILE_JSON enables collection.
         sampler_reset();
-        let _sampler_thr = if std::env::var_os("XEZIM_METHOD_PROFILE").is_some() {
+        let _sampler_thr = if method_profile::requested() {
             SAMPLER_READY.store(true, Ordering::Relaxed);
             let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let d2 = done.clone();

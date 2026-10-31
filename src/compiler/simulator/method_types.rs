@@ -152,7 +152,9 @@ impl Simulator {
                         return self.method_ret_width(&cn, h.path[1].name.name.as_str());
                     }
                 }
-                return None;
+                return (h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()))
+                    .then(|| self.static_method_return_width(&seg, h.path[1].name.name.as_str()))
+                    .flatten();
             }
             _ => return None,
         };
@@ -168,12 +170,62 @@ impl Simulator {
                 } else {
                     None
                 }
+                .or_else(|| {
+                    h.root
+                        .is_none()
+                        .then(|| self.static_method_return_width(&rn, mname))
+                        .flatten()
+                        .map(|_| rn)
+                })
             }
             ExprKind::Index { expr, .. } => Self::collection_element_class(self, expr),
             _ => None,
         };
         let class_name = class_name?;
         self.method_ret_width(&class_name, mname)
+    }
+
+    /// Resolve an unshadowed class-scope call's fixed builtin return width
+    /// without executing it as a width probe (IEEE 1800 §11.6, §13.4).
+    fn static_method_return_width(&self, receiver: &str, method: &str) -> Option<u32> {
+        use crate::ast::decl::ClassMethodKind;
+        use crate::ast::types::DataType;
+        if self
+            .local_stack
+            .iter()
+            .rev()
+            .any(|f| f.contains_key(receiver))
+            || self.signal_name_to_id.contains_key(receiver)
+            || self.signals.contains_key(receiver)
+            || self.this_prop_hides(receiver)
+            // Execution resolves an active type parameter before a class
+            // with the same spelling. Keep that binding on its existing path.
+            || self.resolve_type_param_binding(receiver).is_some()
+            || !self.is_static_method(receiver, method)
+        {
+            return None;
+        }
+        let mut class = receiver;
+        let mut depth = 0;
+        while let Some(cd) = self.module.classes.get(class) {
+            depth += 1;
+            if depth > 64 {
+                return None;
+            }
+            if let Some(m) = cd.methods.get(method) {
+                let ClassMethodKind::Function(f) = &m.kind else {
+                    return None;
+                };
+                return match &f.return_type {
+                    DataType::IntegerAtom { .. } | DataType::Real { .. } => {
+                        self.method_ret_width(receiver, method)
+                    }
+                    _ => None,
+                };
+            }
+            class = cd.extends.as_deref()?;
+        }
+        None
     }
 
     /// Width of a class method's declared return type, resolved through the
@@ -591,5 +643,37 @@ impl Simulator {
             }
             _ => self.infer_width(expr),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn static_width_lookup_defers_to_active_type_parameter() {
+        let mut sim = crate::simulate(
+            r#"
+class A;
+  static function int fixed_width(); return 1; endfunction
+endclass
+class Wide;
+  static function longint fixed_width(); return 64'h100000000; endfunction
+endclass
+class Pick #(type A=Wide);
+endclass
+module top;
+  initial begin end
+endmodule
+"#,
+            10,
+        )
+        .unwrap();
+        assert_eq!(sim.static_method_return_width("A", "fixed_width"), Some(32));
+        sim.current_spec = Some(("Pick".into(), "Wide".into()));
+        assert_eq!(sim.resolve_type_param_binding("A").as_deref(), Some("Wide"));
+        assert_eq!(sim.static_method_return_width("A", "fixed_width"), None);
+        assert_eq!(
+            sim.static_method_return_width("Wide", "fixed_width"),
+            Some(64)
+        );
     }
 }

@@ -1292,6 +1292,9 @@ impl Simulator {
             let method_opt = found_method.take();
             cur_class = None;
             if let Some(method) = method_opt {
+                let profile_id = self.method_profile_id(handle, cname, method_name);
+                let _profile_call =
+                    method_profile::Scope::enter(profile_id, method_profile::Path::Setup, true);
                 let (ports, body) = match &method.kind {
                     ClassMethodKind::Function(f) => (&f.ports, &f.items),
                     ClassMethodKind::Task(t) => (&t.ports, &t.items),
@@ -2257,26 +2260,6 @@ impl Simulator {
                 // §21.2.1.7: the method body starts its own `%m` chain (see
                 // `m_path`); the caller's named blocks are not its scope.
                 let saved_m_scope = std::mem::take(&mut self.m_scope_stack);
-                // Sampled-method profiler: publish this method as in-flight
-                // so a sampler thread can build a wall-time histogram. Use a
-                // save/restore guard so nested method calls (which re-enter
-                // this function) surface the INNERMOST active method while
-                // running, then restore the caller's on the way out. Gated by
-                // SAMPLER_READY so normal runs pay only a predicted branch.
-                let _prev_meth = if SAMPLER_READY.load(Ordering::Relaxed) {
-                    sampler_register_name(fnv_name(method_name), method_name);
-                    Some(CUR_METHOD_HASH.swap(fnv_name(method_name), Ordering::Relaxed))
-                } else {
-                    None
-                };
-                // Planner split: publish whether THIS method's body runs as
-                // bytecode (true) or the AST interpreter (false), restored
-                // alongside _prev_meth above when the method returns.
-                let _prev_compiled = if SAMPLER_READY.load(Ordering::Relaxed) {
-                    Some(CUR_METHOD_COMPILED.swap(false, Ordering::Relaxed))
-                } else {
-                    None
-                };
                 // class-perf pilot: a fully-lowered Function body may run as
                 // bytecode instead of the AST interpreter. ALL-OR-NOTHING:
                 // `try_run_compiled_method` returns None unless every
@@ -2307,6 +2290,11 @@ impl Simulator {
                 {
                     self.return_value = Some(cval);
                 } else {
+                    if !compiled_methods_enabled() {
+                        method_profile::decision(profile_id, method_profile::Decision::Disabled);
+                    }
+                    let _profile_ast =
+                        method_profile::Scope::enter(profile_id, method_profile::Path::Ast, false);
                     // §6.16/§13.5: classify the callee's formal types under
                     // its active specialization, independently of global
                     // string flags. Common frame teardown removes this entry.
@@ -2401,12 +2389,6 @@ impl Simulator {
                         frame_string_prop_more,
                     ));
                 } // end else: AST interpreter path
-                if let Some(prev) = _prev_meth {
-                    CUR_METHOD_HASH.store(prev, Ordering::Relaxed);
-                }
-                if let Some(prev) = _prev_compiled {
-                    CUR_METHOD_COMPILED.store(prev, Ordering::Relaxed);
-                }
                 // Write back any static locals declared in this body before
                 // the locals frame is dropped.
                 self.sync_static_locals();

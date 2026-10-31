@@ -3466,6 +3466,11 @@ impl Simulator {
                 {
                     match &entry.accessor {
                         FastAccessor::Getter(field) if args.is_empty() => {
+                            let _profile_call = method_profile::Scope::enter(
+                                self.method_profile_id(handle, &md.class, method_name),
+                                method_profile::Path::Accessor,
+                                true,
+                            );
                             let value = self
                                 .heap
                                 .get(handle)
@@ -3487,6 +3492,11 @@ impl Simulator {
                         }
                         FastAccessor::Setter(field) if args.len() == 1 => {
                             let arg_val = self.eval_expr(&args[0]);
+                            let _profile_call = method_profile::Scope::enter(
+                                self.method_profile_id(handle, &md.class, method_name),
+                                method_profile::Path::Accessor,
+                                true,
+                            );
                             let fitted = {
                                 let mut v = arg_val;
                                 if let Some(w) = entry.coerce.first().map(|c| c.1)

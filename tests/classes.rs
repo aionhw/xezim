@@ -990,3 +990,6 @@ mod package_type_identity_roundtrip;
 
 #[path = "classes/review_collection_pattern_gaps.rs"]
 mod review_collection_pattern_gaps;
+
+#[path = "classes/method_profile_counts.rs"]
+mod method_profile_counts;
