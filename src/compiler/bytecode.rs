@@ -36,6 +36,9 @@ pub(crate) struct MethodAdmission {
     /// the context width of a compiled `recv.field = rhs`. Strings, reals,
     /// handles and parameter-sized fields are absent (stored self-determined).
     pub instance_field_widths: HashMap<String, HashMap<String, u32>>,
+    /// The `instance_field_widths` fields declared signed (§11.8.1: a
+    /// member operand's signedness types the expression it is in).
+    pub instance_field_signed: HashMap<String, HashSet<String>>,
     /// §8.20: declared class -> method -> the class whose body a call
     /// through a handle of that declared type binds to, for every
     /// NON-virtual method that some subclass redeclares (the only case where
@@ -19036,8 +19039,18 @@ impl<'a> BytecodeCompiler<'a> {
                         _ => None,
                     };
                 }
+                // A bare instance member of the method's class.
+                if self.bare_member_width(h).is_some() {
+                    let class = self.method_class.as_deref()?;
+                    return Some(self.class_field_signed(class, &h.path[0].name.name));
+                }
                 let id = self.lookup_signal_id(h)?;
                 Some(self.signal_signed[id])
+            }
+            ExprKind::MemberAccess { expr: base, member } if self.method_mode => {
+                self.handle_member_width(base, &member.name)?;
+                let class = self.method_handle_chain_class(base)?;
+                Some(self.class_field_signed(&class, &member.name))
             }
             // Part-selects, concatenations and replications are UNSIGNED
             // regardless of their operands (§11.8.1).
@@ -19170,6 +19183,15 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         self.class_field_width(&self.method_handle_chain_class(base)?, member)
+    }
+
+    fn class_field_signed(&self, class: &str, field: &str) -> bool {
+        self.method_admission.as_ref().is_some_and(|admission| {
+            admission
+                .instance_field_signed
+                .get(class)
+                .is_some_and(|fields| fields.contains(field))
+        })
     }
 
     fn class_field_width(&self, class: &str, field: &str) -> Option<u32> {

@@ -2163,13 +2163,25 @@ impl Simulator {
                     for (class, declaration) in &self.module.classes {
                         let mut fields = self.class_member_access_safe_names(class);
                         fields.extend(self.class_string_member_names(class));
-                        let widths = fields
+                        let widths: HashMap<String, u32> = fields
                             .iter()
                             .filter_map(|f| match self.class_prop_width_fixed(class, f) {
                                 Some(Some(w)) if w > 0 => Some((f.clone(), w)),
                                 _ => None,
                             })
                             .collect();
+                        let owners = self.prop_owners(class);
+                        let signed = widths
+                            .keys()
+                            .filter(|f| {
+                                owners
+                                    .get(f.as_str())
+                                    .and_then(|(_, cd)| cd.properties.get(f.as_str()))
+                                    .is_some_and(|sig| sig.is_signed)
+                            })
+                            .cloned()
+                            .collect();
+                        facts.instance_field_signed.insert(class.clone(), signed);
                         facts.instance_field_widths.insert(class.clone(), widths);
                         facts.instance_fields.insert(class.clone(), fields);
                         // Direct superclass (spec args stripped): the
