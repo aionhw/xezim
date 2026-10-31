@@ -1592,6 +1592,14 @@ impl Simulator {
             let mut class_formals: HashSet<String> = Default::default();
             let mut string_formals: HashSet<String> = Default::default();
             for port in ports {
+                // An unpacked formal (`input bit [7:0] data[]`) is a whole
+                // array; its packed type alone passed the scalar gate below,
+                // so the register held no elements and `data[0]` read 0.
+                if !port.dimensions.is_empty() {
+                    trace_decline("formal_unpacked");
+                    self.compiled_method_skip.insert((cid, mid, spec_id));
+                    return None;
+                }
                 // Forward typedefs (`typedef class uvm_component;`) make
                 // resolve_dt_ref erase the class identity, so the OLD check saw
                 // every UVM class formal as non-class and skip-cached the method

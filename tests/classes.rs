@@ -621,6 +621,8 @@ mod compiled_member_operand_width;
 #[path = "classes/compiled_member_operand_signedness.rs"]
 mod compiled_member_operand_signedness;
 
+#[path = "classes/compiled_unpacked_formal.rs"]
+mod compiled_unpacked_formal;
 #[path = "classes/int_property_named_like_struct_property.rs"]
 mod int_property_named_like_struct_property;
 #[path = "classes/compiled_method_test_env.rs"]
