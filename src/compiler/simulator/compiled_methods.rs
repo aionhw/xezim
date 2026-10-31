@@ -2281,6 +2281,16 @@ impl Simulator {
                                 } else {
                                     colls.unsigned_elems.insert(m.clone());
                                 }
+                                // Queues record the element width; for an
+                                // associative member the property's own width is
+                                // the element's (`assoc_elem_width`).
+                                let w = match cd.queue_properties.get(m) {
+                                    Some(&(w, _)) => Some(w),
+                                    None => self.class_prop_width_fixed(&c, m).flatten(),
+                                };
+                                if let Some(w) = w.filter(|&w| w > 0) {
+                                    colls.elem_widths.insert(m.clone(), w);
+                                }
                             }
                             cur = cd.extends.clone();
                         }
@@ -2348,6 +2358,7 @@ impl Simulator {
                                         colls.dense.remove(p);
                                         colls.signed_elems.remove(p);
                                         colls.unsigned_elems.remove(p);
+                                        colls.elem_widths.remove(p);
                                     }
                                 }
                             }

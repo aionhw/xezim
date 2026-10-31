@@ -650,6 +650,9 @@ mod compiled_foreach_handle_member;
 
 #[path = "classes/compiled_string_member_methods.rs"]
 mod compiled_string_member_methods;
+
+#[path = "classes/compiled_coll_elem_store_width.rs"]
+mod compiled_coll_elem_store_width;
 #[path = "classes/int_property_named_like_struct_property.rs"]
 mod int_property_named_like_struct_property;
 #[path = "classes/compiled_method_test_env.rs"]

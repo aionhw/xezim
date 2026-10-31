@@ -66,6 +66,8 @@ pub(crate) struct ClassColls {
     /// Collections of integral elements, by the elements' declared sign.
     pub signed_elems: HashSet<String>,
     pub unsigned_elems: HashSet<String>,
+    /// Declared element width of the integral collection members.
+    pub elem_widths: HashMap<String, u32>,
 }
 
 /// Memoized free-function facts (see `MethodAdmission::fn_facts`).
@@ -6263,6 +6265,20 @@ impl<'a> BytecodeCompiler<'a> {
         Some(dest)
     }
 
+    /// Declared width of an integral member collection element,
+    /// for a target `member_coll_elem_target` admits.
+    fn member_coll_elem_width(&self, expr: &crate::ast::expr::Expression) -> Option<u32> {
+        let (coll, _, recv) = self.member_coll_elem_target(expr)?;
+        let class = self.coll_owner_class(recv.as_ref())?;
+        self.method_admission
+            .as_ref()?
+            .instance_colls
+            .get(&class)?
+            .elem_widths
+            .get(&coll)
+            .copied()
+    }
+
     /// Element WRITE counterpart (`q[i] = v`, `aa[k] = v`, dotted forms).
     /// Lowers to `StoreCollElem`; the exec arm re-runs the interpreter's
     /// `assign_value_index` member arm (key narrowing, width fit, queue
@@ -12327,7 +12343,10 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     let start = self.insns.len();
                     let start_reg = self.next_reg;
-                    if let Some(val_reg) = self.compile_expr(rvalue, 0)
+                    // §11.6.1: the element's declared width is the context
+                    // (`d[i] = d[i] & ((1 << w) - 1)` on `bit [1023:0] d[]`).
+                    let ctx = self.member_coll_elem_width(expr).unwrap_or(0);
+                    if let Some(val_reg) = self.compile_expr(rvalue, ctx)
                         && self.compile_member_coll_elem_store(expr, index, val_reg)
                     {
                         return true;
