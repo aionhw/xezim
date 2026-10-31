@@ -607,6 +607,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "class-perf: sample class-method execution (in-process sampling profiler)",
     ),
     (
+        "XEZIM_METHOD_STMT_FALLBACK",
+        "class-perf: run a statement a compiled method body cannot lower in the interpreter instead of interpreting the whole method (0 disables, default on)",
+    ),
+    (
         "XEZIM_METHOD_TIER",
         "compile a class method after N calls (0 = first call); an explicit setting also attempts compilation on the next call after a wait-free method reaches N measured loop iterations",
     ),

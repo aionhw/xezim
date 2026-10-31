@@ -333,6 +333,14 @@ const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3065;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
+/// What `Simulator::method_string_frame_begin` added to `string_signals`.
+struct MethodStringFrame {
+    signals: Vec<String>,
+    props: std::rc::Rc<Vec<String>>,
+    prop_mask: u64,
+    prop_more: Vec<usize>,
+}
+
 /// clone a declaration.
 #[derive(Clone, Copy)]
 enum CompiledBodyKind<'a> {
@@ -6366,6 +6374,9 @@ pub struct Simulator {
     /// replaced for its duration: (name, width, signed, real, string) as they
     /// were before. See `fb_frame_push`.
     fb_meta_saves: Vec<(String, Option<u32>, bool, bool, bool)>,
+    /// Per carried fallback frame, the `ref` redirections of the compiled
+    /// method's formals it set aside (`fb_frame_push`), restored on pop.
+    fb_unbound_refs: Vec<Vec<(String, Option<Expression>, Option<String>)>>,
     /// `local_stack` depth below each active fallback frame (see
     /// `fb_frame_push`): a write inside one leaves 2-state fitting to the
     /// copy-back, since the carried locals' types are not in

@@ -275,6 +275,23 @@ impl Simulator {
         let depth = self.local_stack.len();
         let mark = self.fb_meta_saves.len();
 
+        // A compiled method's output / ref formal lives in its register; the
+        // carried frame is its only copy for the statement's duration, so the
+        // call's ref redirection of the name is set aside until it ends (the
+        // method epilogue writes the register back as usual).
+        let mut unbound = Vec::new();
+        for l in locals.iter().filter(|l| l.via_binding) {
+            let name = l.name.as_ref();
+            let binding = self
+                .ref_binding_stack
+                .last_mut()
+                .and_then(|m| m.remove(name));
+            let alias = self.ref_alias_stack.last_mut().and_then(|m| m.remove(name));
+            if binding.is_some() || alias.is_some() {
+                unbound.push((name.to_string(), binding, alias));
+            }
+        }
+        self.fb_unbound_refs.push(unbound);
         let mut f = self.take_pooled_frame();
         for l in locals {
             let v = Self::fb_fit(self.vm_regs[l.reg as usize].clone(), l.kind);
@@ -361,6 +378,14 @@ impl Simulator {
             if self.frame_pool.len() < 64 {
                 f.clear();
                 self.frame_pool.push(f);
+            }
+        }
+        for (name, binding, alias) in self.fb_unbound_refs.pop().unwrap_or_default() {
+            if let (Some(b), Some(m)) = (binding, self.ref_binding_stack.last_mut()) {
+                m.insert(name.clone(), b);
+            }
+            if let (Some(a), Some(m)) = (alias, self.ref_alias_stack.last_mut()) {
+                m.insert(name, a);
             }
         }
     }

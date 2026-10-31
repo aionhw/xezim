@@ -3733,6 +3733,7 @@ impl Simulator {
             name_stats_on: std::env::var("XEZIM_NAME_STATS").is_ok(),
             frame_pool: Vec::new(),
             fb_meta_saves: Vec::new(),
+            fb_unbound_refs: Vec::new(),
             fb_frame_depths: Vec::new(),
             param_leaf_index_cell: std::cell::OnceCell::new(),
             var_decl_leaf_index_cell: std::cell::OnceCell::new(),

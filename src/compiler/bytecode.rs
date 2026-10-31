@@ -150,6 +150,13 @@ pub fn census_pair_fusions() -> u64 {
     FUSED_MOVE_FWD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Per-statement interpreter fallback inside compiled method bodies
+/// (`XEZIM_METHOD_STMT_FALLBACK`, default on).
+fn method_stmt_fallback_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XEZIM_METHOD_STMT_FALLBACK").map_or(true, |v| v != "0"))
+}
+
 /// Copies forwarded into their readers by `forward_copies` (static sites).
 pub fn copy_forward_count() -> u64 {
     FUSED_COPY_FWD.load(std::sync::atomic::Ordering::Relaxed)
@@ -333,6 +340,12 @@ pub struct FbLocal {
     pub name: Arc<str>,
     pub reg: RegId,
     pub kind: LocalKind,
+    /// A compiled method's output / inout / ref formal: the call bound the
+    /// name to the caller's actual as well, so the executor sets that
+    /// redirection aside while the carried frame holds the value (the
+    /// method epilogue writes the register back).
+    #[serde(default)]
+    pub via_binding: bool,
 }
 
 /// The locals a fallback carries; empty for the ordinary fallback, which
@@ -1781,6 +1794,11 @@ pub struct BytecodeCompiler<'a> {
     /// against `ctx_width = 0` and so silently truncated.  Missing entry or
     /// width 0 = keep the old self-determined behavior.
     method_formal_widths: HashMap<String, Vec<u32>>,
+    /// Method mode: the output / inout / ref formals. The call binds a ref
+    /// as a redirection to the caller's actual while the compiled body keeps
+    /// it in a register until its epilogue, so a statement fallback carries
+    /// it with that redirection set aside (`via_binding`).
+    method_writeback_names: HashSet<String>,
     /// Step 9g: WRITABLE static-property names (bare) of the enclosing
     /// class chain — reads AND stores lower to Load/StoreClassStatic.
     static_member_names: HashSet<String>,
@@ -2180,6 +2198,7 @@ impl<'a> BytecodeCompiler<'a> {
             method_class_parent: None,
             static_bare_targets: HashMap::default(),
             method_formal_widths: HashMap::default(),
+            method_writeback_names: HashSet::default(),
             static_member_names: HashSet::default(),
             class_const_names: HashSet::default(),
             new_type_map: HashMap::default(),
@@ -4580,7 +4599,11 @@ impl<'a> BytecodeCompiler<'a> {
     /// body? Only then can a fallback need to carry locals (or be unable
     /// to): everywhere else fallbacks are emitted exactly as they always were.
     fn fb_live(&self) -> bool {
-        !self.local_var_regs.is_empty()
+        // A method body always has register-backed state (`this`, formals,
+        // the result cell), and a fallback that could `return` must be
+        // refused even where it names none of it.
+        self.method_mode
+            || !self.local_var_regs.is_empty()
             || !self.local_const_vars.is_empty()
             || !self.local_array_regs.is_empty()
             || !self.local_var_array.is_empty()
@@ -4663,12 +4686,18 @@ impl<'a> BytecodeCompiler<'a> {
                 name: Arc::from(name.as_str()),
                 reg,
                 kind,
+                via_binding: self.method_mode && self.method_writeback_names.contains(name),
             });
         }
         for (name, v, kind) in consts {
             let r = self.alloc_reg();
             self.emit(Insn::LoadConst(r, Box::new(v)));
-            out.push(FbLocal { name, reg: r, kind });
+            out.push(FbLocal {
+                name,
+                reg: r,
+                kind,
+                via_binding: false,
+            });
         }
         Ok(out.into_boxed_slice())
     }
@@ -19735,7 +19764,13 @@ impl<'a> BytecodeCompiler<'a> {
         let start_reg = self.next_reg;
         // Enter method mode; any failure below restores the saved state.
         self.method_mode = true;
-        self.allow_ast_fallback = false;
+        // A statement the compiler cannot lower runs in the interpreter
+        // (`StmtFallback`, carrying the register-backed locals it names) and
+        // the rest of the body stays compiled; one unsupported construct —
+        // a `$sformatf` in a verbose branch — used to send the whole method
+        // to the interpreter. `XEZIM_METHOD_STMT_FALLBACK=0` restores that.
+        self.allow_ast_fallback = method_stmt_fallback_enabled();
+        self.method_writeback_names = writeback_formals.iter().cloned().collect();
         self.allow_expr_fallback = false;
         self.allow_waits = false;
         self.method_ret_is_collection = ret_is_collection;
@@ -19803,6 +19838,9 @@ impl<'a> BytecodeCompiler<'a> {
                 // Mark it string so `infer_lhs_width` keeps 0 instead of
                 // guessing a placeholder width (see the task-path twin).
                 self.local_var_is_string.insert(name.clone());
+                // Typed like a string body local, so a statement fallback
+                // can carry it.
+                self.local_kinds.insert(r, LocalKind::Str);
             }
             if class_formals.contains(name) {
                 self.method_handle_names.insert(name.clone());
@@ -19933,6 +19971,7 @@ impl<'a> BytecodeCompiler<'a> {
                     // message).
                     if is_string {
                         self.local_var_is_string.insert(rname.to_string());
+                        self.local_kinds.insert(r, LocalKind::Str);
                     }
                 }
                 self.method_result_reg = Some(r);
@@ -19946,7 +19985,9 @@ impl<'a> BytecodeCompiler<'a> {
             None => (None, None),
         };
 
-        // Compile every body statement, all-or-nothing.
+        // Compile every body statement. One the compiler cannot lower runs
+        // as a statement fallback where it can carry what it touches;
+        // anything else fails the whole body.
         let mut ok = true;
         for stmt in body {
             if matches!(stmt.kind, StatementKind::VarDecl { .. }) {
@@ -19962,8 +20003,8 @@ impl<'a> BytecodeCompiler<'a> {
 
         if !ok {
             // Census aid: XEZIM_FALLBACK_SITES=1 — the per-site tracer only
-            // covers emit_fallback; method-mode arms that return false
-            // directly (all-or-nothing) surface here instead.
+            // covers emit_fallback; a statement that could not be lowered
+            // or carried (failing the whole body) surfaces here instead.
             if std::env::var("XEZIM_FALLBACK_SITES")
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false)
@@ -23553,6 +23594,7 @@ mod tests {
                     signed: false,
                     two_state: false,
                 },
+                via_binding: false,
             }]
             .into_boxed_slice(),
             None => FbLocals::default(),

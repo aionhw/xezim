@@ -631,6 +631,8 @@ mod compiled_bare_member_store_width;
 mod compiled_short_circuit;
 #[path = "classes/stale_enum_local_name.rs"]
 mod stale_enum_local_name;
+#[path = "classes/compiled_method_stmt_fallback.rs"]
+mod compiled_method_stmt_fallback;
 #[path = "classes/int_property_named_like_struct_property.rs"]
 mod int_property_named_like_struct_property;
 #[path = "classes/compiled_method_test_env.rs"]

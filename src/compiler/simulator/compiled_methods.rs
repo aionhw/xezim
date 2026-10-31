@@ -2751,9 +2751,23 @@ impl Simulator {
         } else {
             None
         };
-        // Run the block.
+        // Run the block. Its statement fallbacks are interpreted code and
+        // see the activation's string typing the AST path would set up.
+        let string_frame = block.has_fallback.then(|| {
+            let (is_function, string_ret) = match kind {
+                CompiledBodyKind::Function(f) => (
+                    true,
+                    Self::is_string_data_type(&f.return_type).then_some(f.name.name.name.as_str()),
+                ),
+                _ => (false, None),
+            };
+            self.method_string_frame_begin(cname, ports, is_function, string_ret, None)
+        });
         self.return_flag = false;
         self.exec_insns(&block.instructions);
+        if let Some(f) = string_frame {
+            self.method_string_frame_end(f);
+        }
         // A StmtFallback for a `return …` statement executed through the
         // interpreter sets `return_value` — the compiled block's result
         // register never sees it (the compiler only bakes the Move for

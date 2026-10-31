@@ -517,13 +517,12 @@ endmodule
             (output.clone(), 0, 0),
             "{tag} cold"
         );
-        // Multi-index member foreach currently declines bytecode lowering.
-        // A persisted refusal proves heat reached admission while preserving
-        // interpreter execution; it must never count as a compiled block.
-        let (blocks, refusals) = if tag == "matrix" { (0, 1) } else { (1, 0) };
+        // Every shape compiles once heat reaches admission; a multi-index
+        // member foreach, which bytecode does not lower, runs as one
+        // interpreted statement inside the compiled body.
         assert_eq!(
             run_with_admission(&source, "100"),
-            (output, blocks, refusals),
+            (output, 1, 0),
             "{tag} hot"
         );
     }

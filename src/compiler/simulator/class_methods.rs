@@ -1227,6 +1227,90 @@ impl Simulator {
     }
 
     /// The string properties of `class_name` and its ancestors.
+    /// §6.16/§13.5: the interpreter's string typing for one method
+    /// activation — its string formals, a string result variable and the
+    /// class's string properties join `string_signals` (the non-string
+    /// formals of a function leave it), and the frame's formal types are
+    /// classified under the active specialization. Compiled bytecode never
+    /// reads these, so only interpreted statements need them: the whole body
+    /// on the AST path, or a compiled body's statement fallbacks.
+    pub(super) fn method_string_frame_begin(
+        &mut self,
+        cname: &str,
+        ports: &[crate::ast::decl::FunctionPort],
+        is_function: bool,
+        string_ret: Option<&str>,
+        found_string_props: Option<std::rc::Rc<Vec<String>>>,
+    ) -> MethodStringFrame {
+        // Common frame teardown removes this entry.
+        if let Some(&fgen) = self.local_gen_stack.last() {
+            if let Some(entry) = self.task_frame_strings(fgen, ports) {
+                self.task_string_formals.push(entry);
+            }
+        }
+        let mut signals: Vec<String> = Vec::new();
+        self.string_signals_removed.push(Vec::new());
+        if is_function {
+            for port in ports.iter() {
+                if !Self::is_string_data_type(&port.data_type) {
+                    self.forget_string_flag(&port.name.name);
+                }
+            }
+            if let Some(r) = string_ret {
+                if self.string_signals.insert(r.to_string()) {
+                    signals.push(r.to_string());
+                }
+            }
+        }
+        for port in ports.iter() {
+            if Self::is_string_data_type(&port.data_type) {
+                if self.string_signals.insert(port.name.name.clone()) {
+                    signals.push(port.name.name.clone());
+                }
+            }
+        }
+        let props = found_string_props.unwrap_or_else(|| self.class_string_props_of(cname));
+        let mut prop_mask: u64 = 0;
+        let mut prop_more: Vec<usize> = Vec::new();
+        for (i, sp) in props.iter().enumerate() {
+            if !self.string_signals.contains(sp) {
+                self.string_signals.insert(sp.clone());
+                if i < 64 {
+                    prop_mask |= 1u64 << i;
+                } else {
+                    prop_more.push(i);
+                }
+            }
+        }
+        MethodStringFrame {
+            signals,
+            props,
+            prop_mask,
+            prop_more,
+        }
+    }
+
+    /// Undo `method_string_frame_begin`.
+    pub(super) fn method_string_frame_end(&mut self, f: MethodStringFrame) {
+        for n in &f.signals {
+            self.string_signals.remove(n);
+        }
+        let mut mask = f.prop_mask;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.string_signals.remove(&f.props[i]);
+        }
+        for &i in &f.prop_more {
+            self.string_signals.remove(&f.props[i]);
+        }
+        if let Some(removed) = self.string_signals_removed.pop() {
+            for n in removed {
+                self.string_signals.insert(n);
+            }
+        }
+    }
+
     pub(super) fn class_string_props_of(&self, class_name: &str) -> std::rc::Rc<Vec<String>> {
         if let Some(hit) = self.class_string_props.borrow().get(class_name) {
             return hit.clone();
@@ -2355,14 +2439,14 @@ impl Simulator {
                 } else {
                     None
                 };
-                // class-perf pilot: a fully-lowered Function body may run as
-                // bytecode instead of the AST interpreter. ALL-OR-NOTHING:
+                // class-perf pilot: a lowered Function body may run as
+                // bytecode instead of the AST interpreter.
                 // `try_run_compiled_method` returns None unless every
-                // statement lowered without a fallback, in which case the
-                // value is byte-identical to the interpreter by construction
-                // (the compiled block reads `this` members and locals from
-                // the same heap / register file the AST path uses). Gated off
-                // by default.
+                // statement lowered, or runs as a statement fallback carrying
+                // the registers it touches, in which case the value is
+                // byte-identical to the interpreter by construction (the
+                // compiled block reads `this` members and locals from the same
+                // heap / register file the AST path uses).
                 // Wait-free tasks compile like functions, after the same
                 // call-count tier: compiling every task on its first call
                 // paid a whole plan + compile for each of the many tasks a
@@ -2385,53 +2469,21 @@ impl Simulator {
                 {
                     self.return_value = Some(cval);
                 } else {
-                    // §6.16/§13.5: classify the callee's formal types under
-                    // its active specialization, independently of global
-                    // string flags. Common frame teardown removes this entry.
-                    if let Some(&fgen) = self.local_gen_stack.last() {
-                        if let Some(entry) = self.task_frame_strings(fgen, ports) {
-                            self.task_string_formals.push(entry);
+                    let string_ret = match &method.kind {
+                        ClassMethodKind::Function(f)
+                            if plan.ret.as_ref().is_some_and(|r| r.decl_string) =>
+                        {
+                            Some(f.name.name.name.as_str())
                         }
-                    }
-                    // Mark string-typed return variable, params, and class
-                    // properties only when the AST interpreter actually runs
-                    // this body (compiled bytecode never reads `string_signals`).
-                    let mut frame_string_signals: Vec<String> = Vec::new();
-                    self.string_signals_removed.push(Vec::new());
-                    if let ClassMethodKind::Function(f) = &method.kind {
-                        for port in ports.iter() {
-                            if !Self::is_string_data_type(&port.data_type) {
-                                self.forget_string_flag(&port.name.name);
-                            }
-                        }
-                        if plan.ret.as_ref().is_some_and(|r| r.decl_string) {
-                            if self.string_signals.insert(f.name.name.name.clone()) {
-                                frame_string_signals.push(f.name.name.name.clone());
-                            }
-                        }
-                    }
-                    for port in ports.iter() {
-                        if Self::is_string_data_type(&port.data_type) {
-                            if self.string_signals.insert(port.name.name.clone()) {
-                                frame_string_signals.push(port.name.name.clone());
-                            }
-                        }
-                    }
-                    let frame_string_props = found_string_props
-                        .clone()
-                        .unwrap_or_else(|| self.class_string_props_of(cname));
-                    let mut frame_string_prop_mask: u64 = 0;
-                    let mut frame_string_prop_more: Vec<usize> = Vec::new();
-                    for (i, sp) in frame_string_props.iter().enumerate() {
-                        if !self.string_signals.contains(sp) {
-                            self.string_signals.insert(sp.clone());
-                            if i < 64 {
-                                frame_string_prop_mask |= 1u64 << i;
-                            } else {
-                                frame_string_prop_more.push(i);
-                            }
-                        }
-                    }
+                        _ => None,
+                    };
+                    let string_frame = self.method_string_frame_begin(
+                        cname,
+                        ports,
+                        matches!(method.kind, ClassMethodKind::Function(_)),
+                        string_ret,
+                        found_string_props.clone(),
+                    );
                     // class-perf loop-heat boost (pass C): while this method
                     // body runs on the AST interpreter, attribute its loop
                     // back-edges to it so the measured-heat gate can admit
@@ -2472,12 +2524,7 @@ impl Simulator {
                     if heat_key.is_some() {
                         self.compiled_method_heat_stack.pop();
                     }
-                    ast_string_cleanup = Some((
-                        frame_string_signals,
-                        frame_string_props,
-                        frame_string_prop_mask,
-                        frame_string_prop_more,
-                    ));
+                    ast_string_cleanup = Some(string_frame);
                 } // end else: AST interpreter path
                 if let Some(prev) = _prev_meth {
                     CUR_METHOD_HASH.store(prev, Ordering::Relaxed);
@@ -2496,30 +2543,8 @@ impl Simulator {
                 // (§6.21/§23.8), or an integral shadow can erase the caller's
                 // string classification after it has already been restored.
                 self.close_decl_shadow_frame();
-                if let Some((
-                    frame_string_signals,
-                    frame_string_props,
-                    frame_string_prop_mask,
-                    frame_string_prop_more,
-                )) = ast_string_cleanup
-                {
-                    for n in &frame_string_signals {
-                        self.string_signals.remove(n);
-                    }
-                    let mut mask = frame_string_prop_mask;
-                    while mask != 0 {
-                        let i = mask.trailing_zeros() as usize;
-                        mask &= mask - 1;
-                        self.string_signals.remove(&frame_string_props[i]);
-                    }
-                    for &i in &frame_string_prop_more {
-                        self.string_signals.remove(&frame_string_props[i]);
-                    }
-                    if let Some(removed) = self.string_signals_removed.pop() {
-                        for n in removed {
-                            self.string_signals.insert(n);
-                        }
-                    }
+                if let Some(string_frame) = ast_string_cleanup {
+                    self.method_string_frame_end(string_frame);
                 }
                 self.restore_spec_pooled(saved_spec);
                 if let Some(prev) = saved_resolve_hint {

@@ -1249,6 +1249,7 @@ checkpoint_state!(
     exec_cache_pids,
     fast_delay_always,
     fatal_finish_number,
+    fb_unbound_refs,
     file_eof,
     file_writes_pending,
     finished,
