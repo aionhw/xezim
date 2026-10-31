@@ -41,6 +41,16 @@ impl Simulator {
         if self.condition_waiters.is_empty() {
             return;
         }
+        // §6.21: an automatic of the running process's own call frame is
+        // private storage. No parked waiter can read it here — another
+        // process sees it only once the fork merge copies it into its frame,
+        // and that merge promotes the waiters reading it. Re-evaluating every
+        // waiter that merely names the same identifier (a loop counter `f`
+        // against a parked `wait (f.go)`) cost a context switch per waiter
+        // per write.
+        if self.lvalue_is_frame_private(lhs) {
+            return;
+        }
         // Cheap reject first: nothing the lvalue names is read by any parked
         // waiter. The union is rebuilt only after the waiter set changed.
         if self.cond_read_union_dirty {
@@ -68,6 +78,26 @@ impl Simulator {
         }
 
         self.promote_condition_waiters_for_names(&target_names);
+    }
+
+    /// Whether `lhs` (`x`, `x[i]`, `x[a:b]`) writes an automatic that lives
+    /// in the running process's current call frame and is not bound by
+    /// `ref` to another variable.
+    fn lvalue_is_frame_private(&self, lhs: &Expression) -> bool {
+        let mut base = lhs;
+        while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &base.kind {
+            base = expr;
+        }
+        let ExprKind::Ident(h) = &base.kind else {
+            return false;
+        };
+        if h.root.is_some() || h.path.len() != 1 {
+            return false;
+        }
+        let name = h.path[0].name.name.as_str();
+        self.local_stack.last().is_some_and(|frame| frame.contains_key(name))
+            && !self.ref_binding_stack.last().is_some_and(|m| m.contains_key(name))
+            && !self.ref_alias_stack.last().is_some_and(|m| m.contains_key(name))
     }
 
     /// Re-check parked condition waiters whose condition names one of
