@@ -85,11 +85,50 @@ impl Simulator {
         Some(rc)
     }
 
+    fn fast_uvm_oneway_hash(&mut self, args: &[Expression]) -> Option<Value> {
+        let str_val = self.eval_expr(args.first()?);
+        let s = str_val.to_string();
+        let mut seed = if let Some(arg) = args.get(1) {
+            self.eval_expr(arg).to_u64().unwrap_or(0) as u32
+        } else {
+            0
+        };
+        if seed == 0 {
+            seed = self
+                .get_signal_value_by_name("uvm_pkg::uvm_global_random_seed")
+                .or_else(|| self.get_signal_value_by_name("uvm_global_random_seed"))
+                .and_then(|v| v.to_u64())
+                .unwrap_or(0) as u32;
+        }
+        let mut crc1 = 0xffff_ffffu32;
+        for &b in s.as_bytes() {
+            if b == 0 {
+                break;
+            }
+            for bit in 0..8 {
+                let msb = (crc1 >> 31) != 0;
+                crc1 <<= 1;
+                if msb ^ (((b >> bit) & 1) != 0) {
+                    crc1 ^= 0x04c1_1db6;
+                    crc1 |= 1;
+                }
+            }
+        }
+        let swapped = crc1.swap_bytes();
+        let hash = seed.wrapping_add(!swapped);
+        Some(Value::from_u64(hash as u64, 32))
+    }
+
     pub(super) fn exec_function_call(
         &mut self,
         fd: &FunctionDeclaration,
         args: &[Expression],
     ) -> Value {
+        if fd.name.name.name == "uvm_oneway_hash" {
+            if let Some(val) = self.fast_uvm_oneway_hash(args) {
+                return val;
+            }
+        }
         // §6.21 / §13.4.2: a function's locals take ITS lifetime, not the
         // calling task's. A static function called from an automatic task
         // shares its locals across calls, so the caller's per-invocation
