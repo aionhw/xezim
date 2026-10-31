@@ -12225,7 +12225,22 @@ impl<'a> BytecodeCompiler<'a> {
                     // `method_handle_names` so `.member` is a heap access.
                     if self.method_mode && self.class_local_names.contains(&decl.name.name) {
                         let slot = self.alloc_reg();
+                        // §8.8: `C h = new(...)` constructs the local's
+                        // declared class, as `h = new(...)` does.
+                        let new_cls = decl
+                            .init
+                            .as_ref()
+                            .filter(|e| Self::is_new_shape(e))
+                            .and_then(|_| self.new_type_map.get(&decl.name.name).cloned());
                         match &decl.init {
+                            Some(expr) if new_cls.is_some() => {
+                                let cls = new_cls.expect("checked");
+                                let Some(value) = self.compile_new_construct(expr, &cls) else {
+                                    self.bail("VarDecl_init");
+                                    return false;
+                                };
+                                self.emit(Insn::Move(slot, value));
+                            }
                             Some(expr) => {
                                 let Some(value) = self.compile_expr(expr, 0) else {
                                     self.bail("VarDecl_init");
@@ -13691,7 +13706,23 @@ impl<'a> BytecodeCompiler<'a> {
         let call_start = self.insns.len();
         let call_next = self.next_reg;
         let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
-        for a in &args {
+        // §13.5.3: an empty actual (`new(a, , c)`) takes its default; the
+        // positions travel with the class name (`class\0mask`).
+        let mut empty_mask: u64 = 0;
+        for (i, a) in args.iter().enumerate() {
+            if matches!(a.kind, ExprKind::Empty) {
+                if i >= 64 {
+                    self.truncate_insns(call_start);
+                    self.next_reg = call_next;
+                    self.bail("Expr_New_args");
+                    return None;
+                }
+                empty_mask |= 1 << i;
+                let r = self.alloc_reg();
+                self.emit(Insn::LoadConst(r, Box::new(Value::zero(1))));
+                arg_values.push(r);
+                continue;
+            }
             match self.compile_expr(a, 0) {
                 Some(r) => arg_values.push(r),
                 None => {
@@ -13714,9 +13745,14 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit(Insn::Move(slot, v));
             }
         }
+        let name = if empty_mask == 0 {
+            class.to_string()
+        } else {
+            format!("{class}\u{0}{empty_mask}")
+        };
         self.emit(Insn::ConstructObject(
             dest,
-            Box::new(Name(class.to_string().into_boxed_str())),
+            Box::new(Name(name.into_boxed_str())),
             arg_start,
             n,
         ));

@@ -2340,7 +2340,11 @@ impl Simulator {
                 self.class_static_set(class, prop, v);
             }
             Insn::ConstructObject(dest, class, arg_start, n_args) => {
-                let class: &str = &class.0;
+                // `class\0mask`: positions of empty actuals (defaults).
+                let (class, empty_mask): (&str, u64) = match class.0.split_once('\u{0}') {
+                    Some((c, m)) => (c, m.parse().unwrap_or(0)),
+                    None => (&class.0, 0),
+                };
                 // Step 9g: `new(args)` / bare `new` — §8.8 constructor
                 // of the baked DEFINING class. Allocation, property
                 // inits, and the ctor chain all stay in
@@ -2357,7 +2361,14 @@ impl Simulator {
                 }
                 let args: Vec<Expression> = argvals
                     .iter()
-                    .map(|v| self.value_method_arg_expr(v))
+                    .enumerate()
+                    .map(|(i, v)| {
+                        if i < 64 && empty_mask & (1 << i) != 0 {
+                            Expression::new(ExprKind::Empty, crate::ast::Span::dummy())
+                        } else {
+                            self.value_method_arg_expr(v)
+                        }
+                    })
                     .collect();
                 let v = if let Some(cd) = self.module.classes.get(class).cloned() {
                     self.instantiate_class(&cd, &args)
