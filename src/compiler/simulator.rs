@@ -7918,6 +7918,15 @@ pub struct Simulator {
     /// `EVENT_NULL_KEY` marks a null handle. Trigger/`.triggered`/wait_order
     /// all chase this map to the canonical key first.
     event_aliases: HashMap<String, String>,
+    /// §15.5.5: the event OBJECT a class-member event slot `(handle,
+    /// field)` holds once an assignment (`ev = other_ev`) re-bound it, as an
+    /// id shared by every slot holding the same event. A slot absent here
+    /// holds its own event. `event_obj_slots` is the reverse index.
+    event_obj_ids: HashMap<(usize, String), u64>,
+    event_obj_slots: HashMap<u64, Vec<(usize, String)>>,
+    next_event_obj_id: u64,
+    /// Every class property name declared `event`, built on first use.
+    class_event_prop_names: Option<std::rc::Rc<HashSet<String>>>,
     /// Fast-path NBA buffer: pre-resolved (signal_id, value) pairs.
     nba_fast: Vec<NbaFast>,
     /// Reverse index: signal_id → most recent index in `nba_fast` for that

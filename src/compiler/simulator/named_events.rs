@@ -1232,20 +1232,31 @@ impl Simulator {
     /// the same slot's remaining active region — mirroring how a blocking
     /// `->e` resumes an `@e` waiter for a module-scope named event.
     pub(super) fn fire_instance_event(&mut self, key: (usize, String)) {
+        // §15.5.5: every slot holding the same event object fires with it.
+        let slots = match self.event_obj_ids.get(&key) {
+            Some(id) => self.event_obj_slots.get(id).cloned().unwrap_or_default(),
+            None => vec![key],
+        };
+        for key in slots {
+            self.fire_instance_event_slot(&key);
+        }
+    }
+
+    fn fire_instance_event_slot(&mut self, key: &(usize, String)) {
         let now = self.time;
         // §15.5.3: `<h>.<ev>.triggered` must read 1 for the rest of this slot.
         // Instance events have no backing signal, so stamp the same table the
         // name-keyed path uses, under a synthetic per-instance key.
-        let stamp = Self::instance_event_stamp_key(&key);
+        let stamp = Self::instance_event_stamp_key(key);
         self.event_triggered_time.insert(stamp, now);
         if !self.cg_instance_event_waiters.is_empty() {
-            if let Some(w) = self.cg_instance_event_waiters.get(&key).cloned() {
+            if let Some(w) = self.cg_instance_event_waiters.get(key).cloned() {
                 self.sample_event_covergroups(w);
             }
         }
         let mut woken = Vec::new();
         self.instance_event_waiters.retain(|w| {
-            if w.key.contains(&key) {
+            if w.key.contains(key) {
                 woken.push((w.pid, w.continuation.clone()));
                 false
             } else {
@@ -1255,6 +1266,138 @@ impl Simulator {
         for (pid, cont) in woken {
             self.event_queue.schedule(now, pid, cont);
         }
+    }
+
+    /// The class-member event slot `e` names — `ev` in a method of its
+    /// class, a static `ev` / `C::ev`, `h.ev`, `this.ev`, `q[i].ev` — or None.
+    fn instance_event_slot(&mut self, e: &Expression) -> Option<(usize, String)> {
+        if let ExprKind::Ident(h) = &e.kind
+            && h.root.is_none()
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+            && let Some(k) = self.resolve_this_event_field(&h.path[0].name.name)
+        {
+            return Some(k);
+        }
+        if let Some(k) = self.static_class_event_key(e) {
+            return Some(k);
+        }
+        if let Some(k) = self.expr_handle_event_field(e) {
+            return Some(k);
+        }
+        self.expr_instance_event_field_general(e)
+    }
+
+    /// §15.5.5 `ev = other_ev` / `ev = null` between class-member events:
+    /// the slot takes the other slot's event object (a null event, its own
+    /// fresh one that nothing else holds). The ordinary value assignment
+    /// still follows, so `ev == null` keeps comparing the stored handles.
+    pub(super) fn bind_instance_event_assign(&mut self, lvalue: &Expression, rvalue: &Expression) {
+        let leaf = |e: &Expression| -> Option<String> {
+            match &e.kind {
+                ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
+                ExprKind::MemberAccess { member, .. } => Some(member.name.clone()),
+                _ => None,
+            }
+        };
+        let names = match &self.class_event_prop_names {
+            Some(n) => n.clone(),
+            None => {
+                let n: HashSet<String> = self
+                    .module
+                    .classes
+                    .values()
+                    .flat_map(|cd| {
+                        cd.property_types.iter().filter_map(|(p, dt)| {
+                            matches!(
+                                dt,
+                                DataType::Simple {
+                                    kind: crate::ast::types::SimpleType::Event,
+                                    ..
+                                }
+                            )
+                            .then(|| p.clone())
+                        })
+                    })
+                    .collect();
+                let n = std::rc::Rc::new(n);
+                self.class_event_prop_names = Some(n.clone());
+                n
+            }
+        };
+        if names.is_empty() || !leaf(lvalue).is_some_and(|n| names.contains(&n)) {
+            return;
+        }
+        let is_null = matches!(rvalue.kind, ExprKind::Null);
+        if !is_null && !leaf(rvalue).is_some_and(|n| names.contains(&n)) {
+            return;
+        }
+        let declared_event =
+            |sim: &Self, k: &(usize, String)| sim.class_prop_declared_event(k.0, &k.1);
+        let Some(slot) = self
+            .instance_event_slot(lvalue)
+            .filter(|k| declared_event(self, k))
+        else {
+            return;
+        };
+        let id = if is_null {
+            self.fresh_event_obj_id()
+        } else {
+            let Some(src) = self
+                .instance_event_slot(rvalue)
+                .filter(|k| declared_event(self, k))
+            else {
+                return;
+            };
+            match self.event_obj_ids.get(&src) {
+                Some(&id) => id,
+                None => {
+                    let id = self.fresh_event_obj_id();
+                    self.event_obj_ids.insert(src.clone(), id);
+                    self.event_obj_slots.entry(id).or_default().push(src);
+                    id
+                }
+            }
+        };
+        if let Some(old) = self.event_obj_ids.insert(slot.clone(), id)
+            && let Some(v) = self.event_obj_slots.get_mut(&old)
+        {
+            v.retain(|s| *s != slot);
+            if v.is_empty() {
+                self.event_obj_slots.remove(&old);
+            }
+        }
+        self.event_obj_slots.entry(id).or_default().push(slot);
+    }
+
+    /// Is `field` of the object `handle` declared `event` (`class_prop_is_event`
+    /// assumes so when no declaration is found)?
+    fn class_prop_declared_event(&self, handle: usize, field: &str) -> bool {
+        let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) else {
+            return false;
+        };
+        let mut cur = Some(inst.class_name.as_str());
+        for _ in 0..64 {
+            let Some(cd) = cur.and_then(|c| self.module.classes.get(c)) else {
+                return false;
+            };
+            if let Some(dt) = cd.property_types.get(field) {
+                return matches!(
+                    dt,
+                    DataType::Simple {
+                        kind: crate::ast::types::SimpleType::Event,
+                        ..
+                    }
+                );
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
+    fn fresh_event_obj_id(&mut self) -> u64 {
+        self.next_event_obj_id += 1;
+        self.next_event_obj_id
     }
 
     /// Resolve signal-backed event spellings once. Event signal IDs are stable

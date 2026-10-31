@@ -1399,6 +1399,8 @@ impl Simulator {
                 }
             }
         }
+        // §15.5.5: a class-member event takes the other event's object.
+        self.bind_instance_event_assign(lvalue, rvalue);
         if self.simple_blocking_assign(lvalue, rvalue) || self.member_target_assign(lvalue, rvalue)
         {
             return;

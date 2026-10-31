@@ -468,6 +468,11 @@ impl Simulator {
         self.randc_used.retain(|(h, _), _| !dead_handle(*h));
         self.randc_pending.retain(|(h, _), _| !dead_handle(*h));
         self.dist_decks.retain(|(h, _), _| !dead_handle(*h));
+        self.event_obj_ids.retain(|(h, _), _| !dead_handle(*h));
+        for slots in self.event_obj_slots.values_mut() {
+            slots.retain(|(h, _)| !dead_handle(*h));
+        }
+        self.event_obj_slots.retain(|_, slots| !slots.is_empty());
         let mut released = 0;
         for (handle, object) in self.heap.iter_mut().enumerate() {
             if dead_handle(handle) && object.take().is_some() {

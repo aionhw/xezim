@@ -4132,6 +4132,10 @@ impl Simulator {
             pending_nba_instance_triggers: Vec::new(),
             active_task_pids: HashMap::default(),
             event_aliases: HashMap::default(),
+            event_obj_ids: HashMap::default(),
+            event_obj_slots: HashMap::default(),
+            next_event_obj_id: 0,
+            class_event_prop_names: None,
             nba_fast: Vec::new(),
             // Named signals stay on the dense hot path. Unnamed large-array
             // elements use NbaFastIndex's sparse tail.

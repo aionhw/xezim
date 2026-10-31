@@ -793,6 +793,8 @@ mod vif_clocking_bare_event;
 mod vif_inherited_type_param;
 #[path = "classes/class_event_bare_triggered.rs"]
 mod class_event_bare_triggered;
+#[path = "classes/class_event_assign_alias.rs"]
+mod class_event_assign_alias;
 #[path = "classes/class_event_forever_wait.rs"]
 mod class_event_forever_wait;
 #[path = "classes/string_local_name_leak.rs"]
