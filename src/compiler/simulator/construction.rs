@@ -2235,7 +2235,48 @@ impl Simulator {
                         .collect();
                     (frags.len() == ta.len()).then(|| frags.join(","))
                 }
-                _ => Some(String::new()),
+                // An UNSPECIALIZED `new()` (or a `create()` whose receiver
+                // lost its `#(...)` args) of a parameterized class built
+                // while a specialization of the SAME class is active: carry
+                // the active spec's type-argument signature instead of
+                // falling back to the declared DEFAULTS. The factory
+                // `reg_agent#(dut_rw)::type_id::create("bus",..)` resolves
+                // `current_spec=("reg_agent","test.dut_rw")` for the call,
+                // and the registry's body constructs with a bare `new()` —
+                // dropping the args rebuilt `reg_agent#(int)` (the default),
+                // so its member `reg_driver#(DO)` bound `DO` to `int` and
+                // `DO::rw` silently no-op'd. The bare `new` takes the active
+                // specialization of this same class (reconciling scoped
+                // `test.reg_agent` vs bare `reg_agent` spellings behind
+                // `same_class_declaration`).
+                _ => {
+                    let mut inherited: Option<String> = None;
+                    if let Some((cb, cs)) = &self.current_spec {
+                        let same = if *cb == class_name_owned {
+                            true
+                        } else {
+                            (|| {
+                                let cb2 = cb.split('#').next().unwrap_or(cb);
+                                let cn2 = class_name_owned.split('#').next().unwrap_or(&class_name_owned);
+                                if cb2 == cn2 {
+                                    return true;
+                                }
+                                match (self.module.classes.get(cb2), self.module.classes.get(cn2)) {
+                                    (Some(a), Some(b)) => {
+                                        a.name == b.name
+                                            && a.enclosing == b.enclosing
+                                            && a.declaring_module == b.declaring_module
+                                    }
+                                    _ => false,
+                                }
+                            })()
+                        };
+                        if same && !cs.trim().is_empty() {
+                            inherited = Some(cs.clone());
+                        }
+                    }
+                    inherited.or_else(|| Some(String::new()))
+                }
             };
             if let Some(raw_sig) = raw_sig {
                 let sig = self.canonicalize_spec_sig(&class_name_owned, &raw_sig);

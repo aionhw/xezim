@@ -1618,3 +1618,120 @@ pub(super) fn stress_bench_items_flow_end_to_end_1_2() {
     assert!(!o.iter().any(|l| l.contains("randomize failed")), "{o:?}");
     assert!(o.iter().any(|l| l.contains("UVM_ERROR :    0")), "{o:?}");
 }
+
+// Regression for the 90Mantis/3641 register-semantics bug family: a
+// parameterized `reg_agent#(dut_rw)` bred by the UVM component factory
+// (`*.type_id::create("bus", .)` in a `uvm_env`) must carry the `dut_rw`
+// specialization into its own constructor so its member `reg_driver#(DO)`
+// binds `DO` to `dut_rw` — not to the model's declared default `rw_base`.
+// The factory `create_component` constructs the BARE class (`reg_agent` with
+// no `#(...)` list); before the fix that dropped the active specialization,
+// so `$typename(DO)` in the driver revealed `rw_base`. The two-top
+// `program test` + `module dut` root shape (exactly the private Mantis test's
+// topology) is what makes the clobber reproduce, so this shells the xezim
+// binary with `-s test -s dut` rather than the single-top `simulate_multi`.
+fn xezim_bin() -> String {
+    let mut p = std::env::current_exe().expect("current_exe");
+    p.pop();
+    if p.ends_with("deps") {
+        p.pop();
+    }
+    p.join("xezim").to_string_lossy().into_owned()
+}
+
+const TWO_TOP_PARAM_AGENT: &str = r#"
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+
+module dut;
+endmodule
+
+program test;
+  class rw_base; endclass
+  class dut_rw; endclass
+
+  class reg_driver #(type DO = rw_base) extends uvm_component;
+    `uvm_component_param_utils(reg_driver #(DO))
+    function new(string name = "reg_driver", uvm_component parent = null);
+      super.new(name, parent);
+    endfunction
+    function string local_dt(); return $typename(DO); endfunction
+  endclass
+
+  class reg_agent #(type DO = rw_base) extends uvm_agent;
+    `uvm_component_param_utils_begin(reg_agent #(DO))
+    `uvm_component_utils_end
+    reg_driver #(DO) drv;
+    function new(string name = "reg_agent", uvm_component parent = null);
+      super.new(name, parent);
+      drv = new("drv", this);
+    endfunction
+  endclass
+
+  class tb_env extends uvm_env;
+    `uvm_component_utils(tb_env)
+    reg_agent #(dut_rw) bus;
+    function new(string name = "tb_env", uvm_component parent = null);
+      super.new(name, parent);
+    endfunction
+    function void build_phase(uvm_phase phase);
+      super.build_phase(phase);
+      bus = reg_agent #(dut_rw)::type_id::create("bus", this);
+    endfunction
+  endclass
+
+  class reg_test extends uvm_test;
+    `uvm_component_utils(reg_test)
+    tb_env env;
+    function new(string name = "reg_test", uvm_component parent = null);
+      super.new(name, parent);
+    endfunction
+    function void build_phase(uvm_phase phase);
+      super.build_phase(phase);
+      env = new("env", this);
+    endfunction
+    task run_phase(uvm_phase phase);
+      string got;
+      phase.raise_objection(this);
+      got = env.bus.drv.local_dt();
+      $display("TEST_DRV_DT=%s", got);
+      if (got == "class test.dut_rw" || got == "class dut_rw") $display("TEST_PASS");
+      else $display("TEST_FAIL got=%s", got);
+      phase.drop_objection(this);
+    endtask
+  endclass
+
+  initial run_test("reg_test");
+endprogram
+"#;
+
+#[test]
+fn reg_agent_param_create_keeps_specialization_two_top() {
+    let src_dir = uvm_dir().join("1.2/src");
+    let uvm_pkg = src_dir.join("uvm_pkg.sv");
+    let test_sv = "/tmp/two_top_param_agent.sv";
+    std::fs::write(test_sv, TWO_TOP_PARAM_AGENT).unwrap();
+    let out = Command::new(xezim_bin())
+        .args([
+            "--simulate",
+            "-s", "test",
+            "-s", "dut",
+            "--no-strict-top",
+            "-I", src_dir.to_str().unwrap(),
+        ])
+        .arg(uvm_pkg)
+        .arg(test_sv)
+        .output()
+        .expect("run xezim binary with two tops");
+    let out = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.contains("TEST_PASS"),
+        "reg_agent#(dut_rw) create must keep DO=dut_rw through the factory's bare new:
+{out}"
+    );
+    assert!(
+        out.contains("UVM_ERROR :    0") || !out.contains("UVM_ERROR :"),
+        "run must be clean of UVM_ERROR:
+{out}"
+    );
+}
