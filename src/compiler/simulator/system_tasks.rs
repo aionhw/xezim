@@ -2757,10 +2757,14 @@ impl Simulator {
                                     );
                                     const TMP: &str = "__xz_locator_fmt";
                                     self.materialize_locator(TMP, &arr_name, &mname, &idxs);
-                                    // An `_index` form yields indices, never the
-                                    // element type, so it is not string-rendered.
-                                    let is_str = !mname.ends_with("_index")
-                                        && self.string_signals.contains(&arr_name);
+                                    // An `_index` form yields indices: strings
+                                    // only for a string-keyed array.
+                                    let is_str = if mname.ends_with("_index") {
+                                        self.is_string_keyed_array(&arr_name)
+                                    } else {
+                                        self.string_signals.contains(&arr_name)
+                                            || self.class_coll_holds_strings(&arr_name)
+                                    };
                                     let mut parts: Vec<String> = Vec::with_capacity(idxs.len());
                                     for i in 0..idxs.len() {
                                         if let Some(v) = self

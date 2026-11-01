@@ -1750,7 +1750,13 @@ impl Simulator {
     /// Copy element `si` of queue `src_obj` onto element `di` of `dst_obj`,
     /// member-wise when the element is an unpacked struct (a single packed copy
     /// would lose every member — the struct has no container signal).
-    pub(super) fn queue_copy_elem(&mut self, src_obj: &str, si: u64, dst_obj: &str, di: u64) {
+    pub(super) fn queue_copy_elem(
+        &mut self,
+        src_obj: &str,
+        si: impl std::fmt::Display,
+        dst_obj: &str,
+        di: u64,
+    ) {
         let (src, dst) = (
             format!("{}[{}]", src_obj, si),
             format!("{}[{}]", dst_obj, di),
