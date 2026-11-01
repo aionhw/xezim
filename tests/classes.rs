@@ -199,6 +199,8 @@ mod compiled_method_collection_calls;
 mod compiled_method_enum_formals;
 #[path = "classes/compiled_method_ref_formals.rs"]
 mod compiled_method_ref_formals;
+#[path = "classes/ref_formal_array_of_collections_row.rs"]
+mod ref_formal_array_of_collections_row;
 #[path = "classes/compiled_method_string_members.rs"]
 mod compiled_method_string_members;
 

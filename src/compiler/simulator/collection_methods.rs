@@ -2075,6 +2075,20 @@ impl Simulator {
     /// `@q#7`), or a member chain `obj.q` / `a.b.q` mapped to the owning
     /// object's `<handle>#q` storage. `None` when `arg` names no collection.
     pub(super) fn queue_actual_storage(&mut self, arg: &Expression) -> Option<String> {
+        // An element of a fixed array of queues / dynamic arrays
+        // (`sub_program[hart]`).
+        let indexed = match &arg.kind {
+            ExprKind::Index { .. } => self
+                .class_array_of_coll_key(arg)
+                .or_else(|| self.indexed_coll_name_gated(arg)),
+            ExprKind::Ident(h) if h.path.last().is_some_and(|s| !s.selects.is_empty()) => {
+                self.selected_ident_coll_name(arg)
+            }
+            _ => None,
+        };
+        if let Some(n) = indexed.filter(|n| self.module.dynamic_arrays.contains(n)) {
+            return Some(n);
+        }
         let cname = match &arg.kind {
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 let mut n = self.resolve_hier_name(h);
