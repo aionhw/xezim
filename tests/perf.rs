@@ -47,3 +47,6 @@ mod condition_waiter_gate;
 
 #[path = "perf/eqc_branch.rs"]
 mod eqc_branch;
+
+#[path = "perf/struct_resolver_compiled.rs"]
+mod struct_resolver_compiled;

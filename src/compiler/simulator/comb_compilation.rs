@@ -356,6 +356,42 @@ impl Simulator {
                 }
             })
         {
+            // §7.2: a member target written as a member access on a plain
+            // name (`n.V`, the form the nettype pass emits for a struct net)
+            // is the member's own leaf signal. Name it so before compiling:
+            // the width inference otherwise took the access for a 32-bit
+            // integral target and converted a `real` member's value.
+            if let ExprKind::MemberAccess { expr: base, member } = &ca.lhs.kind
+                && let ExprKind::Ident(h) = &base.kind
+                && h.root.is_none()
+                && h.path.iter().all(|s| s.selects.is_empty())
+            {
+                let leaf = format!(
+                    "{}.{}",
+                    h.path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                    member.name
+                );
+                if self.signal_name_to_id.contains_key(leaf.as_str()) {
+                    let span = ca.lhs.span;
+                    ca.lhs = Expression::new(
+                        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                            root: None,
+                            path: vec![crate::ast::expr::HierPathSegment {
+                                name: crate::ast::Identifier { name: leaf, span },
+                                selects: Vec::new(),
+                            }],
+                            span,
+                            cached_signal_id: std::cell::Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        }),
+                        span,
+                    );
+                }
+            }
             let explicit_delay = ca.delay;
             // Captured before `ca.lhs` may be moved into the CombItem below.
             let ca_span = ca.lhs.span;
