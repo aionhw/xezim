@@ -358,6 +358,8 @@ mod issue4_coupled_constraints;
 mod ivtest_class_struct_cluster;
 #[path = "classes/local_shadows_sig.rs"]
 mod local_shadows_sig;
+#[path = "classes/scalar_local_shadows_collection.rs"]
+mod scalar_local_shadows_collection;
 #[path = "classes/localparam_class_not_parameterized.rs"]
 mod localparam_class_not_parameterized;
 #[path = "classes/method_default_this_call.rs"]
