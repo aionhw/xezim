@@ -17,6 +17,7 @@ pub mod prof_sampler;
 pub(crate) mod scoped_arrays;
 pub mod simulator;
 pub mod soa;
+pub(crate) mod struct_sra;
 pub mod ts_jit;
 
 pub use arena::{Arena, ArenaGuard, ArenaVec};

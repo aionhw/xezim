@@ -587,3 +587,6 @@ mod checkpoint_save_restore;
 mod block_local_array_for_loop;
 #[path = "misc/array_formal_element_types.rs"]
 mod array_formal_element_types;
+
+#[path = "misc/struct_resolver_scalarized.rs"]
+mod struct_resolver_scalarized;

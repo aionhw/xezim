@@ -2017,6 +2017,9 @@ pub struct BytecodeCompiler<'a> {
     /// and narrows the fallback to just the inner $write/$display.
     tasks: Option<&'a HashMap<String, TaskDeclaration>>,
     functions: Option<&'a HashMap<String, FunctionDeclaration>>,
+    /// A scalarized stand-in for the next `compile_pure_call`'s callee (see
+    /// `compile_struct_member_call`); taken at the function-table lookup.
+    struct_call_fd: Option<FunctionDeclaration>,
     dpi_import_fds: Option<std::rc::Rc<HashMap<String, FunctionDeclaration>>>,
     inlining_stack: Vec<String>,
     pub tasks_inlined: u32,
@@ -2282,6 +2285,7 @@ impl<'a> BytecodeCompiler<'a> {
             allow_expr_fallback: false,
             tasks: None,
             functions: None,
+            struct_call_fd: None,
             dpi_import_fds: None,
             inlining_stack: Vec::new(),
             tasks_inlined: 0,
@@ -3117,6 +3121,63 @@ impl<'a> BytecodeCompiler<'a> {
         f.contains_key(&qualified).then_some(qualified)
     }
 
+    /// `f(args).m` for a pure `f` returning an unpacked struct of scalars:
+    /// inline the scalarized function for member `m` (`struct_sra`). None
+    /// leaves the emitted code and the bail reason as they were.
+    fn compile_struct_member_call(
+        &mut self,
+        func: &Expression,
+        args: &[Expression],
+        member: &str,
+    ) -> Option<RegId> {
+        use crate::ast::types::{DataType, StructUnionKind};
+        let ExprKind::Ident(h) = &func.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let name = self.scoped_callee_name(h.path[0].name.name.clone())?;
+        let fd = self.functions?.get(&name)?;
+        let scope = Some(name.as_str());
+        let members = |dt: &DataType| -> Option<super::struct_sra::Members> {
+            let DataType::Struct(su) = self.resolved_decl_type(dt, scope) else {
+                return None;
+            };
+            if su.packed || !matches!(su.kind, StructUnionKind::Struct) {
+                return None;
+            }
+            let mut out = Vec::new();
+            for m in &su.members {
+                let scalar = !matches!(
+                    self.resolved_decl_type(&m.data_type, scope),
+                    DataType::Struct(_)
+                ) && (self.decl_is_real(&m.data_type, scope)
+                    || (1..=64).contains(&self.decl_width_in(&m.data_type, scope)));
+                for d in &m.declarators {
+                    if !scalar || !d.dimensions.is_empty() {
+                        return None;
+                    }
+                    out.push((d.name.name.clone(), m.data_type.clone()));
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        };
+        let (sfd, sargs) = super::struct_sra::scalarize_member_call(fd, args, member, &members)?;
+        let start = self.insns.len();
+        let next = self.next_reg;
+        let saved_reason = self.bail_reason;
+        self.struct_call_fd = Some(sfd);
+        let r = self.compile_pure_call(func, &sargs);
+        self.struct_call_fd = None;
+        if r.is_none() {
+            self.truncate_insns(start);
+            self.next_reg = next;
+            self.bail_reason = saved_reason;
+        }
+        r
+    }
+
     /// Try to inline a zero-arg, non-blocking user task's body at this
     /// call site. Returns true if successfully inlined.
     /// Inline a call to a pure combinational function, yielding the register
@@ -3226,9 +3287,17 @@ impl<'a> BytecodeCompiler<'a> {
             self.bail("Expr_Call_dpi");
             return None;
         }
-        let Some(fd) = self.functions.and_then(|f| f.get(&name)).cloned() else {
-            self.bail("Expr_Call");
-            return None;
+        // A scalarized stand-in (`compile_struct_member_call`) is never
+        // delegated: its formals are not the declared function's.
+        let (fd, scalarized) = match self.struct_call_fd.take() {
+            Some(fd) => (fd, true),
+            None => {
+                let Some(fd) = self.functions.and_then(|f| f.get(&name)).cloned() else {
+                    self.bail("Expr_Call");
+                    return None;
+                };
+                (fd, false)
+            }
         };
         // §13.5.4 named actuals (`.re(expr)`) normalize to positional order
         // (with §13.5.3 defaults filled) so every path below — delegation and
@@ -3286,6 +3355,7 @@ impl<'a> BytecodeCompiler<'a> {
                 )
             });
             if self.method_mode
+                && !scalarized
                 && input_only_scalar
                 && arity_le
                 && (has_string_port || !fn_pure(self))
@@ -16087,6 +16157,14 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             },
             ExprKind::MemberAccess { expr: base, member } => {
+                // §6.6.7/§7.2: a member of a pure function's unpacked-struct
+                // result (`res('{...}).V`, every struct nettype's resolved
+                // value) inlines over scalars.
+                if let ExprKind::Call { func, args } = &base.kind
+                    && let Some(r) = self.compile_struct_member_call(func, args, &member.name)
+                {
+                    return Some(r);
+                }
                 // class-perf method-mode: `this.<member>`/`<classlocal>.<member>`
                 // is an OBJECT-field read off the heap, not a hierarchical
                 // signal. Only the literal `this` keyword or a method-local
