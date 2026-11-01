@@ -1281,19 +1281,22 @@ impl Simulator {
             // ~40 µs per tick, most of a 5 GHz-clock UVM run. A gated
             // waiter (`cond_gate_for`) is skipped until one of the names it
             // reads is written.
-            let parked = std::mem::take(&mut self.condition_waiters);
+            let mut parked = std::mem::take(&mut self.condition_waiters);
             let written = take_store_writes();
-            let mut still_parked: Vec<(usize, ProcCont)> = Vec::new();
-            for (cpid, cont) in parked {
-                if let Some(Some(bits)) = self.cond_waiter_gate.get(&cpid) {
-                    if !bits.iter().any(|&b| written & b == b) {
-                        still_parked.push((cpid, cont));
-                        continue;
+            // Decide first, then move only the woken entries out: the ones
+            // that stay parked keep their place and their pid counts.
+            let wake: Vec<bool> = parked
+                .iter()
+                .map(|(cpid, _)| {
+                    if let Some(Some(bits)) = self.cond_waiter_gate.get(cpid) {
+                        bits.iter().any(|&b| written & b == b)
+                    } else {
+                        !(from_repass && self.cond_repass_recheck.get(cpid) == Some(&self.time))
                     }
-                } else if from_repass && self.cond_repass_recheck.get(&cpid) == Some(&self.time) {
-                    still_parked.push((cpid, cont));
-                    continue;
-                }
+                })
+                .collect();
+            let woken = parked.take_marked(&wake);
+            for (cpid, cont) in woken {
                 if from_repass {
                     // Entries only matter for the current time slot; drop
                     // older ones so the map stays bounded.
@@ -1311,7 +1314,7 @@ impl Simulator {
                 self.event_queue.schedule(self.time, cpid, cont);
             }
             let newly = std::mem::take(&mut self.condition_waiters);
-            self.condition_waiters = still_parked;
+            self.condition_waiters = parked;
             self.condition_waiters.extend(newly);
             while self.event_queue.next_time() == Some(self.time)
                 && !self.finished

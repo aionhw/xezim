@@ -2148,6 +2148,128 @@ struct ClockingHist {
 /// Number of u64 words needed for the occupancy bitmap (256 / 64 = 4).
 const BITMAP_WORDS: usize = WHEEL_SIZE / 64;
 
+/// A list of `(pid, item)` entries that also counts each pid's entries, so
+/// "does this process wait here?" is O(1) however many processes wait.
+#[derive(Debug)]
+pub(crate) struct PidVec<T> {
+    items: Vec<(usize, T)>,
+    counts: HashMap<usize, u32>,
+}
+
+impl<T> Default for PidVec<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            counts: HashMap::default(),
+        }
+    }
+}
+
+impl<T> PidVec<T> {
+    pub(crate) fn push(&mut self, entry: (usize, T)) {
+        *self.counts.entry(entry.0).or_insert(0) += 1;
+        self.items.push(entry);
+    }
+
+    pub(crate) fn contains_pid(&self, pid: usize) -> bool {
+        self.counts.contains_key(&pid)
+    }
+
+    fn forget(counts: &mut HashMap<usize, u32>, pid: usize) {
+        if let Some(c) = counts.get_mut(&pid) {
+            *c -= 1;
+            if *c == 0 {
+                counts.remove(&pid);
+            }
+        }
+    }
+
+    pub(crate) fn remove(&mut self, index: usize) -> (usize, T) {
+        let entry = self.items.remove(index);
+        Self::forget(&mut self.counts, entry.0);
+        entry
+    }
+
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&(usize, T)) -> bool) {
+        let counts = &mut self.counts;
+        self.items.retain(|entry| {
+            let k = keep(entry);
+            if !k {
+                Self::forget(counts, entry.0);
+            }
+            k
+        });
+    }
+
+    /// Remove and return, in order, the entries whose `marked` flag is set.
+    pub(crate) fn take_marked(&mut self, marked: &[bool]) -> Vec<(usize, T)> {
+        if !marked.iter().any(|&m| m) {
+            return Vec::new();
+        }
+        let mut taken = Vec::new();
+        let items = std::mem::take(&mut self.items);
+        self.items.reserve(items.len());
+        for (entry, &m) in items.into_iter().zip(marked) {
+            if m {
+                Self::forget(&mut self.counts, entry.0);
+                taken.push(entry);
+            } else {
+                self.items.push(entry);
+            }
+        }
+        taken
+    }
+
+    pub(crate) fn extend(&mut self, entries: impl IntoIterator<Item = (usize, T)>) {
+        for entry in entries {
+            self.push(entry);
+        }
+    }
+
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, (usize, T)> {
+        self.items.iter()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+impl<T> std::ops::Index<usize> for PidVec<T> {
+    type Output = (usize, T);
+    fn index(&self, index: usize) -> &(usize, T) {
+        &self.items[index]
+    }
+}
+
+impl<T> IntoIterator for PidVec<T> {
+    type Item = (usize, T);
+    type IntoIter = std::vec::IntoIter<(usize, T)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
+
+impl<T: serde::Serialize> serde::Serialize for PidVec<T> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.items.serialize(s)
+    }
+}
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for PidVec<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut v = Self::default();
+        for entry in Vec::<(usize, T)>::deserialize(d)? {
+            v.push(entry);
+        }
+        Ok(v)
+    }
+}
+
 /// A suspended process's remaining work: a shared statement list plus a cursor,
 /// chained to whatever runs after that list is exhausted.
 ///
@@ -8575,10 +8697,10 @@ pub struct Simulator {
     /// (pid + continuation whose first stmt is the Wait) and is re-checked in a
     /// fixpoint after the same-time batch drains, suspending until the
     /// condition genuinely flips instead of falsely proceeding.
-    condition_waiters: Vec<(usize, ProcCont)>,
+    condition_waiters: PidVec<ProcCont>,
     /// Waiters from `condition_waiters` whose conditions became true upon
     /// blocking writes, recorded in write-satisfaction order (§9.7.4).
-    ready_condition_waiters: Vec<(usize, ProcCont)>,
+    ready_condition_waiters: PidVec<ProcCont>,
     /// Ident/member names read by the wait condition of each parked waiter.
     cond_waiter_reads: HashMap<usize, HashSet<String>>,
     /// Wait condition expression for each parked waiter.

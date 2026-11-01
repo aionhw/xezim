@@ -17,10 +17,10 @@ impl Simulator {
         if self.event_waiters.iter().any(|w| w.pid == pid) {
             return true;
         }
-        if self.condition_waiters.iter().any(|(p, _)| *p == pid) {
+        if self.condition_waiters.contains_pid(pid) {
             return true;
         }
-        if self.ready_condition_waiters.iter().any(|(p, _)| *p == pid) {
+        if self.ready_condition_waiters.contains_pid(pid) {
             return true;
         }
         // A process parked by `#0` in the Inactive-region queue (§4.4.2.3)
