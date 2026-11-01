@@ -8870,6 +8870,14 @@ pub struct Simulator {
     /// See `nonvirtual_target_class`.
     #[allow(clippy::type_complexity)]
     nonvirtual_target_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
+    /// `class_is_a` answer cache: (derived, base) -> bool.
+    class_is_a_cache: std::cell::RefCell<HashMap<(String, String), bool>>,
+    /// `resolve_interface_port` answer cache: raw name -> bound string.
+    interface_resolve_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
+    /// `canonicalize_spec_sig` cache: (class_name, sig) -> canonical signature.
+    spec_sig_cache: std::cell::RefCell<HashMap<(String, String), String>>,
+    /// Whether any class definition in the design has an N-D array property.
+    has_any_array_nd_properties: std::cell::Cell<Option<bool>>,
     /// `class_has_method` answers by class then method (see there).
     has_method_cache: std::cell::RefCell<HashMap<String, HashMap<String, bool>>>,
     /// See `member_string_keyed_unbound`.

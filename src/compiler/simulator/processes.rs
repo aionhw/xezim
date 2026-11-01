@@ -1190,7 +1190,6 @@ impl Simulator {
         let mut saved = self.take_process_context();
         let ctx = self.process_contexts.remove(&pid).unwrap_or_default();
         let sibling_baseline = self.fork_baselines.get(&pid).cloned();
-        let mut sibling_scopes = self.fork_local_scopes.get(&pid).cloned().unwrap_or_default();
         let fork_parent = self.process_parents.get(&pid).copied();
         self.restore_process_context(ctx);
         self.run_process_payload(pid, stmts);
@@ -1217,7 +1216,7 @@ impl Simulator {
         //       into `self.signals`, which is what the parent reads from.
         let child_frames: &[HashMap<String, Value>] = &child_ctx.local_stack;
         let child_frames_gen: &[u64] = &child_ctx.local_gen_stack;
-        let baseline = self.fork_baselines.get(&pid).map(Arc::as_ref);
+        let baseline = sibling_baseline.as_deref();
         let signal_caps = self.fork_signal_captures.get(&pid);
         // Parent-frame keys the child's writes reached, for the wake below.
         let mut written: Vec<String> = Vec::new();
@@ -1297,13 +1296,20 @@ impl Simulator {
         // Match both task activation and lexical block activation. Repeated
         // loop-block declarations share a flattened frame but not storage.
         if let Some(sibling_baseline) = &sibling_baseline {
-            Self::overlay_fork_local_scopes(&mut sibling_scopes, &child_ctx.block_scope_saves);
-            let changes: Vec<HashMap<String, Value>> = child_frames.iter().enumerate()
-                .map(|(i, frame)| frame.iter().filter(|(k, v)| {
-                    sibling_baseline.get(i).and_then(|base| base.get(*k))
-                        .is_some_and(|old| old != *v)
-                }).map(|(k, v)| (k.clone(), v.clone())).collect()).collect();
-            if changes.iter().any(|frame| !frame.is_empty()) {
+            let has_changes = child_frames.iter().enumerate().any(|(i, frame)| {
+                frame.iter().any(|(k, v)| {
+                    sibling_baseline.get(i).and_then(|base| base.get(k))
+                        .is_some_and(|old| old != v)
+                })
+            });
+            if has_changes {
+                let mut sibling_scopes = self.fork_local_scopes.get(&pid).cloned().unwrap_or_default();
+                Self::overlay_fork_local_scopes(&mut sibling_scopes, &child_ctx.block_scope_saves);
+                let changes: Vec<HashMap<String, Value>> = child_frames.iter().enumerate()
+                    .map(|(i, frame)| frame.iter().filter(|(k, v)| {
+                        sibling_baseline.get(i).and_then(|base| base.get(*k))
+                            .is_some_and(|old| old != *v)
+                    }).map(|(k, v)| (k.clone(), v.clone())).collect()).collect();
                 // Only a fork child holding one of the changed frames' own
                 // activations can receive a write (`merge_fork_writes`
                 // matches frames by generation), so visit just those, not
@@ -1319,6 +1325,12 @@ impl Simulator {
                     .collect();
                 candidates.sort_unstable();
                 candidates.dedup();
+                let has_any_block_saves = !child_ctx.block_scope_saves.is_empty()
+                    || !sibling_scopes.is_empty()
+                    || candidates.iter().any(|p| {
+                        self.fork_local_scopes.get(p).is_some_and(|s| !s.is_empty())
+                            || self.process_contexts.get(p).is_some_and(|c| !c.block_scope_saves.is_empty())
+                    });
                 for other_pid in candidates {
                     let Some(other) = self.process_contexts.get_mut(&other_pid) else {
                         continue;
@@ -1327,19 +1339,42 @@ impl Simulator {
                         continue;
                     }
                     let other_pid = &other_pid;
-                    let mut other_scopes = self.fork_local_scopes.get(other_pid).cloned().unwrap_or_default();
-                    Self::overlay_fork_local_scopes(&mut other_scopes, &other.block_scope_saves);
-                    let mut visible = changes.clone();
-                    for (i, frame) in visible.iter_mut().enumerate() {
-                        let frame_generation = child_frames_gen.get(i).copied().unwrap_or(0);
-                        frame.retain(|key, _| {
-                            sibling_scopes.get(&frame_generation).and_then(|m| m.get(key))
-                                == other_scopes.get(&frame_generation).and_then(|m| m.get(key))
-                        });
-                    }
+                    let visible_storage;
+                    let visible: &[HashMap<String, Value>] = if !has_any_block_saves {
+                        &changes
+                    } else {
+                        let base_scopes = self.fork_local_scopes.get(other_pid);
+                        let has_other_blocks = !other.block_scope_saves.is_empty();
+                        let (other_scopes_storage, other_scopes_ref) = if has_other_blocks {
+                            let mut sc = base_scopes.cloned().unwrap_or_default();
+                            Self::overlay_fork_local_scopes(&mut sc, &other.block_scope_saves);
+                            (Some(sc), None)
+                        } else {
+                            (None, base_scopes)
+                        };
+                        let lookup_other = |f_gen: &u64, key: &str| -> Option<u64> {
+                            if let Some(sc) = &other_scopes_storage {
+                                sc.get(f_gen).and_then(|m| m.get(key)).copied()
+                            } else if let Some(sc) = other_scopes_ref {
+                                sc.get(f_gen).and_then(|m| m.get(key)).copied()
+                            } else {
+                                None
+                            }
+                        };
+                        let mut filtered = changes.clone();
+                        for (i, frame) in filtered.iter_mut().enumerate() {
+                            let frame_generation = child_frames_gen.get(i).copied().unwrap_or(0);
+                            frame.retain(|key, _| {
+                                sibling_scopes.get(&frame_generation).and_then(|m| m.get(key)).copied()
+                                    == lookup_other(&frame_generation, key)
+                            });
+                        }
+                        visible_storage = filtered;
+                        &visible_storage
+                    };
                     let updates = Self::merge_fork_writes(
                         &mut other.local_stack, &other.local_gen_stack,
-                        &visible, child_frames_gen, None,
+                        visible, child_frames_gen, None,
                     );
                     // The sibling now holds these values: a later write of
                     // the value it held at the fork is a write too.

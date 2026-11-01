@@ -827,22 +827,6 @@ impl Simulator {
     /// when a segment is not a plain property, so the general paths decide.
     #[inline(never)]
     pub(super) fn frame_handle_path_read(&self, expr: &Expression) -> Option<Value> {
-        fn names<'a>(e: &'a Expression, out: &mut Vec<&'a str>) -> Option<()> {
-            match &e.kind {
-                ExprKind::Ident(h)
-                    if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) =>
-                {
-                    out.extend(h.path.iter().map(|s| s.name.name.as_str()));
-                    Some(())
-                }
-                ExprKind::MemberAccess { expr, member } => {
-                    names(expr, out)?;
-                    out.push(member.name.as_str());
-                    Some(())
-                }
-                _ => None,
-            }
-        }
         let root = match &expr.kind {
             ExprKind::Ident(h) if h.path.len() >= 2 => h.path[0].name.name.as_str(),
             ExprKind::MemberAccess { .. } => {
@@ -874,15 +858,38 @@ impl Simulator {
                 return None;
             }
         }
-        let mut cls = cls.to_string();
-        let mut path = Vec::new();
-        names(expr, &mut path)?;
-        let segs = &path[1..];
+        let mut path: [&str; 8] = [""; 8];
+        let mut path_len = 0;
+        fn collect_names<'a>(e: &'a Expression, out: &mut [&'a str; 8], len: &mut usize) -> Option<()> {
+            match &e.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) =>
+                {
+                    for s in &h.path {
+                        if *len >= 8 { return None; }
+                        out[*len] = s.name.name.as_str();
+                        *len += 1;
+                    }
+                    Some(())
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    collect_names(expr, out, len)?;
+                    if *len >= 8 { return None; }
+                    out[*len] = member.name.as_str();
+                    *len += 1;
+                    Some(())
+                }
+                _ => None,
+            }
+        }
+        collect_names(expr, &mut path, &mut path_len)?;
+        let segs = &path[1..path_len];
+        let mut cur_cls: &str = cls;
         for (i, seg) in segs.iter().enumerate() {
             // §8.10 / §8.14: the member is the one the handle's DECLARED
             // class sees. A static, or a property the object's class
             // re-declares, is stored elsewhere — the general paths decide.
-            let decl = self.prop_owners(&cls);
+            let decl = self.prop_owners(cur_cls);
             let (owner, cd) = decl.get(*seg)?;
             if cd.static_properties.contains(*seg) {
                 return None;
@@ -895,9 +902,10 @@ impl Simulator {
             if i + 1 == segs.len() {
                 return Some(v.clone());
             }
-            cls = self
+            let next_cls = self
                 .class_prop_type_named(owner, seg)
                 .filter(|t| self.module.classes.contains_key(t))?;
+            cur_cls = self.module.classes.get_key_value(&next_cls)?.0.as_str();
             h = v.to_u64()? as usize;
         }
         None
@@ -1678,12 +1686,16 @@ impl Simulator {
             v
         };
         if let Some(dst) = &lflat {
-            let su_opt = self.module.var_decl_types.get(dst).cloned().and_then(|dt| {
-                match self.resolve_dt(&dt) {
-                    DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
-                    _ => None,
-                }
-            });
+            let su_opt = if !self.struct_root_possible(dst) {
+                None
+            } else {
+                self.module.var_decl_types.get(dst).cloned().and_then(|dt| {
+                    match self.resolve_dt(&dt) {
+                        DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
+                        _ => None,
+                    }
+                })
+            };
             if let Some(su) = su_opt {
                 let dst = dst.clone();
                 if let Some(src) = eval_rflat(self, &mut rflat_cache)

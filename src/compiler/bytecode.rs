@@ -403,6 +403,8 @@ pub enum Insn {
     LoadSignalSigned(RegId, SigId),
     /// Load a value from the active process's innermost local frame.
     LoadProcessLocal(RegId, Box<str>),
+    /// §9.7: Query the status of a process from its handle.
+    LoadProcessStatus(RegId, RegId),
     /// Resize register to given width.
     Resize(RegId, u32),
 
@@ -1360,6 +1362,7 @@ impl Insn {
             // non-offsettable (side effects / interpreter re-entry).
             LoadClassStatic(a, _) => *a += rb,
             LoadProcessLocal(..)
+            | LoadProcessStatus(..)
             | Format(..)
             | CaseMaskJump(..)
             | StmtFallback(..)
@@ -1391,6 +1394,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::LoadSignal(..) => "Load",
         Insn::LoadSignalSigned(..) => "LoadS",
         Insn::LoadProcessLocal(..) => "LoadLocal",
+        Insn::LoadProcessStatus(..) => "ProcStatus",
         Insn::Resize(..) => "Resize",
         Insn::Add(..) => "Add",
         Insn::Sub(..) => "Sub",
@@ -5903,6 +5907,7 @@ impl<'a> BytecodeCompiler<'a> {
                 let m = member.name.as_str();
                 let loadable =
                     !(self.class_shadow_names.contains(m) && !self.member_safe_names.contains(m));
+            && !self.member_safe_names.contains(m));
                 loadable && self.method_handle_chain_ok(inner)
             }
             crate::ast::expr::ExprKind::Index { .. } => {
@@ -16721,6 +16726,17 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(dest) = self.compile_formal_struct_member(expr) {
                     return Some(dest);
                 }
+                // §9.7: `p.status` / `p.status()` on a process handle
+                if member.name == "status"
+                    && self
+                        .method_handle_chain_class(base)
+                        .is_some_and(|cls| cls == "process")
+                {
+                    let handle_reg = self.compile_expr(base, 0)?;
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::LoadProcessStatus(dest, handle_reg));
+                    return Some(dest);
+                }
                 // class-perf method-mode: `this.<member>`/`<classlocal>.<member>`
                 // is an OBJECT-field read off the heap, not a hierarchical
                 // signal. Only the literal `this` keyword or a method-local
@@ -21473,6 +21489,9 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::Format(_, fs) => fs.args.iter().for_each(|&a| f(a)),
             Insn::StrOp(_, _, args) => args.iter().for_each(|&a| f(a)),
             Insn::BlockingAssignString(_, v) => f(*v),
+            Insn::LoadProcessStatus(_d, h) => {
+                f(*h);
+            }
             Insn::LoadSignalRangeDyn(_, _, lo, _) => f(*lo),
             Insn::LoadConst(..)
             | Insn::LoadSignal(..)
@@ -21978,6 +21997,7 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::LoadSignal(d, _)
             | Insn::LoadSignalSigned(d, _)
             | Insn::LoadProcessLocal(d, _)
+            | Insn::LoadProcessStatus(d, _)
             | Insn::LoadSignalRange(d, _, _, _)
             | Insn::LoadSignalBit(d, _, _)
             | Insn::LoadSignalRangeDyn(d, _, _, _)
@@ -22827,6 +22847,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::LoadSignal(d, _)
                 | Insn::LoadSignalSigned(d, _)
                 | Insn::LoadProcessLocal(d, _)
+                | Insn::LoadProcessStatus(d, _)
                 | Insn::Resize(d, _)
                 | Insn::Add(d, _, _)
                 | Insn::Sub(d, _, _)
@@ -23457,6 +23478,7 @@ impl<'a> BytecodeCompiler<'a> {
                     store(&mut rw, *d, f);
                 }
                 Insn::LoadProcessLocal(d, _) => store(&mut rw, *d, None),
+                Insn::LoadProcessStatus(d, _) => store(&mut rw, *d, Some((32, true))),
                 // `Value::bit_select` is 1 bit on every path, including the
                 // §11.5.1 out-of-range read.
                 Insn::LoadSignalBit(d, _, _)

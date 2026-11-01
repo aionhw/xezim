@@ -5345,7 +5345,15 @@ impl Simulator {
                 }
                 // §7.4.2: an element of an N-D fixed-array CLASS property —
                 // `obj.m[i][j]` — resolves to its per-instance cell.
-                if !self.no_class_objects() {
+                let has_nd_props = match self.has_any_array_nd_properties.get() {
+                    Some(b) => b,
+                    None => {
+                        let b = self.module.classes.values().any(|c| !c.array_nd_properties.is_empty());
+                        self.has_any_array_nd_properties.set(Some(b));
+                        b
+                    }
+                };
+                if has_nd_props && !self.no_class_objects() {
                     if let Some(nm) = self.class_nd_elem_name(expr, index) {
                         if let Some(v) = self.get_signal_value_by_name(&nm) {
                             return v;

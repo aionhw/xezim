@@ -3039,6 +3039,7 @@ impl Simulator {
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",
             Insn::LoadProcessLocal(..) => "LoadProcessLocal",
+            Insn::LoadProcessStatus(..) => "LoadProcessStatus",
             Insn::Resize(..) => "Resize",
             Insn::Add(..) => "Add",
             Insn::Sub(..) => "Sub",
