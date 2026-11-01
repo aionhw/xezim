@@ -254,3 +254,6 @@ mod assoc_locator_keys;
 
 #[path = "collections/locator_result_methods.rs"]
 mod locator_result_methods;
+
+#[path = "collections/nested_row_locators.rs"]
+mod nested_row_locators;
