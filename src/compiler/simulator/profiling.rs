@@ -883,6 +883,11 @@ impl Simulator {
         let mut unresolved = 0usize;
         self.comb_level = vec![0u32; n];
         self.comb_has_nba = vec![false; n];
+        self.comb_self_exempt = self
+            .comb_entries
+            .iter()
+            .map(CombEntry::reads_own_writes)
+            .collect();
         self.comb_par_safe = vec![false; n];
         // Writer-count pre-pass: a signal written by >1 comb entry is
         // multi-driven; entries touching such a signal CANNOT run in the
@@ -949,7 +954,8 @@ impl Simulator {
                     // par_safe only if the isolated path fully handles it, it
                     // has no deferred NBA, and all its writes are single-driver
                     // (disjoint-write safety for parallel level eval).
-                    self.comb_par_safe[i] = !has_nba && !unsupported && single_writer;
+                    self.comb_par_safe[i] =
+                        !has_nba && !unsupported && single_writer && !self.comb_self_exempt[i];
                 }
                 // AST entries always need &mut self.
                 CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {}

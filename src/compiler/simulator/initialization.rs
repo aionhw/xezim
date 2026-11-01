@@ -4428,6 +4428,7 @@ impl Simulator {
             prepared_comb_cache_path: None,
             comb_level: Vec::new(),
             comb_has_nba: Vec::new(),
+            comb_self_exempt: Vec::new(),
             comb_par_safe: Vec::new(),
             bsp_buckets: Vec::new(),
             bsp_next_seed: Vec::new(),
