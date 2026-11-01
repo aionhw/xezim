@@ -639,17 +639,18 @@ impl Simulator {
     }
 
     /// `(iface, modport)` of a specialization fragment spelling a virtual
-    /// interface type (`virtual bus_if`, `virtual I#(8).mp`, or the
-    /// `normalize_spec_ws` form `virtualbus_if`), else `None`.
+    /// interface type (`virtual bus_if`, `virtual I#(8).mp`), else `None`.
     fn vif_of_spec_frag(&self, frag: &str) -> Option<(String, Option<String>)> {
         let rest = frag.strip_prefix("virtual")?;
-        let spaced = rest.starts_with(char::is_whitespace);
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
         let rest = rest.trim();
         let end = rest
             .find(|c: char| c == '#' || c == '.' || c.is_whitespace())
             .unwrap_or(rest.len());
         let (name, tail) = rest.split_at(end);
-        if name.is_empty() || (!spaced && !self.module.interfaces.contains(name)) {
+        if name.is_empty() {
             return None;
         }
         let tail = match tail.rfind(')') {

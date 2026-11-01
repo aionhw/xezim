@@ -1246,9 +1246,9 @@ impl Simulator {
     }
 
     /// Split a virtual-interface type fragment — `virtual [interface]
-    /// I[#(args)][.modport]` in any spacing, including the whitespace-free
-    /// canonical form — into the interface name, its raw `#(...)` arguments
-    /// and the modport. None for anything else.
+    /// I[#(args)][.modport]` in any spacing, including the canonical form —
+    /// into the interface name, its raw `#(...)` arguments and the modport.
+    /// None for anything else, including a class named `virtualI`.
     pub(super) fn parse_vif_frag(
         &self,
         frag: &str,
@@ -1257,6 +1257,9 @@ impl Simulator {
             return None;
         }
         let rest = frag.trim().strip_prefix("virtual")?;
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
         let head_end = rest.find(['#', '.']).unwrap_or(rest.len());
         let head: String = rest[..head_end]
             .chars()
@@ -1306,7 +1309,7 @@ impl Simulator {
         Some((name, args, modport))
     }
 
-    /// The canonical (whitespace-free) key of `virtual name#(args).modport`
+    /// The canonical (`normalize_spec_ws`) key of `virtual name#(args).modport`
     /// (§6.22.1): named arguments moved to their slots and omitted trailing
     /// parameters filled with the interface's defaults, so `virtual I`,
     /// `virtual interface I#(int)` and `virtual I#(.T(int), .N(4))` key one
@@ -1342,7 +1345,7 @@ impl Simulator {
                 args.push(d);
             }
         }
-        let mut out = format!("virtual{}", name);
+        let mut out = format!("virtual {}", name);
         if !args.is_empty() {
             out.push_str("#(");
             out.push_str(&args.join(","));
@@ -1752,7 +1755,11 @@ impl Simulator {
                             .next()
                             .is_none_or(|c| !c.is_alphanumeric() && c != '_')
                     });
-                if integral && signing {
+                // §25.9: `virtual bus_if` is an interface type, while
+                // `virtualbus_if` can name an unrelated class.
+                let vif = word == "virtual"
+                    && tail.starts_with(|c: char| c.is_alphabetic() || c == '_');
+                if (integral && signing) || vif {
                     out.push(' ');
                 }
             } else {
