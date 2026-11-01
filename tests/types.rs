@@ -640,3 +640,5 @@ mod type_param_array_queries;
 mod logical_operand_self_determined_810;
 #[path = "types/unpacked_struct_procedural_copy.rs"]
 mod unpacked_struct_procedural_copy;
+#[path = "types/unpacked_struct_output_port_whole_write.rs"]
+mod unpacked_struct_output_port_whole_write;
