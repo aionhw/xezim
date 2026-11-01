@@ -278,3 +278,6 @@ mod nested_row_locators;
 
 #[path = "collections/string_key_order.rs"]
 mod string_key_order;
+
+#[path = "collections/review_real_assoc_store.rs"]
+mod review_real_assoc_store;

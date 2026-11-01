@@ -1044,3 +1044,9 @@ mod package_type_identity_roundtrip;
 
 #[path = "classes/review_collection_pattern_gaps.rs"]
 mod review_collection_pattern_gaps;
+
+#[path = "classes/review_compiled_method_shapes.rs"]
+mod review_compiled_method_shapes;
+
+#[path = "classes/review_event_and_frame_routing.rs"]
+mod review_event_and_frame_routing;

@@ -435,3 +435,6 @@ mod class_or_value_change;
 
 #[path = "scheduling/preprocessor_linear_join.rs"]
 mod preprocessor_linear_join;
+
+#[path = "scheduling/review_parked_wait_writes.rs"]
+mod review_parked_wait_writes;
