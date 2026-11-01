@@ -10062,9 +10062,32 @@ impl<'a> BytecodeCompiler<'a> {
                     UnaryOp::PreIncr | UnaryOp::PreDecr | UnaryOp::PostIncr | UnaryOp::PostDecr
                 ) || Self::expr_has_effect(operand)
             }
+            // Seeded generators advance their seed; the others write an
+            // argument or move a file position.
             ExprKind::SystemCall { name, args } => {
-                matches!(name.as_str(), "$urandom" | "$random" | "$urandom_range")
-                    || args.iter().any(Self::expr_has_effect)
+                matches!(
+                    name.as_str(),
+                    "$urandom"
+                        | "$random"
+                        | "$urandom_range"
+                        | "$cast"
+                        | "$sscanf"
+                        | "$fscanf"
+                        | "$fgets"
+                        | "$fgetc"
+                        | "$ungetc"
+                        | "$fread"
+                        | "$value$plusargs"
+                        | "$fopen"
+                        | "$system"
+                        | "$dist_uniform"
+                        | "$dist_normal"
+                        | "$dist_exponential"
+                        | "$dist_poisson"
+                        | "$dist_chi_square"
+                        | "$dist_t"
+                        | "$dist_erlang"
+                ) || args.iter().any(Self::expr_has_effect)
             }
             ExprKind::Paren(x) | ExprKind::MemberAccess { expr: x, .. } => Self::expr_has_effect(x),
             ExprKind::Binary { left, right, .. } => {
