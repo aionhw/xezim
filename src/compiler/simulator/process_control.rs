@@ -71,7 +71,7 @@ impl Simulator {
         // `InstanceEventWaiter`. Without this a `fork...join_any` whose child
         // is the `@m_event` waiter (e.g. event abort branch) fired
         // the join prematurely, killing the loop branch.
-        if self.instance_event_waiters.iter().any(|w| w.pid == pid) {
+        if self.instance_event_waiters.contains_pid(pid) {
             return true;
         }
         // §15.4.1: a producer parked on a FULL bounded mailbox, and §15.3.3 a
@@ -197,8 +197,7 @@ impl Simulator {
             self.event_queue.remove_pid(p);
         }
         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
-        self.instance_event_waiters
-            .retain(|w| !to_kill.contains(&w.pid));
+        self.instance_event_waiters.remove_pids(to_kill.iter());
         self.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
         self.ready_condition_waiters
             .retain(|(p, _)| !to_kill.contains(p));

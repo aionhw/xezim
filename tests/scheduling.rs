@@ -264,6 +264,8 @@ mod always_value_change_after_edge_continuation;
 mod bare_randomize_in_method;
 #[path = "scheduling/class_event_member_wait.rs"]
 mod class_event_member_wait;
+#[path = "scheduling/class_event_parked_watchers.rs"]
+mod class_event_parked_watchers;
 #[path = "scheduling/class_nonevent_prop_wait.rs"]
 mod class_nonevent_prop_wait;
 #[path = "scheduling/clock_gen_dotted_target.rs"]

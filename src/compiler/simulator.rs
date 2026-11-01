@@ -2106,20 +2106,124 @@ enum InstanceEventKeys {
     Any(Vec<(usize, String)>),
 }
 
-impl InstanceEventKeys {
-    fn contains(&self, key: &(usize, String)) -> bool {
-        match self {
-            Self::One(own) => own == key,
-            Self::Any(keys) => keys.contains(key),
-        }
-    }
-}
-
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct InstanceEventWaiter {
     key: InstanceEventKeys,
     pid: usize,
     continuation: ProcCont,
+}
+
+/// The parked `@ev` waiters on class-member events, indexed by event and by
+/// pid. A process parked forever on a rarely-fired event (a reset watcher
+/// left behind by `fork ... join_any`) costs nothing per trigger of another
+/// event or per suspension query; entries keep their arrival order, so a
+/// trigger still wakes its waiters in the order they parked.
+#[derive(Default)]
+struct InstanceEventWaiters {
+    entries: BTreeMap<u64, InstanceEventWaiter>,
+    by_key: HashMap<(usize, String), std::collections::BTreeSet<u64>>,
+    by_pid: HashMap<usize, Vec<u64>>,
+    next: u64,
+}
+
+impl InstanceEventWaiters {
+    fn keys_of(w: &InstanceEventWaiter) -> &[(usize, String)] {
+        match &w.key {
+            InstanceEventKeys::One(k) => std::slice::from_ref(k),
+            InstanceEventKeys::Any(ks) => ks,
+        }
+    }
+
+    fn push(&mut self, w: InstanceEventWaiter) {
+        let seq = self.next;
+        self.next += 1;
+        for k in Self::keys_of(&w) {
+            self.by_key.entry(k.clone()).or_default().insert(seq);
+        }
+        self.by_pid.entry(w.pid).or_default().push(seq);
+        self.entries.insert(seq, w);
+    }
+
+    fn contains_pid(&self, pid: usize) -> bool {
+        self.by_pid.contains_key(&pid)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn unlink(&mut self, seq: u64, w: &InstanceEventWaiter) {
+        for k in Self::keys_of(w) {
+            if let Some(set) = self.by_key.get_mut(k) {
+                set.remove(&seq);
+                if set.is_empty() {
+                    self.by_key.remove(k);
+                }
+            }
+        }
+        if let Some(seqs) = self.by_pid.get_mut(&w.pid) {
+            seqs.retain(|&s| s != seq);
+            if seqs.is_empty() {
+                self.by_pid.remove(&w.pid);
+            }
+        }
+    }
+
+    /// Drop every waiter of `pid` (the process was killed or disabled).
+    fn remove_pid(&mut self, pid: usize) {
+        let Some(seqs) = self.by_pid.remove(&pid) else {
+            return;
+        };
+        for seq in seqs {
+            if let Some(w) = self.entries.remove(&seq) {
+                for k in Self::keys_of(&w) {
+                    if let Some(set) = self.by_key.get_mut(k) {
+                        set.remove(&seq);
+                        if set.is_empty() {
+                            self.by_key.remove(k);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn remove_pids<'a>(&mut self, pids: impl IntoIterator<Item = &'a usize>) {
+        for &pid in pids {
+            self.remove_pid(pid);
+        }
+    }
+
+    /// Remove and return, in parking order, every waiter on `key`.
+    fn take_key(&mut self, key: &(usize, String)) -> Vec<(usize, ProcCont)> {
+        let Some(seqs) = self.by_key.remove(key) else {
+            return Vec::new();
+        };
+        let mut woken = Vec::with_capacity(seqs.len());
+        for seq in seqs {
+            if let Some(w) = self.entries.remove(&seq) {
+                self.unlink(seq, &w);
+                woken.push((w.pid, w.continuation));
+            }
+        }
+        woken
+    }
+}
+
+impl serde::Serialize for InstanceEventWaiters {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(self.entries.values())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for InstanceEventWaiters {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut waiters = Self::default();
+        for w in Vec::<InstanceEventWaiter>::deserialize(d)? {
+            waiters.push(w);
+        }
+        Ok(waiters)
+    }
 }
 
 /// Timing wheel for O(1) near-future event scheduling.
@@ -8804,7 +8908,7 @@ pub struct Simulator {
     /// Processes parked on a class-field named event (`@m_event` inside a
     /// method on `this`). Woken directly by `fire_instance_event` when the
     /// matching `->m_event` runs; see `InstanceEventWaiter`.
-    instance_event_waiters: Vec<InstanceEventWaiter>,
+    instance_event_waiters: InstanceEventWaiters,
     /// Monotonic epoch bumped each time a LATE-region resume (Re-NBA waiters,
     /// reactive initials, deferred clocking continuations) runs a continuation
     /// inline. The run_one_tick tail watches it to know those resumes produced

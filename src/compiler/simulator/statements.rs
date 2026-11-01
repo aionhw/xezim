@@ -5637,8 +5637,7 @@ impl Simulator {
                             self.event_queue.remove_pid(pid);
                         }
                         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
-                        self.instance_event_waiters
-                            .retain(|w| !to_kill.contains(&w.pid));
+                        self.instance_event_waiters.remove_pids(to_kill.iter());
                         for q in self.mailbox_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
                         }
@@ -5667,7 +5666,7 @@ impl Simulator {
                         self.process_contexts.remove(&pid);
                         self.event_queue.remove_pid(pid);
                         self.event_waiters.retain(|w| w.pid != pid);
-                        self.instance_event_waiters.retain(|w| w.pid != pid);
+                        self.instance_event_waiters.remove_pid(pid);
                         for q in self.mailbox_get_waiters.values_mut() {
                             q.retain(|w| w.pid != pid);
                         }
@@ -5722,8 +5721,7 @@ impl Simulator {
                             self.event_queue.remove_pid(pid);
                         }
                         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
-                        self.instance_event_waiters
-                            .retain(|w| !to_kill.contains(&w.pid));
+                        self.instance_event_waiters.remove_pids(to_kill.iter());
                         for q in self.mailbox_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
                         }
@@ -5768,8 +5766,7 @@ impl Simulator {
                     self.event_queue.remove_pid(pid);
                 }
                 self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
-                self.instance_event_waiters
-                    .retain(|w| !to_kill.contains(&w.pid));
+                self.instance_event_waiters.remove_pids(to_kill.iter());
                 for q in self.mailbox_get_waiters.values_mut() {
                     q.retain(|w| !to_kill.contains(&w.pid));
                 }

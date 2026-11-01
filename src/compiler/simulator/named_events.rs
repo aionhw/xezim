@@ -1256,15 +1256,7 @@ impl Simulator {
                 self.sample_event_covergroups(w);
             }
         }
-        let mut woken = Vec::new();
-        self.instance_event_waiters.retain(|w| {
-            if w.key.contains(key) {
-                woken.push((w.pid, w.continuation.clone()));
-                false
-            } else {
-                true
-            }
-        });
+        let woken = self.instance_event_waiters.take_key(key);
         for (pid, cont) in woken {
             self.event_queue.schedule(now, pid, cont);
         }
@@ -1512,15 +1504,7 @@ impl Simulator {
             let now = self.time;
             // Its `.triggered` stamp, kept apart per activation like the wait.
             self.event_triggered_time.insert(key.1.clone(), now);
-            let mut woken = Vec::new();
-            self.instance_event_waiters.retain(|w| {
-                if w.key.contains(&key) {
-                    woken.push((w.pid, w.continuation.clone()));
-                    false
-                } else {
-                    true
-                }
-            });
+            let woken = self.instance_event_waiters.take_key(&key);
             for (pid, cont) in woken {
                 self.event_queue.schedule(now, pid, cont);
             }

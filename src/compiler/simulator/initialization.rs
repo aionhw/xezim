@@ -4335,7 +4335,7 @@ impl Simulator {
             vc_saved: HashMap::default(),
             event_triggered_time: EventStampStore::default(),
             event_waiters: Vec::new(),
-            instance_event_waiters: Vec::new(),
+            instance_event_waiters: InstanceEventWaiters::default(),
             late_resume_epoch: 0,
             fe_trusted_types: HashSet::default(),
             pid_src_file: HashMap::default(),
