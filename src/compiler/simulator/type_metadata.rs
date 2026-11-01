@@ -222,6 +222,22 @@ impl Simulator {
         frames.iter().rev().find_map(|(_, t)| t.get(name).cloned())
     }
 
+    /// The typedef `name` has in the innermost active frame that declares
+    /// it, None when that frame gives it none (a class-handle formal). Unlike
+    /// `local_typedef_type_of`, a callee's formal hides a caller's same-named
+    /// enum local.
+    pub(super) fn declaring_frame_typedef_of(&self, name: &str) -> Option<String> {
+        let base = self.method_local_base.last().copied().unwrap_or(0);
+        let top = self.local_stack.len().min(self.local_type_stack.len());
+        (base..top)
+            .rev()
+            .find(|&i| {
+                self.local_stack[i].contains_key(name)
+                    || self.local_type_stack[i].1.contains_key(name)
+            })
+            .and_then(|i| self.local_type_stack[i].1.get(name).cloned())
+    }
+
     /// Push a local frame, keeping the type overlay in lockstep.
     /// Monotonic frame-generation source for `local_gen_stack`. Each pushed
     /// frame slot gets a distinct generation so separate activations that
@@ -797,7 +813,7 @@ impl Simulator {
         let declared_td = if self.local_stack.is_empty() {
             self.var_typedef_types.get(name).cloned()
         } else {
-            self.local_typedef_type_of(name)
+            self.declaring_frame_typedef_of(name)
         };
         if declared_td
             .as_ref()
