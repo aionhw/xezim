@@ -1373,6 +1373,30 @@ impl Simulator {
         self.module.classes.contains_key(&cls).then_some(cls)
     }
 
+    /// The named index type of associative array `arr` (an enum, a class, a
+    /// typedef), from the frame overlay, the module map or, for a class
+    /// member store `<handle>#<member>`, the member's declaring class.
+    pub(super) fn assoc_key_type_name(&self, arr: &str) -> Option<String> {
+        let local_kt = self.local_typedef_type_of(&format!("{}[]", arr));
+        if local_kt.as_deref() == Some("") {
+            return None;
+        }
+        if let Some(kt) = local_kt.or_else(|| self.module.assoc_key_type_names.get(arr).cloned()) {
+            return Some(kt);
+        }
+        let (h, member) = arr.split_once('#')?;
+        let inst = self.heap.get(h.parse::<usize>().ok()?)?.as_ref()?;
+        let mut cur = Some(inst.class_name.as_str());
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(cn)?;
+            if let Some(kt) = cd.assoc_key_types.get(member) {
+                return Some(kt.clone());
+            }
+            cur = cd.extends.as_deref();
+        }
+        None
+    }
+
     /// Like [`Self::assoc_key_class_of_arr`], but falls back to the
     /// receiver-relative class walk — for a loop inside a class method the
     /// key type lives on the property's declaring class

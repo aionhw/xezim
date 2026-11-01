@@ -10,14 +10,25 @@ impl Simulator {
         let DataType::TypeReference { name: tn, .. } = dt else {
             return None;
         };
+        self.p_enum_label_named(v, &tn.qualified(), &tn.name.name)
+    }
+
+    /// `p_enum_label` for a type known by name only (`qualified` with its
+    /// package or scope, `name` as written).
+    pub(super) fn p_enum_label_named(
+        &self,
+        v: &Value,
+        qualified: &str,
+        name: &str,
+    ) -> Option<String> {
         // The name text may carry its package (`pkg::e_t`) while the table
         // is keyed by the typedef's bare name, or the reverse.
-        let bare = tn.name.name.rsplit("::").next().unwrap_or(&tn.name.name);
+        let bare = name.rsplit("::").next().unwrap_or(name);
         let members = self
             .module
             .enum_members
-            .get(&tn.qualified())
-            .or_else(|| self.module.enum_members.get(&tn.name.name))
+            .get(qualified)
+            .or_else(|| self.module.enum_members.get(name))
             .or_else(|| self.module.enum_members.get(bare))
             .or_else(|| {
                 // `import pkg::*` leaves the bare name: the one package
