@@ -14104,6 +14104,80 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 true
             }
+            StatementKind::Repeat { count, body } => {
+                // §12.7.5: repeat (count) body
+                // Lowered as an internal countdown loop to 0.
+                let Some(cnt_reg) = self.compile_expr(count, 32) else {
+                    self.bail("Repeat_count");
+                    return false;
+                };
+                let iter_reg = self.alloc_reg();
+                self.emit(Insn::Move(iter_reg, cnt_reg));
+                let zero_reg = self.alloc_reg();
+                self.emit(Insn::LoadConst(zero_reg, Box::new(Value::from_u64(0, 32))));
+                let one_reg = self.alloc_reg();
+                self.emit(Insn::LoadConst(one_reg, Box::new(Value::from_u64(1, 32))));
+
+                self.loop_break_patches.push(Vec::new());
+                self.loop_continue_patches.push(Vec::new());
+
+                let top = self.insns.len() as u32;
+                let cond_reg = self.alloc_reg();
+                self.emit(Insn::Gt(cond_reg, iter_reg, zero_reg));
+                let br = self.insns.len();
+                self.emit(Insn::BranchIfFalse(cond_reg, 0));
+
+                if !self.compile_stmt(body) {
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    return false;
+                }
+
+                let step_top = self.insns.len() as u32;
+                self.emit(Insn::Sub(iter_reg, iter_reg, one_reg));
+                self.emit(Insn::Jump(top));
+
+                let end = self.insns.len() as u32;
+                if let Insn::BranchIfFalse(reg, _) = self.insns[br] {
+                    self.insns[br] = Insn::BranchIfFalse(reg, end);
+                }
+                if let Some(patches) = self.loop_continue_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(step_top);
+                    }
+                }
+                if let Some(patches) = self.loop_break_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(end);
+                    }
+                }
+                true
+            }
+            StatementKind::Forever { body } => {
+                // §12.7.1: forever body
+                // Infinite loop: jumps to top at the end; break exits, continue loops.
+                self.loop_break_patches.push(Vec::new());
+                self.loop_continue_patches.push(Vec::new());
+                let top = self.insns.len() as u32;
+                if !self.compile_stmt(body) {
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    return false;
+                }
+                self.emit(Insn::Jump(top));
+                let end = self.insns.len() as u32;
+                if let Some(patches) = self.loop_continue_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(top);
+                    }
+                }
+                if let Some(patches) = self.loop_break_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(end);
+                    }
+                }
+                true
+            }
             StatementKind::Foreach { array, vars, body } => {
                 // class-perf Step 9d FIRST: `foreach` over a class MEMBER
                 // collection (queue / dynamic / associative) inside a
