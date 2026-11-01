@@ -209,3 +209,27 @@ fn c18_constraint_inheritance() {
         ],
     );
 }
+
+// IEEE 1800-2017 §18.5.4, §11.4.13, Table 11-21: an `inside` / `dist` item
+// `~k` is sized with the other operands; `!k` and reductions are 1-bit. None
+// of them drops out of the set.
+#[test]
+fn c18_inside_unary_items() {
+    check(
+        "c18_inside_unary",
+        include_str!("sv/c18_inside_unary.sv"),
+        "c18iu",
+        Order::Exact,
+        &[
+            "T|inside_unary|bitnot ok=1 n=a",
+            "T|inside_unary|bitnot widened ok=1 m=fa",
+            "T|inside_unary|bitnot int ok=1 x=-6",
+            "T|inside_unary|lognot ok=1 en=1",
+            "T|inside_unary|xor-reduce ok=1 en=0",
+            "T|inside_unary|or-reduce dist ok=1 en=1",
+            "T|inside_unary|pair only=1 both=1",
+            "T|inside_unary|dist toggles some=1",
+        ],
+        &[],
+    );
+}

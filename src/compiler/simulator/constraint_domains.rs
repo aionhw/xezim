@@ -789,9 +789,22 @@ impl Simulator {
         match &e.kind {
             ExprKind::Paren(inner) => self.exact_leaves(inner, out),
             ExprKind::Unary {
-                op: UnaryOp::Plus | UnaryOp::Minus,
+                op: UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot,
                 operand,
             } => self.exact_leaves(operand, out),
+            // `!x` and the reductions are 1-bit unsigned with a self-determined
+            // operand (§11.8.1, Table 11-21): a leaf, read by the evaluator.
+            ExprKind::Unary {
+                op:
+                    UnaryOp::LogNot
+                    | UnaryOp::BitAnd
+                    | UnaryOp::BitNand
+                    | UnaryOp::BitOr
+                    | UnaryOp::BitNor
+                    | UnaryOp::BitXor
+                    | UnaryOp::BitXnor,
+                ..
+            } => self.exact_leaf(e, out),
             ExprKind::Unary { .. } => None,
             ExprKind::Binary { op, left, right } => match op {
                 BinaryOp::Add
@@ -823,16 +836,22 @@ impl Simulator {
             // struct members, array elements, ternaries, function calls) goes
             // through the ordinary evaluator, which already gets width and
             // signedness right for a LEAF.
-            _ => {
-                let v = self.eval_expr(e);
-                if v.is_real || v.has_xz() || v.width == 0 || v.width > 64 {
-                    return None;
-                }
-                let raw = v.to_u64()?;
-                out.push((raw, v.width, v.is_signed));
-                Some((v.width, v.is_signed))
-            }
+            _ => self.exact_leaf(e, out),
         }
+    }
+
+    fn exact_leaf(
+        &mut self,
+        e: &Expression,
+        out: &mut Vec<(u64, u32, bool)>,
+    ) -> Option<(u32, bool)> {
+        let v = self.eval_expr(e);
+        if v.is_real || v.has_xz() || v.width == 0 || v.width > 64 {
+            return None;
+        }
+        let raw = v.to_u64()?;
+        out.push((raw, v.width, v.is_signed));
+        Some((v.width, v.is_signed))
     }
 
     /// Fold an operand tree whose leaves `exact_leaves` collected, in the
@@ -850,9 +869,16 @@ impl Simulator {
     ) -> Option<i128> {
         match &e.kind {
             ExprKind::Paren(inner) => self.exact_fold(inner, leaves, k, w, s),
-            ExprKind::Unary { op, operand } => {
+            ExprKind::Unary {
+                op: op @ (UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot),
+                operand,
+            } => {
                 let v = self.exact_fold(operand, leaves, k, w, s)?;
-                Some(if *op == UnaryOp::Minus { -v } else { v })
+                Some(match op {
+                    UnaryOp::Minus => -v,
+                    UnaryOp::BitNot => Self::bits_at(!v, w) as i128,
+                    _ => v,
+                })
             }
             ExprKind::Binary { op, left, right } => {
                 let l = self.exact_fold(left, leaves, k, w, s)?;
