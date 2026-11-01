@@ -274,6 +274,8 @@ mod clock_gen_dotted_target;
 mod clock_gen_fifo_rank;
 #[path = "scheduling/clocking_cont_trigger_same_step.rs"]
 mod clocking_cont_trigger_same_step;
+#[path = "scheduling/comb_packed_element_sensitivity.rs"]
+mod comb_packed_element_sensitivity;
 #[path = "scheduling/comb_self_member_sensitivity.rs"]
 mod comb_self_member_sensitivity;
 #[path = "scheduling/delay_always_compound_body.rs"]

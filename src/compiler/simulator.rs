@@ -1568,6 +1568,22 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+/// How an `always_comb` block touches one packed vector through selects.
+#[derive(Default)]
+struct PackedAccess {
+    reads: HashSet<i64>,
+    writes: HashSet<i64>,
+    /// Touched whole, through a part select, or at a non-constant element.
+    irregular: bool,
+}
+
+thread_local! {
+    /// When `Some`, the read/write collectors record, per variable name, which
+    /// constant elements of a packed vector a block reads and writes.
+    static PACKED_ACCESS: std::cell::RefCell<Option<HashMap<String, PackedAccess>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CombEntry {
     item: CombItem,
@@ -1595,6 +1611,17 @@ struct CombEntry {
     /// stimulus. So: don't seed these from the time-0 dirty set; let the
     /// first real sensitivity transition trigger them.
     defer_at_time0: bool,
+}
+
+impl CombEntry {
+    /// A procedural block that reads a signal it also writes, whose own writes
+    /// must not re-queue it. A continuous assignment re-runs until it settles.
+    fn reads_own_writes(&self) -> bool {
+        matches!(
+            self.item,
+            CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
+        ) && (self.cold.read_signal_ids.iter()).any(|r| self.cold.write_signal_ids.contains(r))
+    }
 }
 
 /// Cold half of a `CombEntry` — see `CombEntry::cold`.
@@ -9300,6 +9327,10 @@ pub struct Simulator {
     /// them into the real NBA queue. So the BSP driver must route these through
     /// the full `&mut self` path. Built alongside comb_level.
     comb_has_nba: Vec<bool>,
+    /// Per comb entry: it reads a signal it also writes (a packed
+    /// multi-dimensional vector, see the sensitivity filter), so its own
+    /// writes must not re-queue it. Other drivers of the vector still do.
+    comb_self_exempt: Vec<bool>,
     /// Per comb entry: evaluable by the static isolated path (no `&mut self`,
     /// disjoint writes) — not AST, no NBA, no unsupported insn. Only par_safe
     /// entries run on worker threads in the parallel BSP level dispatch.
