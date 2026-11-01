@@ -1669,12 +1669,16 @@ impl Simulator {
             v
         };
         if let Some(dst) = &lflat {
-            let su_opt = self.module.var_decl_types.get(dst).cloned().and_then(|dt| {
-                match self.resolve_dt(&dt) {
-                    DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
-                    _ => None,
-                }
-            });
+            let su_opt = if !self.struct_root_possible(dst) {
+                None
+            } else {
+                self.module.var_decl_types.get(dst).cloned().and_then(|dt| {
+                    match self.resolve_dt(&dt) {
+                        DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
+                        _ => None,
+                    }
+                })
+            };
             if let Some(su) = su_opt {
                 let dst = dst.clone();
                 if let Some(src) = eval_rflat(self, &mut rflat_cache)

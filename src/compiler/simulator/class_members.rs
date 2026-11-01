@@ -3117,6 +3117,20 @@ impl Simulator {
     }
 
     pub(super) fn class_is_a(&self, derived: &str, base: &str) -> bool {
+        if derived == base {
+            return true;
+        }
+        // Memoized per (derived, base): class tables are immutable during simulation.
+        let key = (derived.to_string(), base.to_string());
+        if let Some(&ans) = self.class_is_a_cache.borrow().get(&key) {
+            return ans;
+        }
+        let ans = self.class_is_a_uncached(derived, base);
+        self.class_is_a_cache.borrow_mut().insert(key, ans);
+        ans
+    }
+
+    fn class_is_a_uncached(&self, derived: &str, base: &str) -> bool {
         // Class names are keyed bare (the parser keeps only the leaf segment
         // of a scoped name), so the comparison strips just the `#(params)`
         // specialization suffix, not a package prefix. An object built from a

@@ -2748,6 +2748,16 @@ impl Simulator {
     }
 
     pub(super) fn canonicalize_spec_sig(&self, class_name: &str, sig: &str) -> String {
+        let key = (class_name.to_string(), sig.to_string());
+        if let Some(cached) = self.spec_sig_cache.borrow().get(&key) {
+            return cached.clone();
+        }
+        let res = self.canonicalize_spec_sig_uncached(class_name, sig);
+        self.spec_sig_cache.borrow_mut().insert(key, res.clone());
+        res
+    }
+
+    fn canonicalize_spec_sig_uncached(&self, class_name: &str, sig: &str) -> String {
         // The class's parameter lists are read in place: every call below
         // takes `&self`.
         let Some(cd) = self.module.classes.get(class_name) else {

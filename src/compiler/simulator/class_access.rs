@@ -759,7 +759,10 @@ impl Simulator {
                     }
                 }
             }
-            let resolve = |name: &str| {
+            let resolve = |name: &str| -> Option<String> {
+                if let Some(cached) = self.interface_resolve_cache.borrow().get(name) {
+                    return cached.clone();
+                }
                 let bound = xezim_core::elaborate::interface_ports::resolve(
                     name,
                     &self.module.interface_port_aliases,
@@ -783,7 +786,11 @@ impl Simulator {
                         || self.module.functions.contains_key(bound.as_ref())
                         || self.module.tasks.contains_key(bound.as_ref())
                         || self.instance_by_path(bound.as_ref()).is_some());
-                known.then(|| bound.into_owned())
+                let res = known.then(|| bound.into_owned());
+                self.interface_resolve_cache
+                    .borrow_mut()
+                    .insert(name.to_string(), res.clone());
+                res
             };
             if let Some(bound) = resolve(&raw) {
                 return bound;
