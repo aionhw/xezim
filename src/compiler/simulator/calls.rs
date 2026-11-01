@@ -659,15 +659,19 @@ impl Simulator {
                         // that random variable, whatever value it holds. Its
                         // value used to be tried as a handle first, so an
                         // `id` holding 1 switched off object #1 instead.
-                        let this_scalar_prop = this_h.is_some_and(|th| {
+                        // A rand class-handle property is a random variable
+                        // of `this` too: only the handle's mode changes, not
+                        // that of the variables inside the object it holds.
+                        let this_rand_var = this_h.is_some_and(|th| {
                             !self
                                 .local_stack
                                 .last()
                                 .is_some_and(|f| f.contains_key(name))
                                 && self.object_declares_property(th, name)
-                                && self.prop_class_type(th, name).is_none()
+                                && (self.prop_class_type(th, name).is_none()
+                                    || (mname == "rand_mode" && self.prop_is_rand(th, name)))
                         });
-                        let h_val = if this_scalar_prop {
+                        let h_val = if this_rand_var {
                             0
                         } else {
                             self.eval_expr(expr).to_u64().unwrap_or(0) as usize

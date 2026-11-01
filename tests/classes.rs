@@ -703,6 +703,8 @@ mod rand_mode_element_769;
 mod dist_zero_weights_770;
 #[path = "classes/class_param_sized_formals_768.rs"]
 mod class_param_sized_formals_768;
+#[path = "classes/rand_mode_handle_property.rs"]
+mod rand_mode_handle_property;
 #[path = "classes/lrm_chained_handle_writes.rs"]
 mod lrm_chained_handle_writes;
 #[path = "classes/lrm_class_queue_locator_in_expr.rs"]

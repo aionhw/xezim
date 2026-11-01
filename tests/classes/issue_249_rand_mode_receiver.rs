@@ -2,9 +2,11 @@
 //! property (no `this.`) tried the property's VALUE as an object handle
 //! first. When the value equalled a live object's handle, that whole other
 //! object was switched off and `prop` stayed random. A bare name that
-//! declares a non-class property of `this` names that variable (§8.11,
-//! §18.8), whatever it holds; class-handle properties, locals and
-//! constraint names keep their meaning.
+//! declares a non-class or rand class-handle property of `this` names that
+//! variable (IEEE 1800-2017 §8.11, §18.8), whatever it holds; for a handle
+//! only its own mode changes. For a handle that is an interpretation of
+//! §18.8, which also reads the call as the object form. Non-rand handle
+//! properties, locals and constraint names keep their meaning.
 
 use xezim::simulate;
 
@@ -53,7 +55,7 @@ module top;
     $display("T after id=%0d len=%0d", i.id, i.len);
     i.sub = p;
     i.sub_off();
-    $display("T sub_off p=%0d o=%0d", p.rand_mode(), o.rand_mode());
+    $display("T sub_off sub=%0d p.a=%0d o=%0d", i.sub.rand_mode(), p.a.rand_mode(), o.rand_mode());
     i.cons_off();
     $display("T constraint c_len=%0d", i.c_len.constraint_mode());
     i.arg_off(o);
@@ -67,7 +69,7 @@ endmodule
         [
             "T id=0 len=0 o=1 q_id=0",
             "T after id=1 len=1000",
-            "T sub_off p=0 o=1",
+            "T sub_off sub=0 p.a=1 o=1",
             "T constraint c_len=0",
             "T argument o=0",
         ]
