@@ -3868,17 +3868,28 @@ impl Simulator {
     /// The innermost rename-table entry for `bare` (see `dyn_name_lookup`).
     #[inline(always)]
     pub(super) fn dyn_entry(&self, bare: &str) -> Option<&(String, String)> {
-        for frame in self.local_dyn.iter().rev() {
+        for (depth, frame) in self.local_dyn.iter().rev().enumerate() {
             // Frames hold at most a handful of entries — a reverse linear
             // scan (later declaration shadows earlier) beats hashing `bare`
             // once per frame (this probe runs for every bare-name resolve).
             for e in frame.iter().rev() {
                 if e.0 == bare {
+                    if depth > 0 && self.frame_scalar_shadows(bare) {
+                        return None;
+                    }
                     return Some(e);
                 }
             }
         }
         None
+    }
+
+    /// §23.9: a scalar formal or local of the running subroutine hides a
+    /// same-named collection of a caller or of `this`, so a `string str`
+    /// formal reads its own string, not a caller's `str[$]`.
+    #[inline(never)]
+    pub(super) fn frame_scalar_shadows(&self, bare: &str) -> bool {
+        self.local_stack.last().is_some_and(|f| f.contains_key(bare))
     }
 
     /// `dyn_name_lookup`'s hit on an identity entry `(name, name)`: in the
@@ -3942,6 +3953,9 @@ impl Simulator {
     /// after the current frame and the class members have both been
     /// consulted.
     pub(super) fn dyn_name_lookup_enclosing(&self, bare: &str) -> Option<&str> {
+        if self.frame_scalar_shadows(bare) {
+            return None;
+        }
         for frame in self.local_dyn.iter().rev().skip(1) {
             for (k, uq) in frame.iter().rev() {
                 if k == bare {

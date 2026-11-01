@@ -772,10 +772,11 @@ impl Simulator {
             return None;
         }
         // §8.10 / §13.3: the running subroutine's own formal or automatic
-        // local of this name (an entry in its rename frame) shadows a
-        // same-named property — `uvm_packer::put_bits(ref bit bitstream[])`
+        // local of this name (an entry in its rename frame, or a scalar in
+        // its local frame) shadows a same-named property:
+        // `uvm_packer::put_bits(ref bit bitstream[])`
         // must read its formal, not the class's `static bit bitstream[]`.
-        if self.dyn_name_lookup_innermost(name).is_some() {
+        if self.dyn_name_lookup_innermost(name).is_some() || self.frame_scalar_shadows(name) {
             return None;
         }
         // §8.9: inside a STATIC method there is no `this`; the lexical class
