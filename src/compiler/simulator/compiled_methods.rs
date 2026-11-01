@@ -2368,7 +2368,12 @@ impl Simulator {
                                     Some(&(w, _)) => Some(w),
                                     None => self.class_prop_width_fixed(&c, m).flatten(),
                                 };
-                                if let Some(w) = w.filter(|&w| w > 0) {
+                                // These facts serve every specialization, and
+                                // a parameterized class's element width can
+                                // differ between them (§8.25).
+                                if let Some(w) = w.filter(|&w| w > 0)
+                                    && cd.param_defaults.is_empty()
+                                {
                                     colls.elem_widths.insert(m.clone(), w);
                                 }
                             }
