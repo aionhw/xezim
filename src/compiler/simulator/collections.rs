@@ -185,6 +185,20 @@ impl Simulator {
         fitted
     }
 
+    /// The context width of a value stored into an element of associative
+    /// array `name` (§11.6.1): its element width, or none for a `real`
+    /// element, whose integral value is self-determined before conversion.
+    pub(super) fn assoc_store_ctx_width(&self, name: &str) -> Option<u32> {
+        let elem = self
+            .class_member_coll_type(name)
+            .cloned()
+            .or_else(|| self.p_elem_type(name));
+        if elem.is_some_and(|dt| matches!(self.resolve_dt_ref(&dt), DataType::Real { .. })) {
+            return None;
+        }
+        self.assoc_elem_width(name).filter(|&w| w > 0)
+    }
+
     pub(super) fn assoc_elem_width(&self, name: &str) -> Option<u32> {
         if let Some(&w) = self.module.assoc_elem_widths.get(name) {
             return Some(w);

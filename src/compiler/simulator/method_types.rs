@@ -523,7 +523,7 @@ impl Simulator {
                         let scoped = self.dyn_name_lookup(&n).map(|s| s.to_string());
                         let an = scoped.as_deref().unwrap_or(&n);
                         if self.is_associative_array(an)
-                            && let Some(w) = self.assoc_elem_width(an).filter(|&w| w > 0)
+                            && let Some(w) = self.assoc_store_ctx_width(an)
                         {
                             return w;
                         }
