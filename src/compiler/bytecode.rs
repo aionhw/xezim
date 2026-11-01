@@ -10053,6 +10053,26 @@ impl<'a> BytecodeCompiler<'a> {
 
     /// May evaluating `e` have an effect beyond its value — a subroutine or
     /// method call, an increment, an assignment, a randomizing system call?
+    /// How deeply `?:` nests in `e`, through the operators around it.
+    fn ternary_depth(e: &Expression) -> usize {
+        match &e.kind {
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                1 + Self::ternary_depth(condition)
+                    .max(Self::ternary_depth(then_expr))
+                    .max(Self::ternary_depth(else_expr))
+            }
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => Self::ternary_depth(x),
+            ExprKind::Binary { left, right, .. } => {
+                Self::ternary_depth(left).max(Self::ternary_depth(right))
+            }
+            _ => 0,
+        }
+    }
+
     fn expr_has_effect(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Call { .. } | ExprKind::AssignExpr { .. } => true,
@@ -14652,6 +14672,11 @@ impl<'a> BytecodeCompiler<'a> {
                 // "" : h.name()` must not call through null).
                 let short = self.method_mode
                     && (Self::expr_has_effect(then_expr) || Self::expr_has_effect(else_expr));
+                // Each arm is lowered twice below, so nested ones double per
+                // level; a deep nest stays interpreted.
+                if short && Self::ternary_depth(then_expr).max(Self::ternary_depth(else_expr)) > 6 {
+                    return None;
+                }
                 let mut pick: Option<(usize, usize, RegId)> = None;
                 if short {
                     let red = self.alloc_reg();
