@@ -31,7 +31,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   integers is ordered as strings: `first()` gave the number 9 instead of
   `"10"` (§7.8.2, §7.9.4, #781). `%p` of a locator call prints an enum
   index or element by its label, `'{BLUE}` where it printed `'{2}`
-  (§21.2.1.6, #782). Reported by philipaxer.
+  (§21.2.1.6, #782). Every queue method and the `with` reductions apply to
+  a locator result too (`q.find with (item > 2).sum()`, `q.unique.size`), a
+  row of a class member's nested array is searched the same way, and an
+  enum index named through a typedef alias or held by a function-local
+  array prints its labels. Reported by philipaxer, with PRs #783, #784,
+  #785 and #805.
 * A string key may hold `[`, `]` or `\` everywhere: such a key is escaped in
   the element's name, where `%p`, `num()`, nested rows and the walks split
   it at the bracket and read another key. `next()` and `prev()` from a key
@@ -43,6 +48,27 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   philipaxer. An index type wider than 64 bits names one element per
   value, so `w[5]` and `w[100'h5]` are the same element and a `next()`
   walk over such keys ends (§7.8.4).
+* Class-member events, `$bits`, assignment widths and compiled methods
+  (#786-#791, PRs #795-#800, contributed by AaronKel). An assigned
+  class-member event names the source's event object, so a trigger through
+  either name wakes `@` and sets `.triggered` on both, and a process
+  already blocked on the old event stays on it (§15.5.5). `$bits` of an
+  empty string is 0 and of a class-member queue its current size
+  (§20.6.2). `return e` and a store into an associative element evaluate
+  `e` in the return or element width, a `real` element excepted (§13.4.1,
+  §11.6.1). A store `s.f = v` through a class handle is no longer dropped
+  after a method with an enum local `s` has run, or while a caller has one
+  (§23.9). A class method gives its interpreted result once compiled, for
+  redeclared string members, string-collection compares, member operand
+  widths and signs, unpacked formals, bare-member stores, `ref` and `inout`
+  copy-backs, shadowed handles, specialized element widths and `&&`, `||`
+  and `?:` whose unselected operand calls a function or `$cast`
+  (§11.4.7, §11.4.11, §13.5.2).
+* A header default that reads a type parameter, `parameter int H =
+  $bits(T)`, folds with this instance's `T`, also for a genvar-sized
+  override `.T(logic [g*2-1:0])` and a struct type parameter; it read the
+  previous instance's type, 0 for the first (§6.20.3, §20.6.2, §27.4, PR
+  core #135 and #803, contributed by chenbhil).
 * In a parameterized class, a formal, return or local typed `bit [W-1:0]`,
   or by a class typedef of it (`typedef bit [W-1:0] vec_t;`), is as wide
   as the object's specialization makes it, with the type's signedness, also
@@ -88,6 +114,23 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Performance**
 
+* More class methods compile (#792, PR #804, contributed by AaronKel): a
+  statement the compiler cannot lower runs in the interpreter while the rest
+  of the body stays compiled (`XEZIM_METHOD_STMT_FALLBACK=0` turns this
+  off), compiled-to-compiled calls dispatch directly, `ref` and `inout`
+  scalars included, and a method with a loop compiles on its first call.
+  The #792 testcase at 100,000 calls takes 8.8 s instead of 14.3 s.
+* A parked `wait(cond)` is re-checked only when something it reads may
+  have changed, and class-member event waiters are indexed by event and by
+  process (#793, PR #802, contributed by AaronKel): 2,000 parked watchers
+  take 0.8 s instead of 75.4 s. `XEZIM_GROWTH_TRACE=<ticks>` prints the
+  heap, signal and waiter table sizes over a long run.
+* The class-heap collector traces from the previous survivors and the
+  objects allocated since, so it runs every 20,000 allocations again
+  (§8.29, #794, PR #801, contributed by AaronKel): 400,000 churned objects
+  peak at 261 MB instead of 1,292 MB in the same time.
+* A string without X or Z bits converts to text by whole bytes (PR core
+  #137, contributed by AaronKel).
 * An element of a nested collection is read and written through its
   declared shape, found with one lookup: 600,000 writes to `int d[][]` take
   16.0 G instructions instead of 18.2 G, and as many reads 8.2 G instead of
