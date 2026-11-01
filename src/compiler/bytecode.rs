@@ -20192,6 +20192,16 @@ impl<'a> BytecodeCompiler<'a> {
             self.bail("bytecode_register_limit");
             None
         } else {
+            // OBSERVABLE RESULT MARKER (see `compile_class_method`): the
+            // runtime reads the result register after `exec_insns`, so
+            // nothing in the block reads it and `finish`'s peepholes took
+            // it for dead. A constant `#(1*2.0)` — the shape every bare
+            // delay takes under a `timescale whose unit is not the tick —
+            // folded to a `LoadConst` that was then dropped, and the
+            // delay read a stale register (0: a zero-delay loop).
+            if let Some(r) = result {
+                self.emit(Insn::Move(r, r));
+            }
             result
         }
     }
@@ -24101,6 +24111,51 @@ mod tests {
             block.instructions.as_slice(),
             [Insn::LoadSignal(0, 0)]
         ));
+    }
+
+    /// §9.4.1 / §22.7: a root expression's result is read after the block
+    /// runs, so the peepholes must not drop it. `1 * 2.0` is the form a
+    /// bare delay takes when the module's time unit is not the global tick
+    /// (`#1` under `timescale 1ns/100ps` becomes `1 * 10.0`); constant
+    /// folding reduced it to a `LoadConst` nothing in the block read, which
+    /// was then deleted — the fast `always #d` path read a stale register
+    /// and looped at zero delay.
+    #[test]
+    fn root_expr_result_survives_constant_folding() {
+        let signals = NameMap::default();
+        let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
+        let widths: HashMap<String, u32> = HashMap::default();
+        let sp = crate::ast::Span::dummy();
+        let one = Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: true,
+                base: crate::ast::expr::NumberBase::Decimal,
+                value: "1".into(),
+                cached_val: std::cell::Cell::new(None),
+            }),
+            sp,
+        );
+        let two = Expression::new(ExprKind::Number(NumberLiteral::Real(2.0)), sp);
+        let expr = Expression::new(
+            ExprKind::Binary {
+                op: crate::ast::expr::BinaryOp::Mul,
+                left: Box::new(one),
+                right: Box::new(two),
+            },
+            sp,
+        );
+        let mut compiler = BytecodeCompiler::new(&signals, &[], &[], &arrays, &widths);
+        let result = compiler.compile_root_expr(&expr).expect("compiles");
+        let block = compiler.finish();
+        assert!(
+            block.instructions.iter().any(|i| matches!(
+                i,
+                Insn::LoadConst(r, v) if *r == result && v.is_real && v.to_f64() == 2.0
+            )),
+            "result register {result} not written: {:?}",
+            block.instructions
+        );
     }
 
     #[test]
