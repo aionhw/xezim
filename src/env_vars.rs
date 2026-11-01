@@ -478,6 +478,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Build metadata: nearest release tag baked into -V (build-time)",
     ),
     (
+        "XEZIM_GROWTH_TRACE",
+        "Every N ticks of simulated time, print heap, process-context and waiter-table sizes to stderr",
+    ),
+    (
         "XEZIM_HIER_REF_DEBUG",
         "Debug: trace how each hierarchical reference resolves in the §23.8 elaboration check",
     ),

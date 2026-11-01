@@ -1292,6 +1292,7 @@ checkpoint_state!(
     gate_lane_valid,
     gate_obs,
     gate_off_delay_by_id,
+    growth_trace_next,
     has_method_cache,
     has_coll_rows,
     has_modclass,

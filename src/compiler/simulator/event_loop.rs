@@ -2356,6 +2356,7 @@ impl Simulator {
                 if self.checkpoint_due(next_time) && self.serve_checkpoints(next_time) {
                     continue;
                 }
+                self.growth_trace();
                 self.time = next_time;
                 publish_sim_time(next_time);
                 // Lines printed near the end of a burst stay buffered until the

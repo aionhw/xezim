@@ -2152,6 +2152,10 @@ impl InstanceEventWaiters {
         self.entries.is_empty()
     }
 
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     fn unlink(&mut self, seq: u64, w: &InstanceEventWaiter) {
         for k in Self::keys_of(w) {
             if let Some(set) = self.by_key.get_mut(k) {
@@ -8506,6 +8510,8 @@ pub struct Simulator {
     >,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
     killed_pids: HashSet<usize>,
+    /// Next simulated time `growth_trace` prints at.
+    growth_trace_next: u64,
     /// §9.7 `process` class: PIDs that have completed execution (child_finished).
     finished_pids: HashSet<usize>,
     /// §9.7 `process` class: PIDs explicitly suspended via `suspend()`. The

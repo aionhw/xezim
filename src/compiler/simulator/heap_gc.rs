@@ -482,3 +482,40 @@ impl Simulator {
         released
     }
 }
+
+impl Simulator {
+    /// `XEZIM_GROWTH_TRACE=<ticks>`: every <ticks> of simulated time, print
+    /// the sizes of the tables whose growth slows a long run down.
+    pub(super) fn growth_trace(&mut self) {
+        static EVERY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let Some(every) = *EVERY.get_or_init(|| {
+            std::env::var("XEZIM_GROWTH_TRACE").ok()?.parse::<u64>().ok()
+        }) else {
+            return;
+        };
+        if self.time < self.growth_trace_next {
+            return;
+        }
+        self.growth_trace_next = self.time + every.max(1);
+        let frame_keys: usize = self
+            .process_contexts
+            .values()
+            .map(|c| c.local_stack.iter().map(|f| f.len()).sum::<usize>())
+            .sum();
+        eprintln!(
+            "[GROWTH] t={} heap_slots={} live={} gc_runs={} signals={} contexts={} frame_keys={} \
+             event_waiters={} instance_event_waiters={} condition_waiters={} join_waiters={}",
+            self.time,
+            self.heap.len(),
+            self.heap.iter().filter(|o| o.is_some()).count(),
+            self.class_gc_runs,
+            self.signals.len(),
+            self.process_contexts.len(),
+            frame_keys,
+            self.event_waiters.len(),
+            self.instance_event_waiters.len(),
+            self.condition_waiters.len(),
+            self.join_waiters.len(),
+        );
+    }
+}

@@ -91,6 +91,7 @@ unless noted.
 | `XEZIM_METHOD_CACHE=<dir>` | Persistent compiled-method cache directory across runs. `1` uses `~/.cache/xezim/method-cache`; unset (default) disables it. Corrupt entries transparently trigger recompilation |
 | `XEZIM_METHOD_PROFILE=1` | In-process sampling profiler for class methods. When `1`, prints AST-vs-bytecode execution-time histograms on simulation completion (default off) |
 | `XEZIM_FALLBACK_SITES=1` | Log each construct handed to the AST interpreter: the reason, source byte span and scope of the compile-fail / plan-decline site (default off) |
+| `XEZIM_GROWTH_TRACE=<ticks>` | Every `<ticks>` of simulated time, print to stderr the heap size, live objects, collections, process contexts and waiter-table sizes, to find what grows over a long run (default off) |
 | `XEZIM_JIT=1` | Compile bytecode blocks to machine code in-process (needs a `--features jit` build) |
 | `XEZIM_AOT=1` | Compile eligible blocks to native code via generated Rust + `rustc` instead of cranelift. **Requires `XEZIM_JIT=1` as well** — on its own it is a no-op. Needs `--features jit`. See the [user guide](user-guide.md#native-compilation) |
 | `XEZIM_AOT_OPT=0..3` | `rustc` optimization level for the generated crate (default 2) |

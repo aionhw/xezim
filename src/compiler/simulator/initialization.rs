@@ -4230,6 +4230,7 @@ impl Simulator {
             process_loop_bytecode: HashMap::default(),
             process_cond_bytecode: HashMap::default(),
             killed_pids: HashSet::default(),
+            growth_trace_next: 0,
             finished_pids: HashSet::default(),
             suspended_pids: HashSet::default(),
             suspended_proc_info: HashMap::default(),
