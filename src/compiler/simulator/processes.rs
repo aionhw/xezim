@@ -1294,6 +1294,8 @@ impl Simulator {
                     .collect();
                 candidates.sort_unstable();
                 candidates.dedup();
+                let has_any_block_saves = !child_ctx.block_scope_saves.is_empty()
+                    || candidates.iter().any(|p| self.process_contexts.get(p).is_some_and(|c| !c.block_scope_saves.is_empty()));
                 for other_pid in candidates {
                     let Some(other) = self.process_contexts.get_mut(&other_pid) else {
                         continue;
@@ -1302,35 +1304,42 @@ impl Simulator {
                         continue;
                     }
                     let other_pid = &other_pid;
-                    let base_scopes = self.fork_local_scopes.get(other_pid);
-                    let has_other_blocks = !other.block_scope_saves.is_empty();
-                    let (other_scopes_storage, other_scopes_ref) = if has_other_blocks {
-                        let mut sc = base_scopes.cloned().unwrap_or_default();
-                        Self::overlay_fork_local_scopes(&mut sc, &other.block_scope_saves);
-                        (Some(sc), None)
+                    let visible_storage;
+                    let visible: &[HashMap<String, Value>] = if !has_any_block_saves {
+                        &changes
                     } else {
-                        (None, base_scopes)
-                    };
-                    let lookup_other = |f_gen: &u64, key: &str| -> Option<u64> {
-                        if let Some(sc) = &other_scopes_storage {
-                            sc.get(f_gen).and_then(|m| m.get(key)).copied()
-                        } else if let Some(sc) = other_scopes_ref {
-                            sc.get(f_gen).and_then(|m| m.get(key)).copied()
+                        let base_scopes = self.fork_local_scopes.get(other_pid);
+                        let has_other_blocks = !other.block_scope_saves.is_empty();
+                        let (other_scopes_storage, other_scopes_ref) = if has_other_blocks {
+                            let mut sc = base_scopes.cloned().unwrap_or_default();
+                            Self::overlay_fork_local_scopes(&mut sc, &other.block_scope_saves);
+                            (Some(sc), None)
                         } else {
-                            None
+                            (None, base_scopes)
+                        };
+                        let lookup_other = |f_gen: &u64, key: &str| -> Option<u64> {
+                            if let Some(sc) = &other_scopes_storage {
+                                sc.get(f_gen).and_then(|m| m.get(key)).copied()
+                            } else if let Some(sc) = other_scopes_ref {
+                                sc.get(f_gen).and_then(|m| m.get(key)).copied()
+                            } else {
+                                None
+                            }
+                        };
+                        let mut filtered = changes.clone();
+                        for (i, frame) in filtered.iter_mut().enumerate() {
+                            let frame_generation = child_frames_gen.get(i).copied().unwrap_or(0);
+                            frame.retain(|key, _| {
+                                sibling_scopes.get(&frame_generation).and_then(|m| m.get(key)).copied()
+                                    == lookup_other(&frame_generation, key)
+                            });
                         }
+                        visible_storage = filtered;
+                        &visible_storage
                     };
-                    let mut visible = changes.clone();
-                    for (i, frame) in visible.iter_mut().enumerate() {
-                        let frame_generation = child_frames_gen.get(i).copied().unwrap_or(0);
-                        frame.retain(|key, _| {
-                            sibling_scopes.get(&frame_generation).and_then(|m| m.get(key)).copied()
-                                == lookup_other(&frame_generation, key)
-                        });
-                    }
                     let updates = Self::merge_fork_writes(
                         &mut other.local_stack, &other.local_gen_stack,
-                        &visible, child_frames_gen, None,
+                        visible, child_frames_gen, None,
                     );
                     written.extend(updates);
                 }
