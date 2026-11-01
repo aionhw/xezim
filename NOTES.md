@@ -23,6 +23,26 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* `size()` applies to the queue a locator method returns: `q.find_index
+  with (item > 2).size()` read 0 (§7.12.1, §7.10.2, #779). A locator on a
+  row of a nested associative array, `m["a"].find_index with (item > 1)`,
+  searches that row by its own index type, where it returned `'{0}`
+  (§7.12.1, §7.8.1, #780). A string-keyed array whose keys all read as
+  integers is ordered as strings: `first()` gave the number 9 instead of
+  `"10"` (§7.8.2, §7.9.4, #781). `%p` of a locator call prints an enum
+  index or element by its label, `'{BLUE}` where it printed `'{2}`
+  (§21.2.1.6, #782). Reported by philipaxer.
+* A string key may hold `[`, `]` or `\` everywhere: such a key is escaped in
+  the element's name, where `%p`, `num()`, nested rows and the walks split
+  it at the bracket and read another key. `next()` and `prev()` from a key
+  that is not in the array move to the nearest key, where they returned 0
+  (§7.8.1, §7.8.5, #775, PR core #134 and #776). The locator methods search
+  an associative array by key: a string-, signed- or wide-keyed array gave
+  an empty queue, and the `_index` forms and `item.index` take the array's
+  index type (§7.12.1, §7.12.4, #777, PR #778). Reported and fixed by
+  philipaxer. An index type wider than 64 bits names one element per
+  value, so `w[5]` and `w[100'h5]` are the same element and a `next()`
+  walk over such keys ends (§7.8.4).
 * In a parameterized class, a formal, return or local typed `bit [W-1:0]`,
   or by a class typedef of it (`typedef bit [W-1:0] vec_t;`), is as wide
   as the object's specialization makes it, with the type's signedness, also
