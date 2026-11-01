@@ -3803,6 +3803,17 @@ impl Simulator {
         }
     }
 
+    /// §6.19 / §8.23 / §26.3: `scope::lit` names an enum literal declared by
+    /// class or package `scope`. A literal is a constant, so a wait reading
+    /// it never needs a re-check for it.
+    fn scoped_enum_literal(&self, scope: &str, lit: &str) -> bool {
+        if self.module.classes.contains_key(scope) {
+            self.class_enum_member(scope, lit).is_some()
+        } else {
+            self.package_enum_member(scope, lit).is_some()
+        }
+    }
+
     /// `cond_gate_for`'s operand check.
     pub(super) fn cond_operand_gated(&self, e: &Expression, this_h: usize, this_cls: &str) -> bool {
         let this_member = |n: &str| {
@@ -3851,6 +3862,15 @@ impl Simulator {
                     return false;
                 }
                 let head = h.path[0].name.name.as_str();
+                // `Cls::LIT` / `pkg::LIT` outside a subroutine body.
+                if h.path.len() == 2
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && !method_local(head)
+                    && !this_member(head)
+                    && self.scoped_enum_literal(head, &h.path[1].name.name)
+                {
+                    return true;
+                }
                 let head_ok = if method_local(head) {
                     !self.vif_local_names.contains(head)
                 } else {
@@ -3881,6 +3901,18 @@ impl Simulator {
                 true
             }
             ExprKind::MemberAccess { expr, member } => {
+                // `Cls::LIT` / `pkg::LIT` inside a subroutine body, which the
+                // elaborator leaves as a member access of the scope name.
+                if let ExprKind::Ident(h) = &expr.kind
+                    && h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && !method_local(&h.path[0].name.name)
+                    && !this_member(&h.path[0].name.name)
+                    && self.scoped_enum_literal(&h.path[0].name.name, &member.name)
+                {
+                    return true;
+                }
                 self.cond_operand_gated(expr, this_h, this_cls)
                     && obj_prop(self.eval_handle_expr(expr).unwrap_or(0), &member.name)
             }

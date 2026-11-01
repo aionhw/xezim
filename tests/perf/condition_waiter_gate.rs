@@ -211,6 +211,86 @@ fn module_variable_writes_do_not_recheck_class_waiters() {
     assert!(rechecks <= 1500, "condition_waiter_rechecks={rechecks}");
 }
 
+/// Fifty idle waiters whose conditions compare against enum literals named
+/// through a class (`item::CANCELLED`) and a package (`p::DONE`). A literal is
+/// a constant, so it does not keep the wait ungated.
+const ENUM_LITERAL_DESIGN: &str = r#"
+`timescale 1ns/1ns
+package p;
+  typedef enum { IDLE, BUSY, DONE } state_e;
+endpackage
+class item;
+  typedef enum { NEW, ACCEPTED, CANCELLED } status_e;
+  status_e status;
+  p::state_e st;
+endclass
+class watcher;
+  bit is_reset;
+  int woke;
+  task automatic watch(item x);
+    fork
+      begin wait (is_reset == 1 || x.status == item::CANCELLED); woke = $time; end
+      begin wait (x.st == p::DONE); woke += 1000; end
+    join_none
+  endtask
+endclass
+module top;
+  watcher idle[$];
+  watcher w = new(), r = new();
+  item a = new(), b = new();
+  int steps;
+  initial begin
+    for (int i = 0; i < 50; i++) begin
+      automatic watcher x = new();
+      automatic item t = new();
+      idle.push_back(x);
+      x.watch(t);
+    end
+    w.watch(a);
+    r.watch(b);
+  end
+  initial begin
+    longint acc;
+    acc = 0;
+    for (steps = 0; steps < 200; steps++) begin
+      acc += steps;
+      #1;
+    end
+    $display("T|end acc=%0d idle0=%0d", acc, idle[0].woke);
+    $finish;
+  end
+  initial begin
+    #20 a.status = item::ACCEPTED;
+    #0 $display("T|t=%0t accepted=%0d", $time, w.woke);
+    #10 a.status = item::CANCELLED;
+    #0 $display("T|t=%0t cancelled=%0d", $time, w.woke);
+    #10 r.is_reset = 1;
+    #0 $display("T|t=%0t reset=%0d", $time, r.woke);
+    #10 b.st = p::BUSY;
+    #0 $display("T|t=%0t busy=%0d", $time, r.woke);
+    #10 b.st = p::DONE;
+    #0 $display("T|t=%0t done=%0d", $time, r.woke);
+  end
+endmodule
+"#;
+
+const ENUM_LITERAL_EXPECTED: &str = "\
+T|t=20 accepted=0
+T|t=30 cancelled=30
+T|t=40 reset=40
+T|t=50 busy=40
+T|t=60 done=1040
+T|end acc=19900 idle0=0";
+
+#[test]
+fn enum_literal_operands_do_not_ungate_waits() {
+    let (lines, rechecks) = run(ENUM_LITERAL_DESIGN);
+    assert_eq!(lines, expected(ENUM_LITERAL_EXPECTED));
+    // A scoped literal left the wait ungated: every idle waiter was
+    // re-checked on every drain (~61500).
+    assert!(rechecks <= 1000, "condition_waiter_rechecks={rechecks}");
+}
+
 /// Fifty idle `wait(is_reset == 1)` waiters while a method taking a virtual
 /// interface formal is called on every step. Binding and releasing the
 /// formal writes no variable a parked wait reads.
