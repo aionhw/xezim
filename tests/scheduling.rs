@@ -444,3 +444,6 @@ mod labeled_block_local_events;
 
 #[path = "scheduling/program_implicit_finish.rs"]
 mod program_implicit_finish;
+
+#[path = "scheduling/delay_always_constant_scaled_delay.rs"]
+mod delay_always_constant_scaled_delay;
