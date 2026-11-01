@@ -1861,8 +1861,18 @@ impl Simulator {
             // §8.25: a class typedef sized by a class parameter (`vec_t`).
             w
         } else if pre.param_able_result {
-            let scope = self.instance_param_scope(handle);
-            let w = resolve_type_width(&pre.return_type, Some(&scope), Some(&self.module.typedefs));
+            // The null handle (a free function) binds no class parameters,
+            // so the parameter table needs no per-call copy.
+            let w = if handle == 0 {
+                resolve_type_width(
+                    &pre.return_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+            } else {
+                let scope = self.instance_param_scope(handle);
+                resolve_type_width(&pre.return_type, Some(&scope), Some(&self.module.typedefs))
+            };
             if w > 0 { w } else { pre.static_result_width }
         } else {
             pre.static_result_width

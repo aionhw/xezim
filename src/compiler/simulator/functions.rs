@@ -1978,18 +1978,49 @@ impl Simulator {
                 }
             }
         }
-        if let Some(fields) = super::elaborate::packed_struct_field_layout(
-            dt,
-            &self.module.parameters,
-            &self.module.typedefs,
-            &self.module.typedef_types,
-        ) {
+        if let Some(fields) = self.formal_struct_layout(dt) {
             if !fields.is_empty() {
                 self.module
                     .packed_struct_fields
                     .insert(name.to_string(), fields);
             }
         }
+    }
+
+    /// `packed_struct_field_layout` of a formal's type, memoized per named
+    /// type (see `formal_struct_layouts`).
+    fn formal_struct_layout(&mut self, dt: &DataType) -> Option<Vec<(String, u32, u32)>> {
+        let layout = |m: &ElaboratedModule| {
+            super::elaborate::packed_struct_field_layout(
+                dt,
+                &m.parameters,
+                &m.typedefs,
+                &m.typedef_types,
+            )
+        };
+        let key = match dt {
+            DataType::TypeReference {
+                name,
+                dimensions,
+                type_args,
+                ..
+            } if dimensions.is_empty()
+                && type_args.is_empty()
+                && name.scopes.iter().all(|s| s.type_args.is_empty()) =>
+            {
+                name.qualified()
+            }
+            _ => return layout(&self.module),
+        };
+        if let Some((built_gen, fields)) = self.formal_struct_layouts.get(&key) {
+            if *built_gen == self.type_tables_gen {
+                return fields.clone();
+            }
+        }
+        let fields = layout(&self.module);
+        self.formal_struct_layouts
+            .insert(key, (self.type_tables_gen, fields.clone()));
+        fields
     }
 
     fn apply_default_formal_outputs(&mut self, bindings: &[(String, Expression)]) {
