@@ -2527,8 +2527,9 @@ impl Simulator {
                     self.shadowed_prop_names.insert(sp.clone());
                 }
             }
+            // The object is not on the heap yet, so no parked waiter reads
+            // these properties: seeding them notes no name.
             if t.property_seed_keys.is_none() {
-                bump_store_gen();
                 instance.properties = PropMap(t.base_props.clone());
             }
         }

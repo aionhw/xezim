@@ -2145,8 +2145,8 @@ impl Simulator {
                     );
                 }
                 // No key was ever made under this name, so the removal
-                // would find nothing (the store generation still moves).
-                None if !self.vif_local_names.contains(&port.name.name) => bump_store_gen(),
+                // would find nothing and nothing is written.
+                None if !self.vif_local_names.contains(&port.name.name) => {}
                 None => {
                     self.signals
                         .remove(&format!("__vif_local__{}", port.name.name));

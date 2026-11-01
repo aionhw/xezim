@@ -210,3 +210,66 @@ fn module_variable_writes_do_not_recheck_class_waiters() {
     // every step (~13500).
     assert!(rechecks <= 1500, "condition_waiter_rechecks={rechecks}");
 }
+
+/// Fifty idle `wait(is_reset == 1)` waiters while a method taking a virtual
+/// interface formal is called on every step. Binding and releasing the
+/// formal writes no variable a parked wait reads.
+const VIF_FORMAL_CALLS_DESIGN: &str = r#"
+`timescale 1ns/1ns
+interface bus_if;
+  logic [7:0] data;
+endinterface
+class driver;
+  bit is_reset;
+  int woke;
+  int sum;
+  task automatic watch();
+    fork
+      begin wait (is_reset == 1); woke = $time; end
+    join_none
+  endtask
+  function automatic int peek(virtual bus_if v, int k);
+    return v.data + k;
+  endfunction
+endclass
+module top;
+  bus_if bif();
+  driver idle[$];
+  driver d = new();
+  int steps;
+  initial begin
+    for (int i = 0; i < 50; i++) begin
+      automatic driver x = new();
+      idle.push_back(x);
+      x.watch();
+    end
+    d.watch();
+  end
+  initial begin
+    bif.data = 3;
+    for (steps = 0; steps < 200; steps++) begin
+      d.sum += d.peek(bif, steps);
+      #1;
+    end
+    $display("T|end sum=%0d idle0=%0d d=%0d", d.sum, idle[0].woke, d.woke);
+    $finish;
+  end
+  initial begin
+    #50 d.is_reset = 1;
+    #0 $display("T|t=%0t reset=%0d", $time, d.woke);
+  end
+endmodule
+"#;
+
+const VIF_FORMAL_CALLS_EXPECTED: &str = "\
+T|t=50 reset=50
+T|end sum=20500 idle0=0 d=50";
+
+#[test]
+fn virtual_interface_formals_do_not_recheck_waiters() {
+    let (lines, rechecks) = run(VIF_FORMAL_CALLS_DESIGN);
+    assert_eq!(lines, expected(VIF_FORMAL_CALLS_EXPECTED));
+    // Each call's formal bind and release noted every name: every idle
+    // waiter was re-checked twice per step (~10050).
+    assert!(rechecks <= 1000, "condition_waiter_rechecks={rechecks}");
+}

@@ -1556,9 +1556,6 @@ impl Simulator {
                         .collect()
                 };
                 let vif_saved = if vif_fast {
-                    if !ports.is_empty() {
-                        bump_store_gen();
-                    }
                     Vec::new()
                 } else {
                     self.vif_formals_enter(&vif_formals)
@@ -2825,11 +2822,7 @@ impl Simulator {
                 let vif_ended = if !vif_fast {
                     self.vif_formals_exit(vif_saved, &vif_formals, &outs)
                 } else if self.vif_local_names.len() == vif_len0 {
-                    // Still no formal name keyed: the exit only moves the
-                    // store generation again.
-                    if !ports.is_empty() {
-                        bump_store_gen();
-                    }
+                    // Still no formal name keyed: the exit writes nothing.
                     HashMap::default()
                 } else {
                     // The body keyed some name: replay the general exit from

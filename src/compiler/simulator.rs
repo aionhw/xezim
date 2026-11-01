@@ -3613,9 +3613,12 @@ fn note_event_trigger() {
 /// The `STORE_WRITE_MASK` bits of a runtime signal-map key: those of each
 /// name it is spelled from outside its index brackets (`top.blk.acc`,
 /// `12#m_q[3]`, `Cls::count`), so a write to a module variable does not
-/// re-check every gated waiter. A key with a compiler-generated part
-/// (`__vif_local__x`) or an escaped identifier names no source spelling the
-/// waiters could share, so it notes every bit.
+/// re-check every gated waiter. A key with another compiler-generated part
+/// or an escaped identifier names no source spelling the waiters could
+/// share, so it notes every bit. A virtual-interface binding key
+/// (`__vif_local__x`, `__vif_return__`) notes its own spelling only: no
+/// gated condition reads one (`cond_operand_gated` declines vif-bound
+/// names), so a call binding a vif formal need not re-check them all.
 fn signal_key_bits(k: &str) -> u64 {
     if k.contains('\\') {
         return u64::MAX;
@@ -3638,7 +3641,10 @@ fn signal_key_bits(k: &str) -> u64 {
                 i += 1;
             }
             let run = &k[start..i];
-            if run.starts_with("__") {
+            if run.starts_with("__")
+                && !run.starts_with("__vif_local__")
+                && !run.starts_with("__vif_return__")
+            {
                 return u64::MAX;
             }
             bits |= name_bit(run);

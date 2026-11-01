@@ -3798,13 +3798,12 @@ impl Simulator {
                 let lname: &str = h.path[0].name.name.as_str();
                 // `null` acts only on a vif property of `this` or a name that
                 // holds a `__vif_local__` key (the key removal otherwise finds
-                // nothing; the store generation still moves). Any other RHS
-                // must be able to name an interface instance.
+                // nothing, and the ordinary assignment notes the name). Any
+                // other RHS must be able to name an interface instance.
                 if matches!(&rvalue.kind, ExprKind::Null) {
                     if !self.class_member_names().vif_props.contains(lname)
                         && !self.vif_local_names.contains(lname)
                     {
-                        bump_store_gen();
                         return false;
                     }
                 } else if !self.vif_rhs_possible(rvalue) {

@@ -589,10 +589,9 @@ impl Simulator {
         let mut saved = Vec::with_capacity(formals.len());
         for ((name, _), nm) in formals.iter().zip(bound) {
             // No key was ever made for this name and none is made now: the
-            // removal would find nothing (the store generation still moves,
-            // as it did). An empty key marks the slot for the exit.
+            // removal would find nothing, so nothing is written. An empty key
+            // marks the slot for the exit.
             if nm.is_none() && !self.vif_local_names.contains(*name) {
-                bump_store_gen();
                 saved.push((String::new(), None));
                 continue;
             }
@@ -630,7 +629,6 @@ impl Simulator {
             // Untouched on entry: the key exists only if the body made one.
             let key = if key.is_empty() {
                 if !self.vif_local_names.contains(*name) {
-                    bump_store_gen();
                     continue;
                 }
                 format!("__vif_local__{}", name)
