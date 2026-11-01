@@ -251,3 +251,18 @@ mod string_key_escaping;
 
 #[path = "collections/assoc_locator_keys.rs"]
 mod assoc_locator_keys;
+
+#[path = "collections/review_wide_assoc_keys.rs"]
+mod review_wide_assoc_keys;
+
+#[path = "collections/numeric_string_keys_781.rs"]
+mod numeric_string_keys_781;
+
+#[path = "collections/locator_result_size_779.rs"]
+mod locator_result_size_779;
+
+#[path = "collections/nested_row_locators_780.rs"]
+mod nested_row_locators_780;
+
+#[path = "collections/enum_locator_p_782.rs"]
+mod enum_locator_p_782;
