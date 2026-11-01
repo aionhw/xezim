@@ -181,6 +181,8 @@ mod nonzero_based_vector_writes;
 mod package_base_constraint_inherited;
 #[path = "types/package_scope_resolution.rs"]
 mod package_scope_resolution;
+#[path = "types/package_struct_formal_layout_reuse.rs"]
+mod package_struct_formal_layout_reuse;
 #[path = "types/package_typedef_scoping.rs"]
 mod package_typedef_scoping;
 #[path = "types/packed_2d_element_in_size_cast.rs"]

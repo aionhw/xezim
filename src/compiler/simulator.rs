@@ -8896,6 +8896,11 @@ pub struct Simulator {
     /// Moves whenever a procedural `typedef` or an inline-enum local edits the
     /// type tables at run time (see `MethodCallPlan`).
     type_tables_gen: u64,
+    /// Packed struct layouts of named formal types by qualified type name,
+    /// each with the `type_tables_gen` it was built under. Laying out a
+    /// `pkg::T` struct copies the whole parameter table to see the
+    /// package's names bare, too costly to repeat on every call.
+    formal_struct_layouts: HashMap<String, (u64, Option<Vec<(String, u32, u32)>>)>,
     /// Emptied `local_type_stack` overlay pairs, reused by `push_local_frame`
     /// (capacity kept, contents cleared) instead of allocating a map pair for
     /// every activation that records a class/typedef-typed name.
