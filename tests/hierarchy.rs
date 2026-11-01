@@ -356,3 +356,6 @@ mod generate_nested_instance_port;
 
 #[path = "hierarchy/prepared_body_shared_across_ancestors.rs"]
 mod prepared_body_shared_across_ancestors;
+
+#[path = "hierarchy/param_port_actual_no_implicit_net.rs"]
+mod param_port_actual_no_implicit_net;
