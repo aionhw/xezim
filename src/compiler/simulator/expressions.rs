@@ -6613,6 +6613,21 @@ impl Simulator {
                         .or(other)
                     }
                 };
+                // §7.12.3 on a locator call's result queue.
+                if parsed.is_none() {
+                    let call = match &expr.kind {
+                        ExprKind::Call { func, .. } => &**func,
+                        _ => &**expr,
+                    };
+                    if let Some((tmp, method)) = self.locator_result_temp(call)
+                        && matches!(
+                            method,
+                            "sum" | "product" | "min" | "max" | "and" | "or" | "xor"
+                        )
+                    {
+                        return self.reduce_with(&tmp, method, filter, iter_name.as_deref());
+                    }
+                }
                 {
                     if let Some((arr, method)) = parsed {
                         let is_arr = self.is_with_receiver_storage(&arr);

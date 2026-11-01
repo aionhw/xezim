@@ -87,6 +87,38 @@ impl Simulator {
         None
     }
 
+    /// For a method call on a locator result (`q.find with (..).size()`,
+    /// `q.unique.size()`), materialize that result queue (§7.12.1) and
+    /// return it with the method name.
+    pub(super) fn locator_result_temp<'a>(
+        &mut self,
+        func: &'a Expression,
+    ) -> Option<(String, &'a str)> {
+        // `q.unique.size()` parses as one dotted identifier.
+        let dotted_recv;
+        let (recv, mname) = match &func.kind {
+            ExprKind::MemberAccess { expr: recv, member } if Self::ends_in_locator(recv) => {
+                (&**recv, member.name.as_str())
+            }
+            ExprKind::Ident(h)
+                if h.path.len() >= 3
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && Self::is_locator_method(&h.path[h.path.len() - 2].name.name) =>
+            {
+                let mut recv = h.clone();
+                recv.path.pop();
+                dotted_recv = Expression::new(ExprKind::Ident(recv), func.span);
+                (&dotted_recv, h.path[h.path.len() - 1].name.name.as_str())
+            }
+            _ => return None,
+        };
+        let (arr, lm, filter, iter) = self.locator_call(recv)?;
+        let tmp = format!("__xz_locator_{:p}", func);
+        let picks = self.locator_indices_named(&arr, &lm, filter.as_ref(), iter.as_deref());
+        self.materialize_locator(&tmp, &arr, &lm, &picks);
+        Some((tmp, mname))
+    }
+
     pub(super) fn eval_call_inner(&mut self, func: &Expression, args: &[Expression]) -> Value {
         // §11.4.1, §7.8.7: a receiver's selects (`m[f()].push_back(x)`) are
         // evaluated once; the dispatch below resolves the receiver several
@@ -142,16 +174,11 @@ impl Simulator {
                 return v;
             }
         }
-        // §7.12.1, §7.10.2: a locator method returns a queue, so `size()`
-        // applies to its result (`q.find_index with (item > 2).size()`).
-        if let ExprKind::MemberAccess { expr: recv, member } = &func.kind
-            && member.name == "size"
-            && args.is_empty()
-            && Self::locator_shaped(recv)
-            && let Some((arr, mname, filter, iter)) = self.locator_call(recv)
+        // §7.12.1, §7.10.2: a method on a locator call's result queue.
+        if let Some((tmp, mname)) = self.locator_result_temp(func)
+            && let Some(v) = self.eval_builtin_method(&tmp, mname, args)
         {
-            let picks = self.locator_indices_named(&arr, &mname, filter.as_ref(), iter.as_deref());
-            return Self::int_count(picks.len() as u64);
+            return v;
         }
         // Normalize away Specialization wrappers for dispatch shape-matching
         // (the `#(...)` text is retained in the original AST + `current_spec`

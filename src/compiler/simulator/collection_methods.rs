@@ -758,6 +758,21 @@ impl Simulator {
         }
     }
 
+    /// Whether `e` is shaped like a locator call (`q.find with (..)`,
+    /// `q.unique()`), without resolving its receiver.
+    pub(super) fn ends_in_locator(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Paren(inner) => Self::ends_in_locator(inner),
+            ExprKind::WithClause { expr, .. } => Self::ends_in_locator(expr),
+            ExprKind::Call { func, .. } => Self::ends_in_locator(func),
+            ExprKind::MemberAccess { member, .. } => Self::is_locator_method(&member.name),
+            ExprKind::Ident(h) => {
+                h.path.len() >= 2 && Self::is_locator_method(&h.path[h.path.len() - 1].name.name)
+            }
+            _ => false,
+        }
+    }
+
     /// IEEE 1800-2017 §7.12.1 array LOCATOR methods. They select elements and
     /// RETURN a queue — none of them modifies the source array.
     pub(super) fn is_locator_method(m: &str) -> bool {
@@ -774,23 +789,6 @@ impl Simulator {
                 | "unique"
                 | "unique_index"
         )
-    }
-
-    /// Whether `e` is spelled as a locator call (`q.find with (..)`,
-    /// `q.min()`, `q.unique`), before `locator_call` resolves its receiver.
-    pub(super) fn locator_shaped(e: &Expression) -> bool {
-        match &e.kind {
-            ExprKind::Paren(inner) | ExprKind::WithClause { expr: inner, .. } => {
-                Self::locator_shaped(inner)
-            }
-            ExprKind::Call { func, .. } => Self::locator_shaped(func),
-            ExprKind::MemberAccess { member, .. } => Self::is_locator_method(&member.name),
-            ExprKind::Ident(h) => h
-                .path
-                .last()
-                .is_some_and(|s| h.path.len() >= 2 && Self::is_locator_method(&s.name.name)),
-            _ => false,
-        }
     }
 
     /// §8.10: is this BARE name, in the CURRENT scope, a class-typed

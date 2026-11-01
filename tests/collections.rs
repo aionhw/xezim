@@ -270,3 +270,5 @@ mod nested_row_locators_780;
 mod enum_locator_p_782;
 #[path = "collections/assoc_store_context_width.rs"]
 mod assoc_store_context_width;
+#[path = "collections/locator_result_methods.rs"]
+mod locator_result_methods;
