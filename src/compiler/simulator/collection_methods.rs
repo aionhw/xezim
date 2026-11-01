@@ -1342,6 +1342,47 @@ impl Simulator {
         self.collection_element_class_named(leaf)
     }
 
+    /// The named key type of associative array `arr` in scope: a local's
+    /// typedef, else the module-scope table.
+    fn scope_assoc_key_type(&self, arr: &str) -> Option<String> {
+        let local_kt = self.local_typedef_type_of(&format!("{}[]", arr));
+        if local_kt.as_deref() == Some("") {
+            return None;
+        }
+        local_kt.or_else(|| self.module.assoc_key_type_names.get(arr).cloned())
+    }
+
+    /// The named key type of associative array `arr`: in scope (a local's
+    /// `@name#N` store by its name), else a class member's (`<handle>#m`)
+    /// from its declaring class.
+    pub(super) fn assoc_key_type_name(&self, arr: &str) -> Option<String> {
+        let local = arr
+            .strip_prefix('@')
+            .and_then(|s| s.rsplit_once('#'))
+            .map(|(n, _)| n);
+        if let Some(kt) = self
+            .scope_assoc_key_type(arr)
+            .or_else(|| local.and_then(|n| self.scope_assoc_key_type(n)))
+        {
+            return Some(kt);
+        }
+        let (h, member) = arr.split_once('#')?;
+        let mut cur = self
+            .heap
+            .get(h.parse::<usize>().ok()?)?
+            .as_ref()?
+            .class_name
+            .clone();
+        for _ in 0..16 {
+            let cd = self.module.classes.get(&cur)?;
+            if let Some(kt) = cd.assoc_key_types.get(member) {
+                return Some(kt.clone());
+            }
+            cur = cd.extends.clone()?;
+        }
+        None
+    }
+
     /// The CLASS an associative collection's loop variable names, when its
     /// KEY type is a class handle — `foreach (m_successors[succ])` over
     /// `bit m_successors[uvm_phase]` binds `succ` to the KEY (§12.7.3), and
@@ -1350,11 +1391,7 @@ impl Simulator {
     /// `assoc_key_type_names` map) and resolves it to a registered class.
     /// Returns None unless the key type names a class.
     pub(super) fn assoc_key_class_of_arr(&self, arr: &str) -> Option<String> {
-        let local_kt = self.local_typedef_type_of(&format!("{}[]", arr));
-        if local_kt.as_deref() == Some("") {
-            return None;
-        }
-        let kt = local_kt.or_else(|| self.module.assoc_key_type_names.get(arr).cloned())?;
+        let kt = self.scope_assoc_key_type(arr)?;
         let cls = if self.module.classes.contains_key(&kt) {
             kt
         } else {

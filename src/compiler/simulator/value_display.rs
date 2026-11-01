@@ -10,27 +10,54 @@ impl Simulator {
         let DataType::TypeReference { name: tn, .. } = dt else {
             return None;
         };
-        // The name text may carry its package (`pkg::e_t`) while the table
-        // is keyed by the typedef's bare name, or the reverse.
-        let bare = tn.name.name.rsplit("::").next().unwrap_or(&tn.name.name);
         let members = self
             .module
             .enum_members
             .get(&tn.qualified())
-            .or_else(|| self.module.enum_members.get(&tn.name.name))
-            .or_else(|| self.module.enum_members.get(bare))
-            .or_else(|| {
-                // `import pkg::*` leaves the bare name: the one package
-                // declaring it.
-                let suffix = format!("::{bare}");
-                let mut hits = self
-                    .module
-                    .enum_members
-                    .iter()
-                    .filter(|(k, _)| k.ends_with(&suffix));
-                let first = hits.next();
-                if hits.next().is_some() { None } else { first.map(|(_, m)| m) }
-            })?;
+            .or_else(|| self.enum_members_named(&tn.name.name))?;
+        Self::enum_label(members, v)
+    }
+
+    /// The members of the enum type named `name`, following typedef aliases.
+    pub(super) fn enum_members_named(&self, name: &str) -> Option<&Vec<(String, u64)>> {
+        let mut name = name;
+        for _ in 0..8 {
+            // The name text may carry its package (`pkg::e_t`) while the
+            // table is keyed by the typedef's bare name, or the reverse.
+            let bare = name.rsplit("::").next().unwrap_or(name);
+            if let Some(m) = self
+                .module
+                .enum_members
+                .get(name)
+                .or_else(|| self.module.enum_members.get(bare))
+            {
+                return Some(m);
+            }
+            match self.module.typedef_types.get(bare) {
+                Some(DataType::TypeReference { name: next, .. }) => name = &next.name.name,
+                // A local typedef of another type hides package enums.
+                Some(_) => return None,
+                None => break,
+            }
+        }
+        // `import pkg::*` leaves the bare name: the one package declaring it.
+        let bare = name.rsplit("::").next().unwrap_or(name);
+        let suffix = format!("::{bare}");
+        let mut hits = self
+            .module
+            .enum_members
+            .iter()
+            .filter(|(k, _)| k.ends_with(&suffix));
+        let first = hits.next();
+        if hits.next().is_some() {
+            None
+        } else {
+            first.map(|(_, m)| m)
+        }
+    }
+
+    /// The label of `v` among `members`; `None` for x/z or an invalid value.
+    pub(super) fn enum_label(members: &[(String, u64)], v: &Value) -> Option<String> {
         if v.has_xz() {
             return None;
         }
