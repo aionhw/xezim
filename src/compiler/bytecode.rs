@@ -12606,6 +12606,24 @@ impl<'a> BytecodeCompiler<'a> {
                 };
                 let ctr = self.alloc_reg();
                 self.emit(Insn::Move(ctr, cnt));
+                // §12.7.2/§6.12.2: a signed-negative count (e.g. `repeat(-1)`)
+                // means ZERO iterations — mirrors the interpreter's
+                // `repeat_count`, which clamps signed values with `.max(0)`.
+                // Without this guard, `repeat(-1)` would read back as
+                // 0xFFFFFFFF (non-zero, non-XZ) and spin ~2^32 times.
+                let neg_test = self.alloc_reg();
+                let signed_zero = self.alloc_reg();
+                let mut zv = Value::from_u64(0, 32);
+                zv.is_signed = true;
+                self.emit(Insn::LoadConst(signed_zero, Box::new(zv)));
+                // Signed compare (both operands need is_signed for `Lt` to
+                // use signed semantics): neg = (signed ctr < 0).
+                self.emit(Insn::Lt(neg_test, ctr, signed_zero));
+                let neg_jump = self.insns.len();
+                // Skip the counted loop when the count is definitely negative
+                // (`BranchUnlessZero` jumps on a definite 1; an X count falls
+                // through to the BranchIfFalse below, which exits on X/Z).
+                self.emit(Insn::BranchUnlessZero(neg_test, 0));
                 let top = self.insns.len() as u32;
                 let branch_idx = self.insns.len();
                 // Exits when the counter is no longer definitely non-zero
@@ -12620,6 +12638,7 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit(Insn::Jump(top));
                 let end = self.insns.len() as u32;
                 self.insns[branch_idx] = Insn::BranchIfFalse(ctr, end);
+                self.insns[neg_jump] = Insn::BranchUnlessZero(neg_test, end);
                 return true;
             }
 
@@ -13212,7 +13231,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit(Insn::AssignPendingColl(key.into_boxed_str(), val_reg));
                         return true;
                     }
-                    if width > 0 && !via_new {
+                    if width > 0 && !via_new && !self.expr_is_string_static(rvalue) {
                         self.emit(Insn::Resize(val_reg, width));
                     }
                     // class-perf P2: STRING member store (`m_leaf_name = name`)
@@ -13836,7 +13855,7 @@ impl<'a> BytecodeCompiler<'a> {
                                     return false;
                                 }
                             };
-                            if width > 0 {
+                            if width > 0 && !self.expr_is_string_static(rvalue) {
                                 self.emit(Insn::Resize(val_reg, width));
                             }
                             if !self.compile_blocking_target(lvalue, val_reg, width) {
@@ -14149,7 +14168,7 @@ impl<'a> BytecodeCompiler<'a> {
                             return false;
                         }
                     };
-                    if width > 0 {
+                    if width > 0 && !self.expr_is_string_static(rhs) {
                         self.emit(Insn::Resize(val_reg, width));
                     }
                     if !self.compile_blocking_target(lhs, val_reg, width) {
@@ -14272,6 +14291,107 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(patches) = self.loop_continue_patches.pop() {
                     for idx in patches {
                         self.insns[idx] = Insn::Jump(cond_at);
+                    }
+                }
+                if let Some(patches) = self.loop_break_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(end);
+                    }
+                }
+                true
+            }
+            StatementKind::Repeat { count, body } => {
+                // §12.7.5: repeat (count) body
+                // Lowered as an internal countdown loop to 0.
+                // §12.7.2: a real count rounds to an integer (ties away from
+                // zero). compile_expr(count,32) would ceiling the real to an
+                // int (10.4 -> 11), so let the interpreter's `repeat_count`
+                // handle real counts — mirrors the Process-FSM path's
+                // `bail("Repeat_real_count")` above.
+                if self.expr_may_be_real(count) {
+                    self.bail("Repeat_real_count");
+                    return false;
+                }
+                let Some(cnt_reg) = self.compile_expr(count, 32) else {
+                    self.bail("Repeat_count");
+                    return false;
+                };
+                let iter_reg = self.alloc_reg();
+                self.emit(Insn::Move(iter_reg, cnt_reg));
+                let zero_reg = self.alloc_reg();
+                self.emit(Insn::LoadConst(zero_reg, Box::new(Value::from_u64(0, 32))));
+                let one_reg = self.alloc_reg();
+                self.emit(Insn::LoadConst(one_reg, Box::new(Value::from_u64(1, 32))));
+
+                // §12.7.2/§6.12.2: a signed-negative count (e.g. `repeat(-1)`)
+                // means ZERO iterations — mirrors the interpreter's
+                // `repeat_count`, which clamps signed values with `.max(0)`.
+                // Without this, `repeat(-1)` reads back as 0xFFFFFFFF
+                // (non-zero) and the Gt-based loop below spins ~2^32 times.
+                let neg_rs = self.alloc_reg();
+                let signed_zero_reg = self.alloc_reg();
+                let mut zsv = Value::from_u64(0, 32);
+                zsv.is_signed = true;
+                self.emit(Insn::LoadConst(signed_zero_reg, Box::new(zsv)));
+                // Signed compare: `Lt` is signed only when BOTH operands are.
+                self.emit(Insn::Lt(neg_rs, iter_reg, signed_zero_reg));
+                let neg_jmp = self.insns.len();
+                // `BranchUnlessZero` jumps on a definite 1; an X count falls
+                // through to the Gt condition below, which already exits on X.
+                self.emit(Insn::BranchUnlessZero(neg_rs, 0));
+
+                self.loop_break_patches.push(Vec::new());
+                self.loop_continue_patches.push(Vec::new());
+
+                let top = self.insns.len() as u32;
+                let cond_reg = self.alloc_reg();
+                self.emit(Insn::Gt(cond_reg, iter_reg, zero_reg));
+                let br = self.insns.len();
+                self.emit(Insn::BranchIfFalse(cond_reg, 0));
+
+                if !self.compile_stmt(body) {
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    return false;
+                }
+
+                let step_top = self.insns.len() as u32;
+                self.emit(Insn::Sub(iter_reg, iter_reg, one_reg));
+                self.emit(Insn::Jump(top));
+
+                let end = self.insns.len() as u32;
+                if let Insn::BranchIfFalse(reg, _) = self.insns[br] {
+                    self.insns[br] = Insn::BranchIfFalse(reg, end);
+                }
+                self.insns[neg_jmp] = Insn::BranchUnlessZero(neg_rs, end);
+                if let Some(patches) = self.loop_continue_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(step_top);
+                    }
+                }
+                if let Some(patches) = self.loop_break_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(end);
+                    }
+                }
+                true
+            }
+            StatementKind::Forever { body } => {
+                // §12.7.1: forever body
+                // Infinite loop: jumps to top at the end; break exits, continue loops.
+                self.loop_break_patches.push(Vec::new());
+                self.loop_continue_patches.push(Vec::new());
+                let top = self.insns.len() as u32;
+                if !self.compile_stmt(body) {
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    return false;
+                }
+                self.emit(Insn::Jump(top));
+                let end = self.insns.len() as u32;
+                if let Some(patches) = self.loop_continue_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(top);
                     }
                 }
                 if let Some(patches) = self.loop_break_patches.pop() {
