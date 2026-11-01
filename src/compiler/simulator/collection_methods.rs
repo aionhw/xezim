@@ -970,9 +970,12 @@ impl Simulator {
                     Some(a) => a,
                     // A receiver reached through selects — a struct's
                     // dynamic member (`fa[1].q`), an element of a fixed
-                    // array of queues (`q3[1]`, `s.sp[2]`) — names its
-                    // store through the collection resolver.
-                    None if Self::is_locator_method(&member.name) => self.expr_assoc_name(expr)?,
+                    // array of queues (`q3[1]`, `s.sp[2]`), a row of a
+                    // nested associative array (`m["a"]`, §7.8.1) — names
+                    // its store through the collection resolvers.
+                    None if Self::is_locator_method(&member.name) => self
+                        .expr_assoc_name(expr)
+                        .or_else(|| self.nested_index_name(expr))?,
                     None => return None,
                 };
                 (arr, member.name.clone())
