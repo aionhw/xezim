@@ -257,3 +257,6 @@ mod locator_result_methods;
 
 #[path = "collections/nested_row_locators.rs"]
 mod nested_row_locators;
+
+#[path = "collections/string_key_order.rs"]
+mod string_key_order;

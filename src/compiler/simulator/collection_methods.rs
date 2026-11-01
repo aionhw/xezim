@@ -3253,13 +3253,13 @@ impl Simulator {
             && self.is_associative_array(obj_name)
         {
             let keys = self.assoc_top_level_keys_shared(obj_name);
-            // i128, not i64: a full-range unsigned 64-bit key
-            // (18446744073709551615) is numeric too — treating it as a
-            // string wrote the key's ASCII bytes into the ref arg.
-            let all_numeric = keys.iter().all(|k| k.parse::<i128>().is_ok());
             if keys.is_empty() {
                 return Some(Value::zero(32));
             }
+            // §7.8.2: string keys stay strings even when they look numeric.
+            // i128, not i64: a full-range unsigned 64-bit key is numeric too.
+            let all_numeric = !self.is_string_keyed_array(obj_name)
+                && keys.iter().all(|k| k.parse::<i128>().is_ok());
             let result_key = if bm == BuiltinM::First {
                 Some(keys[0].clone())
             } else if bm == BuiltinM::Last {

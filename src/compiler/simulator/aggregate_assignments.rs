@@ -4436,22 +4436,7 @@ impl Simulator {
                         })
                         .cloned()
                 });
-            let prefix = format!("{}[", name);
-            let registered = self.signal_name_to_id.names_with_prefix(&prefix);
-            let mut keys: Vec<String> = self
-                .signals
-                .keys()
-                .map(|k| k.as_str())
-                .chain(registered.iter().map(|k| &**k))
-                .filter_map(|k| k.strip_prefix(prefix.as_str()))
-                .filter_map(|rest| rest.split(']').next())
-                .map(|s| s.to_string())
-                .collect();
-            Self::sort_name_keys(&mut keys);
-            keys.dedup();
-            if keys.iter().all(|k| k.parse::<i64>().is_ok()) {
-                keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
-            }
+            let keys = self.assoc_top_level_keys_shared(name);
             let string_keyed = self.is_string_keyed_array(name);
             let val_is_str = self.string_signals.contains(name);
             let parts: Vec<String> = keys
@@ -4498,25 +4483,7 @@ impl Simulator {
         // Associative array -> `'{key:value, ...}` over its populated keys
         // (LRM §21.2.1.7). Elements live in `signals` as `name[key]…`.
         if self.module.associative_arrays.contains_key(name) {
-            let prefix = format!("{}[", name);
-            // Elements written at run time live in `signals`; elements created
-            // by a declaration initializer live in the compact signal table.
-            let registered = self.signal_name_to_id.names_with_prefix(&prefix);
-            let mut keys: Vec<String> = self
-                .signals
-                .keys()
-                .map(|k| k.as_str())
-                .chain(registered.iter().map(|k| &**k))
-                .filter_map(|k| k.strip_prefix(prefix.as_str()))
-                .filter_map(|rest| rest.split(']').next())
-                .map(|s| s.to_string())
-                .collect();
-            Self::sort_name_keys(&mut keys);
-            keys.dedup();
-            // Numeric keys sort numerically, not lexically.
-            if keys.iter().all(|k| k.parse::<i64>().is_ok()) {
-                keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
-            }
+            let keys = self.assoc_top_level_keys_shared(name);
             let string_keyed = self.is_string_keyed_array(name);
             let parts: Vec<String> = keys
                 .iter()
