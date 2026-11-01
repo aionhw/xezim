@@ -7173,6 +7173,9 @@ impl<'a> BytecodeCompiler<'a> {
     /// Class aliases with parameter-dependent packed bounds need the live
     /// specialization. Do not newly resolve them using module defaults (or
     /// the unresolved-range width of one) in a compiled local declaration.
+    /// §8.25: neither may a method's own `bit [N-1:0]` whose bound names a
+    /// class value parameter the compiler cannot fold; its width would fall
+    /// to the 32-bit default instead of the receiver's specialization.
     fn class_alias_dynamic_width(&self, dt: &crate::ast::types::DataType) -> bool {
         use crate::ast::types::{DataType as D, PackedDimension as P};
         let mut cur = dt;
@@ -7194,14 +7197,24 @@ impl<'a> BytecodeCompiler<'a> {
                     owner = Some(key);
                 }
                 D::IntegerVector { dimensions, .. } | D::Implicit { dimensions, .. } => {
-                    return class_alias
-                        && dimensions.iter().any(|dim| match dim {
-                            P::Range { left, right, .. } => {
-                                !matches!(left.kind, ExprKind::Number(_))
-                                    || !matches!(right.kind, ExprKind::Number(_))
-                            }
-                            P::Unsized(_) => true,
-                        });
+                    if !class_alias {
+                        return self.method_mode
+                            && owner.is_none()
+                            && dimensions.iter().any(|dim| match dim {
+                                P::Range { left, right, .. } => {
+                                    self.eval_const_expr(left).is_none()
+                                        || self.eval_const_expr(right).is_none()
+                                }
+                                P::Unsized(_) => false,
+                            });
+                    }
+                    return dimensions.iter().any(|dim| match dim {
+                        P::Range { left, right, .. } => {
+                            !matches!(left.kind, ExprKind::Number(_))
+                                || !matches!(right.kind, ExprKind::Number(_))
+                        }
+                        P::Unsized(_) => true,
+                    });
                 }
                 _ => return false,
             }
