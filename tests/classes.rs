@@ -121,6 +121,8 @@ mod rand_array_elem_signedness;
 mod rand_obj_array_elem_constraints;
 #[path = "classes/randomize_args_name_object_members.rs"]
 mod randomize_args_name_object_members;
+#[path = "classes/randomize_assoc_joint_solve.rs"]
+mod randomize_assoc_joint_solve;
 #[path = "classes/randomize_failure_diag.rs"]
 mod randomize_failure_diag;
 #[path = "classes/static_fixed_array_storage.rs"]
