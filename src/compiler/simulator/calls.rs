@@ -142,6 +142,17 @@ impl Simulator {
                 return v;
             }
         }
+        // §7.12.1, §7.10.2: a locator method returns a queue, so `size()`
+        // applies to its result (`q.find_index with (item > 2).size()`).
+        if let ExprKind::MemberAccess { expr: recv, member } = &func.kind
+            && member.name == "size"
+            && args.is_empty()
+            && Self::locator_shaped(recv)
+            && let Some((arr, mname, filter, iter)) = self.locator_call(recv)
+        {
+            let picks = self.locator_indices_named(&arr, &mname, filter.as_ref(), iter.as_deref());
+            return Self::int_count(picks.len() as u64);
+        }
         // Normalize away Specialization wrappers for dispatch shape-matching
         // (the `#(...)` text is retained in the original AST + `current_spec`
         // for per-spec static keying). Keeps pre-Specialization dispatch exact.

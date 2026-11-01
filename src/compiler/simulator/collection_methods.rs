@@ -776,6 +776,23 @@ impl Simulator {
         )
     }
 
+    /// Whether `e` is spelled as a locator call (`q.find with (..)`,
+    /// `q.min()`, `q.unique`), before `locator_call` resolves its receiver.
+    pub(super) fn locator_shaped(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Paren(inner) | ExprKind::WithClause { expr: inner, .. } => {
+                Self::locator_shaped(inner)
+            }
+            ExprKind::Call { func, .. } => Self::locator_shaped(func),
+            ExprKind::MemberAccess { member, .. } => Self::is_locator_method(&member.name),
+            ExprKind::Ident(h) => h
+                .path
+                .last()
+                .is_some_and(|s| h.path.len() >= 2 && Self::is_locator_method(&s.name.name)),
+            _ => false,
+        }
+    }
+
     /// §8.10: is this BARE name, in the CURRENT scope, a class-typed
     /// receiver holding a live object? Such a receiver dispatches its USER
     /// methods — never a collection builtin — even when an outer call
