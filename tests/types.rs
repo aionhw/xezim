@@ -629,3 +629,6 @@ mod body_typedef_first_instance_680;
 mod return_expr_context_width;
 #[path = "types/type_param_header_defaults.rs"]
 mod type_param_header_defaults;
+
+#[path = "types/packed_member_array_patterns_771.rs"]
+mod packed_member_array_patterns_771;
