@@ -1835,6 +1835,9 @@ pub struct BytecodeCompiler<'a> {
     /// cell. A carried class handle must be one of these, so a fallback's
     /// member access and dispatch see its declared class.
     method_bound_names: HashSet<String>,
+    /// Registers of class-handle locals declared in a nested block over a
+    /// bound name, which a statement fallback cannot carry.
+    method_shadowing_regs: HashSet<RegId>,
     /// Step 9g: WRITABLE static-property names (bare) of the enclosing
     /// class chain — reads AND stores lower to Load/StoreClassStatic.
     static_member_names: HashSet<String>,
@@ -2237,6 +2240,7 @@ impl<'a> BytecodeCompiler<'a> {
             method_formal_widths: HashMap::default(),
             method_writeback_names: HashSet::default(),
             method_bound_names: HashSet::default(),
+            method_shadowing_regs: HashSet::default(),
             static_member_names: HashSet::default(),
             class_const_names: HashSet::default(),
             new_type_map: HashMap::default(),
@@ -4688,6 +4692,16 @@ impl<'a> BytecodeCompiler<'a> {
                 .get(name)
                 .is_some_and(|(r, _)| !self.local_kinds.contains_key(r));
             let bound = self.method_bound_names.contains(name);
+            // The activation records the outer declaration's class, not a
+            // nested block's redeclaration of the name.
+            if bound
+                && self
+                    .local_var_regs
+                    .get(name)
+                    .is_some_and(|(r, _)| self.method_shadowing_regs.contains(r))
+            {
+                return Err("fb_shadowed_handle");
+            }
             // A nested-block handle carries its declared class instead.
             let nested_class = (!bound)
                 .then(|| self.method_handle_local_types.get(name))
@@ -12298,11 +12312,19 @@ impl<'a> BytecodeCompiler<'a> {
                         let slot = self.alloc_reg();
                         // §8.8: `C h = new(...)` constructs the local's
                         // declared class, as `h = new(...)` does.
+                        // The map is keyed by name, so a declaration that
+                        // shadows another of a different class (a member, a
+                        // sibling block's local) keeps the general lowering.
                         let new_cls = decl
                             .init
                             .as_ref()
                             .filter(|e| Self::is_new_shape(e))
-                            .and_then(|_| self.new_type_map.get(&decl.name.name).cloned());
+                            .and_then(|_| self.new_type_map.get(&decl.name.name))
+                            .filter(|cls| {
+                                matches!(data_type, crate::ast::types::DataType::TypeReference { name, .. }
+                                    if name.name.name.rsplit("::").next() == Some(cls.as_str()))
+                            })
+                            .cloned();
                         match &decl.init {
                             Some(expr) if new_cls.is_some() => {
                                 let cls = new_cls.expect("checked");
@@ -12322,6 +12344,11 @@ impl<'a> BytecodeCompiler<'a> {
                             None => {
                                 self.emit(Insn::LoadConst(slot, Box::new(Value::zero(32))));
                             }
+                        }
+                        if self.method_bound_names.contains(&decl.name.name)
+                            && self.local_var_regs.contains_key(&decl.name.name)
+                        {
+                            self.method_shadowing_regs.insert(slot);
                         }
                         self.local_var_regs
                             .insert(decl.name.name.clone(), (slot, 0));
@@ -20196,6 +20223,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.allow_ast_fallback = method_stmt_fallback_enabled();
         self.method_writeback_names = writeback_formals.iter().cloned().collect();
         self.method_bound_names = formals.iter().map(|(n, _)| n.clone()).collect();
+        self.method_shadowing_regs.clear();
         if let Some((rname, ..)) = result {
             self.method_bound_names.insert(rname.to_string());
         }
