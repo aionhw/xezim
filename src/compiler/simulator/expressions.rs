@@ -5195,12 +5195,15 @@ impl Simulator {
                     if k < 0 || k as usize >= idxs.len() {
                         return Value::new(32); // out-of-range read -> x
                     }
-                    let src_i = idxs[k as usize];
                     if mname.ends_with("_index") {
-                        return Value::from_u64(src_i as u64, 32);
+                        return idxs.index_value(k as usize);
                     }
                     return self
-                        .get_signal_value_by_name(&format!("{}[{}]", arr_name, src_i))
+                        .get_signal_value_by_name(&format!(
+                            "{}[{}]",
+                            arr_name,
+                            idxs.sel(k as usize)
+                        ))
                         .unwrap_or_else(|| Value::new(32));
                 }
                 // §7.4.2: an element of an N-D fixed-array CLASS property —

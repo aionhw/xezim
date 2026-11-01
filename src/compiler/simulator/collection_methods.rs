@@ -4,6 +4,80 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// An associative array's index type, for `item.index` (§7.12.4) and
+/// `_index` locator results (§7.12.1).
+#[derive(Clone, Copy)]
+pub(super) enum AssocKeyTy {
+    Str,
+    Int { width: u32, signed: bool },
+}
+
+impl AssocKeyTy {
+    /// Stored key `k` as a value of this type.
+    pub(super) fn value(self, k: &str) -> Value {
+        match (self, k.parse::<i128>()) {
+            (AssocKeyTy::Int { width, signed }, Ok(n)) => {
+                let mut v = Value::from_u64(n as u64, width.clamp(1, 64));
+                v.is_signed = signed;
+                v
+            }
+            _ => Simulator::name_key_value(k),
+        }
+    }
+}
+
+/// An `int` array index (§7.12.1, §7.12.4).
+fn int_index(i: usize) -> Value {
+    let mut v = Value::from_u64(i as u64, 32);
+    v.is_signed = true;
+    v
+}
+
+/// The select of a picked element: its stored key, or its index.
+pub(super) enum Sel<'a> {
+    Key(&'a str),
+    Pos(usize),
+}
+
+impl std::fmt::Display for Sel<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Sel::Key(k) => f.write_str(k),
+            Sel::Pos(p) => write!(f, "{}", p),
+        }
+    }
+}
+
+/// The elements a locator method picked (§7.12.1): positions in the
+/// array's index order, or in the key list of an associative array.
+pub(super) struct LocatorPicks {
+    assoc: Option<(Arc<Vec<String>>, AssocKeyTy)>,
+    picks: Vec<usize>,
+}
+
+impl LocatorPicks {
+    pub(super) fn len(&self) -> usize {
+        self.picks.len()
+    }
+
+    pub(super) fn sel(&self, i: usize) -> Sel<'_> {
+        let p = self.picks[i];
+        match &self.assoc {
+            Some((k, _)) => Sel::Key(&k[p]),
+            None => Sel::Pos(p),
+        }
+    }
+
+    /// The `_index` result for pick `i`.
+    pub(super) fn index_value(&self, i: usize) -> Value {
+        let p = self.picks[i];
+        match &self.assoc {
+            Some((k, ty)) => ty.value(&k[p]),
+            None => int_index(p),
+        }
+    }
+}
+
 impl Simulator {
     /// If `e` names a plain object-typed lvalue holding a live class handle,
     /// returns that handle; otherwise `None`. Used by `std::randomize(obj)`
@@ -925,30 +999,24 @@ impl Simulator {
         method: &str,
         filter: Option<&Expression>,
         iter_name: Option<&str>,
-    ) -> Vec<usize> {
-        // §7.12.1, §7.8.2: an associative array is searched in index order,
-        // its elements living at `arr[key]`; the `_index` forms yield keys.
-        // With integral non-negative keys the key doubles as the position
-        // every caller names an element by. The positional walk below saw an
-        // associative array as empty, so every locator on one (the axi4
-        // AVIP scoreboard's `find_first_index` over its address tables)
-        // found nothing. String or negative keys keep the old answer.
-        let order: Vec<usize> = if self.is_associative_array(arr) {
-            match self
-                .assoc_top_level_keys(arr)
-                .iter()
-                .map(|k| k.parse::<usize>().ok())
-                .collect::<Option<Vec<_>>>()
-            {
-                Some(ks) => ks,
-                None => return Vec::new(),
-            }
-        } else {
-            (0..self.get_queue_size(arr) as usize).collect()
+    ) -> LocatorPicks {
+        // §7.12.1: an associative array is searched in first()/next() key
+        // order (§7.9); picks index that key list.
+        let assoc = self.is_associative_array(arr).then(|| {
+            (
+                self.assoc_top_level_keys_shared(arr),
+                self.assoc_key_ty(arr),
+            )
+        });
+        let size = match &assoc {
+            Some((k, _)) => k.len(),
+            None => self.get_queue_size(arr) as usize,
         };
-        let size = order.len();
         if size == 0 {
-            return Vec::new();
+            return LocatorPicks {
+                assoc,
+                picks: Vec::new(),
+            };
         }
         let elem_su = self.queue_elem_struct(arr);
         let pushed_frame = if self.local_stack.is_empty() {
@@ -993,20 +1061,24 @@ impl Simulator {
         };
         let mut keys: Vec<i64> = Vec::with_capacity(size);
         let mut truth: Vec<bool> = Vec::with_capacity(size);
-        for &i in &order {
-            let elem = format!("{}[{}]", arr, i);
+        for i in 0..size {
+            let elem = match &assoc {
+                Some((k, _)) => format!("{}[{}]", arr, k[i]),
+                None => format!("{}[{}]", arr, i),
+            };
             if elem_su.is_some() {
                 self.item_alias = Some(elem.clone());
             }
             let v = self
                 .get_signal_value_by_name(&elem)
                 .unwrap_or_else(|| Value::zero(32));
+            // §7.12.4: `item.index` (or `<iterator>.index`) is the
+            // element's index, an int, or an associative array's key.
+            let ix = match &assoc {
+                Some((k, ty)) => ty.value(&k[i]),
+                None => int_index(i),
+            };
             if let Some(f) = self.local_stack.last_mut() {
-                // §7.12.4: `item.index` (or `<iterator>.index`) is the
-                // element's index, an int; it was never bound here, so
-                // `find with (item == item.index)` compared against 0.
-                let mut ix = Value::from_u64(i as u64, 32);
-                ix.is_signed = true;
                 f.insert("item".to_string(), v.clone());
                 f.insert("item.index".to_string(), ix.clone());
                 if let Some(nm) = iter_name {
@@ -1087,7 +1159,10 @@ impl Simulator {
             }
             _ => Vec::new(),
         };
-        picked.into_iter().map(|p| order[p]).collect()
+        LocatorPicks {
+            assoc,
+            picks: picked,
+        }
     }
 
     /// Write a locator result into the destination queue `dst`. The `_index`
@@ -1098,20 +1173,18 @@ impl Simulator {
         dst: &str,
         arr: &str,
         method: &str,
-        idxs: &[usize],
+        picks: &LocatorPicks,
     ) {
         let index_form = method.ends_with("_index");
-        for (i, &src_i) in idxs.iter().enumerate() {
+        for i in 0..picks.len() {
             if index_form {
-                self.set_signal_value_by_name(
-                    &format!("{}[{}]", dst, i),
-                    Value::from_u64(src_i as u64, 32),
-                );
+                let v = picks.index_value(i);
+                self.set_signal_value_by_name(&format!("{}[{}]", dst, i), v);
             } else {
-                self.queue_copy_elem(arr, src_i as u64, dst, i as u64);
+                self.queue_copy_elem(arr, picks.sel(i), dst, i as u64);
             }
         }
-        self.set_queue_size(dst, idxs.len() as u64);
+        self.set_queue_size(dst, picks.len() as u64);
     }
 
     /// Will `sort_with` order by the STRING text of each element's key?
@@ -1158,6 +1231,17 @@ impl Simulator {
             ExprKind::Paren(inner) => self.sort_key_is_string(arr, inner, iter),
             _ => false,
         }
+    }
+
+    /// Whether class collection store `<handle>#<member>` holds strings.
+    pub(super) fn class_coll_holds_strings(&self, store: &str) -> bool {
+        let Some((h, m)) = store.split_once('#') else {
+            return false;
+        };
+        h.parse::<usize>()
+            .ok()
+            .and_then(|h| self.heap.get(h)?.as_ref())
+            .is_some_and(|o| self.class_prop_is_string(&o.class_name, m))
     }
 
     /// Is `prop` on `cls` (or an ancestor) a STRING-typed class property?
@@ -1452,6 +1536,16 @@ impl Simulator {
         }
     }
 
+    /// The index type of associative array `arr`. Wildcard indices are not
+    /// rejected, though §7.12.1 and §7.12.4 forbid them here.
+    pub(super) fn assoc_key_ty(&self, arr: &str) -> AssocKeyTy {
+        if self.is_string_keyed_array(arr) {
+            return AssocKeyTy::Str;
+        }
+        let (width, signed) = self.assoc_index_width_for(arr).unwrap_or((32, true));
+        AssocKeyTy::Int { width, signed }
+    }
+
     pub(super) fn reduce_with(
         &mut self,
         arr: &str,
@@ -1461,11 +1555,14 @@ impl Simulator {
     ) -> Value {
         // §7.8 / §7.12.3: an associative array reduces over its populated
         // keys in key order, and `item.index` is the key.
-        let assoc_keys = self
-            .is_associative_array(arr)
-            .then(|| self.assoc_top_level_keys(arr));
-        let size = match &assoc_keys {
-            Some(k) => k.len() as u64,
+        let assoc = self.is_associative_array(arr).then(|| {
+            (
+                self.assoc_top_level_keys_shared(arr),
+                self.assoc_key_ty(arr),
+            )
+        });
+        let size = match &assoc {
+            Some((k, _)) => k.len() as u64,
             None => self.get_queue_size(arr),
         };
         // Ensure a local frame exists so `item` has somewhere to live.
@@ -1497,30 +1594,18 @@ impl Simulator {
         let mut expr_w: u32 = 0;
         let mut expr_s = false;
         for i in 0..size {
-            let key = assoc_keys.as_ref().map(|k| k[i as usize].as_str());
+            let key = assoc.as_ref().map(|(k, ty)| (k[i as usize].as_str(), *ty));
             let elem = self
                 .get_signal_value_by_name(&match key {
-                    Some(k) => format!("{}[{}]", arr, k),
+                    Some((k, _)) => format!("{}[{}]", arr, k),
                     None => format!("{}[{}]", arr, i),
                 })
                 .unwrap_or_else(|| Value::zero(32));
             // §7.12.4: `item.index` is the element's index (an int), or the
             // key of an associative array.
             let ix = match key {
-                Some(k) => match k.parse::<i128>() {
-                    Ok(n) => {
-                        let (kw, ks) = self.assoc_index_width_for(arr).unwrap_or((32, true));
-                        let mut v = Value::from_u64(n as u64, kw.clamp(1, 64));
-                        v.is_signed = ks;
-                        v
-                    }
-                    Err(_) => Self::name_key_value(k),
-                },
-                None => {
-                    let mut v = Value::from_u64(i, 32);
-                    v.is_signed = true;
-                    v
-                }
+                Some((k, ty)) => ty.value(k),
+                None => int_index(i as usize),
             };
             if let Some(f) = self.local_stack.last_mut() {
                 if let Some(nm) = iter {

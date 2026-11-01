@@ -248,3 +248,6 @@ mod review_coll_shape_rows;
 
 #[path = "collections/string_key_escaping.rs"]
 mod string_key_escaping;
+
+#[path = "collections/assoc_locator_keys.rs"]
+mod assoc_locator_keys;
