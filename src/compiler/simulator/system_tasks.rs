@@ -2765,26 +2765,32 @@ impl Simulator {
                                         self.string_signals.contains(&arr_name)
                                             || self.class_coll_holds_strings(&arr_name)
                                     };
-                                    // §21.2.1.6: an enum prints by its label —
-                                    // an `_index` result of an enum-keyed array,
-                                    // or an element of an enum array.
-                                    let key_ty = mname
-                                        .ends_with("_index")
-                                        .then(|| self.assoc_key_type_name(&arr_name))
-                                        .flatten();
-                                    let elem_dt = (!mname.ends_with("_index"))
-                                        .then(|| self.module.var_decl_types.get(&arr_name).cloned())
-                                        .flatten();
+                                    // §21.2.1.6: an enum result (key or element
+                                    // type) prints its labels.
+                                    let enum_ty = if !mname.ends_with("_index") {
+                                        self.class_member_coll_type(&arr_name)
+                                            .cloned()
+                                            .or_else(|| self.p_elem_type(&arr_name))
+                                            .and_then(|dt| match dt {
+                                                DataType::TypeReference { name, .. } => {
+                                                    Some(name.qualified())
+                                                }
+                                                _ => None,
+                                            })
+                                    } else if self.is_associative_array(&arr_name) {
+                                        self.assoc_key_type_name(&arr_name)
+                                    } else {
+                                        None
+                                    };
+                                    let members =
+                                        enum_ty.as_deref().and_then(|t| self.enum_members_named(t));
                                     let mut parts: Vec<String> = Vec::with_capacity(idxs.len());
                                     for i in 0..idxs.len() {
                                         if let Some(v) = self
                                             .get_signal_value_by_name(&format!("{}[{}]", TMP, i))
                                         {
-                                            let label = match (&key_ty, &elem_dt) {
-                                                (Some(t), _) => self.p_enum_label_named(&v, t, t),
-                                                (_, Some(dt)) => self.p_enum_label(&v, dt),
-                                                _ => None,
-                                            };
+                                            let label =
+                                                members.and_then(|m| Self::enum_label(m, &v));
                                             parts.push(label.unwrap_or_else(|| {
                                                 Self::render_p_value(&v, is_str)
                                             }));
