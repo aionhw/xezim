@@ -1514,7 +1514,7 @@ impl Simulator {
                         v.is_signed = ks;
                         v
                     }
-                    Err(_) => Value::from_string(k),
+                    Err(_) => Self::name_key_value(k),
                 },
                 None => {
                     let mut v = Value::from_u64(i, 32);
@@ -3167,28 +3167,28 @@ impl Simulator {
                     // (assoc_key_str): a signed ref var must read back
                     // "-3", not its zero-extended u64 form — otherwise
                     // next()/prev() never find the current position.
-                    let cur = if all_numeric {
-                        self.assoc_key_str(obj_name, &cur_val)
+                    // §7.8.5: the given index need not exist.
+                    let (cur_num, cur_str) = if all_numeric {
+                        (
+                            self.assoc_key_str(obj_name, &cur_val).parse::<i128>().ok(),
+                            String::new(),
+                        )
                     } else {
-                        cur_val.to_sv_string()
+                        (None, cur_val.to_sv_string())
                     };
-                    if let Some(pos) = keys.iter().position(|k| *k == cur) {
-                        if bm == BuiltinM::Next {
-                            if pos + 1 < keys.len() {
-                                Some(keys[pos + 1].clone())
-                            } else {
-                                None
-                            }
+                    let order = |k: &str| {
+                        if all_numeric {
+                            k.parse::<i128>().ok().cmp(&cur_num)
                         } else {
-                            if pos > 0 {
-                                Some(keys[pos - 1].clone())
-                            } else {
-                                None
-                            }
+                            (*decode_name_key(k)).cmp(cur_str.as_str())
                         }
+                    };
+                    let found = if bm == BuiltinM::Next {
+                        keys.iter().find(|k| order(k).is_gt())
                     } else {
-                        None
-                    }
+                        keys.iter().rev().find(|k| order(k).is_lt())
+                    };
+                    found.cloned()
                 } else {
                     None
                 }
@@ -3200,7 +3200,7 @@ impl Simulator {
                         let w = self.infer_width(arg);
                         self.assign_value(arg, &Value::from_u64(key_int as u64, w));
                     } else {
-                        let key_val = Value::from_string(&key);
+                        let key_val = Self::name_key_value(&key);
                         self.assign_value(arg, &key_val);
                     }
                 }

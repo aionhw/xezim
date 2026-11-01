@@ -963,7 +963,7 @@ impl Simulator {
                         .iter()
                         .map(|k| {
                             if is_str {
-                                Value::from_string(k)
+                                Self::name_key_value(k)
                             } else if kw > 64 {
                                 let mut v = Value::from_str_radix(k, 16, kw);
                                 v.is_signed = signed;
@@ -1178,7 +1178,7 @@ impl Simulator {
                                     let kv = if let Ok(v) = key.parse::<i64>() {
                                         Value::from_u64(v as u64, 32)
                                     } else {
-                                        Value::from_string(key)
+                                        Self::name_key_value(key)
                                     };
                                     self.set_loop_var(n, kv);
                                 }
@@ -1262,7 +1262,6 @@ impl Simulator {
                         is_str = false;
                     } else {
                         let prefix = format!("{}[", an);
-                        let mut struct_elem: Option<bool> = None;
                         // An assoc-of-collections member (e.g.
                         // `bq_t all[int]`) stores elements as
                         // `all[5][0]` etc. — extract the key up to
@@ -1273,14 +1272,10 @@ impl Simulator {
                             .elem_keys_with_prefix(&prefix)
                             .filter_map(|k| {
                                 let rest = k.strip_prefix(prefix.as_str())?;
-                                let se = Self::key_has_member_suffix(rest)
-                                    && *struct_elem.get_or_insert_with(|| {
-                                        self.queue_elem_struct(&an).is_some()
-                                    });
-                                Self::assoc_elem_key_seg(rest, se).map(|s| s.to_string())
+                                Self::assoc_first_key_seg(rest).map(|s| s.to_string())
                             })
                             .collect();
-                        ks.sort();
+                        Self::sort_name_keys(&mut ks);
                         ks.dedup();
                         is_str = self
                             .module
@@ -1293,7 +1288,7 @@ impl Simulator {
                         // lexicographic sort would visit "10" before "2".
                         // Use i64 so negative (signed) keys keep order.
                         if is_str {
-                            ks.sort();
+                            Self::sort_name_keys(&mut ks);
                         } else {
                             // §7.9: int keys traverse in NUMERIC order
                             // including NEGATIVE keys — u64 parsing
@@ -1317,7 +1312,7 @@ impl Simulator {
                             break;
                         }
                         let kv = if is_str {
-                            Value::from_string(&key)
+                            Self::name_key_value(&key)
                         } else if kw > 64 {
                             // Wide numeric keys are keyed by hex digits.
                             Value::from_str_radix(&key, 16, kw)
@@ -1757,7 +1752,7 @@ impl Simulator {
                                 }
                                 if let Some(n) = &ov {
                                     let kv = if is_str {
-                                        Value::from_string(key)
+                                        Self::name_key_value(key)
                                     } else {
                                         let mut v = Value::from_u64(
                                             key.parse::<i64>().unwrap_or(0) as u64,
@@ -1854,7 +1849,6 @@ impl Simulator {
                     let (kw, ks_sign) = self.assoc_index_width_for(&name).unwrap_or((32, false));
                     self.widths.insert(var.name.clone(), kw);
                     let prefix = format!("{}[", name);
-                    let mut struct_elem: Option<bool> = None;
                     // An assoc-of-collections (e.g. `bq_t all[int]`
                     // where `bq_t = Base[$]`) stores elements as
                     // `all[5][0]` etc. — extract the key up to the
@@ -1865,13 +1859,10 @@ impl Simulator {
                         .elem_keys_with_prefix(&prefix)
                         .filter_map(|k| {
                             let rest = k.strip_prefix(prefix.as_str())?;
-                            let se = Self::key_has_member_suffix(rest)
-                                && *struct_elem
-                                    .get_or_insert_with(|| self.queue_elem_struct(&name).is_some());
-                            Self::assoc_elem_key_seg(rest, se).map(|s| s.to_string())
+                            Self::assoc_first_key_seg(rest).map(|s| s.to_string())
                         })
                         .collect();
-                    keys.sort();
+                    Self::sort_name_keys(&mut keys);
                     keys.dedup();
                     let is_str = self
                         .module
@@ -1883,7 +1874,7 @@ impl Simulator {
                     // Numeric key order for integer-keyed arrays (see
                     // note above); lexicographic would scramble order.
                     if is_str {
-                        keys.sort();
+                        Self::sort_name_keys(&mut keys);
                     } else {
                         keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
                     }
@@ -1892,7 +1883,7 @@ impl Simulator {
                             break;
                         }
                         let kv = if is_str {
-                            Value::from_string(&key)
+                            Self::name_key_value(&key)
                         } else if kw > 64 {
                             Value::from_str_radix(&key, 16, kw)
                         } else {

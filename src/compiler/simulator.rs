@@ -50,6 +50,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use xezim_core::elaborate::resolve_type_width;
 use xezim_core::hasher::{HashMap, HashSet};
+use xezim_core::value::{decode_name_key, encode_name_key};
 
 static SIM_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
