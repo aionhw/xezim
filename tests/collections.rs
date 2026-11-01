@@ -251,3 +251,6 @@ mod string_key_escaping;
 
 #[path = "collections/assoc_locator_keys.rs"]
 mod assoc_locator_keys;
+
+#[path = "collections/locator_result_methods.rs"]
+mod locator_result_methods;
