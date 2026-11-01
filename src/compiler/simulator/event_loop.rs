@@ -95,6 +95,12 @@ impl Simulator {
             return false;
         }
         let name = h.path[0].name.name.as_str();
+        // A `static` local's frame entry is a copy of one cell that every
+        // call of the subroutine shares (§6.21), so another process can be
+        // parked on it.
+        if self.static_local_names.contains(name) {
+            return false;
+        }
         self.local_stack.last().is_some_and(|frame| frame.contains_key(name))
             && !self.ref_binding_stack.last().is_some_and(|m| m.contains_key(name))
             && !self.ref_alias_stack.last().is_some_and(|m| m.contains_key(name))

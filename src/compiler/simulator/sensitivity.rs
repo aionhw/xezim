@@ -3924,6 +3924,15 @@ impl Simulator {
                 let ExprKind::MemberAccess { expr, member } = &func.kind else {
                     return false;
                 };
+                // A mailbox's `num()` changes on put and get, which note no
+                // write (§15.4.3).
+                if member.name == "num"
+                    && self
+                        .eval_handle_expr(expr)
+                        .is_some_and(|h| self.mailboxes.contains_key(&h))
+                {
+                    return false;
+                }
                 matches!(
                     member.name.as_str(),
                     "size" | "num" | "exists" | "first" | "last" | "next" | "prev"
