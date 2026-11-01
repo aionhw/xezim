@@ -1513,6 +1513,18 @@ struct LocalArrayBind {
     elem_signed: Option<bool>,
 }
 
+/// A member of a packed-struct formal that an inlined body reads as a slice
+/// of the formal's register.
+#[derive(Clone)]
+struct FormalMember {
+    off: u32,
+    width: u32,
+    signed: bool,
+    /// Declared range (`[7:4]`) that selects on the member are labeled by;
+    /// None for a 1-bit member without one.
+    dim: Option<(i64, i64)>,
+}
+
 /// `format!("{}.{}", scope, name)` without the formatting machinery: the
 /// compiler builds one such scoped key per identifier lookup.
 fn cat_dot(scope: &str, name: &str) -> String {
@@ -2058,6 +2070,11 @@ pub struct BytecodeCompiler<'a> {
     /// Register-backed local -> packed element width, for `local[i]`
     /// splice/extract compilation.
     pub local_var_elem: std::collections::HashMap<String, u32>,
+    /// Packed-struct formals of an inlined pure function: name -> (the
+    /// formal's register, its flattened members). Keyed like
+    /// `local_var_regs`, and honored only while the name still resolves to
+    /// that register.
+    local_var_struct: HashMap<String, (RegId, Vec<(String, FormalMember)>)>,
     /// Loop variables bound to COMPILE-TIME constants by the unroller. Read
     /// before every other name source, so `state[col*4]` folds to a constant
     /// index while `col` is unrolled.
@@ -2319,6 +2336,7 @@ impl<'a> BytecodeCompiler<'a> {
             local_typedef_types: HashMap::default(),
             unresolved_type_names: HashSet::default(),
             local_var_elem: std::collections::HashMap::new(),
+            local_var_struct: HashMap::default(),
             cast_widths: None,
             pattern_ctx: None,
             inline_ret_ty: None,
@@ -2479,6 +2497,148 @@ impl<'a> BytecodeCompiler<'a> {
         let (key, fields) = self.packed_struct_layout_for_hier(&hier)?;
         let value = self.compile_expr(unwrapped, 0)?;
         Some((value, key, hier, fields))
+    }
+
+    /// The flattened member layout of a packed-struct formal, computed as the
+    /// interpreter's `register_formal_type_metadata` does. A 4-state struct
+    /// with 2-state members is left out: those members read x/z as 0, which
+    /// a slice does not do (see `mixed_packed_vars`).
+    fn packed_formal_layout(
+        &self,
+        dt: &crate::ast::types::DataType,
+        width: u32,
+    ) -> Option<Vec<(String, FormalMember)>> {
+        use crate::compiler::elaborate as el;
+        let types = self.typedef_types?;
+        let fields = el::packed_struct_field_layout(dt, self.params?, self.typedefs?, types)?;
+        if fields.is_empty() || fields.iter().any(|&(_, off, w)| w == 0 || off + w > width) {
+            return None;
+        }
+        if !el::is_type_two_state_resolved(dt, types) && Self::has_two_state_member(dt, types) {
+            return None;
+        }
+        Some(
+            fields
+                .into_iter()
+                .filter_map(|(n, off, width)| {
+                    let (signed, dim) = self.struct_member_type(dt, &n)?;
+                    Some((
+                        n,
+                        FormalMember {
+                            off,
+                            width,
+                            signed,
+                            dim,
+                        },
+                    ))
+                })
+                .collect(),
+        )
+    }
+
+    /// Signedness and declared range of the member at dotted `path` (`p.hi`)
+    /// of a packed struct. None when it, or a member on the way to it, has
+    /// more than one dimension or one that does not span its bits (a packed
+    /// array of wider elements): a select on it picks elements, not bits.
+    fn struct_member_type(
+        &self,
+        dt: &crate::ast::types::DataType,
+        path: &str,
+    ) -> Option<(bool, Option<(i64, i64)>)> {
+        use crate::compiler::elaborate as el;
+        let (params, typedefs, types) = (self.params?, self.typedefs?, self.typedef_types?);
+        let crate::ast::types::DataType::Struct(su) = el::resolve_typedef_chain(dt, types) else {
+            return None;
+        };
+        let (head, rest) = path
+            .split_once('.')
+            .map_or((path, None), |(h, r)| (h, Some(r)));
+        let m = su
+            .members
+            .iter()
+            .find(|m| m.declarators.iter().any(|d| d.name.name == head))?;
+        let q = el::type_query_dims_of(&m.data_type, Some(params), Some(typedefs), Some(types));
+        let w = el::resolve_type_width(&m.data_type, Some(params), Some(typedefs));
+        let dim = match q.dims[..] {
+            [] => q.whole,
+            [d] => Some(d),
+            _ => return None,
+        };
+        match dim {
+            Some((l, r)) if l.abs_diff(r) + 1 != u64::from(w) => return None,
+            None if w != 1 => return None,
+            _ => {}
+        }
+        match rest {
+            Some(r) => self.struct_member_type(&m.data_type, r),
+            None => Some((el::is_type_signed_resolved(&m.data_type, types), dim)),
+        }
+    }
+
+    fn has_two_state_member(
+        dt: &crate::ast::types::DataType,
+        types: &HashMap<String, crate::ast::types::DataType>,
+    ) -> bool {
+        use crate::compiler::elaborate as el;
+        let crate::ast::types::DataType::Struct(su) = el::resolve_typedef_chain(dt, types) else {
+            return false;
+        };
+        su.members.iter().any(|m| {
+            el::is_type_two_state_resolved(&m.data_type, types)
+                || Self::has_two_state_member(&m.data_type, types)
+        })
+    }
+
+    /// The dotted name of a select-free member chain (`c.p.hi`), whether it
+    /// arrives as nested member accesses or folded into one identifier, as
+    /// in an instance's rewritten function body.
+    fn member_chain_name(expr: &Expression) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(hier)
+                if hier.root.is_none() && hier.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                Some(Self::hier_raw_name(hier))
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                Some(cat_dot(&Self::member_chain_name(expr)?, &member.name))
+            }
+            _ => None,
+        }
+    }
+
+    /// The member of a register-bound packed-struct formal that `expr`
+    /// reads (`c.a`, `c.p.hi`), with the formal's register.
+    fn formal_struct_member(&self, expr: &Expression) -> Option<(RegId, &FormalMember)> {
+        if self.local_var_struct.is_empty() {
+            return None;
+        }
+        let dotted = Self::member_chain_name(expr)?;
+        let mut cut = dotted.len();
+        while let Some(i) = dotted[..cut].rfind('.') {
+            let (base, member) = (&dotted[..i], &dotted[i + 1..]);
+            if let Some((slot, fields)) = self.local_var_struct.get(base)
+                && self.local_var_regs.get(base).map(|b| b.0) == Some(*slot)
+            {
+                let (_, m) = fields.iter().find(|f| f.0 == member)?;
+                return Some((*slot, m));
+            }
+            cut = i;
+        }
+        None
+    }
+
+    /// §7.2.1: a packed struct is a vector whose members are fixed bit
+    /// ranges, so a member of a packed-struct formal is a constant slice of
+    /// its register, with the member's own signedness.
+    fn compile_formal_struct_member(&mut self, expr: &Expression) -> Option<RegId> {
+        let (slot, m) = self.formal_struct_member(expr)?;
+        let (off, w, signed) = (m.off, m.width, m.signed);
+        let dest = self.alloc_reg();
+        self.emit(Insn::RangeSelectConst(dest, slot, off + w - 1, off));
+        if signed {
+            self.emit(Insn::SetSigned(dest));
+        }
+        Some(dest)
     }
 
     /// Metadata for a packed-array member of a packed struct. The elaborated
@@ -3570,6 +3730,7 @@ impl<'a> BytecodeCompiler<'a> {
         let mut string_formal_names: Vec<String> = Vec::new();
         let mut real_formal_names: Vec<String> = Vec::new();
         let mut array_binds: Vec<(String, LocalArrayBind)> = Vec::new();
+        let mut struct_binds: Vec<(String, (RegId, Vec<(String, FormalMember)>))> = Vec::new();
         for (i, (p, a)) in fd.ports.iter().zip(args).enumerate() {
             if is_unsized_dim(p) {
                 // Dynamic-array formal from a fixed assignment pattern: one
@@ -3680,6 +3841,11 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit_local_fit(slot);
             }
             binds.push((p.name.name.clone(), (slot, w)));
+            if let Some(fields) =
+                self.packed_formal_layout(Self::port_effective_type(&fd.ports, i), w)
+            {
+                struct_binds.push((p.name.name.clone(), (slot, fields)));
+            }
             if let Some(ew) = self.decl_elem_width_in(&p.data_type, Some(&name)) {
                 if ew > 0 && w > ew && w % ew == 0 {
                     elem_binds.push((p.name.name.clone(), ew));
@@ -3700,6 +3866,14 @@ impl<'a> BytecodeCompiler<'a> {
         let saved_local_reals = std::mem::take(&mut self.local_var_is_real);
         let saved_local_arrays = std::mem::take(&mut self.local_var_array);
         let saved_local_elems = std::mem::take(&mut self.local_var_elem);
+        let saved_local_structs = std::mem::take(&mut self.local_var_struct);
+        for (n, sb) in struct_binds {
+            if let Some(pfx) = &qpfx {
+                self.local_var_struct
+                    .insert(format!("{pfx}.{n}"), sb.clone());
+            }
+            self.local_var_struct.insert(n, sb);
+        }
         for (n, ab) in array_binds {
             if let Some(pfx) = &qpfx {
                 self.local_var_array
@@ -3810,6 +3984,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.local_var_is_real = saved_local_reals;
         self.local_var_array = saved_local_arrays;
         self.local_var_elem = saved_local_elems;
+        self.local_var_struct = saved_local_structs;
         if !ok {
             if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
                 eprintln!(
@@ -6950,11 +7125,10 @@ impl<'a> BytecodeCompiler<'a> {
                         {
                             return true;
                         }
-                        // `fname.member` may arrive as TWO segments; it is
-                        // function-local when the head is bound (the return
-                        // variable or a formal).
-                        return h.path.len() == 2
-                            && bound.contains(&h.path[0].name.name)
+                        // `fname.member` (or a nested `c.p.hi`) may arrive as
+                        // segments; it is function-local when the head is
+                        // bound (the return variable or a formal).
+                        return bound.contains(&h.path[0].name.name)
                             && h.path
                                 .iter()
                                 .all(|seg| seg.selects.iter().all(|x| expr_ok(x, bound, me, ext)));
@@ -11364,6 +11538,9 @@ impl<'a> BytecodeCompiler<'a> {
             cur = inner;
             layers += 1;
         }
+        if let Some((_, m)) = self.formal_struct_member(cur) {
+            return if layers == 0 { m.dim } else { None };
+        }
         let ExprKind::Ident(h) = &cur.kind else {
             return None;
         };
@@ -14471,6 +14648,9 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit(Insn::Move(r, src));
                     return Some(r);
                 }
+                if let Some(r) = self.compile_formal_struct_member(expr) {
+                    return Some(r);
+                }
                 // Element of a register-bound LOCAL ARRAY (`row[n]` parsed as
                 // an Ident with one select).
                 if !self.local_var_array.is_empty()
@@ -16528,6 +16708,9 @@ impl<'a> BytecodeCompiler<'a> {
                     && let Some(r) = self.compile_struct_member_call(func, args, &member.name)
                 {
                     return Some(r);
+                }
+                if let Some(dest) = self.compile_formal_struct_member(expr) {
+                    return Some(dest);
                 }
                 // class-perf method-mode: `this.<member>`/`<classlocal>.<member>`
                 // is an OBJECT-field read off the heap, not a hierarchical
@@ -20194,6 +20377,9 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn expr_signedness(&mut self, e: &Expression) -> Option<bool> {
+        if let Some((_, m)) = self.formal_struct_member(e) {
+            return Some(m.signed);
+        }
         match &e.kind {
             ExprKind::Number(NumberLiteral::Integer { signed, .. }) => Some(*signed),
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(false),
@@ -20478,6 +20664,9 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn expr_max_width(&self, expr: &Expression) -> u32 {
+        if let Some((_, m)) = self.formal_struct_member(expr) {
+            return m.width;
+        }
         match &expr.kind {
             ExprKind::Ident(hier) => self
                 .lookup_signal_id(hier)
