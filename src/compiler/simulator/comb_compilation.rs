@@ -718,6 +718,7 @@ impl Simulator {
                     &self.module.arrays,
                     &self.widths,
                 );
+                compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 compiler.set_params(&self.module.parameters);
@@ -802,6 +803,7 @@ impl Simulator {
                     &self.module.arrays,
                     &self.widths,
                 );
+                compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 compiler.set_params(&self.module.parameters);
@@ -1516,6 +1518,25 @@ impl Simulator {
                         }
                     }
                 }
+                // §9.2.2.2.1 + §7.2: a WHOLE unpacked struct read (`l = t;`)
+                // resolves to the container signal, which never changes, or
+                // inside an instance to no signal at all — the members are
+                // the signals that do. Depend on the member leaves, or
+                // `always_comb l = t;` never re-fired after time zero.
+                for r in sens_reads.iter() {
+                    let scoped = [
+                        scope_hint.as_ref().map(|s| format!("{s}.{r}")),
+                        (!ab.scope.is_empty()).then(|| format!("{}.{}", ab.scope, r)),
+                        Some(r.clone()),
+                    ];
+                    for name in scoped.iter().flatten() {
+                        for &lid in self.unpacked_struct_sens.get(name).into_iter().flatten() {
+                            if !rids.contains(&lid) {
+                                rids.push(lid);
+                            }
+                        }
+                    }
+                }
                 if std::env::var("XEZIM_DUMP_COMB_SENS").is_ok() {
                     let names: Vec<&str> = rids.iter().map(|&id| self.name_for_id(id)).collect();
                     eprintln!(
@@ -1549,6 +1570,7 @@ impl Simulator {
                         &self.module.arrays,
                         &self.widths,
                     );
+                    compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
                     compiler.set_scope_hint(scope_hint.clone());
                     compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                     compiler.set_tasks(&self.module.tasks);

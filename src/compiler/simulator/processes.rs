@@ -2379,6 +2379,7 @@ impl Simulator {
                 &self.module.arrays,
                 &self.widths,
             );
+            compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
             compiler.set_ast_fallback(false);
             compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
             compiler.set_scope_hint(scope_hint);
@@ -2620,6 +2621,7 @@ impl Simulator {
                 &self.module.arrays,
                 &self.widths,
             );
+            compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
             compiler.set_ast_fallback(false);
             compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
             compiler.set_scope_hint(scope_hint);

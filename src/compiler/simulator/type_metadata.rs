@@ -1407,6 +1407,103 @@ impl Simulator {
         self.dotted_segments_denote_class_object(segs)
     }
 
+    /// §7.2: every unpacked-struct variable with a container signal, keyed by
+    /// that signal's id, listing its scalar member leaves (nested structs
+    /// flattened, `m.n`). A struct with an array or union member gets an
+    /// empty list: the compiler then leaves its whole-struct copies to the
+    /// interpreter.
+    pub(super) fn build_unpacked_struct_leaves(&self) -> super::bytecode::UnpackedStructLeaves {
+        fn flatten(
+            sim: &Simulator,
+            full: &str,
+            rel: &str,
+            dt: &DataType,
+            out: &mut Vec<(String, String)>,
+        ) -> bool {
+            match sim.resolve_dt(dt) {
+                DataType::Struct(su) if !su.packed => {
+                    if !matches!(su.kind, crate::ast::types::StructUnionKind::Struct) {
+                        return false;
+                    }
+                    for m in &su.members {
+                        for d in &m.declarators {
+                            if !d.dimensions.is_empty() {
+                                return false;
+                            }
+                            let n = &d.name.name;
+                            let rel = if rel.is_empty() {
+                                n.clone()
+                            } else {
+                                format!("{rel}.{n}")
+                            };
+                            if !flatten(sim, &format!("{full}.{n}"), &rel, &m.data_type, out) {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                }
+                _ => {
+                    if sim.signal_name_to_id.get(full).is_none() {
+                        return false;
+                    }
+                    out.push((rel.to_string(), full.to_string()));
+                    true
+                }
+            }
+        }
+        let mut map = super::bytecode::UnpackedStructLeaves::default();
+        for (name, dt) in &self.module.var_decl_types {
+            let DataType::Struct(su) = self.resolve_dt(dt) else {
+                continue;
+            };
+            if su.packed || !matches!(su.kind, crate::ast::types::StructUnionKind::Struct) {
+                continue;
+            }
+            let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
+                continue;
+            };
+            let mut leaves = Vec::new();
+            if !flatten(self, name, "", dt, &mut leaves) {
+                leaves.clear();
+            }
+            map.insert(id, leaves);
+        }
+        map
+    }
+
+    /// Every signal below each unpacked-struct VARIABLE (`s.a`, `s.arr[1]`,
+    /// `s.in.x`), keyed by the variable's name: what a whole-struct read
+    /// depends on. Covers instance-scoped structs too, which have member
+    /// leaves but no container signal. One pass over the signal names.
+    pub(super) fn build_unpacked_struct_sens(&self) -> HashMap<String, Vec<usize>> {
+        let mut names: HashSet<&str> = HashSet::default();
+        for (name, dt) in &self.module.var_decl_types {
+            if let DataType::Struct(su) = self.resolve_dt(dt)
+                && !su.packed
+                && matches!(su.kind, crate::ast::types::StructUnionKind::Struct)
+            {
+                names.insert(name.as_str());
+            }
+        }
+        let mut out: HashMap<String, Vec<usize>> = HashMap::default();
+        if names.is_empty() {
+            return out;
+        }
+        for (name, &id) in self.signal_name_to_id.iter() {
+            let name: &str = name.as_ref();
+            for (pos, _) in name.match_indices('.') {
+                if names.contains(&name[..pos]) {
+                    out.entry(name[..pos].to_string()).or_default().push(id);
+                }
+            }
+        }
+        for v in out.values_mut() {
+            v.sort_unstable();
+        }
+        out
+    }
+
     /// Follow a typedef chain to the underlying type.
     pub(super) fn resolve_dt(&self, dt: &DataType) -> DataType {
         self.resolve_dt_ref(dt).clone()

@@ -2283,6 +2283,7 @@ impl Simulator {
             &self.module.arrays,
             &self.widths,
         );
+        compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
         compiler.allow_waits = true;
         // System-task statements (`$display`, `$write`, `$finish`, ...)
         // lower to statement fallbacks; the gate below admits only those,

@@ -2605,6 +2605,7 @@ impl Simulator {
                         &self.module.arrays,
                         &self.widths,
                     );
+                    compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
                     compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                     compiler.set_typedef_types(&self.module.typedef_types);
                     compiler.method_enum_constants = method_enum_constants;
