@@ -1353,13 +1353,23 @@ impl Simulator {
                 }
             }
         };
-        if let Some(old) = self.event_obj_ids.insert(slot.clone(), id)
+        let old = self.event_obj_ids.insert(slot.clone(), id);
+        let mut heir = None;
+        if let Some(old) = old
             && let Some(v) = self.event_obj_slots.get_mut(&old)
         {
             v.retain(|s| *s != slot);
+            heir = v.first().cloned();
             if v.is_empty() {
                 self.event_obj_slots.remove(&old);
             }
+        }
+        // §15.5.5: a process already blocked on the slot stays blocked on
+        // its old event, woken through another slot still holding it, or
+        // never.
+        if old != Some(id) {
+            let to = heir.unwrap_or_else(|| (usize::MAX, String::new()));
+            self.instance_event_waiters.rekey(&slot, &to);
         }
         self.event_obj_slots.entry(id).or_default().push(slot);
         note_event_trigger();

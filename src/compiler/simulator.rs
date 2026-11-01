@@ -2198,6 +2198,26 @@ impl InstanceEventWaiters {
         }
     }
 
+    /// Park every waiter on `from` on `to` instead.
+    fn rekey(&mut self, from: &(usize, String), to: &(usize, String)) {
+        let Some(seqs) = self.by_key.remove(from) else {
+            return;
+        };
+        for seq in &seqs {
+            if let Some(w) = self.entries.get_mut(seq) {
+                match &mut w.key {
+                    InstanceEventKeys::One(k) => *k = to.clone(),
+                    InstanceEventKeys::Any(ks) => {
+                        for k in ks.iter_mut().filter(|k| *k == from) {
+                            *k = to.clone();
+                        }
+                    }
+                }
+            }
+        }
+        self.by_key.entry(to.clone()).or_default().extend(seqs);
+    }
+
     /// Remove and return, in parking order, every waiter on `key`.
     fn take_key(&mut self, key: &(usize, String)) -> Vec<(usize, ProcCont)> {
         let Some(seqs) = self.by_key.remove(key) else {
