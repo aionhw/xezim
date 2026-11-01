@@ -498,6 +498,9 @@ mod forward_declared_class_formal_member_write;
 #[path = "classes/forward_class_formal_vs_caller_struct_collision.rs"]
 mod forward_class_formal_vs_caller_struct_collision;
 
+#[path = "classes/forward_class_string_member_compare.rs"]
+mod forward_class_string_member_compare;
+
 #[path = "classes/pkg_assoc_elem_read_neq.rs"]
 mod pkg_assoc_elem_read_neq;
 #[path = "classes/queue_elem_receiver_splice.rs"]
