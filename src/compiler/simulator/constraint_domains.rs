@@ -1579,6 +1579,29 @@ impl Simulator {
         None
     }
 
+    /// §18.3: the `enum_members` key of an unpacked struct member's enum
+    /// type. A member of a package struct names its type `pkg::name`, while
+    /// `enum_members` holds that enum under its bare name; the bare entry is
+    /// used only when it is the same declaration.
+    pub(super) fn struct_member_enum_key(&self, dt: &DataType) -> Option<String> {
+        let DataType::TypeReference { name, .. } = dt else {
+            return None;
+        };
+        let n = &name.name.name;
+        if self.module.enum_members.contains_key(n) {
+            return Some(n.clone());
+        }
+        let (pkg, leaf) = n.rsplit_once("::")?;
+        let same_decl = matches!(
+            (self.module.typedef_types.get(n), self.module.typedef_types.get(leaf)),
+            (Some(DataType::Enum(a)), Some(DataType::Enum(b))) if a.span == b.span
+        );
+        (same_decl
+            && self.module.packages.contains(pkg)
+            && self.module.enum_members.contains_key(leaf))
+        .then(|| leaf.to_string())
+    }
+
     /// The rand SCALAR properties that appear in `e`, in source order of first
     /// appearance — the candidate targets of an algebraic solve. Only bare
     /// single-segment identifiers qualify (a `sub.field` is not a scalar

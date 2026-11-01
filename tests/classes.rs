@@ -119,6 +119,8 @@ mod pure_constraint_nonvirtual;
 mod rand_array_elem_signedness;
 #[path = "classes/rand_obj_array_elem_constraints.rs"]
 mod rand_obj_array_elem_constraints;
+#[path = "classes/rand_package_struct_enum_member.rs"]
+mod rand_package_struct_enum_member;
 #[path = "classes/randomize_args_name_object_members.rs"]
 mod randomize_args_name_object_members;
 #[path = "classes/randomize_assoc_joint_solve.rs"]
