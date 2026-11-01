@@ -743,7 +743,7 @@ impl Simulator {
             .filter(|k| !k.contains('[') && !k.contains(']'))
             .collect();
         if self.is_string_keyed_array(scoped) {
-            keys.sort();
+            Self::sort_name_keys(&mut keys);
         } else {
             keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
         }
@@ -1671,7 +1671,7 @@ impl Simulator {
                         let mut frame: HashMap<String, Value> = HashMap::default();
                         if let Some(Some(n)) = idx_names.first() {
                             let kv = if self.is_string_keyed_array(&c.scoped) {
-                                Value::from_string(&key)
+                                Self::name_key_value(&key)
                             } else {
                                 Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, 32)
                             };
@@ -2685,7 +2685,7 @@ impl Simulator {
                     let mut frame: HashMap<String, Value> = HashMap::default();
                     if let Some(Some(n)) = idx_names.first() {
                         let kv = if self.is_string_keyed_array(&c.scoped) {
-                            Value::from_string(&key)
+                            Self::name_key_value(&key)
                         } else {
                             Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, 32)
                         };

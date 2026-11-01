@@ -4441,7 +4441,7 @@ impl Simulator {
                 .filter_map(|rest| rest.split(']').next())
                 .map(|s| s.to_string())
                 .collect();
-            keys.sort();
+            Self::sort_name_keys(&mut keys);
             keys.dedup();
             if keys.iter().all(|k| k.parse::<i64>().is_ok()) {
                 keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
@@ -4468,7 +4468,7 @@ impl Simulator {
                         }
                     };
                     if string_keyed {
-                        format!("\"{}\":{}", k, v)
+                        format!("\"{}\":{}", decode_name_key(k), v)
                     } else {
                         format!("{}:{}", k, v)
                     }
@@ -4505,7 +4505,7 @@ impl Simulator {
                 .filter_map(|rest| rest.split(']').next())
                 .map(|s| s.to_string())
                 .collect();
-            keys.sort();
+            Self::sort_name_keys(&mut keys);
             keys.dedup();
             // Numeric keys sort numerically, not lexically.
             if keys.iter().all(|k| k.parse::<i64>().is_ok()) {
@@ -4523,7 +4523,7 @@ impl Simulator {
                         self.render_p_typed(&elem, &dt)
                     };
                     if string_keyed {
-                        format!("\"{}\":{}", k, v)
+                        format!("\"{}\":{}", decode_name_key(k), v)
                     } else {
                         format!("{}:{}", k, v)
                     }

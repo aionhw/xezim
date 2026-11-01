@@ -5163,7 +5163,7 @@ impl Simulator {
                             keys[*idx].clone()
                         };
                         let kv = if *is_str {
-                            Value::from_string(&key_str)
+                            Self::name_key_value(&key_str)
                         } else if key_type.1 {
                             let mut v = Value::from_u64(
                                 key_str.parse::<i64>().unwrap_or(0) as u64,
@@ -5272,7 +5272,7 @@ impl Simulator {
                             // run the FIRST iteration now
                             if let Some(vn) = &loop_var {
                                 let kv = if is_str {
-                                    Value::from_string(&keys[0])
+                                    Self::name_key_value(&keys[0])
                                 } else if key_type.1 {
                                     let mut v = Value::from_u64(
                                         keys[0].parse::<i64>().unwrap_or(0) as u64,

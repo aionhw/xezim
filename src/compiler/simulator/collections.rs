@@ -2096,7 +2096,7 @@ impl Simulator {
 
     pub(super) fn assoc_key_str(&self, name: &str, idx_val: &Value) -> String {
         if self.is_string_keyed_array(name) {
-            idx_val.to_sv_string()
+            encode_name_key(&idx_val.to_sv_string()).into_owned()
         } else if idx_val.width > 64 {
             // A wide key that isn't flagged string-keyed: `to_u64()` would
             // truncate to the low 64 bits (the last ~8 chars) and collide.
@@ -2113,7 +2113,7 @@ impl Simulator {
                     return idx_val.resize(kw).to_hex();
                 }
             }
-            idx_val.to_sv_string()
+            encode_name_key(&idx_val.to_sv_string()).into_owned()
         } else {
             // §7.8.2: the index is narrowed to the declared key type before
             // keying. `int k; shortint aa[shortint]; aa[k]` with a 32-bit k
@@ -2185,7 +2185,7 @@ impl Simulator {
                 return Arc::clone(keys);
             }
         }
-        let keys = Arc::new(self.assoc_top_level_keys_uncached(obj_name, &prefix));
+        let keys = Arc::new(self.assoc_top_level_keys_uncached(&prefix));
         let mut cache = self.assoc_keys_cache.borrow_mut();
         // Per-call and per-object array names come and go; bound the cache
         // rather than track every name's lifetime.
@@ -2196,39 +2196,21 @@ impl Simulator {
         keys
     }
 
-    fn assoc_top_level_keys_uncached(&self, obj_name: &str, prefix: &str) -> Vec<String> {
-        // A STRUCT element stores member-wise leaves (`sa[k].id`), which do
-        // not end in `]` — accept any entry whose key bracket closes, else
-        // struct-element assoc arrays enumerate as empty (num()/foreach).
-        //
-        // The stored entry is `name + rest` where `rest = KEY`, or
-        // `KEY[K2]...[Kn]` for a MULTIDIM assoc (`arr[k1][k2]`) or an
-        // assoc-of-queue (`arr[key][i]`). Decide which by inspection: a
-        // multi-index entry has an inner `[` immediately after its FIRST
-        // `]` (`k1][k2]`), so the level-0 key = up to that `]`. Otherwise
-        // the array is 1-D and KEY is the WHOLE text, which may itself
-        // contain `]`/`[` (UVM component names like
-        // `special-:{ chars{}[0123456789] _` are legal assoc string keys,
-        // §7.11) — take up to the LAST `]` so such brackets are not mistaken
-        // for an index end.
+    fn assoc_top_level_keys_uncached(&self, prefix: &str) -> Vec<String> {
         // The `signal_name_to_id` half of this enumeration is fixed for the
         // run (see `assoc_static_keys_cache`), so scan it once per prefix
         // instead of on every call.
         let static_keys = self.assoc_static_keys(&prefix);
-        let mut struct_elem: Option<bool> = None;
         let mut keys: Vec<String> = self
             .signals
             .elem_keys_with_prefix(&prefix)
             .chain(static_keys.iter().map(|k| &**k))
             .filter_map(|k| {
                 let rest = &k[prefix.len()..];
-                let se = Self::key_has_member_suffix(rest)
-                    && *struct_elem
-                        .get_or_insert_with(|| self.queue_elem_struct(obj_name).is_some());
-                Self::assoc_elem_key_seg(rest, se).map(|s| s.to_string())
+                Self::assoc_first_key_seg(rest).map(|s| s.to_string())
             })
             .collect();
-        keys.sort();
+        Self::sort_name_keys(&mut keys);
         keys.dedup();
         // i128 covers both signed keys and full-range u64 keys; with i64 a
         // single 2^63+ key demoted the whole sort to lexicographic.
@@ -3334,7 +3316,7 @@ impl Simulator {
                 let kv = match ty {
                     None => {
                         self.widths.remove(&v.name);
-                        Value::from_string(&key)
+                        Self::name_key_value(&key)
                     }
                     Some((w, signed)) => {
                         self.widths.insert(v.name.clone(), w);
@@ -3463,10 +3445,10 @@ impl Simulator {
                             let first = b.iter().position(|&c| c != 0).unwrap_or(b.len());
                             Value::from_string(&String::from_utf8_lossy(&b[first..]))
                         }
-                        _ => Value::from_string(&key),
+                        _ => Self::name_key_value(&key),
                     }
                 } else if as_text {
-                    let mut v = Value::from_string(&key).resize(kw);
+                    let mut v = Self::name_key_value(&key).resize(kw);
                     v.is_signed = ksign;
                     v
                 } else if kw > 64 {
@@ -3624,51 +3606,24 @@ impl Simulator {
     /// Compute the iteration keys for a named array/collection
     /// (`<name>.size` dense fallback, else raw key-scan of `<name>[…]`).
     /// Returns `(keys, is_str)`. Integer keys are sorted numerically.
-    /// Top-level assoc key for a stored entry whose text after the array
-    /// name is `rest`. A MULTIDIM or collection-valued assoc stores
-    /// `arr[k1][k2]...` (an inner `[` right after the FIRST `]`), so the
-    /// level-0 key runs to that `]`. Otherwise the array is 1-D and the key
-    /// is the WHOLE text to the FINAL `]` — a 1-D string key may itself
-    /// contain `]`/`[` (a UVM component name like
-    /// `special-:{ chars{}[0123456789] _` is a legal assoc key, §7.11).
-    pub(super) fn assoc_first_key_seg(rest: &str) -> Option<&str> {
-        if rest
-            .find(']')
-            .map_or(false, |p| rest[p + 1..].starts_with('['))
-        {
-            rest.find(']').map(|e| &rest[..e])
+    /// Sort stored string keys by the strings they name (§7.8.2).
+    pub(super) fn sort_name_keys(keys: &mut [String]) {
+        if keys.iter().any(|k| k.contains('\\')) {
+            keys.sort_by(|a, b| decode_name_key(a).cmp(&decode_name_key(b)));
         } else {
-            rest.rfind(']').map(|e| &rest[..e])
+            keys.sort();
         }
     }
 
-    /// `assoc_first_key_seg` for an array whose ELEMENT is an unpacked
-    /// struct when `struct_elem`: such an element is stored as its member
-    /// leaves (`sa[KEY].m`, `sa[KEY].arr[1][0]`), so the key ends at the
-    /// first `].` — the last `]` would take the member's own index as part
-    /// of the key and enumerate one phantom key per array-member leaf.
-    /// Whether a stored entry's text after `name[` has a `].` — the shape of
-    /// a struct-element member leaf. A byte scan on `]` (memchr), not a
-    /// substring search: this runs once per stored entry of every
-    /// associative-array enumeration.
-    pub(super) fn key_has_member_suffix(rest: &str) -> bool {
-        let mut s = rest;
-        while let Some(p) = s.find(']') {
-            if s.as_bytes().get(p + 1) == Some(&b'.') {
-                return true;
-            }
-            s = &s[p + 1..];
-        }
-        false
+    /// A stored string key as the SV value it names.
+    pub(super) fn name_key_value(key: &str) -> Value {
+        Value::from_string(&decode_name_key(key))
     }
 
-    pub(super) fn assoc_elem_key_seg(rest: &str, struct_elem: bool) -> Option<&str> {
-        if struct_elem {
-            if let Some(p) = rest.find("].") {
-                return Self::assoc_first_key_seg(&rest[..=p]);
-            }
-        }
-        Self::assoc_first_key_seg(rest)
+    /// Top-level key of a stored entry `rest` (`KEY]`, `KEY][K2]..`,
+    /// `KEY].m`); keys hold no raw `]` (`encode_name_key`).
+    pub(super) fn assoc_first_key_seg(rest: &str) -> Option<&str> {
+        rest.find(']').map(|e| &rest[..e])
     }
 
     pub(super) fn array_iter_keys(&self, name: &str) -> (Vec<String>, bool) {
@@ -3685,26 +3640,12 @@ impl Simulator {
             return ((0..sz).map(|i| i.to_string()).collect(), false);
         }
         let prefix = format!("{}[", name);
-        // For an associative array whose VALUES are themselves collections
-        // (e.g. `bq_t all[int]` where `bq_t = Base[$]`), an element at key 5
-        // is stored as `all[5][0]`, `all[5][1]`, etc. The key must be
-        // extracted up to the FIRST `]`, not `k.len()-1` (which would grab
-        // `5][0`). Dedup because multiple sub-elements share one key.
-        //
-        // But a 1-D STRING key may itself contain `]`/`[` (e.g. a UVM
-        // component name `special-:{ chars{}[0123456789] _`), stored
-        // verbatim as `arr[KEY]`. Distinguish by shape: a multi-index entry
-        // has an inner `[` right after its first `]` (`k1][k2]`), so extract
-        // up to that `]`; otherwise take the whole key up to the final `]`.
-        let mut struct_elem: Option<bool> = None;
         let mut ks: Vec<String> = self
             .signals
             .elem_keys_with_prefix(&prefix)
             .filter_map(|k| {
                 let rest = k.strip_prefix(prefix.as_str())?;
-                let se = Self::key_has_member_suffix(rest)
-                    && *struct_elem.get_or_insert_with(|| self.queue_elem_struct(name).is_some());
-                Self::assoc_elem_key_seg(rest, se).map(|s| s.to_string())
+                Self::assoc_first_key_seg(rest).map(|s| s.to_string())
             })
             .collect();
         ks.sort();
@@ -3717,7 +3658,7 @@ impl Simulator {
             .unwrap_or(false)
             || self.is_string_keyed_array(name);
         if is_str {
-            ks.sort();
+            Self::sort_name_keys(&mut ks);
         } else {
             // §7.9: numeric order incl. NEGATIVE int keys.
             ks.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));

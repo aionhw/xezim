@@ -2734,7 +2734,7 @@ impl Simulator {
                     .iter()
                     .map(|key| {
                         if is_str {
-                            Value::from_string(key)
+                            Self::name_key_value(key)
                         } else {
                             let mut v = Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
                             v.is_signed = ks_sign;

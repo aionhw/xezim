@@ -20,8 +20,8 @@ rand = "0.8"
 # `./scripts/use-local-core.sh` once (or use scripts/cargo-local.sh per
 # invocation) and plain `cargo build` uses it — no network, no git dep.
 # See "Modifying xezim-core" in README.md.
-xezim-core = { git = "https://github.com/aionhw/xezim-core.git", rev = "5dc1d131442eb4c6cf3a7c0ced7e3d09b32a6cf2" }
-sv-parser = { git = "https://github.com/aionhw/xezim-core.git", rev = "5dc1d131442eb4c6cf3a7c0ced7e3d09b32a6cf2" }
+xezim-core = { git = "https://github.com/aionhw/xezim-core.git", rev = "f37196ae6e7b75e4b15b72661d255b5fd0c66bdb" }
+sv-parser = { git = "https://github.com/aionhw/xezim-core.git", rev = "f37196ae6e7b75e4b15b72661d255b5fd0c66bdb" }
 libloading = "0.8"
 libffi = "3"
 libc = "0.2"

@@ -245,3 +245,6 @@ mod coll_shape_iteration;
 
 #[path = "collections/review_coll_shape_rows.rs"]
 mod review_coll_shape_rows;
+
+#[path = "collections/string_key_escaping.rs"]
+mod string_key_escaping;
