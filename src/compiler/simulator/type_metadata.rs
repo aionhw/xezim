@@ -1517,6 +1517,13 @@ impl Simulator {
         for _ in 0..16 {
             if let DataType::TypeReference { name, .. } = cur {
                 if let Some(next) = self.module.typedef_types.get(&name.name.name) {
+                    // §8.27: `typedef class C;` leaves a void placeholder
+                    // under C. The class itself is the type.
+                    if matches!(next, DataType::Void(_))
+                        && self.module.classes.contains_key(&name.name.name)
+                    {
+                        break;
+                    }
                     cur = next;
                     continue;
                 }
