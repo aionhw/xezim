@@ -7512,18 +7512,18 @@ impl Simulator {
                 None => u.1 = true,
             }
         }
-        // `$countones(x)` of a whole variable is a count variable (see
-        // `Csp::pop`); of a select or a field it counts single bits (see
-        // `csp_countones`).
+        // `$countones(x)` of a whole variable of at most 64 bits is a count
+        // variable (see `Csp::pop`). Of a select, or of a wider variable, it
+        // is the sum of single bits (see `csp_countones`).
         if let ExprKind::SystemCall { name, args } = &Self::unparen(e).kind
             && name == "$countones"
             && let [x] = args.as_slice()
             && let Some((v, lo, w, whole)) = self.csp_slice_base_k(csp, x, &mut konst)
-            && w <= 64
+            && w > 0
         {
-            if whole && lo == 0 && w == csp.vars[v].width && !csp.wide.contains(&v) {
+            if whole && lo == 0 && w == csp.vars[v].width && w <= 64 && !csp.wide.contains(&v) {
                 CSP_SCAN_POPS.with(|p| p.borrow_mut().push(v));
-            } else {
+            } else if csp.vars.len() + w as usize <= MAX_VARS {
                 let u = uses.entry(v).or_default();
                 u.0.extend((lo..lo + w).map(|b| (b, 1)));
             }

@@ -386,6 +386,8 @@ mod process_class_9_7;
 mod pure_sv_phase_objection;
 #[path = "classes/randomize_countones_count.rs"]
 mod randomize_countones_count;
+#[path = "classes/randomize_countones_wide.rs"]
+mod randomize_countones_wide;
 #[path = "classes/randomize_dist_weights.rs"]
 mod randomize_dist_weights;
 #[path = "classes/randomize_foreach_accept.rs"]
