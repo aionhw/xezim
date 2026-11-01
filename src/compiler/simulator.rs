@@ -6899,6 +6899,12 @@ pub struct Simulator {
     /// Set of signal IDs that are signed.
     signal_signed: Vec<bool>,
     signal_real: Vec<bool>,
+    /// §7.2 unpacked-struct variables for the bytecode compiler's member-wise
+    /// struct copy (`BytecodeCompiler::set_unpacked_structs`).
+    unpacked_struct_leaves: super::bytecode::UnpackedStructLeaves,
+    /// Every signal under each unpacked-struct variable, by the variable's
+    /// name (`build_unpacked_struct_sens`): what a whole-struct read depends on.
+    unpacked_struct_sens: HashMap<String, Vec<usize>>,
     /// Signal ids whose declared type is 2-state (`bit`/`byte`/`int`/…). Per
     /// §6.11.1/§10.7 an implicit conversion of a 4-state RHS into such a target
     /// maps X/Z to 0 — enforced in `fit_value_to_signal`.

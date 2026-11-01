@@ -3761,6 +3761,8 @@ impl Simulator {
             signal_widths: signal_widths_vec,
             signal_signed: signal_signed_vec,
             signal_real: signal_real_vec,
+            unpacked_struct_leaves: HashMap::default(),
+            unpacked_struct_sens: HashMap::default(),
             signal_two_state,
             signal_gate_driven,
             signal_is_string,
@@ -4746,6 +4748,8 @@ impl Simulator {
             pending_t0_triggers: Vec::new(),
             in_pre_process_settle: false,
         };
+        sim.unpacked_struct_leaves = sim.build_unpacked_struct_leaves();
+        sim.unpacked_struct_sens = sim.build_unpacked_struct_sens();
         sim.has_coll_rows = !sim.module.coll_shapes.is_empty()
             || sim
                 .module

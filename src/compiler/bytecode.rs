@@ -11,6 +11,11 @@ use crate::ast::types::PortDirection;
 use std::sync::Arc;
 use xezim_core::hasher::{HashMap, HashSet};
 
+/// §7.2: unpacked-struct variables by container signal id → (member path,
+/// leaf signal name) in declaration order. An empty list: a struct whose
+/// leaves are not all plain signals (array or union members).
+pub type UnpackedStructLeaves = HashMap<usize, Vec<(String, String)>>;
+
 const MAX_INLINE_DEPTH: usize = 8;
 
 /// Sentinel for a method receiver whose declared class could not be resolved
@@ -2014,6 +2019,10 @@ pub struct BytecodeCompiler<'a> {
     /// and narrows the fallback to just the inner $write/$display.
     tasks: Option<&'a HashMap<String, TaskDeclaration>>,
     functions: Option<&'a HashMap<String, FunctionDeclaration>>,
+    /// §7.2: unpacked-struct variables, by container signal id, with their
+    /// member leaves as (member path, leaf signal name); an empty list marks
+    /// one whose leaves are not plain signals (see `UnpackedStructLeaves`).
+    unpacked_structs: Option<&'a UnpackedStructLeaves>,
     dpi_import_fds: Option<std::rc::Rc<HashMap<String, FunctionDeclaration>>>,
     inlining_stack: Vec<String>,
     pub tasks_inlined: u32,
@@ -2279,6 +2288,7 @@ impl<'a> BytecodeCompiler<'a> {
             allow_expr_fallback: false,
             tasks: None,
             functions: None,
+            unpacked_structs: None,
             dpi_import_fds: None,
             inlining_stack: Vec::new(),
             tasks_inlined: 0,
@@ -2764,6 +2774,10 @@ impl<'a> BytecodeCompiler<'a> {
     ) {
         self.typedefs = Some(widths);
         self.typedef_elems = Some(elems);
+    }
+
+    pub fn set_unpacked_structs(&mut self, m: &'a UnpackedStructLeaves) {
+        self.unpacked_structs = Some(m);
     }
 
     pub fn set_typedef_types(&mut self, types: &'a HashMap<String, crate::ast::types::DataType>) {
@@ -11916,7 +11930,117 @@ impl<'a> BytecodeCompiler<'a> {
         false
     }
 
+    /// §7.2: `a = b` / `a <= b` between WHOLE unpacked structs. Each member
+    /// is its own signal and the container only carries the width, so a
+    /// plain signal copy moved a container nobody reads and left every
+    /// member of `a` unchanged (`always_comb l = t;` kept `l` at its
+    /// default while the identical `initial` statement worked). Copies
+    /// member by member when both sides are struct variables with the same
+    /// members. Some(false) for any other source, or when a name may be a
+    /// same-named struct of an inner scope, so the statement takes the
+    /// interpreter, which already copies member-wise; None when `a` is not a
+    /// struct variable.
+    fn compile_unpacked_struct_copy(&mut self, stmt: &Statement) -> Option<bool> {
+        let map = self.unpacked_structs?;
+        let (lvalue, rvalue, nb_delay) = match &stmt.kind {
+            StatementKind::BlockingAssign { lvalue, rvalue } => (lvalue, rvalue, None),
+            StatementKind::NonblockingAssign {
+                lvalue,
+                delay,
+                rvalue,
+            } => (lvalue, rvalue, Some(delay)),
+            _ => return None,
+        };
+        // `lookup_signal_id` falls back from `<scope>.<n>` to outer names. A
+        // struct declared in an inner scope may have member leaves but no
+        // container signal, so an outer hit can be an unrelated struct of
+        // the same name: give up on it when an inner scope has the member
+        // leaf (`Some(None)`).
+        let id_of = |e: &Expression| match &e.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                let id = self.lookup_signal_id(h)?;
+                if let (Some(scope), Some((path, leaf))) = (
+                    self.scope_hint.as_deref(),
+                    map.get(&id).and_then(|v| v.first()),
+                ) {
+                    let raw = Self::hier_raw_cow(h);
+                    let shadowed = scope
+                        .match_indices('.')
+                        .map(|(i, _)| i)
+                        .chain([scope.len()])
+                        .any(|end| {
+                            let key = format!("{}.{raw}.{path}", &scope[..end]);
+                            key != *leaf && self.signal_name_to_id.get(key.as_str()).is_some()
+                        });
+                    if shadowed {
+                        return Some(None);
+                    }
+                }
+                Some(Some(id))
+            }
+            _ => None,
+        };
+        let Some(dst) = id_of(lvalue)? else {
+            return Some(false);
+        };
+        let dst = map.get(&dst)?;
+        let Some(src) = id_of(rvalue).flatten().and_then(|id| map.get(&id)) else {
+            return Some(false);
+        };
+        if dst.is_empty() || dst.len() != src.len() || dst.iter().zip(src).any(|(d, s)| d.0 != s.0)
+        {
+            return Some(false);
+        }
+        let leaf = |name: &str, span| {
+            Expression::new(
+                ExprKind::Ident(HierarchicalIdentifier {
+                    root: None,
+                    path: vec![HierPathSegment {
+                        name: crate::ast::Identifier {
+                            name: name.to_string(),
+                            span,
+                        },
+                        selects: Vec::new(),
+                    }],
+                    span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                }),
+                span,
+            )
+        };
+        let pairs: Vec<(String, String)> = dst
+            .iter()
+            .zip(src)
+            .map(|(d, s)| (d.1.clone(), s.1.clone()))
+            .collect();
+        for (d, s) in pairs {
+            let (l, r) = (leaf(&d, lvalue.span), leaf(&s, rvalue.span));
+            let kind = match nb_delay {
+                None => StatementKind::BlockingAssign {
+                    lvalue: l,
+                    rvalue: r,
+                },
+                Some(delay) => StatementKind::NonblockingAssign {
+                    lvalue: l,
+                    delay: delay.clone(),
+                    rvalue: r,
+                },
+            };
+            if !self.compile_stmt_strict(&Statement::new(kind, stmt.span)) {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
     fn compile_stmt_strict(&mut self, stmt: &Statement) -> bool {
+        if let Some(done) = self.compile_unpacked_struct_copy(stmt) {
+            if !done {
+                self.bail("Stmt_unpacked_struct_whole");
+            }
+            return done;
+        }
         match &stmt.kind {
             // Process-FSM mode: a statement-level timing control becomes a
             // wait insn followed by its guarded statement. Star (`@*`) and

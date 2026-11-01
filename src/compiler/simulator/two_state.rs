@@ -5002,6 +5002,7 @@ impl Simulator {
                 &self.module.arrays,
                 &self.widths,
             );
+            compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
             compiler.set_ast_fallback(true);
             // Edge blocks only: sensitivity is the explicit clock list, so a
             // read hidden inside an interpreted expression can't break wake-up
@@ -5409,6 +5410,7 @@ impl Simulator {
                     &self.module.arrays,
                     &self.widths,
                 );
+                compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
                 compiler.set_ast_fallback(false);
                 compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 compiler.set_scope_hint(scope_hint);
@@ -5449,6 +5451,7 @@ impl Simulator {
                     &self.module.arrays,
                     &self.widths,
                 );
+                delay_compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
                 delay_compiler.set_ast_fallback(false);
                 delay_compiler.set_scope_hint(self.process_scope_hint.get(&pid).cloned());
                 delay_compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
