@@ -239,6 +239,9 @@ mod enclosing_value_parameter_specialization;
 #[path = "collections/lexical_value_parameter_specialization.rs"]
 mod lexical_value_parameter_specialization;
 
+#[path = "collections/parameterized_vif_specialization_cast.rs"]
+mod parameterized_vif_specialization_cast;
+
 #[path = "collections/coll_rows_typed_by_declaration.rs"]
 mod coll_rows_typed_by_declaration;
 
