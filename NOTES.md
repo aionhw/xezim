@@ -48,6 +48,19 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   philipaxer. An index type wider than 64 bits names one element per
   value, so `w[5]` and `w[100'h5]` are the same element and a `next()`
   walk over such keys ends (§7.8.4).
+* An array pattern fills a packed array element by element where the array
+  is a member of a packed struct and where its elements are packed structs:
+  a nested `'{default: 4'hA}` member pattern, a direct `cfg.dom = '{...}`
+  with positional, `default:` or `index: value` items, and `'{default:
+  '{...}}` on a packed or unpacked array of structs kept only the low
+  element, wrote nothing, or laid the items out at their own widths.
+  `index: value` items name their element on any packed array, where they
+  were concatenated in the order written. A struct-level `default:` fills
+  each innermost element of a multi-dimensional packed-array member, which
+  is no simple bit vector type, so `bit [16:0][3:0] m` takes 4'hA seventeen
+  times from `'{default: 8'hAA}`, in module, class-property, array-element
+  and unpacked-struct storage (§6.11.1, §10.9.1, §10.9.2, #771, reported by
+  Ganesh-TNL).
 * Class-member events, `$bits`, assignment widths and compiled methods
   (#786-#791, PRs #795-#800, contributed by AaronKel). An assigned
   class-member event names the source's event object, so a trigger through
