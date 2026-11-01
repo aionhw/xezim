@@ -173,7 +173,7 @@ pub fn census_pair_fusions() -> u64 {
 
 /// Per-statement interpreter fallback inside compiled method bodies
 /// (`XEZIM_METHOD_STMT_FALLBACK`, default on).
-fn method_stmt_fallback_enabled() -> bool {
+pub(crate) fn method_stmt_fallback_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("XEZIM_METHOD_STMT_FALLBACK").map_or(true, |v| v != "0"))
 }

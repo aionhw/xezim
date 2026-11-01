@@ -1127,6 +1127,8 @@ impl Simulator {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         METHOD_CACHE_COMPILER_SALT.hash(&mut h);
+        // A declined statement compiles as a fallback only when this is on.
+        super::bytecode::method_stmt_fallback_enabled().hash(&mut h);
         // Methods embed package constants, typedef targets, foreign class
         // metadata and signal IDs, not just their own class declaration.
         // Hash the elaborated context once, only when disk caching is used.

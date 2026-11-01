@@ -333,8 +333,8 @@ fn method_boost_enabled() -> bool {
 /// lowering, register allocation, block layout. Stale entries with an old
 /// salt hash to different keys and are simply recompiled; the safety net is
 /// the suite-level ON == OFF parity run against a warm cache.
-// §6.16 / §6.24.3: string casts emit conversion rather than width resizing.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3065;
+// §13.5.2: ref / inout copy-backs fit the actual; declined shadowed handles.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3066;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
