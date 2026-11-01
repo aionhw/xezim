@@ -922,12 +922,7 @@ impl Simulator {
                         Some(&self.module.typedefs),
                     )
                     .max(1);
-                    let et = if let DataType::TypeReference { name, .. } = &m.data_type {
-                        Some(name.name.name.clone())
-                            .filter(|n| self.module.enum_members.contains_key(n))
-                    } else {
-                        None
-                    };
+                    let et = self.struct_member_enum_key(&m.data_type);
                     let signed = super::elaborate::is_type_signed_resolved(
                         &m.data_type,
                         &self.module.typedef_types,
