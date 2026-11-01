@@ -15,6 +15,14 @@ pub(super) enum AssocKeyTy {
 impl AssocKeyTy {
     /// Stored key `k` as a value of this type.
     pub(super) fn value(self, k: &str) -> Value {
+        if let AssocKeyTy::Int { width, signed } = self
+            && width > 64
+        {
+            // Keyed by hex digits (`assoc_key_str`).
+            let mut v = Value::from_str_radix(k, 16, width);
+            v.is_signed = signed;
+            return v;
+        }
         match (self, k.parse::<i128>()) {
             (AssocKeyTy::Int { width, signed }, Ok(n)) => {
                 let mut v = Value::from_u64(n as u64, width.clamp(1, 64));
@@ -3237,7 +3245,12 @@ impl Simulator {
             // i128, not i64: a full-range unsigned 64-bit key
             // (18446744073709551615) is numeric too — treating it as a
             // string wrote the key's ASCII bytes into the ref arg.
-            let all_numeric = keys.iter().all(|k| k.parse::<i128>().is_ok());
+            // A key type wider than 64 bits is keyed by fixed-width hex
+            // digits (`assoc_key_str`), which order as the values do.
+            let wide = self
+                .assoc_index_width_for(obj_name)
+                .filter(|&(kw, _)| kw > 64);
+            let all_numeric = wide.is_none() && keys.iter().all(|k| k.parse::<i128>().is_ok());
             if keys.is_empty() {
                 return Some(Value::zero(32));
             }
@@ -3258,12 +3271,16 @@ impl Simulator {
                             self.assoc_key_str(obj_name, &cur_val).parse::<i128>().ok(),
                             String::new(),
                         )
+                    } else if wide.is_some() {
+                        (None, self.assoc_key_str(obj_name, &cur_val))
                     } else {
                         (None, cur_val.to_sv_string())
                     };
                     let order = |k: &str| {
                         if all_numeric {
                             k.parse::<i128>().ok().cmp(&cur_num)
+                        } else if wide.is_some() {
+                            k.cmp(cur_str.as_str())
                         } else {
                             (*decode_name_key(k)).cmp(cur_str.as_str())
                         }
@@ -3280,7 +3297,11 @@ impl Simulator {
             };
             if let Some(key) = result_key {
                 if let Some(arg) = args.first() {
-                    if all_numeric {
+                    if let Some((kw, ks)) = wide {
+                        let mut v = Value::from_str_radix(&key, 16, kw);
+                        v.is_signed = ks;
+                        self.assign_value(arg, &v);
+                    } else if all_numeric {
                         let key_int = key.parse::<i128>().unwrap_or(0);
                         let w = self.infer_width(arg);
                         self.assign_value(arg, &Value::from_u64(key_int as u64, w));

@@ -2115,12 +2115,20 @@ impl Simulator {
             }
             encode_name_key(&idx_val.to_sv_string()).into_owned()
         } else {
+            let iw = self.assoc_index_width_for(name);
+            // A wide key type keys by hex digits whatever the index width:
+            // `w[5]` and `w[100'h5]` name one element (§7.8.4).
+            if let Some((kw, _)) = iw
+                && kw > 64
+            {
+                return idx_val.resize(kw).to_hex();
+            }
             // §7.8.2: the index is narrowed to the declared key type before
             // keying. `int k; shortint aa[shortint]; aa[k]` with a 32-bit k
             // must store the 16-bit-truncated value so a later read with the
             // correctly-narrowed key matches. Without this the packed key text
             // diverged from the unpacked one and AA round-trips corrupted.
-            let (mut v, is_signed) = if let Some((kw, ks)) = self.assoc_index_width_for(name) {
+            let (mut v, is_signed) = if let Some((kw, ks)) = iw {
                 let narrowed = idx_val.resize(kw);
                 (narrowed, ks)
             } else {
@@ -3615,6 +3623,17 @@ impl Simulator {
         }
     }
 
+    /// Sort stored integral keys by value. A key type wider than 64 bits is
+    /// keyed by fixed-width hex digits (`assoc_key_str`), which already
+    /// order as their values do.
+    pub(super) fn sort_int_keys(keys: &mut [String], wide: bool) {
+        if wide {
+            keys.sort();
+        } else {
+            keys.sort_by_key(|k| k.parse::<i128>().unwrap_or(0));
+        }
+    }
+
     /// A stored string key as the SV value it names.
     pub(super) fn name_key_value(key: &str) -> Value {
         Value::from_string(&decode_name_key(key))
@@ -3661,7 +3680,10 @@ impl Simulator {
             Self::sort_name_keys(&mut ks);
         } else {
             // §7.9: numeric order incl. NEGATIVE int keys.
-            ks.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
+            let wide = self
+                .assoc_index_width_for(name)
+                .is_some_and(|(w, _)| w > 64);
+            Self::sort_int_keys(&mut ks, wide);
         }
         (ks, is_str)
     }

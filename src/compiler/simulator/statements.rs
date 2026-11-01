@@ -1293,7 +1293,8 @@ impl Simulator {
                             // §7.9: int keys traverse in NUMERIC order
                             // including NEGATIVE keys — u64 parsing
                             // mangled "-7" to 0.
-                            ks.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
+                            let wide = self.assoc_index_width_for(&an).is_some_and(|(w, _)| w > 64);
+                            Self::sort_int_keys(&mut ks, wide);
                         }
                         keys = ks;
                     }
@@ -1876,7 +1877,7 @@ impl Simulator {
                     if is_str {
                         Self::sort_name_keys(&mut keys);
                     } else {
-                        keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
+                        Self::sort_int_keys(&mut keys, kw > 64);
                     }
                     for key in keys {
                         if self.finished {
