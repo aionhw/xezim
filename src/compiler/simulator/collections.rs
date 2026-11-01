@@ -2153,8 +2153,8 @@ impl Simulator {
     /// `num()`/`first()` over the wrong set. The top-level assoc key is the
     /// text between `arr[` and the FIRST `]`, uniform across plain assoc
     /// (`arr[KEY]`), assoc-of-queue (`arr[KEY][i]`), and multidim assoc
-    /// (`arr[k1][k2]`). Returned sorted (numeric keys ascending by value,
-    /// else lexicographic) to match the LRM's first/next/last/prev order and
+    /// (`arr[k1][k2]`). Returned sorted (integral keys numerically, string
+    /// keys lexicographically) to match the LRM's first/next/last/prev order and
     /// `num()`'s count of distinct keys.
     /// `signal_name_to_id` keys under `prefix`, memoized.
     ///
@@ -2193,9 +2193,8 @@ impl Simulator {
                 return Arc::clone(keys);
             }
         }
-        let keys = Arc::new(
-            self.assoc_top_level_keys_uncached(&prefix, self.is_string_keyed_array(obj_name)),
-        );
+        let numeric = !self.is_string_keyed_array(obj_name);
+        let keys = Arc::new(self.assoc_top_level_keys_uncached(&prefix, numeric));
         let mut cache = self.assoc_keys_cache.borrow_mut();
         // Per-call and per-object array names come and go; bound the cache
         // rather than track every name's lifetime.
@@ -2206,7 +2205,7 @@ impl Simulator {
         keys
     }
 
-    fn assoc_top_level_keys_uncached(&self, prefix: &str, string_keyed: bool) -> Vec<String> {
+    fn assoc_top_level_keys_uncached(&self, prefix: &str, numeric: bool) -> Vec<String> {
         // The `signal_name_to_id` half of this enumeration is fixed for the
         // run (see `assoc_static_keys_cache`), so scan it once per prefix
         // instead of on every call.
@@ -2222,10 +2221,9 @@ impl Simulator {
             .collect();
         Self::sort_name_keys(&mut keys);
         keys.dedup();
-        // i128 covers both signed keys and full-range u64 keys; with i64 a
-        // single 2^63+ key demoted the whole sort to lexicographic. String
-        // keys stay lexicographic however they read (§7.8.2).
-        if !string_keyed && !keys.is_empty() && keys.iter().all(|k| k.parse::<i128>().is_ok()) {
+        // §7.8.2: string keys stay lexicographic even when they look numeric.
+        // i128 covers both signed keys and full-range u64 keys.
+        if numeric && !keys.is_empty() && keys.iter().all(|k| k.parse::<i128>().is_ok()) {
             keys.sort_by_key(|k| k.parse::<i128>().unwrap_or(0));
         }
         keys
