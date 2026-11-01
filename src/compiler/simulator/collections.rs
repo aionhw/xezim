@@ -2193,7 +2193,9 @@ impl Simulator {
                 return Arc::clone(keys);
             }
         }
-        let keys = Arc::new(self.assoc_top_level_keys_uncached(&prefix));
+        let keys = Arc::new(
+            self.assoc_top_level_keys_uncached(&prefix, self.is_string_keyed_array(obj_name)),
+        );
         let mut cache = self.assoc_keys_cache.borrow_mut();
         // Per-call and per-object array names come and go; bound the cache
         // rather than track every name's lifetime.
@@ -2204,7 +2206,7 @@ impl Simulator {
         keys
     }
 
-    fn assoc_top_level_keys_uncached(&self, prefix: &str) -> Vec<String> {
+    fn assoc_top_level_keys_uncached(&self, prefix: &str, string_keyed: bool) -> Vec<String> {
         // The `signal_name_to_id` half of this enumeration is fixed for the
         // run (see `assoc_static_keys_cache`), so scan it once per prefix
         // instead of on every call.
@@ -2221,8 +2223,9 @@ impl Simulator {
         Self::sort_name_keys(&mut keys);
         keys.dedup();
         // i128 covers both signed keys and full-range u64 keys; with i64 a
-        // single 2^63+ key demoted the whole sort to lexicographic.
-        if !keys.is_empty() && keys.iter().all(|k| k.parse::<i128>().is_ok()) {
+        // single 2^63+ key demoted the whole sort to lexicographic. String
+        // keys stay lexicographic however they read (§7.8.2).
+        if !string_keyed && !keys.is_empty() && keys.iter().all(|k| k.parse::<i128>().is_ok()) {
             keys.sort_by_key(|k| k.parse::<i128>().unwrap_or(0));
         }
         keys

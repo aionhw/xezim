@@ -4449,10 +4449,10 @@ impl Simulator {
                 .collect();
             Self::sort_name_keys(&mut keys);
             keys.dedup();
-            if keys.iter().all(|k| k.parse::<i64>().is_ok()) {
+            let string_keyed = self.is_string_keyed_array(name);
+            if !string_keyed && keys.iter().all(|k| k.parse::<i64>().is_ok()) {
                 keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
             }
-            let string_keyed = self.is_string_keyed_array(name);
             let val_is_str = self.string_signals.contains(name);
             let parts: Vec<String> = keys
                 .iter()
@@ -4513,11 +4513,12 @@ impl Simulator {
                 .collect();
             Self::sort_name_keys(&mut keys);
             keys.dedup();
-            // Numeric keys sort numerically, not lexically.
-            if keys.iter().all(|k| k.parse::<i64>().is_ok()) {
+            // Numeric keys sort numerically, not lexically; string keys
+            // lexically however they read (§7.8.2).
+            let string_keyed = self.is_string_keyed_array(name);
+            if !string_keyed && keys.iter().all(|k| k.parse::<i64>().is_ok()) {
                 keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
             }
-            let string_keyed = self.is_string_keyed_array(name);
             let parts: Vec<String> = keys
                 .iter()
                 .map(|k| {

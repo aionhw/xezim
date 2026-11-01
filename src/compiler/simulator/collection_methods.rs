@@ -3250,7 +3250,10 @@ impl Simulator {
             let wide = self
                 .assoc_index_width_for(obj_name)
                 .filter(|&(kw, _)| kw > 64);
-            let all_numeric = wide.is_none() && keys.iter().all(|k| k.parse::<i128>().is_ok());
+            // §7.8.2, §7.9.4: string keys are strings however they read.
+            let all_numeric = wide.is_none()
+                && !self.is_string_keyed_array(obj_name)
+                && keys.iter().all(|k| k.parse::<i128>().is_ok());
             if keys.is_empty() {
                 return Some(Value::zero(32));
             }
