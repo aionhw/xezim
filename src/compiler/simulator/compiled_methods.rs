@@ -4139,6 +4139,16 @@ impl Simulator {
             }
             args.push(v);
         }
+        // §13.5.2: the copy-back of an integral `ref` / `inout` formal is an
+        // assignment to the actual, so it takes the actual's width and sign.
+        let actual_fits: Vec<Option<(u32, bool)>> = entry
+            .writeback
+            .iter()
+            .map(|&i| {
+                let src = self.vm_regs.get(arg_base + i)?;
+                (entry.coerce.get(i)?.1 > 0).then_some((src.width, src.is_signed))
+            })
+            .collect();
         // --- every guard passed; state changes from here on ---
         self.vm_direct_calls += 1;
         self.push_queue_frame();
@@ -4199,8 +4209,17 @@ impl Simulator {
         let written_back: Vec<(usize, Value)> = entry
             .writeback
             .iter()
-            .filter_map(|&i| {
-                let v = self.vm_regs.get(entry.this_reg as usize + 1 + i)?.clone();
+            .zip(&actual_fits)
+            .filter_map(|(&i, fit)| {
+                let mut v = self.vm_regs.get(entry.this_reg as usize + 1 + i)?.clone();
+                if let Some((w, signed)) = *fit
+                    && !v.is_real
+                {
+                    if v.width != w {
+                        v = v.resize_for_assign(w);
+                    }
+                    v.is_signed = signed;
+                }
                 Some((arg_base + i, v))
             })
             .collect();
