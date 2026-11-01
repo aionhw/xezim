@@ -7347,6 +7347,11 @@ pub struct Simulator {
     /// Class reclamation bookkeeping (`heap_gc`): heap length at the last
     /// collection, live objects it left, and running totals.
     class_gc_heap_len: usize,
+    /// Objects live after the last collection, ascending. Handles are only
+    /// ever appended, so these plus the slots from `class_gc_scan_from` on
+    /// are every live object: a collection never walks dead slots.
+    class_gc_survivors: Vec<usize>,
+    class_gc_scan_from: usize,
     class_gc_live: usize,
     class_gc_released: usize,
     class_gc_runs: usize,

@@ -47,7 +47,7 @@ fn lifetime_fixture_exercises_hidden_roots_while_processes_are_parked() {
     trace.trace(&sim.process_contexts).unwrap();
     let shadowed = node(99);
     assert!(
-        trace.candidates[shadowed as usize],
+        trace.candidates.get(shadowed as usize),
         "serialized context omitted shadowed handle"
     );
     assert!(sim.process_contexts.values().any(|ctx| {
@@ -335,4 +335,33 @@ endmodule
         .unwrap()
         .join()
         .unwrap();
+}
+
+// §8.7: collections after the first trace only the previous survivors and
+// the objects allocated since. An object that survived (through an edge from
+// another survivor) must still be reclaimed once that edge goes away, and an
+// object allocated later and reachable only from a survivor must stay live.
+#[test]
+fn incremental_collection_tracks_survivors_across_runs() {
+    let sim = crate::simulate(
+        include_str!("../../../tests/fixtures/memory/heap_incremental.sv"),
+        100_000,
+    )
+    .expect("incremental heap fixture");
+    assert!(sim.finished);
+    assert_eq!(sim.error_count, 0);
+    assert!(sim.class_gc_runs >= 3, "only {} collections", sim.class_gc_runs);
+    assert!(sim
+        .output
+        .iter()
+        .any(|line| line.message.contains("GC_INCR sum=9 next_null=1")));
+    let ids: Vec<u64> = sim
+        .heap
+        .iter()
+        .flatten()
+        .filter(|object| object.class_name == "Node")
+        .filter_map(|object| object.properties.get("id").and_then(|v| v.to_u64()))
+        .filter(|&id| id < 1000)
+        .collect();
+    assert_eq!(ids, vec![1, 8], "node 7 must be reclaimed, 1 and 8 kept");
 }

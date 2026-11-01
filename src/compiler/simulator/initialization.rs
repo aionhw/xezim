@@ -3903,6 +3903,8 @@ impl Simulator {
             uvm_dpi: Default::default(),
             heap: vec![None], // index 0 is null
             class_gc_heap_len: 0,
+            class_gc_survivors: Vec::new(),
+            class_gc_scan_from: 0,
             class_gc_live: 0,
             class_gc_released: 0,
             class_gc_runs: 0,

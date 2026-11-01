@@ -36,16 +36,13 @@ impl Simulator {
             return;
         }
         let grown = self.heap.len().saturating_sub(self.class_gc_heap_len);
-        // A collection costs time and memory in proportion to every slot
-        // ever allocated, not to the live objects, so the next one waits for
-        // half again as many allocations: the slots grow geometrically
-        // between collections and the total cost stays linear. A fixed
-        // threshold made a long run with few live objects quadratic.
+        // A collection traces the previous survivors and the slots allocated
+        // since, not every slot ever allocated, so its cost follows the live
+        // objects plus the new ones and a fixed threshold stays linear over a
+        // long run.
         let threshold = match mode {
             ClassGcMode::Stress => 1,
-            _ => CLASS_GC_MIN_ALLOCS
-                .max(self.class_gc_live)
-                .max(self.heap.len() / 2),
+            _ => CLASS_GC_MIN_ALLOCS.max(self.class_gc_live),
         };
         // A suspended DPI task keeps values on a foreign stack the trace
         // cannot see; wait until none is parked.
@@ -53,18 +50,26 @@ impl Simulator {
             return;
         }
         self.class_gc_heap_len = self.heap.len();
-        let Ok(marked) = self.class_heap_reachability_probe() else {
+        let objects: Vec<usize> = self
+            .class_gc_survivors
+            .iter()
+            .copied()
+            .chain(self.class_gc_scan_from.max(1)..self.heap.len())
+            .filter(|&h| self.heap[h].is_some())
+            .collect();
+        let Ok(marked) = self.class_heap_mark(&objects) else {
             return;
         };
-        let dead: Vec<bool> = self
-            .heap
-            .iter()
-            .zip(&marked)
-            .enumerate()
-            .map(|(h, (object, &live))| h != 0 && object.is_some() && !live)
-            .collect();
-        let released = self.release_unreachable_class_storage(&dead);
-        self.class_gc_live = self.heap.iter().filter(|o| o.is_some()).count();
+        self.class_gc_scan_from = self.heap.len();
+        let (live, dead_list): (Vec<usize>, Vec<usize>) =
+            objects.into_iter().partition(|&h| marked.get(h));
+        let mut dead = super::heap_trace::SlotBits::new(self.heap.len());
+        for &h in &dead_list {
+            dead.set(h);
+        }
+        let released = self.release_class_storage(&dead, &dead_list);
+        self.class_gc_live = live.len();
+        self.class_gc_survivors = live;
         self.class_gc_released += released;
         self.class_gc_runs += 1;
     }
@@ -268,14 +273,28 @@ impl Simulator {
 }
 
 impl Simulator {
-    /// The objects reachable from the runtime roots, transitively: the
-    /// marking `maybe_collect_class_heap` sweeps by.
+    /// The objects reachable from the runtime roots, transitively, marked
+    /// over every allocated object rather than the previous survivors.
+    #[cfg(test)]
     pub(super) fn class_heap_reachability_probe(&self) -> Result<Vec<bool>, TraceError> {
+        let objects: Vec<usize> = (1..self.heap.len())
+            .filter(|&h| self.heap[h].is_some())
+            .collect();
+        let marked = self.class_heap_mark(&objects)?;
+        Ok((0..self.heap.len()).map(|h| marked.get(h)).collect())
+    }
+
+    /// Mark the live objects among `objects`, which must list every
+    /// allocated object (edges are traced from these only).
+    fn class_heap_mark(
+        &self,
+        objects: &[usize],
+    ) -> Result<super::heap_trace::SlotBits, TraceError> {
         let mut roots = self.trace_class_runtime_roots()?;
-        let mut edges = vec![Vec::new(); self.heap.len()];
+        let mut edges: HashMap<usize, Vec<usize>> = HashMap::default();
         let mut edge_trace = HandleTrace::new(self.heap.len());
-        for (handle, object) in self.heap.iter().enumerate() {
-            let Some(object) = object else {
+        for &handle in objects {
+            let Some(object) = self.heap.get(handle).and_then(Option::as_ref) else {
                 continue;
             };
             for (property, value) in object.properties.iter() {
@@ -291,28 +310,35 @@ impl Simulator {
                     }
                 }
             }
-            edges[handle].extend(edge_trace.drain_candidates());
+            let found = edge_trace.drain_candidates();
+            if !found.is_empty() {
+                edges.entry(handle).or_default().extend(found);
+            }
         }
         for (name, value) in self.signals.iter().chain(self.class_assoc_defaults.iter()) {
-            if let Some(owner) = Self::class_storage_owner(name).filter(|&h| h < edges.len()) {
+            if let Some(owner) = Self::class_storage_owner(name).filter(|&h| h < self.heap.len()) {
                 edge_trace.trace(name)?;
                 let (_, property) = name.split_once('#').unwrap();
                 if !self.class_property_has_no_handles(owner, property) {
                     edge_trace.trace(value)?;
                 }
-                edges[owner].extend(edge_trace.drain_candidates());
+                let found = edge_trace.drain_candidates();
+                if !found.is_empty() {
+                    edges.entry(owner).or_default().extend(found);
+                }
             } else {
                 roots.trace(&(name, value))?;
             }
         }
-        let mut marked = vec![false; self.heap.len()];
+        let mut marked = super::heap_trace::SlotBits::new(self.heap.len());
         let mut todo = roots.drain_candidates();
         while let Some(handle) = todo.pop() {
-            if marked[handle] || self.heap[handle].is_none() {
+            if self.heap.get(handle).is_none_or(Option::is_none) || !marked.set(handle) {
                 continue;
             }
-            marked[handle] = true;
-            todo.extend_from_slice(&edges[handle]);
+            if let Some(next) = edges.get(&handle) {
+                todo.extend_from_slice(next);
+            }
         }
         Ok(marked)
     }
@@ -354,10 +380,28 @@ impl Simulator {
     /// Sweep only slots whose unreachable status has already been established
     /// (`maybe_collect_class_heap`). Keep handle indices monotonic: stale
     /// numeric comparisons must never alias a subsequently allocated object.
+    #[cfg(test)]
     pub(super) fn release_unreachable_class_storage(&mut self, dead: &[bool]) -> usize {
         assert_eq!(dead.len(), self.heap.len());
         assert!(!dead.first().copied().unwrap_or(false));
-        let dead_handle = |h: usize| dead.get(h).copied().unwrap_or(false);
+        let list: Vec<usize> = (0..dead.len()).filter(|&h| dead[h]).collect();
+        let mut bits = super::heap_trace::SlotBits::new(dead.len());
+        for &h in &list {
+            bits.set(h);
+        }
+        self.release_class_storage(&bits, &list)
+    }
+
+    /// The sweep: `dead` marks exactly the handles in `dead_list`.
+    fn release_class_storage(
+        &mut self,
+        dead: &super::heap_trace::SlotBits,
+        dead_list: &[usize],
+    ) -> usize {
+        if dead_list.is_empty() {
+            return 0;
+        }
+        let dead_handle = |h: usize| dead.get(h);
         let dead_name = |name: &str| Self::class_storage_owner(name).is_some_and(&dead_handle);
         // Inherent remove maintains SignalMap's element index. HashMap::retain
         // through DerefMut would leave dangling names in that index.
@@ -474,8 +518,8 @@ impl Simulator {
         }
         self.event_obj_slots.retain(|_, slots| !slots.is_empty());
         let mut released = 0;
-        for (handle, object) in self.heap.iter_mut().enumerate() {
-            if dead_handle(handle) && object.take().is_some() {
+        for &handle in dead_list {
+            if self.heap.get_mut(handle).and_then(Option::take).is_some() {
                 released += 1;
             }
         }
