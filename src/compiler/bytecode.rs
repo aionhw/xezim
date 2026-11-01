@@ -2072,6 +2072,9 @@ pub struct BytecodeCompiler<'a> {
     /// pattern is otherwise context-free at expression level — its meaning
     /// depends entirely on the target type.
     pattern_layout: Option<Vec<(String, u32, u32)>>,
+    /// The struct signal `pattern_layout` belongs to, which keys its
+    /// members' packed dimensions.
+    pattern_root: Option<String>,
     /// Named-cast targets known at compile time: name -> (width, signed).
     /// See the simulator's `cast_widths`.
     cast_widths: Option<&'a HashMap<String, (u32, bool)>>,
@@ -2289,6 +2292,7 @@ impl<'a> BytecodeCompiler<'a> {
             local_var_elem: std::collections::HashMap::new(),
             cast_widths: None,
             pattern_layout: None,
+            pattern_root: None,
             local_const_vars: HashMap::default(),
             local_const_kinds: HashMap::default(),
             local_array_regs: HashMap::default(),
@@ -8080,7 +8084,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// ~8 of them per cycle (`mstatus_q.mpp`, `irqs_i.irq_fast`, ...), which
     /// made this the largest single fallback after the named-cast fix.
     /// Field layout of `lv` when it names a packed-struct SIGNAL directly.
-    fn lvalue_struct_layout(&self, lv: &Expression) -> Option<Vec<(String, u32, u32)>> {
+    fn lvalue_struct_layout(&self, lv: &Expression) -> Option<(String, Vec<(String, u32, u32)>)> {
         let fields_tbl = self.packed_struct_fields?;
         // `arr[i] <= '{...}`: an ELEMENT of an array of packed structs carries
         // the element layout, which is keyed by the array name — same keying
@@ -8098,13 +8102,23 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         let raw = Self::hier_raw_name(h);
-        if let Some(scope) = &self.scope_hint {
-            let q = cat_dot(scope, &raw);
-            if let Some(l) = fields_tbl.get(&q) {
-                return Some(l.clone());
-            }
+        let named = self
+            .scope_hint
+            .as_ref()
+            .map(|scope| cat_dot(scope, &raw))
+            .filter(|q| fields_tbl.contains_key(q))
+            .unwrap_or(raw);
+        let layout = fields_tbl.get(&named)?;
+        // A whole packed ARRAY of structs is keyed the same way; its pattern
+        // spans the elements, not one struct.
+        let struct_w = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+        if matches!(lv.kind, ExprKind::Ident(_))
+            && let Some(&id) = self.signal_name_to_id.get(named.as_str())
+            && self.signal_widths.get(id).is_some_and(|&sw| sw > struct_w)
+        {
+            return None;
         }
-        fields_tbl.get(&raw).cloned()
+        Some((named, layout.clone()))
     }
 
     /// §10.9.2: an assignment pattern applied to a PACKED-struct target is a
@@ -8220,11 +8234,29 @@ impl<'a> BytecodeCompiler<'a> {
             .cloned()
             .collect();
         if kids.is_empty() {
-            let src = self.compile_expr(default, w)?;
+            // §10.9.2: a multi-dimensional packed-array member is no simple
+            // bit vector type (§6.11.1); each innermost element takes the
+            // default.
+            let ew = self
+                .pattern_root
+                .as_ref()
+                .zip(self.packed_full_dims)
+                .and_then(|(root, dims)| dims.get(&format!("{root}.{name}")))
+                .filter(|d| d.len() > 1)
+                .and_then(|d| d.last())
+                .map(|&(l, r)| ((l - r).unsigned_abs() + 1) as u32)
+                .filter(|&ew| w % ew == 0)
+                .unwrap_or(w);
+            let src = self.compile_expr(default, ew)?;
             let r = self.alloc_reg();
             self.emit(Insn::Move(r, src));
-            self.emit(Insn::Resize(r, w));
-            return Some(r);
+            self.emit(Insn::Resize(r, ew));
+            if ew == w {
+                return Some(r);
+            }
+            let dest = self.alloc_reg();
+            self.emit(Insn::Concat(dest, Box::new(vec![r; (w / ew) as usize])));
+            return Some(dest);
         }
         if matches!(default.kind, ExprKind::AssignmentPattern(_)) {
             return None;
@@ -12425,10 +12457,12 @@ impl<'a> BytecodeCompiler<'a> {
                 let width = self.infer_lhs_width(lvalue);
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
-                self.pattern_layout = self.lvalue_struct_layout(lvalue);
+                (self.pattern_root, self.pattern_layout) =
+                    self.lvalue_struct_layout(lvalue).unzip();
                 let rctx = self.assign_rhs_ctx(lvalue, width);
                 let compiled = self.compile_expr(rvalue, rctx);
                 self.pattern_layout = None;
+                self.pattern_root = None;
                 if let Some(val_reg) = compiled {
                     // Note: NbaAssign itself performs §10.7 assignment-padding resize,
                     // so we don't emit a generic (zero-extending) Resize here — that
@@ -12504,7 +12538,8 @@ impl<'a> BytecodeCompiler<'a> {
                 let width = self.infer_lhs_width(lvalue);
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
-                self.pattern_layout = self.lvalue_struct_layout(lvalue);
+                (self.pattern_root, self.pattern_layout) =
+                    self.lvalue_struct_layout(lvalue).unzip();
                 // Step 9g: `lhs = new` / `lhs = new(args)` — the
                 // constructed class is the LHS's DECLARED type (§8.8); a
                 // handle needs no Resize regardless of the inferred width.
@@ -12521,6 +12556,7 @@ impl<'a> BytecodeCompiler<'a> {
                     self.compile_expr(rvalue, rctx)
                 };
                 self.pattern_layout = None;
+                self.pattern_root = None;
                 if let Some(val_reg) = compiled {
                     // class-perf collection-return store (§13.4):
                     // `q_local = coll_fn(..)`. The callee hands a queue /

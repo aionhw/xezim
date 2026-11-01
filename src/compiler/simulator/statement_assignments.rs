@@ -1505,7 +1505,28 @@ impl Simulator {
                 }
             }
         }
-        if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
+        // §10.9.1: a packed array of packed structs is one value too; its
+        // pattern is laid out element by element, each element by member.
+        if let ExprKind::AssignmentPattern(items) = &rvalue.kind
+            && let ExprKind::Ident(h) = &lvalue.kind
+            && self
+                .packed_struct_array_elem(&self.resolve_hier_name(h))
+                .is_some()
+            && let Some(v) = self.packed_pattern_for_lhs(lvalue, items)
+        {
+            self.assign_value(lvalue, &v);
+            self.settle_after_proc_write();
+            return;
+        }
+        // A member of a packed struct is a slice of the struct's one value:
+        // the element-wise spread below writes names nothing reads.
+        let packed_member = matches!(&rvalue.kind, ExprKind::AssignmentPattern(items)
+            if self
+                .resolve_packed_struct_target(lvalue, items)
+                .is_some_and(|(_, prefix, ..)| !prefix.is_empty()));
+        if let ExprKind::AssignmentPattern(items) = &rvalue.kind
+            && !packed_member
+        {
             let spread = self.assign_class_fixed_array_pattern(lvalue, items)
                 || self.assign_class_collection_pattern(lvalue, items)
                 || if matches!(&lvalue.kind, ExprKind::Ident(_)) {

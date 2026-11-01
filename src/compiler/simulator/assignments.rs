@@ -948,15 +948,17 @@ impl Simulator {
         items: &[AssignmentPatternItem],
     ) -> Option<(String, String, Vec<(String, u32, u32)>, u32, u32)> {
         // Keyed/Typed items denote associative or type-keyed aggregates, not a
-        // by-member struct pack — leave those to the existing paths.
-        if items.iter().any(|it| {
-            matches!(
-                it,
-                AssignmentPatternItem::Keyed(..) | AssignmentPatternItem::Typed(..)
-            )
-        }) {
+        // by-member struct pack — leave those to the existing paths, except
+        // `index: value` items for a member that is a packed array.
+        if items
+            .iter()
+            .any(|it| matches!(it, AssignmentPatternItem::Typed(..)))
+        {
             return None;
         }
+        let keyed = items
+            .iter()
+            .any(|it| matches!(it, AssignmentPatternItem::Keyed(..)));
         let flat = self.flat_member_name(lvalue)?;
         // The base may be INSTANCE-SCOPED ("u.r2"), so the first-dot split
         // misread the instance prefix as the struct base and every lookup
@@ -976,6 +978,15 @@ impl Simulator {
             let Some(layout) = self.module.packed_struct_fields.get(&obj_name).cloned() else {
                 continue;
             };
+            if keyed
+                && (prefix.is_empty()
+                    || !self
+                        .module
+                        .packed_full_dims
+                        .contains_key(&format!("{obj_name}.{prefix}")))
+            {
+                continue;
+            }
             let (base_offset, width) = if prefix.is_empty() {
                 // Whole base signal: span = max (offset + width) over fields.
                 let total = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
@@ -1016,7 +1027,14 @@ impl Simulator {
             // Write straight into the whole base value at absolute offsets, so a
             // member assign leaves its sibling members untouched.
             if let Some(mut acc) = self.get_local_or_signal(&obj_name)
-                && self.apply_packed_struct_pattern(&mut acc, &layout, &prefix, 0, items)
+                && self.apply_packed_struct_pattern(
+                    &mut acc,
+                    &layout,
+                    &prefix,
+                    0,
+                    items,
+                    &PackedDims::Root(&obj_name),
+                )
             {
                 self.set_local_or_signal(&obj_name, acc);
                 return true;
@@ -1028,7 +1046,8 @@ impl Simulator {
         // see (`packed_struct_fields` has no entry for a dotted class
         // property). Lay the pattern out at the property's declared member
         // offsets so later member reads — which use those offsets — agree.
-        if let Some((handle, prop, layout)) = self.class_prop_pattern_target(lvalue, items) {
+        if let Some((handle, prop, (layout, dims))) = self.class_prop_pattern_target(lvalue, items)
+        {
             let total = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
             let mut acc = Value::zero(total);
             if let Some(seed) = self
@@ -1041,7 +1060,14 @@ impl Simulator {
                     acc.set_bit(b as usize, seed.get_bit(b as usize));
                 }
             }
-            if self.apply_packed_struct_pattern(&mut acc, &layout, "", 0, items) {
+            if self.apply_packed_struct_pattern(
+                &mut acc,
+                &layout,
+                "",
+                0,
+                items,
+                &PackedDims::Map(&dims),
+            ) {
                 // `set_prop_if_changed` reports whether the VALUE changed, not
                 // whether the assignment was handled — a pattern equal to the
                 // current contents (e.g. re-assigning the same literal) must
@@ -1057,14 +1083,22 @@ impl Simulator {
         // (`u_ctrl.cfg_arr[2] = '{...}`, packed or unpacked). Resolve through
         // the read-side `declared_packed_access` so the write lands at the
         // same bit offsets the reads use.
-        if let Some((storage, off, width, layout)) = self.declared_elem_pattern_target(lvalue, items)
+        if let Some((storage, off, width, (layout, dims))) =
+            self.declared_elem_pattern_target(lvalue, items)
         {
             if let Some(mut base_val) = self.get_local_or_signal(&storage) {
                 let mut acc = Value::zero(width);
                 for b in 0..width {
                     acc.set_bit(b as usize, base_val.get_bit((off + b) as usize));
                 }
-                if self.apply_packed_struct_pattern(&mut acc, &layout, "", 0, items) {
+                if self.apply_packed_struct_pattern(
+                    &mut acc,
+                    &layout,
+                    "",
+                    0,
+                    items,
+                    &PackedDims::Map(&dims),
+                ) {
                     for b in 0..width {
                         base_val.set_bit((off + b) as usize, acc.get_bit(b as usize));
                     }
@@ -1099,7 +1133,14 @@ impl Simulator {
                 for b in 0..width {
                     acc.set_bit(b as usize, base_val.get_bit((base_off + b) as usize));
                 }
-                if self.apply_packed_struct_pattern(&mut acc, &layout, &prefix, base_off, items) {
+                if self.apply_packed_struct_pattern(
+                    &mut acc,
+                    &layout,
+                    &prefix,
+                    base_off,
+                    items,
+                    &PackedDims::Root(&obj_name),
+                ) {
                     return Some(acc);
                 }
             }
@@ -1108,7 +1149,8 @@ impl Simulator {
         // layout, seeded from the current property value. The scheduled
         // store (NBA / settling) then writes this value through the normal
         // class-property path.
-        if let Some((handle, prop, layout)) = self.class_prop_pattern_target(lvalue, items) {
+        if let Some((handle, prop, (layout, dims))) = self.class_prop_pattern_target(lvalue, items)
+        {
             let total = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
             let mut acc = Value::zero(total);
             if let Some(seed) = self
@@ -1121,7 +1163,14 @@ impl Simulator {
                     acc.set_bit(b as usize, seed.get_bit(b as usize));
                 }
             }
-            if self.apply_packed_struct_pattern(&mut acc, &layout, "", 0, items) {
+            if self.apply_packed_struct_pattern(
+                &mut acc,
+                &layout,
+                "",
+                0,
+                items,
+                &PackedDims::Map(&dims),
+            ) {
                 return Some(acc);
             }
             return None;
@@ -1129,14 +1178,22 @@ impl Simulator {
         // Declared-type destination (a fixed-array struct element on an
         // instance): evaluate at the element's own layout, 0-based within
         // the element — the scheduled store places the value.
-        if let Some((storage, off, width, layout)) = self.declared_elem_pattern_target(lvalue, items)
+        if let Some((storage, off, width, (layout, dims))) =
+            self.declared_elem_pattern_target(lvalue, items)
         {
             if let Some(base_val) = self.get_local_or_signal(&storage) {
                 let mut acc = Value::zero(width);
                 for b in 0..width {
                     acc.set_bit(b as usize, base_val.get_bit((off + b) as usize));
                 }
-                if self.apply_packed_struct_pattern(&mut acc, &layout, "", 0, items) {
+                if self.apply_packed_struct_pattern(
+                    &mut acc,
+                    &layout,
+                    "",
+                    0,
+                    items,
+                    &PackedDims::Map(&dims),
+                ) {
                     return Some(acc);
                 }
             }
@@ -1156,7 +1213,7 @@ impl Simulator {
         &mut self,
         lvalue: &Expression,
         items: &[AssignmentPatternItem],
-    ) -> Option<(usize, String, Vec<(String, u32, u32)>)> {
+    ) -> Option<(usize, String, PackedStructShape)> {
         // §8.14/§8.15: `super.p`, and `h.p` / `this.p` naming a property a
         // derived class redeclares, select a base class's cell; take the
         // spelling `assign_value` writes, never the leaf's `p`.
@@ -1268,13 +1325,15 @@ impl Simulator {
         if !su.packed {
             return None;
         }
+        let mut dims = HashMap::default();
+        self.struct_member_dims(&su, "", &mut dims);
         let layout = super::elaborate::packed_struct_field_layout(
             &DataType::Struct(su),
             &self.module.parameters,
             &self.module.typedefs,
             &self.module.typedef_types,
         )?;
-        Some((handle, prop, layout))
+        Some((handle, prop, (layout, dims)))
     }
 
     /// Resolve a declared-type destination for a packed-struct assignment
@@ -1288,7 +1347,7 @@ impl Simulator {
         &mut self,
         lvalue: &Expression,
         items: &[AssignmentPatternItem],
-    ) -> Option<(String, u32, u32, Vec<(String, u32, u32)>)> {
+    ) -> Option<(String, u32, u32, PackedStructShape)> {
         if items.iter().any(|it| {
             matches!(
                 it,
@@ -1328,7 +1387,57 @@ impl Simulator {
         if total == 0 || total != access.width {
             return None;
         }
-        Some((access.storage, access.offset, access.width, layout))
+        let mut dims = HashMap::default();
+        if let DataType::Struct(su) = &access.element_type {
+            self.struct_member_dims(su, "", &mut dims);
+        }
+        Some((access.storage, access.offset, access.width, (layout, dims)))
+    }
+
+    /// The packed dimensions of struct member `key` (a path below the
+    /// struct), outermost first.
+    pub(super) fn packed_member_dims(
+        &self,
+        src: &PackedDims<'_>,
+        key: &str,
+    ) -> Option<Vec<(i64, i64)>> {
+        match src {
+            PackedDims::Root(root) if !root.is_empty() => self
+                .module
+                .packed_full_dims
+                .get(&format!("{root}.{key}"))
+                .cloned(),
+            PackedDims::Map(m) => m.get(key).cloned(),
+            PackedDims::Root(_) => None,
+        }
+    }
+
+    /// §10.9.2: the value a `default:` gives a `w`-bit member whose packed
+    /// dimensions are `dims`, when it is a multi-dimensional packed array.
+    /// Such a member is no simple bit vector type (§6.11.1), so each innermost
+    /// element takes the default: `bit [16:0][3:0]` takes 4'hA from 8'hAA
+    /// seventeen times, not 68'hAA once. None for any other member.
+    pub(super) fn default_per_packed_element(
+        &mut self,
+        default: &Expression,
+        dims: &[(i64, i64)],
+        w: u32,
+    ) -> Option<Value> {
+        if dims.len() < 2 || matches!(default.kind, ExprKind::AssignmentPattern(_)) {
+            return None;
+        }
+        let &(l, r) = dims.last()?;
+        let ew = ((l - r).unsigned_abs() + 1) as u32;
+        if w % ew != 0 {
+            return None;
+        }
+        let raw = self.eval_expr_ctx(default, ew);
+        let elem = self.fit_pattern_item_value(raw, ew);
+        let mut v = Value::zero(w);
+        for b in 0..w {
+            v.set_bit(b as usize, elem.get_bit((b % ew) as usize));
+        }
+        Some(v)
     }
 
     /// Write each member of a packed-struct assignment pattern into `acc` at
@@ -1346,6 +1455,7 @@ impl Simulator {
         prefix: &str,
         base_offset: u32,
         items: &[AssignmentPatternItem],
+        dims_src: &PackedDims<'_>,
     ) -> bool {
         let pfx = if prefix.is_empty() {
             String::new()
@@ -1363,7 +1473,26 @@ impl Simulator {
             }
         }
         if children.is_empty() {
-            return false;
+            // §10.9.1: a pattern on a member that is a packed array of its
+            // own (`bit [16:0][3:0] port_domain`) fills it element by
+            // element, `default:` included, at the declared dimensions.
+            let dims = (!prefix.is_empty())
+                .then(|| self.packed_member_dims(dims_src, prefix))
+                .flatten();
+            let Some(dims) = dims else {
+                return false;
+            };
+            let Some(&(_, off, w)) = layout.iter().find(|(k, _, _)| k == prefix) else {
+                return false;
+            };
+            let Some(piece) = self.packed_pattern_value(items, &dims, w) else {
+                return false;
+            };
+            let dst = off - base_offset;
+            for b in 0..w {
+                acc.set_bit((dst + b) as usize, piece.get_bit(b as usize));
+            }
+            return true;
         }
         // The first-declared member is the MSB, i.e. the highest offset. Ordered
         // items bind in declaration order.
@@ -1400,16 +1529,32 @@ impl Simulator {
                     .any(|(k, _, _)| k.len() > full.len() + 1 && k.starts_with(&format!("{full}.")))
             {
                 let sub = [AssignmentPatternItem::Default(d.clone())];
-                if self.apply_packed_struct_pattern(acc, layout, full, base_offset, &sub) {
+                if self.apply_packed_struct_pattern(acc, layout, full, base_offset, &sub, dims_src)
+                {
                     continue;
                 }
+            }
+            // §10.9.2: a multi-dimensional packed-array member is no simple
+            // bit vector type (§6.11.1), so `default:` is assigned to each of
+            // its innermost elements: `bit [16:0][3:0] m` takes 4'hA from
+            // `default: 8'hAA` seventeen times, not 68'hAA once.
+            if keyed.is_none()
+                && let Some(d) = default
+                && let Some(dims) = self.packed_member_dims(dims_src, full)
+                && let Some(piece) = self.default_per_packed_element(d, &dims, *w)
+            {
+                let dst = off - base_offset;
+                for b in 0..*w {
+                    acc.set_bit((dst + b) as usize, piece.get_bit(b as usize));
+                }
+                continue;
             }
             let expr = keyed.or(default);
             let Some(e) = expr else { continue };
             // A nested pattern on a sub-struct member recurses so each of ITS
             // members lands at the right offset too.
             if let ExprKind::AssignmentPattern(sub) = &e.kind {
-                if self.apply_packed_struct_pattern(acc, layout, full, base_offset, sub) {
+                if self.apply_packed_struct_pattern(acc, layout, full, base_offset, sub, dims_src) {
                     continue;
                 }
             }

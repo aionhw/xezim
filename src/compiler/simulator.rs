@@ -2092,6 +2092,18 @@ struct WaiterValueCtx {
     cells: bool,
 }
 
+/// A packed struct's member layout and its members' packed dimensions.
+pub(super) type PackedStructShape = (Vec<(String, u32, u32)>, HashMap<String, Vec<(i64, i64)>>);
+
+/// Where `apply_packed_struct_pattern` finds the packed dimensions of a
+/// struct member: under a registered root signal (`root.member` in
+/// `packed_full_dims`), or in a map keyed by member path built from the
+/// struct's type. `Root("")` knows none.
+pub(super) enum PackedDims<'a> {
+    Root(&'a str),
+    Map(&'a HashMap<String, Vec<(i64, i64)>>),
+}
+
 /// A process parked on a CLASS-FIELD named event (`event m_event` inside a
 /// class, awaited/triggered as `@m_event` / `->m_event` from a method on
 /// `this`). Unlike a module-scope named event, a class `event` field has no
