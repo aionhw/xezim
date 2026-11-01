@@ -1500,6 +1500,9 @@ struct LocalArrayBind {
     lo: i64,
     elem_w: u32,
     is_real: bool,
+    /// The elements' declared signedness when every element is stamped with
+    /// it (an inlined array formal); None when unknown.
+    elem_signed: Option<bool>,
 }
 
 /// `format!("{}.{}", scope, name)` without the formatting machinery: the
@@ -3462,6 +3465,11 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("Expr_Call_ports");
                     return None;
                 }
+                // §13.5: each element fits the declared element type,
+                // signing included, exactly like a scalar input formal; a
+                // bare resize left `input int d[]` elements unsigned, so
+                // `d[0] / 2` of -6 read 2147483645.
+                let elem_kind = self.local_kind_of(&p.data_type, Some(&name));
                 let mut regs = Vec::with_capacity(items.len());
                 for it in items {
                     let crate::ast::expr::AssignmentPatternItem::Ordered(e) = it else {
@@ -3477,6 +3485,10 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit_to_real(slot);
                     } else {
                         self.emit(Insn::Resize(slot, elem_w));
+                        if let Some(k) = elem_kind {
+                            self.local_kinds.insert(slot, k);
+                            self.emit_local_fit(slot);
+                        }
                     }
                     regs.push(slot);
                 }
@@ -3487,6 +3499,10 @@ impl<'a> BytecodeCompiler<'a> {
                         lo: 0,
                         elem_w,
                         is_real,
+                        elem_signed: match elem_kind {
+                            Some(LocalKind::Int { signed, .. }) if !is_real => Some(signed),
+                            _ => None,
+                        },
                     },
                 ));
                 continue;
@@ -6433,6 +6449,7 @@ impl<'a> BytecodeCompiler<'a> {
                 lo,
                 elem_w,
                 is_real,
+                elem_signed: None,
             },
         );
         true
@@ -9861,6 +9878,16 @@ impl<'a> BytecodeCompiler<'a> {
                             .is_some_and(|r| r.get(id).copied().unwrap_or(false))
                     })
             }
+            // §11.3.1: an element of a register-bound local `real` array (an
+            // inlined function's `input real d[]`) is real too. Without this
+            // `d[k] / x` divided as integers and read 0.
+            ExprKind::Index { expr: a, .. } => matches!(
+                &a.kind,
+                ExprKind::Ident(h) if self
+                    .local_var_array
+                    .get(&Self::hier_raw_name(h))
+                    .is_some_and(|ab| ab.is_real)
+            ),
             ExprKind::Paren(x) => self.expr_is_real_static(x),
             ExprKind::Unary {
                 op: UnaryOp::Plus | UnaryOp::Minus,
@@ -19744,6 +19771,14 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Index { expr, .. } => {
                 // §7.4: an unpacked element retains its declared type; only
                 // a packed bit-select is necessarily unsigned (§11.8.1).
+                if let ExprKind::Ident(h) = &expr.kind
+                    && let Some(signed) = self
+                        .local_var_array
+                        .get(&Self::hier_raw_name(h))
+                        .and_then(|ab| ab.elem_signed)
+                {
+                    return Some(signed);
+                }
                 if let Some(id) = self.const_multi_dim_array_elem_signal_id(e) {
                     return self.signal_signed.get(id).copied();
                 }

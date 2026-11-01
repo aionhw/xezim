@@ -585,3 +585,5 @@ mod checkpoint_save_restore;
 
 #[path = "misc/block_local_array_for_loop.rs"]
 mod block_local_array_for_loop;
+#[path = "misc/array_formal_element_types.rs"]
+mod array_formal_element_types;
