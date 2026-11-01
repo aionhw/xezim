@@ -571,6 +571,8 @@ mod null_deref_fatal;
 mod shadowed_property_initializers;
 #[path = "classes/std_randomize_object_member.rs"]
 mod std_randomize_object_member;
+#[path = "classes/rand_unread_sub_object_joint_solve.rs"]
+mod rand_unread_sub_object_joint_solve;
 #[path = "classes/two_state_property_writes.rs"]
 mod two_state_property_writes;
 #[path = "classes/typedef_param_class_construction.rs"]
