@@ -438,3 +438,6 @@ mod preprocessor_linear_join;
 
 #[path = "scheduling/review_parked_wait_writes.rs"]
 mod review_parked_wait_writes;
+
+#[path = "scheduling/labeled_block_local_events.rs"]
+mod labeled_block_local_events;

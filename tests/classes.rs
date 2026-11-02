@@ -1053,3 +1053,6 @@ mod review_event_and_frame_routing;
 
 #[path = "classes/cast_to_interface_class_806.rs"]
 mod cast_to_interface_class_806;
+
+#[path = "classes/concurrent_local_type_metadata.rs"]
+mod concurrent_local_type_metadata;
