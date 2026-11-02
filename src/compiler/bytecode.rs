@@ -2716,20 +2716,33 @@ impl<'a> BytecodeCompiler<'a> {
         self.array_first_id = Some(arrays);
     }
 
-    fn array_operand(&self, name: String) -> Box<ArrayOperand> {
+    /// The operand addressing array `name`, or None (a bail) when it has no
+    /// cells to address: neither a dense id range nor element signals by
+    /// name. A block-local array of a process is declared at run time into
+    /// by-name storage that has neither, and a compiled store into it was
+    /// dropped: `for (int i ...) arr[i] = v;` left `arr` 0 (§6.21).
+    fn array_operand(&mut self, name: String) -> Option<Box<ArrayOperand>> {
         if let Some(&(first_id, lo, hi)) = self
             .array_first_id
             .and_then(|arrays| arrays.get(name.as_str()))
         {
-            Box::new(ArrayOperand::Dense {
+            return Some(Box::new(ArrayOperand::Dense {
                 name,
                 first_id,
                 lo,
                 hi,
-            })
-        } else {
-            Box::new(ArrayOperand::Named(name))
+            }));
         }
+        let lo = self.arrays.get(&name).map_or(0, |&(lo, _, _)| lo);
+        if self
+            .signal_name_to_id
+            .get(format!("{name}[{lo}]").as_str())
+            .is_none()
+        {
+            self.bail("array_without_cells");
+            return None;
+        }
+        Some(Box::new(ArrayOperand::Named(name)))
     }
 
     pub fn set_params(&mut self, params: &'a HashMap<String, Value>) {
@@ -15071,7 +15084,7 @@ impl<'a> BytecodeCompiler<'a> {
                     if let Some(name) = self.lookup_array_name(hier) {
                         let idx_reg = self.compile_expr(index, 0)?;
                         let dest = self.alloc_reg();
-                        let array = self.array_operand(name);
+                        let array = self.array_operand(name)?;
                         self.emit(Insn::LoadArrayElem(dest, array, idx_reg));
                         return Some(dest);
                     }
@@ -16926,7 +16939,7 @@ impl<'a> BytecodeCompiler<'a> {
             lo_reg,
             Box::new(Value::from_u64(off as u64, 32)),
         ));
-        Some((self.array_operand(name), idx_reg, hi_reg, lo_reg, resized))
+        Some((self.array_operand(name)?, idx_reg, hi_reg, lo_reg, resized))
     }
 
     /// A packed lvalue PATH that mixes several dynamic steps:
@@ -17304,7 +17317,9 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            let array = self.array_operand(name);
+                            let Some(array) = self.array_operand(name) else {
+                                return false;
+                            };
                             self.emit(Insn::NbaAssignArray(array, idx_reg, val_reg, width));
                             return true;
                         }
@@ -17608,7 +17623,9 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                 };
                                 if let Some((hi_reg, lo_reg)) = regs {
-                                    let array = self.array_operand(name);
+                                    let Some(array) = self.array_operand(name) else {
+                                        return false;
+                                    };
                                     self.emit(Insn::NbaAssignArrayRange(
                                         array, idx_reg, hi_reg, lo_reg, val_reg,
                                     ));
@@ -17883,7 +17900,9 @@ impl<'a> BytecodeCompiler<'a> {
                     b_reg,
                     Box::new(Value::from_u64(b as u64, 32)),
                 ));
-                let array = self.array_operand(name);
+                let Some(array) = self.array_operand(name) else {
+                    return Some(false);
+                };
                 self.emit(Insn::BlockingAssignArrayRange(
                     array, idx_reg, b_reg, b_reg, val_reg,
                 ));
@@ -18502,7 +18521,9 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            let array = self.array_operand(name);
+                            let Some(array) = self.array_operand(name) else {
+                                return false;
+                            };
                             self.emit(Insn::BlockingAssignArray(array, idx_reg, val_reg, width));
                             return true;
                         }
@@ -18926,7 +18947,9 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                 };
                                 if let Some((hi_reg, lo_reg)) = regs {
-                                    let array = self.array_operand(name);
+                                    let Some(array) = self.array_operand(name) else {
+                                        return false;
+                                    };
                                     self.emit(Insn::BlockingAssignArrayRange(
                                         array, idx_reg, hi_reg, lo_reg, val_reg,
                                     ));
