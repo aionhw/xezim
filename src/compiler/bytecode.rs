@@ -3247,7 +3247,7 @@ impl<'a> BytecodeCompiler<'a> {
                 h.path[0].name.name.clone()
             }
             _ => {
-                self.bail("Expr_Call");
+                self.bail("Expr_Call_func_not_single_ident");
                 return None;
             }
         };
@@ -13543,7 +13543,7 @@ impl<'a> BytecodeCompiler<'a> {
                         if self.compile_expr(e, 0).is_some() {
                             return true;
                         }
-                        self.bail("Expr_Call");
+                        self.bail("Expr_Call_stmt");
                         return self.emit_fallback(stmt);
                     }
                     // class-perf Step 9c: `$cast(dest, src);` in statement
@@ -17122,7 +17122,59 @@ impl<'a> BytecodeCompiler<'a> {
                         .class_method_names
                         .contains(h.path[0].name.name.as_str())
                 {
-                    let Some(this_reg) = self.method_this_reg else {
+                    let this_reg = if let Some(tr) = self.method_this_reg {
+                        tr
+                    } else if let Some(target) = self.static_bare_targets.get(h.path[0].name.name.as_str()).cloned() {
+                        // Static method in a static method body (where this_reg is None):
+                        // emit CallStaticScoped with this class target.
+                        let call_start = self.insns.len();
+                        let call_next = self.next_reg;
+                        let mut ok = true;
+                        let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
+                        for a in args {
+                            match self.compile_expr(a, 0) {
+                                Some(r) => arg_values.push(r),
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok {
+                            let dest = self.alloc_reg();
+                            let n = arg_values.len() as u32;
+                            let arg_start = self.alloc_reg();
+                            for _ in 1..arg_values.len() {
+                                self.alloc_reg();
+                            }
+                            for (i, &v) in arg_values.iter().enumerate() {
+                                let slot = (arg_start as usize + i) as RegId;
+                                if slot != v {
+                                    self.emit(Insn::Move(slot, v));
+                                }
+                            }
+                            self.emit(Insn::CallStaticScoped(
+                                dest,
+                                Box::new(NamePair(
+                                    target.into_boxed_str(),
+                                    h.path[0].name.name.clone().into_boxed_str(),
+                                )),
+                                arg_start,
+                                n,
+                            ));
+                            let wb_target = self.method_class.clone();
+                            self.emit_arg_slot_writeback(
+                                args,
+                                arg_start,
+                                wb_target.as_deref().map(|c| (c, h.path[0].name.name.as_str())),
+                            )?;
+                            return Some(dest);
+                        }
+                        self.truncate_insns(call_start);
+                        self.next_reg = call_next;
+                        self.bail("Expr_Call_bare_static");
+                        return None;
+                    } else {
                         self.bail("bare_call_no_this");
                         return None;
                     };
