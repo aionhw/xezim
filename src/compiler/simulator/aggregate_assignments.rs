@@ -4135,6 +4135,18 @@ impl Simulator {
             // copied a packed container nobody reads, leaving the members
             // x, while the same statement at top level resolved through
             // `flat_path_type`.
+            // A MEMBER of that element (`u.arr[2].f`) is not the element.
+            // `flat_path_type` walks from the first segment, so an instance
+            // prefix (`u.arr[2].f`) misses and used to fall through to this
+            // element lookup. The member path then answered the struct type,
+            // a nonblocking `arr[i].f <= v` expanded as a whole-struct copy,
+            // and each leaf was `arr[i].f.f` — the same shape, so the
+            // expansion recursed until the stack died. Only a name that
+            // ends on the element select (`u.arr[2]`) is the element.
+            let end = name.rfind(']')?;
+            if end + 1 != name.len() {
+                return None;
+            }
             let base = name.rfind('[').map(|i| &name[..i])?;
             if base.is_empty() {
                 return None;
