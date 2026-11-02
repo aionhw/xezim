@@ -1477,6 +1477,14 @@ impl<'a> Ck<'a> {
     /// `target = rhs` where `target` has type `lt`; `what` names the target
     /// (built only for a report).
     fn check_value(&mut self, lt: &Ty, rhs: &Expression, what: impl FnOnce() -> String) {
+        if is_new_call(rhs)
+            && let Ty::Class(c) = lt
+        {
+            self.check_ctor_call(c, rhs);
+        }
+        if let Some(c) = typed_new_class(rhs) {
+            self.check_ctor_call(c, rhs);
+        }
         if is_new_call(rhs) {
             // `new(args)` and `new[n](init)` share one AST shape; only the
             // bare `new` is certainly a class constructor.
@@ -1658,6 +1666,34 @@ impl<'a> Ck<'a> {
                 ),
             );
         }
+    }
+
+    /// §8.7, §13.5: the actuals of `new`, `new(...)` or `C::new(...)` bound to
+    /// the formals of class `c`'s own constructor. Constructors are not
+    /// inherited: a class that declares none has the implicit `new()` with no
+    /// formals, unless it extends a class, where `extends B(default)` (§8.17)
+    /// would give it the base's.
+    fn check_ctor_call(&mut self, c: &str, rhs: &Expression) {
+        let Some(ci) = self.chain(c).and_then(|ch| ch.first().cloned()) else {
+            return;
+        };
+        if ci.interface {
+            return;
+        }
+        let sig = match ci.methods.get("new") {
+            Some(s) => s.clone(),
+            None if ci.base.is_none() => Rc::new(Sig {
+                ret: Ty::Void,
+                ports: Vec::new(),
+                is_task: false,
+            }),
+            None => return,
+        };
+        let args: &[Expression] = match &rhs.kind {
+            ExprKind::Call { args, .. } => args,
+            _ => &[],
+        };
+        self.check_call(&format!("{c}::new"), &sig, args, rhs.span);
     }
 
     fn walk_expr(&mut self, e: &Expression) {
