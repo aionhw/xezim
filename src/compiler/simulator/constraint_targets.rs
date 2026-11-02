@@ -1152,6 +1152,7 @@ impl Simulator {
         let mut lo_b: u64 = 0;
         let mut hi_b: u64 = 64;
         let mut bounded = false;
+        let mut dist: Option<Vec<(u64, u64, u128)>> = None;
         // Every size expression is evaluated WHILE the foreach index of a row
         // constraint is still bound, so `m[i].size() == i + 2` resolves.
         let items = self.size_constraint_items(prop, row, constraints);
@@ -1159,6 +1160,7 @@ impl Simulator {
             match kind {
                 SizeCon::Eq(n) => exact = Some(n),
                 SizeCon::In(rs) => ranges.extend(rs),
+                SizeCon::Dist(items) => dist = Some(items),
                 SizeCon::Rel(op, v) => {
                     bounded = true;
                     match op {
@@ -1173,6 +1175,34 @@ impl Simulator {
         }
         if let Some(n) = exact {
             return Some(n.min(1 << 16));
+        }
+        // §18.5.4: a dist on the size draws it by weight on every randomize,
+        // within whatever bounds the other size constraints set. Without it
+        // the size was picked only when the array first failed its
+        // constraints, and a re-randomized object kept the length it had.
+        if let Some(items) = dist {
+            let total: u128 = items.iter().map(|&(_, _, m)| m).sum();
+            let admits = |n: u64| {
+                (ranges.is_empty() || ranges.iter().any(|&(l, h)| l <= n && n <= h))
+                    && (!bounded || (lo_b <= n && n <= hi_b))
+            };
+            for _ in 0..64 {
+                if total == 0 {
+                    break;
+                }
+                let mut draw = self.rng.gen_range(0..total);
+                let Some(&(l, h, _)) = items.iter().find(|&&(_, _, m)| {
+                    let hit = draw < m;
+                    draw = draw.saturating_sub(m);
+                    hit
+                }) else {
+                    break;
+                };
+                let n = if h > l { self.rng.gen_range(l..=h) } else { l };
+                if admits(n) {
+                    return Some(n.min(1 << 16));
+                }
+            }
         }
         if !ranges.is_empty() {
             let (l, h) = ranges[self.rng.gen_range(0..ranges.len())];
@@ -1301,10 +1331,42 @@ impl Simulator {
                 expr,
                 range,
                 is_dist,
+                dist_weights,
                 ..
-            } if !*is_dist && Self::is_size_call(expr, prop, row, recv) => {
+            } if Self::is_size_call(expr, prop, row, recv) => {
                 let rs = range.clone();
-                out.push(SizeCon::In(self.eval_range_list(&rs)));
+                if !*is_dist {
+                    out.push(SizeCon::In(self.eval_range_list(&rs)));
+                } else {
+                    use crate::ast::decl::DistWeight;
+                    let mut items = Vec::with_capacity(rs.len());
+                    for (i, r) in rs.iter().enumerate() {
+                        let Some(&(l, h)) = self.eval_range_list(std::slice::from_ref(r)).first()
+                        else {
+                            continue;
+                        };
+                        let (w, total) = match dist_weights.get(i).and_then(|w| w.as_ref()) {
+                            Some(DistWeight::Each(e)) => {
+                                (self.eval_expr(e).to_u64().unwrap_or(1), false)
+                            }
+                            Some(DistWeight::Total(e)) => {
+                                (self.eval_expr(e).to_u64().unwrap_or(1), true)
+                            }
+                            None => (1, false),
+                        };
+                        // `:/` spreads the weight over the item, `:=` gives
+                        // it to every value in it.
+                        let m = if total {
+                            w as u128
+                        } else {
+                            w as u128 * (h - l + 1) as u128
+                        };
+                        if m > 0 {
+                            items.push((l, h, m));
+                        }
+                    }
+                    out.push(SizeCon::Dist(items));
+                }
             }
             ConstraintItem::Expr(e) => match &e.kind {
                 // §18.5.6: `guard -> q.size() == N`. The parser's expression

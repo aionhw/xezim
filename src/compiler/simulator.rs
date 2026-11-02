@@ -13384,6 +13384,8 @@ enum SizeCon {
     In(Vec<(u64, u64)>),
     /// `a.size() < E`, `>= E`, … — E already evaluated.
     Rel(crate::ast::expr::BinaryOp, u64),
+    /// `a.size() dist {…}` — each item's bounds and its weight over them.
+    Dist(Vec<(u64, u64, u128)>),
 }
 
 // ===========================================================================
