@@ -353,3 +353,6 @@ mod own_definition_name_assign_target;
 
 #[path = "hierarchy/generate_nested_instance_port.rs"]
 mod generate_nested_instance_port;
+
+#[path = "hierarchy/prepared_body_shared_across_ancestors.rs"]
+mod prepared_body_shared_across_ancestors;
