@@ -3406,7 +3406,16 @@ impl Simulator {
             .and_then(|ds| ds.iter().find(|d| d.0 == sig))
             .is_some_and(|(_, deck, pos)| *pos < deck.len());
         if !live {
-            let deck = self.build_dist_deck(masses)?;
+            let mut deck = self.build_dist_deck(masses)?;
+            // The schedule opens on its heaviest item: start it at a random
+            // phase, so each deal has its item's probability, including an
+            // object's first. A testbench that randomizes a fresh object per
+            // call drew a 9:1 dist's light item never.
+            if deck.len() > 1 {
+                use rand::Rng;
+                let phase = self.cur_rng().gen_range(0..deck.len());
+                deck.rotate_left(phase);
+            }
             let decks = self.dist_decks.entry(key.clone()).or_default();
             decks.retain(|d| d.0 != sig);
             if decks.len() >= MAX_DECKS {
