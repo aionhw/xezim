@@ -1810,9 +1810,12 @@ impl Simulator {
                     let mut val = if plain_class && port.direction == PortDirection::Output {
                         Value::zero(32)
                     } else if arg_supplied(i) {
-                        let value = match actual_ctx {
-                            Some(w) => self.eval_expr_ctx(&args[i], w),
-                            None => self.eval_expr(&args[i]),
+                        let value = match self.formal_pattern_value(port, &args[i]) {
+                            Some(v) => v,
+                            None => match actual_ctx {
+                                Some(w) => self.eval_expr_ctx(&args[i], w),
+                                None => self.eval_expr(&args[i]),
+                            },
                         };
                         self.vif_argument_value(port, &args[i], value)
                     } else if let Some(def) = &port.default {
@@ -2370,6 +2373,13 @@ impl Simulator {
                     _ => 0,
                 };
                 self.fn_ret_ctx_stack.push(method_ret_ctx);
+                let frame = match &method.kind {
+                    ClassMethodKind::Function(f) if Self::ret_may_take_pattern(&f.return_type) => {
+                        ReturnPatternType::Method(method.clone())
+                    }
+                    _ => ReturnPatternType::NotPacked,
+                };
+                self.fn_ret_frames.push(frame);
                 // §13.4.1: a method returning a queue, dynamic or associative
                 // array has a return VARIABLE of that type, which the body may
                 // fill in place (`build[k] = v`); declare it as a collection
@@ -2535,6 +2545,7 @@ impl Simulator {
                 self.fn_ret_collection_stack.pop();
                 self.fn_ret_assoc_stack.pop();
                 self.fn_ret_ctx_stack.pop();
+                self.fn_ret_frames.pop();
                 // Declaration snapshots describe this activation's string
                 // flags. Restore them before reinstating the caller's flags
                 // (§6.21/§23.8), or an integral shadow can erase the caller's

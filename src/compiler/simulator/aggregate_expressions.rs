@@ -3757,10 +3757,13 @@ impl Simulator {
                 // 8-bit operands sums at 32 bits, and a streaming operand
                 // left-justifies in it (§11.4.14.2).
                 let ctx_w = self.cast_context_width(&dt);
-                let mut v = match args.get(1) {
-                    Some(a) if ctx_w > 0 && !inner_is_call => self.eval_expr_ctx(a, ctx_w),
-                    Some(a) => self.eval_expr(a),
-                    None => Value::zero(1),
+                // §10.8: a pattern operand takes the cast type.
+                let typed = args.get(1).and_then(|a| self.eval_in_packed_type(a, &dt));
+                let mut v = match (typed, args.get(1)) {
+                    (Some(v), _) => v,
+                    (None, Some(a)) if ctx_w > 0 && !inner_is_call => self.eval_expr_ctx(a, ctx_w),
+                    (None, Some(a)) => self.eval_expr(a),
+                    (None, None) => Value::zero(1),
                 };
                 // §6.24.1: cast of a CALL returning a dynamic array/queue
                 // packs the returned elements, element 0 most significant,
@@ -3871,10 +3874,21 @@ impl Simulator {
                         None => 0,
                     }
                 };
-                let mut inner_v = match args.get(1) {
-                    Some(a) if ctx_w > 0 && !inner_is_call => self.eval_expr_ctx(a, ctx_w),
-                    Some(a) => self.eval_expr(a),
-                    None => Value::zero(1),
+                // §10.8: a pattern operand takes the cast type.
+                let typed = match (args.get(1), target.as_deref()) {
+                    (Some(a), Some(nm)) if has_pattern(a) => {
+                        match self.module.typedef_types.get(nm).cloned() {
+                            Some(dt) => self.eval_in_packed_type(a, &dt),
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let mut inner_v = match (typed, args.get(1)) {
+                    (Some(v), _) => v,
+                    (None, Some(a)) if ctx_w > 0 && !inner_is_call => self.eval_expr_ctx(a, ctx_w),
+                    (None, Some(a)) => self.eval_expr(a),
+                    (None, None) => Value::zero(1),
                 };
                 // §6.24.1: a cast whose operand is a CALL returning a
                 // dynamic array/queue packs the returned elements —
@@ -4379,6 +4393,10 @@ impl Simulator {
                 Value::from_string(&self.rng.to_state_string())
             }
             "$typename" => {
+                // §20.6.1: a typed pattern has the type that prefixes it.
+                if let Some(ExprKind::TypedPattern { ty, .. }) = args.first().map(|a| &a.kind) {
+                    return Value::from_string(&self.typename_of_dt(ty));
+                }
                 if let Some(arg) = args.first() {
                     if let ExprKind::Ident(hier) = &arg.kind {
                         // IEEE 1800-2017 §20.6.1: $typename of a built-in

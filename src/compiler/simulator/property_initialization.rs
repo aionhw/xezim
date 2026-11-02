@@ -427,7 +427,15 @@ impl Simulator {
                 }
             }
             let real = cdef.properties.get(&pname).is_some_and(|sig| sig.is_real);
-            self.evaluate_property_init_at_construct(handle, &slot, init, real);
+            // §10.8: a pattern takes the property's declared type.
+            let decl_ty = if has_pattern(&init) {
+                self.class_property_decl_type(&cdef.name, &pname)
+                    .filter(|(_, unpacked)| unpacked.is_empty())
+                    .map(|(dt, _)| dt)
+            } else {
+                None
+            };
+            self.evaluate_property_init_at_construct(handle, &slot, init, real, decl_ty);
         }
     }
 
@@ -439,6 +447,7 @@ impl Simulator {
         pname: &str,
         init: &Expression,
         real: bool,
+        decl_ty: Option<DataType>,
     ) {
         // An initializer may construct another object. Bound malformed
         // self-recursive declarations without re-running any initializer.
@@ -447,10 +456,11 @@ impl Simulator {
         }
         let width = self.heap_prop_width(handle, pname);
         self.construct_init_depth += 1;
-        let value = if let Some(width) = width {
-            self.eval_expr_ctx(init, width)
-        } else {
-            self.eval_expr(init)
+        let typed = decl_ty.and_then(|dt| self.eval_in_packed_type(init, &dt));
+        let value = match (typed, width) {
+            (Some(v), _) => v,
+            (None, Some(width)) => self.eval_expr_ctx(init, width),
+            (None, None) => self.eval_expr(init),
         };
         self.construct_init_depth -= 1;
         let value = if real {

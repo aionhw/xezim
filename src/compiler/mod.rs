@@ -13,6 +13,7 @@ mod fb_scan;
 pub mod fst_sink;
 mod interrupt;
 pub mod jit;
+pub(crate) mod packed_assignment_pattern_plan;
 pub mod prof_sampler;
 pub(crate) mod scoped_arrays;
 pub mod simulator;

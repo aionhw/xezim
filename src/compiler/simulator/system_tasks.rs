@@ -2663,6 +2663,15 @@ impl Simulator {
                                 let arg = &args[ai];
                                 ai += 1;
                                 self.p_top_level = true;
+                                // §21.2.1.7: a packed typed pattern renders as a
+                                // value of its own type.
+                                if let ExprKind::TypedPattern { ty, .. } = &arg.kind
+                                    && is_packed(ty, self)
+                                {
+                                    let v = self.eval_expr(arg);
+                                    result.push_str(&self.render_p_value_typed(&v, ty));
+                                    continue;
+                                }
                                 // §8.9: a static fixed array spelled `Cls::S`
                                 // or `C#(T)::S`, or one element of it,
                                 // `Cls::S[i]`.

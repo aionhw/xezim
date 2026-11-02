@@ -654,7 +654,8 @@ fn expr_refs(e: &Expression, out: &mut Vec<Ref>) {
         | ExprKind::MemberAccess { expr: x, .. }
         | ExprKind::RandomizeWith { call: x, .. }
         | ExprKind::Tagged { inner: Some(x), .. }
-        | ExprKind::ShallowCopy { source: x } => each(x),
+        | ExprKind::ShallowCopy { source: x }
+        | ExprKind::TypedPattern { pattern: x, .. } => each(x),
         ExprKind::Inside { expr, ranges } => {
             each(expr);
             ranges.iter().for_each(each);

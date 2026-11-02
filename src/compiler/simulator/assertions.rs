@@ -2501,6 +2501,9 @@ impl Simulator {
                     self.sva_collect_action_sampled_expr(item.expr(), out, sels);
                 }
             }
+            ExprKind::TypedPattern { pattern, .. } => {
+                self.sva_collect_action_sampled_expr(pattern, out, sels)
+            }
             ExprKind::NamedArg {
                 expr: Some(expr), ..
             } => self.sva_collect_action_sampled_expr(expr, out, sels),

@@ -813,6 +813,9 @@ impl Simulator {
         port: &crate::ast::decl::FunctionPort,
         default: &Expression,
     ) -> Value {
+        if let Some(v) = self.formal_pattern_value(port, default) {
+            return v;
+        }
         let mut width = self.actual_context_width(port);
         if width.is_none() && Self::actual_ctx_shape(port) {
             if let DataType::IntegerVector { dimensions, .. } = &port.data_type {
@@ -1611,7 +1614,7 @@ impl Simulator {
         n: usize,
         widths: &[u32],
     ) -> Option<Vec<Value>> {
-        let ExprKind::AssignmentPattern(parts) = &arg.kind else {
+        let ExprKind::AssignmentPattern(parts) = &arg.peel_typed_pattern().kind else {
             return None;
         };
         if parts.len() != n {
@@ -1645,7 +1648,7 @@ impl Simulator {
         arg: &Expression,
         keys: &[(String, u32, bool)],
     ) -> Option<Vec<Value>> {
-        let ExprKind::AssignmentPattern(items) = &arg.kind else {
+        let ExprKind::AssignmentPattern(items) = &arg.peel_typed_pattern().kind else {
             return None;
         };
         if items.is_empty() {
@@ -2031,6 +2034,7 @@ impl Simulator {
         if !self.port_is_assoc_array(port) {
             return None;
         }
+        let arg = arg.peel_typed_pattern();
         // §13.5.3 / §10.9.1: an assignment-pattern actual (a formal's default,
         // `int m[string] = '{default: 0}`) has no storage to copy from: the
         // formal starts as a fresh array holding the pattern's keyed items,
@@ -2279,7 +2283,7 @@ impl Simulator {
         // copy from: register the formal and assign the pattern's items to
         // its elements, the leftmost item to the leftmost index. There is
         // nothing to copy back, so the returned caller is empty.
-        if let ExprKind::AssignmentPattern(items) = &arg.kind {
+        if let ExprKind::AssignmentPattern(items) = &arg.peel_typed_pattern().kind {
             if dims.len() != 1 {
                 return None;
             }

@@ -6666,6 +6666,8 @@ impl Simulator {
                 }
                 r
             }
+            // §10.9: a typed pattern has its type's value.
+            ExprKind::TypedPattern { ty, pattern } => self.eval_typed_pattern(ty, pattern),
             _ => Value::zero(32),
         }
     }

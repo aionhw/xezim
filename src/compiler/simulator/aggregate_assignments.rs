@@ -328,7 +328,7 @@ impl Simulator {
     /// `e` is itself an assignment pattern and `dt` an unpacked struct, recurse
     /// member-wise; otherwise evaluate and write the leaf.
     pub(super) fn assign_pattern_or_leaf(&mut self, target: &str, dt: &DataType, e: &Expression) {
-        if let ExprKind::AssignmentPattern(sub) = &e.kind {
+        if let ExprKind::AssignmentPattern(sub) = &e.peel_typed_pattern().kind {
             if !sub.is_empty() {
                 if let DataType::Struct(su) = self.resolve_dt(dt) {
                     if Self::spreads_member_wise(&su) {
@@ -336,25 +336,9 @@ impl Simulator {
                         return;
                     }
                 }
-                // §10.9.2: a pattern for a packed struct element is laid out
-                // by its members, and one for a multi-dimensional packed
-                // element by its dimensions; evaluated without the type it
-                // was concatenated at its items' own widths.
-                let w = super::elaborate::resolve_type_width(
-                    dt,
-                    Some(&self.module.parameters),
-                    Some(&self.module.typedefs),
-                );
-                let v = match self.packed_struct_layout_of(dt) {
-                    Some(shape) => self.packed_struct_pattern_value(sub, &shape, w),
-                    None => super::elaborate::packed_full_dims_of(
-                        &self.resolve_dt(dt),
-                        &self.module.parameters,
-                    )
-                    .filter(|d| d.len() > 1)
-                    .and_then(|d| self.packed_pattern_value(sub, &d, w)),
-                };
-                if let Some(v) = v.filter(|_| w > 0) {
+                // §10.9.2: a pattern for a packed element takes the
+                // element's type.
+                if let Some(v) = self.eval_in_packed_type(e, dt) {
                     self.write_leaf_by_name(target, v);
                     return;
                 }
@@ -396,7 +380,10 @@ impl Simulator {
             Some(&self.module.parameters),
             Some(&self.module.typedefs),
         );
-        let mut v = if elem_w > 0 {
+        // §10.8: a pattern item takes the packed element type.
+        let mut v = if let Some(v) = self.eval_in_packed_type(e, dt) {
+            v
+        } else if elem_w > 0 {
             self.eval_expr_ctx(e, elem_w)
         } else {
             self.eval_expr(e)
@@ -966,20 +953,25 @@ impl Simulator {
             };
             let target = format!("{}.{}", base, mname);
             if dims.is_empty() {
-                let packed = (!explicit)
-                    .then(|| {
-                        let dt = self.resolve_dt(&mdt);
-                        super::elaborate::packed_full_dims_of(&dt, &self.module.parameters)
-                    })
-                    .flatten();
-                let w = super::elaborate::resolve_type_width(
-                    &mdt,
-                    Some(&self.module.parameters),
-                    Some(&self.module.typedefs),
-                );
-                if let Some(v) = packed.and_then(|d| self.default_per_packed_element(e, &d, w)) {
-                    self.write_leaf_by_name(&target, v);
-                    continue;
+                // §10.9.2: `default:` fills each innermost element of a
+                // multi-dimensional packed member, which is no simple bit
+                // vector type (§6.11.1).
+                let multi_dim = || {
+                    let dt = self.resolve_dt(&mdt);
+                    super::elaborate::packed_full_dims_of(&dt, &self.module.parameters)
+                        .is_some_and(|d| d.len() > 1)
+                };
+                if !explicit && multi_dim() {
+                    let fill = Expression::new(
+                        ExprKind::AssignmentPattern(vec![AssignmentPatternItem::Default(
+                            e.clone(),
+                        )]),
+                        e.span,
+                    );
+                    if let Some(v) = self.eval_in_packed_type(&fill, &mdt) {
+                        self.write_leaf_by_name(&target, v);
+                        continue;
+                    }
                 }
                 self.assign_pattern_or_leaf(&target, &mdt, e);
                 continue;
@@ -1998,6 +1990,9 @@ impl Simulator {
     /// evaluated once, when the assignment captures its target, so the
     /// width lookup must not evaluate it (see `effect_free_target_width`).
     pub(super) fn eval_target_rhs(&mut self, lvalue: &Expression, rvalue: &Expression) -> Value {
+        if let Some(v) = self.eval_pattern_for_lvalue(lvalue, rvalue) {
+            return v;
+        }
         if !Self::rhs_takes_context(rvalue) {
             return self.eval_expr(rvalue);
         }
@@ -3431,124 +3426,6 @@ impl Simulator {
         out
     }
 
-    /// IEEE 1800-2017 §10.9.2 / §10.10: an assignment pattern assigned to an
-    /// aggregate whose leaves each live in their OWN signal — an unpacked
-    /// struct, an unpacked array of unpacked structs, or an associative array —
-    /// must be spread member-/element-/key-wise. Collapsing it into one packed
-    /// value (the scalar path) writes a container signal nobody ever reads, so
-    /// every member stays X and an associative array stays empty.
-    ///
-    /// Returns false when `base` really IS a single signal (a scalar, a packed
-    /// struct, an array of packed elements) — those keep the packed path.
-    /// Build the packed value for a positional pattern applied to a packed
-    /// multi-D target. `dims` are the DECLARED packed dims outermost-first;
-    /// each nesting level consumes one. Returns None when the shape cannot be
-    /// honored (item count mismatch and no default) so the caller can fall
-    /// back rather than store garbage.
-    pub(super) fn packed_pattern_value(
-        &mut self,
-        items: &[AssignmentPatternItem],
-        dims: &[(i64, i64)],
-        total_w: u32,
-    ) -> Option<Value> {
-        self.packed_pattern_value_of(items, dims, total_w, None)
-    }
-
-    /// [`Self::packed_pattern_value`] for an array whose elements are packed
-    /// structs laid out as `elem`: a pattern item for an element is spread
-    /// over its members (`'{default: '{default: 8'hAA}}`, §10.9.2).
-    pub(super) fn packed_pattern_value_of(
-        &mut self,
-        items: &[AssignmentPatternItem],
-        dims: &[(i64, i64)],
-        total_w: u32,
-        elem: Option<&PackedStructShape>,
-    ) -> Option<Value> {
-        let count: u64 = match dims.first() {
-            Some(&(l, r)) => (l - r).unsigned_abs() + 1,
-            None => items.len() as u64,
-        };
-        if count == 0 || total_w == 0 || total_w as u64 % count != 0 {
-            return None;
-        }
-        let elem_w = total_w / count as u32;
-        let inner = dims.get(1..).unwrap_or(&[]);
-        let elem = elem.filter(|_| inner.is_empty());
-        // Positional items, with `default:` filling any positions not given.
-        // An `index: value` item (§10.9.1) names its element by index; item 0
-        // of the positional list is the element at the left bound.
-        let mut default_v: Option<Value> = None;
-        let mut ordered: Vec<&Expression> = Vec::new();
-        let mut keyed: Vec<Option<&Expression>> = Vec::new();
-        for item in items {
-            match item {
-                AssignmentPatternItem::Ordered(e) => ordered.push(e),
-                AssignmentPatternItem::Keyed(k, e) => {
-                    let &(l, r) = dims.first()?;
-                    let i = self.eval_expr(k).to_i64()?;
-                    let pos = if l >= r { l - i } else { i - l };
-                    if !(0..count as i64).contains(&pos) {
-                        return None;
-                    }
-                    keyed.resize(count as usize, None);
-                    keyed[pos as usize] = Some(e);
-                }
-                AssignmentPatternItem::Default(e) => {
-                    default_v = Some(match (&e.kind, elem) {
-                        (ExprKind::AssignmentPattern(sub), Some(shape)) => {
-                            self.packed_struct_pattern_value(sub, shape, elem_w)?
-                        }
-                        // A struct element takes the default member by member.
-                        (_, Some(shape)) => self.packed_struct_pattern_value(
-                            std::slice::from_ref(item),
-                            shape,
-                            elem_w,
-                        )?,
-                        _ => {
-                            let dv = self.eval_expr(e);
-                            self.fit_pattern_item_value(dv, elem_w)
-                        }
-                    });
-                }
-                _ => return None,
-            }
-        }
-        if !keyed.is_empty() && !ordered.is_empty() {
-            return None;
-        }
-        let given = if keyed.is_empty() {
-            ordered.len() as u64
-        } else {
-            keyed.iter().filter(|e| e.is_some()).count() as u64
-        };
-        if default_v.is_none() && given != count {
-            return None;
-        }
-        let mut acc = Value::zero(0);
-        for k in (0..count as usize).rev() {
-            let item = match keyed.get(k) {
-                Some(e) => *e,
-                None => ordered.get(k).copied(),
-            };
-            let ev = match item {
-                Some(e) => {
-                    if let ExprKind::AssignmentPattern(sub) = &e.kind {
-                        match elem {
-                            Some(shape) => self.packed_struct_pattern_value(sub, shape, elem_w)?,
-                            None => self.packed_pattern_value(sub, inner, elem_w)?,
-                        }
-                    } else {
-                        let v = self.eval_expr(e);
-                        self.fit_pattern_item_value(v, elem_w)
-                    }
-                }
-                None => default_v.clone()?,
-            };
-            acc = ev.concat_with(&acc);
-        }
-        Some(acc)
-    }
-
     /// Convert one pattern item to the element type: reals round (§6.12.2),
     /// everything else fits by ordinary assignment resize.
     pub(super) fn fit_pattern_item_value(&self, v: Value, elem_w: u32) -> Value {
@@ -3556,157 +3433,6 @@ impl Simulator {
             Self::real_to_int(v.to_f64(), elem_w)
         } else {
             v.resize_for_assign(elem_w)
-        }
-    }
-
-    /// A struct pattern laid out over the packed struct `shape`, `width`
-    /// bits wide.
-    pub(super) fn packed_struct_pattern_value(
-        &mut self,
-        items: &[AssignmentPatternItem],
-        shape: &PackedStructShape,
-        width: u32,
-    ) -> Option<Value> {
-        let mut acc = Value::zero(width);
-        let (layout, dims) = shape;
-        self.apply_packed_struct_pattern(&mut acc, layout, "", 0, items, &PackedDims::Map(dims))
-            .then_some(acc)
-    }
-
-    /// The member layout of `dt` when it is a packed struct, with the packed
-    /// dimensions of its members by member path.
-    pub(super) fn packed_struct_layout_of(&self, dt: &DataType) -> Option<PackedStructShape> {
-        let DataType::Struct(su) = self.resolve_dt(dt) else {
-            return None;
-        };
-        if !su.packed {
-            return None;
-        }
-        let mut dims = HashMap::default();
-        self.struct_member_dims(&su, "", &mut dims);
-        Some((self.packed_agg_layout(&su).0, dims))
-    }
-
-    pub(super) fn struct_member_dims(
-        &self,
-        su: &crate::ast::types::StructUnionType,
-        prefix: &str,
-        out: &mut HashMap<String, Vec<(i64, i64)>>,
-    ) {
-        for m in &su.members {
-            let fd = super::elaborate::packed_full_dims_of(&m.data_type, &self.module.parameters);
-            for d in &m.declarators {
-                let key = if prefix.is_empty() {
-                    d.name.name.clone()
-                } else {
-                    format!("{prefix}.{}", d.name.name)
-                };
-                if let DataType::Struct(sub) = self.resolve_dt(&m.data_type)
-                    && sub.packed
-                {
-                    self.struct_member_dims(&sub, &key, out);
-                }
-                if let Some(fd) = &fd {
-                    out.insert(key, fd.clone());
-                }
-            }
-        }
-    }
-
-    /// For a packed array of packed structs `name`, the element's member
-    /// layout and the number of the array's own packed dimensions.
-    pub(super) fn packed_struct_array_elem(
-        &self,
-        name: &str,
-    ) -> Option<(PackedStructShape, usize)> {
-        let Some(DataType::TypeReference {
-            name: tn,
-            dimensions,
-            type_args,
-            span,
-        }) = self.module.var_decl_types.get(name)
-        else {
-            return None;
-        };
-        if dimensions.is_empty() || self.module.arrays.contains_key(name) {
-            return None;
-        }
-        let elem = DataType::TypeReference {
-            name: tn.clone(),
-            dimensions: Vec::new(),
-            type_args: type_args.clone(),
-            span: *span,
-        };
-        Some((self.packed_struct_layout_of(&elem)?, dimensions.len()))
-    }
-
-    /// Packed-pattern value for an assignment TARGET (bare packed vector, or
-    /// an element of an unpacked array of packed vectors). None when the
-    /// target has no registered packed element shape.
-    pub(super) fn packed_pattern_for_lhs(
-        &mut self,
-        lhs: &Expression,
-        items: &[AssignmentPatternItem],
-    ) -> Option<Value> {
-        let (name, is_elem) = match &lhs.kind {
-            ExprKind::Ident(h) => (self.resolve_hier_name(h), false),
-            ExprKind::Index { expr, .. } => {
-                if let ExprKind::Ident(h) = &expr.kind {
-                    (self.resolve_hier_name(h), true)
-                } else {
-                    return None;
-                }
-            }
-            _ => return None,
-        };
-        let packed_elem_w = self.module.packed_signal_elem_widths.get(&*name).copied();
-        let total_w = if is_elem {
-            self.module.arrays.get(&*name).map(|t| t.2)?
-        } else {
-            if self.module.arrays.contains_key(&*name) {
-                return None; // whole-array target: the unpacked path owns it
-            }
-            self.lookup_signal_width(&name)?
-        };
-        let dims: Vec<(i64, i64)> = match packed_elem_w {
-            Some(ew) => self
-                .module
-                .packed_full_dims
-                .get(&*name)
-                .cloned()
-                .unwrap_or_else(|| vec![((total_w as i64 / ew as i64) - 1, 0)]),
-            None => {
-                // §10.9.2: a plain packed VECTOR is a packed array of 1-bit
-                // elements, so `'{default:1'b1}` sets EVERY bit — `logic [15:0]
-                // v = '{default:1'b1};` is 16'hffff. With no entry in
-                // `packed_signal_elem_widths` this used to bail to the generic
-                // concat-the-items fallback, which produced a ONE-BIT 1 and
-                // zero-extended it to 16'h0001 (a reset that armed only bank 0).
-                // Aggregates with their own pattern path must not be diverted
-                // here.
-                if self.module.packed_struct_fields.contains_key(&*name)
-                    || self.module.associative_arrays.contains_key(&*name)
-                    || self.module.dynamic_arrays.contains(&*name)
-                    || self.module.arrays_2d.contains_key(&*name)
-                    || self.module.arrays_nd.contains_key(&*name)
-                    || self.module.string_signals.contains(&*name)
-                    || self.real_signals.contains(&*name)
-                    || total_w <= 1
-                {
-                    return None;
-                }
-                vec![(total_w as i64 - 1, 0)]
-            }
-        };
-        // A packed array of packed structs: its element type, without the
-        // array's own packed dimensions.
-        // The registered dimensions continue into the struct's own bits;
-        // the pattern spans only the array's.
-        match self.packed_struct_array_elem(&name) {
-            Some((shape, n)) if n <= dims.len() => {
-                self.packed_pattern_value_of(items, &dims[..n], total_w, Some(&shape))
-            }
-            _ => self.packed_pattern_value(items, &dims, total_w),
         }
     }
 
@@ -3738,6 +3464,15 @@ impl Simulator {
         out
     }
 
+    /// IEEE 1800-2017 §10.9.2 / §10.10: an assignment pattern assigned to an
+    /// aggregate whose leaves each live in their OWN signal — an unpacked
+    /// struct, an unpacked array of unpacked structs, or an associative array —
+    /// must be spread member-/element-/key-wise. Collapsing it into one packed
+    /// value (the scalar path) writes a container signal nobody ever reads, so
+    /// every member stays X and an associative array stays empty.
+    ///
+    /// Returns false when `base` really IS a single signal (a scalar, a packed
+    /// struct, an array of packed elements) — those keep the packed path.
     pub(super) fn assign_pattern_aggregate(
         &mut self,
         base: &str,
@@ -3809,6 +3544,13 @@ impl Simulator {
         let registered_fixed = self.module.arrays.contains_key(base)
             || self.module.arrays_2d.contains_key(base)
             || self.module.arrays_nd.contains_key(base);
+        // §10.9: a declared packed variable takes a pattern as one value.
+        if !registered_fixed
+            && self.module.var_decl_types.contains_key(base)
+            && is_packed(&dt, self)
+        {
+            return false;
+        }
         if !dt_is_unpacked_struct && !self.module.dynamic_arrays.contains(base) && !registered_fixed
         {
             // Only register SUB-PATHS (dotted, like `info.addr`) in
@@ -3831,33 +3573,12 @@ impl Simulator {
             }
         }
 
-        // §7.4.2/§10.9: a positional pattern onto a PACKED multi-D vector —
-        // `bit [3:0][3:0] x; x = '{1'b1, 2, 3.0, "TEST"};` — converts each
-        // item to the ELEMENT type and packs MSB-element-first, recursing one
-        // packed dimension per nesting level (a nested `'{...}` inside a 4-bit
-        // element splits it into four 1-bit sub-elements). Falling through to
-        // the generic eval concatenated the items at their OWN widths, so a
-        // 1-bit item shifted every later element. Real items convert (§6.12.2
-        // rounds), strings keep their low bits.
+        // §10.9.1: a packed multi-D vector takes a pattern as one packed
+        // value, evaluated against its declared type by the caller.
         if !self.module.arrays.contains_key(base)
             && self.module.packed_signal_elem_widths.contains_key(base)
         {
-            if let Some(total_w) = self.lookup_signal_width(base) {
-                let dims: Vec<(i64, i64)> = self
-                    .module
-                    .packed_full_dims
-                    .get(base)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        let ew = self.module.packed_signal_elem_widths[base] as i64;
-                        vec![((total_w as i64 / ew) - 1, 0)]
-                    });
-                if let Some(v) = self.packed_pattern_value(items, &dims, total_w) {
-                    self.set_signal_value_by_name(base, v);
-                    self.settle_after_proc_write();
-                    return true;
-                }
-            }
+            return false;
         }
 
         // Fixed unpacked array of any rank (§10.9.1): positional items,
