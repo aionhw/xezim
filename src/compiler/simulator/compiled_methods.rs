@@ -682,6 +682,60 @@ impl Simulator {
         out
     }
 
+    fn walk_type_param_locals(
+        st: &Statement,
+        cd: &xezim_core::elaborate::ElaboratedClass,
+        out: &mut HashMap<String, String>,
+    ) {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } => {
+                if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
+                    if cd.type_param_names.iter().any(|p| p == &name.name.name) {
+                        for d in declarators {
+                            out.entry(d.name.name.clone()).or_insert_with(|| name.name.name.clone());
+                        }
+                    }
+                }
+            }
+            SK::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::walk_type_param_locals(then_stmt, cd, out);
+                if let Some(e) = else_stmt {
+                    Self::walk_type_param_locals(e, cd, out);
+                }
+            }
+            SK::Case { items, .. } => {
+                for it in items {
+                    Self::walk_type_param_locals(&it.stmt, cd, out);
+                }
+            }
+            SK::For { body, .. }
+            | SK::Foreach { body, .. }
+            | SK::ForeachTail { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body, .. }
+            | SK::ForeverTail { body, .. }
+            | SK::TimingControl { stmt: body, .. }
+            | SK::Wait { stmt: body, .. } => Self::walk_type_param_locals(body, cd, out),
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                for s in stmts {
+                    Self::walk_type_param_locals(s, cd, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn class_typed_member_names(&self, cname: &str) -> HashSet<String> {
         let mut out = HashSet::default();
         let mut seen = HashSet::default();
@@ -1968,6 +2022,7 @@ impl Simulator {
                 // registers; the compiler needs their names (it cannot see
                 // the class table).
                 let class_locals = self.class_typed_local_names(body);
+                let cd_opt = self.module.classes.get(cname);
                 // class-perf P2 (typed handle roots): declared class per
                 // handle FORMAL and class-typed body LOCAL, so a dispatch
                 // chain rooted at one (`sched.m_parent.get_phase_type()` —
@@ -1979,6 +2034,12 @@ impl Simulator {
                     for port in ports {
                         if let Some(cls) = self.typeref_class_name(&port.data_type) {
                             m.insert(port.name.name.clone(), cls);
+                        } else if let Some(cd) = cd_opt {
+                            if let crate::ast::types::DataType::TypeReference { name, .. } = &port.data_type {
+                                if cd.type_param_names.iter().any(|p| p == &name.name.name) {
+                                    m.insert(port.name.name.clone(), name.name.name.clone());
+                                }
+                            }
                         }
                     }
                     // A name declared with two classes in different blocks
@@ -1998,6 +2059,11 @@ impl Simulator {
                     }
                     for n in conflict {
                         m.remove(&n);
+                    }
+                    if let Some(cd) = cd_opt {
+                        for st in body {
+                            Self::walk_type_param_locals(st, cd, &mut m);
+                        }
                     }
                     m
                 };
