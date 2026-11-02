@@ -48,6 +48,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   philipaxer. An index type wider than 64 bits names one element per
   value, so `w[5]` and `w[100'h5]` are the same element and a `next()`
   walk over such keys ends (§7.8.4).
+* Each operand of `&&`, `||`, `->` and `<->` is self-determined in
+  compiled continuous assignments, `always_comb` and `always_ff`: both were
+  sized to the wider one, counting a call as wide as its widest argument, so
+  `~f(x) || 1'b0` with a 1-bit `f(x)` of 1 read true (§11.6.1, #810,
+  reported by chuanseng-ng).
+* A value change made by `vpi_put_value` inside a VPI routine is reported
+  once that routine returns, in the same time slot, not by calling the
+  value-change routine from within it. cocotb 1.x aborted with "We are
+  calling up again" when a test drove a clock from Python and awaited its
+  edge (§38.36.1, #811, reported by chuanseng-ng).
 * `$cast` to an interface-class handle succeeds when the object's class, or
   a base class, implements that interface class or one extending it; it
   returned 0 because only the `extends` chain was searched (§8.26, §8.16,
