@@ -5724,6 +5724,7 @@ impl<'a> BytecodeCompiler<'a> {
                 self.method_handle_names.contains(name)
                     || (self.bare_member_names.contains(name)
                         && self.member_class_names.contains(name))
+                    || self.static_member_names.contains(name)
             }
             crate::ast::expr::ExprKind::MemberAccess {
                 expr: inner,
@@ -5778,6 +5779,10 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 if self.method_handle_names.contains(name) {
                     return Some(UNTYPED.to_string());
+                }
+                if self.static_member_names.contains(name) {
+                    let cls = self.method_class.as_deref()?;
+                    return self.handle_member_types?.get(cls)?.get(name).cloned();
                 }
                 if self.bare_member_names.contains(name) {
                     // Step 9e: a COLLECTION member carries its ELEMENT class
