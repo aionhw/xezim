@@ -76,6 +76,29 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   each read their own members: the block rename gave every reference the
   declaration's source position, and `p.b.size()` read `p.a`'s length
   (§6.21, §23.6, reported by Ganesh-TNL).
+* A `dist` on a dynamic array's or a queue's `size()` is drawn on every
+  `randomize()`; an object randomized again kept the length it had (§18.4,
+  §18.5.4, reported by Ganesh-TNL).
+* `and()`, `or()`, `xor()` and `product()` equalities in a constraint are
+  solved and checked, where `randomize()` returned 1 with them violated. A
+  reduction or locator `with (item.field)` over packed-struct elements
+  reads the field, which read 0 for every element, and the result has the
+  field's width, so `sum() with (item.code)` over 4-bit codes wraps. An
+  associative array is never resized by randomization, so an unmet
+  `aa.size()`, `num()` or `exists()` constraint fails the call instead of
+  passing with the array empty (§7.12.1, §7.12.3, §18.4, §18.5.8.2,
+  reported by Ganesh-TNL).
+* `dist` weights hold for an element of a fixed array and for a field of a
+  dynamic array's struct element (`p[i].mask dist …`), which were drawn at
+  the uniform baseline, and for an item whose branch adds constraints: a
+  failed trial no longer uses up its dealt item, the retries deal it again,
+  and the joint solver that follows keeps it where it can. That solver
+  repaired the failed trial toward the other item, so a 1-in-10 wrap mode
+  came out 1 in 30 to 1 in 50. A fresh object's first draw is no longer
+  always the heaviest item, which a testbench creating an object per call
+  saw as a 1-in-10 item never drawn. A field equality on an element
+  (`p[i].valid == 1`) is solved too, where it made the element be drawn
+  again whole (§18.5.4, §18.5.7, reported by Ganesh-TNL).
 * Each operand of `&&`, `||`, `->` and `<->` is self-determined in
   compiled continuous assignments, `always_comb` and `always_ff`: both were
   sized to the wider one, counting a call as wide as its widest argument, so
