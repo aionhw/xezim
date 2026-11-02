@@ -2429,7 +2429,17 @@ impl Simulator {
                 lg = 0.0;
                 for (u, old) in &st.trail[mark..] {
                     let u = *u;
-                    if u == v || after[u] || drawn[u] || seen[u] {
+                    // A variable decided through its segments (`Aux::composite`)
+                    // holds no values of its own — its domain is the shadow the
+                    // slice link (`v == Σ seg << lo`) keeps of them — so it
+                    // counts nothing here: its narrowing is the segments'
+                    // narrowing again. Worse, it leaks back the freedom of a
+                    // variable `v` is solved before (§18.5.10): `solve pkt.psel
+                    // before pkt.paddr` excludes the `paddr` segment from the
+                    // estimate, but the whole-`pkt` variable still narrows with
+                    // it, and weighing `pkt.psel` by that narrowing draws the
+                    // `psel` with the most `paddr` values every time.
+                    if u == v || after[u] || drawn[u] || seen[u] || aux.composite[u] {
                         continue;
                     }
                     seen[u] = true;

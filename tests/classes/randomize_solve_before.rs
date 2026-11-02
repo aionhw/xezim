@@ -194,3 +194,45 @@ endmodule
     assert_eq!(get(&c, "bad_r"), 0, "{c:?}");
     assert_eq!(get(&c, "fail"), 0, "{c:?}");
 }
+
+/// §18.5.10 on the fields of a packed struct: `solve pkt.psel before
+/// pkt.paddr` draws `psel` uniformly over its three values even though the
+/// `paddr` ranges leave them very different solution counts (512, 512 and
+/// 2^32 − 1024 values). The whole-`pkt` variable the slice link keeps beside
+/// the field segments narrowed with `paddr` as well, and the weigh counted
+/// it: the ordering excluded the `paddr` segment from the estimate, but not
+/// the shadow of it, so `psel` came up 2 on every draw.
+#[test]
+fn ordered_struct_field_is_not_weighed_by_its_brother() {
+    let c = counts(
+        r#"
+typedef struct packed { bit [1:0] psel; bit [31:0] paddr; } router_packet_t;
+class R; rand router_packet_t pkt;
+  constraint c { pkt.psel inside {0, 1, 2};
+                 (pkt.psel == 0) -> (pkt.paddr inside {[32'hE000_0200 : 32'hE000_03FF]});
+                 (pkt.psel == 1) -> (pkt.paddr inside {[32'hE000_0400 : 32'hE000_05FF]});
+                 (pkt.psel == 2) -> !(pkt.paddr inside {[32'hE000_0200 : 32'hE000_05FF]});
+                 solve pkt.psel before pkt.paddr; } endclass
+module top;
+  initial begin
+    automatic R r = new;
+    automatic int fails, bad, rp[3];
+    for (int i = 0; i < 3000; i++) begin
+      if (!r.randomize()) fails++;
+      rp[r.pkt.psel]++;
+      if (r.pkt.psel == 0 && !(r.pkt.paddr inside {[32'hE000_0200 : 32'hE000_03FF]})) bad++;
+      if (r.pkt.psel == 1 && !(r.pkt.paddr inside {[32'hE000_0400 : 32'hE000_05FF]})) bad++;
+      if (r.pkt.psel == 2 && (r.pkt.paddr inside {[32'hE000_0200 : 32'hE000_05FF]})) bad++;
+    end
+    $display("fails=%0d bad=%0d rp0=%0d rp1=%0d rp2=%0d", fails, bad, rp[0], rp[1], rp[2]);
+  end
+endmodule
+"#,
+    );
+    assert_eq!(get(&c, "fails"), 0, "{c:?}");
+    assert_eq!(get(&c, "bad"), 0, "{c:?}");
+    // the ordered field uniform over 0..3 (1000, sd ~26)
+    for k in ["rp0", "rp1", "rp2"] {
+        within(&c, k, 880, 1120);
+    }
+}
