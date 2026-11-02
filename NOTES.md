@@ -61,6 +61,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   the implicit `new()`, which takes no arguments. Such calls ran with the
   missing formals left at their defaults and the extra actuals dropped
   (§8.7, §13.5, #812, reported by dhanunay).
+* Concurrent processes whose automatic locals share a name but not a type
+  keep each local's own type. The declaration that ran last registered its
+  enum typedef, struct members, packed layout and class under the bare
+  name, so a class task suspended across another's declaration read
+  `c.num()` from the other enum, printed the other struct's members with
+  `%p` and selected `w.f[3]` with the other packed layout (§6.21, §13.3.1,
+  reported by Ganesh-TNL).
+* An `event` declared in a labeled block of two processes is two events,
+  stored under the blocks' names: a wait on one resumed in the same time
+  step instead of at its trigger, so `@(e)` woke at time 0, even with
+  nothing triggering it (§6.21, §15.5, reported by Ganesh-TNL).
 * Each operand of `&&`, `||`, `->` and `<->` is self-determined in
   compiled continuous assignments, `always_comb` and `always_ff`: both were
   sized to the wider one, counting a call as wide as its widest argument, so
