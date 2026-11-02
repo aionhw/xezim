@@ -11,6 +11,8 @@ fn messages(src: &str) -> Vec<String> {
 
 #[test]
 fn package_class_and_unit_task_delays_use_the_timescale() {
+    // The program waits past the module's `$finish`: the end of a program's
+    // last initial procedure ends the run (§24.3).
     let msgs = messages(
         "`timescale 1ns/1ps
 package p; class PB; task dly(); #200; endtask endclass
@@ -18,7 +20,7 @@ package p; class PB; task dly(); #200; endtask endclass
 task unit_dly(); #50; endtask
 class UC; task dly(); #25; endtask endclass
 package pu; timeunit 1us; class PU; task dly(); #3; endtask endclass endpackage
-program prg; initial begin #7; $display(\"program=%0t\", $time); end endprogram
+program prg; initial begin #7; $display(\"program=%0t\", $time); #10000; end endprogram
 module tb; import p::*; import pu::*; PU pu_o = new(); prg p_i();
   class MB; task dly(); #200; endtask endclass
   PB pb = new(); MB mb = new(); UC uc = new();

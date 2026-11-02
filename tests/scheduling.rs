@@ -441,3 +441,6 @@ mod review_parked_wait_writes;
 
 #[path = "scheduling/labeled_block_local_events.rs"]
 mod labeled_block_local_events;
+
+#[path = "scheduling/program_implicit_finish.rs"]
+mod program_implicit_finish;
