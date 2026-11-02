@@ -19905,6 +19905,72 @@ impl<'a> BytecodeCompiler<'a> {
             .copied()
     }
 
+    /// §6.24.1 / §11.6.1: a cast is self-determined at its target width.
+    /// That width is what a parent `+` or `>` must see —
+    /// `((9)'(cnt) + step) > 8'hff` adds at 9 bits, so 255+1 saturates
+    /// instead of wrapping. The system-call fallback reported 0, the sum
+    /// stayed 8 bits, and the compare saw 0. A named target (`W'(x)`,
+    /// `(W)'(x)`) contributes the parameter value or the typedef width.
+    fn cast_self_width(&self, name: &str, args: &[Expression]) -> Option<u32> {
+        let literal = args.first().and_then(|a| self.literal_cast_size(a));
+        match name {
+            "$__xz_size_cast" => literal,
+            "$__xz_named_cast" => literal.or_else(|| {
+                let key = self.named_cast_key(args.first()?)?;
+                self.cast_widths
+                    .and_then(|m| m.get(&key).map(|&(w, _)| w.max(1)))
+                    .or_else(|| {
+                        self.params
+                            .and_then(|p| p.get(&key))
+                            .and_then(|v| v.to_u64())
+                            .map(|n| (n as u32).max(1))
+                    })
+            }),
+            _ => None,
+        }
+    }
+
+    /// Value of a cast-size literal (`9` in `9'(x)`), not the literal's
+    /// own bit width.
+    fn literal_cast_size(&self, e: &Expression) -> Option<u32> {
+        let ExprKind::Number(n) = &e.kind else {
+            return None;
+        };
+        self.eval_number_static(n)
+            .and_then(|v| v.to_u64())
+            .map(|bits| (bits as u32).max(1))
+    }
+
+    /// Name a `$__xz_named_cast` target resolves to. Same key the cast
+    /// compiler uses, so the width reported here is the width it resizes to.
+    fn named_cast_key(&self, target: &Expression) -> Option<String> {
+        match &target.kind {
+            ExprKind::Paren(inner) => self.named_cast_key(inner),
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let n = h.path.len();
+                let key = format!("{}::{}", h.path[n - 2].name.name, h.path[n - 1].name.name);
+                let known = self.cast_widths.is_some_and(|m| m.contains_key(&key))
+                    || self.params.is_some_and(|p| p.contains_key(&key));
+                Some(if known {
+                    key
+                } else {
+                    h.path[n - 1].name.name.clone()
+                })
+            }
+            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
+            ExprKind::MemberAccess { expr, member } => {
+                let ExprKind::Ident(h) = &expr.kind else {
+                    return None;
+                };
+                let key = format!("{}::{}", h.path.last()?.name.name, member.name);
+                let known = self.cast_widths.is_some_and(|m| m.contains_key(&key))
+                    || self.params.is_some_and(|p| p.contains_key(&key));
+                Some(if known { key } else { member.name.clone() })
+            }
+            _ => None,
+        }
+    }
+
     fn expr_max_width(&self, expr: &Expression) -> u32 {
         match &expr.kind {
             ExprKind::Ident(hier) => self
@@ -20006,9 +20072,10 @@ impl<'a> BytecodeCompiler<'a> {
             // catch-all returned: `out_step <= $countones(be) >> 3` with a
             // 4-bit target then compiled the shift at the target's width and
             // truncated a count of 24 to 8 before shifting.
-            ExprKind::SystemCall { name, args } => {
-                self.system_function_width(name, args).unwrap_or(0)
-            }
+            ExprKind::SystemCall { name, args } => self
+                .cast_self_width(name, args)
+                .or_else(|| self.system_function_width(name, args))
+                .unwrap_or(0),
             ExprKind::Conditional {
                 then_expr,
                 else_expr,
