@@ -162,6 +162,15 @@ fn arrays() {
     check("arrays");
 }
 
+/// A range choice may give an array the length of the choice (§9.3.3.3):
+/// a slice (including a one-element slice), a bit string, a hex string,
+/// and the same form for `bit_vector` and an integer array. A scalar
+/// choice still repeats the element.
+#[test]
+fn agg_slice() {
+    check("agg_slice");
+}
+
 /// Records: aggregates, element selection, a record signal (§5.3.3).
 #[test]
 fn records() {
