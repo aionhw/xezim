@@ -2857,6 +2857,15 @@ impl Simulator {
             }
             return true;
         }
+        // §18.4: randomize() never adds or removes an associative array's
+        // entries, so its `size()`, `num()` and `exists()` read the current
+        // contents: check them like any other expression. Excused below, an
+        // unmet `aa.size() == 3` passed with the array still empty.
+        if let ConstraintItem::Expr(e) = item
+            && Self::assoc_queries_only(e, rand_colls)
+        {
+            return self.check_constraint_item(handle, item);
+        }
         // Skip constraints the solver structurally cannot satisfy
         // (dynamic-array size/sum/element relations, foreach, solve
         // ordering) so they don't block an otherwise-valid config.
@@ -2867,6 +2876,38 @@ impl Simulator {
             return false;
         }
         true
+    }
+
+    /// True when every query `expr_unmodeled` would excuse in `expr` is a
+    /// `size()`, `num()` or `exists()` of a rand associative array, and there
+    /// is at least one.
+    pub(super) fn assoc_queries_only(expr: &Expression, colls: &[RandColl]) -> bool {
+        fn walk(e: &Expression, colls: &[RandColl], found: &mut bool) -> bool {
+            match &e.kind {
+                ExprKind::Call { func, args } => {
+                    if let ExprKind::MemberAccess { expr, member } = &func.kind
+                        && matches!(member.name.as_str(), "size" | "num" | "exists")
+                    {
+                        let assoc = Simulator::plain_ident_name(expr).is_some_and(|n| {
+                            colls
+                                .iter()
+                                .any(|c| c.kind == CollKind::Assoc && c.prop == n)
+                        });
+                        *found |= assoc;
+                        return assoc && !args.iter().any(Simulator::expr_unmodeled);
+                    }
+                    !Simulator::expr_unmodeled(e)
+                }
+                ExprKind::Binary { left, right, .. } => {
+                    walk(left, colls, found) && walk(right, colls, found)
+                }
+                ExprKind::Unary { operand, .. } => walk(operand, colls, found),
+                ExprKind::Paren(inner) => walk(inner, colls, found),
+                _ => !Simulator::expr_unmodeled(e),
+            }
+        }
+        let mut found = false;
+        walk(expr, colls, &mut found) && found
     }
 
     /// If `expr` is a bare reference to a randomizable scalar property, return
