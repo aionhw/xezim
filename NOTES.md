@@ -72,6 +72,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   stored under the blocks' names: a wait on one resumed in the same time
   step instead of at its trigger, so `@(e)` woke at time 0, even with
   nothing triggering it (§6.21, §15.5, reported by Ganesh-TNL).
+* Two class handles declared under one name in nested blocks of a process
+  each read their own members: the block rename gave every reference the
+  declaration's source position, and `p.b.size()` read `p.a`'s length
+  (§6.21, §23.6, reported by Ganesh-TNL).
 * Each operand of `&&`, `||`, `->` and `<->` is self-determined in
   compiled continuous assignments, `always_comb` and `always_ff`: both were
   sized to the wider one, counting a call as wide as its widest argument, so
