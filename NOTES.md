@@ -99,6 +99,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   saw as a 1-in-10 item never drawn. A field equality on an element
   (`p[i].valid == 1`) is solved too, where it made the element be drawn
   again whole (§18.5.4, §18.5.7, reported by Ganesh-TNL).
+* A run with programs ends when every thread that started in a program's
+  initial procedures has ended, by an implicit `$finish`, and a program's
+  remaining threads end with its initial procedures. The run went on to its
+  time limit, so `final` procedures reported that time and a module's later
+  output still printed (§24.3, §24.7).
 * Each operand of `&&`, `||`, `->` and `<->` is self-determined in
   compiled continuous assignments, `always_comb` and `always_ff`: both were
   sized to the wider one, counting a call as wide as its widest argument, so
