@@ -1050,3 +1050,6 @@ mod review_compiled_method_shapes;
 
 #[path = "classes/review_event_and_frame_routing.rs"]
 mod review_event_and_frame_routing;
+
+#[path = "classes/cast_to_interface_class_806.rs"]
+mod cast_to_interface_class_806;
