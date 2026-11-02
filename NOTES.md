@@ -48,6 +48,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   philipaxer. An index type wider than 64 bits names one element per
   value, so `w[5]` and `w[100'h5]` are the same element and a `next()`
   walk over such keys ends (§7.8.4).
+* A fixed-size array declared in an `initial`, `always` or `final` block,
+  a nested block, a fork child or a static task keeps the element writes a
+  `for (int i ...)` loop makes: a loop the process compiled stored each
+  element through the signal table, where a block-local array has no cells,
+  and every write was dropped, so the array read 0 or x after the loop
+  (§6.21, §12.7.1, reported by Ganesh-TNL).
 * A constructor call is checked against the class's own `new` like any
   other call: too many actuals, or a formal left without an actual and
   without a default, is an error, for `new`, `new(...)` and `C::new(...)`,
