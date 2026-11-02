@@ -125,3 +125,35 @@ endmodule
     );
     assert_eq!(u(&sim, "pl"), 0x5A, "scalar member unaffected");
 }
+
+/// §10.4.2: a nonblocking write of one member of an unpacked-struct array
+/// element inside an instance. The instance-prefixed flat name
+/// (`u.storage[0].value`) used to be given the element's struct type, so the
+/// NBA expanded as a whole-struct copy whose leaf was `....value.value` and
+/// the expansion recursed without advancing time.
+#[test]
+fn nba_struct_array_member_in_instance() {
+    let src = r#"
+module leaf(input logic clk, input logic rst);
+  typedef struct { logic [31:0] value; } f_t;
+  f_t storage[2];
+  always_ff @(posedge clk) begin
+    if (rst) storage[0].value <= 32'h0;
+    else storage[0].value <= 32'h2a;
+  end
+endmodule
+module tb;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  logic rst = 1;
+  leaf u(.clk(clk), .rst(rst));
+  initial begin
+    #12 rst = 0;
+    #10 $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "u.storage[0].value"), 0x2a);
+    assert!(sim.get_signal("u.storage[1].value").is_some());
+}

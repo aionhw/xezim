@@ -3104,6 +3104,23 @@ impl Simulator {
                         }
                     }
                 }
+                // A leaf of an unpacked struct (`storage[0].value`,
+                // `field.r1[0].f.value`) is its own signal. Inside an
+                // instance the table key carries the instance prefix
+                // (`u.storage[0].value`); the bare flat name misses, and
+                // the queued-lvalue path commits later with the scope hint
+                // already popped, so the write never landed. Resolve it
+                // now, while this block's hint is still installed.
+                if let Some(flat) = self.flat_member_name(lhs) {
+                    if let Some(&id) = self.signal_name_to_id.get(flat.as_str()) {
+                        return Some(id);
+                    }
+                    if let Some(scoped) = self.hint_scoped(&flat) {
+                        if let Some(&id) = self.signal_name_to_id.get(scoped.as_str()) {
+                            return Some(id);
+                        }
+                    }
+                }
                 None
             }
             _ => None,
