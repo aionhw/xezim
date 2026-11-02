@@ -207,6 +207,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Performance**
 
+* Instances whose parameters differ only in the instances above them share
+  one prepared body. The body cache was keyed on every parameter in the
+  scope, the ancestors' included, so a deep hierarchy formatted a long key
+  and kept a body copy and that key for nearly every instance until
+  elaboration ended (§23.10, #721, reported by amal-khailtash).
+  `XEZIM_COMPILE_PHASES` reports the cache as `[elab-stats]` lines.
 * More class methods compile (#792, PR #804, contributed by AaronKel): a
   statement the compiler cannot lower runs in the interpreter while the rest
   of the body stays compiled (`XEZIM_METHOD_STMT_FALLBACK=0` turns this
