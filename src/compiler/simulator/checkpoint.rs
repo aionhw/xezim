@@ -1203,6 +1203,7 @@ checkpoint_state!(
     dirty_list,
     dirty_signals,
     disable_labels,
+    dist_dealt,
     dist_decks,
     dist_picked_once,
     dpi_bind_tried,

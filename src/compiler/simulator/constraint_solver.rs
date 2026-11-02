@@ -1247,7 +1247,20 @@ impl Simulator {
             .chain(rand_nd_arrays.iter().map(|a| a.0.clone()))
             .chain(rand_colls.iter().map(|c| c.prop.clone()))
             .collect();
-        for _trial in 0..trials {
+        // §18.5.4: the weights apply over the solutions. A trial that failed
+        // after dealing a dist item used that item up, and the retry dealt
+        // the next, so an item whose branch fails more often (a wrap mode
+        // with extra constraints) was accepted below its weight. The first
+        // retries deal the same items again.
+        const REDEAL_TRIALS: usize = 32;
+        let mut dist_pin_tried = false;
+        let deal_marks: Vec<((usize, String), Vec<(u64, usize)>)> = self
+            .dist_decks
+            .iter()
+            .filter(|(k, _)| k.0 == handle)
+            .map(|(k, ds)| (k.clone(), ds.iter().map(|d| (d.0, d.2)).collect()))
+            .collect();
+        for trial in 0..trials {
             // Ctrl-C / SIGTERM: stop searching and let the run shut down.
             if interrupt_requested() {
                 self.take_interrupt();
@@ -1256,12 +1269,24 @@ impl Simulator {
             if !self.take_randomize_budget(handle, &class_name, &constraints) {
                 break;
             }
+            if trial > 0 && trial < REDEAL_TRIALS {
+                for (k, ds) in self.dist_decks.iter_mut().filter(|(k, _)| k.0 == handle) {
+                    let marks = deal_marks.iter().find(|(m, _)| m == k).map(|(_, v)| v);
+                    for d in ds.iter_mut() {
+                        // A deck first dealt from in a failed trial starts over.
+                        d.2 = marks
+                            .and_then(|v| v.iter().find(|m| m.0 == d.0))
+                            .map_or(0, |m| m.1.min(d.1.len()));
+                    }
+                }
+            }
             self.rand_tight_mode = fixed_fe_fail_streak >= 4;
             // LRM §18.5.4 dist: clear the pick-once gate at each trial so a
             // failed trial doesn't permanently freeze the dist constraint.
             // Within a single trial the gate still ensures the fixpoint
             // loop draws only one weighted sample per (handle, prop).
             self.dist_picked_once.clear();
+            self.dist_dealt.clear();
             let mut solved_props: HashMap<String, Value> = HashMap::default();
             let mut backup = HashMap::default();
 
@@ -2055,7 +2080,7 @@ impl Simulator {
                         &citems,
                         &cvar_names,
                         &cvar_dom,
-                        _trial,
+                        trial,
                         Some(handle),
                     );
                     self.constraint_cmp_unsigned = false;
@@ -2614,9 +2639,36 @@ impl Simulator {
                         && !(sub_objs.is_empty() && Self::csp_size_solved(c, &constraints))
                 });
                 csp_runs += 1;
+                // §18.5.4: the first joint solve keeps each dist target in
+                // the item its trial dealt. Repairing the trial's values, it
+                // replaced an item whose branch conflicted with them, so a
+                // wrap mode weighted 1 in 10 came out 1 in 50. Without a
+                // solution so, the next run solves without the items.
+                let dealt = std::mem::take(&mut self.dist_dealt);
+                let pinned = !dist_pin_tried && !dealt.is_empty();
+                dist_pin_tried |= pinned;
+                let pinned_set;
+                let csp_cons: &[ClassConstraint] = if pinned {
+                    let mut cons = constraints.clone();
+                    cons.push(ClassConstraint {
+                        is_static: false,
+                        is_extern: false,
+                        has_body: true,
+                        name: crate::ast::Identifier {
+                            name: "__dealt__".to_string(),
+                            span: crate::ast::Span::new(0, 0),
+                        },
+                        items: dealt,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                    pinned_set = cons;
+                    &pinned_set
+                } else {
+                    &constraints
+                };
                 match self.rand_csp_solve(
                     handle,
-                    &constraints,
+                    csp_cons,
                     &constraint_depth,
                     &csp_rand_props,
                     &csp_signed,
@@ -2653,7 +2705,7 @@ impl Simulator {
                         }
                         return Value::from_u64(1, 32);
                     }
-                    rand_csp::CspOutcome::Unsat if !sized => {
+                    rand_csp::CspOutcome::Unsat if !sized && !pinned => {
                         if let Some(Some(inst)) = self.heap.get_mut(handle) {
                             for (name, val) in backup {
                                 inst.properties.insert(name, val);
@@ -2662,8 +2714,8 @@ impl Simulator {
                         csp_unsat = true;
                         break;
                     }
-                    rand_csp::CspOutcome::NotApplicable => csp_ok = false,
-                    rand_csp::CspOutcome::GaveUp if !sized => csp_ok = false,
+                    rand_csp::CspOutcome::NotApplicable if !pinned => csp_ok = false,
+                    rand_csp::CspOutcome::GaveUp if !sized && !pinned => csp_ok = false,
                     _ => {}
                 }
                 // §18.5.14/§18.6.1: with soft items present a trial is left
@@ -2689,7 +2741,7 @@ impl Simulator {
             // On the final trial, when diagnostics are requested, report which
             // constraint items remain unsatisfiable so the solver gaps for a
             // given class are visible without a full re-run.
-            if _trial == 999 && std::env::var("XEZIM_RAND_DBG").is_ok() {
+            if trial == 999 && std::env::var("XEZIM_RAND_DBG").is_ok() {
                 eprintln!(
                     "[rand-dbg] {} randomize FAILED after 1000 trials; {} rand props, {} constraint blocks",
                     class_name,

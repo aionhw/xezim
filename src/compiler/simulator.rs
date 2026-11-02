@@ -7521,6 +7521,10 @@ pub struct Simulator {
     /// weighted values (9:1 weights produced ~98:2 instead of 90:10).
     /// Cleared by `exec_randomize` at entry.
     dist_picked_once: HashSet<(usize, String)>,
+    /// The dist items the current trial dealt, as `target inside {item}`:
+    /// the joint solve after a failed trial first keeps each target in its
+    /// item (§18.5.4).
+    dist_dealt: Vec<ConstraintItem>,
     /// IEEE 1800-2017 §18.3/§18.5.12 — the `inside`-range domain of each rand
     /// property of the object currently being solved (exact, signed). The
     /// fixpoint consults it so an affine solve or a `!=` re-pick lands the

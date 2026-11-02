@@ -2516,6 +2516,7 @@ impl Simulator {
                             });
                         if let Some(p) = picked {
                             self.dist_picked_once.insert(key);
+                            self.note_dist_dealt(expr, range, &p);
                             return self.set_prop_if_changed(handle, &v, p);
                         }
                         return false;
@@ -2552,6 +2553,7 @@ impl Simulator {
                             });
                         if let Some(p) = picked {
                             self.dist_picked_once.insert(key);
+                            self.note_dist_dealt(expr, range, &p);
                             return self.set_rand_member(&t, p);
                         }
                         return false;
@@ -2969,6 +2971,28 @@ impl Simulator {
                 _ => Self::index_chain_root_is(b, arr),
             },
             _ => false,
+        }
+    }
+
+    /// Record that this trial dealt `target`'s value `picked` from the
+    /// dist item containing it (`dist_dealt`).
+    pub(super) fn note_dist_dealt(
+        &mut self,
+        target: &Expression,
+        range: &[ConstraintRange],
+        picked: &Value,
+    ) {
+        if let Some(item) = range
+            .iter()
+            .find(|r| self.value_in_ranges(picked, std::slice::from_ref(*r)))
+        {
+            self.dist_dealt.push(ConstraintItem::Inside {
+                expr: target.clone(),
+                range: vec![item.clone()],
+                is_dist: false,
+                dist_weights: Vec::new(),
+                span: target.span,
+            });
         }
     }
 

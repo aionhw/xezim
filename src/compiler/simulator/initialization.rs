@@ -3927,6 +3927,7 @@ impl Simulator {
             item_alias: None,
             locator_iter: "item".to_string(),
             dist_picked_once: HashSet::default(),
+            dist_dealt: Vec::new(),
             rand_ranges: HashMap::default(),
             rand_elem_ranges: HashMap::default(),
             class_statics: StaticMap::default(),
