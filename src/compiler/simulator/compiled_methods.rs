@@ -1675,10 +1675,21 @@ impl Simulator {
                 && !is_string_result
                 && !is_void_result
                 && self.fn_returns_collection(&_f.return_type);
+            let cd_opt = self.module.classes.get(cname);
+            let is_type_param_result = !is_class_result
+                && cd_opt.is_some_and(|cd| {
+                    match &_f.return_type {
+                        crate::ast::types::DataType::TypeReference { name, .. } => {
+                            cd.type_param_names.iter().any(|p| p == &name.name.name)
+                        }
+                        _ => false,
+                    }
+                });
             let (static_result_width, result_signed) = if is_string_result {
                 (0u32, false)
-            } else if is_class_result {
-                // class handle: width meaningless; pass through untouched.
+            } else if is_class_result || is_type_param_result {
+                // class handle or type parameter (e.g. CB in uvm_callbacks):
+                // width meaningless; pass through untouched.
                 (0u32, false)
             } else if is_void_result {
                 // Step 9e: void / ctor — passthrough result cell.
@@ -1753,8 +1764,19 @@ impl Simulator {
                     // a compile-able integer vector/atom. (String formals are
                     // handled above — allowed, not skipped.)
                     use crate::ast::types::DataType as DT;
-                    let Some(pw) = self.scalar_formal_integral(&port.data_type).map(|(w, _)| w)
-                    else {
+                    let is_type_param_formal = cd_opt.is_some_and(|cd| {
+                        match &port.data_type {
+                            DT::TypeReference { name, .. } => {
+                                cd.type_param_names.iter().any(|p| p == &name.name.name)
+                            }
+                            _ => false,
+                        }
+                    });
+                    let Some(pw) = (if is_type_param_formal {
+                        Some(0)
+                    } else {
+                        self.scalar_formal_integral(&port.data_type).map(|(w, _)| w)
+                    }) else {
                         // class-perf collection-return: a TYPE-PARAM formal
                         // (`KEY_T key` — an unresolvable TypeReference: type
                         // params are never hoisted into `typedef_types`) of a
