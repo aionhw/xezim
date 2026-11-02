@@ -191,6 +191,7 @@ fn pkg_qualified_static_factory_create() {
     let src = r#"
 package factory_pkg;
   class product;
+    function new(string name = ""); endfunction
   endclass
   class maker;
     static function product create();
