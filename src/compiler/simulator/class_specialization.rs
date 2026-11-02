@@ -3163,12 +3163,15 @@ impl Simulator {
     /// compiled plan. The common (non-parameterized) path always returns 0 and is
     /// untouched.
     pub(super) fn instance_spec_id(&mut self, handle: usize) -> u32 {
-        let Some(spec) = self
-            .heap
-            .get(handle)
-            .and_then(|o| o.as_ref())
-            .and_then(|inst| inst.spec.clone())
-        else {
+        let spec = if handle != 0 {
+            self.heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|inst| inst.spec.clone())
+        } else {
+            self.current_spec.clone()
+        };
+        let Some(spec) = spec else {
             return 0;
         };
         if let Some(&id) = self.compiled_spec_intern.get(&spec) {
