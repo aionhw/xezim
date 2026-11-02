@@ -635,3 +635,6 @@ mod packed_member_array_patterns_771;
 
 #[path = "types/type_param_array_queries.rs"]
 mod type_param_array_queries;
+
+#[path = "types/logical_operand_self_determined_810.rs"]
+mod logical_operand_self_determined_810;
