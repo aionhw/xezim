@@ -48,8 +48,11 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   nested `foreach` bounds, parameter-dependent packed selects in child
   instances, casts in constant expressions and constant functions (typedef
   width and signing, `$bits` of a cast), array parameters built from
-  replication and keyed patterns, port widths of fill-literal actuals, and
-  member resolution by static type while another process is suspended.
+  replication and keyed patterns, port widths of fill-literal actuals,
+  member resolution by static type while another process is suspended,
+  header defaults that read an instance's type parameter (`parameter int H =
+  $bits(T)`), and the array queries of a type parameter answered from the
+  type it is bound to (§6.20.3, §20.7).
 - **Jayaraman RP** — cross-platform installation scripts, including the macOS
   installer with UVM setup, and `%` and unknown conversion specifiers printed
   literally by `$display` and `$sformatf`.
@@ -105,9 +108,18 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   activation and released on every disable path (§9.3.2, §9.6.2); a broad set
   of constrained-random fixes for `inside`, `foreach`, enum domains and
   context widths (§18); extern-method linking through package class aliases
-  and linear macro line joining in the core (§8.24, §22.5.1); and the
+  and linear macro line joining in the core (§8.24, §22.5.1); the
   execution-cache releases and associative-array key caching that keep long
-  runs fast.
+  runs fast; class methods that compile more often and call each other
+  directly, with compiled results that match the interpreter's for member
+  operand widths and signs, unpacked formals and short-circuit operators
+  (§11.4.7, §11.6.1); parked `wait` conditions re-checked only when an
+  operand may have changed, and the class heap collected incrementally from
+  the previous survivors (§8.29); assigned class-member events that share one
+  event object (§15.5.5), `$bits` of dynamic operands (§20.6.2), `return` and
+  associative-element stores evaluated in their target's width (§11.6.1),
+  stores through a handle that a same-named enum local had hidden, and string
+  bytes read straight from the value words in the core.
 - **[Hern](https://github.com/hernloh)** — labelled assertion and cover sites
   named in the coverage results file.
 - **[opensource-elearning](https://github.com/opensource-elearning)** — reads
@@ -123,7 +135,13 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
 - **[Philip Axer](https://github.com/philipaxer)** — nested collections typed
   by their declared shape at every level: the shape recorded in the core for
   every scope, rows created as their parent's kind allows, and `%p` and
-  `foreach` over queue and dynamic outer levels (§7.4.5, §7.8, §7.10).
+  `foreach` over queue and dynamic outer levels (§7.4.5, §7.8, §7.10); string
+  keys that hold brackets, locator methods that search associative arrays by
+  key, queue methods and reductions on a locator's result, rows of nested
+  collections as locator receivers, string keys ordered as strings, and enum
+  labels in `%p` of a locator result (§7.8, §7.12, §21.2.1.6); and time
+  literals and `$time` in packages and `$unit` scopes scaled by their own
+  time unit (§3.14.2.3).
 
 ## Bug reports
 
@@ -135,7 +153,9 @@ work. Thank you in particular to
 [auty1395](https://github.com/auty1395),
 [bharathnaruto-spec](https://github.com/bharathnaruto-spec),
 [chenbhil](https://github.com/chenbhil),
+[chuanseng-ng](https://github.com/chuanseng-ng),
 [davekeeshan](https://github.com/davekeeshan),
+[dhanunay](https://github.com/dhanunay),
 [Dragon-Git](https://github.com/Dragon-Git),
 [ds54e](https://github.com/ds54e),
 [Ganesh-TNL](https://github.com/Ganesh-TNL),
