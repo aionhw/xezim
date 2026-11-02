@@ -441,11 +441,16 @@ impl Simulator {
         if !self.deferred_clocking_guarded.is_empty() {
             self.resolve_deferred_clocking_guards();
         }
+        if self.deferred_clocking_conts.is_empty() {
+            return;
+        }
+        let table_mod_before = self.table_modified;
+        self.table_modified = false;
+        let store_writes_before = STORE_WRITE_MASK.with(|m| m.get());
         let mut guard = 0u32;
         let mut ran_any = false;
         while !self.deferred_clocking_conts.is_empty() {
             let conts = std::mem::take(&mut self.deferred_clocking_conts);
-            self.late_resume_epoch += conts.len() as u64;
             for (pid, stmts) in conts {
                 if self.finished {
                     break;
@@ -469,13 +474,19 @@ impl Simulator {
                 break;
             }
         }
+        let wrote_signals =
+            self.table_modified || self.dirty_any || !self.changed_edge_pos.is_empty();
+        self.table_modified |= table_mod_before;
         // These continuations run after the tick's edge pass. A named event
         // or signal they write (`##2; -> ev;`) had no pass left to wake its
         // `@(ev)` / `@(sig)` waiters, which then resumed one tick late
         // (a clocking-synchronised trigger was seen a clock toggle after
         // it fired). Give their writes the same edge pass the clocking
         // mirror gets above.
-        if ran_any && !self.finished {
+        if ran_any
+            && !self.finished
+            && (wrote_signals || !self.dirty_edge || self.dirty_edge_shadow)
+        {
             self.settle_combinatorial();
             let saved = self.edge_dispatch_phase;
             self.edge_dispatch_phase = "clocking-conts";
@@ -483,6 +494,23 @@ impl Simulator {
             self.edge_dispatch_phase = saved;
             let limit = self.cascade_limit;
             let _ = self.drain_edge_cascade(limit);
+        }
+        if ran_any
+            && (wrote_signals
+                || STORE_WRITE_MASK.with(|m| m.get()) != store_writes_before
+                || !self.nba_fast.is_empty()
+                || !self.nba_queue.is_empty()
+                || !self.pending_nba_triggers.is_empty()
+                || !self.packed_nba.is_empty()
+                || !self.pending_nba_instance_triggers.is_empty()
+                || !self.ready_condition_waiters.is_empty()
+                || !self.nba_region_waiters.is_empty()
+                || !self.pending_reactive.is_empty()
+                || !self.reactive_conts.is_empty()
+                || self.event_queue.next_time() == Some(self.time)
+                || !self.inactive_queue.is_empty())
+        {
+            self.late_resume_epoch += 1;
         }
     }
 

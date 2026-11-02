@@ -356,6 +356,8 @@ impl Simulator {
     /// (`o.leaf`, `o.arr[1]`, #612): unless its head is a data object other
     /// than an interface instance, which makes it a member select.
     fn nested_iface_operand(&self, e: &Expression) -> Option<Option<String>> {
+        let rebased = self.vif_rebase_expr(e);
+        let e = rebased.as_ref().unwrap_or(e);
         let mut cur = e;
         let head = loop {
             match &cur.kind {
@@ -1669,6 +1671,9 @@ impl Simulator {
         }
         if let Some(b) = self.static_vif_binding(rvalue) {
             return Some(b);
+        }
+        if let Some(rebased) = self.vif_rebase_expr(rvalue) {
+            return self.resolve_vif_rhs_name(&rebased);
         }
         // §25.9/§25.10: an ELEMENT of a vif array or collection held by an
         // object, a class scope or a frame (`o.vq[0]`, `S::pa[1]`, `vq[i]`)

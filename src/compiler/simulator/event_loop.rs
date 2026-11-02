@@ -1399,7 +1399,11 @@ impl Simulator {
         }
         // §14.4: #1step samples precede every callback/active-region write
         // at this time, and remain fixed across this slot's later deltas.
+        let _t_cb = profile_timing.then(std::time::Instant::now);
         self.refresh_clocking_preponed();
+        if let Some(t) = _t_cb {
+            accum.t_clocking += t.elapsed().as_nanos() as u64;
+        }
         // LRM §16.5.1: the same holds for the Preponed samples of every
         // SVA-referenced signal: taken before the slot's Pre-Active VPI
         // callbacks (cbAtStartOfSimTime, cbAfterDelay; §4.4.3.2) and its
@@ -1676,6 +1680,7 @@ impl Simulator {
         } else {
             self.check_edges();
         }
+        self.toggled_clock_positions.clear();
         if let Some(t) = _t {
             accum.t_edges += t.elapsed().as_nanos() as u64;
         }
@@ -1709,6 +1714,7 @@ impl Simulator {
         // LRM §14.3 clocking-block input snapshot — refresh per-cycle
         // sample state so subsequent `cb.<sig>` reads see the pre-edge
         // value (`#1step` input skew).
+        let _t_cb = profile_timing.then(std::time::Instant::now);
         self.tick_clocking_blocks();
         // §14.13: deliver `@(cb.sig)` events for samples just published. The
         // publish happens after this slot's edge pass, so run one more.
@@ -1725,9 +1731,13 @@ impl Simulator {
         // region — so they observe post-edge state and this cycle's samples.
         let tick_late_epoch_start = self.late_resume_epoch;
         self.drain_deferred_clocking_conts();
+        if let Some(t) = _t_cb {
+            accum.t_clocking += t.elapsed().as_nanos() as u64;
+        }
         if self.finished {
             return;
         }
+        let _t_late = profile_timing.then(std::time::Instant::now);
         self.drain_reactive_region();
         if self.finished {
             return;
@@ -1743,9 +1753,16 @@ impl Simulator {
         self.check_monitor();
         self.drain_pending_strobes();
         self.dump_write_changes();
+        if let Some(t) = _t_late {
+            accum.t_late += t.elapsed().as_nanos() as u64;
+        }
 
         // Condition-waiter fixpoint (level-sensitive `wait(expr)` resume).
+        let _t_cond = profile_timing.then(std::time::Instant::now);
         self.drain_condition_waiters(false, false);
+        if let Some(t) = _t_cond {
+            accum.t_cond += t.elapsed().as_nanos() as u64;
+        }
 
         // LRM §4.4/§4.7: every late-region resume above (clocking conts,
         // reactive initials, Re-NBA waiters, condition waiters re-queued at
@@ -1771,23 +1788,43 @@ impl Simulator {
             loop {
                 let epoch_before = self.late_resume_epoch;
                 if self.dirty_any {
+                    let _t_ls = profile_timing.then(std::time::Instant::now);
                     self.settle_combinatorial();
+                    if let Some(t) = _t_ls {
+                        accum.t_settle += t.elapsed().as_nanos() as u64;
+                    }
                 }
+                let _t_le = profile_timing.then(std::time::Instant::now);
                 self.check_edges();
                 let _ = self.drain_edge_cascade(cascade_limit);
+                if let Some(t) = _t_le {
+                    accum.t_edges += t.elapsed().as_nanos() as u64;
+                }
+                let _t_lc = profile_timing.then(std::time::Instant::now);
                 self.drain_deferred_clocking_conts();
+                if let Some(t) = _t_lc {
+                    accum.t_clocking += t.elapsed().as_nanos() as u64;
+                }
                 if self.finished {
                     return;
                 }
+                let _t_lr = profile_timing.then(std::time::Instant::now);
                 self.drain_reactive_region();
                 if self.finished {
                     return;
                 }
                 self.drain_nba_region_waiters();
+                if let Some(t) = _t_lr {
+                    accum.t_late += t.elapsed().as_nanos() as u64;
+                }
                 if self.finished {
                     return;
                 }
+                let _t_lcond = profile_timing.then(std::time::Instant::now);
                 self.drain_condition_waiters(false, true);
+                if let Some(t) = _t_lcond {
+                    accum.t_cond += t.elapsed().as_nanos() as u64;
+                }
                 late_passes += 1;
                 if self.finished || late_passes > 10_000 || self.late_resume_epoch == epoch_before {
                     break;
@@ -2512,15 +2549,21 @@ impl Simulator {
         let t_process = accum.t_process;
         let t_snap = accum.t_snap;
         let t_sched = accum.t_sched;
+        let t_clocking = accum.t_clocking;
+        let t_cond = accum.t_cond;
+        let t_late = accum.t_late;
         let sim_elapsed = sim_start_rt.elapsed();
         chatter!(
-            "[PROF] settle={:.1}ms edges={:.1}ms nba={:.1}ms process={:.1}ms snap={:.1}ms sched={:.1}ms",
+            "[PROF] settle={:.1}ms edges={:.1}ms nba={:.1}ms process={:.1}ms snap={:.1}ms sched={:.1}ms clocking={:.1}ms cond={:.1}ms late={:.1}ms",
             t_settle as f64 / 1e6,
             t_edges as f64 / 1e6,
             t_nba as f64 / 1e6,
             t_process as f64 / 1e6,
             t_snap as f64 / 1e6,
-            t_sched as f64 / 1e6
+            t_sched as f64 / 1e6,
+            t_clocking as f64 / 1e6,
+            t_cond as f64 / 1e6,
+            t_late as f64 / 1e6
         );
         if std::env::var("XEZIM_CACHE_FIT").is_ok() {
             let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);

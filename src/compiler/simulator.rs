@@ -3158,6 +3158,9 @@ struct PerTickAccum {
     t_process: u64,
     t_snap: u64,
     t_sched: u64,
+    t_clocking: u64,
+    t_cond: u64,
+    t_late: u64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
