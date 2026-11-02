@@ -16896,6 +16896,19 @@ impl<'a> BytecodeCompiler<'a> {
                     };
                     if let Some(handle_reg) = base_reg {
                         if !self.method_instance_field_ok(base, &member.name) {
+                            if let Some(class) = self.method_handle_chain_class(base) {
+                                if self.static_member_names.contains(member.name.as_str()) {
+                                    let dest = self.alloc_reg();
+                                    self.emit(Insn::LoadClassStatic(
+                                        dest,
+                                        Box::new(NamePair(
+                                            class.into_boxed_str(),
+                                            member.name.clone().into_boxed_str(),
+                                        )),
+                                    ));
+                                    return Some(dest);
+                                }
+                            }
                             self.bail("method_receiver_field");
                             return None;
                         }
