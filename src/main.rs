@@ -3249,7 +3249,10 @@ fn run_main() -> i32 {
                 xezim_core::vhdl::VhdlFile { path, library }
             })
             .collect(),
-        vhdl_options,
+        {
+            vhdl_options.expose_ports = !vpi_libs.is_empty();
+            vhdl_options
+        },
     );
     // A VHDL simulation runs until no events are left (IEEE 1076-2008
     // §14.7.5), as GHDL does: no default run-length limit.
