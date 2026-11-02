@@ -48,6 +48,20 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   philipaxer. An index type wider than 64 bits names one element per
   value, so `w[5]` and `w[100'h5]` are the same element and a `next()`
   walk over such keys ends (§7.8.4).
+* `$cast` to an interface-class handle succeeds when the object's class, or
+  a base class, implements that interface class or one extending it; it
+  returned 0 because only the `extends` chain was searched (§8.26, §8.16,
+  #806, reported by dhanunay).
+* A time literal and `$time` in a package or `$unit` task, function or
+  class use that scope's time unit, as its delays do; they used the calling
+  module's, so `time t = 1ns; #(t);` in a 1 ns package waited 1 µs from a
+  1 ps module (§3.14.2.3, §5.8, #807, PR core #139 and #808). Reported and
+  fixed by philipaxer.
+* The array queries of a type parameter (`$left(T)`, `$right`, `$high`,
+  `$low`, `$size`, `$increment`, `$dimensions`, `$unpacked_dimensions`)
+  answer from the type it is bound to, in constants and at run time; they
+  read the type's width alone as `[w-1:0]` in a constant and 0 in a
+  statement (§20.7, PR core #138, contributed by chenbhil).
 * An array pattern fills a packed array element by element where the array
   is a member of a packed struct and where its elements are packed structs:
   a nested `'{default: 4'hA}` member pattern, a direct `cfg.dom = '{...}`
