@@ -2378,7 +2378,10 @@ impl Simulator {
             }
         }
         let eligible = match &stmt.kind {
-            StatementKind::For { .. } => !self.stmt_has_event_wait(stmt),
+            StatementKind::For { .. }
+            | StatementKind::While { .. }
+            | StatementKind::DoWhile { .. }
+            | StatementKind::Repeat { .. } => !self.stmt_has_event_wait(stmt),
             _ => false,
         };
         if !eligible || stmt.span.start == 0 && stmt.span.end == 0 {
