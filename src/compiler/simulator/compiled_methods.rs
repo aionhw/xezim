@@ -439,6 +439,7 @@ impl Simulator {
         let mut out: HashMap<String, HashMap<String, String>> = HashMap::default();
         for (cn, _) in self.module.classes.iter() {
             let mut members: HashMap<String, String> = HashMap::default();
+            let mut declared: HashSet<String> = HashSet::default();
             let mut seen = HashSet::default();
             let mut cur = cn.clone();
             while let Some(c) = self.module.classes.get(&cur) {
@@ -446,8 +447,17 @@ impl Simulator {
                     break;
                 }
                 for (p, dt) in c.property_types.iter() {
-                    // or_insert: the most-derived declarer wins; ancestors
-                    // only contribute names the chain hasn't declared.
+                    // The most-derived declaration wins, even one left out
+                    // below; ancestors only contribute undeclared names.
+                    if !declared.insert(p.clone()) {
+                        continue;
+                    }
+                    // §7.4.4: an element of a multidimensional member
+                    // (`c m[int][$]`, `c a[2][3]`) is a subarray, not a
+                    // handle.
+                    if c.prop_coll_shapes.contains_key(p) || c.array_nd_properties.contains_key(p) {
+                        continue;
+                    }
                     // Step 9e: collection members (queue/dyn-array/assoc)
                     // whose ELEMENT type is a class also land here so the
                     // compiler can tell a HANDLE element read from an
@@ -463,8 +473,8 @@ impl Simulator {
                     }
                 }
                 // class-perf P2: METHOD return classes join the same
-                // per-class map (a property of the same name wins via
-                // or_insert): a dispatch chain may continue through a
+                // per-class map (a property of the same name wins, see
+                // `declared`): a dispatch chain may continue through a
                 // method RESULT — `uvm_get_report_object().
                 // uvm_get_report_object().get_report_...` (the report
                 // macros' default RO). Tasks and non-class returns stay
@@ -473,7 +483,7 @@ impl Simulator {
                 for (m, cm) in c.methods.iter() {
                     if let crate::ast::decl::ClassMethodKind::Function(f) = &cm.kind {
                         if let Some(t) = self.typeref_class_name(&f.return_type) {
-                            if !t.contains('#') {
+                            if !t.contains('#') && !declared.contains(m) {
                                 members.entry(m.clone()).or_insert(t);
                             }
                         }
