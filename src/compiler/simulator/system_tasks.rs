@@ -3598,6 +3598,7 @@ impl Simulator {
         // module-top and program-top behavior identical. Allocate a fresh pid
         // so process-scoped bookkeeping (disable labels, scope hints) has
         // somewhere to attach.
+        let mut ended = Vec::new();
         for (stmts, scope) in blocks {
             if self.finished {
                 break;
@@ -3610,11 +3611,23 @@ impl Simulator {
             }
             // `%m` and bare names resolve in the program instance.
             self.current_scope.clone_from(&scope);
+            self.program_pids.insert(pid);
+            self.program_pid_scope.insert(pid, scope.clone());
+            self.program_initial_pids.insert(pid);
+            *self.program_initials_live.entry(scope.clone()).or_default() += 1;
             if !scope.is_empty() {
                 self.process_scope_hint.insert(pid, scope);
             }
-            self.program_pids.insert(pid);
             self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
+            if !self.is_pid_suspended(pid) {
+                ended.push(pid);
+            }
+        }
+        // An initial procedure that ended without waiting ends after every
+        // program has started, so the implicit `$finish` (§24.3) cannot come
+        // before a later program's first statement.
+        for pid in ended {
+            self.child_finished(pid);
         }
     }
 

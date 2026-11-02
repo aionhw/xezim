@@ -7251,6 +7251,14 @@ pub struct Simulator {
     /// blocks and every fork child they spawn). They resume in the Reactive
     /// region, after the slot's NBA updates and clocking events.
     program_pids: HashSet<usize>,
+    /// §24.3: the program instance (its scope) of each live program process,
+    /// the program initial procedures still running, and how many of each
+    /// program's are. When a program's initial procedures have all ended,
+    /// its remaining processes end too; when no program process is left, the
+    /// run ends by an implicit `$finish`.
+    program_pid_scope: HashMap<usize, String>,
+    program_initial_pids: HashSet<usize>,
+    program_initials_live: HashMap<String, usize>,
     /// §24.3: program-process continuations woken in the Active region (an
     /// edge, a delay, a join), held for this slot's Reactive region.
     reactive_conts: Vec<(usize, ProcCont)>,

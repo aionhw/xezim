@@ -467,6 +467,56 @@ impl Simulator {
         self.forever_sens_cache.retain(|&(p, _), _| p != pid);
     }
 
+    /// §24.3: program process `pid` has ended. When it was the last of its
+    /// program's initial procedures, the program's other processes (their
+    /// descendants) end with it; when no thread that originated in a program
+    /// initial procedure is left, the run ends by an implicit `$finish`. The
+    /// run used to go on to the time limit.
+    pub(super) fn program_process_ended(&mut self, pid: usize) {
+        let Some(scope) = self.program_pid_scope.remove(&pid) else {
+            return;
+        };
+        // A process ended by `disable fork` or `kill()` never passes here.
+        let killed: Vec<usize> = (self.program_pid_scope.keys())
+            .copied()
+            .filter(|p| self.killed_pids.contains(p))
+            .collect();
+        for p in killed {
+            if let Some(s) = self.program_pid_scope.remove(&p)
+                && self.program_initial_pids.remove(&p)
+                && let Some(n) = self.program_initials_live.get_mut(&s)
+            {
+                *n = n.saturating_sub(1);
+            }
+        }
+        if self.program_initial_pids.remove(&pid) {
+            let left = self.program_initials_live.get_mut(&scope).map_or(0, |n| {
+                *n = n.saturating_sub(1);
+                *n
+            });
+            if left == 0 {
+                let rest: Vec<usize> = self
+                    .program_pid_scope
+                    .iter()
+                    .filter(|(_, s)| **s == scope)
+                    .map(|(&p, _)| p)
+                    .collect();
+                for p in rest {
+                    self.program_pid_scope.remove(&p);
+                    self.program_pids.remove(&p);
+                    self.proc_kill(p);
+                }
+            }
+        }
+        if self.program_pid_scope.is_empty()
+            && !self.program_initials_live.is_empty()
+            && self.program_initials_live.values().all(|&n| n == 0)
+        {
+            self.flush_file_writes();
+            self.finished = true;
+        }
+    }
+
     pub(super) fn child_finished(&mut self, child_pid: usize) {
         self.finished_pids.insert(child_pid);
         self.release_process_execution_caches(child_pid);
@@ -475,8 +525,8 @@ impl Simulator {
         if !self.process_m_scope.is_empty() {
             self.process_m_scope.remove(&child_pid);
         }
-        if !self.program_pids.is_empty() {
-            self.program_pids.remove(&child_pid);
+        if !self.program_pids.is_empty() && self.program_pids.remove(&child_pid) {
+            self.program_process_ended(child_pid);
         }
         if !self.process_m_label.is_empty() && self.process_parents.contains_key(&child_pid) {
             self.process_m_label.remove(&child_pid);

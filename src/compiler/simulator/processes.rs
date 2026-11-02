@@ -180,6 +180,9 @@ impl Simulator {
         // §24.3: a fork child of a program process is a program process.
         if !self.program_pids.is_empty() && self.program_pids.contains(&parent) {
             self.program_pids.insert(child);
+            if let Some(scope) = self.program_pid_scope.get(&parent).cloned() {
+                self.program_pid_scope.insert(child, scope);
+            }
         }
         if let Some(l) = self.process_m_label.get(&parent) {
             let l = l.clone();
