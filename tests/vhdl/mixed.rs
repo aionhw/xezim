@@ -79,3 +79,12 @@ fn mixed_clocked() {
 fn mixed_record() {
     check("mixed_record");
 }
+
+/// A record signal whose field is an array, instantiated from
+/// SystemVerilog. The default value used to drop that array, so the first
+/// read failed its bound check. The golden is the value written on the
+/// clock edge (Questa connects a record differently; do not regenerate).
+#[test]
+fn mixed_record_field() {
+    check("mixed_record_field");
+}
