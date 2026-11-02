@@ -4344,8 +4344,12 @@ impl Simulator {
                             // §15.5: an event with no signal — a subroutine's
                             // local `event e;` — waits for `fire_named_event`
                             // by name. The signal fallback below resumed it
-                            // after the slot's NBA region, i.e. at once.
-                            if !canon.contains('.') && canon != Self::EVENT_NULL_KEY {
+                            // after the slot's NBA region, i.e. at once. So
+                            // does a labeled block's local stored under its
+                            // hierarchical name (`a.e`, §6.21).
+                            if (!canon.contains('.') || self.module.events.contains(canon.as_str()))
+                                && canon != Self::EVENT_NULL_KEY
+                            {
                                 let cont = pc.pushed_body(body, pc.start + i + 1);
                                 self.instance_event_waiters.push(InstanceEventWaiter {
                                     key: InstanceEventKeys::One(self.unbacked_event_key(&canon)),
