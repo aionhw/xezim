@@ -1397,11 +1397,15 @@ pub(super) fn vpi_notify_pli_error() {
 }
 
 /// `write_sig!` wrote a watched signal: report the change now, so the
-/// routine runs in the same region as the write.
+/// routine runs in the same region as the write. A write from inside a
+/// callback (`vpi_put_value` from a routine) is not reported from within
+/// it: the settle after the routine returns compares the watched values
+/// and reports the change in the same time slot. Calling a routine while
+/// another one runs aborts cocotb 1.x ("calling up again").
 #[cold]
 #[inline(never)]
 pub(super) fn vpi_vc_written(sp: *mut Simulator, sig: usize) {
-    if sp.is_null() {
+    if sp.is_null() || CB_DEPTH.with(|d| d.get()) > 0 {
         return;
     }
     let sim = unsafe { &mut *sp };
