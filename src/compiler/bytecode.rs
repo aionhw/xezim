@@ -14424,6 +14424,15 @@ impl<'a> BytecodeCompiler<'a> {
                         || self.expr_has_string_type_static(right));
                 let sub_ctx = if string_cmp {
                     0
+                } else if matches!(
+                    op,
+                    BinaryOp::LogAnd | BinaryOp::LogOr | BinaryOp::LogImplies | BinaryOp::LogEquiv
+                ) {
+                    // §11.6.1 Table 11-21: each operand of `&&`, `||`, `->`
+                    // and `<->` is self-determined on its own. Sizing both to
+                    // the wider one (an 8-bit call argument counted as the
+                    // call's width) made `~f(x)` of a 1-bit `f` 8'hfe, true.
+                    0
                 } else if is_self_determined {
                     let lw = self.expr_max_width(left);
                     let rw = self.expr_max_width(right);
