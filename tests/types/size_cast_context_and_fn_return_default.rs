@@ -45,6 +45,55 @@ endmodule
     assert_eq!(u(&sim, "c4"), 1, "narrowing cast unchanged");
 }
 
+/// A cast's own width sizes the expression it sits in (§6.24.1, §11.6.1).
+/// `9'(cnt) + step > 8'hff` with cnt = 255 and step = 1 is a 9-bit sum
+/// (256), so the compare is true. Reporting the cast as 0 bits wide wrapped
+/// the sum to 0. The parenthesized spelling `(9)'(x)` is the parser's
+/// half of the same bug.
+#[test]
+fn size_cast_widens_the_parent_sum() {
+    let src = r#"
+module tb;
+  logic [7:0] cnt;
+  logic [7:0] step;
+  logic [7:0] result;
+  logic sat, sat_param;
+  logic [15:0] wide;
+  localparam int W = 9;
+  always_comb begin
+    automatic logic [7:0] next_c;
+    next_c = cnt;
+    if ((9'(next_c) + step) > 8'hff)
+      result = 8'hff;
+    else
+      result = next_c + step;
+    sat = (9'(next_c) + step) > 8'hff;
+    sat_param = (W'(next_c) + step) > 8'hff;
+    wide = {9'(next_c) + step};
+  end
+  int held, flagged, param, carried, exact;
+  initial begin
+    cnt = 8'hfe;
+    step = 8'h01;
+    #1;
+    exact = (result === 8'hff) && (sat === 1'b0) && (wide === 16'h00ff);
+    cnt = 8'hff;
+    #1;
+    held = (result === 8'hff);
+    flagged = (sat === 1'b1);
+    param = (sat_param === 1'b1);
+    carried = (wide === 16'h0100);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "exact"), 1, "254+1 is 255 and does not saturate");
+    assert_eq!(u(&sim, "held"), 1, "255+1 stays saturated");
+    assert_eq!(u(&sim, "flagged"), 1, "the compare sees the 9-bit sum");
+    assert_eq!(u(&sim, "param"), 1, "a parameter cast widens the sum too");
+    assert_eq!(u(&sim, "carried"), 1, "the sum itself keeps the carry");
+}
+
 #[test]
 fn function_return_defaults_to_type_default() {
     let src = r#"
