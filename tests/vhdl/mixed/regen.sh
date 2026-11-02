@@ -8,6 +8,12 @@ cd "$(dirname "$0")"
 here=$PWD
 for sv in ${1:-*}.sv; do
   n=${sv%.sv}
+  # mixed_record's golden is the packed layout xezim defines for a record
+  # port. Questa connects a record as a record, so a regen must not
+  # overwrite it.
+  if [ "$n" = mixed_record ]; then
+    continue
+  fi
   work=$(mktemp -d)
   (cd "$work" && vlib work >/dev/null &&
     vcom -2008 -quiet "$here/$n.vhd" &&

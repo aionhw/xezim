@@ -69,3 +69,13 @@ fn mixed_sandwich() {
 fn mixed_clocked() {
     check("mixed_clocked");
 }
+
+/// A record port in both directions, and a three-dimensional array of
+/// records. Each crosses as one packed logic vector: the left index and
+/// the first field are the most significant bits, and each std_logic is
+/// one bit. The golden is that layout (the outer index runs `downto`, so
+/// the higher index is on the left).
+#[test]
+fn mixed_record() {
+    check("mixed_record");
+}
