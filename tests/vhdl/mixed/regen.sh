@@ -11,7 +11,7 @@ for sv in ${1:-*}.sv; do
   # mixed_record's golden is the packed layout xezim defines for a record
   # port. Questa connects a record as a record, so a regen must not
   # overwrite it.
-  if [ "$n" = mixed_record ]; then
+  if [ "$n" = mixed_record ] || [ "$n" = mixed_record_field ]; then
     continue
   fi
   work=$(mktemp -d)
