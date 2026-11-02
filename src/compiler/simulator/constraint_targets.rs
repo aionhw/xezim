@@ -1000,6 +1000,46 @@ impl Simulator {
         Some(format!("{}[{}]", bn, key))
     }
 
+    /// The bits (offset, width) of the packed-struct field `e` names in
+    /// collection element `elem_key` (`p[i].mask` with `p[i]` that element),
+    /// for a field of at most 64 bits.
+    pub(super) fn elem_field_of(&mut self, e: &Expression, elem_key: &str) -> Option<(u32, u32)> {
+        let (base, field) = match &e.kind {
+            ExprKind::MemberAccess { expr, member } => ((**expr).clone(), member.name.clone()),
+            // `p[i].mask` as one path: the element is its first segment.
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 2
+                    && h.path[0].selects.len() == 1
+                    && h.path[1].selects.is_empty() =>
+            {
+                let mut head = h.clone();
+                head.path.truncate(1);
+                let index = head.path[0].selects.pop()?;
+                head.cached_signal_id = std::cell::Cell::new(None);
+                head.cached_resolved_name = std::cell::OnceCell::new();
+                let arr = Expression::new(ExprKind::Ident(head), e.span);
+                (
+                    Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(arr),
+                            index: Box::new(index),
+                        },
+                        e.span,
+                    ),
+                    h.path[1].name.name.clone(),
+                )
+            }
+            _ => return None,
+        };
+        if self.coll_elem_expr_key(&base).as_deref() != Some(elem_key) {
+            return None;
+        }
+        let fields = self.coll_packed_elem_fields(&elem_key[..elem_key.rfind('[')?])?;
+        let &(_, off, w) = fields.iter().find(|(n, _, _)| *n == field)?;
+        (w <= 64).then_some((off, w))
+    }
+
     /// Write one collection element. The instance-scoped key (`<h>#m[i]`) is
     /// the storage of record; an ALREADY-EXISTING compact-table alias
     /// (`m[i]`, for an array that was also materialised there) is kept in step.
@@ -1916,6 +1956,26 @@ impl Simulator {
                 dist_weights,
                 ..
             } => {
+                // §18.5.4: a FIELD of this element (`p[i].mask dist …`) is
+                // drawn into the element; it kept its baseline draw.
+                if let Some((off, w)) = self.elem_field_of(expr, elem_key) {
+                    let mut cur = self
+                        .read_coll_elem(elem_key)
+                        .unwrap_or_else(|| Value::zero(width));
+                    let field = cur.range_select((off + w - 1) as usize, off as usize);
+                    let new = if *is_dist {
+                        self.pick_dist_value(None, range, dist_weights)
+                    } else if !self.value_in_ranges(&field, range) {
+                        self.pick_from_ranges(range, w, field.is_signed)
+                    } else {
+                        None
+                    };
+                    if let Some(v) = new.and_then(|v| v.resize(w).to_u64()) {
+                        cur.splice_bits64(off as usize, v, 0, w as usize);
+                        self.write_coll_elem(elem_key, cur);
+                    }
+                    return false;
+                }
                 if self.coll_elem_expr_key(expr).as_deref() != Some(elem_key) {
                     return false;
                 }
@@ -1973,6 +2033,26 @@ impl Simulator {
                     false
                 }
                 ExprKind::Binary { op, left, right } => {
+                    // §18.5.7: `p[i].field == E` sets that field of this
+                    // element. Left alone it kept its baseline draw, the
+                    // body failed, and the generate-and-test fallback redrew
+                    // the whole element, discarding its other fields' draws.
+                    if *op == BinaryOp::Eq {
+                        let field = match self.elem_field_of(left, elem_key) {
+                            Some(f) => Some((f, right)),
+                            None => self.elem_field_of(right, elem_key).map(|f| (f, left)),
+                        };
+                        if let Some(((off, w), other)) = field {
+                            if let Some(v) = self.eval_expr(other).resize(w).to_u64() {
+                                let mut cur = self
+                                    .read_coll_elem(elem_key)
+                                    .unwrap_or_else(|| Value::zero(width));
+                                cur.splice_bits64(off as usize, v, 0, w as usize);
+                                self.write_coll_elem(elem_key, cur);
+                            }
+                            return false;
+                        }
+                    }
                     let on_l = self.coll_elem_expr_key(left).as_deref() == Some(elem_key);
                     let on_r = self.coll_elem_expr_key(right).as_deref() == Some(elem_key);
                     if on_l == on_r {

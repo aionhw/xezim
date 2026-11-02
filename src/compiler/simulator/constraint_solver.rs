@@ -2267,6 +2267,15 @@ impl Simulator {
                 let mut used: HashSet<u64> = HashSet::default();
                 let cyclic = randc_set.contains(prop.as_str());
                 for i in *lo..=*hi {
+                    // §18.5.4: an element this trial drew from its `dist`
+                    // keeps the draw; `dist_picked_once` stops the foreach
+                    // pass below from drawing it again.
+                    if self
+                        .dist_picked_once
+                        .contains(&(handle, format!("{prop}[{i}]")))
+                    {
+                        continue;
+                    }
                     // §18.4.2: each element of a randc array cycles on its own.
                     let cycled = if cyclic {
                         let key = format!("{prop}[{i}]");

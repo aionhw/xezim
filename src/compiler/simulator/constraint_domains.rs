@@ -2993,7 +2993,11 @@ impl Simulator {
         // evaluated with the bound `i`. Other shapes can be added later.
         // Also handle the dedicated ConstraintItem::Inside variant.
         if let ConstraintItem::Inside {
-            expr: inner, range, ..
+            expr: inner,
+            range,
+            is_dist,
+            dist_weights,
+            ..
         } = item
         {
             let inside_arr = Self::index_chain_root_is(inner, arr_name);
@@ -3005,6 +3009,33 @@ impl Simulator {
                     .class_elem_load(handle, arr_name, idx)
                     .or_else(|| self.get_signal_value_by_name(&elem_name))
                     .unwrap_or_else(|| Value::zero(32));
+                // §18.5.4: a dist draws the element by weight, once per
+                // trial (`dist_picked_once`, as for a scalar). Taken as a
+                // plain `inside`, ranges covering the whole domain left the
+                // uniform baseline, and a 40-weight item was drawn at 1/65536.
+                if *is_dist && !dist_weights.is_empty() {
+                    let key = (handle, elem_name.clone());
+                    if self.dist_picked_once.contains(&key) {
+                        return false;
+                    }
+                    let Some(mut p) = self.pick_dist_value(Some(key.clone()), range, dist_weights)
+                    else {
+                        return false;
+                    };
+                    p = p.resize(cur.width.max(1));
+                    p.is_signed = cur.is_signed;
+                    self.dist_picked_once.insert(key);
+                    if p == cur {
+                        return false;
+                    }
+                    self.class_elem_store(handle, arr_name, idx, p.clone());
+                    if self.module.arrays.contains_key(arr_name)
+                        || self.signal_name_to_id.contains_key(elem_name.as_str())
+                    {
+                        self.set_signal_value_by_name(&elem_name, p);
+                    }
+                    return true;
+                }
                 if self.value_in_ranges(&cur, range) {
                     return false;
                 }
