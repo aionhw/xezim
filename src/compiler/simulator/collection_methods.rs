@@ -1067,22 +1067,7 @@ impl Simulator {
         // §7.12/§7.2.1: a PACKED-struct element binds its fields too, so
         // `find with (item.lo > 2)` slices them out of `item`.
         let pfields = if elem_su.is_none() {
-            match self.module.packed_struct_fields.get(arr) {
-                Some(f) => Some(f.clone()),
-                // A struct's dynamic member (`s.sp[2]`): its declared type.
-                None if arr.contains('.') && self.struct_colls_possible() => {
-                    self.struct_member_coll_of(arr).and_then(|(_, dt, _)| {
-                        super::elaborate::packed_struct_field_layout(
-                            &dt,
-                            &self.module.parameters,
-                            &self.module.typedefs,
-                            &self.module.typedef_types,
-                        )
-                    })
-                }
-                None => None,
-            }
-            .filter(|f| !f.is_empty())
+            self.coll_packed_elem_fields(arr)
         } else {
             None
         };
@@ -1645,6 +1630,9 @@ impl Simulator {
             .last()
             .and_then(|f| f.get("item.index").cloned());
         let iter_index = iter.map(|nm| format!("{}.index", nm));
+        // §7.12.3/§7.2.1: a packed-struct element binds its fields, as for
+        // the locators: `sum() with (item.code)` read 0 for every element.
+        let pfields = self.coll_packed_elem_fields(arr);
         // §7.12.3: accumulate at 128 bits — the `with` expression's type can
         // be wider than 64 bits (`q.sum() with (item)` over `logic [95:0]`),
         // and an i64 accumulator wrapped there, building a result capped at
@@ -1678,6 +1666,13 @@ impl Simulator {
                 if let Some(k) = &iter_index {
                     f.insert(k.clone(), ix.clone());
                 }
+                if let Some(fields) = &pfields {
+                    let it = iter.unwrap_or("item");
+                    for (fname, off, w) in fields {
+                        let slice = elem.range_select((off + w - 1) as usize, *off as usize);
+                        f.insert(format!("{}.{}", it, fname), slice);
+                    }
+                }
                 f.insert("item".to_string(), elem);
                 f.insert("item.index".to_string(), ix);
             }
@@ -1704,6 +1699,12 @@ impl Simulator {
                 (Some(a), "xor") => a ^ v,
                 (Some(a), _) => a,
             });
+        }
+        if let (Some(fields), Some(f)) = (&pfields, self.local_stack.last_mut()) {
+            let it = iter.unwrap_or("item");
+            for (fname, _, _) in fields {
+                f.remove(&format!("{}.{}", it, fname));
+            }
         }
         // Restore the prior `item` binding (if any); drop the iterator's.
         if let Some(f) = self.local_stack.last_mut() {

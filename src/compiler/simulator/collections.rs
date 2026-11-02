@@ -298,6 +298,46 @@ impl Simulator {
         ))
     }
 
+    /// §7.2.1: the field layout of a packed-struct element of collection
+    /// `arr`, for `item.<field>` in a `with` clause: a module or struct
+    /// member collection's registered layout, or a class member's (`<h>#m`)
+    /// from its declared type on the object's class or an ancestor.
+    pub(super) fn coll_packed_elem_fields(&self, arr: &str) -> Option<Vec<(String, u32, u32)>> {
+        let layout = |dt: &DataType| {
+            super::elaborate::packed_struct_field_layout(
+                dt,
+                &self.module.parameters,
+                &self.module.typedefs,
+                &self.module.typedef_types,
+            )
+        };
+        let fields = if let Some(f) = self.module.packed_struct_fields.get(arr) {
+            Some(f.clone())
+        } else if let Some((h, prop)) = arr.split_once('#')
+            && let Ok(handle) = h.parse::<usize>()
+        {
+            // A class member collection.
+            let mut cls = self.heap.get(handle)?.as_ref()?.class_name.clone();
+            let mut found = None;
+            for _ in 0..64 {
+                let cd = self.module.classes.get(&cls)?;
+                if let Some(dt) = self.class_prop_decl_type(cd, prop) {
+                    found = layout(dt);
+                    break;
+                }
+                cls = cd.extends.clone()?;
+            }
+            found
+        } else if arr.contains('.') && self.struct_colls_possible() {
+            // A struct's dynamic member (`s.sp[2]`): its declared type.
+            self.struct_member_coll_of(arr)
+                .and_then(|(_, dt, _)| layout(&dt))
+        } else {
+            None
+        };
+        fields.filter(|f| !f.is_empty())
+    }
+
     pub(super) fn is_associative_array(&self, name: &str) -> bool {
         if self.module.associative_arrays.contains_key(name) {
             return true;
