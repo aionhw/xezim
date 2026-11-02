@@ -1056,3 +1056,6 @@ mod cast_to_interface_class_806;
 
 #[path = "classes/concurrent_local_type_metadata.rs"]
 mod concurrent_local_type_metadata;
+
+#[path = "classes/renamed_local_member_reads.rs"]
+mod renamed_local_member_reads;
