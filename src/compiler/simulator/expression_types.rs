@@ -176,6 +176,12 @@ impl Simulator {
                     if let Some(t) = self.local_class_type_of(&name) {
                         return Some(t);
                     }
+                    // The frame's typedef, before the flat maps a concurrent
+                    // process's same-named local of another type overwrote
+                    // (`c.num()` of a `color_e c` read a `fruit_e c`'s).
+                    if let Some(t) = self.local_typedef_type_of(&name).filter(|t| !t.is_empty()) {
+                        return Some(t);
+                    }
                     // A class-typed procedural local declared in this scope.
                     if let Some(t) = self.var_class_types.get(&*name) {
                         return Some(t.clone());

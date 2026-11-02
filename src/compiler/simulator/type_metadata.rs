@@ -238,6 +238,239 @@ impl Simulator {
             .and_then(|i| self.local_type_stack[i].1.get(name).cloned())
     }
 
+    /// The name-keyed metadata registered for local `name` now. Only a
+    /// struct-typed local has `name.member` entries; the scan for them is
+    /// skipped for every other local.
+    fn capture_local_meta(&self, name: &str, origin: MetaOrigin) -> LocalMeta {
+        let m = &self.module;
+        let members =
+            m.struct_members.contains_key(name) || m.packed_struct_fields.contains_key(name);
+        let pfx = format!("{name}.");
+        let keyed = |k: &str| k == name || (members && k.starts_with(&pfx));
+        fn pick<V: Clone>(
+            map: &HashMap<String, V>,
+            name: &str,
+            members: bool,
+            keyed: &dyn Fn(&str) -> bool,
+        ) -> Vec<(String, V)> {
+            if members {
+                (map.iter())
+                    .filter(|(k, _)| keyed(k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            } else {
+                map.get(name)
+                    .map(|v| (name.to_string(), v.clone()))
+                    .into_iter()
+                    .collect()
+            }
+        }
+        LocalMeta {
+            origin,
+            members,
+            typedef: self.var_typedef_types.get(name).cloned(),
+            class: self.var_class_types.get(name).cloned(),
+            container: self.var_container_types.get(name).cloned(),
+            type_args: self.var_type_args.get(name).cloned(),
+            decl_types: pick(&m.var_decl_types, name, members, &keyed),
+            struct_members: pick(&m.struct_members, name, members, &keyed),
+            packed_fields: pick(&m.packed_struct_fields, name, members, &keyed),
+            elem_widths: pick(&m.packed_signal_elem_widths, name, members, &keyed),
+            full_dims: pick(&m.packed_full_dims, name, members, &keyed),
+            width: self.widths.get(name).copied(),
+            signed: self.signed_signals.contains(name),
+            real: self.real_signals.contains(name),
+            string: self.string_signals.contains(name),
+        }
+    }
+
+    /// Make `meta` the name-keyed metadata of local `name` again, replacing
+    /// what the installed declaration (`members`: a struct's) registered.
+    fn apply_local_meta(&mut self, name: &str, meta: &LocalMeta, members: bool) {
+        fn put<V: Clone>(map: &mut HashMap<String, V>, k: &str, v: &Option<V>) {
+            match v {
+                Some(v) => {
+                    map.insert(k.to_string(), v.clone());
+                }
+                None => {
+                    map.remove(k);
+                }
+            }
+        }
+        fn flag(set: &mut HashSet<String>, k: &str, on: bool) {
+            if on {
+                set.insert(k.to_string());
+            } else {
+                set.remove(k);
+            }
+        }
+        fn keyed<V: Clone>(
+            map: &mut HashMap<String, V>,
+            name: &str,
+            members: bool,
+            v: &[(String, V)],
+        ) {
+            if members {
+                let pfx = format!("{name}.");
+                map.retain(|k, _| k != name && !k.starts_with(&pfx));
+            } else {
+                map.remove(name);
+            }
+            map.extend(v.iter().cloned());
+        }
+        put(&mut self.var_typedef_types, name, &meta.typedef);
+        put(&mut self.var_class_types, name, &meta.class);
+        put(&mut self.var_container_types, name, &meta.container);
+        put(&mut self.var_type_args, name, &meta.type_args);
+        put(&mut self.widths, name, &meta.width);
+        flag(&mut self.signed_signals, name, meta.signed);
+        flag(&mut self.real_signals, name, meta.real);
+        flag(&mut self.string_signals, name, meta.string);
+        let m = &mut self.module;
+        keyed(&mut m.var_decl_types, name, members, &meta.decl_types);
+        keyed(&mut m.struct_members, name, members, &meta.struct_members);
+        keyed(
+            &mut m.packed_struct_fields,
+            name,
+            members,
+            &meta.packed_fields,
+        );
+        keyed(
+            &mut m.packed_signal_elem_widths,
+            name,
+            members,
+            &meta.elem_widths,
+        );
+        keyed(&mut m.packed_full_dims, name, members, &meta.full_dims);
+    }
+
+    /// Save the installed metadata of `name` for every frame sharing it.
+    fn save_installed_meta(&mut self, name: &str) {
+        let Some(owner) = self.local_meta_owner.get(name) else {
+            return;
+        };
+        let meta = self.capture_local_meta(name, owner.origin.clone());
+        for g in owner.gens.clone() {
+            let list = self.local_meta_saved.entry(g).or_default();
+            list.retain(|(n, _)| n != name);
+            list.push((name.to_string(), meta.clone()));
+        }
+    }
+
+    /// A frame-local `name` declared by `stmt` is being declared in the
+    /// current frame: save the metadata a live frame registered under the
+    /// same name for another declaration, then make this frame its owner.
+    /// Frames running the same declaration share the installed entries.
+    pub(super) fn claim_local_meta(&mut self, name: &str, stmt: &Statement) {
+        let Some(&g) = self.local_gen_stack.last() else {
+            return;
+        };
+        let origin = MetaOrigin {
+            span: (stmt.span.start, stmt.span.end),
+            class: self.class_context_stack.last().cloned().flatten(),
+            spec: self.current_spec.clone(),
+        };
+        match self.local_meta_owner.get_mut(name) {
+            Some(owner) if owner.origin == origin => {
+                if !owner.gens.contains(&g) {
+                    owner.gens.push(g);
+                }
+            }
+            Some(_) => {
+                self.save_installed_meta(name);
+                self.local_meta_owner.insert(
+                    name.to_string(),
+                    MetaOwner {
+                        origin,
+                        gens: vec![g],
+                    },
+                );
+            }
+            None => {
+                self.local_meta_owner.insert(
+                    name.to_string(),
+                    MetaOwner {
+                        origin,
+                        gens: vec![g],
+                    },
+                );
+            }
+        }
+        self.local_meta_owned
+            .entry(g)
+            .or_default()
+            .push(name.to_string());
+    }
+
+    /// The running frames may hold locals whose metadata another frame's
+    /// declaration displaced since: restore them, the innermost frame's
+    /// declaration winning over an outer one's of the same name.
+    pub(super) fn reapply_local_meta(&mut self) {
+        let mut seen: Vec<String> = Vec::new();
+        for i in (0..self.local_gen_stack.len()).rev() {
+            let g = self.local_gen_stack[i];
+            let mut kept = Vec::new();
+            for (name, meta) in self.local_meta_saved.remove(&g).unwrap_or_default() {
+                if seen.contains(&name) {
+                    kept.push((name, meta));
+                    continue;
+                }
+                seen.push(name.clone());
+                match self.local_meta_owner.get_mut(&name) {
+                    Some(owner) if owner.origin == meta.origin => {
+                        if !owner.gens.contains(&g) {
+                            owner.gens.push(g);
+                        }
+                        continue;
+                    }
+                    Some(_) => self.save_installed_meta(&name),
+                    None => {}
+                }
+                let members = meta.members
+                    || self.module.struct_members.contains_key(&name)
+                    || self.module.packed_struct_fields.contains_key(&name);
+                self.apply_local_meta(&name, &meta, members);
+                self.local_meta_owner.insert(
+                    name.clone(),
+                    MetaOwner {
+                        origin: meta.origin.clone(),
+                        gens: vec![g],
+                    },
+                );
+            }
+            if let Some(names) = self.local_meta_owned.get(&g) {
+                for n in names {
+                    if !seen.contains(n)
+                        && self
+                            .local_meta_owner
+                            .get(n)
+                            .is_some_and(|o| o.gens.contains(&g))
+                    {
+                        seen.push(n.clone());
+                    }
+                }
+            }
+            if !kept.is_empty() {
+                self.local_meta_saved.insert(g, kept);
+            }
+        }
+    }
+
+    /// Frame generation `g` is gone: forget what it owned and what it saved.
+    fn release_local_meta(&mut self, g: u64) {
+        if let Some(names) = self.local_meta_owned.remove(&g) {
+            for n in names {
+                if let Some(owner) = self.local_meta_owner.get_mut(&n) {
+                    owner.gens.retain(|&x| x != g);
+                    if owner.gens.is_empty() {
+                        self.local_meta_owner.remove(&n);
+                    }
+                }
+            }
+        }
+        self.local_meta_saved.remove(&g);
+    }
+
     /// Push a local frame, keeping the type overlay in lockstep.
     /// Monotonic frame-generation source for `local_gen_stack`. Each pushed
     /// frame slot gets a distinct generation so separate activations that
@@ -601,6 +834,12 @@ impl Simulator {
         let pair = self.local_type_stack.pop();
         self.recycle_local_types(pair);
         if let Some(g) = self.local_gen_stack.pop() {
+            if !self.local_meta_owned.is_empty() {
+                self.release_local_meta(g);
+                if !self.local_meta_saved.is_empty() {
+                    self.reapply_local_meta();
+                }
+            }
             if self.task_string_formals.last().is_some_and(|e| e.fgen == g) {
                 self.task_string_formals.pop();
             }
@@ -618,6 +857,12 @@ impl Simulator {
         let pair = self.local_type_stack.pop();
         self.recycle_local_types(pair);
         if let Some(g) = self.local_gen_stack.pop() {
+            if !self.local_meta_owned.is_empty() {
+                self.release_local_meta(g);
+                if !self.local_meta_saved.is_empty() {
+                    self.reapply_local_meta();
+                }
+            }
             if self.task_string_formals.last().is_some_and(|e| e.fgen == g) {
                 self.task_string_formals.pop();
             }

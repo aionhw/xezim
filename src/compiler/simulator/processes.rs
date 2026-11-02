@@ -159,6 +159,9 @@ impl Simulator {
         self.current_static_task = ctx.current_static_task;
         self.current_auto_task = ctx.current_auto_task;
         self.task_string_formals = ctx.task_string_formals;
+        if !self.local_meta_saved.is_empty() {
+            self.reapply_local_meta();
+        }
     }
 
     /// Capture the current process context, including the current

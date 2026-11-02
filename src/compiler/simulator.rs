@@ -2092,6 +2092,51 @@ struct WaiterValueCtx {
     cells: bool,
 }
 
+/// The name-keyed metadata a frame-local's declaration registers: its
+/// typedef, class, declared type, struct members, packed layout and widths,
+/// under the bare name and its `name.member` keys. Two concurrent processes
+/// whose same-named locals differ in type share these tables, so the one
+/// that declared last displaced the other's; `capture_local_meta` saves a
+/// displaced entry and `reapply_local_meta` restores it when its process
+/// runs again.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(super) struct LocalMeta {
+    origin: MetaOrigin,
+    /// A struct's: `name.member` entries belong to it.
+    members: bool,
+    typedef: Option<String>,
+    class: Option<String>,
+    container: Option<String>,
+    type_args: Option<Vec<Expression>>,
+    decl_types: Vec<(String, DataType)>,
+    struct_members: Vec<(String, Vec<String>)>,
+    packed_fields: Vec<(String, Vec<(String, u32, u32)>)>,
+    elem_widths: Vec<(String, u32)>,
+    full_dims: Vec<(String, Vec<(i64, i64)>)>,
+    width: Option<u32>,
+    signed: bool,
+    real: bool,
+    string: bool,
+}
+
+/// Where a frame-local's declaration came from: its statement, and the class
+/// and specialization it ran in. Frames running the same declaration register
+/// the same metadata.
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct MetaOrigin {
+    span: (usize, usize),
+    class: Option<String>,
+    spec: Option<(String, String)>,
+}
+
+/// The declaration whose metadata is installed under a local's name, and the
+/// live frames that share it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct MetaOwner {
+    origin: MetaOrigin,
+    gens: Vec<u64>,
+}
+
 /// A packed struct's member layout and its members' packed dimensions.
 pub(super) type PackedStructShape = (Vec<(String, u32, u32)>, HashMap<String, Vec<(i64, i64)>>);
 
@@ -7608,6 +7653,13 @@ pub struct Simulator {
     /// `var_class_types`; populated at VarDecl exec time when the
     /// data type is a `TypeReference` whose name is in `module.typedefs`.
     var_typedef_types: HashMap<String, String>,
+    /// The frame generation whose declaration last registered each
+    /// frame-local's name-keyed metadata, the names each generation owns,
+    /// and the metadata of locals another frame's declaration displaced, by
+    /// the generation they belong to (see `LocalMeta`).
+    local_meta_owner: HashMap<String, MetaOwner>,
+    local_meta_owned: HashMap<u64, Vec<String>>,
+    local_meta_saved: HashMap<u64, Vec<(String, LocalMeta)>>,
     /// Names of `string`-typed variables (locals, params, package globals) so
     /// `{a, b}` concatenation involving them is treated as string concat.
     string_signals: HashSet<String>,

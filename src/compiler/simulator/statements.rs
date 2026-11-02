@@ -2100,11 +2100,18 @@ impl Simulator {
     #[inline(never)]
     pub(super) fn exec_stmt_var_decl(
         &mut self,
-        _stmt: &Statement,
+        stmt: &Statement,
         data_type: &DataType,
         lifetime: &Option<crate::ast::types::Lifetime>,
         declarators: &[VarDeclarator],
     ) {
+        // A frame local's metadata is keyed by its bare name; another
+        // process's same-named local may own those entries now.
+        if !self.local_stack.is_empty() {
+            for d in declarators {
+                self.claim_local_meta(&d.name.name, stmt);
+            }
+        }
         // §6.20.2 / §8.25: a local typed by a TYPE PARAMETER of the method's
         // class (`T tmp;`) has the type bound in this specialization.
         let tp_param = self.local_type_param_concrete(data_type);
