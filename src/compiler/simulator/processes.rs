@@ -1295,7 +1295,11 @@ impl Simulator {
                 candidates.sort_unstable();
                 candidates.dedup();
                 let has_any_block_saves = !child_ctx.block_scope_saves.is_empty()
-                    || candidates.iter().any(|p| self.process_contexts.get(p).is_some_and(|c| !c.block_scope_saves.is_empty()));
+                    || !sibling_scopes.is_empty()
+                    || candidates.iter().any(|p| {
+                        self.fork_local_scopes.get(p).is_some_and(|s| !s.is_empty())
+                            || self.process_contexts.get(p).is_some_and(|c| !c.block_scope_saves.is_empty())
+                    });
                 for other_pid in candidates {
                     let Some(other) = self.process_contexts.get_mut(&other_pid) else {
                         continue;
