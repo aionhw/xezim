@@ -1360,6 +1360,14 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) {
+        // §10.9: a typed pattern written to an unpacked target places its
+        // items like an untyped one.
+        if let ExprKind::TypedPattern { pattern, .. } = &rvalue.kind
+            && !self.lvalue_is_packed(lvalue)
+        {
+            self.exec_stmt_blocking_assign_body(stmt, lvalue, pattern);
+            return;
+        }
         if let Some(selected) = self.selected_aggregate_rhs(Some(lvalue), rvalue) {
             self.exec_stmt_blocking_assign(stmt, lvalue, &selected);
             return;
@@ -1505,28 +1513,18 @@ impl Simulator {
                 }
             }
         }
-        // §10.9.1: a packed array of packed structs is one value too; its
-        // pattern is laid out element by element, each element by member.
-        if let ExprKind::AssignmentPattern(items) = &rvalue.kind
-            && let ExprKind::Ident(h) = &lvalue.kind
-            && self
-                .packed_struct_array_elem(&self.resolve_hier_name(h))
-                .is_some()
-            && let Some(v) = self.packed_pattern_for_lhs(lvalue, items)
+        // §10.8, §10.9: a pattern written to a packed target takes the
+        // target's declared type. The element-wise
+        // spread below is for unpacked targets.
+        if has_pattern(rvalue)
+            && let Some(ty) = self.lvalue_pattern_type(lvalue)
+            && let Some(v) = self.eval_in_packed_type(rvalue, &ty)
         {
             self.assign_value(lvalue, &v);
             self.settle_after_proc_write();
             return;
         }
-        // A member of a packed struct is a slice of the struct's one value:
-        // the element-wise spread below writes names nothing reads.
-        let packed_member = matches!(&rvalue.kind, ExprKind::AssignmentPattern(items)
-            if self
-                .resolve_packed_struct_target(lvalue, items)
-                .is_some_and(|(_, prefix, ..)| !prefix.is_empty()));
-        if let ExprKind::AssignmentPattern(items) = &rvalue.kind
-            && !packed_member
-        {
+        if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
             let spread = self.assign_class_fixed_array_pattern(lvalue, items)
                 || self.assign_class_collection_pattern(lvalue, items)
                 || if matches!(&lvalue.kind, ExprKind::Ident(_)) {
@@ -1544,27 +1542,6 @@ impl Simulator {
                         }
                 };
             if spread {
-                self.settle_after_proc_write();
-                return;
-            }
-        }
-        // A named/ordered/default pattern written to a PACKED struct
-        // must be laid out by member OFFSET, not blind-concatenated:
-        // an unsized `'0` (32 bits) or any other non-member-width item
-        // would otherwise shift every field. Fall through untouched when
-        // the lvalue is not a registered packed struct.
-        if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
-            if self.try_assign_packed_struct_pattern(lvalue, items) {
-                self.settle_after_proc_write();
-                return;
-            }
-            // §10.9.2: the same per-ELEMENT expansion the continuous
-            // and nonblocking paths already do. Without it a BLOCKING
-            // `v = '{default:1'b1};` on a packed target fell through to
-            // the generic concat, which built a value out of the items'
-            // own widths (one bit) instead of one item per element.
-            if let Some(v) = self.packed_pattern_for_lhs(lvalue, items) {
-                self.assign_value(lvalue, &v);
                 self.settle_after_proc_write();
                 return;
             }

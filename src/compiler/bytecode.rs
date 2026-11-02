@@ -2081,15 +2081,13 @@ pub struct BytecodeCompiler<'a> {
     /// a string no fixed width, so they are never resized to a context and
     /// compare by text.
     local_coll_strings: HashSet<String>,
-    /// Packed-struct field layout of the CURRENT assignment's destination,
-    /// installed by the assign arms around their rvalue compile so an
-    /// `'{...}` assignment pattern can compile to a Concat. An assignment
-    /// pattern is otherwise context-free at expression level — its meaning
-    /// depends entirely on the target type.
-    pattern_layout: Option<Vec<(String, u32, u32)>>,
-    /// The struct signal `pattern_layout` belongs to, which keys its
-    /// members' packed dimensions.
-    pattern_root: Option<String>,
+    /// §10.8: the type an untyped assignment pattern takes, installed right
+    /// before compiling an assignment-like source (an assignment RHS, an
+    /// inlined formal's actual, a return value). `compile_expr_typed` takes
+    /// it, and passes it on only to a parenthesised or conditional operand.
+    pattern_ctx: Option<crate::ast::types::DataType>,
+    /// The return type of the function being inlined, for `return '{...}`.
+    inline_ret_ty: Option<crate::ast::types::DataType>,
     /// Named-cast targets known at compile time: name -> (width, signed).
     /// See the simulator's `cast_widths`.
     cast_widths: Option<&'a HashMap<String, (u32, bool)>>,
@@ -2128,6 +2126,9 @@ pub struct BytecodeCompiler<'a> {
     /// `idx * elem_w` is only correct for a normalized `[N-1:0]` range and
     /// mis-places (or drops) elements of e.g. `[2:1]` or an ascending `[0:1]`.
     packed_full_dims: Option<&'a HashMap<String, Vec<(i64, i64)>>>,
+    /// Declared variable types, for the type a pattern assigned to a
+    /// variable takes (§10.8).
+    var_decl_types: Option<&'a HashMap<String, crate::ast::types::DataType>>,
     /// Stack of pending `break` jump-target patches, one entry per enclosing
     /// loop. When the loop's end address is known we rewrite each `Jump(0)`
     /// at these insn-indices to the loop-exit address. LRM §12.7.
@@ -2308,8 +2309,8 @@ impl<'a> BytecodeCompiler<'a> {
             unresolved_type_names: HashSet::default(),
             local_var_elem: std::collections::HashMap::new(),
             cast_widths: None,
-            pattern_layout: None,
-            pattern_root: None,
+            pattern_ctx: None,
+            inline_ret_ty: None,
             local_const_vars: HashMap::default(),
             local_const_kinds: HashMap::default(),
             local_array_regs: HashMap::default(),
@@ -2320,6 +2321,7 @@ impl<'a> BytecodeCompiler<'a> {
             assoc_elem_widths: None,
             assoc_arrays: None,
             packed_full_dims: None,
+            var_decl_types: None,
             loop_break_patches: Vec::new(),
             loop_continue_patches: Vec::new(),
             foreach_slot_count: 0,
@@ -2837,6 +2839,10 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_packed_full_dims(&mut self, d: &'a HashMap<String, Vec<(i64, i64)>>) {
         self.packed_full_dims = Some(d);
+    }
+
+    pub fn set_var_decl_types(&mut self, t: &'a HashMap<String, crate::ast::types::DataType>) {
+        self.var_decl_types = Some(t);
     }
 
     /// The declared OUTERMOST packed dimension `(left, right)` of the signal
@@ -3614,6 +3620,9 @@ impl<'a> BytecodeCompiler<'a> {
                 let init = self.type_default_value_in(&p.data_type, w, Some(&name));
                 self.emit(Insn::LoadConst(slot, Box::new(init)));
             } else {
+                if p.dimensions.is_empty() {
+                    self.pattern_ctx = Some(p.data_type.clone());
+                }
                 let v = self.compile_expr(a, w)?;
                 self.emit(Insn::Move(slot, v));
             }
@@ -3740,7 +3749,9 @@ impl<'a> BytecodeCompiler<'a> {
         let saved_continue_patches = std::mem::take(&mut self.loop_continue_patches);
         self.inline_ret = Some((Some(ret_slot), ret_w));
         let saved_ret_real = std::mem::replace(&mut self.inline_ret_real, ret_is_real);
+        let saved_ret_ty = self.inline_ret_ty.replace(fd.return_type.clone());
         let mut ok = self.compile_pure_body(&items);
+        self.inline_ret_ty = saved_ret_ty;
         self.inline_ret_real = saved_ret_real;
         // Early returns land HERE — after the body, before the output-formal
         // copy-out, which §13.5.3 performs on every return path.
@@ -7069,6 +7080,7 @@ impl<'a> BytecodeCompiler<'a> {
                         _ => false,
                     })
                 }
+                ExprKind::TypedPattern { pattern, .. } => expr_ok(pattern, bound, me, ext),
                 _ => false,
             }
         }
@@ -8106,6 +8118,7 @@ impl<'a> BytecodeCompiler<'a> {
                     || self.touches_string_formal(else_expr)
             }
             ExprKind::Concatenation(parts) => parts.iter().any(|p| self.touches_string_formal(p)),
+            ExprKind::TypedPattern { pattern, .. } => self.touches_string_formal(pattern),
             ExprKind::AssignmentPattern(items) => items.iter().any(|p| match p {
                 crate::ast::expr::AssignmentPatternItem::Ordered(v) => {
                     self.touches_string_formal(v)
@@ -8200,7 +8213,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// ~8 of them per cycle (`mstatus_q.mpp`, `irqs_i.irq_fast`, ...), which
     /// made this the largest single fallback after the named-cast fix.
     /// Field layout of `lv` when it names a packed-struct SIGNAL directly.
-    fn lvalue_struct_layout(&self, lv: &Expression) -> Option<(String, Vec<(String, u32, u32)>)> {
+    fn lvalue_struct_layout(&self, lv: &Expression) -> Option<Vec<(String, u32, u32)>> {
         let fields_tbl = self.packed_struct_fields?;
         // `arr[i] <= '{...}`: an ELEMENT of an array of packed structs carries
         // the element layout, which is keyed by the array name — same keying
@@ -8234,157 +8247,196 @@ impl<'a> BytecodeCompiler<'a> {
         {
             return None;
         }
-        Some((named, layout.clone()))
+        Some(layout.clone())
     }
 
-    /// §10.9.2: an assignment pattern applied to a PACKED-struct target is a
-    /// concatenation of its members in declared order (first field = MSBs).
-    /// Named items bind by field, `default:` fills whatever is left, ordered
-    /// items map by position. Every field must be covered exactly once, and
-    /// each member expression compiles at ITS OWN field's width — that is
-    /// what makes this exactly the interpreter's member-wise semantics.
-    /// ibex's CSR write logic rebuilds `mstatus_d`/`mcause_d` this way every
-    /// cycle; the pattern bail dragged the whole block (11% of the bench)
-    /// onto the AST path.
-    fn compile_packed_struct_pattern(
-        &mut self,
-        items: &[crate::ast::expr::AssignmentPatternItem],
-        layout: &[(String, u32, u32)],
-    ) -> Option<RegId> {
-        use crate::ast::expr::AssignmentPatternItem as Item;
-        if layout.is_empty() {
+    /// The declared type of the variable `lv` names, when it is packed and
+    /// spans the whole signal (an unpacked array records its element type).
+    fn declared_pattern_ctx(&mut self, lv: &Expression) -> Option<crate::ast::types::DataType> {
+        use crate::compiler::packed_assignment_pattern_plan as pp;
+        let ExprKind::Ident(h) = &lv.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
             return None;
         }
-        // The recorded layout is flattened: a nested member is its own row
-        // (`exception.cause`) as well as its parent (`exception`). Those rows
-        // overlap. Concatenating every row builds a value wider than the
-        // struct, and the assignment keeps the low bits, so a named member
-        // such as `trans_id` lands outside its slot. A later member write
-        // repairs the fields it touches and leaves the shifted one at 0.
-        // Pack only the direct children — the same set the interpreter walks
-        // in `apply_packed_struct_pattern`. A pattern on a nested member
-        // still bails (this function's caller has already taken
-        // `pattern_layout`), and the statement runs on the interpreter.
-        let mut fields: Vec<(String, u32, u32)> = layout
-            .iter()
-            .filter(|(n, _, _)| !n.contains('.'))
-            .cloned()
-            .collect();
-        if fields.is_empty() {
-            return None;
-        }
-        // MSB-first: highest offset first.
-        fields.sort_by(|a, b| b.1.cmp(&a.1));
+        let raw = Self::hier_raw_name(h);
+        let scoped = self.scope_hint.as_deref().map(|sc| cat_dot(sc, &raw));
+        let (ty, w) = [scoped.as_deref(), Some(raw.as_ref())]
+            .into_iter()
+            .flatten()
+            .find_map(|n| {
+                let ty = self.var_decl_types?.get(n)?;
+                let id = *self.signal_name_to_id.get(n)?;
+                Some((ty.clone(), *self.signal_widths.get(id)?))
+            })?;
+        (pp::packed_width(&ty, &mut BcPatternTypeResolver(self)) == Some(w)).then_some(ty)
+    }
 
-        let mut named: Vec<(usize, &Expression)> = Vec::new();
-        let mut ordered: Vec<&Expression> = Vec::new();
-        let mut default: Option<&Expression> = None;
-        for it in items {
-            match it {
-                Item::Named(id, e) => {
-                    let idx = fields.iter().position(|(n, _, _)| *n == id.name)?;
-                    if named.iter().any(|(i, _)| *i == idx) {
-                        return None;
+    /// §10.8: the type of an assignment target, for the pattern `rvalue`
+    /// assigned to it: a registered packed struct (or member of one), or a
+    /// vector with recorded packed dimensions.
+    fn lvalue_pattern_ctx(
+        &mut self,
+        lv: &Expression,
+        rvalue: &Expression,
+    ) -> Option<crate::ast::types::DataType> {
+        use crate::compiler::packed_assignment_pattern_plan as pp;
+        if !pp::has_pattern(rvalue) {
+            return None;
+        }
+        if let Some(ty) = self.declared_pattern_ctx(lv) {
+            return Some(ty);
+        }
+        if let Some(layout) = self.lvalue_struct_layout(lv) {
+            return pp::layout_struct_type(&layout, "");
+        }
+        let ExprKind::Ident(h) = &lv.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let raw = Self::hier_raw_name(h);
+        let scoped = self.scope_hint.as_deref().map(|sc| cat_dot(sc, &raw));
+        let names: Vec<&str> = scoped
+            .iter()
+            .map(String::as_str)
+            .chain([raw.as_ref()])
+            .collect();
+        if let Some(fields) = self.packed_struct_fields {
+            for name in &names {
+                let mut split = name.len();
+                while let Some(dot) = name[..split].rfind('.') {
+                    split = dot;
+                    if let Some(layout) = fields.get(&name[..split]) {
+                        return pp::layout_struct_type(layout, &name[split + 1..]);
                     }
-                    named.push((idx, e));
                 }
-                Item::Ordered(e) => ordered.push(e),
-                Item::Default(e) => {
-                    if default.is_some() {
-                        return None;
-                    }
-                    default = Some(e);
-                }
-                _ => return None,
             }
         }
-        // Mixed ordered+named is not a legal pattern; ordered must cover all.
-        if !ordered.is_empty() && (!named.is_empty() || default.is_some()) {
+        let dims = self.packed_full_dims?;
+        names
+            .iter()
+            .find_map(|n| dims.get(*n))
+            .filter(|d| !d.is_empty())
+            .map(|d| pp::packed_dims_vector(crate::ast::types::IntegerVectorType::Logic, d))
+    }
+
+    /// §10.9: compile a typed pattern, or an untyped one (possibly under a
+    /// parenthesis or conditional) in the context type `ctx`, from its
+    /// layout plan. A typed pattern with no plan falls back to the
+    /// interpreter for that expression alone.
+    fn compile_pattern(
+        &mut self,
+        expr: &Expression,
+        ctx_width: u32,
+        ctx: Option<crate::ast::types::DataType>,
+    ) -> Option<RegId> {
+        use crate::compiler::packed_assignment_pattern_plan as pp;
+        let (src, ty) = match (&expr.kind, ctx) {
+            (ExprKind::TypedPattern { ty, pattern }, _) => (pattern.as_ref(), (**ty).clone()),
+            (_, Some(ty)) => (expr, ty),
+            _ => return None,
+        };
+        let start = self.insns.len();
+        let start_reg = self.next_reg;
+        let plan = pp::packed_plan(src, &ty, &mut BcPatternTypeResolver(self));
+        if let Some(r) = plan.and_then(|p| self.compile_pattern_plan(&p)) {
+            return Some(r);
+        }
+        self.truncate_insns(start);
+        self.next_reg = start_reg;
+        if matches!(expr.kind, ExprKind::TypedPattern { .. }) {
+            return self.emit_expr_fallback(expr, ctx_width, "typed_pattern");
+        }
+        self.bail("Expr_AssignmentPattern");
+        None
+    }
+
+    /// Emit a pattern plan: each slice compiled at its own width (§10.9.2),
+    /// adjacent constant slices folded, then one Concat, most significant
+    /// slice first.
+    fn compile_pattern_plan(
+        &mut self,
+        plan: &crate::compiler::packed_assignment_pattern_plan::PackedPlan<'_>,
+    ) -> Option<RegId> {
+        use crate::compiler::packed_assignment_pattern_plan::SliceSrc;
+        if !plan.disjoint() {
             return None;
         }
-        if !ordered.is_empty() && ordered.len() != fields.len() {
-            return None;
-        }
-        let mut regs: Vec<RegId> = Vec::with_capacity(fields.len());
-        for (idx, (name, _, w)) in fields.iter().enumerate() {
-            let expr = if !ordered.is_empty() {
-                ordered[idx]
-            } else if let Some((_, e)) = named.iter().find(|(i, _)| *i == idx) {
-                e
-            } else {
-                // §10.9.2: `default:` fills a nested struct member member by
-                // member (see `apply_packed_struct_pattern`).
-                let d = default?;
-                regs.push(self.compile_default_fill(layout, name, d, *w)?);
-                continue;
+        let mut slices: Vec<_> = plan.slices.iter().collect();
+        slices.sort_by(|a, b| b.offset.cmp(&a.offset));
+        let mut regs: Vec<RegId> = Vec::with_capacity(slices.len());
+        let mut pending: Option<Value> = None;
+        let flush = |c: &mut Self, pending: &mut Option<Value>, regs: &mut Vec<RegId>| {
+            if let Some(v) = pending.take() {
+                let r = c.alloc_reg();
+                c.emit(Insn::LoadConst(r, Box::new(v)));
+                regs.push(r);
+            }
+        };
+        for s in slices {
+            let r = match &s.src {
+                SliceSrc::Const(v) => {
+                    pending = Some(match pending.take() {
+                        Some(p) => p.concat_with(v),
+                        None => v.clone(),
+                    });
+                    continue;
+                }
+                SliceSrc::Expr(e) => {
+                    flush(self, &mut pending, &mut regs);
+                    let src = self.compile_expr(e, s.width)?;
+                    let r = self.alloc_reg();
+                    self.emit(Insn::Move(r, src));
+                    self.emit(Insn::Resize(r, s.width));
+                    if s.two_state {
+                        self.emit(Insn::DropXz(r));
+                    }
+                    r
+                }
+                SliceSrc::Cond { cond, then, els } => {
+                    // Both operands run (Select merges them on an x/z
+                    // condition), so neither may have an effect.
+                    if Self::plan_has_effect(then) || Self::plan_has_effect(els) {
+                        return None;
+                    }
+                    flush(self, &mut pending, &mut regs);
+                    let c = self.compile_expr(cond, 0)?;
+                    let t = self.compile_pattern_plan(then)?;
+                    let e = self.compile_pattern_plan(els)?;
+                    let r = self.alloc_reg();
+                    self.emit(Insn::Select(r, c, t, e));
+                    r
+                }
             };
-            let src = self.compile_expr(expr, *w)?;
-            let r = self.alloc_reg();
-            self.emit(Insn::Move(r, src));
-            self.emit(Insn::Resize(r, *w));
             regs.push(r);
         }
+        flush(self, &mut pending, &mut regs);
         let dest = self.alloc_reg();
         self.emit(Insn::Concat(dest, Box::new(regs)));
+        if plan.signed {
+            self.emit(Insn::SetSigned(dest));
+        } else {
+            self.emit(Insn::ClearSigned(dest));
+        }
         Some(dest)
     }
 
-    /// The value `default:` gives the packed-struct member `name` of width
-    /// `w`: each of its own members filled in turn when it is a nested
-    /// struct (§10.9.2), else the default at the member's width. A pattern
-    /// default is left to the interpreter.
-    fn compile_default_fill(
-        &mut self,
-        layout: &[(String, u32, u32)],
-        name: &str,
-        default: &Expression,
-        w: u32,
-    ) -> Option<RegId> {
-        let pfx = format!("{name}.");
-        let mut kids: Vec<(String, u32, u32)> = layout
-            .iter()
-            .filter(|(k, _, _)| {
-                k.strip_prefix(&pfx)
-                    .is_some_and(|r| !r.is_empty() && !r.contains('.'))
-            })
-            .cloned()
-            .collect();
-        if kids.is_empty() {
-            // §10.9.2: a multi-dimensional packed-array member is no simple
-            // bit vector type (§6.11.1); each innermost element takes the
-            // default.
-            let ew = self
-                .pattern_root
-                .as_ref()
-                .zip(self.packed_full_dims)
-                .and_then(|(root, dims)| dims.get(&format!("{root}.{name}")))
-                .filter(|d| d.len() > 1)
-                .and_then(|d| d.last())
-                .map(|&(l, r)| ((l - r).unsigned_abs() + 1) as u32)
-                .filter(|&ew| w % ew == 0)
-                .unwrap_or(w);
-            let src = self.compile_expr(default, ew)?;
-            let r = self.alloc_reg();
-            self.emit(Insn::Move(r, src));
-            self.emit(Insn::Resize(r, ew));
-            if ew == w {
-                return Some(r);
+    fn plan_has_effect(
+        plan: &crate::compiler::packed_assignment_pattern_plan::PackedPlan<'_>,
+    ) -> bool {
+        use crate::compiler::packed_assignment_pattern_plan::SliceSrc;
+        plan.slices.iter().any(|s| match &s.src {
+            SliceSrc::Expr(e) => Self::expr_has_effect(e),
+            SliceSrc::Const(_) => false,
+            SliceSrc::Cond { cond, then, els } => {
+                Self::expr_has_effect(cond)
+                    || Self::plan_has_effect(then)
+                    || Self::plan_has_effect(els)
             }
-            let dest = self.alloc_reg();
-            self.emit(Insn::Concat(dest, Box::new(vec![r; (w / ew) as usize])));
-            return Some(dest);
-        }
-        if matches!(default.kind, ExprKind::AssignmentPattern(_)) {
-            return None;
-        }
-        kids.sort_by(|a, b| b.1.cmp(&a.1));
-        let mut regs = Vec::with_capacity(kids.len());
-        for (k, _, kw) in &kids {
-            regs.push(self.compile_default_fill(layout, k, default, *kw)?);
-        }
-        let dest = self.alloc_reg();
-        self.emit(Insn::Concat(dest, Box::new(regs)));
-        Some(dest)
+        })
     }
 
     fn compile_packed_member_read(&mut self, hier: &HierarchicalIdentifier) -> Option<RegId> {
@@ -12319,6 +12371,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("Return_unknown_width");
                         return false;
                     };
+                    self.pattern_ctx = self.method_return_type.cloned();
                     let Some(v) = self.compile_expr(e, w) else {
                         return false;
                     };
@@ -12343,6 +12396,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("Return_value_in_void");
                         return false;
                     };
+                    self.pattern_ctx = self.inline_ret_ty.clone();
                     let Some(v) = self.compile_expr(e, w) else {
                         return false;
                     };
@@ -12712,12 +12766,10 @@ impl<'a> BytecodeCompiler<'a> {
                 let width = self.infer_lhs_width(lvalue);
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
-                (self.pattern_root, self.pattern_layout) =
-                    self.lvalue_struct_layout(lvalue).unzip();
                 let rctx = self.assign_rhs_ctx(lvalue, width);
+                self.pattern_ctx = self.lvalue_pattern_ctx(lvalue, rvalue);
                 let compiled = self.compile_expr(rvalue, rctx);
-                self.pattern_layout = None;
-                self.pattern_root = None;
+                self.pattern_ctx = None;
                 if let Some(val_reg) = compiled {
                     // Note: NbaAssign itself performs §10.7 assignment-padding resize,
                     // so we don't emit a generic (zero-extending) Resize here — that
@@ -12793,8 +12845,6 @@ impl<'a> BytecodeCompiler<'a> {
                 let width = self.infer_lhs_width(lvalue);
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
-                (self.pattern_root, self.pattern_layout) =
-                    self.lvalue_struct_layout(lvalue).unzip();
                 // Step 9g: `lhs = new` / `lhs = new(args)` — the
                 // constructed class is the LHS's DECLARED type (§8.8); a
                 // handle needs no Resize regardless of the inferred width.
@@ -12808,10 +12858,10 @@ impl<'a> BytecodeCompiler<'a> {
                     self.compile_new_construct(rvalue, &cls)
                 } else {
                     let rctx = self.assign_rhs_ctx(lvalue, width);
+                    self.pattern_ctx = self.lvalue_pattern_ctx(lvalue, rvalue);
                     self.compile_expr(rvalue, rctx)
                 };
-                self.pattern_layout = None;
-                self.pattern_root = None;
+                self.pattern_ctx = None;
                 if let Some(val_reg) = compiled {
                     // class-perf collection-return store (§13.4):
                     // `q_local = coll_fn(..)`. The callee hands a queue /
@@ -13402,6 +13452,7 @@ impl<'a> BytecodeCompiler<'a> {
                     ExprKind::Replication { .. } => "Expr_Replication",
                     ExprKind::MemberAccess { .. } => "Expr_MemberAccess",
                     ExprKind::AssignmentPattern(_) => "Expr_AsgnPat",
+                    ExprKind::TypedPattern { .. } => "Expr_TypedPat",
                     ExprKind::Index { .. } => "Expr_Index",
                     ExprKind::RangeSelect { .. } => "Expr_RangeSelect",
                     ExprKind::Conditional { .. } => "Expr_Conditional",
@@ -14160,6 +14211,15 @@ impl<'a> BytecodeCompiler<'a> {
         ctx_width: u32,
         unsigned_context: bool,
     ) -> Option<RegId> {
+        // §10.8: only a pattern, or a parenthesised or conditional operand
+        // holding one, takes the context type; other operands start without.
+        let pattern_ctx = self.pattern_ctx.take();
+        if matches!(expr.kind, ExprKind::TypedPattern { .. })
+            || (pattern_ctx.is_some()
+                && crate::compiler::packed_assignment_pattern_plan::has_pattern(expr))
+        {
+            return self.compile_pattern(expr, ctx_width, pattern_ctx);
+        }
         let result = self.compile_expr_inner(expr, ctx_width, unsigned_context)?;
         let propagates = matches!(
             expr.kind,
@@ -16454,17 +16514,10 @@ impl<'a> BytecodeCompiler<'a> {
             // formals. That is the overwhelmingly common combinational-helper
             // shape in RTL (`lfsr32(s)`, `mix(a,b)`), and leaving it to the AST
             // interpreter dragged the whole enclosing block out of bytecode.
-            // §10.9.2 assignment pattern with a KNOWN packed-struct target —
-            // the assign arms install the destination's layout around the
-            // rvalue compile. Without a layout it stays on the AST path.
-            ExprKind::AssignmentPattern(items) => {
-                if let Some(layout) = self.pattern_layout.take() {
-                    let r = self.compile_packed_struct_pattern(items, &layout);
-                    self.pattern_layout = Some(layout);
-                    if let Some(r) = r {
-                        return Some(r);
-                    }
-                }
+            // An assignment pattern outside an assignment-like context has
+            // no type (§10.9); `compile_expr_typed` compiles typed and
+            // context-typed ones.
+            ExprKind::AssignmentPattern(_) | ExprKind::TypedPattern { .. } => {
                 self.bail("Expr_AssignmentPattern");
                 None
             }
@@ -17112,6 +17165,7 @@ impl<'a> BytecodeCompiler<'a> {
                     ExprKind::StringLiteral(_) => "Expr_StringLiteral",
                     ExprKind::Replication { .. } => "Expr_Replication",
                     ExprKind::AssignmentPattern(_) => "Expr_AssignmentPattern",
+                    ExprKind::TypedPattern { .. } => "Expr_TypedPattern",
                     ExprKind::Call { .. } => "Expr_Call",
                     ExprKind::Inside { .. } => "Expr_Inside",
                     ExprKind::MemberAccess { expr, member } => {
@@ -29591,5 +29645,38 @@ pub(crate) fn has_context_shift(e: &Expression) -> bool {
             ..
         } => has_context_shift(then_expr) || has_context_shift(else_expr),
         _ => false,
+    }
+}
+
+/// The compiler's type tables, as a pattern plan resolves them.
+struct BcPatternTypeResolver<'c, 'a>(&'c mut BytecodeCompiler<'a>);
+
+impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
+    for BcPatternTypeResolver<'_, '_>
+{
+    fn typedef_target(
+        &mut self,
+        name: &crate::ast::types::TypeName,
+    ) -> Option<crate::ast::types::DataType> {
+        self.0
+            .typedef_type_entry(name, None)
+            .map(|(_, t)| t.clone())
+    }
+
+    fn const_i64(&mut self, e: &Expression) -> Option<i64> {
+        self.0.fold_const_i64(e)
+    }
+
+    fn is_type_name(&mut self, name: &str) -> bool {
+        let span = crate::ast::Span::dummy();
+        let tn = crate::ast::types::TypeName {
+            scopes: Vec::new(),
+            name: crate::ast::Identifier {
+                name: name.to_string(),
+                span,
+            },
+            span,
+        };
+        self.0.typedef_type_entry(&tn, None).is_some()
     }
 }

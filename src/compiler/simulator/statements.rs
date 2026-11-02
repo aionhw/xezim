@@ -3525,7 +3525,13 @@ impl Simulator {
                     match produced {
                         Some(p) => p,
                         None => {
-                            let raw = self.eval_expr_ctx(init_expr, w);
+                            // §10.8: a pattern takes the declared type.
+                            let typed = if d.dimensions.is_empty() {
+                                self.eval_in_packed_type(init_expr, data_type)
+                            } else {
+                                None
+                            };
+                            let raw = typed.unwrap_or_else(|| self.eval_expr_ctx(init_expr, w));
                             Self::fit_local_decl_init(
                                 raw,
                                 w,
@@ -4188,24 +4194,24 @@ impl Simulator {
                         return;
                     }
                 }
-                // A named/ordered/default pattern driven onto a PACKED struct
-                // (or sub-member) must be laid out by member offset, not
-                // blind-concatenated — see try_assign_packed_struct_pattern.
-                // A pattern onto a PACKED ARRAY lvalue likewise expands per
-                // ELEMENT (`cdts <= '{default: v}` on logic [1:0][9:0] filled
-                // only element 0 through the generic eval) — same route the
-                // CA and blocking paths already take.
-                // §10.9.2/§10.10: a pattern written to an aggregate whose
-                // leaves are SEPARATE signals (unpacked struct, unpacked array
-                // of them, associative array) must be spread member-wise, not
-                // collapsed into one packed value. Only the blocking path did
-                // this, so `s <= '{a:8'h77, b:8'h88};` on an unpacked struct
-                // left every member x while the identical blocking assignment
-                // was correct.
-                if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
-                    if self.packed_pattern_for_lhs(lvalue, items).is_none()
-                        && self.eval_packed_struct_pattern(lvalue, items).is_none()
+                // §10.8, §10.9: a pattern driven onto a packed target takes
+                // the target's declared type.
+                let packed_pattern = self.eval_pattern_for_lvalue(packed_lvalue, rvalue);
+                // §10.9: a typed pattern driven onto an unpacked target
+                // places its items like an untyped one.
+                let rvalue = match &rvalue.kind {
+                    ExprKind::TypedPattern { pattern, .. }
+                        if packed_pattern.is_none() && !self.lvalue_is_packed(packed_lvalue) =>
                     {
+                        pattern.as_ref()
+                    }
+                    _ => rvalue,
+                };
+                // §10.9.2/§10.10: a pattern written to an aggregate whose
+                // leaves are separate signals (unpacked struct, unpacked array
+                // of them, associative array) is spread member-wise.
+                if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
+                    if packed_pattern.is_none() {
                         let spread = if matches!(&lvalue.kind, ExprKind::Ident(_)) {
                             self.pattern_aggregate_names(lvalue)
                                 .into_iter()
@@ -4261,12 +4267,10 @@ impl Simulator {
                     }
                     return;
                 }
-                let val = match &rvalue.kind {
-                    ExprKind::AssignmentPattern(items) => self
-                        .packed_pattern_for_lhs(lvalue, items)
-                        .or_else(|| self.eval_packed_struct_pattern(lvalue, items))
-                        .unwrap_or_else(|| self.eval_expr(rvalue)),
-                    _ => self.eval_target_rhs(packed_lvalue, rvalue),
+                let val = match (packed_pattern, &rvalue.kind) {
+                    (Some(v), _) => v,
+                    (None, ExprKind::AssignmentPattern(_)) => self.eval_expr(rvalue),
+                    (None, _) => self.eval_target_rhs(packed_lvalue, rvalue),
                 };
                 // LRM §14.4: clocking-block output drive
                 // `cb.<out_sig> <= val`. Defer to the cb's next clock
@@ -5597,9 +5601,13 @@ impl Simulator {
                                 // §13.4.1: in the return variable's context,
                                 // like `f = e` (`return b + u` with a byte b
                                 // and 8-bit u in an int function is 9 bits).
-                                None => match self.fn_ret_ctx_stack.last() {
-                                    Some(&w) if w > 0 => self.eval_expr_ctx(e, w),
-                                    _ => self.eval_expr(e),
+                                // §10.8: a pattern takes the return type.
+                                None => match self.ret_pattern_value(e) {
+                                    Some(v) => v,
+                                    None => match self.fn_ret_ctx_stack.last() {
+                                        Some(&w) if w > 0 => self.eval_expr_ctx(e, w),
+                                        _ => self.eval_expr(e),
+                                    },
                                 },
                             },
                         }

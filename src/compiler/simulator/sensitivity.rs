@@ -69,6 +69,7 @@ impl Simulator {
                     Self::collect_leaf_idents(p.expr(), out);
                 }
             }
+            ExprKind::TypedPattern { pattern, .. } => Self::collect_leaf_idents(pattern, out),
             ExprKind::Replication { count, exprs } => {
                 Self::collect_leaf_idents(count, out);
                 for e in exprs {
@@ -651,6 +652,9 @@ impl Simulator {
                     Self::collect_rooted_ident_names(it.expr(), out);
                 }
             }
+            ExprKind::TypedPattern { pattern, .. } => {
+                Self::collect_rooted_ident_names(pattern, out)
+            }
             ExprKind::Inside { expr, ranges } => {
                 Self::collect_rooted_ident_names(expr, out);
                 for r in ranges {
@@ -899,6 +903,9 @@ impl Simulator {
                 for p in parts {
                     Self::collect_expr_reads(p.expr(), module, reads);
                 }
+            }
+            ExprKind::TypedPattern { pattern, .. } => {
+                Self::collect_expr_reads(pattern, module, reads)
             }
             ExprKind::Replication { count, exprs } => {
                 Self::collect_expr_reads(count, module, reads);

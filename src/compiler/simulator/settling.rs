@@ -662,19 +662,10 @@ impl Simulator {
                     *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                 }
                 let w = self.infer_lhs_width(lhs);
-                // §7.4.2/§10.9: `assign x = '{...}` (or `assign x[i] = '{...}`
-                // on an array of packed vectors) converts each item to the
-                // ELEMENT type. The generic eval concatenates items at their
-                // own widths, which scrambles any item that is not exactly
-                // element-sized.
-                //
-                let val = if let ExprKind::AssignmentPattern(items) = &rhs.kind {
-                    self.packed_pattern_for_lhs(lhs, items)
-                        .or_else(|| self.eval_packed_struct_pattern(lhs, items))
-                        .unwrap_or_else(|| self.eval_expr_ctx(rhs, w))
-                        .resize(w)
-                } else {
-                    self.eval_expr_ctx(rhs, w).resize(w)
+                // §10.8, §10.9: a pattern takes the net's declared type.
+                let val = match self.eval_pattern_for_lvalue(lhs, rhs) {
+                    Some(v) => v.resize(w),
+                    None => self.eval_expr_ctx(rhs, w).resize(w),
                 };
                 let delay = if *explicit_delay > 0 {
                     *explicit_delay

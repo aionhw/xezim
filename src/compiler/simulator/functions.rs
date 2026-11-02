@@ -383,9 +383,12 @@ impl Simulator {
                 // formal_seed` below only resizes the value that is handed it,
                 // which cannot restore a carry the self-determined width
                 // already dropped.
-                let value = match self.actual_context_width(port) {
-                    Some(w) => self.eval_expr_ctx(&args[i], w),
-                    None => self.eval_expr(&args[i]),
+                let value = match self.formal_pattern_value(port, &args[i]) {
+                    Some(v) => v,
+                    None => match self.actual_context_width(port) {
+                        Some(w) => self.eval_expr_ctx(&args[i], w),
+                        None => self.eval_expr(&args[i]),
+                    },
                 };
                 self.vif_argument_value(port, &args[i], value)
             } else if let Some(def) = &port.default {
@@ -683,6 +686,8 @@ impl Simulator {
             .scalar_formal_integral(&fd.return_type)
             .map_or(0, |(w, _)| w);
         self.fn_ret_ctx_stack.push(ret_ctx);
+        let frame = self.return_pattern_type(fd);
+        self.fn_ret_frames.push(frame);
         // §13.4.1: a function returning a queue, dynamic or associative
         // array (through a typedef) has a return VARIABLE of that type: the
         // body may fill it in place (`f.push_back(v)`, `f[k] = v`, `f = new[n]`,
@@ -809,6 +814,7 @@ impl Simulator {
         self.fn_ret_collection_stack.pop();
         self.fn_ret_assoc_stack.pop();
         self.fn_ret_ctx_stack.pop();
+        self.fn_ret_frames.pop();
         self.pkg_scope_stack.pop();
         self.m_scope_stack = saved_m_scope_fn;
         self.this_stack.pop();
@@ -2394,7 +2400,10 @@ impl Simulator {
                 }
                 _ => {
                     let mut val = if arg_supplied(i) {
-                        let value = self.eval_expr(&args[i]);
+                        let value = match self.formal_pattern_value(port, &args[i]) {
+                            Some(v) => v,
+                            None => self.eval_expr(&args[i]),
+                        };
                         self.vif_argument_value(port, &args[i], value)
                     } else if let Some(def) = &port.default {
                         // Caller omitted this arg → apply the formal's default

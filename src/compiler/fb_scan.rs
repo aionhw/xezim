@@ -259,6 +259,7 @@ impl FbScan<'_> {
                     self.lvalue(it.expr(), flags);
                 }
             }
+            ExprKind::TypedPattern { pattern, .. } => self.lvalue(pattern, flags),
             _ => self.expr(e),
         }
     }
@@ -459,6 +460,7 @@ impl FbScan<'_> {
                 }
             }
             ExprKind::ShallowCopy { source } => self.expr(source),
+            ExprKind::TypedPattern { pattern, .. } => self.expr(pattern),
             // Implicit iterator / pattern / constraint names.
             ExprKind::WithClause { .. } => self.refuse("fb_with_clause"),
             ExprKind::RandomizeWith { .. } => self.refuse("fb_randomize_with"),

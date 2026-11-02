@@ -15,6 +15,7 @@ use super::{
     bytecode, dispatch, elaborate, fst_sink, interrupt, jit, sdf, stdout_sink, value, vcd_sink,
 };
 
+use super::packed_assignment_pattern_plan::{has_pattern, is_packed};
 use super::elaborate::{
     AlwaysBlock, CollShape, Dim, DpiImportSpec, ElaboratedModule, KeyKind, Signal,
 };
@@ -2185,18 +2186,6 @@ pub(super) struct MetaOwner {
     gens: Vec<u64>,
 }
 
-/// A packed struct's member layout and its members' packed dimensions.
-pub(super) type PackedStructShape = (Vec<(String, u32, u32)>, HashMap<String, Vec<(i64, i64)>>);
-
-/// Where `apply_packed_struct_pattern` finds the packed dimensions of a
-/// struct member: under a registered root signal (`root.member` in
-/// `packed_full_dims`), or in a map keyed by member path built from the
-/// struct's type. `Root("")` knows none.
-pub(super) enum PackedDims<'a> {
-    Root(&'a str),
-    Map(&'a HashMap<String, Vec<(i64, i64)>>),
-}
-
 /// A process parked on a CLASS-FIELD named event (`event m_event` inside a
 /// class, awaited/triggered as `@m_event` / `->m_event` from a method on
 /// `this`). Unlike a module-scope named event, a class `event` field has no
@@ -3012,6 +3001,7 @@ mod jit_runtime;
 mod mailboxes;
 mod method_types;
 mod named_events;
+mod packed_assignment_patterns;
 mod process_control;
 mod process_scopes;
 mod processes;
@@ -6729,6 +6719,16 @@ enum CombPlan {
     Interp,
 }
 
+/// A `fn_ret_frames` entry: the declaration whose return type a pattern in
+/// `return` takes, held by reference count.
+#[derive(Clone)]
+pub(crate) enum ReturnPatternType {
+    /// A return type no pattern can target.
+    NotPacked,
+    Func(std::rc::Rc<DataType>),
+    Method(Arc<crate::ast::decl::ClassMethod>),
+}
+
 #[derive(serde::Serialize)]
 pub struct Simulator {
     pub signals: SignalMap,
@@ -7987,6 +7987,15 @@ pub struct Simulator {
     /// integral return, the context `return e` evaluates `e` in (§13.4.1:
     /// as if assigned to the return variable); 0 for other types.
     fn_ret_ctx_stack: Vec<u32>,
+    /// Parallel to `fn_ret_ctx_stack`: the running subroutine, for the type
+    /// `return '{...}` takes (§10.8, §13.4.1). Empty whenever no function is
+    /// running, which is every checkpoint.
+    #[serde(skip)]
+    fn_ret_frames: Vec<ReturnPatternType>,
+    /// Shared return types of free functions, by return-type span then
+    /// function name, so a call pushes its frame without allocating.
+    #[serde(skip)]
+    fn_ret_types: HashMap<(usize, usize), Vec<(String, std::rc::Rc<DataType>)>>,
     /// Stable instance scope of the process currently running (for `%m`).
     /// Unlike `name_resolve_hint`, this is not mutated by name resolution.
     current_scope: String,
@@ -8649,6 +8658,9 @@ pub struct Simulator {
     /// large) real delay value, keyed by the delay expression's source offset —
     /// warn once per site so a spiking clock names itself without spamming.
     warned_delay_spikes: HashSet<usize>,
+    /// Assignment patterns already warned about an uncovered member.
+    #[serde(skip)]
+    warned_uncovered_patterns: HashSet<(usize, usize)>,
     /// PIDs whose first-at-time-0 variable `#(expr)` delay evaluated to 0 and
     /// was deferred once past the time-0 settle (so the period signal — e.g. a
     /// real cont-assign feeding `always #(p/2) clk=~clk` — settles before the

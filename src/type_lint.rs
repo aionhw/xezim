@@ -3273,7 +3273,8 @@ pub(crate) fn visit_expr<'e>(e: &'e Expression, f: &mut dyn FnMut(&'e Expression
         }
         ExprKind::Paren(x)
         | ExprKind::Specialization { base: x, .. }
-        | ExprKind::ShallowCopy { source: x } => visit_expr(x, f),
+        | ExprKind::ShallowCopy { source: x }
+        | ExprKind::TypedPattern { pattern: x, .. } => visit_expr(x, f),
         ExprKind::WithClause { expr, filter } => {
             visit_expr(expr, f);
             visit_expr(filter, f);

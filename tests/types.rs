@@ -193,6 +193,8 @@ mod packed_3d_chained_select;
 mod packed_array_typedef_element_width;
 #[path = "types/packed_assignment_patterns.rs"]
 mod packed_assignment_patterns;
+#[path = "types/packed_pattern_context_type.rs"]
+mod packed_pattern_context_type;
 #[path = "types/packed_elem_shift_context_width.rs"]
 mod packed_elem_shift_context_width;
 #[path = "types/packed_element_range_select.rs"]
