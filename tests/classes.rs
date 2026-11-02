@@ -1059,3 +1059,12 @@ mod concurrent_local_type_metadata;
 
 #[path = "classes/renamed_local_member_reads.rs"]
 mod renamed_local_member_reads;
+
+#[path = "classes/randomize_size_dist_redraw.rs"]
+mod randomize_size_dist_redraw;
+
+#[path = "classes/randomize_array_reductions.rs"]
+mod randomize_array_reductions;
+
+#[path = "classes/randomize_elem_dist_weights.rs"]
+mod randomize_elem_dist_weights;

@@ -281,3 +281,6 @@ mod string_key_order;
 
 #[path = "collections/review_real_assoc_store.rs"]
 mod review_real_assoc_store;
+
+#[path = "collections/reduction_with_struct_field.rs"]
+mod reduction_with_struct_field;
