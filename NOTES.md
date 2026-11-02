@@ -48,6 +48,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   philipaxer. An index type wider than 64 bits names one element per
   value, so `w[5]` and `w[100'h5]` are the same element and a `next()`
   walk over such keys ends (§7.8.4).
+* A constructor call is checked against the class's own `new` like any
+  other call: too many actuals, or a formal left without an actual and
+  without a default, is an error, for `new`, `new(...)` and `C::new(...)`,
+  in assignments and declarations. A class that declares no constructor has
+  the implicit `new()`, which takes no arguments. Such calls ran with the
+  missing formals left at their defaults and the extra actuals dropped
+  (§8.7, §13.5, #812, reported by dhanunay).
 * Each operand of `&&`, `||`, `->` and `<->` is self-determined in
   compiled continuous assignments, `always_comb` and `always_ff`: both were
   sized to the wider one, counting a call as wide as its widest argument, so
