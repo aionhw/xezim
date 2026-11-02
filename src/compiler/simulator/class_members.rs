@@ -3073,6 +3073,9 @@ impl Simulator {
         let base = strip(base);
         let mut cur = Some(self.typedef_unroll(derived));
         let mut guard = 0;
+        // §8.26: a class is also every interface class it or a base class
+        // implements, and every one those extend.
+        let mut ifaces: Vec<String> = Vec::new();
         while let Some(c) = cur {
             guard += 1;
             if guard > 128 {
@@ -3081,14 +3084,35 @@ impl Simulator {
             if strip(&c) == base || self.class_origin(&c) == base {
                 return true;
             }
-            let nxt = self
+            let cd = self
                 .module
                 .classes
                 .get(&c)
-                .or_else(|| self.module.classes.get(&strip(&c)))
+                .or_else(|| self.module.classes.get(&strip(&c)));
+            if let Some(cd) = cd {
+                ifaces.extend(cd.implements.iter().cloned());
+            }
+            cur = cd
                 .and_then(|cd| cd.extends.clone())
                 .map(|e| self.typedef_unroll(&e));
-            cur = nxt;
+        }
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(i) = ifaces.pop() {
+            if seen.len() > 128 || !seen.insert(i.clone()) {
+                continue;
+            }
+            let i = self.typedef_unroll(&i);
+            if strip(&i) == base {
+                return true;
+            }
+            if let Some(cd) = self
+                .module
+                .classes
+                .get(&i)
+                .or_else(|| self.module.classes.get(&strip(&i)))
+            {
+                ifaces.extend(cd.extends.iter().chain(&cd.implements).cloned());
+            }
         }
         false
     }
