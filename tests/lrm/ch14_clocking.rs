@@ -46,6 +46,19 @@ fn c14_16_clocking_inout_iface_net() {
     );
 }
 
+// §14.3, §14.5: clockvars bound to expressions in interface instances
+#[test]
+fn c14_5_clocking_expr_iface() {
+    check(
+        "14.5_clocking_expr_iface",
+        include_str!("sv/14.5_clocking_expr_iface.sv"),
+        "top",
+        Order::Exact,
+        &["T|q|u1=1 u2=0", "T|d|u1=1 u2=0"],
+        &[],
+    );
+}
+
 // §14.4: Output skew (default output #2)
 #[test]
 fn c14_16_clocking_output_skew() {
