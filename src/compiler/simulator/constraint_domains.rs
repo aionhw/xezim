@@ -4598,22 +4598,15 @@ impl Simulator {
         match &expr.kind {
             ExprKind::Call { func, args } => {
                 if let ExprKind::MemberAccess { member, .. } = &func.kind {
-                    // NOTE: `sum` is deliberately absent — a `.sum() == K`
-                    // equality is now solved by `distribute_array_sum` and must
-                    // be CHECKED (so an infeasible target retries/fails instead
-                    // of silently passing). The rest stay unmodeled.
+                    // NOTE: the reductions are deliberately absent — `.sum()`,
+                    // `.and()`, `.or()`, `.xor()` and `.product()` equalities
+                    // are solved by `distribute_array_sum` and
+                    // `repair_array_reduction` and must be CHECKED (so an
+                    // infeasible target retries/fails instead of silently
+                    // passing). The rest stay unmodeled.
                     if matches!(
                         member.name.as_str(),
-                        "size"
-                            | "exists"
-                            | "len"
-                            | "product"
-                            | "min"
-                            | "max"
-                            | "num"
-                            | "and"
-                            | "or"
-                            | "xor"
+                        "size" | "exists" | "len" | "min" | "max" | "num"
                     ) {
                         return true;
                     }

@@ -2141,16 +2141,23 @@ impl Simulator {
 
     /// The bare array name of a `<arr>.sum()` call (no `with`).
     pub(super) fn plain_sum_array(e: &Expression) -> Option<String> {
+        Self::plain_reduce_array(e, "sum")
+    }
+
+    /// The bare array name of a `<arr>.<method>()` reduction call (no `with`).
+    pub(super) fn plain_reduce_array(e: &Expression, method: &str) -> Option<String> {
         match &e.kind {
-            ExprKind::Call { func, args } if args.is_empty() => Self::plain_sum_array(func),
-            ExprKind::MemberAccess { expr, member } if member.name == "sum" => {
+            ExprKind::Call { func, args } if args.is_empty() => {
+                Self::plain_reduce_array(func, method)
+            }
+            ExprKind::MemberAccess { expr, member } if member.name == method => {
                 if let ExprKind::Ident(h) = &expr.kind {
                     return h.path.last().map(|s| s.name.name.clone());
                 }
                 None
             }
             ExprKind::Ident(h)
-                if h.path.len() >= 2 && h.path.last().is_some_and(|s| s.name.name == "sum") =>
+                if h.path.len() >= 2 && h.path.last().is_some_and(|s| s.name.name == method) =>
             {
                 Some(h.path[h.path.len() - 2].name.name.clone())
             }
@@ -2407,7 +2414,257 @@ impl Simulator {
                     .map(|i| format!("{}[{}]", c.scoped, i))
                     .collect();
                 self.distribute_sum_over(&keys, k, lo, hi, c.width, pinned);
+            } else if let Some((c, method, view, k)) = self.reduce_eq_target(it, colls, rand_names)
+            {
+                self.repair_array_reduction(&c, method, view, k, pinned);
             }
+        }
+    }
+
+    /// §7.12.3/§18.5.8.2 — `<arr>.<red>() [with (item[.field])] == K` for a
+    /// reduction `distribute_array_sum` does not solve: `and`, `or`, `xor`,
+    /// `product`, and a `sum` over a struct field. Returns the collection,
+    /// the reduction, the bits of each element it reduces (offset, width) and
+    /// the target, which must fit those bits: the reduction's result has the
+    /// width of its operand.
+    pub(super) fn reduce_eq_target(
+        &mut self,
+        item: &ConstraintItem,
+        colls: &[RandColl],
+        rand_names: &HashSet<String>,
+    ) -> Option<(RandColl, &'static str, (u32, u32), u64)> {
+        let ConstraintItem::Expr(e) = item else {
+            return None;
+        };
+        let ExprKind::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } = &e.kind
+        else {
+            return None;
+        };
+        for (red_side, const_side) in [(left, right), (right, left)] {
+            let mut side = red_side.as_ref();
+            while let ExprKind::Paren(inner) = &side.kind {
+                side = inner;
+            }
+            let (call, filter) = match &side.kind {
+                ExprKind::WithClause { expr, filter } => (expr.as_ref(), Some(filter.as_ref())),
+                _ => (side, None),
+            };
+            let Some((method, name)) = ["and", "or", "xor", "product", "sum"]
+                .into_iter()
+                .find_map(|m| Self::plain_reduce_array(call, m).map(|n| (m, n)))
+            else {
+                continue;
+            };
+            let Some(c) = colls.iter().find(|c| c.prop == name).cloned() else {
+                continue;
+            };
+            if c.is_object_elem || c.nested || c.width > 64 {
+                continue;
+            }
+            let view = match filter {
+                None => (0, c.width),
+                Some(f) if self.filter_is_identity(f) => (0, c.width),
+                Some(f) => {
+                    // `item.field` of a packed-struct element.
+                    let field = match &f.kind {
+                        ExprKind::Ident(h)
+                            if h.path.len() == 2
+                                && h.path[0].name.name == "item"
+                                && h.path.iter().all(|s| s.selects.is_empty()) =>
+                        {
+                            h.path[1].name.name.clone()
+                        }
+                        ExprKind::MemberAccess { expr, member }
+                            if Self::plain_ident_name(expr).as_deref() == Some("item") =>
+                        {
+                            member.name.clone()
+                        }
+                        _ => continue,
+                    };
+                    let fields = self.coll_packed_elem_fields(&c.scoped);
+                    let Some(&(_, off, w)) = fields
+                        .as_ref()
+                        .and_then(|fs| fs.iter().find(|(n, _, _)| *n == field))
+                    else {
+                        continue;
+                    };
+                    (off, w)
+                }
+            };
+            // A plain `sum` is `distribute_array_sum`'s.
+            if method == "sum" && view == (0, c.width) {
+                continue;
+            }
+            let mut ids: HashSet<String> = HashSet::default();
+            self.collect_expr_idents(const_side, &mut ids);
+            if ids
+                .iter()
+                .any(|n| rand_names.contains(n) || colls.iter().any(|c| &c.prop == n))
+            {
+                continue;
+            }
+            let tv = self.eval_expr(const_side);
+            let Some(k) = tv.to_u64().filter(|_| !tv.has_xz()) else {
+                continue;
+            };
+            let mask = if view.1 >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << view.1) - 1
+            };
+            if k & !mask != 0 {
+                continue;
+            }
+            return Some((c, method, view, k));
+        }
+        None
+    }
+
+    /// Construct elements meeting `<red>(view of each element) == k`: draw
+    /// the free elements as they are and correct as few of them as the
+    /// reduction needs (rejection over the element domain almost never meets
+    /// an `and`/`or`/`xor`/`product` target). Elements pinned by another
+    /// constraint keep their value; an infeasible target is left to the trial
+    /// checker, which rejects and retries.
+    pub(super) fn repair_array_reduction(
+        &mut self,
+        c: &RandColl,
+        method: &str,
+        (off, w): (u32, u32),
+        k: u64,
+        pinned: &mut HashSet<String>,
+    ) {
+        use rand::Rng;
+        let keys = self.coll_elem_keys(c);
+        if keys.is_empty() {
+            return;
+        }
+        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let mut vals: Vec<u64> = keys
+            .iter()
+            .map(|key| {
+                self.read_coll_elem(key)
+                    .and_then(|v| v.to_u64())
+                    .map_or(0, |v| (v >> off) & mask)
+            })
+            .collect();
+        let free: Vec<usize> = (0..keys.len())
+            .filter(|&i| !pinned.contains(&keys[i]))
+            .collect();
+        if free.is_empty() {
+            return;
+        }
+        let pick = |sim: &mut Self| free[sim.cur_rng().gen_range(0..free.len())];
+        let mut touched: Vec<usize> = Vec::new();
+        match method {
+            // Every element holds the target's ones, and every other bit is
+            // 0 in at least one element.
+            "and" => {
+                for &i in &free {
+                    vals[i] |= k;
+                }
+                let extra = vals.iter().fold(mask, |a, v| a & v) & !k;
+                for b in (0..w).filter(|b| extra >> b & 1 == 1) {
+                    let i = pick(self);
+                    vals[i] &= !(1u64 << b);
+                }
+                touched.extend(&free);
+            }
+            // No element holds a bit outside the target, and every target
+            // bit is 1 in at least one element.
+            "or" => {
+                for &i in &free {
+                    vals[i] &= k;
+                }
+                let missing = k & !vals.iter().fold(0, |a, v| a | v);
+                for b in (0..w).filter(|b| missing >> b & 1 == 1) {
+                    let i = pick(self);
+                    vals[i] |= 1u64 << b;
+                }
+                touched.extend(&free);
+            }
+            "xor" => {
+                let j = pick(self);
+                let rest = (0..vals.len())
+                    .filter(|&i| i != j)
+                    .fold(0, |a, i| a ^ vals[i]);
+                vals[j] = (rest ^ k) & mask;
+                touched.push(j);
+            }
+            // The result wraps at the operand width.
+            "sum" => {
+                let j = pick(self);
+                let rest = (0..vals.len())
+                    .filter(|&i| i != j)
+                    .fold(0u64, |a, i| a.wrapping_add(vals[i]));
+                vals[j] = k.wrapping_sub(rest) & mask;
+                touched.push(j);
+            }
+            "product" => {
+                let prod = |vals: &[u64], skip: Option<usize>| {
+                    (0..vals.len())
+                        .filter(|&i| Some(i) != skip)
+                        .fold(1u64, |a, i| a.wrapping_mul(vals[i]))
+                        & mask
+                };
+                if prod(&vals, None) == k {
+                    return;
+                }
+                let j = pick(self);
+                if k == 0 {
+                    vals[j] = 0;
+                } else {
+                    // `x * P == k (mod 2^w)` takes `P = 2^t * odd` with
+                    // 2^t dividing k; make the other free elements odd when
+                    // their product has too many factors of 2.
+                    let need = k.trailing_zeros();
+                    if prod(&vals, Some(j)) == 0 || prod(&vals, Some(j)).trailing_zeros() > need {
+                        for &i in free.iter().filter(|&&i| i != j) {
+                            vals[i] |= 1;
+                            touched.push(i);
+                        }
+                    }
+                    let p = prod(&vals, Some(j));
+                    if p == 0 || p.trailing_zeros() > need {
+                        return;
+                    }
+                    let t = p.trailing_zeros();
+                    let odd = p >> t;
+                    // Inverse of an odd number modulo 2^64 (Newton).
+                    let mut inv = odd;
+                    for _ in 0..6 {
+                        inv = inv.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(inv)));
+                    }
+                    // `x` is fixed modulo 2^(w-t); its bits above are free.
+                    let low_mask = if w - t >= 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << (w - t)) - 1
+                    };
+                    let low = (k >> t).wrapping_mul(inv) & low_mask;
+                    let hi = if t == 0 {
+                        0
+                    } else {
+                        self.cur_rng().r#gen::<u64>() << (w - t)
+                    };
+                    vals[j] = (low | hi) & mask;
+                }
+                touched.push(j);
+            }
+            _ => return,
+        }
+        for i in touched {
+            let old = self
+                .read_coll_elem(&keys[i])
+                .and_then(|v| v.to_u64())
+                .unwrap_or(0);
+            let new = (old & !(mask << off)) | (vals[i] << off);
+            self.write_coll_elem(&keys[i], Value::from_u64(new, c.width));
+            pinned.insert(keys[i].clone());
         }
     }
 
