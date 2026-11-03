@@ -3169,7 +3169,9 @@ impl<'a> BytecodeCompiler<'a> {
                 ) && (self.decl_is_real(&m.data_type, scope)
                     || (1..=64).contains(&self.decl_width_in(&m.data_type, scope)));
                 for d in &m.declarators {
-                    if !scalar || !d.dimensions.is_empty() {
+                    // §7.2.2: a member default initializes the scalarized
+                    // locals too; they are declared without one.
+                    if !scalar || !d.dimensions.is_empty() || d.init.is_some() {
                         return None;
                     }
                     out.push((d.name.name.clone(), m.data_type.clone()));
