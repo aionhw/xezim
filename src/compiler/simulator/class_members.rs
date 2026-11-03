@@ -1214,6 +1214,13 @@ impl Simulator {
         }
     }
 
+    /// Storage key of `ClassName::q` for a static queue or dynamic array
+    /// (§8.9): the store the class's own methods use.
+    fn class_scoped_static_coll(&self, class: &str, member: &str) -> Option<String> {
+        self.member_is_static_coll(class, member)
+            .then(|| self.spec_static_coll_key_in_class(member, class))
+    }
+
     /// Instance-scoped storage name for an associative-array access whose
     /// base expression is either a bare member (`m` — uses `this`) or a
     /// member of another object (`obj.m`). Returns `<handle>#<member>`.
@@ -1368,6 +1375,11 @@ impl Simulator {
                         {
                             return Some(k);
                         }
+                        if let Some(k) =
+                            self.class_scoped_static_coll(&bh.path[0].name.name, &member.name)
+                        {
+                            return Some(k);
+                        }
                     }
                     obj_member(self, &bh.path[0].name.name, &member.name)
                 }
@@ -1518,6 +1530,12 @@ impl Simulator {
                     }
                     let hd = self.eval_expr(&base_expr).to_u64().unwrap_or(0) as usize;
                     return self.handle_collection_name(hd, &h.path[1].name.name);
+                }
+                if self.module.classes.contains_key(&h.path[0].name.name)
+                    && let Some(k) =
+                        self.class_scoped_static_coll(&h.path[0].name.name, &h.path[1].name.name)
+                {
+                    return Some(k);
                 }
                 obj_member(self, &h.path[0].name.name, &h.path[1].name.name)
             }
