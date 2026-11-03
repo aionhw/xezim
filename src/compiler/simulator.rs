@@ -337,7 +337,8 @@ fn method_boost_enabled() -> bool {
 /// the suite-level ON == OFF parity run against a warm cache.
 // §18.8 (#846): mode builtins retain their receiver expressions in compiled code.
 // §11.4.10, §11.4.3: shift, `/`, `%` and `**` operands of unknown width keep their loaded width.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3068;
+// §8.25: compiled methods take type-parameter formals and locals.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3069;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never

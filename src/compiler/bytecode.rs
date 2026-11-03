@@ -5908,7 +5908,6 @@ impl<'a> BytecodeCompiler<'a> {
                 let m = member.name.as_str();
                 let loadable =
                     !(self.class_shadow_names.contains(m) && !self.member_safe_names.contains(m));
-            && !self.member_safe_names.contains(m));
                 loadable && self.method_handle_chain_ok(inner)
             }
             crate::ast::expr::ExprKind::Index { .. } => {
@@ -22263,6 +22262,14 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::Format(..)
                 | Insn::StrOp(..)
                 | Insn::BinOpConstAdd2(..)
+                | Insn::CallMethod(..)
+                | Insn::CallScopedMethod(..)
+                | Insn::CallStaticScoped(..)
+                | Insn::CallFreeFunction(..)
+                | Insn::CallCollMethod(..)
+                | Insn::ConstructObject(..)
+                | Insn::ForeachNext(..)
+                | Insn::Cast(..)
         )
     }
 
@@ -23577,19 +23584,36 @@ impl<'a> BytecodeCompiler<'a> {
                 // Class-member store defines nothing (only the heap object).
                 Insn::StoreClassMember(..) => {}
                 // Method call: dest width isn't statically known (callee
-                // return width follows its runtime type) — bare dest store.
-                Insn::CallMethod(d, ..) => store(&mut rw, *d, None),
-                Insn::CallScopedMethod(d, ..) => store(&mut rw, *d, None),
-                Insn::CallFreeFunction(d, ..) => store(&mut rw, *d, None),
+                // return width follows its runtime type) — bare dest store,
+                // and any writeback argument registers `a..a+n` may be
+                // overwritten in place by `vm_drain_arg_temps`.
+                Insn::CallMethod(d, _, _, a, n)
+                | Insn::CallScopedMethod(d, _, _, a, n) => {
+                    store(&mut rw, *d, None);
+                    for x in *a..*a + (*n as RegId) {
+                        store(&mut rw, x, None);
+                    }
+                }
+                Insn::CallFreeFunction(d, _, a, n)
+                | Insn::CallStaticScoped(d, _, a, n)
+                | Insn::ConstructObject(d, _, a, n) => {
+                    store(&mut rw, *d, None);
+                    for x in *a..*a + (*n as RegId) {
+                        store(&mut rw, x, None);
+                    }
+                }
                 Insn::LoadClassStatic(d, ..) => store(&mut rw, *d, None),
                 // Step 9g: static store defines no SSA value; a fresh
                 // object handle has runtime-determined width (bare store).
                 Insn::StoreClassStatic(..) => {}
-                Insn::ConstructObject(d, ..) => store(&mut rw, *d, None),
-                Insn::CallStaticScoped(d, ..) => store(&mut rw, *d, None),
                 // Collection builtin: dest width follows the runtime member
                 // (count / exists flag / popped element) — bare dest store.
-                Insn::CallCollMethod(d, ..) => store(&mut rw, *d, None),
+                Insn::CallCollMethod(d, _, _, a, n, _) => {
+                    store(&mut rw, *d, None);
+                    for x in *a..*a + (*n as RegId) {
+                        store(&mut rw, x, None);
+                    }
+                }
                 // Collection element read: width follows the runtime store —
                 // bare dest store (like LoadClassMember).
                 Insn::LoadCollElem(d, ..) => store(&mut rw, *d, None),
