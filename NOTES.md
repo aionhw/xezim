@@ -271,6 +271,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   its name: a nonblocking write in a method, `s.f <= v`, and an element write
   through a handle, `h.v[1] = x`, wrote the module's `s` or `v` (§8.4,
   §10.4.2).
+* A clockvar bound to a part-select, `input a = bus[3:0];` or `output o =
+  o_drv[3:0];`, samples that slice at the clocking event and a drive of it
+  writes the slice and leaves the other bits alone; such a clockvar read x
+  and drove nothing (§14.5, #823, reported by philipaxer).
+* The output skew of a renamed clockvar, `output #2 q = q_drv;`, applies to a
+  drive issued between clocking events: the drive took effect at the next
+  clocking event instead of two time units after it (§14.4, §14.16, #824,
+  reported by philipaxer).
 
 **Performance**
 
@@ -321,6 +329,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   per clock: 2,000 such blocks spent 23.1 s of a 24.8 s run in the NBA
   region, now 0.25 s (§9.2.2.4, §9.4.2). A RAM model's dynamic index keeps
   the whole-array arming.
+* With no top named, a design whose only uninstantiated module stands
+  beside a package, a `$unit` class or another non-instantiable declaration
+  keeps the compilation-unit subroutine bodies in that module alone. The
+  package or class counted as a second root, so every definition got every
+  body again: 200 definitions and a 2,000-arm `$unit` function compiled in
+  2,013 MB, now 56 MB, the same as with `-s top` (§23.3.1, §3.12.1, #834,
+  reported by git-hevangel). Two or more uninstantiated modules still take
+  the eager copy.
 * A member of a struct resolution function's result, the `n.V =
   res('{...}).V` assign a struct nettype emits for each member, compiles:
   the function is inlined over one scalar per member (§6.6.7, §7.2, PR #837
