@@ -15024,8 +15024,7 @@ impl<'a> BytecodeCompiler<'a> {
                         // §11.8.1 signedness applies exactly as for +/-.
                         let opw = ctx_width
                             .max(self.lrm_self_width(left))
-                            .max(self.lrm_self_width(right))
-                            .max(1);
+                            .max(self.lrm_self_width(right));
                         let ls = self.expr_signedness(left);
                         let rs = self.expr_signedness(right);
                         if ls == Some(false) || rs == Some(false) {
@@ -15036,8 +15035,10 @@ impl<'a> BytecodeCompiler<'a> {
                                 self.emit(Insn::ClearSigned(r));
                             }
                         }
-                        self.emit(Insn::Resize(l, opw));
-                        self.emit(Insn::Resize(r, opw));
+                        if opw > 0 {
+                            self.emit(Insn::Resize(l, opw));
+                            self.emit(Insn::Resize(r, opw));
+                        }
                         if matches!(op, BinaryOp::Div) {
                             self.emit(Insn::Div(dest, l, r));
                         } else {
@@ -15124,8 +15125,12 @@ impl<'a> BytecodeCompiler<'a> {
                         // operation width — ctx joined with the operand's own
                         // LRM width (never the carry-aware estimate, which
                         // shifted dropped carries back into range).
-                        let opw = ctx_width.max(self.lrm_self_width(left)).max(1);
-                        self.emit(Insn::Resize(l, opw));
+                        // An operand of unknown width (0) in a self-determined
+                        // context keeps the width its load produced.
+                        let opw = ctx_width.max(self.lrm_self_width(left));
+                        if opw > 0 {
+                            self.emit(Insn::Resize(l, opw));
+                        }
                         self.emit(Insn::Shl(dest, l, r));
                     }
                     BinaryOp::ShiftRight | BinaryOp::ArithShiftRight => {
@@ -15135,8 +15140,10 @@ impl<'a> BytecodeCompiler<'a> {
                         // shifted at 8 bits then zero-extended (00000013 for
                         // 1ffffff3), and `(a+a) >> 1` shifted the carry back
                         // in (0xa3 for 0x23).
-                        let opw = ctx_width.max(self.lrm_self_width(left)).max(1);
-                        self.emit(Insn::Resize(l, opw));
+                        let opw = ctx_width.max(self.lrm_self_width(left));
+                        if opw > 0 {
+                            self.emit(Insn::Resize(l, opw));
+                        }
                         if matches!(op, BinaryOp::ShiftRight) {
                             self.emit(Insn::Shr(dest, l, r));
                         } else {
@@ -15174,8 +15181,10 @@ impl<'a> BytecodeCompiler<'a> {
                             // to the operation width first; `a ** 2` in a
                             // 32-bit context computed at 8 bits (0x90) and
                             // then bailed the whole block to the interpreter.
-                            let opw = sub_ctx.max(self.expr_max_width(left)).max(1);
-                            self.emit(Insn::Resize(l, opw));
+                            let opw = sub_ctx.max(self.expr_max_width(left));
+                            if opw > 0 {
+                                self.emit(Insn::Resize(l, opw));
+                            }
                             self.emit(Insn::Pow(dest, l, r));
                         }
                     }
