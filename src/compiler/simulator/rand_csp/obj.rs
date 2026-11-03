@@ -89,6 +89,8 @@ impl Simulator {
         let mut out: Vec<(String, usize)> = Vec::new();
         let mut seen: HashSet<usize> = HashSet::default();
         let mut elems_in = false;
+        // §18.8: element handles whose rand_mode is off are not solved.
+        let off = self.rand_mode_disabled.get(&handle);
         for p in rand_obj_props {
             if !Self::csp_constraints_read(p, constraints) {
                 continue;
@@ -126,10 +128,14 @@ impl Simulator {
                         if sub == 0 || self.heap.get(sub).and_then(|o| o.as_ref()).is_none() {
                             continue;
                         }
+                        let name = format!("{}[{}]", p, idx);
+                        if off.is_some_and(|d| d.contains(&name)) {
+                            continue;
+                        }
                         if sub == handle || !seen.insert(sub) {
                             return None;
                         }
-                        out.push((format!("{}[{}]", p, idx), sub));
+                        out.push((name, sub));
                     }
                 }
                 None => {

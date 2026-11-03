@@ -1305,18 +1305,21 @@ impl Simulator {
                 // preserved (a shared element is randomized once, and both
                 // slots read the same result). §18.5.9/§18.4.1.
                 let coll_name = format!("{}#{}", handle, p);
-                let is_coll = self.is_associative_array(&coll_name)
-                    || self
-                        .heap
-                        .get(handle)
-                        .and_then(|o| o.as_ref())
-                        .map(|i| i.class_name.clone())
-                        .and_then(|cn| self.module.classes.get(&cn).cloned())
-                        .map(|cd| {
-                            cd.queue_properties.contains_key(p)
-                                || cd.array_properties.contains_key(p)
-                        })
-                        .unwrap_or(false);
+                // The declaring class may be a base class (§8.13).
+                let mut is_coll = self.is_associative_array(&coll_name);
+                let mut cn = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .map(|i| i.class_name.clone());
+                while let (false, Some(c)) = (is_coll, cn) {
+                    let Some(cd) = self.module.classes.get(&c) else {
+                        break;
+                    };
+                    is_coll =
+                        cd.queue_properties.contains_key(p) || cd.array_properties.contains_key(p);
+                    cn = cd.extends.clone();
+                }
                 if is_coll {
                     if self.is_associative_array(&coll_name) {
                         // Associative array: iterate the stored keys.
@@ -1329,6 +1332,11 @@ impl Simulator {
                             .map(|k| k[prefix.len()..k.len() - 1].to_string())
                             .collect();
                         for key in keys {
+                            // §18.8: an element handle whose rand_mode is
+                            // off keeps its object as it is.
+                            if rand_disabled.contains(&format!("{}[{}]", p, key)) {
+                                continue;
+                            }
                             if let Some(v) =
                                 self.get_signal_value_by_name(&format!("{}[{}]", coll_name, key))
                             {
@@ -1346,6 +1354,9 @@ impl Simulator {
                         // Dynamic array / queue / fixed array: 0-based indices.
                         let n = self.get_queue_size(&coll_name);
                         for i in 0..n {
+                            if rand_disabled.contains(&format!("{}[{}]", p, i)) {
+                                continue;
+                            }
                             if let Some(v) =
                                 self.get_signal_value_by_name(&format!("{}[{}]", coll_name, i))
                             {
@@ -3362,7 +3373,24 @@ impl Simulator {
         handle: usize,
         obj_props: &[String],
     ) -> bool {
+        // §18.8: an element handle whose rand_mode is off was not randomized;
+        // its constraints are not part of this solve.
+        let off: Vec<usize> = self
+            .rand_mode_disabled
+            .get(&handle)
+            .map(|d| {
+                d.iter()
+                    .filter(|k| k.contains('['))
+                    .filter_map(|k| self.read_coll_elem(&format!("{handle}#{k}")))
+                    .filter_map(|v| v.to_u64())
+                    .map(|v| v as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
         for sub in self.rand_child_handles(handle, obj_props) {
+            if off.contains(&sub) {
+                continue;
+            }
             let Some(sub_class) = self
                 .heap
                 .get(sub)
