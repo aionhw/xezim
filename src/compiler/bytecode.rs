@@ -12037,6 +12037,19 @@ impl<'a> BytecodeCompiler<'a> {
     /// same-named struct of an inner scope, so the statement takes the
     /// interpreter, which already copies member-wise; None when `a` is not a
     /// struct variable.
+    /// True when `name` is a register-bound local, a formal or a local
+    /// collection of the code being compiled, or a member of one (`name.m`).
+    fn names_local(&self, name: &str) -> bool {
+        let member = format!("{name}.");
+        self.local_var_regs
+            .keys()
+            .any(|k| k == name || k.starts_with(&member))
+            || self.local_array_regs.contains_key(name)
+            || self.local_coll_names.contains(name)
+            || self.decl_local_regs.contains(name)
+            || self.process_local_names.contains(name)
+    }
+
     fn compile_unpacked_struct_copy(&mut self, stmt: &Statement) -> Option<bool> {
         let map = self.unpacked_structs?;
         let (lvalue, rvalue, nb_delay) = match &stmt.kind {
@@ -12056,6 +12069,12 @@ impl<'a> BytecodeCompiler<'a> {
         let id_of = |e: &Expression| match &e.kind {
             ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
                 let id = self.lookup_signal_id(h)?;
+                // §13.4.2, §23.9: a local or formal of an inlined subroutine
+                // (its members bound as `r.a` registers) hides a module
+                // struct of the same name, which the lookup found.
+                if map.contains_key(&id) && self.names_local(&h.path[0].name.name) {
+                    return Some(None);
+                }
                 if let (Some(scope), Some((path, leaf))) = (
                     self.scope_hint.as_deref(),
                     map.get(&id).and_then(|v| v.first()),
