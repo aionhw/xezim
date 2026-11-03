@@ -86,8 +86,41 @@ fn bare_name(e: &Expression) -> Option<&str> {
     }
 }
 
+/// True when evaluating `e` has no effect: names, literals and operators over
+/// them. A call, an increment or an assignment may, so a part holding one
+/// must not be dropped or evaluated once per member (§13.5).
+fn effect_free(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
+        ExprKind::Ident(h) => h.path.iter().all(|s| s.selects.iter().all(effect_free)),
+        ExprKind::Paren(x) => effect_free(x),
+        ExprKind::Unary { op, operand } => {
+            !matches!(
+                op,
+                UnaryOp::PreIncr | UnaryOp::PreDecr | UnaryOp::PostIncr | UnaryOp::PostDecr
+            ) && effect_free(operand)
+        }
+        ExprKind::Binary { op, left, right } => {
+            *op != BinaryOp::Assign && effect_free(left) && effect_free(right)
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => effect_free(condition) && effect_free(then_expr) && effect_free(else_expr),
+        ExprKind::Concatenation(v) => v.iter().all(effect_free),
+        ExprKind::MemberAccess { expr, .. } => effect_free(expr),
+        ExprKind::Index { expr, index } => effect_free(expr) && effect_free(index),
+        ExprKind::RangeSelect {
+            expr, left, right, ..
+        } => effect_free(expr) && effect_free(left) && effect_free(right),
+        _ => false,
+    }
+}
+
 /// One expression per member from a struct-valued actual or item: an ordered
-/// or named pattern is taken apart, anything else is member-selected.
+/// or named pattern is taken apart, anything else is member-selected, which
+/// evaluates it once per member, so it must have no effect.
 fn split_value(e: &Expression, members: &Members) -> Option<Vec<Expression>> {
     if let ExprKind::AssignmentPattern(items) = &e.kind {
         if items
@@ -111,6 +144,9 @@ fn split_value(e: &Expression, members: &Members) -> Option<Vec<Expression>> {
             return None;
         }
         return Some(out);
+    }
+    if !effect_free(e) {
+        return None;
     }
     Some(
         members
@@ -446,6 +482,15 @@ impl Ctx<'_> {
                 } else {
                     let parts = split_value(e, self.ret)?;
                     let i = self.ret.iter().position(|(m, _)| m == self.sel)?;
+                    // §10.9.2: every item of the pattern is evaluated; only
+                    // the selected one is kept here.
+                    if parts
+                        .iter()
+                        .enumerate()
+                        .any(|(j, p)| j != i && !effect_free(p))
+                    {
+                        return None;
+                    }
                     let mut v = parts[i].clone();
                     self.expr(&mut v)?;
                     v
