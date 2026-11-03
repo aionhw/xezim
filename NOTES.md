@@ -259,6 +259,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * The members of a function's unpacked-struct result start at their declared
   defaults: `function s_t f(); f.c = 1; endfunction` returned 0 or x in a
   member declared `int a = 3` (§13.4.1, §7.2.2).
+* A UDP table row may write its symbols next to each other, `01:0;` or
+  `(01)00:?:0;`, as A.5.3 defines them; such a table was rejected and the
+  primitive became an empty module with an undriven output (§29.3.4, #841,
+  reported by git-hevangel).
+* An out-of-block method of a `$unit` class that writes a member by its bare
+  name elaborates when the top module declares a variable of that name; the
+  use-before-declaration check took the module's variable for the member
+  (§8.24, §23.9, #843, reported by git-hevangel).
 * A class property is the object's storage, whatever module variable shares
   its name: a nonblocking write in a method, `s.f <= v`, and an element write
   through a handle, `h.v[1] = x`, wrote the module's `s` or `v` (§8.4,
@@ -300,6 +308,19 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and 5.7 G after, and 250 instances 96.6 G and 4.0 G. The elaborated design
   is unchanged for every design under tests/ and examples/. Reported by
   git-hevangel.
+* A frame local whose type metadata a deeper frame's same-named local
+  displaced gets it back when that frame returns, and only then: the live
+  frames were rescanned after every frame pop below the displacement, so a
+  deep call chain running a loop of calls stalled for hours at one timestamp
+  (§6.21, §13.3.1, #833, reported by Ganesh-TNL). `[PROF]
+  local_meta_reapplies` counts the scans.
+* An edge block that reads or writes one element of an unpacked array by a
+  constant index is re-armed by writes to that element only. Every element
+  of the array armed it, so N blocks each writing one element of a shared
+  array (a generate loop of flops) marked N blocks per element write, N²
+  per clock: 2,000 such blocks spent 23.1 s of a 24.8 s run in the NBA
+  region, now 0.25 s (§9.2.2.4, §9.4.2). A RAM model's dynamic index keeps
+  the whole-array arming.
 * A member of a struct resolution function's result, the `n.V =
   res('{...}).V` assign a struct nettype emits for each member, compiles:
   the function is inlined over one scalar per member (§6.6.7, §7.2, PR #837
