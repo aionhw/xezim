@@ -231,3 +231,63 @@ endmodule
     );
     assert_eq!(out, vec!["R 1.5 -1", "R 0.0 6"]);
 }
+
+/// §7.2.2: a member default initializes the result local of the resolver.
+/// The scalarized locals carry no initializer, so such a type keeps the call
+/// path and the defaulted members read back their defaults.
+#[test]
+fn member_defaults_keep_their_values() {
+    let out = lines(
+        r#"
+package ee;
+  typedef struct { real V; real I = 0.5; real R = 1.0e3; } ee_t;
+  function automatic ee_t res(input ee_t d[]);
+    ee_t r;
+    r.V = 0.0;
+    foreach (d[k]) r.V += d[k].V;
+    return r;
+  endfunction
+endpackage
+import ee::*;
+module top;
+  real v = 1.0, yr, yi;
+  assign yr = res('{'{v, 0.0, 10.0}}).R;
+  assign yi = res('{'{v, 0.0, 10.0}}).I;
+  initial #1 $display("R %g %g", yr, yi);
+endmodule
+"#,
+    );
+    assert_eq!(out, ["R 1000 0.5"]);
+}
+
+/// §10.9.2, §13.5: every item of a returned pattern and a struct actual are
+/// each evaluated once per call, whichever member is selected. A call in an
+/// unselected item still runs, and a call as the actual is not repeated per
+/// member.
+#[test]
+fn effects_run_once_per_call() {
+    let out = lines(
+        r#"
+typedef struct { int V; int n; } t_t;
+module top;
+  int c1 = 0, c2 = 0;
+  function automatic int bump(input int x); c1 = c1 + 1; return x; endfunction
+  function automatic t_t f(input int x); return '{V: x, n: bump(x)}; endfunction
+  function automatic t_t g(input int x); c2 = c2 + 1; return '{x, x}; endfunction
+  function automatic t_t h(input t_t a); t_t r; r.V = a.V + a.n; r.n = 0; return r; endfunction
+  int x = 0, y1, y2;
+  bit clk = 0;
+  always @(x) y1 = f(x).V;
+  always @(posedge clk) y2 <= h(g(3)).V;
+  initial begin
+    #1 x = 1;
+    #1 x = 2;
+    #1 x = 3;
+    repeat (3) begin #1 clk = 1; #1 clk = 0; end
+    #1 $display("R %0d %0d %0d %0d", y1, c1, y2, c2);
+  end
+endmodule
+"#,
+    );
+    assert_eq!(out, ["R 3 3 6 3"]);
+}
