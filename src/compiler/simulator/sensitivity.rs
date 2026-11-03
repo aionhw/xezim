@@ -11,6 +11,10 @@ thread_local! {
     /// While a function body's reads are collected: the reads of the
     /// functions it calls, kept apart from its own (`collect_callee_reads`).
     static CALLEE_READS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
+    /// The constant part select being applied to the bare name the collector
+    /// is about to visit (`v[7:4]`): the `Ident` arms hand it to
+    /// `note_packed_access` instead of recording a whole-vector access.
+    static PACKED_SELECT: std::cell::Cell<Option<(i64, i64)>> = const { std::cell::Cell::new(None) };
 }
 
 /// Record `name` as read whole, when `collect_stmt_reads_whole` is collecting.
@@ -754,7 +758,7 @@ impl Simulator {
                     }
                 }
                 note_whole_read(&name);
-                Self::note_packed_access(&name, None, false);
+                Self::note_packed_access(&name, PACKED_SELECT.take(), false);
                 reads.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
@@ -809,7 +813,7 @@ impl Simulator {
                     } else {
                         note_whole_read(&name);
                         let idx = Self::constant_array_index(index, module);
-                        Self::note_packed_access(&name, Some(idx), false);
+                        Self::note_packed_access(&name, idx.map(|i| (i, i)), false);
                         reads.insert(name);
                     }
                 } else if let Some(elems) = Self::multi_dim_elem_names(base, index, module) {
@@ -841,11 +845,18 @@ impl Simulator {
             }
             ExprKind::RangeSelect {
                 expr: base,
+                kind,
                 left,
                 right,
-                ..
             } => {
+                // A constant part select of a bare vector names its elements
+                // (`w[3:0]`); the `Ident` arm records them in place of a
+                // whole read. Cleared again in case that arm returned early.
+                if matches!(base.kind, ExprKind::Ident(_)) {
+                    PACKED_SELECT.set(Self::constant_select_range(kind, left, right, module));
+                }
                 Self::collect_expr_reads(base, module, reads);
+                PACKED_SELECT.set(None);
                 Self::collect_expr_reads(left, module, reads);
                 Self::collect_expr_reads(right, module, reads);
             }
@@ -1122,7 +1133,7 @@ impl Simulator {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 let name = Self::resolve_hier_name_static(hier, module);
-                Self::note_packed_access(&name, None, true);
+                Self::note_packed_access(&name, PACKED_SELECT.take(), true);
                 writes.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
@@ -1155,7 +1166,7 @@ impl Simulator {
                             }
                         } else {
                             let idx = Self::constant_array_index(index, module);
-                            Self::note_packed_access(&name, Some(idx), true);
+                            Self::note_packed_access(&name, idx.map(|i| (i, i)), true);
                             writes.insert(name);
                         }
                     }
@@ -1185,8 +1196,19 @@ impl Simulator {
                     }
                 }
             }
-            ExprKind::RangeSelect { expr: base, .. } => {
-                Self::collect_lhs_writes_ex(base, module, writes, arrays.as_deref_mut())
+            ExprKind::RangeSelect {
+                expr: base,
+                kind,
+                left,
+                right,
+            } => {
+                // `w[7:4] = ...` writes those elements, not the whole vector
+                // (see the read collector's arm).
+                if matches!(base.kind, ExprKind::Ident(_)) {
+                    PACKED_SELECT.set(Self::constant_select_range(kind, left, right, module));
+                }
+                Self::collect_lhs_writes_ex(base, module, writes, arrays.as_deref_mut());
+                PACKED_SELECT.set(None);
             }
             ExprKind::Concatenation(exprs) => {
                 for e in exprs {
@@ -1198,24 +1220,47 @@ impl Simulator {
     }
 
     /// Record one access to `name` for the packed-vector sensitivity rule in
-    /// `comb_compilation`. `elem` is `None` for a whole-variable access and
-    /// `Some(None)` for a select whose index is not a constant.
-    fn note_packed_access(name: &str, elem: Option<Option<i64>>, is_write: bool) {
+    /// `comb_compilation`. `elems` is the inclusive range of outermost-dimension
+    /// elements a constant select covers; `None` for a whole-variable access
+    /// or a select whose bounds are not constants.
+    fn note_packed_access(name: &str, elems: Option<(i64, i64)>, is_write: bool) {
+        /// A wider constant part select counts as the whole vector.
+        const MAX_ELEMS: i64 = 4096;
         PACKED_ACCESS.with(|p| {
             let mut p = p.borrow_mut();
             let Some(map) = p.as_mut() else { return };
             let acc = map.entry(name.to_string()).or_default();
-            match elem {
-                Some(Some(i)) => {
-                    if is_write {
-                        acc.writes.insert(i);
+            match elems {
+                Some((a, b)) if (a - b).abs() < MAX_ELEMS => {
+                    let set = if is_write {
+                        &mut acc.writes
                     } else {
-                        acc.reads.insert(i);
-                    }
+                        &mut acc.reads
+                    };
+                    set.extend(a.min(b)..=a.max(b));
                 }
-                _ => acc.irregular = true,
+                _ if is_write => acc.write_any = true,
+                _ => acc.read_any = true,
             }
         });
+    }
+
+    /// The outermost-dimension elements a part select of `base` with constant
+    /// bounds covers (`v[7:4]`, `v[4 +: 4]`, `v[7 -: 4]`), for
+    /// `note_packed_access`.
+    fn constant_select_range(
+        kind: &RangeKind,
+        left: &Expression,
+        right: &Expression,
+        module: &ElaboratedModule,
+    ) -> Option<(i64, i64)> {
+        let l = Self::constant_array_index(left, module)?;
+        let r = Self::constant_array_index(right, module)?;
+        Some(match kind {
+            RangeKind::Constant => (l, r),
+            RangeKind::IndexedUp => (l, l + (r - 1).max(0)),
+            RangeKind::IndexedDown => (l - (r - 1).max(0), l),
+        })
     }
 
     /// Collect reads/writes from a statement (for always @* / always_comb blocks).

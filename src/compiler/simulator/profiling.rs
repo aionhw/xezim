@@ -865,6 +865,18 @@ impl Simulator {
         );
     }
 
+    /// Per comb entry: `CombEntry::reads_own_writes`, for the self-dependency
+    /// skips of both settle loops. Called with the levels and by the canonical
+    /// settle whenever the entry table changed length (first settle, cache
+    /// load, checkpoint restore).
+    pub(super) fn build_comb_self_exempt(&mut self) {
+        self.comb_self_exempt = self
+            .comb_entries
+            .iter()
+            .map(CombEntry::reads_own_writes)
+            .collect();
+    }
+
     /// Feasibility probe for levelized / bulk-synchronous parallel settle
     /// (XEZIM_SETTLE_LEVELS=1). Assigns each comb entry a static level =
     /// longest producer chain (entries in stored topo order; cyclic back-edges
@@ -883,11 +895,7 @@ impl Simulator {
         let mut unresolved = 0usize;
         self.comb_level = vec![0u32; n];
         self.comb_has_nba = vec![false; n];
-        self.comb_self_exempt = self
-            .comb_entries
-            .iter()
-            .map(CombEntry::reads_own_writes)
-            .collect();
+        self.build_comb_self_exempt();
         self.comb_par_safe = vec![false; n];
         // Writer-count pre-pass: a signal written by >1 comb entry is
         // multi-driven; entries touching such a signal CANNOT run in the

@@ -1310,6 +1310,9 @@ impl Simulator {
         if !self.gate_lane_valid || self.gate_lane.len() != self.comb_entries.len() {
             self.build_gate_lane();
         }
+        if self.comb_self_exempt.len() != self.comb_entries.len() {
+            self.build_comb_self_exempt();
+        }
         if !self.quiet_valid || self.quiet_bits.len() != self.signal_table.len().div_ceil(64) {
             self.build_quiet_bits();
         }
@@ -1701,7 +1704,18 @@ impl Simulator {
                         if __tree_clk && tree_entry.get(__dep).copied().unwrap_or(false) {
                             continue;
                         }
-                        if __dep == $eidx && entries[__dep].reads_own_writes() {
+                        // An `always @*` that reads a packed element it also
+                        // writes (`PackedAccess::keeps_sensitivity`), the one
+                        // kind the arm above lets through. Precomputed; only
+                        // a self-dependency gets this far, and only an entry
+                        // added since the table was built misses it.
+                        if __dep == $eidx
+                            && self
+                                .comb_self_exempt
+                                .get(__dep)
+                                .copied()
+                                .unwrap_or_else(|| entries[__dep].reads_own_writes())
+                        {
                             continue;
                         }
                         if lane_on {

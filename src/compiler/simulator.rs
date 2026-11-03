@@ -1569,12 +1569,33 @@ thread_local! {
 }
 
 /// How an `always_comb` block touches one packed vector through selects.
+/// An element is an index in the vector's outermost dimension (a bit of a
+/// one-dimensional vector); a constant part select records every element
+/// it covers.
 #[derive(Default)]
 struct PackedAccess {
     reads: HashSet<i64>,
     writes: HashSet<i64>,
-    /// Touched whole, through a part select, or at a non-constant element.
-    irregular: bool,
+    /// Read whole or at a non-constant select.
+    read_any: bool,
+    /// Written whole or at a non-constant select.
+    write_any: bool,
+}
+
+impl PackedAccess {
+    /// §9.2.2.2.1: the vector stays in the block's sensitivity when the block
+    /// reads some element it does not write. Its longest static prefix is
+    /// read (`v[0]`, `v[i]`, `v`), and only the written select expressions
+    /// are excluded, so `v[1] = v[0]; v[2] = v[1]` is sensitive to `v` and
+    /// `v[1] = v[i] + 1` too. A block that writes the vector whole or at a
+    /// non-constant element (`v = '0; v[i] = x`), or one that writes every
+    /// element it reads (`v[0] = a; v[0] ^= b`), sees its own transient
+    /// values and keeps the old exclusion, so it cannot re-queue itself.
+    fn keeps_sensitivity(&self) -> bool {
+        !self.write_any
+            && !self.writes.is_empty()
+            && (self.read_any || self.reads.iter().any(|r| !self.writes.contains(r)))
+    }
 }
 
 thread_local! {
@@ -9335,9 +9356,10 @@ pub struct Simulator {
     /// them into the real NBA queue. So the BSP driver must route these through
     /// the full `&mut self` path. Built alongside comb_level.
     comb_has_nba: Vec<bool>,
-    /// Per comb entry: it reads a signal it also writes (a packed
-    /// multi-dimensional vector, see the sensitivity filter), so its own
-    /// writes must not re-queue it. Other drivers of the vector still do.
+    /// Per comb entry: it reads a signal it also writes (a packed vector,
+    /// see `PackedAccess::keeps_sensitivity`), so its own writes must not
+    /// re-queue it. Other drivers of the vector still do. Rebuilt with the
+    /// levels and whenever its length differs from `comb_entries`.
     comb_self_exempt: Vec<bool>,
     /// Per comb entry: evaluable by the static isolated path (no `&mut self`,
     /// disjoint writes) — not AST, no NBA, no unsupported insn. Only par_safe
