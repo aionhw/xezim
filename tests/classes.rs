@@ -125,6 +125,8 @@ mod rand_package_struct_enum_member;
 mod randomize_args_name_object_members;
 #[path = "classes/randomize_assoc_joint_solve.rs"]
 mod randomize_assoc_joint_solve;
+#[path = "classes/randomize_assoc_keys_joint_solve.rs"]
+mod randomize_assoc_keys_joint_solve;
 #[path = "classes/randomize_failure_diag.rs"]
 mod randomize_failure_diag;
 #[path = "classes/static_fixed_array_storage.rs"]
@@ -438,8 +440,12 @@ mod randomize_member_subset;
 mod randomize_nonrand_members;
 #[path = "classes/randomize_soft_solver_gave_up.rs"]
 mod randomize_soft_solver_gave_up;
+#[path = "classes/randomize_soft_sub_object_pushdown.rs"]
+mod randomize_soft_sub_object_pushdown;
 #[path = "classes/randomize_solve_before.rs"]
 mod randomize_solve_before;
+#[path = "classes/randomize_sub_object_array_method.rs"]
+mod randomize_sub_object_array_method;
 #[path = "classes/randomize_with_this_and_subset.rs"]
 mod randomize_with_this_and_subset;
 #[path = "classes/null_receiver_static_spec_544.rs"]
@@ -718,6 +724,8 @@ mod rand_mode_element_769;
 mod dist_zero_weights_770;
 #[path = "classes/class_param_sized_formals_768.rs"]
 mod class_param_sized_formals_768;
+#[path = "classes/rand_mode_handle_element.rs"]
+mod rand_mode_handle_element;
 #[path = "classes/rand_mode_handle_property.rs"]
 mod rand_mode_handle_property;
 #[path = "classes/lrm_chained_handle_writes.rs"]
