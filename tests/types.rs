@@ -255,6 +255,8 @@ mod scoped_type_cast;
 mod shift_context_width;
 #[path = "types/shift_width_and_scope_hint.rs"]
 mod shift_width_and_scope_hint;
+#[path = "types/compiled_member_operand_width.rs"]
+mod compiled_member_operand_width;
 #[path = "types/signedness_and_power_context.rs"]
 mod signedness_and_power_context;
 #[path = "types/size_cast_context_and_fn_return_default.rs"]
