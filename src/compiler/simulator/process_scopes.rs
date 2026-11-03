@@ -2951,10 +2951,30 @@ impl Simulator {
                 .is_some_and(|o| o.properties.contains_key(name))
     }
 
+    /// §8.4: in a method, a target rooted at a property of `this` (`s.f <=
+    /// v`, `v[1] <= x`) is the property, not a same-named module variable,
+    /// so it has no signal id; the queued path commits it with `this`
+    /// restored. A virtual-interface property keeps its own redirect.
+    fn nba_root_is_this_prop(&self, h: &HierarchicalIdentifier) -> bool {
+        let name = h.path[0].name.name.as_str();
+        h.root.is_none()
+            && self.this_prop_hides(name)
+            && !self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|th| self.heap.get(th)?.as_ref().map(|i| i.class_name.clone()))
+                .is_some_and(|cn| self.class_vif_decl(&cn, name).is_some())
+    }
+
     pub(super) fn resolve_nba_target(&mut self, lhs: &Expression) -> Option<usize> {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 if self.bare_selected_storage_shadows_signal(hier) {
+                    return None;
+                }
+                if self.nba_root_is_this_prop(hier) {
                     return None;
                 }
                 let is_ambiguous_leaf =
@@ -2991,6 +3011,15 @@ impl Simulator {
                             return self.signal_name_to_id.get(leaf.as_str()).copied();
                         }
                     }
+                }
+                let mut root = expr.as_ref();
+                while let ExprKind::Index { expr, .. } = &root.kind {
+                    root = expr;
+                }
+                if let ExprKind::Ident(h) = &root.kind
+                    && self.nba_root_is_this_prop(h)
+                {
+                    return None;
                 }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
