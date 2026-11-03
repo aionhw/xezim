@@ -3111,7 +3111,34 @@ impl Simulator {
                 // the queued-lvalue path commits later with the scope hint
                 // already popped, so the write never landed. Resolve it
                 // now, while this block's hint is still installed.
-                if let Some(flat) = self.flat_member_name(lhs) {
+                //
+                // Not for an element of a dynamic array, queue or associative
+                // array, whose readers watch the collection (see the Index arm
+                // above), nor in a class method, where a property can hide a
+                // module name.
+                let mut root = expr.as_ref();
+                while let ExprKind::Index { expr: e, .. } | ExprKind::MemberAccess { expr: e, .. } =
+                    &root.kind
+                {
+                    root = e;
+                }
+                let dynamic_root = match &root.kind {
+                    ExprKind::Ident(h) => {
+                        let name = self.resolve_hier_name(h).into_owned();
+                        let scoped = self.hint_scoped(&name);
+                        [Some(name), scoped].into_iter().flatten().any(|n| {
+                            self.module.dynamic_arrays.contains(&n)
+                                || self.module.queue_vars.contains(&n)
+                                || self.module.associative_arrays.contains_key(&n)
+                        })
+                    }
+                    _ => true,
+                };
+                let in_method = matches!(self.this_stack.last(), Some(Some(_)));
+                if !dynamic_root
+                    && !in_method
+                    && let Some(flat) = self.flat_member_name(lhs)
+                {
                     if let Some(&id) = self.signal_name_to_id.get(flat.as_str()) {
                         return Some(id);
                     }
