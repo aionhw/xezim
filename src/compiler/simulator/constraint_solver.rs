@@ -792,6 +792,9 @@ impl Simulator {
                 span: crate::ast::Span::new(0, 0),
             });
             constraint_src_files.push(inline_src_file);
+            // §18.5.14.1: an in-line block outranks every class constraint;
+            // the soft-priority contest below handles it by name.
+            constraint_depth.push(0);
         }
         // §18.8: the elements whose rand_mode is off keep their values.
         let pins = self.rand_mode_element_pins(handle);
@@ -808,6 +811,7 @@ impl Simulator {
                 span: crate::ast::Span::new(0, 0),
             });
             constraint_src_files.push(None);
+            constraint_depth.push(0);
         }
 
         // §18.5.5: expand the array SLICE of a `unique {…}` list into the
@@ -2144,7 +2148,13 @@ impl Simulator {
                         Some(v) => v,
                         None => continue,
                     };
-                    let rank = (constraint_depth[bi], con.span.start, ii);
+                    // §18.5.14.1: an in-line item (or one pushed down from
+                    // the container object) outranks the class's own.
+                    let rank = if con.name.name == "__inline__" {
+                        (0, usize::MAX, ii)
+                    } else {
+                        (constraint_depth[bi], con.span.start, ii)
+                    };
                     let wins = match soft_rank.get(&v) {
                         None => true,
                         Some(&(d, s, i0)) => {
