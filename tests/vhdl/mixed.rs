@@ -1,9 +1,12 @@
 //! Mixed-language designs: SystemVerilog and VHDL in one simulation. Each
 //! `mixed/<name>.sv` + `mixed/<name>.vhd` runs through `xezim` and its output
 //! must equal `mixed/<name>.golden`, produced by Questa 2021.2
-//! (`mixed/regen.sh`; GHDL does not simulate SystemVerilog). The designs
-//! print only through SV `$display` and VHDL TEXTIO, whose text is the same
-//! in every simulator, and keep clear of races between the languages.
+//! (`mixed/regen.sh`; GHDL does not simulate SystemVerilog). A design whose
+//! ports Questa cannot connect (a VHDL record or array of vectors at the
+//! boundary) has a golden of the layout xezim defines instead, and a
+//! `mixed/<name>.lrm` saying why. The designs print only through SV
+//! `$display` and VHDL TEXTIO, whose text is the same in every simulator,
+//! and keep clear of races between the languages.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -33,7 +36,7 @@ fn check(name: &str) {
     assert_eq!(
         actual.join("\n").trim_end(),
         golden.trim_end(),
-        "{} differs from Questa\nstderr:\n{}",
+        "{} differs from its golden\nstderr:\n{}",
         name,
         String::from_utf8_lossy(&out.stderr)
     );
@@ -70,21 +73,34 @@ fn mixed_clocked() {
     check("mixed_clocked");
 }
 
-/// A record port in both directions, and a three-dimensional array of
-/// records. Each crosses as one packed logic vector: the left index and
-/// the first field are the most significant bits, and each std_logic is
-/// one bit. The golden is that layout (the outer index runs `downto`, so
-/// the higher index is on the left).
+/// A record port in both directions, and three-dimensional arrays of
+/// records in both directions. Each crosses as one packed logic vector: the
+/// left index and the first field are the most significant bits, and each
+/// std_logic is one bit. Every field and element is read on its own; the
+/// golden is that layout (`mixed_record.lrm`).
 #[test]
 fn mixed_record() {
     check("mixed_record");
 }
 
 /// A record signal whose field is an array, instantiated from
-/// SystemVerilog. The default value used to drop that array, so the first
-/// read failed its bound check. The golden is the value written on the
-/// clock edge (Questa connects a record differently; do not regenerate).
+/// SystemVerilog and initialised from a constant: its initial value, then
+/// the values written on a clock edge.
 #[test]
 fn mixed_record_field() {
     check("mixed_record_field");
+}
+
+/// A signal of a record subtype constraining an array field, in an entity
+/// instantiated from SystemVerilog: the field written whole and by a slice.
+#[test]
+fn mixed_record_subtype() {
+    check("mixed_record_subtype");
+}
+
+/// A slice of an array of vectors as the actual of a SystemVerilog
+/// component's port: only its elements cross (`mixed_slice_actual.lrm`).
+#[test]
+fn mixed_slice_actual() {
+    check("mixed_slice_actual");
 }

@@ -171,6 +171,30 @@ fn agg_slice() {
     check("agg_slice");
 }
 
+/// An array of the aggregate's type as an element association (§9.3.3.3):
+/// positional bit strings and slices, two range choices sharing one
+/// value, unconstrained aggregates as long as their elements, integer and
+/// string positional arrays before `others`, slices of an array of
+/// vectors, and an `(open)(7 downto 0)` element subtype.
+#[test]
+fn agg_array_value() {
+    check("agg_array_value");
+}
+
+/// A port of a constrained array subtype whose bounds differ from the
+/// actual's is indexed by its own bounds, reading and writing (§6.5.6.3).
+#[test]
+fn port_formal_bounds() {
+    check("port_formal_bounds");
+}
+
+/// A signal of a record subtype constraining an array field: the field and
+/// a slice of it assigned, a concurrent assignment following (§5.3.3).
+#[test]
+fn record_constrained_field() {
+    check("record_constrained_field");
+}
+
 /// Records: aggregates, element selection, a record signal (§5.3.3).
 #[test]
 fn records() {

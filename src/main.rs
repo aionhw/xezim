@@ -3238,6 +3238,8 @@ fn run_main() -> i32 {
         .into_iter()
         .partition(|f| xezim_core::vhdl::is_vhdl_path(f));
     source_files = sv_sources;
+    // A VPI library (a cocotb testbench) drives the VHDL top's ports.
+    vhdl_options.expose_ports = !vpi_libs.is_empty();
     xezim_core::vhdl::configure_with(
         vhdl_sources
             .into_iter()
@@ -3249,10 +3251,7 @@ fn run_main() -> i32 {
                 xezim_core::vhdl::VhdlFile { path, library }
             })
             .collect(),
-        {
-            vhdl_options.expose_ports = !vpi_libs.is_empty();
-            vhdl_options
-        },
+        vhdl_options,
     );
     // A VHDL simulation runs until no events are left (IEEE 1076-2008
     // §14.7.5), as GHDL does: no default run-length limit.

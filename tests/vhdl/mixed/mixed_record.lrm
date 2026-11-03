@@ -1,0 +1,7 @@
+Questa 2021.2 cannot connect a VHDL record port to Verilog (vsim-3362:
+"The type of VHDL port 'd' is invalid for Verilog connection"), so this
+golden is the layout xezim defines (docs/vhdl-guide.md, "Mixed with
+SystemVerilog"): a record or a multi-dimensional array crosses as one
+packed logic vector, the left index of each dimension and the first field
+in the most significant bits, one bit per std_logic. The design reads each
+field and element separately, so a layout error in either direction shows.

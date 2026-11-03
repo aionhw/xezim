@@ -12,3 +12,5 @@ mod mixed;
 mod simulation;
 #[path = "vhdl/simulation19.rs"]
 mod simulation19;
+#[path = "vhdl/vpi.rs"]
+mod vpi;

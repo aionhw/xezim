@@ -39,6 +39,19 @@ fn syntax_error_is_located() {
     assert!(text.contains("2 |   port (x : in bit"), "{}", text);
 }
 
+/// §9.3.3.3: a static range choice outside the aggregate's index range is
+/// an error at its value, not elements silently dropped.
+#[test]
+fn aggregate_choice_out_of_range_is_located() {
+    let (out, text) = xezim(&["errors/agg_choice_range.vhd"], &[]);
+    assert!(!out.status.success(), "{}", text);
+    assert!(
+        text.contains("agg_choice_range.vhd:11:27: error: VHDL: choice is out of index range"),
+        "{}",
+        text
+    );
+}
+
 /// §13.2: `--work=<lib>` puts the following files' design units into that
 /// library (`XEZIM_VHDL_DUMP` lists them).
 #[test]

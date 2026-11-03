@@ -1,0 +1,2 @@
+port_formal_bounds.vhd:29:5:@2ns:(report note): sub '1''0''H' 1010 0000 0101
+port_formal_bounds.vhd:47:5:@3ns:(report note): top '1''0''H' 1010 0000 0101

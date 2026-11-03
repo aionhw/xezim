@@ -1,0 +1,4 @@
+Questa 2021.2 cannot connect a VHDL array of vectors to a Verilog packed
+vector, so this golden is the layout xezim defines (docs/vhdl-guide.md,
+"Mixed with SystemVerilog"): the elements of the actual slice in order, the
+left one in the most significant bits.

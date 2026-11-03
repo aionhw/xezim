@@ -176,7 +176,25 @@ z; back as 0 1 x z → `'0' '1' 'X' 'Z'`), the left element of a vector
 being the most significant bit (`(0 to 3)` too); bit and boolean are 0/1
 (x and z become `'0'`); integers are 32-bit; reals are reals. Arrays of
 integers or reals (outputs and hierarchical reads) are unpacked arrays
-with the VHDL bounds.
+with the VHDL bounds. Any other composite (a record, a multi-dimensional
+array, an array of records or of vectors) crosses as one packed `logic`
+vector, as Questa cannot connect it: the left index of each dimension and
+the first field are the most significant bits, each `std_logic`, bit or
+boolean one bit and each integer 32 bits; a composite holding a real
+cannot cross. A slice as the actual of an SV module's port passes only the
+slice's elements. Such a port cannot connect to an SV port declared with
+an unpacked dimension or an unpacked struct. Hierarchical reads of the
+entity's signals cover those up to 2048 bits (a larger memory is left out:
+its copy would be refreshed on every change).
+
+With a VPI library (`--vpi-lib`, `-m`, as a cocotb testbench loads it) the
+ports of a VHDL top level are visible and drivable by name
+(`vpi_handle_by_name("top.d")`), and the simulation waits for the
+testbench as for SV. An input keeps its VHDL default until the testbench
+writes it a value other than z. A port that cannot cross (a mode view, an
+`inout` port, an input array of integers or reals, a type listed above as
+not crossing) is left out with a warning. The choice is made when the
+design is elaborated: with `--compile`, pass `--vpi-lib` there too.
 
 VHDL keeps its own simulation cycle inside each instantiated entity. A
 change of an SV input runs the VHDL cycles of that time at once, the way

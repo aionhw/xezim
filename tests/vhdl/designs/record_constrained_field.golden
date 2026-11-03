@@ -1,0 +1,3 @@
+record_constrained_field.vhd:19:5:@0ms:(report note): 0 UUUUUUUU UUUUUUUU
+record_constrained_field.vhd:23:5:@1ns:(report note): 1 01011100 01011100 3
+record_constrained_field.vhd:26:5:@2ns:(report note): 2 10011100 10011100

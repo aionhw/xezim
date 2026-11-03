@@ -264,3 +264,11 @@ fn dir19() {
 fn imgnd19() {
     check("imgnd19");
 }
+
+/// §9.3.3.3 array values across range choices in a constant, a generic's
+/// default and a choice with run-time bounds (nvc golden; GHDL 4.1 stops
+/// with an internal error).
+#[test]
+fn agg_array_static19() {
+    check("agg_array_static19");
+}

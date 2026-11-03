@@ -3,17 +3,15 @@
 # Questa (vcom -2008, vlog -sv, vsim): <name>.golden is the simulation's
 # transcript without Questa's own lines. Needs vlib/vcom/vlog/vsim
 # (tested with Questa 2021.2). `./regen.sh <name>` regenerates one design.
+# A design Questa cannot connect (a VHDL record or array of vectors at the
+# language boundary) has a golden of the layout xezim defines and a
+# <name>.lrm file saying why; it is skipped here.
 set -u
 cd "$(dirname "$0")"
 here=$PWD
 for sv in ${1:-*}.sv; do
   n=${sv%.sv}
-  # mixed_record's golden is the packed layout xezim defines for a record
-  # port. Questa connects a record as a record, so a regen must not
-  # overwrite it.
-  if [ "$n" = mixed_record ] || [ "$n" = mixed_record_field ]; then
-    continue
-  fi
+  [ -f "$n.lrm" ] && { echo "skipping $n (layout golden, see $n.lrm)"; continue; }
   work=$(mktemp -d)
   (cd "$work" && vlib work >/dev/null &&
     vcom -2008 -quiet "$here/$n.vhd" &&

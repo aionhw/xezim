@@ -1,0 +1,14 @@
+agg_array_value.vhd:45:5:@0ms:(report note): bits 10100101
+agg_array_value.vhd:47:5:@0ms:(report note): bits others 10100000
+agg_array_value.vhd:49:5:@0ms:(report note): two choices 01100110
+agg_array_value.vhd:51:5:@0ms:(report note): slices 11000011
+agg_array_value.vhd:52:5:@0ms:(report note): unconstrained 8 11000011
+agg_array_value.vhd:53:5:@0ms:(report note): unconstrained mixed 7 1100111
+agg_array_value.vhd:55:5:@0ms:(report note): int positional 1 2 3 4 0 0 0 0 
+agg_array_value.vhd:57:5:@0ms:(report note): int then scalar 5 6 7 8 77 0 0 0 
+agg_array_value.vhd:59:5:@0ms:(report note): int range -1 -1 1 2 3 4 -1 -1 
+agg_array_value.vhd:61:5:@0ms:(report note): string [ab   ]
+agg_array_value.vhd:63:5:@0ms:(report note): strings [abcde]
+agg_array_value.vhd:65:5:@0ms:(report note): vectors 01011010 01011010 00000000
+agg_array_value.vhd:67:5:@0ms:(report note): open element 10100101 8
+agg_array_value.vhd:69:5:@0ms:(report note): open slice 11000011 11111111
