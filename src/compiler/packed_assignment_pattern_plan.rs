@@ -889,9 +889,9 @@ impl PlanBuilder<'_> {
                 }
                 DataType::IntegerVector {
                     kind,
-                    signing,
                     dimensions,
                     span,
+                    ..
                 } => {
                     let Some((d, rest)) = dimensions.split_first() else {
                         return Some(Shape::Leaf { width: 1 });

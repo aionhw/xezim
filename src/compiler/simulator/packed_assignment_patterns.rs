@@ -28,14 +28,11 @@ impl PatternTypeResolver for Simulator {
         match &e.kind {
             ExprKind::Paren(inner) => self.expr_type(inner),
             ExprKind::Call { func, .. } => self.call_return_type(func),
-            ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
-                if let Some(dt) = self.param_decl_type(e) =>
-            {
-                Some(dt)
-            }
-            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } | ExprKind::Index { .. } => {
-                self.lvalue_pattern_type(e)
-            }
+            // A parameter's declared type first (§6.20.2), then a variable's.
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => self
+                .param_decl_type(e)
+                .or_else(|| self.lvalue_pattern_type(e)),
+            ExprKind::Index { .. } => self.lvalue_pattern_type(e),
             _ => None,
         }
     }
