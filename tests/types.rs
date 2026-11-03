@@ -229,6 +229,8 @@ mod param_sized_array;
 mod param_struct_widths_and_nba_patterns;
 #[path = "types/parameter_const_eval_corners.rs"]
 mod parameter_const_eval_corners;
+#[path = "types/pattern_context_in_child_ports.rs"]
+mod pattern_context_in_child_ports;
 #[path = "types/pattern_params_and_call_member.rs"]
 mod pattern_params_and_call_member;
 #[path = "types/power_operator_signedness.rs"]
