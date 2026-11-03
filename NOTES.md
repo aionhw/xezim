@@ -215,8 +215,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   fixed by philipaxer.
 * A size cast's width sizes the expression around it: `(9'(c) + s) >
   8'hff` with 8-bit `c` and `s` sums at 9 bits, where it wrapped to 0, and
-  the parenthesized `(W)'(x)` keeps its size, where it was dropped (§6.24.1,
-  §11.6.1, #827, PR core #144 and #828). In compiled code a function call in
+  a parenthesized or computed size, `(W)'(x)`, `(W+1)'(x)` or
+  `$clog2(N)'(x)`, keeps its value, where it was dropped (§6.24.1, §11.6.1,
+  #827, PR core #144 and #828). In compiled code a function call in
   such an expression is as wide as its return type, and a size cast keeps
   its operand's signedness, so `(W)'(sa)` of a signed -1 sign-extends.
   Reported and fixed by davekeeshan.
@@ -255,6 +256,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * With `solve pkt.psel before pkt.paddr` over fields of a packed-struct rand
   member, `psel` is drawn over its range; it came up 2 on every draw
   (§18.5.10, #815, PR #829, contributed by Ganesh-TNL).
+* The members of a function's unpacked-struct result start at their declared
+  defaults: `function s_t f(); f.c = 1; endfunction` returned 0 or x in a
+  member declared `int a = 3` (§13.4.1, §7.2.2).
+* A class property is the object's storage, whatever module variable shares
+  its name: a nonblocking write in a method, `s.f <= v`, and an element write
+  through a handle, `h.v[1] = x`, wrote the module's `s` or `v` (§8.4,
+  §10.4.2).
 
 **Performance**
 
