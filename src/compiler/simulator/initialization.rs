@@ -3824,6 +3824,7 @@ impl Simulator {
             clocking_mirror_dirty: false,
             clocking_cycle_pending: HashMap::default(),
             clocking_sig_alias: HashMap::default(),
+            clocking_sig_bound_sel: HashMap::default(),
             clocking_out_skew: HashMap::default(),
             clocking_sig_out_skew: HashMap::default(),
             clocking_in_skew: HashMap::default(),

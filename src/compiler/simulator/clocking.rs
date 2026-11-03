@@ -68,6 +68,29 @@ impl Simulator {
             .and_then(|(vis, _)| per_sig.get(vis).copied())
     }
 
+    /// §14.5: `sel` (`bus[3:0]`, `mem[2][7:4]`) applied to `base`, the
+    /// sampled value of the net under the selects: the base is swapped for
+    /// the saved value and the select chain evaluated as usual.
+    fn apply_bound_select(&mut self, sel: &Expression, base: Value) -> Value {
+        fn swap_base(e: &mut Expression, saved: Expression) {
+            match &mut e.kind {
+                ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. }
+                    if Simulator::select_chain_base(expr).is_some() =>
+                {
+                    swap_base(expr, saved)
+                }
+                ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                    **expr = saved;
+                }
+                _ => *e = saved,
+            }
+        }
+        let saved = self.make_intra_saved_expr(base, sel.span);
+        let mut e = sel.clone();
+        swap_base(&mut e, saved);
+        self.eval_expr(&e)
+    }
+
     pub(super) fn tick_clocking_blocks(&mut self) {
         if self.clocking_meta.is_empty() {
             return;
@@ -211,11 +234,14 @@ impl Simulator {
             // - `#N`: the value N time units before the edge (`ClockingHist`).
             // A per-signal skew overrides the block default. The `##N` /
             // default-clocking aliases share the named block's skews.
-            let skey: &str = if cb.starts_with("__xz_default_clocking") {
-                self.default_clocking_cb.as_deref().unwrap_or(cb.as_str())
+            let skey: String = if cb.starts_with("__xz_default_clocking") {
+                self.default_clocking_cb
+                    .clone()
+                    .unwrap_or_else(|| cb.clone())
             } else {
-                cb.as_str()
+                cb.clone()
             };
+            let skey = skey.as_str();
             let in_dskew = self
                 .clocking_in_skew
                 .get(skey)
@@ -264,6 +290,17 @@ impl Simulator {
                     } else {
                         self.clocking_hist_value(sig, self.time.saturating_sub(skew))
                             .or_else(|| self.get_signal_value_by_name(sig))
+                    };
+                    // §14.5: a clockvar bound to a select samples that select
+                    // of the base net's sample (#823).
+                    let bound_sel = self
+                        .clocking_sig_bound_sel
+                        .get(skey)
+                        .and_then(|m| m.get(vis))
+                        .cloned();
+                    let v = match (v, bound_sel) {
+                        (Some(v), Some(sel)) => Some(self.apply_bound_select(&sel, v)),
+                        (v, _) => v,
                     };
                     if let Some(v) = v {
                         snap.insert(vis.clone(), v);

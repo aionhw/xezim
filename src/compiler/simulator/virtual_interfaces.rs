@@ -2364,6 +2364,18 @@ impl Simulator {
         }
     }
 
+    /// The expression under a chain of bit, part and element selects
+    /// (`bus[3:0]`, `mem[i][7:4]`): the net a select-bound clockvar names.
+    pub(super) fn select_chain_base(expr: &Expression) -> Option<&Expression> {
+        match &expr.kind {
+            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
+                Some(Self::select_chain_base(base).unwrap_or(base))
+            }
+            ExprKind::Ident(h) if h.path.last().is_some_and(|s| !s.selects.is_empty()) => None,
+            _ => None,
+        }
+    }
+
     /// First segment of a `flatten_member_path` chain, without building it.
     pub(super) fn member_path_head(expr: &Expression) -> Option<&str> {
         match &expr.kind {

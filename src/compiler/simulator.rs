@@ -7224,6 +7224,11 @@ pub struct Simulator {
     /// resolved net). The snapshot/meta store the NET; reads and drives use
     /// the clocking name, so they translate through this first.
     clocking_sig_alias: HashMap<String, HashMap<String, String>>,
+    /// §14.5 a clockvar bound to a select of a net (`input a = bus[3:0];`):
+    /// cb → (clocking name → the bound expression). The meta/alias store the
+    /// BASE net; a sample applies the select to the base's sample, a drive
+    /// writes through it (#823).
+    clocking_sig_bound_sel: HashMap<String, HashMap<String, Expression>>,
     /// §14.4 per-cb default OUTPUT skew in ticks (absent = #0).
     clocking_out_skew: HashMap<String, u64>,
     /// §14.4 per-signal output-skew overrides: cb → (resolved net → ticks).

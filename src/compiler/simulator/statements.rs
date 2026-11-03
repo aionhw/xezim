@@ -4323,7 +4323,27 @@ impl Simulator {
                             if let Some((net, _)) = out_net {
                                 let net = net.clone();
                                 let last_sels = &hier.path[hier.path.len() - 1].selects;
-                                let target = if cb_sels.is_empty() && last_sels.is_empty() {
+                                // §14.5: a clockvar bound to a select of the
+                                // net drives through that select (#823).
+                                let bound_sel = self
+                                    .clocking_sig_bound_sel
+                                    .get(&cb)
+                                    .and_then(|m| m.get(raw_sig))
+                                    .filter(|_| last_sels.is_empty())
+                                    .cloned();
+                                let target = if let Some(b) = bound_sel {
+                                    let mut t = b;
+                                    for layer in cb_sels.iter().rev() {
+                                        let mut l = (*layer).clone();
+                                        if let ExprKind::Index { expr, .. }
+                                        | ExprKind::RangeSelect { expr, .. } = &mut l.kind
+                                        {
+                                            *expr = Box::new(t);
+                                        }
+                                        t = l;
+                                    }
+                                    Some(self.freeze_lvalue_indices(&t))
+                                } else if cb_sels.is_empty() && last_sels.is_empty() {
                                     None
                                 } else {
                                     let mut t = Expression::new(

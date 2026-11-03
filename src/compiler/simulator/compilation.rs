@@ -76,6 +76,7 @@ impl Simulator {
                 // §14.3 renaming: the meta/snapshot key on the RESOLVED NET;
                 // `alias_map` translates the clocking-visible name to it.
                 let mut alias_map: HashMap<String, String> = HashMap::default();
+                let mut bound_sels: HashMap<String, Expression> = HashMap::default();
                 let mut inouts: HashSet<String> = HashSet::default();
                 let sigs: Vec<(String, bool)> = cd
                     .signals
@@ -86,10 +87,26 @@ impl Simulator {
                             crate::ast::types::PortDirection::Input
                                 | crate::ast::types::PortDirection::Inout
                         );
-                        let net = match s.bound_to.as_ref().and_then(Self::flatten_member_path) {
+                        // §14.5: a clockvar may be bound to a select of a
+                        // signal (`input a = bus[3:0];`). The base net is
+                        // the sampled/driven net; the select is kept.
+                        let (flat, has_sel) = match s.bound_to.as_ref() {
+                            Some(e) => match Self::flatten_member_path(e) {
+                                Some(segs) => (Some(segs), false),
+                                None => (
+                                    Self::select_chain_base(e).and_then(Self::flatten_member_path),
+                                    true,
+                                ),
+                            },
+                            None => (None, false),
+                        };
+                        let net = match flat {
                             Some(segs) if !segs.is_empty() => {
                                 let n = segs.join(".");
                                 alias_map.insert(s.name.name.clone(), n.clone());
+                                if has_sel && let Some(e) = s.bound_to.as_ref() {
+                                    bound_sels.insert(s.name.name.clone(), e.clone());
+                                }
                                 n
                             }
                             _ => s.name.name.clone(),
@@ -115,6 +132,14 @@ impl Simulator {
                             .insert("__xz_default_clocking".to_string(), alias_map.clone());
                     }
                     self.clocking_sig_alias.insert(cb_name.clone(), alias_map);
+                }
+                if !bound_sels.is_empty() {
+                    if cd.is_default {
+                        self.clocking_sig_bound_sel
+                            .insert("__xz_default_clocking".to_string(), bound_sels.clone());
+                    }
+                    self.clocking_sig_bound_sel
+                        .insert(cb_name.clone(), bound_sels);
                 }
                 // §14.11: alias the parser's reserved `##N` marker to the
                 // `default clocking` block, so the desugared
