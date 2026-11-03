@@ -192,3 +192,53 @@ endmodule
     assert_eq!(u(&sim, "rs"), 0xffff, "compiled: (W)'(sa) stays signed");
     assert_eq!(u(&sim, "rsi"), 0xffff, "procedural: (W)'(sa) stays signed");
 }
+
+/// §6.24.1: a casting size may be any constant expression (a parameter
+/// expression, a constant system or user function, a conditional), and it
+/// sizes the operand and the expression around it as a literal does. These
+/// were dropped, so `{(4+0)'(a)}` kept all 8 bits. Compiled (`always_comb`)
+/// and procedural forms agree.
+#[test]
+fn constant_expression_cast_sizes() {
+    let src = r#"
+module tb;
+  localparam int W = 7, N = 16;
+  function automatic int sz(int k); return k + 1; endfunction
+  logic [7:0] a = 8'hab, b = 8'hff;
+  logic signed [3:0] sn = -2;
+  logic [15:0] c1, c2, c3, c4, c5, c6, p1, p2, p3, p4, p5, p6;
+  always_comb c1 = {(4+0)'(a)};
+  always_comb c2 = {(W+1)'(a) + (W+1)'(b)};
+  always_comb c3 = {$clog2(N)'(a)};
+  always_comb c4 = {(N > 4 ? 12 : 4)'(a)};
+  always_comb c5 = (W+5)'(sn);
+  always_comb c6 = {(W+2)'(a) + b};
+  initial begin
+    #1;
+    p1 = {(4+0)'(a)};
+    p2 = {(W+1)'(a) + (W+1)'(b)};
+    p3 = {$clog2(N)'(a)};
+    p4 = {(N > 4 ? 12 : 4)'(a)};
+    p5 = (W+5)'(sn);
+    p6 = {sz(3)'(a)};
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    for (n, want) in [
+        ("c1", 0x000b),
+        ("c2", 0x00aa),
+        ("c3", 0x000b),
+        ("c4", 0x00ab),
+        ("c5", 0xfffe),
+        ("c6", 0x01aa),
+        ("p1", 0x000b),
+        ("p2", 0x00aa),
+        ("p3", 0x000b),
+        ("p4", 0x00ab),
+        ("p5", 0xfffe),
+        ("p6", 0x000b),
+    ] {
+        assert_eq!(u(&sim, n), want, "{n}");
+    }
+}
