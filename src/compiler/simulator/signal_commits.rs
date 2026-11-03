@@ -1446,7 +1446,57 @@ impl Simulator {
             let mut arm_extra_b: Vec<u32> = Vec::new();
             let mut arm_only_b = false;
             let mut arm_seen: HashSet<usize> = HashSet::default();
+            let mut arm_seen_elems: HashSet<usize> = HashSet::default();
             let armed = self.armed_edge;
+            // Index registers holding one constant for the whole block: a
+            // `q[3] <= d` or `x = m[7]` touches that element alone, so only
+            // it arms the block. Arming every element of the array made N
+            // blocks that each write one element of a shared array (a
+            // generate loop of flops) mark N blocks per element write,
+            // N^2 per clock. A register written once, by `LoadConst`, holds
+            // that constant on every path; an opaque instruction may write
+            // registers this scan does not see, so such a block keeps the
+            // whole-array arming.
+            let const_idx: HashMap<super::bytecode::RegId, i64> = {
+                use super::bytecode::BytecodeCompiler as Bc;
+                let mut m: HashMap<super::bytecode::RegId, (u32, Option<i64>)> = HashMap::default();
+                let mut opaque_any = false;
+                for insn in &cb.instructions {
+                    if Bc::is_opaque_insn(insn) {
+                        opaque_any = true;
+                        break;
+                    }
+                    let k = match insn {
+                        Insn::LoadConst(_, v) if !v.is_real && !v.has_xz() => v.to_i64(),
+                        _ => None,
+                    };
+                    if let Some(r) = Bc::dest_reg(insn).or_else(|| Bc::in_place_reg(insn)) {
+                        let e = m.entry(r).or_insert((0, None));
+                        e.0 += 1;
+                        e.1 = k;
+                    }
+                }
+                if opaque_any {
+                    HashMap::default()
+                } else {
+                    m.into_iter()
+                        .filter_map(|(r, (n, k))| (n == 1).then_some((r, k?)))
+                        .collect()
+                }
+            };
+            let arm_elems = |arr: &super::bytecode::ArrayOperand,
+                             idx: &super::bytecode::RegId,
+                             out: &mut Vec<u32>,
+                             seen: &mut HashSet<usize>,
+                             seen_elems: &mut HashSet<usize>|
+             -> bool {
+                if let Some(&k) = const_idx.get(idx)
+                    && Self::arm_array_elem(arr, k, armed, out, seen_elems)
+                {
+                    return true;
+                }
+                Self::arm_array_elems(arr, armed, out, seen)
+            };
             // A block that escapes to the AST interpreter (`StmtFallback`, e.g.
             // its only effect is `$display`/`$monitor`) has side effects and
             // reads the bytecode can't see. Gating it on "no tracked data-input
@@ -1514,8 +1564,14 @@ impl Simulator {
                             metas.push((0, w));
                         }
                     }
-                    Insn::LoadArrayElem(_, arr, _) => {
-                        if Self::arm_array_elems(arr, armed, &mut arm_extra_b, &mut arm_seen) {
+                    Insn::LoadArrayElem(_, arr, idx) => {
+                        if arm_elems(
+                            arr,
+                            idx,
+                            &mut arm_extra_b,
+                            &mut arm_seen,
+                            &mut arm_seen_elems,
+                        ) {
                             arm_only_b = true;
                         } else {
                             dynamic = true;
@@ -1544,11 +1600,17 @@ impl Simulator {
                     }
                     // Array-element NBA/blocking writes (memory) use a dynamic
                     // index; conservatively make such blocks non-gateable.
-                    Insn::NbaAssignArray(arr, ..)
-                    | Insn::NbaAssignArrayRange(arr, ..)
-                    | Insn::BlockingAssignArray(arr, ..)
-                    | Insn::BlockingAssignArrayRange(arr, ..) => {
-                        if Self::arm_array_elems(arr, armed, &mut arm_extra_b, &mut arm_seen) {
+                    Insn::NbaAssignArray(arr, idx, ..)
+                    | Insn::NbaAssignArrayRange(arr, idx, ..)
+                    | Insn::BlockingAssignArray(arr, idx, ..)
+                    | Insn::BlockingAssignArrayRange(arr, idx, ..) => {
+                        if arm_elems(
+                            arr,
+                            idx,
+                            &mut arm_extra_b,
+                            &mut arm_seen,
+                            &mut arm_seen_elems,
+                        ) {
                             arm_only_b = true;
                         } else {
                             dynamic = true;
@@ -1754,6 +1816,33 @@ impl Simulator {
         }
     }
 
+    /// Register one element of a dense unpacked array, selected by the
+    /// constant index `k`, as an arm-only input of the block. False when the
+    /// index is outside the array or the array is not dense (the caller then
+    /// arms the whole array, as before).
+    pub(super) fn arm_array_elem(
+        arr: &super::bytecode::ArrayOperand,
+        k: i64,
+        armed: bool,
+        out: &mut Vec<u32>,
+        seen: &mut HashSet<usize>,
+    ) -> bool {
+        if !armed {
+            return false;
+        }
+        match arr {
+            super::bytecode::ArrayOperand::Dense {
+                first_id, lo, hi, ..
+            } if *lo <= k && k <= *hi && !is_packed_id(*first_id) => {
+                let id = *first_id + (k - *lo) as usize;
+                if seen.insert(id) {
+                    out.push(id as u32);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
     pub(super) fn build_armed_edge_state(&mut self, arm_extra: &[Vec<u32>]) {
         self.armed_input_bitmap.clear();
         self.armed_input_ranges.clear();

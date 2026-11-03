@@ -21529,7 +21529,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// irrelevant afterwards). None for stores, branches and waits, which
     /// define nothing, and for the in-place and opaque shapes, which
     /// `in_place_reg` / `is_opaque_insn` classify instead.
-    fn dest_reg(insn: &Insn) -> Option<RegId> {
+    pub(crate) fn dest_reg(insn: &Insn) -> Option<RegId> {
         match insn {
             Insn::LoadConst(d, _)
             | Insn::LoadSignal(d, _)
@@ -21589,7 +21589,7 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     /// The register an instruction modifies IN PLACE (read and written).
-    fn in_place_reg(insn: &Insn) -> Option<RegId> {
+    pub(crate) fn in_place_reg(insn: &Insn) -> Option<RegId> {
         match insn {
             Insn::Resize(a, _) | Insn::SetSigned(a) | Insn::ClearSigned(a) | Insn::DropXz(a) => {
                 Some(*a)
@@ -21601,7 +21601,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// Instructions whose register traffic this file's rewrites do not
     /// model: interpreter escapes, formatting, string ops, and the fused
     /// pair form that only exists after every rewrite has run.
-    fn is_opaque_insn(insn: &Insn) -> bool {
+    pub(crate) fn is_opaque_insn(insn: &Insn) -> bool {
         matches!(
             insn,
             Insn::StmtFallback(..)
