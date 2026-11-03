@@ -3809,6 +3809,19 @@ impl Simulator {
             ExprKind::AssignmentPattern(its) => Some(its.as_slice()),
             _ => None,
         };
+        // A call is one value. Spreading `mk().a` and `mk().b` would re-run it.
+        if items.is_none() && matches!(rvalue.kind, ExprKind::Call { .. }) {
+            let fields = self.struct_leaf_layout("X", su);
+            let flat = !fields.is_empty() && fields.iter().all(|(k, _, w, _)| *w > 0 && k.strip_prefix("X.").is_some_and(|n| !n.contains(['.', '[']))) && su.members.iter().all(|m| self.unpacked_struct_of(&m.data_type).is_none() && !matches!(m.data_type, DataType::Simple { kind: crate::ast::types::SimpleType::String, .. }));
+            if flat {
+                let v = self.eval_expr(rvalue);
+                for (key, off, w, real) in fields {
+                    let mut mv = v.range_select((off + w - 1) as usize, off as usize); if real { mv = Value::from_f64(f64::from_bits(mv.to_u64().unwrap_or(0))); }
+                    self.assign_value(&Self::append_member_expr(lvalue, &key[2..]), &mv);
+                }
+                return;
+            }
+        }
         let ordered: Vec<_> = items
             .unwrap_or(&[])
             .iter()
