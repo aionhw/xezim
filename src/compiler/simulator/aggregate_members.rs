@@ -4154,7 +4154,8 @@ impl Simulator {
 
     /// §13.4.1 / §6.8: the initial leaves of a function's unpacked-struct
     /// return variable `ret_name` — each member starts at its type's default,
-    /// x for a 4-state member and 0 for a 2-state one.
+    /// x for a 4-state member and 0 for a 2-state one, or at its declared
+    /// default (§7.2.2), as for any variable of the type.
     pub(super) fn struct_return_leaf_seeds(
         &mut self,
         ret_name: &str,
@@ -4163,9 +4164,25 @@ impl Simulator {
         let mut defaults = Vec::new();
         self.struct_leaf_plain_defaults(ret_name, su, 0, &mut defaults);
         let defaults: HashMap<String, Value> = defaults.into_iter().collect();
+        let mut inits = Vec::new();
+        self.struct_member_defaults(ret_name, su, 0, &mut inits);
+        let mut declared: HashMap<String, Value> = HashMap::default();
+        if !inits.is_empty() {
+            let mut leaves = Vec::new();
+            self.unpacked_struct_leaf_defaults(ret_name, su, 0, &mut leaves);
+            let keys: HashSet<&str> = inits.iter().map(|(k, _, _)| k.as_str()).collect();
+            declared = leaves
+                .into_iter()
+                .filter(|(k, _, _)| keys.contains(k.as_str()))
+                .map(|(k, v, _)| (k, v))
+                .collect();
+        }
         self.unpacked_struct_leaf_keys(ret_name, su)
             .into_iter()
             .map(|(k, w, is_real)| {
+                if let Some(v) = declared.remove(&k) {
+                    return (k, v);
+                }
                 let seed = if is_real {
                     Value::from_f64(0.0)
                 } else {
