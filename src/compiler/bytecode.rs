@@ -20299,11 +20299,28 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             }
             ExprKind::Paren(inner) => self.expr_max_width(inner),
-            ExprKind::Call { args, .. } => args
-                .iter()
-                .map(|a| self.expr_max_width(a))
-                .max()
-                .unwrap_or(0),
+            ExprKind::Call { func, args } => {
+                // §11.6.1: a function call is as wide as its return type; its
+                // arguments are sized by the formals, not by the call's
+                // context (`f(16'(a))` with an 8-bit result is 8 bits).
+                if let ExprKind::Ident(h) = &func.kind
+                    && h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && let Some(name) = self.scoped_callee_name(h.path[0].name.name.clone())
+                    && let Some(fd) = self.functions.and_then(|f| f.get(&name))
+                    && !matches!(fd.return_type, crate::ast::types::DataType::Void(_))
+                {
+                    let w = self.decl_width_in(&fd.return_type, Some(name.as_str()));
+                    if w > 0 {
+                        return w;
+                    }
+                }
+                args.iter()
+                    .map(|a| self.expr_max_width(a))
+                    .max()
+                    .unwrap_or(0)
+            }
             // A system FUNCTION has the result type the LRM gives it, not the
             // width of its arguments — and certainly not 0, which the old
             // catch-all returned: `out_step <= $countones(be) >> 3` with a
