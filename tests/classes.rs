@@ -802,6 +802,8 @@ mod static_property_through_handle;
 mod struct_array_field_read;
 #[path = "classes/struct_prop_whole_copy.rs"]
 mod struct_prop_whole_copy;
+#[path = "classes/struct_prop_nested_member_copy.rs"]
+mod struct_prop_nested_member_copy;
 #[path = "classes/type_param_inherited_member_write.rs"]
 mod type_param_inherited_member_write;
 #[path = "classes/type_param_prop_member_write.rs"]

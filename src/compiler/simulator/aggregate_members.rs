@@ -1668,18 +1668,58 @@ impl Simulator {
                     for tup in tups {
                         let lhs_f = Self::append_elem_path(lvalue, mname, &tup);
                         let rhs_f = Self::append_elem_path(rvalue, mname, &tup);
-                        let v = self.eval_expr(&rhs_f);
-                        self.assign_value(&lhs_f, &v);
+                        self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &[]);
                     }
                     continue;
                 }
                 let lhs_f = Self::append_member_expr(lvalue, mname);
                 let rhs_f = Self::append_member_expr(rvalue, mname);
-                let v = self.eval_expr(&rhs_f);
-                self.assign_value(&lhs_f, &v);
+                self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &md.dimensions);
             }
         }
         Some(())
+    }
+
+    /// `lhs = rhs` for one struct member. A nested UNPACKED struct member has
+    /// no single value (`eval(rhs.n)` reads 0), so it is copied leaf by leaf
+    /// (§7.2).
+    fn assign_member_leaves(
+        &mut self,
+        lhs: &Expression,
+        rhs: &Expression,
+        dt: &DataType,
+        dims: &[crate::ast::types::UnpackedDimension],
+    ) {
+        if dims.is_empty() {
+            if let Some(inner) = self.unpacked_struct_of(dt) {
+                for m in &inner.members {
+                    for md in &m.declarators {
+                        let mname = md.name.name.as_str();
+                        if let Some(tups) = self.member_elem_indices(&md.dimensions) {
+                            for tup in tups {
+                                let lhs_f = Self::append_elem_path(lhs, mname, &tup);
+                                let rhs_f = Self::append_elem_path(rhs, mname, &tup);
+                                self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &[]);
+                            }
+                            continue;
+                        }
+                        let lhs_f = Self::append_member_expr(lhs, mname);
+                        let rhs_f = Self::append_member_expr(rhs, mname);
+                        self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &md.dimensions);
+                    }
+                }
+                return;
+            }
+        }
+        // A queue or dynamic member is the collection, not one scalar cell.
+        if let Some(kind) = Self::coll_kind_of(dims)
+            && let (Some(dst), Some(src)) = (self.expr_assoc_name(lhs), self.expr_assoc_name(rhs))
+        {
+            if dst != src { self.clear_coll(&dst, kind); self.copy_coll(&dst, &src, kind); }
+            return;
+        }
+        let v = self.eval_expr(rhs);
+        self.assign_value(lhs, &v);
     }
 
     /// Mirror of `try_decompose_struct_class_prop_assign` for the READ side:
@@ -1765,15 +1805,13 @@ impl Simulator {
                     for tup in tups {
                         let lhs_f = Self::append_elem_path(lvalue, mname, &tup);
                         let rhs_f = Self::append_elem_path(rvalue, mname, &tup);
-                        let v = self.eval_expr(&rhs_f);
-                        self.assign_value(&lhs_f, &v);
+                        self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &[]);
                     }
                     continue;
                 }
                 let lhs_f = Self::append_member_expr(lvalue, mname);
                 let rhs_f = Self::append_member_expr(rvalue, mname);
-                let v = self.eval_expr(&rhs_f);
-                self.assign_value(&lhs_f, &v);
+                self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &md.dimensions);
             }
         }
         Some(())
