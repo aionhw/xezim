@@ -157,3 +157,32 @@ endmodule
     );
     assert_eq!(out, vec!["R 42 7 3 4"]);
 }
+
+/// §13.4.2, §6.21: an automatic struct local of a function hides the module
+/// struct of the same name. Inlining the function must copy into the local,
+/// not into the module's `r`.
+#[test]
+fn inlined_function_local_struct_hides_module_struct() {
+    let out = lines(
+        r#"
+typedef struct { int a; int b; } s_t;
+module top;
+  s_t r = '{100, 200};
+  s_t g;
+  int x = 0, y;
+  function automatic int f(input int v);
+    s_t r;
+    r = g;
+    return v + 1;
+  endfunction
+  assign y = f(x);
+  initial begin
+    g = '{1, 2};
+    #1 x = 5;
+    #1 $display("R r=%0d,%0d y=%0d", r.a, r.b, y);
+  end
+endmodule
+"#,
+    );
+    assert_eq!(out, ["R r=100,200 y=6"]);
+}
