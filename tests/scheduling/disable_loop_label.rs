@@ -41,3 +41,21 @@ fn disable_outer_from_nested_loop() {
         "disable outer breaks nested loops, continues after"
     );
 }
+
+#[test]
+fn disable_named_seq_block_in_compiled_body() {
+    let src = "module t; int a=0, b=0; initial begin\n\
+        begin : blk\n\
+          a = 1;\n\
+          disable blk;\n\
+          a = 2;\n\
+        end\n\
+        b = a + 10;\n\
+        $display(\"C a=%0d b=%0d\", a, b);\n\
+        $finish; end endmodule";
+    assert_eq!(
+        out(src, "C "),
+        "C a=1 b=11",
+        "disable blk exits named block and resumes execution after it"
+    );
+}
