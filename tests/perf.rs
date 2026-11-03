@@ -50,3 +50,6 @@ mod eqc_branch;
 
 #[path = "perf/struct_resolver_compiled.rs"]
 mod struct_resolver_compiled;
+
+#[path = "perf/displaced_local_meta_reapply.rs"]
+mod displaced_local_meta_reapply;
