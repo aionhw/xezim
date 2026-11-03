@@ -279,6 +279,26 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   drive issued between clocking events: the drive took effect at the next
   clocking event instead of two time units after it (§14.4, §14.16, #824,
   reported by philipaxer).
+* In a module that is not the top, a member of an element of a packed array
+  of packed structs whose dimension is that module's parameter, `par[i].a`
+  with `s_t [N-1:0] par`, reads and writes the member's bits of element `i`;
+  the declaration was sized against the top's parameters, where `N` was
+  missing or another module's, so a 1-bit first member landed on bit `i` of
+  the whole array (§7.2.1, §7.4.5, §23.10, #816, reported by hernloh).
+* A `localparam` or `parameter` of a packed array of packed structs type in
+  an instantiated module takes its assignment pattern element by element,
+  so `s_t [1:0] P = '{'{a: 8'h33, b: 8'h44}, '{a: 8'h11, b: 8'h22}}` is
+  32'h3344_1122 and `$bits(P)` is 32; the pattern was packed as one struct
+  (§6.20.2, §10.9.1, §10.9.2, #817, reported by hernloh). A header
+  parameter overridden with such a pattern packs the same way.
+* An `always_comb` that writes one element of a packed vector and reads
+  another stays sensitive to the vector: `ds[1] = ds[0] + 1`, `w[7:4] =
+  w[3:0] + 1` and `st[1] = st[i] + 1` never woke when the element they read
+  was driven from outside, because every read of a name the block also
+  writes was dropped (§9.2.2.2.1, #844, PR #845, contributed by auty1395).
+  The rule follows the LRM text: the vector is kept unless the block writes
+  it whole or at a non-constant index, or writes every element it reads;
+  the block's own write does not re-queue it.
 * Inside a class, `sub.rand_mode(0)` on a `rand` class-handle property
   changes the handle's own mode, as `this.sub.rand_mode(0)` does; it switched
   off every random variable inside the object instead, so the object's
@@ -309,7 +329,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * A subroutine's scalar formal or local hides a same-named collection of a
   caller or of a subclass: `str.len()` on a `string str` formal read the
   caller's `str[$]` queue size (§23.9, #856, PR #857, contributed by
-  auty1395).
+  auty1395). It hides a same-named module-level collection too, as does a
+  class property: a `$unit` function's `str.len()` read the module's
+  `str[$]` size, and `return str` returned the queue (§23.9, §8.10).
 * A class first named through `typedef class C;` resolves to the class, not
   to the placeholder the forward declaration leaves, so `q[i].label == ""`
   on a string member compares text and returns 1 or 0 instead of x (§8.27,
