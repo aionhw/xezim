@@ -642,3 +642,6 @@ mod logical_operand_self_determined_810;
 mod unpacked_struct_procedural_copy;
 #[path = "types/unpacked_struct_output_port_whole_write.rs"]
 mod unpacked_struct_output_port_whole_write;
+
+#[path = "types/function_result_member_defaults.rs"]
+mod function_result_member_defaults;
