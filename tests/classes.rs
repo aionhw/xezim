@@ -788,6 +788,8 @@ mod sqr_zero_time_loop;
 mod static_assoc_struct_pool;
 #[path = "classes/static_collection_qualified_access.rs"]
 mod static_collection_qualified_access;
+#[path = "classes/class_scoped_static_queue_copy.rs"]
+mod class_scoped_static_queue_copy;
 #[path = "classes/static_instance_assoc_object.rs"]
 mod static_instance_assoc_object;
 #[path = "classes/static_property_through_handle.rs"]
