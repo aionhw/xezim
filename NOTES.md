@@ -205,6 +205,57 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   §7.10.1, §12.7.3, §21.2.1.7, #765, PR core #132, #133 and #772–#774).
   Reported and fixed by philipaxer.
 
+* A queue method on an element of a class's collection of queues of
+  handles, `m[k].push_back(o)` in a compiled method, applies to that queue;
+  it reported a null handle (§7.4.4, §7.10.2.7, #820, PR #821). Reported and
+  fixed by philipaxer.
+* A clockvar bound to an expression in an interface, `output q = q_drv;`,
+  drives and samples that instance's signal, not a same-named net `q`; it
+  drove nothing (§14.3, §14.5, #822, PR core #143 and #826). Reported and
+  fixed by philipaxer.
+* A size cast's width sizes the expression around it: `(9'(c) + s) >
+  8'hff` with 8-bit `c` and `s` sums at 9 bits, where it wrapped to 0, and
+  the parenthesized `(W)'(x)` keeps its size, where it was dropped (§6.24.1,
+  §11.6.1, #827, PR core #144 and #828). In compiled code a function call in
+  such an expression is as wide as its return type, and a size cast keeps
+  its operand's signedness, so `(W)'(sa)` of a signed -1 sign-extends.
+  Reported and fixed by davekeeshan.
+* A nonblocking write of one field of an unpacked-struct array element
+  inside an instance, `storage[0].value <= v`, completes; its expansion
+  recursed and the time slot never ended (§10.4.2, #831, PR #832). The same
+  write to an element of a queue or dynamic array wakes the processes that
+  read it. Reported and fixed by davekeeshan.
+* A parameter override list must fit the definition it instantiates,
+  wherever either is written: excess ordered values, a parameter set twice
+  and a name that is not an overridable parameter are errors (§23.10.2,
+  #818, PR core #146), and so is a list mixing ordered and named entries
+  (A.4.1.1, core #150, PR core #151). A parameter in a `generate` region of
+  a module without a parameter port list takes an ordered slot, and its
+  override applies; it kept its default (§23.10.2.1, §27.3). Reported and
+  fixed by chuanseng-ng.
+* A compiled delay expression reads its value: `always #1 a = a + 1;` under
+  `` `timescale 1ns/100ps `` ran away with stall warnings, and `always
+  #(1*2)` ran at the wrong period (§9.4.1, §22.7, PR #835, contributed by
+  ds54e).
+* An element of an inlined function's dynamic-array formal keeps its
+  declared type: a `real` element divided as an integer, so `d[k] / x` read
+  0, and a signed `int` element read as unsigned (§11.3.1, §13.5, PR #836,
+  contributed by ds54e).
+* A compiled process copies a whole unpacked struct member by member, where
+  `always_comb l = t;` left `l` at its default, and an `always_comb` that
+  reads a whole struct re-fires when a member changes, inside instances too
+  (§7.2, §9.2.2.2.1, PR #838, contributed by ds54e). An inlined function's
+  struct local is not taken for a module struct of the same name.
+* A child module that writes a whole unpacked struct to its output port,
+  `assign o = '{x, 7};`, drives the parent, which read the members' defaults
+  (§7.2, §23.3.3, PR core #152 and #839, contributed by ds54e).
+* A header parameter used as a port actual inside its module, `leaf u
+  (.a(VREF));`, creates no implicit 1-bit net and no warning (§6.20, §6.10,
+  PR core #154 and #840, contributed by ds54e).
+* With `solve pkt.psel before pkt.paddr` over fields of a packed-struct rand
+  member, `psel` is drawn over its range; it came up 2 on every draw
+  (§18.5.10, #815, PR #829, contributed by Ganesh-TNL).
+
 **Performance**
 
 * Instances whose parameters differ only in the instances above them share
@@ -241,6 +292,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and 5.7 G after, and 250 instances 96.6 G and 4.0 G. The elaborated design
   is unchanged for every design under tests/ and examples/. Reported by
   git-hevangel.
+* A member of a struct resolution function's result, the `n.V =
+  res('{...}).V` assign a struct nettype emits for each member, compiles:
+  the function is inlined over one scalar per member (§6.6.7, §7.2, PR #837
+  and core #153, contributed by ds54e). Each settle ran the resolver in the
+  interpreter once per member, over 99% of a charge-pump regulator model's
+  run. A struct with member defaults, or a call whose unused part has a side
+  effect, keeps the call.
 
 ### 0.11.4 — class-object reclamation, linear elaboration, class and randomization correctness (October 2026)
 
