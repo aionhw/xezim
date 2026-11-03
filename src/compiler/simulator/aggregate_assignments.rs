@@ -1498,6 +1498,140 @@ impl Simulator {
         Some(leaves)
     }
 
+    /// Declared bounds of a fixed multi-dimensional unpacked array, outermost
+    /// first, or None for anything else (queues, associative arrays, 1-D
+    /// arrays, arrays of unpacked structs).
+    fn fixed_unpacked_dims(&self, name: &str) -> Option<Vec<(i64, i64)>> {
+        if self.module.dynamic_arrays.contains(name) || self.is_associative_array(name) {
+            return None;
+        }
+        if let Some(dt) = self.module.var_decl_types.get(name)
+            && matches!(self.resolve_dt(dt), DataType::Struct(_))
+        {
+            return None;
+        }
+        if let Some(&(r0, r1, _)) = self.module.arrays_2d.get(name) {
+            return Some(match self.module.unpacked_decl_dims.get(name) {
+                Some(d) if d.len() == 2 => d.clone(),
+                _ => vec![r0, r1],
+            });
+        }
+        let (shape, _) = self.module.arrays_nd.get(name)?;
+        Some(match self.module.unpacked_decl_dims.get(name) {
+            Some(d) if d.len() == shape.len() => d.clone(),
+            _ => shape.clone(),
+        })
+    }
+
+    /// For an array operand that is a whole array or a row of a multi-
+    /// dimensional unpacked array (`q`, `q[1]`), the dimensions left below the
+    /// selected indices and the leaf-path suffixes in declared order.
+    fn unpacked_row_suffixes(&mut self, expr: &Expression) -> Option<Vec<String>> {
+        let mut idx_exprs: Vec<&Expression> = Vec::new();
+        let mut cur = expr;
+        while let ExprKind::Index { expr: inner, index } = &cur.kind {
+            idx_exprs.push(index);
+            cur = inner;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        let nm = self.resolve_hier_name(h).into_owned();
+        let dims = self.fixed_unpacked_dims(&nm)?;
+        let k = idx_exprs.len();
+        if k >= dims.len() {
+            return None;
+        }
+        for ie in &idx_exprs {
+            if !Self::cond_expr_is_effect_free(ie, false) || self.eval_expr(ie).has_xz() {
+                return None;
+            }
+        }
+        let mut total: u64 = 1;
+        for &(l, r) in &dims[k..] {
+            total = total
+                .checked_mul(l.abs_diff(r) + 1)
+                .filter(|&t| t <= 1 << 16)?;
+        }
+        let mut suffixes = vec![String::new()];
+        for &(l, r) in &dims[k..] {
+            let idx: Vec<i64> = if l <= r {
+                (l..=r).collect()
+            } else {
+                (r..=l).rev().collect()
+            };
+            suffixes = suffixes
+                .iter()
+                .flat_map(|p| idx.iter().map(move |i| format!("{}[{}]", p, i)))
+                .collect();
+        }
+        Some(suffixes)
+    }
+
+    /// §10.4.2 / §7.6: a nonblocking assignment whose target is a ROW of a
+    /// multi-dimensional unpacked array (`q[1] <= in_i`, `q[i] <= q[i+1]`,
+    /// `q[0] <= '{default: 0}`). Each element is its own signal, so the row is
+    /// updated as one nonblocking assignment per element, every source read
+    /// now. Without this the single update queued against `q[1]` landed on no
+    /// storage and the row read back x.
+    pub(super) fn unpacked_row_nba_leaves(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> Option<Vec<(Expression, Value)>> {
+        if !matches!(lvalue.kind, ExprKind::Index { .. }) {
+            return None;
+        }
+        let targets = self.unpacked_row_suffixes(lvalue)?;
+        let mut values: Vec<Value> = Vec::with_capacity(targets.len());
+        if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
+            // A flat pattern over a single remaining dimension: element i is
+            // the i-th positional item, the item keyed by its declared index,
+            // or the default.
+            let first = targets.first()?;
+            if first.matches('[').count() != 1 {
+                return None;
+            }
+            let indices: Vec<i64> = targets
+                .iter()
+                .map(|s| s.trim_matches(['[', ']']).parse().ok())
+                .collect::<Option<_>>()?;
+            let elems = self.pattern_elems(items, &indices);
+            for e in elems {
+                values.push(self.eval_expr(e?));
+            }
+        } else {
+            // A row or whole multi-dimensional array, or a plain 1-D unpacked
+            // array of the same element count (`q[1] <= in_i`).
+            let sources = match self.unpacked_row_suffixes(rvalue) {
+                Some(s) => s,
+                None => {
+                    let src = self.foreach_check_operand_name(rvalue)?;
+                    if self.module.dynamic_arrays.contains(&src) || self.is_associative_array(&src)
+                    {
+                        return None;
+                    }
+                    let (elems, _) = self.stream_elem_order(&src)?;
+                    elems.iter().map(|e| e[src.len()..].to_string()).collect()
+                }
+            };
+            if sources.len() != targets.len() {
+                return None;
+            }
+            for sfx in &sources {
+                let leaf = Self::append_leaf_path(rvalue, sfx);
+                values.push(self.eval_expr(&leaf));
+            }
+        }
+        Some(
+            targets
+                .iter()
+                .zip(values)
+                .map(|(sfx, v)| (Self::append_leaf_path(lvalue, sfx), v))
+                .collect(),
+        )
+    }
+
     pub(super) fn unpacked_struct_nba_leaves(
         &mut self,
         lvalue: &Expression,
