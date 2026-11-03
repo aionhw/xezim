@@ -16194,17 +16194,21 @@ impl<'a> BytecodeCompiler<'a> {
                             return None;
                         }
                     }
-                    let known = literal_w.map(|w| (w, false)).or_else(|| {
+                    // (width, signedness): a SIZE cast (`8'(x)`, `N'(x)`)
+                    // keeps the operand's signedness (§6.24.1), a type
+                    // cast takes the type's.
+                    let known = literal_w.map(|w| (w, None)).or_else(|| {
                         target.as_ref().and_then(|nm| {
                             self.cast_widths
                                 .and_then(|m| m.get(nm).copied())
+                                .map(|(w, signed)| (w, Some(signed)))
                                 .or_else(|| {
                                     // Parameter-valued SIZE cast: `N'(x)` with
                                     // N a constant parameter.
                                     self.params
                                         .and_then(|p| p.get(nm))
                                         .and_then(|v| v.to_u64())
-                                        .map(|n| ((n as u32).max(1), false))
+                                        .map(|n| ((n as u32).max(1), None))
                                 })
                         })
                     });
@@ -16239,10 +16243,10 @@ impl<'a> BytecodeCompiler<'a> {
                                 self.emit(Insn::DropXz(r));
                             }
                         }
-                        if signed {
-                            self.emit(Insn::SetSigned(r));
-                        } else {
-                            self.emit(Insn::ClearSigned(r));
+                        match signed {
+                            Some(true) => self.emit(Insn::SetSigned(r)),
+                            Some(false) => self.emit(Insn::ClearSigned(r)),
+                            None => {}
                         }
                         Some(r)
                     } else {
