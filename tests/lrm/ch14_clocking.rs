@@ -81,6 +81,39 @@ fn c14_16_clocking_output_skew() {
     );
 }
 
+// §14.5: a clockvar bound to a part-select samples and drives that slice
+#[test]
+fn c14_5_clockvar_slice_binding() {
+    check(
+        "14.5_clockvar_slice_binding",
+        include_str!("sv/14.5_clockvar_slice_binding.sv"),
+        "c145s",
+        Order::Exact,
+        &[
+            "T|14.5|in a=a hi=5",
+            "T|14.5|out o_drv=09",
+            "T|14.5|out2 o_drv=c9",
+            "T|14.5|stale a=a",
+            "T|14.5|fresh a=3 hi=c",
+        ],
+        &[],
+    );
+}
+
+// §14.4, §14.16: the output skew of a renamed clockvar applies to drives
+// issued between clocking events
+#[test]
+fn c14_4_renamed_clockvar_output_skew() {
+    check(
+        "14.4_renamed_clockvar_output_skew",
+        include_str!("sv/14.4_renamed_clockvar_output_skew.sv"),
+        "c144r",
+        Order::Exact,
+        &["T|14.4|q t=17", "T|14.4|r t=28"],
+        &[],
+    );
+}
+
 // §14.3: clocking block inout signals
 #[test]
 fn c14_3_clocking_inout_signals() {
