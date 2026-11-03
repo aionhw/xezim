@@ -1874,11 +1874,19 @@ impl Simulator {
                         if plain_class {
                             // A class handle is bound as passed.
                         } else if let Some(pw) = param_w {
-                            let signed = match &port.data_type {
+                            let (signed, two_state) = match &port.data_type {
                                 DataType::TypeReference { name, .. } => self
                                     .class_local_typedef(cname, &name.name.name)
-                                    .is_some_and(super::elaborate::is_type_signed),
-                                _ => false,
+                                    .map_or((false, false), |td| {
+                                        (
+                                            super::elaborate::is_type_signed(td),
+                                            super::elaborate::is_type_two_state_resolved(
+                                                td,
+                                                &self.module.typedef_types,
+                                            ),
+                                        )
+                                    }),
+                                _ => (false, false),
                             };
                             if val.is_real {
                                 val = Self::real_to_int(val.to_f64(), pw);
@@ -1886,6 +1894,10 @@ impl Simulator {
                                 val = val.resize_for_assign(pw);
                             }
                             val.is_signed = signed;
+                            // §6.11.2: x and z become 0 in a 2-state formal.
+                            if two_state && val.has_xz() {
+                                val = val.to_two_state();
+                            }
                         } else if let Some((pw, signed)) =
                             self.scalar_formal_integral(&port.data_type)
                         {
@@ -2093,7 +2105,13 @@ impl Simulator {
                             // cell dropped the upper half. Register the width
                             // too so a later `retname = <narrow>` zero-extends
                             // back, mirroring a typed VarDecl.
-                            let rw = if plan.type_gen == self.type_tables_gen {
+                            // §8.25: a return type sized by the class's
+                            // parameters takes the receiver's specialization.
+                            let rw = if let Some(w) =
+                                self.method_formal_param_width(handle, cname, &f.return_type)
+                            {
+                                w
+                            } else if plan.type_gen == self.type_tables_gen {
                                 rp.width
                             } else {
                                 super::elaborate::resolve_type_width(
