@@ -1071,3 +1071,6 @@ mod randomize_elem_dist_weights;
 
 #[path = "classes/property_hides_module_variable.rs"]
 mod property_hides_module_variable;
+
+#[path = "classes/unit_class_out_of_block_members_843.rs"]
+mod unit_class_out_of_block_members_843;
