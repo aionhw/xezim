@@ -847,19 +847,23 @@ impl Simulator {
 
         // Rand collection members (dynamic arrays, queues, associative arrays).
         let rand_colls = self.collect_rand_colls(handle, &rand_disabled, &constraints);
-        // `unique {c}` items naming one of those collections (§18.5.5).
-        let unique_colls: Vec<RandColl> = {
-            let mut out: Vec<RandColl> = Vec::new();
-            fn walk(item: &ConstraintItem, out: &mut Vec<String>) {
+        Self::regroup_unique_colls(&mut constraints, &rand_colls);
+        // `unique {c}` / `unique {a, b}` items naming those collections
+        // (§18.5.5), one group per item.
+        let unique_colls: Vec<Vec<RandColl>> = {
+            let mut out: Vec<Vec<RandColl>> = Vec::new();
+            fn walk(item: &ConstraintItem, out: &mut Vec<Vec<String>>) {
                 match item {
                     ConstraintItem::Unique { exprs, .. } => {
+                        let mut group = Vec::new();
                         for e in exprs {
                             if let ExprKind::Ident(h) = &e.kind {
                                 if let Some(s) = h.path.last() {
-                                    out.push(s.name.name.clone());
+                                    group.push(s.name.name.clone());
                                 }
                             }
                         }
+                        out.push(group);
                     }
                     ConstraintItem::Block(items) => {
                         for i in items {
@@ -870,15 +874,19 @@ impl Simulator {
                     _ => {}
                 }
             }
-            let mut names: Vec<String> = Vec::new();
+            let mut groups: Vec<Vec<String>> = Vec::new();
             for con in &constraints {
                 for it in &con.items {
-                    walk(it, &mut names);
+                    walk(it, &mut groups);
                 }
             }
-            for n in names {
-                if let Some(c) = rand_colls.iter().find(|c| c.prop == n) {
-                    out.push(c.clone());
+            for g in groups {
+                let cs: Vec<RandColl> = g
+                    .iter()
+                    .filter_map(|n| rand_colls.iter().find(|c| &c.prop == n).cloned())
+                    .collect();
+                if !cs.is_empty() {
+                    out.push(cs);
                 }
             }
             out
@@ -2498,8 +2506,8 @@ impl Simulator {
                 }
                 self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
                 self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
-                for c in &unique_colls {
-                    self.enforce_unique_coll(c, &constraints, &pinned_elems);
+                for cs in &unique_colls {
+                    self.enforce_unique_coll(cs, &constraints, &pinned_elems);
                 }
             }
             {

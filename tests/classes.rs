@@ -424,6 +424,10 @@ mod randomize_inside_range;
 mod randomize_std_failed_restores_arrays;
 #[path = "classes/randomize_object_arrays.rs"]
 mod randomize_object_arrays;
+#[path = "classes/unique_multi_dyn_array.rs"]
+mod unique_multi_dyn_array;
+#[path = "classes/unique_scalar_and_fixed_array.rs"]
+mod unique_scalar_and_fixed_array;
 #[path = "classes/randomize_issue_255_full.rs"]
 mod randomize_issue_255_full;
 #[path = "classes/randomize_issue_255_shapes.rs"]
