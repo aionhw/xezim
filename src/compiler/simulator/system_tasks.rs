@@ -2662,6 +2662,20 @@ impl Simulator {
                             if ai < args.len() {
                                 let arg = &args[ai];
                                 ai += 1;
+                                // §10.9: an unpacked typed pattern renders as a
+                                // variable of its type.
+                                if let Some(Some(s)) =
+                                    self.with_typed_pattern_storage(arg, |sim, held| {
+                                        let ExprKind::Ident(h) = &held.kind else {
+                                            return None;
+                                        };
+                                        sim.p_top_level = true;
+                                        sim.render_p_var(&h.path[0].name.name)
+                                    })
+                                {
+                                    result.push_str(&s);
+                                    continue;
+                                }
                                 self.p_top_level = true;
                                 // §21.2.1.7: a packed typed pattern renders as a
                                 // value of its own type.

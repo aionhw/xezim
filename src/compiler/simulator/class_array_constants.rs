@@ -42,7 +42,7 @@ impl Simulator {
     /// §8.25: retain a value-parameter pattern in an object's specialization
     /// signature, including literal sizes, signs, keys and replication.
     pub(super) fn class_array_arg_fragment(&self, expr: &Expression) -> Option<String> {
-        match &expr.kind {
+        match &expr.peel_typed_pattern().kind {
             ExprKind::AssignmentPattern(items) => {
                 let parts: Option<Vec<String>> = items
                     .iter()
@@ -536,7 +536,7 @@ impl Simulator {
         key: &str,
     ) -> Option<()> {
         let layout = self.class_array_layout(class, leaf)?;
-        let ExprKind::AssignmentPattern(items) = &init.kind else {
+        let ExprKind::AssignmentPattern(items) = &init.peel_typed_pattern().kind else {
             return None;
         };
         let count = usize::try_from(layout.hi.checked_sub(layout.lo)?.checked_add(1)?).ok()?;
@@ -626,7 +626,7 @@ impl Simulator {
         leaf: &str,
         init: &Expression,
     ) {
-        let ExprKind::AssignmentPattern(items) = &init.kind else {
+        let ExprKind::AssignmentPattern(items) = &init.peel_typed_pattern().kind else {
             return;
         };
         let signature = self.canonicalize_spec_sig(class, "");

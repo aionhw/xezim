@@ -644,7 +644,7 @@ impl Simulator {
             );
             let r = if dims.len() > 1 {
                 let inner = descending.get(1..).unwrap_or(&[]);
-                match &e.kind {
+                match &self.unpacked_pattern(e).kind {
                     ExprKind::AssignmentPattern(sub) => {
                         self.pattern_cmp_dims(&elem, &dims[1..], inner, sub, case)
                     }
@@ -676,6 +676,7 @@ impl Simulator {
         // §10.9: an item is assignment-like to its ELEMENT — an integral
         // item converts to the element type first, so `-1` matches a
         // `bit [7:0]` element holding 255.
+        let item = self.unpacked_pattern(item);
         if !matches!(item.kind, ExprKind::AssignmentPattern(_))
             && !self.operand_is_string(&elem)
             && self.unpacked_struct_type_of(&elem).is_none()
@@ -1859,7 +1860,7 @@ impl Simulator {
         // A queue literal / assignment pattern (`{"a", "b"}` or `'{...}`) passed
         // directly as the actual: bind each top-level element as one queue
         // entry.
-        let literal_elems: Option<Vec<&Expression>> = match &arg.kind {
+        let literal_elems: Option<Vec<&Expression>> = match &self.unpacked_pattern(arg).kind {
             ExprKind::Concatenation(parts) => Some(parts.iter().collect()),
             ExprKind::AssignmentPattern(items) => Some(self.pattern_ordered(items)),
             _ => None,
@@ -1911,7 +1912,10 @@ impl Simulator {
             // An element that is itself a `'{..}` pattern (a dynamic array of
             // UNPACKED structs) is scattered member-wise, not evaluated.
             for (j, part) in parts.iter().enumerate() {
-                if matches!(part.kind, ExprKind::AssignmentPattern(_)) {
+                if matches!(
+                    self.unpacked_pattern(part).kind,
+                    ExprKind::AssignmentPattern(_)
+                ) {
                     self.assign_pattern_or_leaf(&format!("{}[{}]", key, j), queue_data_type, part);
                     continue;
                 }

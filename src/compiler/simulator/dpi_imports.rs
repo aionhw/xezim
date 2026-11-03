@@ -925,7 +925,7 @@ impl Simulator {
         &mut self,
         e: &Expression,
     ) -> Option<(Vec<Value>, Vec<(i64, i64)>)> {
-        let ExprKind::AssignmentPattern(items) = &e.kind else {
+        let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(e).kind else {
             return None;
         };
         if items.is_empty()
@@ -936,9 +936,12 @@ impl Simulator {
             return None;
         }
         let n = items.len() as i64;
-        let nested = items
-            .iter()
-            .all(|it| matches!(it.expr().kind, ExprKind::AssignmentPattern(_)));
+        let nested = items.iter().all(|it| {
+            matches!(
+                self.unpacked_pattern(it.expr()).kind,
+                ExprKind::AssignmentPattern(_)
+            )
+        });
         if nested {
             let mut out = Vec::new();
             let mut inner: Option<Vec<(i64, i64)>> = None;

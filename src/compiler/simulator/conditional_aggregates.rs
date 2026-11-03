@@ -631,6 +631,144 @@ impl Simulator {
         }
     }
 
+    /// The pattern of the typed pattern `e`, `T'{...}`, when `T` is not
+    /// packed. An unpacked target has an equivalent type (§6.22.2), so the
+    /// items place as an untyped pattern's; a packed `T'{...}` is a value.
+    pub(super) fn unpacked_typed_pattern<'e>(
+        &mut self,
+        e: &'e Expression,
+    ) -> Option<&'e Expression> {
+        match &e.kind {
+            ExprKind::TypedPattern { ty, pattern } if !is_packed(ty, self) => Some(pattern),
+            _ => None,
+        }
+    }
+
+    /// `e`, or its pattern when it is an unpacked typed pattern.
+    pub(super) fn unpacked_pattern<'e>(&mut self, e: &'e Expression) -> &'e Expression {
+        self.unpacked_typed_pattern(e).unwrap_or(e)
+    }
+
+    /// The element type and unpacked dimensions of the unpacked type `ty`
+    /// (an unpacked array typedef, or an unpacked struct).
+    fn unpacked_type_shape(
+        &mut self,
+        ty: &DataType,
+    ) -> Option<(DataType, Vec<crate::ast::types::UnpackedDimension>)> {
+        let mut dims = Vec::new();
+        let mut cur = ty.clone();
+        for _ in 0..16 {
+            let DataType::TypeReference { name, .. } = &cur else {
+                break;
+            };
+            let key = if name.has_scope() {
+                name.qualified()
+            } else {
+                name.name.name.clone()
+            };
+            let Some(d) = self
+                .typedef_unpacked_dims_of(&key)
+                .filter(|d| !d.is_empty())
+            else {
+                break;
+            };
+            dims.extend(d.iter().cloned());
+            let base = if name.has_scope() {
+                super::elaborate::lookup_scoped_type(name, &self.module.typedef_types).cloned()
+            } else {
+                self.lookup_typedef_target(&key)
+            };
+            cur = base?;
+        }
+        if dims.is_empty() && self.unpacked_struct_of(&cur).is_none() {
+            return None;
+        }
+        Some((cur, dims))
+    }
+
+    /// §10.9: run `f` on storage holding the value of the typed pattern `e`
+    /// of an unpacked type `T`, a variable of type `T` initialized with the
+    /// pattern, then release it. None for any other expression.
+    pub(super) fn with_typed_pattern_storage<R>(
+        &mut self,
+        e: &Expression,
+        f: impl FnOnce(&mut Self, &Expression) -> R,
+    ) -> Option<R> {
+        let ExprKind::TypedPattern { ty, pattern } = &e.kind else {
+            return None;
+        };
+        let (dt, dims) = self.unpacked_type_shape(ty)?;
+        let value = self.snapshot_aggregate_operand_body(
+            pattern,
+            Some(AggregateContext::Declared(&dt, &dims)),
+        )?;
+        self.typed_pattern_seq += 1;
+        let name = format!("__xz_typed_pattern_{}__", self.typed_pattern_seq);
+        self.store_conditional_aggregate(&name, &value);
+        let held = Self::hier_ident_expr(
+            vec![crate::ast::expr::HierPathSegment {
+                name: crate::ast::Identifier {
+                    name: name.clone(),
+                    span: e.span,
+                },
+                selects: Vec::new(),
+            }],
+            e.span,
+        );
+        let out = f(self, &held);
+        self.release_conditional_aggregate(&name, &value);
+        self.typed_pattern_seq -= 1;
+        Some(out)
+    }
+
+    /// The packed transport value of the typed pattern `e` with an unpacked
+    /// struct type, as an unpacked struct return carries it.
+    pub(super) fn typed_struct_pattern_value(&mut self, e: &Expression) -> Option<Value> {
+        let ExprKind::TypedPattern { ty, .. } = &e.kind else {
+            return None;
+        };
+        let su = self.unpacked_struct_of(ty)?;
+        self.with_typed_pattern_storage(e, |sim, held| {
+            let ExprKind::Ident(h) = &held.kind else {
+                return None;
+            };
+            sim.pack_unpacked_struct(&h.path[0].name.name, &su)
+        })?
+    }
+
+    /// Remove what `store_conditional_aggregate` stored for `value`.
+    fn release_conditional_aggregate(&mut self, name: &str, value: &AggregateValue) {
+        self.module.var_decl_types.remove(name);
+        self.module.arrays.remove(name);
+        self.module.arrays_2d.remove(name);
+        self.module.arrays_nd.remove(name);
+        self.module.dynamic_arrays.remove(name);
+        self.module.unpacked_decl_dims.remove(name);
+        self.module.descending_arrays.remove(name);
+        match &value.kind {
+            AggregateKind::Scalar { .. } => {
+                self.signals.remove(name);
+            }
+            AggregateKind::Struct(fields) => {
+                for (field, value) in fields {
+                    self.release_conditional_aggregate(&format!("{name}.{field}"), value);
+                }
+            }
+            AggregateKind::Array {
+                indices,
+                values,
+                dynamic,
+            } => {
+                if *dynamic {
+                    self.signals.remove(&Self::name_with_suffix(name, ".size"));
+                }
+                for (i, child) in indices.iter().zip(values) {
+                    self.release_conditional_aggregate(&format!("{name}[{i}]"), child);
+                }
+            }
+        }
+    }
+
     fn store_conditional_aggregate(&mut self, name: &str, value: &AggregateValue) {
         self.module
             .var_decl_types

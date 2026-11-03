@@ -328,7 +328,7 @@ impl Simulator {
     /// `e` is itself an assignment pattern and `dt` an unpacked struct, recurse
     /// member-wise; otherwise evaluate and write the leaf.
     pub(super) fn assign_pattern_or_leaf(&mut self, target: &str, dt: &DataType, e: &Expression) {
-        if let ExprKind::AssignmentPattern(sub) = &e.peel_typed_pattern().kind {
+        if let ExprKind::AssignmentPattern(sub) = &self.unpacked_pattern(e).kind {
             if !sub.is_empty() {
                 if let DataType::Struct(su) = self.resolve_dt(dt) {
                     if Self::spreads_member_wise(&su) {
@@ -445,7 +445,7 @@ impl Simulator {
             .map(|t| t.2)
             .or_else(|| self.module.assoc_elem_widths.get(name).copied())
             .unwrap_or(32);
-        match &e.kind {
+        match &self.unpacked_pattern(e).kind {
             ExprKind::AssignmentPattern(items) => {
                 if is_assoc {
                     self.eval_builtin_method(name, "delete", &[]);
@@ -749,7 +749,7 @@ impl Simulator {
         {
             return true;
         }
-        if let ExprKind::AssignmentPattern(items) = &rvalue.kind
+        if let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(rvalue).kind
             && !items.is_empty()
             && !self.no_class_objects()
             && Self::receiver_prop_name(lvalue).is_some_and(|p| self.struct_prop_name_possible(p))
@@ -853,7 +853,7 @@ impl Simulator {
                 && depth < 8
                 && let Some(inner) = self.unpacked_struct_of(&mdt)
             {
-                match &e.kind {
+                match &self.unpacked_pattern(e).kind {
                     ExprKind::AssignmentPattern(sub) if !sub.is_empty() => {
                         self.assign_class_struct_members(stmt, &lhs, &inner, sub, depth + 1);
                         continue;
@@ -878,7 +878,7 @@ impl Simulator {
     /// alone.
     #[allow(clippy::type_complexity)]
     pub(super) fn bind_struct_pattern_items<'a>(
-        &self,
+        &mut self,
         su: &crate::ast::types::StructUnionType,
         items: &'a [AssignmentPatternItem],
     ) -> Vec<(
@@ -910,6 +910,17 @@ impl Simulator {
                 AssignmentPatternItem::Named(id, e) => {
                     if let Some(i) = members.iter().position(|(n, _, _)| *n == id.name) {
                         by_name[i] = Some(e);
+                    } else if <Self as crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver>::is_type_name(
+                        self, &id.name,
+                    ) {
+                        // A `name:` key naming no member but a type is a
+                        // type key (§10.9.2).
+                        let key_dt = crate::compiler::packed_assignment_pattern_plan::type_ref(&id.name);
+                        for (i, (_, mdt, _)) in members.iter().enumerate() {
+                            if by_name[i].is_none() && self.pattern_type_matches(mdt, &key_dt) {
+                                by_name[i] = Some(e);
+                            }
+                        }
                     }
                 }
                 AssignmentPatternItem::Default(e) => default = Some(e),
@@ -953,25 +964,11 @@ impl Simulator {
             };
             let target = format!("{}.{}", base, mname);
             if dims.is_empty() {
-                // §10.9.2: `default:` fills each innermost element of a
-                // multi-dimensional packed member, which is no simple bit
-                // vector type (§6.11.1).
-                let multi_dim = || {
-                    let dt = self.resolve_dt(&mdt);
-                    super::elaborate::packed_full_dims_of(&dt, &self.module.parameters)
-                        .is_some_and(|d| d.len() > 1)
-                };
-                if !explicit && multi_dim() {
-                    let fill = Expression::new(
-                        ExprKind::AssignmentPattern(vec![AssignmentPatternItem::Default(
-                            e.clone(),
-                        )]),
-                        e.span,
-                    );
-                    if let Some(v) = self.eval_in_packed_type(&fill, &mdt) {
-                        self.write_leaf_by_name(&target, v);
-                        continue;
-                    }
+                // §10.9.2: the type and default keys reach a packed member
+                // no other key sets.
+                if !explicit && let Some(v) = self.eval_default_in_packed_type(items, &mdt) {
+                    self.write_leaf_by_name(&target, v);
+                    continue;
                 }
                 self.assign_pattern_or_leaf(&target, &mdt, e);
                 continue;
@@ -1014,7 +1011,7 @@ impl Simulator {
             self.assign_pattern_or_leaf(target, dt, e);
             return;
         };
-        match &e.kind {
+        match &self.unpacked_pattern(e).kind {
             ExprKind::AssignmentPattern(sub) => {
                 self.assign_pattern_items_over_dims(target, dt, lists, sub);
             }
@@ -1507,8 +1504,10 @@ impl Simulator {
             ExprKind::MemberAccess { .. } | ExprKind::Index { .. } => {}
             _ => return None,
         }
-        if matches!(rvalue.kind, ExprKind::AssignmentPattern(_))
-            || !Self::expr_root_first_seg(lvalue).is_some_and(|r| self.struct_root_possible(r))
+        if matches!(
+            self.unpacked_pattern(rvalue).kind,
+            ExprKind::AssignmentPattern(_)
+        ) || !Self::expr_root_first_seg(lvalue).is_some_and(|r| self.struct_root_possible(r))
         {
             return None;
         }
@@ -2508,7 +2507,7 @@ impl Simulator {
     pub(super) fn populate_queue_from_init(&mut self, scoped_q: &str, init: &Expression) {
         // §7.10.1: both the pattern form `'{1,2,3}` and the queue
         // concatenation form `{1,2,3}` initialize element-wise.
-        let elems: Vec<&Expression> = match &init.kind {
+        let elems: Vec<&Expression> = match &self.unpacked_pattern(init).kind {
             ExprKind::AssignmentPattern(items) => items.iter().map(|it| it.expr()).collect(),
             ExprKind::Concatenation(parts) => parts.iter().collect(),
             _ => return,
@@ -2968,7 +2967,7 @@ impl Simulator {
                     return;
                 }
             }
-            if let ExprKind::AssignmentPattern(items) = &arg.kind {
+            if let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(arg).kind {
                 let vals: Vec<Value> = items.iter().map(|it| self.eval_expr(it.expr())).collect();
                 for (k, j) in dst.iter().enumerate() {
                     let v = vals.get(k).cloned().unwrap_or_else(|| Value::zero(32));
@@ -3006,7 +3005,7 @@ impl Simulator {
         }
         if let Some(su) = self.queue_elem_struct(obj_name) {
             if Self::spreads_member_wise(&su) {
-                if let ExprKind::AssignmentPattern(items) = &arg.kind {
+                if let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(arg).kind {
                     if !items.is_empty() {
                         self.assign_pattern_into_struct(elem, &su, items);
                         return;
@@ -3283,20 +3282,10 @@ impl Simulator {
         ))
     }
 
-    /// Whether a struct member's declared type matches a `type:value` key of an
-    /// assignment pattern (§10.9.2), after resolving typedefs on both sides.
-    pub(super) fn pattern_type_matches(&self, member_dt: &DataType, key_dt: &DataType) -> bool {
-        use crate::ast::types::DataType as D;
-        match (self.resolve_dt(member_dt), self.resolve_dt(key_dt)) {
-            (D::IntegerAtom { kind: a, .. }, D::IntegerAtom { kind: b, .. }) => a == b,
-            (D::IntegerVector { kind: a, .. }, D::IntegerVector { kind: b, .. }) => a == b,
-            (D::Real { kind: a, .. }, D::Real { kind: b, .. }) => a == b,
-            (D::Simple { kind: a, .. }, D::Simple { kind: b, .. }) => a == b,
-            (D::TypeReference { name: a, .. }, D::TypeReference { name: b, .. }) => {
-                a.name.name == b.name.name
-            }
-            _ => false,
-        }
+    /// Whether a member's declared type matches a `type:value` key (§10.9.2,
+    /// §6.22.1).
+    pub(super) fn pattern_type_matches(&mut self, member_dt: &DataType, key_dt: &DataType) -> bool {
+        crate::compiler::packed_assignment_pattern_plan::types_match(member_dt, key_dt, self)
     }
 
     /// Element expressions of ONE array dimension, in the order of `indices`.
@@ -3392,7 +3381,7 @@ impl Simulator {
             let Some(e) = e else { continue };
             let target = format!("{}[{}]", base, indices[k]);
             if dims.len() > 1 {
-                match &e.kind {
+                match &self.unpacked_pattern(e).kind {
                     ExprKind::AssignmentPattern(sub) if !sub.is_empty() => {
                         self.assign_pattern_array(&target, &dims[1..], dt, sub, inner_desc);
                     }
@@ -3464,15 +3453,9 @@ impl Simulator {
         out
     }
 
-    /// IEEE 1800-2017 §10.9.2 / §10.10: an assignment pattern assigned to an
-    /// aggregate whose leaves each live in their OWN signal — an unpacked
-    /// struct, an unpacked array of unpacked structs, or an associative array —
-    /// must be spread member-/element-/key-wise. Collapsing it into one packed
-    /// value (the scalar path) writes a container signal nobody ever reads, so
-    /// every member stays X and an associative array stays empty.
-    ///
-    /// Returns false when `base` really IS a single signal (a scalar, a packed
-    /// struct, an array of packed elements) — those keep the packed path.
+    /// §10.9.2, §10.10: spread a pattern over an aggregate whose leaves are
+    /// separate signals (an unpacked struct, an unpacked array of them, an
+    /// associative array). False when `base` is one signal.
     pub(super) fn assign_pattern_aggregate(
         &mut self,
         base: &str,
@@ -3620,6 +3603,7 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) -> bool {
+        let rvalue = self.unpacked_pattern(rvalue);
         let (ExprKind::Index { expr: b, index }, ExprKind::AssignmentPattern(items)) =
             (&lvalue.kind, &rvalue.kind)
         else {

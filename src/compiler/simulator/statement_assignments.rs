@@ -1360,11 +1360,7 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) {
-        // §10.9: a typed pattern written to an unpacked target places its
-        // items like an untyped one.
-        if let ExprKind::TypedPattern { pattern, .. } = &rvalue.kind
-            && !self.lvalue_is_packed(lvalue)
-        {
+        if let Some(pattern) = self.unpacked_typed_pattern(rvalue) {
             self.exec_stmt_blocking_assign_body(stmt, lvalue, pattern);
             return;
         }

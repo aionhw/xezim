@@ -2608,6 +2608,7 @@ impl Simulator {
                     compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
                     compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                     compiler.set_typedef_types(&self.module.typedef_types);
+                    Self::set_pattern_type_tables(&self.module, &mut compiler);
                     compiler.method_enum_constants = method_enum_constants;
                     compiler.class_scoped_enums = Some(match &self.class_scoped_enum_cache {
                         Some(rc) => rc.clone(),

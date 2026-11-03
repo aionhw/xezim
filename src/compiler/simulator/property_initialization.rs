@@ -283,6 +283,9 @@ impl Simulator {
                 }
                 continue;
             }
+            // §10.9: a typed pattern of an unpacked type initializes the
+            // property as an untyped one does.
+            let init = self.unpacked_pattern(init);
             // §7.9.11: an associative-array property's pattern
             // initializer (`int m[int] = '{1: 5, default: -1}`) fills the
             // per-instance store and records its default.

@@ -457,7 +457,7 @@ impl Simulator {
         if let Some(se) = src_expr
             && src.is_none()
         {
-            match &se.kind {
+            match &self.unpacked_pattern(se).kind {
                 ExprKind::AssignmentPattern(items) => {
                     for (i, item) in items.iter().enumerate() {
                         if (i as u64) >= n {
@@ -4197,16 +4197,7 @@ impl Simulator {
                 // §10.8, §10.9: a pattern driven onto a packed target takes
                 // the target's declared type.
                 let packed_pattern = self.eval_pattern_for_lvalue(packed_lvalue, rvalue);
-                // §10.9: a typed pattern driven onto an unpacked target
-                // places its items like an untyped one.
-                let rvalue = match &rvalue.kind {
-                    ExprKind::TypedPattern { pattern, .. }
-                        if packed_pattern.is_none() && !self.lvalue_is_packed(packed_lvalue) =>
-                    {
-                        pattern.as_ref()
-                    }
-                    _ => rvalue,
-                };
+                let rvalue = self.unpacked_pattern(rvalue);
                 // §10.9.2/§10.10: a pattern written to an aggregate whose
                 // leaves are separate signals (unpacked struct, unpacked array
                 // of them, associative array) is spread member-wise.
@@ -5541,7 +5532,7 @@ impl Simulator {
                             .unwrap_or(false)
                     {
                         if matches!(
-                            e.kind,
+                            self.unpacked_pattern(e).kind,
                             ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
                         ) {
                             const RET_SNAP: &str = "__xz_ret_coll__";

@@ -122,7 +122,7 @@ fn effect_free(e: &Expression) -> bool {
 /// or named pattern is taken apart, anything else is member-selected, which
 /// evaluates it once per member, so it must have no effect.
 fn split_value(e: &Expression, members: &Members) -> Option<Vec<Expression>> {
-    if let ExprKind::AssignmentPattern(items) = &e.kind {
+    if let ExprKind::AssignmentPattern(items) = &e.peel_typed_pattern().kind {
         if items
             .iter()
             .all(|it| matches!(it, AssignmentPatternItem::Ordered(_)))
