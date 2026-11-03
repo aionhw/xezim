@@ -162,3 +162,33 @@ endmodule
         "always_comb refires on vars read in scoped callees"
     );
 }
+
+/// §11.6.1: a function call in an expression is as wide as its return type.
+/// `f(16'(a))` returns 8 bits, so `f(...) + b` with 8-bit `b` sums at 8 bits
+/// and wraps; the 16-bit argument does not widen it. §6.24.1: a size cast
+/// keeps its operand's signedness, so `(W)'(sa)` of a signed -1 stays signed
+/// and sign-extends. Compiled (`always_comb`) and procedural forms agree.
+#[test]
+fn call_width_and_size_cast_signedness_in_compiled_code() {
+    let src = r#"
+module tb;
+  function automatic logic [7:0] f(input logic [15:0] v); return v[7:0]; endfunction
+  logic [7:0] a = 8'hff, b = 8'h01;
+  localparam int W = 9;
+  logic signed [7:0] sa = -1;
+  logic r, ri;
+  logic signed [15:0] rs, rsi;
+  always_comb r = (f(16'(a)) + b) > 8'hff;
+  always_comb rs = (W)'(sa);
+  initial begin
+    #1 ri = (f(16'(a)) + b) > 8'hff;
+    rsi = (W)'(sa);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "r"), 0, "compiled: the call is 8 bits wide");
+    assert_eq!(u(&sim, "ri"), 0, "procedural: the call is 8 bits wide");
+    assert_eq!(u(&sim, "rs"), 0xffff, "compiled: (W)'(sa) stays signed");
+    assert_eq!(u(&sim, "rsi"), 0xffff, "procedural: (W)'(sa) stays signed");
+}
