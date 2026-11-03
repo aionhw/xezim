@@ -5007,6 +5007,7 @@ impl Simulator {
             // read hidden inside an interpreted expression can't break wake-up
             // analysis here (unlike comb entries / cont-assigns).
             compiler.set_expr_fallback(true);
+            compiler.set_edge_delegate(true);
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
             compiler.set_functions(&self.module.functions);
@@ -5943,6 +5944,7 @@ impl Simulator {
                     matches!(
                         insn,
                         super::bytecode::Insn::StmtFallback(..)
+                            | super::bytecode::Insn::CallFreeFunction(..)
                             | super::bytecode::Insn::CovHit(..)
                             | super::bytecode::Insn::EvalExprFallback(..)
                     )
@@ -5973,6 +5975,7 @@ impl Simulator {
                 for insn in &cb.instructions {
                     match insn {
                         BcInsn::StmtFallback(..)
+                        | BcInsn::CallFreeFunction(..)
                         | BcInsn::CovHit(..)
                         | BcInsn::EvalExprFallback(..)
                         | BcInsn::BlockingAssign(..)

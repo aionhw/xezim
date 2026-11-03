@@ -1668,6 +1668,10 @@ pub struct BytecodeCompiler<'a> {
     /// runtime falls back to the proven AST interpreter — byte-identical by
     /// construction.
     method_mode: bool,
+    /// Edge-block calls that read or write module signals stay calls.
+    /// Inlining them (the VHDL kernel's `vh_next`) copies the whole body
+    /// into the always, and that bytecode walk is the simulation.
+    edge_delegate: bool,
     /// VM register holding the receiving object's heap handle (`this`).
     /// Seeded by the method-mode prologue before the body runs.
     method_this_reg: Option<RegId>,
@@ -2142,6 +2146,7 @@ impl<'a> BytecodeCompiler<'a> {
             for_loop_var_ids: std::collections::HashMap::default(),
             local_var_regs: std::collections::HashMap::default(),
             method_mode: false,
+            edge_delegate: false,
             method_this_reg: None,
             method_handle_names: std::collections::HashSet::default(),
             method_handle_local_types: HashMap::default(),
@@ -2840,6 +2845,14 @@ impl<'a> BytecodeCompiler<'a> {
         self.allow_expr_fallback = allow;
     }
 
+    /// Edge blocks only. A function that is not closed over its arguments
+    /// is emitted as `CallFreeFunction` instead of being inlined into the
+    /// block. The isolated parallel executor cannot run that insn, so the
+    /// block is kept on the sequential path.
+    pub fn set_edge_delegate(&mut self, allow: bool) {
+        self.edge_delegate = allow;
+    }
+
     pub fn set_scope_hint(&mut self, scope: Option<String>) {
         self.scope_hint = scope;
     }
@@ -3200,10 +3213,16 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 )
             });
-            if self.method_mode
-                && input_only_scalar
+            // Closed over its arguments: no module-signal read or write.
+            // An edge block inlines those helpers. One that touches module
+            // state is a call, or the VHDL kernel's next-time scan is
+            // pasted into `always @(vh_tick)` and the block is tens of
+            // thousands of instructions.
+            let edge_call = self.edge_delegate
+                && !self.fn_is_pure_in(&fd, name.rsplit_once('.').map(|(p, _)| p));
+            if input_only_scalar
                 && arity_le
-                && (has_string_port || !fn_pure(self))
+                && (edge_call || (self.method_mode && (has_string_port || !fn_pure(self))))
             {
                 let call_start = self.insns.len();
                 let call_next = self.next_reg;
