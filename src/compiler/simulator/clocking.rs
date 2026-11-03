@@ -52,6 +52,22 @@ impl Simulator {
     /// next posedge updates it — this is the `#1step` input-skew
     /// behavior (IEEE 1800-2023 §14.13 / §14.16) that lets clocking block
     /// monitors sample stable pre-edge state.
+    /// §14.4: the per-signal output skew of the clockvar bound to `net`.
+    /// The skew map is keyed by the clockvar's own name; a renamed clockvar
+    /// (`output #2 q = q_drv;`) queues its drive under the bound net, so the
+    /// alias map is consulted the other way round (#824).
+    fn clocking_net_out_skew(&self, cb: &str, net: &str) -> Option<u64> {
+        let per_sig = self.clocking_sig_out_skew.get(cb)?;
+        if let Some(&s) = per_sig.get(net) {
+            return Some(s);
+        }
+        let aliases = self.clocking_sig_alias.get(cb)?;
+        aliases
+            .iter()
+            .find(|(_, bound)| bound.as_str() == net)
+            .and_then(|(vis, _)| per_sig.get(vis).copied())
+    }
+
     pub(super) fn tick_clocking_blocks(&mut self) {
         if self.clocking_meta.is_empty() {
             return;
@@ -127,12 +143,7 @@ impl Simulator {
                 let mut keep: Vec<(u64, String, Value, Option<Expression>)> = Vec::new();
                 for (n, net, val, target) in pend.drain(..) {
                     if n <= 1 {
-                        let skew = self
-                            .clocking_sig_out_skew
-                            .get(&cb)
-                            .and_then(|m| m.get(&net))
-                            .copied()
-                            .unwrap_or(dskew);
+                        let skew = self.clocking_net_out_skew(&cb, &net).unwrap_or(dskew);
                         if let Some(t) = target {
                             self.drive_clocking_select(&t, val, skew);
                         } else if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
@@ -158,12 +169,7 @@ impl Simulator {
                 let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
                 for (sig, val, target) in pending {
                     // §14.4 output skew for drives maturing at THIS edge.
-                    let skew = self
-                        .clocking_sig_out_skew
-                        .get(&cb)
-                        .and_then(|m| m.get(&sig))
-                        .copied()
-                        .unwrap_or(dskew);
+                    let skew = self.clocking_net_out_skew(&cb, &sig).unwrap_or(dskew);
                     if let Some(t) = target {
                         if skew > 0 {
                             self.drive_clocking_select(&t, val, skew);
