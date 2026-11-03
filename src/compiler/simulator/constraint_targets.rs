@@ -750,6 +750,24 @@ impl Simulator {
         keys
     }
 
+    /// §7.8.2/§18.5.8.1: the value a `foreach` loop variable holds for key
+    /// `key` of associative member `scoped`: the string, or an integer at the
+    /// declared index width and signedness, so an `int` key `-3` stays
+    /// negative where a 32-bit unsigned parse made `i < 0` false.
+    pub(super) fn assoc_foreach_key_value(&self, scoped: &str, key: &str) -> Value {
+        if self.is_string_keyed_array(scoped) {
+            return Self::name_key_value(key);
+        }
+        let (kw, signed) = self.assoc_index_width_for(scoped).unwrap_or((32, false));
+        if kw > 64 {
+            // Wide numeric keys are keyed by hex digits.
+            return Value::from_str_radix(key, 16, kw);
+        }
+        let mut v = Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
+        v.is_signed = signed;
+        v
+    }
+
     /// Every element storage key of a collection, in index order.
     pub(super) fn coll_elem_keys(&self, c: &RandColl) -> Vec<String> {
         match c.kind {
@@ -1772,11 +1790,7 @@ impl Simulator {
                     for key in self.assoc_key_strs(&c.scoped) {
                         let mut frame: HashMap<String, Value> = HashMap::default();
                         if let Some(Some(n)) = idx_names.first() {
-                            let kv = if self.is_string_keyed_array(&c.scoped) {
-                                Self::name_key_value(&key)
-                            } else {
-                                Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, 32)
-                            };
+                            let kv = self.assoc_foreach_key_value(&c.scoped, &key);
                             frame.insert(n.clone(), kv);
                         }
                         self.push_local_frame(frame);
@@ -3083,11 +3097,7 @@ impl Simulator {
                 for key in self.assoc_key_strs(&c.scoped) {
                     let mut frame: HashMap<String, Value> = HashMap::default();
                     if let Some(Some(n)) = idx_names.first() {
-                        let kv = if self.is_string_keyed_array(&c.scoped) {
-                            Self::name_key_value(&key)
-                        } else {
-                            Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, 32)
-                        };
+                        let kv = self.assoc_foreach_key_value(&c.scoped, &key);
                         frame.insert(n.clone(), kv);
                     }
                     self.push_local_frame(frame);

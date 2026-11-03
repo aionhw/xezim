@@ -1811,18 +1811,25 @@ impl Simulator {
                 // §18.4: randomize() keeps an associative array's keys and
                 // draws a value for each element, so with integral keys its
                 // elements are variables indexed by the stored keys.
+                // One keyed by strings (or by integers the solver does not
+                // index) stays with the trial's draw; its own items are then
+                // judged by the evaluator (`csp_eval_node`), so the rest of
+                // the class is still solved jointly.
                 CollKind::Assoc => {
                     if self.is_string_keyed_array(&c.scoped) {
-                        return None;
+                        continue;
                     }
                     let mut keys = Vec::new();
+                    let mut indexed = true;
                     for k in self.assoc_key_strs(&c.scoped) {
                         // A `foreach` key is bound as a signed 32-bit value.
-                        let i = k.parse::<i32>().ok()?;
-                        if i.to_string() != k {
-                            return None;
+                        match k.parse::<i32>() {
+                            Ok(i) if i.to_string() == k => keys.push(i.into()),
+                            _ => indexed = false,
                         }
-                        keys.push(i.into());
+                    }
+                    if !indexed {
+                        continue;
                     }
                     keys
                 }
@@ -4668,7 +4675,12 @@ impl Simulator {
             ExprKind::MemberAccess { expr, .. } => matches!(expr.kind, ExprKind::This),
             _ => false,
         };
-        if !plain || self.prop_class_type(handle, name).is_some() {
+        // An associative member has no index range; its element type's
+        // packed range (`bit [3:0] m[string]`) is not one either.
+        if !plain
+            || self.prop_class_type(handle, name).is_some()
+            || self.is_associative_array(&format!("{handle}#{name}"))
+        {
             return None;
         }
         let (lo, hi) = match self
