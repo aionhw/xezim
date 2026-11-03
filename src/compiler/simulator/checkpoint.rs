@@ -1324,6 +1324,7 @@ checkpoint_state!(
     local_iface_aliases,
     local_meta_owned,
     local_meta_owner,
+    local_meta_reapplies,
     local_meta_saved,
     local_stack,
     local_type_pool,

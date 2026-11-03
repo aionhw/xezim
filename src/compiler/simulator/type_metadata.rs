@@ -406,16 +406,16 @@ impl Simulator {
     /// declaration displaced since: restore them, the innermost frame's
     /// declaration winning over an outer one's of the same name.
     pub(super) fn reapply_local_meta(&mut self) {
-        let mut seen: Vec<String> = Vec::new();
+        self.local_meta_reapplies += 1;
+        let mut seen: HashSet<String> = HashSet::default();
         for i in (0..self.local_gen_stack.len()).rev() {
             let g = self.local_gen_stack[i];
             let mut kept = Vec::new();
             for (name, meta) in self.local_meta_saved.remove(&g).unwrap_or_default() {
-                if seen.contains(&name) {
+                if !seen.insert(name.clone()) {
                     kept.push((name, meta));
                     continue;
                 }
-                seen.push(name.clone());
                 match self.local_meta_owner.get_mut(&name) {
                     Some(owner) if owner.origin == meta.origin => {
                         if !owner.gens.contains(&g) {
@@ -446,7 +446,7 @@ impl Simulator {
                             .get(n)
                             .is_some_and(|o| o.gens.contains(&g))
                     {
-                        seen.push(n.clone());
+                        seen.insert(n.clone());
                     }
                 }
             }
@@ -457,18 +457,30 @@ impl Simulator {
     }
 
     /// Frame generation `g` is gone: forget what it owned and what it saved.
-    fn release_local_meta(&mut self, g: u64) {
+    /// True when a name it owned is left without an owner while a live frame
+    /// saved metadata under that name: only then can `reapply_local_meta`
+    /// restore anything. Re-running it after every other pop rescanned every
+    /// live frame per call, so a displaced outer local made each later call
+    /// pay for the whole stack (#833).
+    fn release_local_meta(&mut self, g: u64) -> bool {
+        self.local_meta_saved.remove(&g);
+        let mut restorable = false;
         if let Some(names) = self.local_meta_owned.remove(&g) {
             for n in names {
                 if let Some(owner) = self.local_meta_owner.get_mut(&n) {
                     owner.gens.retain(|&x| x != g);
                     if owner.gens.is_empty() {
                         self.local_meta_owner.remove(&n);
+                        restorable = restorable
+                            || self
+                                .local_meta_saved
+                                .values()
+                                .any(|l| l.iter().any(|(s, _)| *s == n));
                     }
                 }
             }
         }
-        self.local_meta_saved.remove(&g);
+        restorable
     }
 
     /// Push a local frame, keeping the type overlay in lockstep.
@@ -834,11 +846,8 @@ impl Simulator {
         let pair = self.local_type_stack.pop();
         self.recycle_local_types(pair);
         if let Some(g) = self.local_gen_stack.pop() {
-            if !self.local_meta_owned.is_empty() {
-                self.release_local_meta(g);
-                if !self.local_meta_saved.is_empty() {
-                    self.reapply_local_meta();
-                }
+            if !self.local_meta_owned.is_empty() && self.release_local_meta(g) {
+                self.reapply_local_meta();
             }
             if self.task_string_formals.last().is_some_and(|e| e.fgen == g) {
                 self.task_string_formals.pop();
@@ -857,11 +866,8 @@ impl Simulator {
         let pair = self.local_type_stack.pop();
         self.recycle_local_types(pair);
         if let Some(g) = self.local_gen_stack.pop() {
-            if !self.local_meta_owned.is_empty() {
-                self.release_local_meta(g);
-                if !self.local_meta_saved.is_empty() {
-                    self.reapply_local_meta();
-                }
+            if !self.local_meta_owned.is_empty() && self.release_local_meta(g) {
+                self.reapply_local_meta();
             }
             if self.task_string_formals.last().is_some_and(|e| e.fgen == g) {
                 self.task_string_formals.pop();

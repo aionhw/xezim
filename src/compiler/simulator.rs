@@ -8966,6 +8966,9 @@ pub struct Simulator {
     /// Compiled-to-compiled calls dispatched directly (`vm_try_direct_call_from`),
     /// without the interpreter's binding (`[PROF] vm_direct_calls`).
     vm_direct_calls: u64,
+    /// Rescans of the live frames for displaced local metadata
+    /// (`reapply_local_meta`, `[PROF] local_meta_reapplies`).
+    local_meta_reapplies: u64,
     /// SV-2023: blocked mailbox `get`/`peek` proxies keyed by mailbox handle.
     /// Each waiter records the suspended process pid, the destination lvalue
     /// expression to receive the value, and the post-get continuation

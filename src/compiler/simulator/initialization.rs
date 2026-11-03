@@ -4332,6 +4332,7 @@ impl Simulator {
             cond_progress: 0,
             cond_waiter_rechecks: 0,
             vm_direct_calls: 0,
+            local_meta_reapplies: 0,
             mailbox_get_waiters: HashMap::default(),
             fork_baselines: HashMap::default(),
             fork_collection_captures: HashMap::default(),
