@@ -1658,16 +1658,13 @@ impl Simulator {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
         // rewritten as `return Some(...)`.)
-        // Roadmap 11-12 (opt-in XEZIM_PROC_FSM=1): a MULTI-WAIT always body
+        // Roadmap 11-12 (XEZIM_PROC_FSM != 0): a MULTI-WAIT always body
         // (an event/delay head plus at least one more wait inside) is served
         // by the edge path only through per-fire AST continuations — compile
         // it into a process FSM instead when the whole tree compiles. Single-
         // wait bodies stay on their (native) edge/clock-gen fast paths.
         {
-            use std::sync::OnceLock;
-            static FSM_ON: OnceLock<bool> = OnceLock::new();
-            let fsm_on =
-                *FSM_ON.get_or_init(|| std::env::var("XEZIM_PROC_FSM").as_deref() == Ok("1"));
+            let fsm_on = self.proc_fsm_mode != 0;
             let tc = Self::count_timing_controls(&ab.stmt);
             if fsm_on
                 && (tc >= 2 || (tc >= 1 && Self::stmt_contains_call(&ab.stmt)))
@@ -2226,15 +2223,12 @@ impl Simulator {
             if self.stmt_is_blocking(&ab.stmt)
                 || self.stmt_calls_blocking_task(&ab.stmt, &ab.scope, 3)
             {
-                // Roadmap 11-12 (opt-in XEZIM_PROC_FSM=1): a blocking always
+                // Roadmap 11-12 (XEZIM_PROC_FSM != 0): a blocking always
                 // body whose whole statement tree compiles fallback-free
                 // becomes a bytecode FSM — resumes re-enter at a saved pc
                 // instead of re-walking the AST continuation chain.
                 {
-                    use std::sync::OnceLock;
-                    static ON: OnceLock<bool> = OnceLock::new();
-                    let fsm_on =
-                        *ON.get_or_init(|| std::env::var("XEZIM_PROC_FSM").as_deref() == Ok("1"));
+                    let fsm_on = self.proc_fsm_mode != 0;
                     if fsm_on
                         && self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block")
                     {
