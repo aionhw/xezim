@@ -1355,6 +1355,16 @@ impl Simulator {
                 Self::rebase_expr(expr, t, hit)
                     && ranges.iter_mut().all(|r| Self::rebase_expr(r, t, hit))
             }
+            // A method of a member below `prop` (`prop.r.sum()`): the receiver
+            // is rebased and the call kept, so the sub-object's own solve
+            // reads `r.sum()` of its array.
+            ExprKind::Call { func, args } => {
+                let ExprKind::MemberAccess { expr, .. } = &mut func.kind else {
+                    return false;
+                };
+                Self::rebase_expr(expr, t, hit)
+                    && args.iter_mut().all(|a| Self::rebase_expr(a, t, hit))
+            }
             _ => false,
         }
     }

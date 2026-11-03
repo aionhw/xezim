@@ -2671,7 +2671,7 @@ impl Simulator {
                 } else {
                     &constraints
                 };
-                match self.rand_csp_solve(
+                let csp_outcome = self.rand_csp_solve(
                     handle,
                     csp_cons,
                     &constraint_depth,
@@ -2682,7 +2682,15 @@ impl Simulator {
                     &array_enums,
                     false,
                     &sub_objs,
-                ) {
+                );
+                if std::env::var_os("XEZIM_RAND_DBG").is_some() {
+                    eprintln!(
+                        "[rand-dbg] trial {trial} joint solve: {:?} (sub-objects {:?})",
+                        csp_outcome,
+                        sub_objs.iter().map(|s| s.0.clone()).collect::<Vec<_>>()
+                    );
+                }
+                match csp_outcome {
                     rand_csp::CspOutcome::Sat
                         if !self.randomize_budget_exhausted
                             && self.sub_object_constraints_ok(handle, &rand_obj_props) =>
