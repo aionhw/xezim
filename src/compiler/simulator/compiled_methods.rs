@@ -1841,22 +1841,20 @@ impl Simulator {
                 && !is_string_result
                 && !is_void_result
                 && self.fn_returns_collection(&_f.return_type);
-            let cd_opt = self.module.classes.get(cname);
+            let cd_type_params: Option<Vec<String>> = self
+                .module
+                .classes
+                .get(cname)
+                .map(|cd| cd.type_param_names.clone());
             let is_type_param_result = !is_class_result
-                && cd_opt.is_some_and(|cd| {
+                && cd_type_params.as_ref().is_some_and(|tp| {
                     match &_f.return_type {
                         crate::ast::types::DataType::TypeReference { name, .. } => {
-                            cd.type_param_names.iter().any(|p| p == &name.name.name)
+                            tp.iter().any(|p| p == &name.name.name)
                         }
                         _ => false,
                     }
                 });
-            // Owned snapshot of this class's type-param names, used (without
-            // holding `self.module`'s borrow) to recognize TYPE-PARAM formals
-            // in the width loop below (feature 38fc4804).
-            let tp_names: std::collections::HashSet<String> = cd_opt
-                .map(|cd| cd.type_param_names.iter().cloned().collect())
-                .unwrap_or_default();
             let (static_result_width, result_signed) = if is_string_result {
                 (0u32, false)
             } else if is_class_result || is_type_param_result {
@@ -1936,10 +1934,14 @@ impl Simulator {
                     // a compile-able integer vector/atom. (String formals are
                     // handled above — allowed, not skipped.)
                     use crate::ast::types::DataType as DT;
-                    let is_type_param_formal = match &port.data_type {
-                        DT::TypeReference { name, .. } => tp_names.contains(&name.name.name),
-                        _ => false,
-                    };
+                    let is_type_param_formal = cd_type_params.as_ref().is_some_and(|tp| {
+                        match &port.data_type {
+                            DT::TypeReference { name, .. } => {
+                                tp.iter().any(|p| p == &name.name.name)
+                            }
+                            _ => false,
+                        }
+                    });
                     let Some(pw) = (if is_type_param_formal {
                         Some(0)
                     } else {
