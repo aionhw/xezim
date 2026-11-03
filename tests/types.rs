@@ -201,10 +201,14 @@ mod packed_element_range_select;
 mod packed_local_nested_select;
 #[path = "types/packed_multidim_unpacked_select.rs"]
 mod packed_multidim_unpacked_select;
+#[path = "types/packed_struct_array_elem_member_in_instance.rs"]
+mod packed_struct_array_elem_member_in_instance;
 #[path = "types/packed_struct_array_elem_write.rs"]
 mod packed_struct_array_elem_write;
 #[path = "types/packed_struct_array_local.rs"]
 mod packed_struct_array_local;
+#[path = "types/packed_struct_array_param_pattern_in_instance.rs"]
+mod packed_struct_array_param_pattern_in_instance;
 #[path = "types/packed_struct_formal_member.rs"]
 mod packed_struct_formal_member;
 #[path = "types/packed_struct_member_width.rs"]
