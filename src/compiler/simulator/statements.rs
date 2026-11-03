@@ -4230,6 +4230,7 @@ impl Simulator {
                 // nonblocking assignment per leaf, every source leaf read now.
                 if let Some(leaf_nbas) = self
                     .unpacked_array_nba_leaves(lvalue, rvalue)
+                    .or_else(|| self.unpacked_row_nba_leaves(lvalue, rvalue))
                     .or_else(|| self.unpacked_struct_nba_leaves(lvalue, rvalue))
                 {
                     let d = match intra_d {

@@ -201,6 +201,9 @@ mod next_rest_whole_array_nba_381;
 #[path = "collections/collection_returns_387.rs"]
 mod collection_returns_387;
 
+#[path = "collections/unpacked_row_nonblocking_assign.rs"]
+mod unpacked_row_nonblocking_assign;
+
 #[path = "collections/review_package_collection_aliases.rs"]
 mod review_package_collection_aliases;
 
