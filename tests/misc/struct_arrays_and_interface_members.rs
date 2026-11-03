@@ -157,3 +157,26 @@ endmodule
     assert_eq!(u(&sim, "u.storage[0].value"), 0x2a);
     assert!(sim.get_signal("u.storage[1].value").is_some());
 }
+
+/// §10.4.2, §7.10: a nonblocking write of a member of a queue element wakes
+/// the processes that read it. Readers of a queue element watch the queue, so
+/// the write must not be redirected to a flat member signal.
+#[test]
+fn nba_queue_element_member_wakes_readers() {
+    let src = r#"
+typedef struct { logic [7:0] f; } s_t;
+module tb;
+  logic clk = 0;
+  s_t q[$];
+  logic [7:0] r;
+  always_comb r = q[0].f;
+  always_ff @(posedge clk) q[0].f <= q[0].f + 8'h1;
+  initial begin
+    q.push_back('{f: 8'h10});
+    repeat (3) begin #5 clk = 1; #5 clk = 0; end
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "r"), 0x13);
+}
