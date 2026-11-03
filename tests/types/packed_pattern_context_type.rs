@@ -373,3 +373,245 @@ endmodule
     let _ = std::fs::remove_dir_all(&dir);
     assert!(restored.contains("R 10"), "{restored}");
 }
+
+/// A typed pattern in an instance or generate body reads that scope's
+/// names and types: ports, genvars, type parameters and local typedefs.
+#[test]
+fn typed_pattern_in_instance_scope() {
+    let out = lines(
+        r#"
+typedef struct packed {logic [3:0] a, b;} s_t;
+module leaf(input s_t i, output s_t o); assign o = i; endmodule
+module sub #(parameter type T = logic [7:0]) (input logic [3:0] pi, output s_t o,
+                                              output T t1, output T t2);
+  logic [3:0] x = 4'h3, y = 4'h4;
+  s_t l;
+  assign o = s_t'{4'h1, pi};
+  assign t1 = T'{a: 1, b: 2};
+  assign t2 = T'{default: '1};
+  leaf lf(.i(s_t'{x, y}), .o(l));
+endmodule
+module loc1(output logic [7:0] o);
+  typedef struct packed {logic [1:0] p; logic [5:0] q;} l_t;
+  assign o = l_t'{p: 2'h3, q: 6'h1};
+endmodule
+module loc2(output logic [7:0] o);
+  typedef struct packed {logic [5:0] p; logic [1:0] q;} l_t;
+  assign o = l_t'{p: 6'h3, q: 2'h1};
+endmodule
+module tb;
+  logic [3:0] pi = 4'hE, x = 4'hA, y = 4'hB;
+  s_t o, t1, t2, g[2];
+  logic [7:0] l1, l2;
+  sub #(.T(s_t)) u(.pi(4'h2), .o(o), .t1(t1), .t2(t2));
+  loc1 u1(.o(l1));
+  loc2 u2(.o(l2));
+  for (genvar i = 0; i < 2; i++) begin : G
+    assign g[i] = s_t'{i[3:0], 4'h7};
+  end
+  initial #1 $display("o=%h lf=%h t=%h %h g=%h %h l=%h %h", o, u.l, t1, t2, g[0], g[1], l1, l2);
+endmodule
+"#,
+    );
+    has(&out, "o=12 lf=34 t=12 ff g=07 17 l=c1 0d");
+}
+
+/// §10.9: a typed pattern of an unpacked type holds the value a variable of
+/// that type would; in an assignment-like context its items place as an
+/// untyped pattern's do.
+#[test]
+fn unpacked_typed_patterns() {
+    let out = lines(
+        r#"
+typedef struct {int a, b;} s_t;
+typedef int arr_t[3];
+typedef int arr2_t[2];
+typedef int q_t[$];
+class C; s_t s = s_t'{1, 2}; endclass
+module leaf(input arr2_t ai, input s_t si);
+  initial #2 $display("port %0d %0d %0d", ai[0], ai[1], si.a + si.b);
+endmodule
+module tb;
+  s_t s = '{4, 3}, w;
+  arr_t ar = '{1, 2, 3}, r;
+  int d[] = q_t'{1, 2, 3};
+  q_t q;
+  assign w = s_t'{7, 8};
+  leaf l(.ai(arr2_t'{9, 10}), .si(s_t'{1, 2}));
+  function q_t fq(); return q_t'{1, 2, 3}; endfunction
+  function arr_t fa(); return arr_t'{4, 5, 6}; endfunction
+  initial begin
+    C c = new;
+    #1;
+    $display("eq %b %b %b", s == s_t'{4, 3}, s != s_t'{4, 3}, ar == arr_t'{1, 2, 3});
+    $display("w %0d %0d prop %0d %0d", w.a, w.b, c.s.a, c.s.b);
+    q = fq(); r = fa();
+    $display("q %p r %p d %0d", q, r, d.size());
+    $display("bits %0d p %p", $bits(arr_t'{1, 2, 3}), arr_t'{1, 2, 3});
+  end
+endmodule
+"#,
+    );
+    has(&out, "eq 1 0 1");
+    has(&out, "w 7 8 prop 1 2");
+    has(&out, "q '{1, 2, 3} r '{4, 5, 6} d 3");
+    has(&out, "bits 96 p '{1, 2, 3}");
+    has(&out, "port 9 10 3");
+    assert!(!out.iter().any(|l| l.contains("uncovered")), "{out:?}");
+}
+
+/// A typed row of an unpacked type inside a pattern is a row; a typed
+/// element is one value for every leaf a `default:` reaches.
+#[test]
+fn unpacked_typed_rows() {
+    let out = lines(
+        r#"
+typedef int row_t[3];
+typedef struct {int a, b;} us_t;
+module tb;
+  int m [2][3] = '{default: row_t'{4, 5, 6}};
+  int n [2][3] = '{row_t'{1, 2, 3}, '{default: 9}};
+  us_t sa [2][2] = '{default: us_t'{7, 8}};
+  initial #1 $display("m %0d %0d %0d n %0d %0d %0d sa %0d %0d", m[0][0], m[1][1], m[1][2],
+                      n[0][0], n[0][2], n[1][1], sa[1][0].a, sa[1][1].b);
+endmodule
+"#,
+    );
+    has(&out, "m 4 5 6 n 1 3 9 sa 7 8");
+}
+
+/// §10.9.1, §10.9.2: `default:` assigns a value whose self-determined type
+/// matches the element or member whole; otherwise it descends.
+#[test]
+fn default_of_matching_type_assigns_whole() {
+    let out = lines(
+        r#"
+typedef struct packed {logic [3:0] a, b;} e_t;
+package pk; localparam e_t PR = '{4'h3, 4'hC}; endpackage
+module sub; localparam e_t SR = '{4'h7, 4'h1}; e_t [1:0] s;
+  initial begin s = '{default: SR}; #1 $display("sub %h", s); end
+endmodule
+module tb;
+  localparam e_t RST = '{4'hA, 4'h5};
+  e_t v = '{4'h9, 4'h6};
+  e_t [3:0] x, y, z, c;
+  e_t [1:0] p;
+  logic [3:0][7:0] w = 32'h01020304;
+  logic [31:0] f = 32'h01020304;
+  logic [1:0][3:0][7:0] m3, m4;
+  sub u();
+  assign y = '{default: RST};
+  initial begin
+    x = '{default: RST}; z = '{default: v}; c = '{default: e_t'(8'hB4)};
+    p = '{default: pk::PR}; m3 = '{default: w}; m4 = '{default: f};
+    #1 $display("%h %h %h %h %h %h %h", x, y, z, c, p, m3, m4);
+  end
+endmodule
+"#,
+    );
+    has(
+        &out,
+        "a5a5a5a5 a5a5a5a5 96969696 b4b4b4b4 3c3c 0102030401020304 0404040404040404",
+    );
+    has(&out, "sub 7171");
+}
+
+/// Compiled processes lay a pattern over the declared type, multi-dimensional
+/// members included, and agree with the interpreter on `default:`.
+#[test]
+fn compiled_patterns_use_declared_types() {
+    const SRC: &str = r#"
+typedef struct packed {logic [3:0] h; logic [1:0][3:0] v;} s_t;
+typedef struct packed {s_t in; logic [3:0] t;} o_t;
+module sub(input logic [3:0] d, output s_t o, output o_t p);
+  always_comb o = '{h: d, v: '{4'h2, d}};
+  always_comb begin p.t = d; p.in = '{h: d, v: '{4'h2, d}}; end
+endmodule
+module tb;
+  logic clk = 0;
+  s_t a, arr[2], o;
+  o_t p;
+  logic [3:0] d = 4'h5;
+  logic [511:0] q;
+  sub u(.d(d), .o(o), .p(p));
+  always @(posedge clk) a <= '{h: d, v: '{4'h2, d}};
+  always_comb arr[0] = '{h: d, v: '{4'h2, d}};
+  always_comb arr[1] = '{default: d};
+  always_ff @(posedge clk) q <= '{default: d};
+  initial begin
+    #1 clk = 1;
+    #1 $display("a=%h arr=%h %h o=%h p=%h q=%h", a, arr[0], arr[1], o, p, q[7:0]);
+    $finish;
+  end
+endmodule
+"#;
+    let out = run_bin(SRC, "declared", &[("XEZIM_FALLBACK_SITES", "1")]);
+    assert!(out.contains("a=525 arr=525 555 o=525 p=5255 q=ff"), "{out}");
+    assert!(!out.contains("[FALLBACK]"), "{out}");
+}
+
+/// §10.9.1, §10.9.2: an uncovered member is an error; a compiled process
+/// leaves the pattern to the interpreter, which warns and sets it to 0.
+#[test]
+fn compiled_uncovered_pattern_warns() {
+    const SRC: &str = r#"
+module tb;
+  typedef struct packed {logic [3:0] a, b;} s_t;
+  logic clk = 0;
+  s_t q;
+  always_ff @(posedge clk) q <= '{a: 4'h1};
+  initial begin #1 clk = 1; #1 $display("q=%h", q); $finish; end
+endmodule
+"#;
+    let out = run_bin(SRC, "uncovered", &[]);
+    assert!(out.contains("q=10"), "{out}");
+    assert!(out.contains("uncovered"), "{out}");
+}
+
+/// §10.9: a packed typed pattern is a value of its own type, whatever
+/// target or container it goes to.
+#[test]
+fn packed_typed_pattern_keeps_type_in_any_target() {
+    let out = lines(
+        r#"
+typedef struct packed {logic [1:0] h; logic [5:0] l;} hl_t;
+class K; logic [7:0] v[2]; endclass
+module tb;
+  mailbox #(hl_t) mb = new;
+  hl_t g;
+  logic [15:0] w;
+  initial begin
+    K k = new;
+    k.v[0] = hl_t'{1, 2};
+    k.v[1] <= hl_t'{1, 2};
+    w = hl_t'{1, 2};
+    mb.put(hl_t'{2, 3});
+    mb.get(g);
+    #1 $display("%h %h %h %h", k.v[0], k.v[1], w, g);
+  end
+endmodule
+"#,
+    );
+    has(&out, "42 42 0042 83");
+}
+
+/// §10.9.2: type and default keys reach a packed member of an unpacked
+/// struct; a bare type name is a type key.
+#[test]
+fn default_reaches_packed_member_of_unpacked_struct() {
+    let out = lines(
+        r#"
+typedef struct packed {logic [3:0] a, b;} ps_t;
+typedef struct {ps_t p; int x;} us_t;
+module tb;
+  us_t u, t;
+  initial begin
+    u = '{default: 1};
+    t = '{ps_t: 8'hA5, default: 3};
+    #1 $display("%h %0d %h %0d", u.p, u.x, t.p, t.x);
+  end
+endmodule
+"#,
+    );
+    has(&out, "11 1 a5 3");
+}
