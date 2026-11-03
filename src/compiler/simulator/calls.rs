@@ -431,8 +431,10 @@ impl Simulator {
                         || self.module.arrays.contains_key(&recv_name))
                         // §8.4/§23.9: in a method, a property of `this`
                         // (`s.q` of a struct property `s`) hides a
-                        // same-named module variable.
-                        && !self.this_prop_hides(
+                        // same-named module variable; so does a scalar
+                        // formal or local of the running subroutine
+                        // (`str.len()` on a `string str` formal).
+                        && !self.scalar_hides_module_coll(
                             recv_name.split(['.', '[']).next().unwrap_or(&recv_name),
                         )
                     {

@@ -5569,10 +5569,14 @@ impl Simulator {
                             }
                         }
                     }
-                    if self.module.arrays.contains_key(&*name)
+                    if (self.module.arrays.contains_key(&*name)
                         || self.module.dynamic_arrays.contains(&*name)
                         || self.is_associative_array(&name)
-                        || self.is_per_spec_dynamic_static(&name)
+                        || self.is_per_spec_dynamic_static(&name))
+                        // §23.9 / §8.10: `str[0]` on a scalar `string str`
+                        // formal or property is its character, not an
+                        // element of a same-named module-level `str[$]`.
+                        && !self.bare_scalar_hides_coll(expr, &name)
                     {
                         // Check if `name` is a queue/dynamic array. This
                         // handles struct-field sub-paths (`info.addr`) and

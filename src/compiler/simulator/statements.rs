@@ -5473,6 +5473,7 @@ impl Simulator {
                         // member that `get_elements` returns, recording the
                         // wrong (empty) storage under `pending_ret_collection`
                         // and dropping every message element.
+                        let mut from_bare = false;
                         let n = self
                             .dyn_name_lookup_innermost(bare)
                             .map(|s| std::borrow::Cow::Owned(s.to_string()))
@@ -5487,8 +5488,18 @@ impl Simulator {
                                 self.dyn_name_lookup_enclosing(bare)
                                     .map(|s| std::borrow::Cow::Owned(s.to_string()))
                             })
-                            .unwrap_or_else(|| self.resolve_hier_name(h));
-                        if self.module.dynamic_arrays.contains(&*n) {
+                            .unwrap_or_else(|| {
+                                from_bare = true;
+                                self.resolve_hier_name(h)
+                            });
+                        // §23.9 / §8.10: `return str;` of a scalar `string
+                        // str` formal, local or property returns that scalar,
+                        // not a same-named module-level `str[$]`.
+                        if self.module.dynamic_arrays.contains(&*n)
+                            && !(from_bare
+                                && h.path.len() == 1
+                                && self.scalar_hides_module_coll(bare))
+                        {
                             // Frame teardown wipes a subroutine-LOCAL
                             // collection before the caller's assignment
                             // consumes it (the recorded name read back size

@@ -2513,6 +2513,17 @@ impl Simulator {
                         _inst_scoped = scoped;
                         _inst_scoped.as_str()
                     }
+                    // §23.9 / §8.10: a bare name that is a scalar of the
+                    // running frame or of `this` is not the module-level
+                    // collection of that name (`str.len()` on a `string
+                    // str` formal beside a module `string str[$]`).
+                    None if (self.module.dynamic_arrays.contains(obj_name)
+                        || self.module.arrays.contains_key(obj_name)
+                        || self.module.associative_arrays.contains_key(obj_name))
+                        && self.scalar_hides_module_coll(obj_name) =>
+                    {
+                        return None;
+                    }
                     None => obj_name,
                 },
                 // A local under its per-call storage key: a same-named

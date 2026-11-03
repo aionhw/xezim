@@ -3894,6 +3894,24 @@ impl Simulator {
             .is_some_and(|f| f.contains_key(bare))
     }
 
+    /// §23.9 / §8.10: a MODULE-level collection named `bare` is out of scope
+    /// in a subroutine whose own frame, or whose `this`, declares a scalar of
+    /// that name — a `string str` formal or property hides a module-level
+    /// `string str[$]`. Callers test the module registration first; this
+    /// only decides who owns the name.
+    pub(super) fn scalar_hides_module_coll(&self, bare: &str) -> bool {
+        self.frame_scalar_shadows(bare) || self.this_prop_hides(bare)
+    }
+
+    /// `scalar_hides_module_coll` for an indexed base: only a plain
+    /// one-segment name that resolved to itself can be a module collection a
+    /// scalar hides (a rewritten `<handle>#member` or scoped name cannot).
+    pub(super) fn bare_scalar_hides_coll(&self, base: &Expression, name: &str) -> bool {
+        matches!(&base.kind, ExprKind::Ident(h)
+            if h.path.len() == 1 && h.path[0].selects.is_empty() && h.path[0].name.name == name)
+            && self.scalar_hides_module_coll(name)
+    }
+
     /// `dyn_name_lookup`'s hit on an identity entry `(name, name)`: in the
     /// innermost frame a collection formal resolves to its storage key (see
     /// `formal_dyn`); anywhere else the bare name stands.
