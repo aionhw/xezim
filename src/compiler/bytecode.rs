@@ -16009,13 +16009,8 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 "$__xz_size_cast" => {
                     // §6.24.1 `N'(x)`: evaluate x in context width N,
-                    // then resize. N is a literal (parser lowering).
-                    let n = match args.first().map(|a| &a.kind) {
-                        Some(ExprKind::Number(NumberLiteral::Integer { value, .. })) => {
-                            value.parse::<u32>().ok()
-                        }
-                        _ => None,
-                    };
+                    // then resize. N is a constant expression, folded here.
+                    let n = args.first().and_then(|a| self.eval_const_expr(a));
                     let Some(n) = n.filter(|&n| n > 0) else {
                         self.bail("SystemCall_size_cast_width");
                         return None;
@@ -20176,7 +20171,11 @@ impl<'a> BytecodeCompiler<'a> {
     fn cast_self_width(&self, name: &str, args: &[Expression]) -> Option<u32> {
         let literal = args.first().and_then(|a| self.literal_cast_size(a));
         match name {
-            "$__xz_size_cast" => literal,
+            "$__xz_size_cast" => literal.or_else(|| {
+                args.first()
+                    .and_then(|a| self.eval_const_expr(a))
+                    .map(|n| n.max(1))
+            }),
             "$__xz_named_cast" => literal.or_else(|| {
                 let key = self.named_cast_key(args.first()?)?;
                 self.cast_widths
