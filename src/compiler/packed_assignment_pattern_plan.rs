@@ -379,8 +379,51 @@ pub(crate) fn layout_struct_type(
         .iter()
         .map(|&(leaf, _, w)| {
             let path = format!("{pfx}{leaf}");
-            let data_type =
-                layout_struct_type(layout, &path, dims).unwrap_or_else(|| match dims(&path) {
+            let data_type = match layout_struct_type(layout, &path, dims) {
+                // A packed array of structs: the flattened rows describe one
+                // element; its recorded dimensions give the count.
+                Some(DataType::Struct(mut su)) => {
+                    let elem_w: u32 = su
+                        .members
+                        .iter()
+                        .map(|m| match &m.data_type {
+                            DataType::IntegerVector { dimensions, .. } => dimensions
+                                .iter()
+                                .map(|d| match d {
+                                    PackedDimension::Range { left, right, .. } => {
+                                        match (lit_i64(left), lit_i64(right)) {
+                                            (Some(l), Some(r)) => (l.abs_diff(r) + 1) as u32,
+                                            _ => 0,
+                                        }
+                                    }
+                                    _ => 0,
+                                })
+                                .product::<u32>()
+                                .max(1),
+                            _ => 0,
+                        })
+                        .sum();
+                    if let Some(d) = dims(&path)
+                        && elem_w > 0
+                        && elem_w < w
+                        && d.iter().map(|&(l, r)| l.abs_diff(r) + 1).product::<u64>()
+                            * u64::from(elem_w)
+                            == u64::from(w)
+                    {
+                        let span = crate::ast::Span::dummy();
+                        su.dimensions = d
+                            .iter()
+                            .map(|&(l, r)| PackedDimension::Range {
+                                left: Box::new(int_lit(l)),
+                                right: Box::new(int_lit(r)),
+                                span,
+                            })
+                            .collect();
+                    }
+                    DataType::Struct(su)
+                }
+                Some(other) => other,
+                None => match dims(&path) {
                     Some(d)
                         if d.iter().map(|&(l, r)| l.abs_diff(r) + 1).product::<u64>()
                             == u64::from(w) =>
@@ -388,7 +431,8 @@ pub(crate) fn layout_struct_type(
                         packed_dims_vector(IntegerVectorType::Logic, &d)
                     }
                     _ => logic_vector(w),
-                });
+                },
+            };
             StructMember {
                 rand_qualifier: None,
                 data_type,
@@ -419,6 +463,20 @@ pub(crate) fn layout_struct_type(
         dimensions: Vec::new(),
         span,
     }))
+}
+
+/// The value of an integer literal expression `int_lit` built (or any
+/// plain decimal literal, with an optional unary minus).
+fn lit_i64(e: &Expression) -> Option<i64> {
+    use crate::ast::expr::{NumberLiteral, UnaryOp};
+    match &e.kind {
+        ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.parse().ok(),
+        ExprKind::Unary {
+            op: UnaryOp::Minus,
+            operand,
+        } => lit_i64(operand).map(|v| -v),
+        _ => None,
+    }
 }
 
 /// A literal integer expression.

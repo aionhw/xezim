@@ -42,11 +42,43 @@ impl Simulator {
     /// The declared type of the parameter `e` names (§6.20.2).
     fn param_decl_type(&self, e: &Expression) -> Option<DataType> {
         let types = &self.module.param_decl_types;
-        if let ExprKind::Ident(h) = &e.kind
-            && let Some(dt) = types.get(self.resolve_hier_name(h).as_ref())
-        {
-            return Some(dt.clone());
+        if let ExprKind::Ident(h) = &e.kind {
+            let name = self.resolve_hier_name(h);
+            if let Some(dt) = types.get(name.as_ref()) {
+                return Some(dt.clone());
+            }
+            // A parameter of the running instance is keyed by its scope
+            // (`u.N`), a package parameter imported bare by its package
+            // (`pkg::P`); the pattern names both bare (§23.10, §26.3).
+            if h.path.len() == 1 && h.root.is_none() {
+                let bare = h.path[0].name.name.as_str();
+                if let Some(hint) = self.name_resolve_hint.borrow().as_deref() {
+                    let mut scope = hint;
+                    loop {
+                        if let Some(dt) = types.get(&format!("{scope}.{bare}")) {
+                            return Some(dt.clone());
+                        }
+                        let Some((outer, _)) = scope.rsplit_once('.') else {
+                            break;
+                        };
+                        scope = outer;
+                    }
+                }
+                if self.module.parameters.contains_key(bare) {
+                    let mut found = None;
+                    for (k, dt) in types {
+                        if k.rsplit_once("::").is_some_and(|(_, n)| n == bare) {
+                            if found.is_some() {
+                                return None;
+                            }
+                            found = Some(dt.clone());
+                        }
+                    }
+                    return found;
+                }
+            }
         }
+        // `pkg::P`, as a scoped identifier or a member-access chain.
         types
             .get(&packed_assignment_pattern_plan::scoped_name_key(e)?)
             .cloned()
@@ -263,6 +295,9 @@ impl Simulator {
         if let Some(dt) = self.member_path_type(lvalue) {
             return Some(dt);
         }
+        if let Some(dt) = self.aliased_decl_type(lvalue) {
+            return Some(dt);
+        }
         if let Some(dt) = self.registered_vector_type(lvalue) {
             return Some(dt);
         }
@@ -300,6 +335,46 @@ impl Simulator {
         }
         let ty = self.lvalue_pattern_type(lvalue)?;
         self.eval_in_packed_type(rvalue, &ty)
+    }
+
+    /// The declared type of a bare name with no record of its own in the
+    /// running scope: a port collapsed onto the net it connects (`u.o` on
+    /// `port_aliases`, formal to actual) takes that net's declared type
+    /// (§23.3.3). Tried under the instance scope first, then bare.
+    fn aliased_decl_type(&mut self, lvalue: &Expression) -> Option<DataType> {
+        let ExprKind::Ident(h) = &lvalue.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let bare = h.path[0].name.name.as_str();
+        let hint = self.name_resolve_hint.borrow().clone();
+        let mut names: Vec<String> = Vec::new();
+        if let Some(hint) = hint.as_deref() {
+            let mut scope = hint;
+            loop {
+                names.push(format!("{scope}.{bare}"));
+                let Some((outer, _)) = scope.rsplit_once('.') else {
+                    break;
+                };
+                scope = outer;
+            }
+        }
+        names.push(bare.to_string());
+        let m = &self.module;
+        names.iter().find_map(|n| {
+            // Only through an alias: a name with its own record was found
+            // by `declared_packed_access` already.
+            m.port_aliases.contains_key(n).then(|| {
+                packed_assignment_pattern_plan::declared_type(
+                    n,
+                    &m.var_decl_types,
+                    Some(&m.port_aliases),
+                )
+                .cloned()
+            })?
+        })
     }
 
     /// The packed vector type of a signal (or an element of an unpacked

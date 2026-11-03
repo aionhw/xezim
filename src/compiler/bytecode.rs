@@ -8298,7 +8298,9 @@ impl<'a> BytecodeCompiler<'a> {
             .into_iter()
             .flatten()
             .find_map(|n| {
-                let ty = self.var_decl_types?.get(n)?;
+                // A port collapsed onto the net it connects takes that
+                // net's declared type (`port_aliases`, formal to actual).
+                let ty = pp::declared_type(n, self.var_decl_types?, self.port_aliases)?;
                 let w = if elem {
                     if self.multi_dim_arrays.is_some_and(|m| m.contains(n)) {
                         return None;
@@ -29791,7 +29793,7 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
         }
         let raw = BytecodeCompiler::hier_raw_name(h);
         let scoped = self.0.scope_hint.as_deref().map(|sc| cat_dot(sc, &raw));
-        [self.0.var_decl_types, self.0.param_decl_types]
+        let found = [self.0.var_decl_types, self.0.param_decl_types]
             .into_iter()
             .flatten()
             .find_map(|types| {
@@ -29799,6 +29801,23 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
                     .into_iter()
                     .flatten()
                     .find_map(|n| types.get(n).cloned())
-            })
+            });
+        if found.is_some() {
+            return found;
+        }
+        // A package parameter imported bare is keyed `pkg::P` (§26.3).
+        if h.path.len() == 1 && self.0.params.is_some_and(|p| p.contains_key(raw.as_str())) {
+            let mut hit = None;
+            for (k, dt) in self.0.param_decl_types? {
+                if k.rsplit_once("::").is_some_and(|(_, n)| n == raw) {
+                    if hit.is_some() {
+                        return None;
+                    }
+                    hit = Some(dt.clone());
+                }
+            }
+            return hit;
+        }
+        None
     }
 }
