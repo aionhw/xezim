@@ -1068,3 +1068,6 @@ mod randomize_array_reductions;
 
 #[path = "classes/randomize_elem_dist_weights.rs"]
 mod randomize_elem_dist_weights;
+
+#[path = "classes/property_hides_module_variable.rs"]
+mod property_hides_module_variable;
