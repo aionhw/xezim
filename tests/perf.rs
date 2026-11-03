@@ -53,3 +53,6 @@ mod struct_resolver_compiled;
 
 #[path = "perf/displaced_local_meta_reapply.rs"]
 mod displaced_local_meta_reapply;
+
+#[path = "perf/const_index_array_arming.rs"]
+mod const_index_array_arming;
