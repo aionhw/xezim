@@ -2896,6 +2896,17 @@ impl Simulator {
             // hijack class-member arrays and virtual-interface writes,
             // which own their own storage.
             let (base, may_create) = match &expr.kind {
+                // §8.4: `h.v[i]` with `h` a class handle names the object's
+                // property, which the handle arms below write. The resolved
+                // name is the bare property name, and a same-named module
+                // array's element would take the write here.
+                ExprKind::Ident(h)
+                    if h.path.len() >= 2
+                        && !self.no_class_objects()
+                        && self.class_of_var(&h.path[0].name.name).is_some() =>
+                {
+                    (None, false)
+                }
                 ExprKind::Ident(h) => (Some(self.resolve_hier_name(h)), true),
                 ExprKind::MemberAccess { .. } => (
                     self.flat_member_name(expr).map(std::borrow::Cow::Owned),
