@@ -2151,6 +2151,9 @@ pub struct BytecodeCompiler<'a> {
     /// Same stack-of-Vecs shape, but for `continue` — patched to the loop's
     /// step (or condition-recheck) address.
     loop_continue_patches: Vec<Vec<usize>>,
+    /// Stack of pending `disable <named_block>` jump-target patches, by block name.
+    /// LRM §9.6.2: disabling an active named block terminates that block.
+    named_block_patches: HashMap<String, Vec<usize>>,
     /// Set of signal names declared as `string` (LRM §6.16). When a
     /// concatenation involves any of these, the bytecode bails to the AST
     /// interpreter, which has byte-level (not bit-level) concat semantics.
@@ -2342,6 +2345,7 @@ impl<'a> BytecodeCompiler<'a> {
             port_aliases: None,
             loop_break_patches: Vec::new(),
             loop_continue_patches: Vec::new(),
+            named_block_patches: HashMap::default(),
             foreach_slot_count: 0,
             string_signals: None,
             local_var_is_string: HashSet::default(),
@@ -3783,6 +3787,7 @@ impl<'a> BytecodeCompiler<'a> {
         // the caller. A failed body can leave unfinished loop frames behind.
         let saved_break_patches = std::mem::take(&mut self.loop_break_patches);
         let saved_continue_patches = std::mem::take(&mut self.loop_continue_patches);
+        let saved_named_block_patches = std::mem::take(&mut self.named_block_patches);
         self.inline_ret = Some((Some(ret_slot), ret_w));
         let saved_ret_real = std::mem::replace(&mut self.inline_ret_real, ret_is_real);
         let saved_ret_ty = self.inline_ret_ty.replace(fd.return_type.clone());
@@ -3799,6 +3804,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.inline_ret_jumps = saved_ret_jumps;
         self.loop_break_patches = saved_break_patches;
         self.loop_continue_patches = saved_continue_patches;
+        self.named_block_patches = saved_named_block_patches;
         if ok {
             for (target, value, width) in &ref_writes {
                 if !self.compile_blocking_target(target, *value, *width) {
@@ -4148,6 +4154,7 @@ impl<'a> BytecodeCompiler<'a> {
             // when a failed lowering leaves unfinished loop frames behind.
             let saved_break_patches = std::mem::take(&mut self.loop_break_patches);
             let saved_continue_patches = std::mem::take(&mut self.loop_continue_patches);
+            let saved_named_block_patches = std::mem::take(&mut self.named_block_patches);
             self.inline_ret = Some((None, 0));
             for st in &body {
                 if !self.compile_stmt(st) {
@@ -4164,6 +4171,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.inline_ret_jumps = saved_ret_jumps;
             self.loop_break_patches = saved_break_patches;
             self.loop_continue_patches = saved_continue_patches;
+            self.named_block_patches = saved_named_block_patches;
             self.inlining_stack.pop();
             self.inline_foreign -= foreign as u32;
             self.m_labels = saved_labels;
@@ -8246,6 +8254,9 @@ impl<'a> BytecodeCompiler<'a> {
             patches.retain(|&pc| pc < len);
         }
         for patches in &mut self.loop_continue_patches {
+            patches.retain(|&pc| pc < len);
+        }
+        for patches in self.named_block_patches.values_mut() {
             patches.retain(|&pc| pc < len);
         }
     }
@@ -13251,14 +13262,28 @@ impl<'a> BytecodeCompiler<'a> {
                 let saved_reals = self.local_var_is_real.clone();
                 let saved_strings = self.local_var_is_string.clone();
                 let m_depth = self.m_labels.len();
-                if let Some(n) = name {
+                let prev_block_patches = if let Some(n) = name {
                     self.m_labels.push(n.clone());
-                }
+                    self.named_block_patches.insert(n.name.clone(), Vec::new())
+                } else {
+                    None
+                };
                 let mut ok = true;
                 for s in stmts {
                     if !self.compile_stmt(s) {
                         ok = false;
                         break;
+                    }
+                }
+                if let Some(n) = name {
+                    if let Some(patches) = self.named_block_patches.remove(&n.name) {
+                        let end = self.insns.len() as u32;
+                        for idx in patches {
+                            self.insns[idx] = Insn::Jump(end);
+                        }
+                    }
+                    if let Some(prev) = prev_block_patches {
+                        self.named_block_patches.insert(n.name.clone(), prev);
                     }
                 }
                 self.m_labels.truncate(m_depth);
@@ -14008,6 +14033,20 @@ impl<'a> BytecodeCompiler<'a> {
                     );
                 }
                 true
+            }
+            StatementKind::Disable(id) => {
+                // LRM §9.6.2: disable <named_block> terminates execution of that block.
+                // If the block is an active enclosing named block in this compiled unit,
+                // emit a forward Jump(0) and record the patch.
+                if self.named_block_patches.contains_key(&id.name) {
+                    let idx = self.insns.len();
+                    self.emit(Insn::Jump(0));
+                    self.named_block_patches.get_mut(&id.name).unwrap().push(idx);
+                    true
+                } else {
+                    self.bail("Disable");
+                    self.emit_fallback(stmt)
+                }
             }
             StatementKind::Break => {
                 // LRM §12.7 — exits innermost enclosing loop. Compiled as a
@@ -17377,10 +17416,10 @@ impl<'a> BytecodeCompiler<'a> {
                 // marshals register VALUES as constant actuals, so a
                 // write-back would be a no-op and the caller's lvalue would
                 // silently keep its pre-call value (uvm_config_db::get's
-                // inout `value` arg zeroed every config read). Formal
-                // directions are runtime state here (the receiver resolves
-                // through typedef/type-param chains at run time), so any
-                // potentially-assignable actual declines the whole method.
+                // inout `value` arg zeroed every config read).
+                // Register-backed locals are writable via emit_arg_slot_writeback,
+                // but other assignable actuals (heap members, static members,
+                // arrays) decline the compiled static method call.
                 let arg_could_be_ref_bound = |a: &Expression| -> bool {
                     match &a.kind {
                         ExprKind::Ident(h)
@@ -17392,8 +17431,10 @@ impl<'a> BytecodeCompiler<'a> {
                             if n == "this" {
                                 return false;
                             }
-                            self.local_var_regs.contains_key(n)
-                                || self.local_array_regs.contains_key(n)
+                            if self.local_var_reg_of(h).is_some() {
+                                return false;
+                            }
+                            self.local_array_regs.contains_key(n)
                                 || self.bare_member_names.contains(n)
                                 || self.static_member_names.contains(n)
                                 || self.string_member_names.contains(n)
