@@ -65,6 +65,8 @@ mod x_default_neighbours;
 mod x_default_open;
 #[path = "classes/class_queue_struct_member_arrays.rs"]
 mod class_queue_struct_member_arrays;
+#[path = "classes/class_queue_struct_pattern_init.rs"]
+mod class_queue_struct_pattern_init;
 #[path = "classes/class_struct_collection_elements.rs"]
 mod class_struct_collection_elements;
 #[path = "classes/class_time_field_neg_one.rs"]
