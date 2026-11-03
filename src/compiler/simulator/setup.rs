@@ -2303,7 +2303,7 @@ impl Simulator {
         compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
         compiler.set_assoc_arrays(&self.module.associative_arrays);
         compiler.set_packed_full_dims(&self.module.packed_full_dims);
-        compiler.set_var_decl_types(&self.module.var_decl_types);
+        Self::set_pattern_type_tables(&self.module, &mut compiler);
         compiler.set_packed_struct_fields(
             self.bc_packed_fields
                 .as_ref()

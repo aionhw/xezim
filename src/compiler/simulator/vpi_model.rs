@@ -5664,7 +5664,7 @@ fn op_type(e: &Expression) -> c_int {
         ExprKind::Concatenation(_) => 33,
         ExprKind::Replication { .. } => 34,
         ExprKind::Inside { .. } => 95,
-        ExprKind::AssignmentPattern(_) => 75,
+        ExprKind::AssignmentPattern(_) | ExprKind::TypedPattern { .. } => 75,
         ExprKind::StreamOp { left_to_right, .. } => {
             if *left_to_right {
                 71

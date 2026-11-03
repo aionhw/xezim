@@ -2129,6 +2129,13 @@ pub struct BytecodeCompiler<'a> {
     /// Declared variable types, for the type a pattern assigned to a
     /// variable takes (§10.8).
     var_decl_types: Option<&'a HashMap<String, crate::ast::types::DataType>>,
+    /// Unpacked dimensions of typedefs (`typedef int arr_t[3]`), by the
+    /// `typedef_types` key: such a type is not packed.
+    typedef_unpacked_dims: Option<&'a HashMap<String, Vec<crate::ast::types::UnpackedDimension>>>,
+    /// Declared types of explicitly typed value parameters.
+    param_decl_types: Option<&'a HashMap<String, crate::ast::types::DataType>>,
+    /// Ports collapsed onto the nets they connect, formal to actual.
+    port_aliases: Option<&'a HashMap<String, String>>,
     /// Stack of pending `break` jump-target patches, one entry per enclosing
     /// loop. When the loop's end address is known we rewrite each `Jump(0)`
     /// at these insn-indices to the loop-exit address. LRM §12.7.
@@ -2322,6 +2329,9 @@ impl<'a> BytecodeCompiler<'a> {
             assoc_arrays: None,
             packed_full_dims: None,
             var_decl_types: None,
+            typedef_unpacked_dims: None,
+            param_decl_types: None,
+            port_aliases: None,
             loop_break_patches: Vec::new(),
             loop_continue_patches: Vec::new(),
             foreach_slot_count: 0,
@@ -2843,6 +2853,21 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_var_decl_types(&mut self, t: &'a HashMap<String, crate::ast::types::DataType>) {
         self.var_decl_types = Some(t);
+    }
+
+    pub fn set_port_aliases(&mut self, a: &'a HashMap<String, String>) {
+        self.port_aliases = Some(a);
+    }
+
+    pub fn set_param_decl_types(&mut self, t: &'a HashMap<String, crate::ast::types::DataType>) {
+        self.param_decl_types = Some(t);
+    }
+
+    pub fn set_typedef_unpacked_dims(
+        &mut self,
+        d: &'a HashMap<String, Vec<crate::ast::types::UnpackedDimension>>,
+    ) {
+        self.typedef_unpacked_dims = Some(d);
     }
 
     /// The declared OUTERMOST packed dimension `(left, right)` of the signal
@@ -8213,7 +8238,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// ~8 of them per cycle (`mstatus_q.mpp`, `irqs_i.irq_fast`, ...), which
     /// made this the largest single fallback after the named-cast fix.
     /// Field layout of `lv` when it names a packed-struct SIGNAL directly.
-    fn lvalue_struct_layout(&self, lv: &Expression) -> Option<Vec<(String, u32, u32)>> {
+    fn lvalue_struct_layout(&self, lv: &Expression) -> Option<(String, Vec<(String, u32, u32)>)> {
         let fields_tbl = self.packed_struct_fields?;
         // `arr[i] <= '{...}`: an ELEMENT of an array of packed structs carries
         // the element layout, which is keyed by the array name — same keying
@@ -8247,15 +8272,22 @@ impl<'a> BytecodeCompiler<'a> {
         {
             return None;
         }
-        Some(layout.clone())
+        Some((named, layout.clone()))
     }
 
-    /// The declared type of the variable `lv` names, when it is packed and
-    /// spans the whole signal (an unpacked array records its element type).
+    /// The declared type of the variable `lv` names, or of an element
+    /// `arr[i]` of a one-dimensional unpacked array (which records its
+    /// element type), when it is packed and spans the whole signal or
+    /// element.
     fn declared_pattern_ctx(&mut self, lv: &Expression) -> Option<crate::ast::types::DataType> {
         use crate::compiler::packed_assignment_pattern_plan as pp;
-        let ExprKind::Ident(h) = &lv.kind else {
-            return None;
+        let (h, elem) = match &lv.kind {
+            ExprKind::Ident(h) => (h, false),
+            ExprKind::Index { expr, .. } => match &expr.kind {
+                ExprKind::Ident(h) => (h, true),
+                _ => return None,
+            },
+            _ => return None,
         };
         if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
             return None;
@@ -8267,8 +8299,16 @@ impl<'a> BytecodeCompiler<'a> {
             .flatten()
             .find_map(|n| {
                 let ty = self.var_decl_types?.get(n)?;
-                let id = *self.signal_name_to_id.get(n)?;
-                Some((ty.clone(), *self.signal_widths.get(id)?))
+                let w = if elem {
+                    if self.multi_dim_arrays.is_some_and(|m| m.contains(n)) {
+                        return None;
+                    }
+                    self.arrays.get(n)?.2
+                } else {
+                    let id = *self.signal_name_to_id.get(n)?;
+                    *self.signal_widths.get(id)?
+                };
+                Some((ty.clone(), w))
             })?;
         (pp::packed_width(&ty, &mut BcPatternTypeResolver(self)) == Some(w)).then_some(ty)
     }
@@ -8288,8 +8328,12 @@ impl<'a> BytecodeCompiler<'a> {
         if let Some(ty) = self.declared_pattern_ctx(lv) {
             return Some(ty);
         }
-        if let Some(layout) = self.lvalue_struct_layout(lv) {
-            return pp::layout_struct_type(&layout, "");
+        let full_dims = self.packed_full_dims;
+        let member_dims = |root: &str, path: &str| {
+            full_dims.and_then(|t| t.get(&format!("{root}.{path}")).cloned())
+        };
+        if let Some((root, layout)) = self.lvalue_struct_layout(lv) {
+            return pp::layout_struct_type(&layout, "", &|p| member_dims(&root, p));
         }
         let ExprKind::Ident(h) = &lv.kind else {
             return None;
@@ -8304,13 +8348,32 @@ impl<'a> BytecodeCompiler<'a> {
             .map(String::as_str)
             .chain([raw.as_ref()])
             .collect();
+        // A member of a declared variable takes its declared member type.
+        if let Some(types) = self.var_decl_types {
+            for name in &names {
+                let mut split = name.len();
+                while let Some(dot) = name[..split].rfind('.') {
+                    split = dot;
+                    if let Some(dt) = pp::declared_type(&name[..split], types, self.port_aliases) {
+                        return pp::member_path_type(
+                            dt,
+                            &name[split + 1..],
+                            &mut BcPatternTypeResolver(self),
+                        );
+                    }
+                }
+            }
+        }
         if let Some(fields) = self.packed_struct_fields {
             for name in &names {
                 let mut split = name.len();
                 while let Some(dot) = name[..split].rfind('.') {
                     split = dot;
                     if let Some(layout) = fields.get(&name[..split]) {
-                        return pp::layout_struct_type(layout, &name[split + 1..]);
+                        let root = &name[..split];
+                        return pp::layout_struct_type(layout, &name[split + 1..], &|p| {
+                            member_dims(root, p)
+                        });
                     }
                 }
             }
@@ -8341,13 +8404,20 @@ impl<'a> BytecodeCompiler<'a> {
         };
         let start = self.insns.len();
         let start_reg = self.next_reg;
-        let plan = pp::packed_plan(src, &ty, &mut BcPatternTypeResolver(self));
+        // An element no item covers is an error (§10.9.1, §10.9.2): leave the
+        // pattern to the interpreter, which warns.
+        let plan =
+            pp::packed_plan(src, &ty, &mut BcPatternTypeResolver(self)).filter(|p| !p.uncovered);
         if let Some(r) = plan.and_then(|p| self.compile_pattern_plan(&p)) {
             return Some(r);
         }
         self.truncate_insns(start);
         self.next_reg = start_reg;
-        if matches!(expr.kind, ExprKind::TypedPattern { .. }) {
+        // A packed typed pattern with no plan evaluates in the interpreter;
+        // an unpacked one has no packed value, so its statement stays there.
+        if matches!(expr.kind, ExprKind::TypedPattern { .. })
+            && pp::is_packed(&ty, &mut BcPatternTypeResolver(self))
+        {
             return self.emit_expr_fallback(expr, ctx_width, "typed_pattern");
         }
         self.bail("Expr_AssignmentPattern");
@@ -8396,6 +8466,19 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     r
                 }
+                SliceSrc::Repeat { expr, elem, count } => {
+                    flush(self, &mut pending, &mut regs);
+                    let src = self.compile_expr(expr, *elem)?;
+                    let r = self.alloc_reg();
+                    self.emit(Insn::Move(r, src));
+                    self.emit(Insn::Resize(r, *elem));
+                    if s.two_state {
+                        self.emit(Insn::DropXz(r));
+                    }
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::Replicate(dest, r, *count));
+                    dest
+                }
                 SliceSrc::Cond { cond, then, els } => {
                     // Both operands run (Select merges them on an x/z
                     // condition), so neither may have an effect.
@@ -8429,7 +8512,7 @@ impl<'a> BytecodeCompiler<'a> {
     ) -> bool {
         use crate::compiler::packed_assignment_pattern_plan::SliceSrc;
         plan.slices.iter().any(|s| match &s.src {
-            SliceSrc::Expr(e) => Self::expr_has_effect(e),
+            SliceSrc::Expr(e) | SliceSrc::Repeat { expr: e, .. } => Self::expr_has_effect(e),
             SliceSrc::Const(_) => false,
             SliceSrc::Cond { cond, then, els } => {
                 Self::expr_has_effect(cond)
@@ -12814,7 +12897,7 @@ impl<'a> BytecodeCompiler<'a> {
                     // (`mb[i] = new(...)` allocates / constructs) — neither
                     // is a plain element store. Keep both shapes AST.
                     && !match &rvalue.kind {
-                        ExprKind::AssignmentPattern(..) => true,
+                        ExprKind::AssignmentPattern(..) | ExprKind::TypedPattern { .. } => true,
                         ExprKind::Call { func, .. } => matches!(
                             &func.kind,
                             ExprKind::Ident(h)
@@ -29658,9 +29741,16 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
         &mut self,
         name: &crate::ast::types::TypeName,
     ) -> Option<crate::ast::types::DataType> {
-        self.0
-            .typedef_type_entry(name, None)
-            .map(|(_, t)| t.clone())
+        // A typedef with unpacked dimensions is not packed (§7.4).
+        let (key, t) = self.0.typedef_type_entry(name, None)?;
+        if self
+            .0
+            .typedef_unpacked_dims
+            .is_some_and(|d| d.get(key).is_some_and(|v| !v.is_empty()))
+        {
+            return None;
+        }
+        Some(t.clone())
     }
 
     fn const_i64(&mut self, e: &Expression) -> Option<i64> {
@@ -29668,6 +29758,9 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
     }
 
     fn is_type_name(&mut self, name: &str) -> bool {
+        if self.0.params.is_some_and(|p| p.contains_key(name)) {
+            return false;
+        }
         let span = crate::ast::Span::dummy();
         let tn = crate::ast::types::TypeName {
             scopes: Vec::new(),
@@ -29678,5 +29771,34 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
             span,
         };
         self.0.typedef_type_entry(&tn, None).is_some()
+    }
+
+    fn expr_type(&mut self, e: &Expression) -> Option<crate::ast::types::DataType> {
+        use crate::compiler::packed_assignment_pattern_plan as pp;
+        if let Some(t) = pp::named_type_of(e) {
+            return Some(t);
+        }
+        if let Some(dt) =
+            pp::scoped_name_key(e).and_then(|k| self.0.param_decl_types?.get(&k).cloned())
+        {
+            return Some(dt);
+        }
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let raw = BytecodeCompiler::hier_raw_name(h);
+        let scoped = self.0.scope_hint.as_deref().map(|sc| cat_dot(sc, &raw));
+        [self.0.var_decl_types, self.0.param_decl_types]
+            .into_iter()
+            .flatten()
+            .find_map(|types| {
+                [scoped.as_deref(), Some(raw.as_str())]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|n| types.get(n).cloned())
+            })
     }
 }

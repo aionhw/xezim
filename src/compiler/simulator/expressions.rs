@@ -3822,14 +3822,40 @@ impl Simulator {
                     }
                 }
                 // §11.4.5 / §10.9: equality against an ASSIGNMENT PATTERN
-                // (`a == '{9, 5, 5, 5}`) compares element- / member-wise.
+                // (`a == '{9, 5, 5, 5}`) compares element- / member-wise. A
+                // typed pattern of an unpacked type compares the same way;
+                // against another pattern it is a value of its type.
                 if matches!(
                     op,
                     BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
-                ) && (matches!(left.kind, ExprKind::AssignmentPattern(_))
-                    || matches!(right.kind, ExprKind::AssignmentPattern(_)))
-                {
-                    if let Some(v) = self.compare_with_pattern(*op, left, right) {
+                ) {
+                    let (lt, rt) = (
+                        self.unpacked_typed_pattern(left),
+                        self.unpacked_typed_pattern(right),
+                    );
+                    let (l, r) = (lt.unwrap_or(left), rt.unwrap_or(right));
+                    let pat = |e: &Expression| matches!(e.kind, ExprKind::AssignmentPattern(_));
+                    let v = if pat(l) && pat(r) {
+                        // Two patterns: a typed one is the value of its type.
+                        if lt.is_some() {
+                            self.with_typed_pattern_storage(left, |sim, held| {
+                                sim.compare_with_pattern(*op, held, r)
+                            })
+                            .flatten()
+                        } else if rt.is_some() {
+                            self.with_typed_pattern_storage(right, |sim, held| {
+                                sim.compare_with_pattern(*op, l, held)
+                            })
+                            .flatten()
+                        } else {
+                            None
+                        }
+                    } else if pat(l) || pat(r) {
+                        self.compare_with_pattern(*op, l, r)
+                    } else {
+                        None
+                    };
+                    if let Some(v) = v {
                         return v;
                     }
                 }
@@ -6671,7 +6697,7 @@ impl Simulator {
                 r
             }
             // §10.9: a typed pattern has its type's value.
-            ExprKind::TypedPattern { ty, pattern } => self.eval_typed_pattern(ty, pattern),
+            ExprKind::TypedPattern { .. } => self.eval_typed_pattern(expr),
             _ => Value::zero(32),
         }
     }

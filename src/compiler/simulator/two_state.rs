@@ -5026,6 +5026,7 @@ impl Simulator {
             compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
+            Self::set_pattern_type_tables(&self.module, &mut compiler);
             compiler.set_packed_struct_fields(
                 self.bc_packed_fields
                     .as_ref()
@@ -5430,6 +5431,7 @@ impl Simulator {
                 compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
+                Self::set_pattern_type_tables(&self.module, &mut compiler);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_arrays_2d(&self.module.arrays_2d);
                 compiler
@@ -5472,6 +5474,7 @@ impl Simulator {
                 delay_compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 delay_compiler.set_assoc_arrays(&self.module.associative_arrays);
                 delay_compiler.set_packed_full_dims(&self.module.packed_full_dims);
+                Self::set_pattern_type_tables(&self.module, &mut delay_compiler);
                 delay_compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 delay_compiler.set_arrays_2d(&self.module.arrays_2d);
                 delay_compiler

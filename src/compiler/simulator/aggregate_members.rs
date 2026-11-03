@@ -3511,7 +3511,7 @@ impl Simulator {
         rvalue: &Expression,
         su: &crate::ast::types::StructUnionType,
     ) {
-        let items = match &rvalue.kind {
+        let items = match &self.unpacked_pattern(rvalue).kind {
             ExprKind::AssignmentPattern(its) => Some(its.as_slice()),
             _ => None,
         };

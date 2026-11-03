@@ -1614,7 +1614,7 @@ impl Simulator {
         n: usize,
         widths: &[u32],
     ) -> Option<Vec<Value>> {
-        let ExprKind::AssignmentPattern(parts) = &arg.peel_typed_pattern().kind else {
+        let ExprKind::AssignmentPattern(parts) = &self.unpacked_pattern(arg).kind else {
             return None;
         };
         if parts.len() != n {
@@ -1648,7 +1648,7 @@ impl Simulator {
         arg: &Expression,
         keys: &[(String, u32, bool)],
     ) -> Option<Vec<Value>> {
-        let ExprKind::AssignmentPattern(items) = &arg.peel_typed_pattern().kind else {
+        let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(arg).kind else {
             return None;
         };
         if items.is_empty() {
@@ -2034,7 +2034,7 @@ impl Simulator {
         if !self.port_is_assoc_array(port) {
             return None;
         }
-        let arg = arg.peel_typed_pattern();
+        let arg = self.unpacked_pattern(arg);
         // §13.5.3 / §10.9.1: an assignment-pattern actual (a formal's default,
         // `int m[string] = '{default: 0}`) has no storage to copy from: the
         // formal starts as a fresh array holding the pattern's keyed items,
@@ -2262,6 +2262,7 @@ impl Simulator {
         {
             return self.bind_array_arg(port, &selected);
         }
+        let arg = self.unpacked_pattern(arg);
         let params = Some(&self.module.parameters);
         let (lo, hi) = match dims.first()? {
             UD::Range { left, right, .. } => {
@@ -2283,7 +2284,7 @@ impl Simulator {
         // copy from: register the formal and assign the pattern's items to
         // its elements, the leftmost item to the leftmost index. There is
         // nothing to copy back, so the returned caller is empty.
-        if let ExprKind::AssignmentPattern(items) = &arg.peel_typed_pattern().kind {
+        if let ExprKind::AssignmentPattern(items) = &arg.kind {
             if dims.len() != 1 {
                 return None;
             }
@@ -2690,7 +2691,9 @@ impl Simulator {
         let d = port.default.as_ref()?;
         (matches!(
             d.kind,
-            ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
+            ExprKind::AssignmentPattern(_)
+                | ExprKind::TypedPattern { .. }
+                | ExprKind::Concatenation(_)
         ) || !port.dimensions.is_empty()
             || matches!(port.direction, PortDirection::Output | PortDirection::Inout))
         .then_some(d)

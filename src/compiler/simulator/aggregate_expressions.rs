@@ -2716,6 +2716,18 @@ impl Simulator {
             }
             "$bits" => {
                 if let Some(arg) = args.first() {
+                    // §10.9: a typed pattern sizes as its type, `$bits(T)`.
+                    let named;
+                    let arg = match &arg.kind {
+                        ExprKind::TypedPattern { ty, .. } => match type_name_expr(ty) {
+                            Some(e) => {
+                                named = e;
+                                &named
+                            }
+                            None => arg,
+                        },
+                        _ => arg,
+                    };
                     // §5.9: the empty string literal `""` is equivalent to
                     // `"\0"` — one character, 8 bits (its VALUE stays a
                     // width-0 zero elsewhere; only the size query sees the

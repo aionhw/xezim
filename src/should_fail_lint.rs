@@ -355,7 +355,7 @@ fn check_array_flat_init(d: &VarDeclarator, elab: &ElaboratedModule, errs: &mut 
     };
     let n = (l - r).abs() + 1;
     let Some(init) = &d.init else { return };
-    let ExprKind::AssignmentPattern(items) = &init.kind else {
+    let ExprKind::AssignmentPattern(items) = &init.peel_typed_pattern().kind else {
         return;
     };
     let mut m: i64 = 0;
@@ -365,7 +365,9 @@ fn check_array_flat_init(d: &VarDeclarator, elab: &ElaboratedModule, errs: &mut 
                 // a nested pattern/replication is a proper per-entry init, not flat
                 if matches!(
                     e.kind,
-                    ExprKind::AssignmentPattern(_) | ExprKind::Replication { .. }
+                    ExprKind::AssignmentPattern(_)
+                        | ExprKind::TypedPattern { .. }
+                        | ExprKind::Replication { .. }
                 ) {
                     return;
                 }
@@ -4383,7 +4385,7 @@ fn check_unpacked_pattern_counts(items: &[ModuleItem], errs: &mut Vec<String>) {
                     // 1-D flat initializers are `check_array_flat_init`'s.
                     if dims.len() > 1
                         && let Some(init) = &decl.init
-                        && let ExprKind::AssignmentPattern(pi) = &init.kind
+                        && let ExprKind::AssignmentPattern(pi) = &init.peel_typed_pattern().kind
                     {
                         pattern_count(&decl.name.name, pi, &dims, errs);
                     }
@@ -4420,7 +4422,7 @@ fn check_unpacked_pattern_counts(items: &[ModuleItem], errs: &mut Vec<String>) {
     }
     for s in &procs {
         for_each_assign_pair(s, &mut |lhs, rhs| {
-            let ExprKind::AssignmentPattern(pi) = &rhs.kind else {
+            let ExprKind::AssignmentPattern(pi) = &rhs.peel_typed_pattern().kind else {
                 return;
             };
             let mut base = lhs;
@@ -4515,7 +4517,7 @@ fn pattern_count(
     }
     if dims.len() > 1 {
         for e in ordered {
-            if let ExprKind::AssignmentPattern(inner) = &e.kind {
+            if let ExprKind::AssignmentPattern(inner) = &e.peel_typed_pattern().kind {
                 pattern_count(name, inner, &dims[1..], errs);
             }
         }

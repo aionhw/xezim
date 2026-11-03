@@ -15,10 +15,10 @@ use super::{
     bytecode, dispatch, elaborate, fst_sink, interrupt, jit, sdf, stdout_sink, value, vcd_sink,
 };
 
-use super::packed_assignment_pattern_plan::{has_pattern, is_packed};
 use super::elaborate::{
     AlwaysBlock, CollShape, Dim, DpiImportSpec, ElaboratedModule, KeyKind, Signal,
 };
+use super::packed_assignment_pattern_plan::{has_pattern, is_packed, type_name_expr};
 use super::value::{LogicBit, Value};
 use crate::ast::decl::{
     AlwaysKind, ClassConstraint, ConstraintItem, ConstraintRange, CovergroupDeclaration,
@@ -6720,7 +6720,7 @@ enum CombPlan {
 }
 
 /// A `fn_ret_frames` entry: the declaration whose return type a pattern in
-/// `return` takes, held by reference count.
+/// `return` takes.
 #[derive(Clone)]
 pub(crate) enum ReturnPatternType {
     /// A return type no pattern can target.
@@ -8661,6 +8661,9 @@ pub struct Simulator {
     /// Assignment patterns already warned about an uncovered member.
     #[serde(skip)]
     warned_uncovered_patterns: HashSet<(usize, usize)>,
+    /// Names the storage of each typed pattern value held at once.
+    #[serde(skip)]
+    typed_pattern_seq: u64,
     /// PIDs whose first-at-time-0 variable `#(expr)` delay evaluated to 0 and
     /// was deferred once past the time-0 settle (so the period signal — e.g. a
     /// real cont-assign feeding `always #(p/2) clk=~clk` — settles before the

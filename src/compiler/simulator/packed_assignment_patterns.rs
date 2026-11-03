@@ -20,9 +20,54 @@ impl PatternTypeResolver for Simulator {
     fn is_type_name(&mut self, name: &str) -> bool {
         !self.module.parameters.contains_key(name) && self.lookup_typedef_target(name).is_some()
     }
+
+    fn expr_type(&mut self, e: &Expression) -> Option<DataType> {
+        if let Some(t) = packed_assignment_pattern_plan::named_type_of(e) {
+            return Some(t);
+        }
+        match &e.kind {
+            ExprKind::Paren(inner) => self.expr_type(inner),
+            ExprKind::Call { func, .. } => self.call_return_type(func),
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
+                if let Some(dt) = self.param_decl_type(e) =>
+            {
+                Some(dt)
+            }
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } | ExprKind::Index { .. } => {
+                self.lvalue_pattern_type(e)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Simulator {
+    /// The declared type of the parameter `e` names (§6.20.2).
+    fn param_decl_type(&self, e: &Expression) -> Option<DataType> {
+        let types = &self.module.param_decl_types;
+        if let ExprKind::Ident(h) = &e.kind
+            && let Some(dt) = types.get(self.resolve_hier_name(h).as_ref())
+        {
+            return Some(dt.clone());
+        }
+        types
+            .get(&packed_assignment_pattern_plan::scoped_name_key(e)?)
+            .cloned()
+    }
+
+    /// Give `compiler` the tables a pattern plan resolves its context type
+    /// from: declared variable and parameter types, and typedef unpacked
+    /// dimensions.
+    pub(super) fn set_pattern_type_tables<'a>(
+        module: &'a ElaboratedModule,
+        compiler: &mut super::bytecode::BytecodeCompiler<'a>,
+    ) {
+        compiler.set_var_decl_types(&module.var_decl_types);
+        compiler.set_typedef_unpacked_dims(&module.typedef_unpacked_dims);
+        compiler.set_param_decl_types(&module.param_decl_types);
+        compiler.set_port_aliases(&module.port_aliases);
+    }
+
     /// `e` evaluated as the source of an assignment to `dt` (§10.8), when
     /// `e` holds a pattern and `dt` is a packed aggregate. None otherwise, so
     /// the caller keeps its own evaluation.
@@ -44,10 +89,28 @@ impl Simulator {
         Some(self.exec_packed_assignment_pattern_plan(&plan))
     }
 
+    /// The value the type and default keys of `items` give a member of the
+    /// packed type `dt` no other key sets (§10.9.1, §10.9.2).
+    pub(super) fn eval_default_in_packed_type(
+        &mut self,
+        items: &[AssignmentPatternItem],
+        dt: &DataType,
+    ) -> Option<Value> {
+        let plan = packed_assignment_pattern_plan::default_plan(items, dt, self)?;
+        Some(self.exec_packed_assignment_pattern_plan(&plan))
+    }
+
     /// `T'{...}`: the value a variable of type `T` holds when initialized
     /// with the pattern (§10.9).
-    pub(super) fn eval_typed_pattern(&mut self, ty: &DataType, pattern: &Expression) -> Value {
-        match self.eval_in_packed_type(pattern, ty) {
+    pub(super) fn eval_typed_pattern(&mut self, e: &Expression) -> Value {
+        let ExprKind::TypedPattern { ty, pattern } = &e.kind else {
+            return self.eval_expr(e);
+        };
+        if let Some(v) = self.eval_in_packed_type(pattern, ty) {
+            return v;
+        }
+        // An unpacked struct value travels packed, as a struct return does.
+        match self.typed_struct_pattern_value(e) {
             Some(v) => v,
             None => self.eval_expr(pattern),
         }
@@ -69,6 +132,16 @@ impl Simulator {
                     }
                 }
                 SliceSrc::Const(v) => v.clone(),
+                SliceSrc::Repeat { expr, elem, count } => {
+                    let raw = self.eval_expr_ctx(expr, *elem);
+                    let v = self.fit_pattern_item_value(raw, *elem);
+                    let v = if s.two_state && v.has_xz() {
+                        v.to_two_state()
+                    } else {
+                        v
+                    };
+                    v.replicate(*count as usize)
+                }
                 SliceSrc::Cond { cond, then, els } => {
                     let c = self.eval_expr(cond);
                     if c.has_unknown() {
@@ -88,17 +161,29 @@ impl Simulator {
         acc
     }
 
-    /// The target of a named type: a class-scope typedef first, then the
-    /// design's tables, then a bound type parameter.
+    /// The target of a named packed type: a class-scope typedef first, then
+    /// the design's tables, then a bound type parameter. None for a typedef
+    /// with unpacked dimensions (§7.4).
     fn pattern_typedef_target(&self, name: &TypeName) -> Option<DataType> {
+        let unpacked = |key: &str| {
+            self.typedef_unpacked_dims_of(key)
+                .is_some_and(|d| !d.is_empty())
+        };
         if name.has_scope()
             && let Some(dt) = super::elaborate::lookup_scoped_type(name, &self.module.typedef_types)
         {
-            return Some(dt.clone());
+            return (!unpacked(&name.qualified())).then(|| dt.clone());
+        }
+        if unpacked(&name.name.name) {
+            return None;
         }
         self.lookup_typedef_target(&name.name.name).or_else(|| {
             let bound = self.resolve_type_param_binding(&name.name.name)?;
-            self.module.typedef_types.get(bound.trim()).cloned()
+            let bound = bound.trim();
+            if unpacked(bound) {
+                return None;
+            }
+            self.module.typedef_types.get(bound).cloned()
         })
     }
 
@@ -170,10 +255,8 @@ impl Simulator {
         self.eval_in_packed_type(e, &port.data_type)
     }
 
-    /// The declared type of an assignment target, for evaluating a pattern
-    /// assigned to it. Packed geometry comes from the declaration the reads
-    /// use; a struct member path and a class property follow their
-    /// declarations.
+    /// The declared type of an assignment target, which a pattern assigned to
+    /// it takes (§10.8).
     pub(super) fn lvalue_pattern_type(&mut self, lvalue: &Expression) -> Option<DataType> {
         if let Some(access) = self.declared_packed_access(lvalue)
             && access.unpacked == 0
@@ -220,15 +303,6 @@ impl Simulator {
         }
         let ty = self.lvalue_pattern_type(lvalue)?;
         self.eval_in_packed_type(rvalue, &ty)
-    }
-
-    /// Whether `lvalue` has a packed declared type (a pattern assigned to
-    /// it is evaluated as a packed value).
-    pub(super) fn lvalue_is_packed(&mut self, lvalue: &Expression) -> bool {
-        match self.lvalue_pattern_type(lvalue) {
-            Some(ty) => is_packed(&ty, self),
-            None => false,
-        }
     }
 
     /// The packed vector type of a signal (or an element of an unpacked
@@ -293,7 +367,10 @@ impl Simulator {
             let base = &flat[..split];
             if let Some(layout) = self.module.packed_struct_fields.get(base) {
                 let prefix = flat.get(split + 1..).unwrap_or("");
-                return packed_assignment_pattern_plan::layout_struct_type(layout, prefix);
+                let full = &self.module.packed_full_dims;
+                return packed_assignment_pattern_plan::layout_struct_type(layout, prefix, &|p| {
+                    full.get(&format!("{base}.{p}")).cloned()
+                });
             }
             split = flat[..split].rfind('.')?;
         }
@@ -345,36 +422,25 @@ impl Simulator {
     /// variable (`s.inner`, `u_inst.s`).
     fn member_path_type(&mut self, lvalue: &Expression) -> Option<DataType> {
         let flat = self.flat_member_name(lvalue)?;
-        if flat.contains('[') || !flat.contains('.') {
+        if flat.contains('[') {
             return None;
         }
         let mut split = flat.len();
         loop {
-            let base = &flat[..split];
-            if let Some(dt) = self.module.var_decl_types.get(base).cloned() {
-                let mut cur = dt;
-                let rest = flat.get(split + 1..).unwrap_or("");
-                let mut ok = !rest.is_empty();
-                for seg in rest.split('.').filter(|s| !s.is_empty()) {
-                    let DataType::Struct(su) = self.resolve_dt(&cur) else {
-                        ok = false;
-                        break;
-                    };
-                    let Some(m) = su.members.iter().find(|m| {
-                        m.declarators
-                            .iter()
-                            .any(|d| d.name.name == seg && d.dimensions.is_empty())
-                    }) else {
-                        ok = false;
-                        break;
-                    };
-                    cur = m.data_type.clone();
-                }
-                if ok {
-                    return Some(cur);
-                }
-            }
             split = flat[..split].rfind('.')?;
+            if let Some(dt) = packed_assignment_pattern_plan::declared_type(
+                &flat[..split],
+                &self.module.var_decl_types,
+                Some(&self.module.port_aliases),
+            )
+            .cloned()
+            {
+                return packed_assignment_pattern_plan::member_path_type(
+                    &dt,
+                    &flat[split + 1..],
+                    self,
+                );
+            }
         }
     }
 }

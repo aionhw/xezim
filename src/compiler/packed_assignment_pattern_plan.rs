@@ -23,6 +23,83 @@ pub(crate) trait PatternTypeResolver {
     fn const_i64(&mut self, e: &Expression) -> Option<i64>;
     /// Whether a bare `name:` key names a type (§10.9.2 type key).
     fn is_type_name(&mut self, name: &str) -> bool;
+    /// The self-determined type of `e`, when known: a declared variable, a
+    /// typed pattern, a cast or a call.
+    fn expr_type(&mut self, e: &Expression) -> Option<DataType>;
+}
+
+/// The `::`-joined key of a scoped name `a::b`, written as a member-access
+/// chain or, after elaboration, one multi-segment path (as `named_cast_key`
+/// joins it).
+pub(crate) fn scoped_name_key(e: &Expression) -> Option<String> {
+    let mut links: Vec<&str> = Vec::new();
+    let mut cur = e;
+    loop {
+        match &cur.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                links.push(&member.name);
+                cur = expr;
+            }
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                links.extend(h.path.iter().rev().map(|s| s.name.name.as_str()));
+                break;
+            }
+            _ => return None,
+        }
+    }
+    if links.len() < 2 {
+        return None;
+    }
+    links.reverse();
+    Some(links.join("::"))
+}
+
+/// The name of the named type `ty` as the parser writes it in an expression
+/// (`$bits(T)`, `$bits(pkg::T)`): an identifier, or a member-access chain.
+pub(crate) fn type_name_expr(ty: &DataType) -> Option<Expression> {
+    let DataType::TypeReference {
+        name,
+        dimensions,
+        type_args,
+        ..
+    } = ty
+    else {
+        return None;
+    };
+    if !dimensions.is_empty() || !type_args.is_empty() {
+        return None;
+    }
+    let mut links = name.scopes.iter().map(|s| &s.name);
+    let mut e = ident_expr(links.next().unwrap_or(&name.name));
+    for id in links.chain((!name.scopes.is_empty()).then_some(&name.name)) {
+        e = Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(e),
+                member: id.clone(),
+            },
+            id.span,
+        );
+    }
+    Some(e)
+}
+
+/// The type a cast or typed pattern names, when `e` is one.
+pub(crate) fn named_type_of(e: &Expression) -> Option<DataType> {
+    match &e.kind {
+        ExprKind::TypedPattern { ty, .. } => Some((**ty).clone()),
+        ExprKind::Paren(inner) => named_type_of(inner),
+        ExprKind::SystemCall { name, args } if name == "$__xz_named_cast" && args.len() == 2 => {
+            match &args[0].kind {
+                ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
+                    Some(type_ref(&h.path[0].name.name))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// What fills one slice of a plan.
@@ -31,6 +108,14 @@ pub(crate) enum SliceSrc<'a> {
     Expr(&'a Expression),
     /// Bits no item sets.
     Const(Value),
+    /// `count` copies of an item, each evaluated as an assignment to an
+    /// element of `elem` bits: a `default:` over many elements. The item
+    /// evaluates once (§10.9.1: the number of evaluations is undefined).
+    Repeat {
+        expr: &'a Expression,
+        elem: u32,
+        count: u32,
+    },
     /// `c ? p1 : p2` with pattern operands: each operand in the slice's
     /// type; an x/z condition merges both bit by bit (§11.4.11).
     Cond {
@@ -106,9 +191,89 @@ pub(crate) fn packed_plan<'a>(
     Some(PackedPlan {
         width,
         signed,
-        slices,
+        slices: merge_repeats(slices),
         uncovered: b.uncovered,
     })
+}
+
+/// Merge runs of adjacent slices, most significant first, that hold the
+/// same item at the same width into one `Repeat`.
+fn merge_repeats(slices: Vec<Slice<'_>>) -> Vec<Slice<'_>> {
+    let mut out: Vec<Slice<'_>> = Vec::with_capacity(slices.len());
+    for s in slices {
+        if let Some(prev) = out.last_mut()
+            && prev.two_state == s.two_state
+            && s.offset + s.width == prev.offset
+        {
+            let run = match &prev.src {
+                SliceSrc::Expr(e) => Some((*e, prev.width, 1)),
+                SliceSrc::Repeat { expr, elem, count } => Some((*expr, *elem, *count)),
+                _ => None,
+            };
+            if let Some((expr, elem, count)) = run
+                && s.width == elem
+                && matches!(s.src, SliceSrc::Expr(e) if std::ptr::eq(e, expr))
+            {
+                prev.offset = s.offset;
+                prev.width += s.width;
+                prev.src = SliceSrc::Repeat {
+                    expr,
+                    elem,
+                    count: count + 1,
+                };
+                continue;
+            }
+        }
+        out.push(s);
+    }
+    out
+}
+
+/// The plan of a member or element of packed type `ty` that no positional
+/// or member key of the enclosing pattern `items` sets: its type and
+/// default keys apply (§10.9.1, §10.9.2). None when `items` has neither.
+pub(crate) fn default_plan<'a>(
+    items: &'a [AssignmentPatternItem],
+    ty: &DataType,
+    r: &mut dyn PatternTypeResolver,
+) -> Option<PackedPlan<'a>> {
+    let mut keys = Keys::default();
+    for it in items {
+        match it {
+            AssignmentPatternItem::Default(e) => keys.default = Some(e),
+            AssignmentPatternItem::Typed(t, e) => keys.types.push((t.clone(), e)),
+            AssignmentPatternItem::Named(id, e) if r.is_type_name(&id.name) => {
+                keys.types.push((type_ref(&id.name), e))
+            }
+            _ => {}
+        }
+    }
+    if keys.default.is_none() && keys.types.is_empty() {
+        return None;
+    }
+    let mut b = PlanBuilder {
+        r,
+        uncovered: false,
+    };
+    let width = b.width(ty)?;
+    let signed = b.signed(ty);
+    let mut slices = Vec::new();
+    b.unkeyed(&keys, ty, 0, width, &mut slices)?;
+    Some(PackedPlan {
+        width,
+        signed,
+        slices: merge_repeats(slices),
+        uncovered: b.uncovered,
+    })
+}
+
+/// §6.22.1: whether `a` and `b` are matching types.
+pub(crate) fn types_match(a: &DataType, b: &DataType, r: &mut dyn PatternTypeResolver) -> bool {
+    PlanBuilder {
+        r,
+        uncovered: false,
+    }
+    .types_match(a, b)
 }
 
 /// Whether `ty` is a packed type (a pattern assigned to it is one value).
@@ -121,6 +286,57 @@ pub(crate) fn is_packed(ty: &DataType, r: &mut dyn PatternTypeResolver) -> bool 
     .is_some()
 }
 
+/// The declared type of the variable `name`. A port collapsed onto the net
+/// it connects (`port_aliases`, formal to actual) takes that net's type.
+pub(crate) fn declared_type<'t>(
+    name: &str,
+    types: &'t std::collections::HashMap<String, DataType, impl std::hash::BuildHasher>,
+    aliases: Option<&std::collections::HashMap<String, String, impl std::hash::BuildHasher>>,
+) -> Option<&'t DataType> {
+    let mut cur = name;
+    for _ in 0..64 {
+        if let Some(dt) = types.get(cur) {
+            return Some(dt);
+        }
+        cur = aliases?.get(cur)?;
+    }
+    None
+}
+
+/// The declared type of the member path `path` (`m` or `m.n`) of a struct of
+/// type `ty`, packed or unpacked.
+pub(crate) fn member_path_type(
+    ty: &DataType,
+    path: &str,
+    r: &mut dyn PatternTypeResolver,
+) -> Option<DataType> {
+    let mut cur = ty.clone();
+    for seg in path.split('.') {
+        let mut su = None;
+        for _ in 0..64 {
+            match cur {
+                DataType::TypeReference {
+                    ref name,
+                    ref dimensions,
+                    ..
+                } if dimensions.is_empty() => cur = r.typedef_target(name)?,
+                DataType::Struct(s) if s.dimensions.is_empty() => {
+                    su = Some(s);
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        let m = su?.members.into_iter().find(|m| {
+            m.declarators
+                .iter()
+                .any(|d| d.name.name == seg && d.dimensions.is_empty())
+        })?;
+        cur = m.data_type;
+    }
+    Some(cur)
+}
+
 /// The width of the packed type `ty`.
 pub(crate) fn packed_width(ty: &DataType, r: &mut dyn PatternTypeResolver) -> Option<u32> {
     PlanBuilder {
@@ -130,10 +346,14 @@ pub(crate) fn packed_width(ty: &DataType, r: &mut dyn PatternTypeResolver) -> Op
     .width(ty)
 }
 
-/// A struct or union type with the layout `(path, offset, width)` records
-/// at `prefix`, members `logic` vectors unless they have members of their
-/// own; overlapping members make it a union.
-pub(crate) fn layout_struct_type(layout: &[(String, u32, u32)], prefix: &str) -> Option<DataType> {
+/// The packed struct at `prefix` of a flat `(path, offset, width)` layout.
+/// A leaf member is a `logic` vector with the packed dimensions `dims` gives
+/// for its path; overlapping members make a union.
+pub(crate) fn layout_struct_type(
+    layout: &[(String, u32, u32)],
+    prefix: &str,
+    dims: &dyn Fn(&str) -> Option<Vec<(i64, i64)>>,
+) -> Option<DataType> {
     use crate::ast::types::{StructDeclarator, StructMember};
     let pfx = if prefix.is_empty() {
         String::new()
@@ -157,20 +377,32 @@ pub(crate) fn layout_struct_type(layout: &[(String, u32, u32)], prefix: &str) ->
     let span = crate::ast::Span::dummy();
     let members = kids
         .iter()
-        .map(|&(leaf, _, w)| StructMember {
-            rand_qualifier: None,
-            data_type: layout_struct_type(layout, &format!("{pfx}{leaf}"))
-                .unwrap_or_else(|| logic_vector(w)),
-            declarators: vec![StructDeclarator {
-                name: crate::ast::Identifier {
-                    name: leaf.to_string(),
+        .map(|&(leaf, _, w)| {
+            let path = format!("{pfx}{leaf}");
+            let data_type =
+                layout_struct_type(layout, &path, dims).unwrap_or_else(|| match dims(&path) {
+                    Some(d)
+                        if d.iter().map(|&(l, r)| l.abs_diff(r) + 1).product::<u64>()
+                            == u64::from(w) =>
+                    {
+                        packed_dims_vector(IntegerVectorType::Logic, &d)
+                    }
+                    _ => logic_vector(w),
+                });
+            StructMember {
+                rand_qualifier: None,
+                data_type,
+                declarators: vec![StructDeclarator {
+                    name: crate::ast::Identifier {
+                        name: leaf.to_string(),
+                        span,
+                    },
+                    dimensions: Vec::new(),
+                    init: None,
                     span,
-                },
-                dimensions: Vec::new(),
-                init: None,
+                }],
                 span,
-            }],
-            span,
+            }
         })
         .collect();
     Some(DataType::Struct(StructUnionType {
@@ -301,6 +533,7 @@ impl PlanBuilder<'_> {
                 let arm = |b: &mut Self, x: &'a Expression| -> Option<Box<PackedPlan<'a>>> {
                     let mut slices = Vec::new();
                     b.expr(x, ty, 0, width, &mut slices)?;
+                    // An operand is a slice; the outer plan carries the sign.
                     Some(Box::new(PackedPlan {
                         width,
                         signed: false,
@@ -354,6 +587,33 @@ impl PlanBuilder<'_> {
                     return None;
                 }
                 let ew = self.width(&elem)?;
+                // Only type and default keys: one item fills every element.
+                if keys.ordered.is_empty() && keys.keyed.is_empty() {
+                    let mut one = Vec::new();
+                    self.unkeyed(keys, &elem, offset, ew, &mut one)?;
+                    if let [
+                        Slice {
+                            src: SliceSrc::Expr(e),
+                            width,
+                            two_state,
+                            ..
+                        },
+                    ] = one.as_slice()
+                        && *width == ew
+                    {
+                        out.push(Slice {
+                            offset,
+                            width: ew.checked_mul(u32::try_from(n).ok()?)?,
+                            two_state: *two_state,
+                            src: SliceSrc::Repeat {
+                                expr: e,
+                                elem: ew,
+                                count: u32::try_from(n).ok()?,
+                            },
+                        });
+                        return Some(());
+                    }
+                }
                 let mut explicit: Vec<Option<&'a Expression>> = vec![None; n];
                 for (pos, e) in keys.ordered.iter().enumerate().take(n) {
                     explicit[pos] = Some(e);
@@ -521,15 +781,16 @@ impl PlanBuilder<'_> {
 
     /// §10.9.1, §10.9.2: type and default keys descend into `ty` unless it
     /// takes the default whole: a simple bit vector, a non-aggregate, or a
-    /// value of `ty`'s own type.
+    /// value whose self-determined type matches `ty`.
     fn default_descends(&mut self, ty: &DataType, default: Option<&Expression>) -> bool {
         if let Some(d) = default {
-            match &d.kind {
-                ExprKind::AssignmentPattern(_) => return false,
-                ExprKind::TypedPattern { ty: own, .. } if self.types_match(own, ty) => {
-                    return false;
-                }
-                _ => {}
+            if matches!(d.kind, ExprKind::AssignmentPattern(_)) {
+                return false;
+            }
+            if let Some(own) = self.r.expr_type(d)
+                && self.types_match(&own, ty)
+            {
+                return false;
             }
         }
         match self.view(ty) {
@@ -636,9 +897,10 @@ impl PlanBuilder<'_> {
                         return Some(Shape::Leaf { width: 1 });
                     };
                     let (left, right) = self.dim(d)?;
+                    // §7.4.1: the elements of a packed array are unsigned.
                     let elem = DataType::IntegerVector {
                         kind,
-                        signing: if rest.is_empty() { None } else { signing },
+                        signing: None,
                         dimensions: rest.to_vec(),
                         span,
                     };
@@ -864,12 +1126,28 @@ impl PlanBuilder<'_> {
                     out.push_str(&format!("s{kind:?}"));
                     return Some(out);
                 }
+                // A struct, union or enum matches only its own declaration,
+                // named by its span and members; a synthesized one has none.
                 DataType::Struct(su) if su.dimensions.is_empty() => {
+                    if su.span == crate::ast::Span::dummy() {
+                        return None;
+                    }
                     out.push_str(&format!("u{}:{}", su.span.start, su.span.end));
+                    for m in &su.members {
+                        for d in &m.declarators {
+                            out.push_str(&format!(",{}", d.name.name));
+                        }
+                    }
                     return Some(out);
                 }
                 DataType::Enum(e) if e.dimensions.is_empty() => {
+                    if e.span == crate::ast::Span::dummy() {
+                        return None;
+                    }
                     out.push_str(&format!("e{}:{}", e.span.start, e.span.end));
+                    for m in &e.members {
+                        out.push_str(&format!(",{}", m.name.name));
+                    }
                     return Some(out);
                 }
                 // A packed array: its outer dimension, then its element.
@@ -915,7 +1193,7 @@ fn ident_expr(id: &crate::ast::Identifier) -> Expression {
     )
 }
 
-fn type_ref(name: &str) -> DataType {
+pub(crate) fn type_ref(name: &str) -> DataType {
     let span = crate::ast::Span::dummy();
     DataType::TypeReference {
         name: TypeName {

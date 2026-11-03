@@ -231,7 +231,7 @@ impl Simulator {
     /// stashed member-wise and queued as its shadow id, and an assignment
     /// pattern is queued as a `mbx_patterns` token.
     pub(super) fn mbx_message(&mut self, arg: &Expression) -> Value {
-        if let ExprKind::AssignmentPattern(items) = &arg.peel_typed_pattern().kind {
+        if let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(arg).kind {
             if !items.is_empty() {
                 let items = self.snapshot_pattern_items(items, arg.span);
                 self.mbx_msg_seq += 1;
@@ -282,7 +282,7 @@ impl Simulator {
     }
 
     fn snapshot_pattern_leaf(&mut self, e: &Expression, span: crate::ast::Span) -> Expression {
-        if let ExprKind::AssignmentPattern(sub) = &e.kind {
+        if let ExprKind::AssignmentPattern(sub) = &self.unpacked_pattern(e).kind {
             return Expression::new(
                 ExprKind::AssignmentPattern(self.snapshot_pattern_items(sub, span)),
                 span,
