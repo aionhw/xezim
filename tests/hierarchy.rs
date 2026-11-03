@@ -362,3 +362,6 @@ mod param_port_actual_no_implicit_net;
 
 #[path = "hierarchy/generate_region_parameter_override.rs"]
 mod generate_region_parameter_override;
+
+#[path = "hierarchy/param_override_lists.rs"]
+mod param_override_lists;
