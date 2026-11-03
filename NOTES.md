@@ -279,6 +279,58 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   drive issued between clocking events: the drive took effect at the next
   clocking event instead of two time units after it (§14.4, §14.16, #824,
   reported by philipaxer).
+* Inside a class, `sub.rand_mode(0)` on a `rand` class-handle property
+  changes the handle's own mode, as `this.sub.rand_mode(0)` does; it switched
+  off every random variable inside the object instead, so the object's
+  constraints were still checked and `randomize()` failed (§18.8, #846, PR
+  #847, contributed by auty1395). A derived class randomizes the elements
+  of an inherited array or queue of rand handles, and an element switched
+  off with `rand_mode(0)` keeps its object (§18.8, §8.13).
+* A class with a rand associative array is solved jointly, its elements
+  indexed by the stored keys, so `main + sub.sum() == total` beside one no
+  longer fails by repeated guessing (§18.4, §18.5, #848, PR #849, contributed
+  by auty1395). The `foreach` key of such an array is bound at its declared
+  index type, so an `int` key `-3` stays negative, and a string-keyed array
+  is left to the trials without taking the rest of the class with it
+  (§7.8.2).
+* An `inside` or `dist` item written with a unary operator keeps its place
+  in the set: `en inside {!cur}`, `n inside {~k}` and `en dist {cur :/ 2,
+  ~cur :/ 1}` dropped the item, so the first had no solution and the last
+  always drew `cur` (§18.5.4, §11.4.13, #850, PR #851, contributed by
+  auty1395).
+* `$countones` of a whole variable wider than 64 bits is a constraint the
+  solver reads as the sum of its bits, so `std::randomize(m) with
+  { $countones(m) inside {[1:2]}; }` on a 78-bit `m` succeeds (§18.5,
+  §20.9, #852, PR #853, contributed by auty1395).
+* A `ref` dynamic-array formal bound to one row of a fixed array of
+  collections (`item_c rows[2][]`, passed as `rows[1]`) shares that row with
+  the caller, so sizing and filling it in the callee is visible after the
+  call (§13.5.2, #854, PR #855, contributed by auty1395).
+* A subroutine's scalar formal or local hides a same-named collection of a
+  caller or of a subclass: `str.len()` on a `string str` formal read the
+  caller's `str[$]` queue size (§23.9, #856, PR #857, contributed by
+  auty1395).
+* A class first named through `typedef class C;` resolves to the class, not
+  to the placeholder the forward declaration leaves, so `q[i].label == ""`
+  on a string member compares text and returns 1 or 0 instead of x (§8.27,
+  §6.16, #858, PR #859, contributed by auty1395).
+* A rand sub-object that no constraint of the class reads stays out of the
+  class's joint solve, so a sub-object holding a rand dynamic array no
+  longer sends the class's `sum()` constraint to the trial loop and makes
+  `randomize()` fail (§18.5.9, §18.3, #860, PR #861, contributed by
+  auty1395). A class constraint that reads a rand sub-object's member or
+  array method, `soft sub.v == 7` or `sub.r.sum() == 60`, joins the
+  sub-object's own solve as an in-line item that outranks its class
+  constraints, where the first panicked and the second failed by chance
+  (§18.5.14.1).
+* A rand enum member of an unpacked struct declared in a package draws its
+  named constants only; the member's type was looked up under its bare name
+  and missed (§18.3, #862, PR #863, contributed by auty1395). An enum member
+  of a rand *packed* struct is not restricted, as §18.4 says.
+* The parameter override checks of #818 are pinned from the binary: exit
+  status, the rendered line, `--compile` and `--no-strict`, children in
+  other files, generate blocks, interfaces and binds (§23.10.2, A.4.1.1,
+  PR #866, contributed by chuanseng-ng).
 
 **Performance**
 
