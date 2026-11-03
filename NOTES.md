@@ -353,6 +353,25 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   status, the rendered line, `--compile` and `--no-strict`, children in
   other files, generate blocks, interfaces and binds (§23.10.2, A.4.1.1,
   PR #866, contributed by chuanseng-ng).
+* An assignment pattern takes the type of its assignment-like context, and
+  a typed pattern `T'{...}` takes `T`, everywhere: a function's `return
+  '{...}`, a subroutine argument, a class property initializer, a cast
+  operand, a conditional operand, a port actual and `==` against a pattern
+  were laid out as a concatenation of the items at their own widths, so
+  `s_t'{1, 0}` was 64 bits and `f() !== 2'b10` (§10.8, §10.9, #813, PR
+  #814 and core #140, contributed by philipaxer). One plan builder lays a
+  pattern over a packed type as bit slices for the interpreter and the
+  bytecode compiler alike; `default:` assigns a value whose type matches the
+  element whole (§6.22.1), a typed pattern of an unpacked type places its
+  items as an untyped one does, and `$bits(T'{...})` is `$bits(T)`. A
+  pattern assigned to a child's output port of a package struct type with a
+  typedef-array member, and a `default:` naming a parameter of the child or
+  a package parameter imported bare, took the port's flattened layout and
+  missed the parameter's declared type, so the value was split by member
+  (§23.3.3, §26.3). A plan is built on every interpreted execution: a loop
+  of interpreted pattern assignments runs about 40% more instructions than
+  before (compiled blocks and methods are unaffected); caching the plan per
+  pattern is the open follow-up.
 
 **Performance**
 
