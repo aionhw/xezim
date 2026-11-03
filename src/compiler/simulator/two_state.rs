@@ -5022,6 +5022,7 @@ impl Simulator {
             compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
             compiler.set_typedef_types(&self.module.typedef_types);
             compiler.set_member_wise_struct_ids(&self.member_wise_struct_ids);
+            compiler.set_member_wise_struct_names(&self.member_wise_struct_names);
             compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -5425,6 +5426,7 @@ impl Simulator {
                 compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                 compiler.set_typedef_types(&self.module.typedef_types);
                 compiler.set_member_wise_struct_ids(&self.member_wise_struct_ids);
+                compiler.set_member_wise_struct_names(&self.member_wise_struct_names);
                 compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -5466,6 +5468,7 @@ impl Simulator {
                     .set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                 delay_compiler.set_typedef_types(&self.module.typedef_types);
                 delay_compiler.set_member_wise_struct_ids(&self.member_wise_struct_ids);
+                delay_compiler.set_member_wise_struct_names(&self.member_wise_struct_names);
                 delay_compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 delay_compiler.set_assoc_arrays(&self.module.associative_arrays);
                 delay_compiler.set_packed_full_dims(&self.module.packed_full_dims);

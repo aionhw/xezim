@@ -302,22 +302,60 @@ impl Simulator {
     pub(super) fn init_member_wise_struct_ids(&mut self) {
         let mut ids: HashSet<usize> = HashSet::default();
         let mut holders: HashMap<&str, usize> = HashMap::default();
-        for (name, dt) in self.module.var_decl_types.iter() {
-            let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
-                continue;
-            };
-            if self.module.dynamic_arrays.contains(name)
+        let is_collection = |name: &str| {
+            self.module.dynamic_arrays.contains(name)
                 || self.module.arrays.contains_key(name)
                 || self.module.associative_arrays.contains_key(name)
-            {
+        };
+        // The member-wise struct types, by the bare variable name.
+        // The names of the variables, placeholder or not (an instance's
+        // variable may have only its leaves).
+        let mut names: HashSet<String> = HashSet::default();
+        let mut by_bare: HashMap<&str, &crate::ast::types::StructUnionType> = HashMap::default();
+        for (name, dt) in self.module.var_decl_types.iter() {
+            if is_collection(name) {
                 continue;
             }
             if let DataType::Struct(su) = self.resolve_dt_ref(dt)
                 && Self::spreads_member_wise(su)
-                && self.struct_storage_exists(name, su)
             {
-                ids.insert(id);
-                holders.insert(name.as_str(), id);
+                by_bare.insert(name.as_str(), su);
+                if self.struct_storage_exists(name, su) {
+                    names.insert(name.clone());
+                    if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                        ids.insert(id);
+                        holders.insert(name.as_str(), id);
+                    }
+                }
+            }
+        }
+        // The same variable in an instance (`dut.s`): named by its scope,
+        // with or without a placeholder signal (the leaves are the
+        // storage). A prefix whose last segment happens to name such a
+        // variable has no leaves of that type below it.
+        if !by_bare.is_empty() {
+            let mut seen: HashSet<&str> = HashSet::default();
+            for (name, &id) in self.signal_name_to_id.iter() {
+                let name: &str = name;
+                let mut end = name.len();
+                loop {
+                    let p = &name[..end];
+                    let last = p.rfind('.').map_or(p, |d| &p[d + 1..]);
+                    if p.contains('.')
+                        && seen.insert(p)
+                        && let Some(su) = by_bare.get(last)
+                        && !is_collection(p)
+                        && self.struct_storage_exists(p, su)
+                    {
+                        names.insert(p.to_string());
+                        if end == name.len() && !holders.contains_key(p) {
+                            ids.insert(id);
+                            holders.insert(p, id);
+                        }
+                    }
+                    let Some(dot) = p.rfind('.') else { break };
+                    end = dot;
+                }
             }
         }
         // §9.4.2: the leaves under each placeholder, for the sensitivity
@@ -340,7 +378,43 @@ impl Simulator {
                 v.sort_unstable();
             }
         }
+        // A member that is itself a member-wise struct (`s.f0`) has only
+        // leaves too: a node of the same kind.
+        let mut todo: Vec<(String, crate::ast::types::StructUnionType)> = Vec::new();
+        for n in &names {
+            let last = n.rfind('.').map_or(n.as_str(), |d| &n[d + 1..]);
+            let dt = self
+                .module
+                .var_decl_types
+                .get(n.as_str())
+                .or_else(|| self.module.var_decl_types.get(last));
+            if let Some(dt) = dt
+                && let DataType::Struct(su) = self.resolve_dt_ref(dt)
+            {
+                todo.push((n.clone(), su.clone()));
+            }
+        }
+        while let Some((n, su)) = todo.pop() {
+            for m in &su.members {
+                let Some(inner) = self.unpacked_struct_of(&m.data_type) else {
+                    continue;
+                };
+                if !Self::spreads_member_wise(&inner) {
+                    continue;
+                }
+                for md in &m.declarators {
+                    let child = format!("{}.{}", n, md.name.name);
+                    if md.dimensions.is_empty()
+                        && self.struct_storage_exists(&child, &inner)
+                        && names.insert(child.clone())
+                    {
+                        todo.push((child, inner.clone()));
+                    }
+                }
+            }
+        }
         self.member_wise_struct_ids = ids;
+        self.member_wise_struct_names = names;
         self.member_wise_struct_leaves = leaves;
     }
 

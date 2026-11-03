@@ -2027,6 +2027,7 @@ pub struct BytecodeCompiler<'a> {
     /// an `initial` block copied all three); such accesses bail to the
     /// interpreter instead.
     member_wise_struct_ids: Option<&'a HashSet<usize>>,
+    member_wise_struct_names: Option<&'a HashSet<String>>,
     /// Declared packed dimensions (outermost first) per signal, from the
     /// elaborated model. Needed because a packed element's LSB offset is
     /// `(idx - low_bound) * elem_w` for a DESCENDING range — the plain
@@ -2215,6 +2216,7 @@ impl<'a> BytecodeCompiler<'a> {
             assoc_elem_widths: None,
             assoc_arrays: None,
             member_wise_struct_ids: None,
+            member_wise_struct_names: None,
             packed_full_dims: None,
             loop_break_patches: Vec::new(),
             loop_continue_patches: Vec::new(),
@@ -2600,6 +2602,10 @@ impl<'a> BytecodeCompiler<'a> {
         self.member_wise_struct_ids = Some(ids);
     }
 
+    pub fn set_member_wise_struct_names(&mut self, names: &'a HashSet<String>) {
+        self.member_wise_struct_names = Some(names);
+    }
+
     /// Is signal `id` the unmaintained whole-struct placeholder of a
     /// member-wise unpacked struct variable (see `member_wise_struct_ids`)?
     /// A whole-value access to one must take the interpreter's leaf-wise
@@ -2607,6 +2613,22 @@ impl<'a> BytecodeCompiler<'a> {
     fn is_member_wise_struct_id(&self, id: usize) -> bool {
         self.member_wise_struct_ids
             .is_some_and(|ids| ids.contains(&id))
+    }
+
+    /// Whether `name` (dotted, as written) is a member-wise unpacked struct
+    /// variable or a struct member of one (`s`, `s.f0`), here or, by the
+    /// block's scope, in an instance (`u.s.f0`): such a name has leaves, no
+    /// value of its own. A leaf (`s.f0.d`) or an element is not.
+    fn is_member_wise_struct_name(&self, name: &str) -> bool {
+        let Some(names) = self.member_wise_struct_names else {
+            return false;
+        };
+        !name.contains('[')
+            && (names.contains(name)
+                || self
+                    .scope_hint
+                    .as_ref()
+                    .is_some_and(|sc| names.contains(&format!("{sc}.{name}"))))
     }
 
     /// Must an element STORE to this name avoid the dense array fast path?
@@ -13491,6 +13513,16 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(r) = self.compile_packed_member_read(hier) {
                     return Some(r);
                 }
+                // §7.2: a member of a member-wise unpacked struct that is a
+                // struct itself (`s.f0`) has no value of its own either,
+                // only leaves — the expression fallback read a placeholder,
+                // so `s.f0 != last.f0` in an `always` block was always
+                // false. As for the whole variable, take the interpreter's
+                // statement paths.
+                if hier.root.is_none() && self.is_member_wise_struct_name(&Self::hier_raw_cow(hier)) {
+                    self.bail("ident_unpacked_struct_member");
+                    return None;
+                }
                 if std::env::var_os("XEZIM_PROBE_IDENT").is_some() {
                     if let ExprKind::Ident(h) = &expr.kind {
                         eprintln!("[IDENT_FALLBACK] {}", Self::hier_raw_name(h));
@@ -15370,6 +15402,24 @@ impl<'a> BytecodeCompiler<'a> {
                             Box::new(Value::from_u64(val, width.max(1))),
                         ));
                         return Some(r);
+                    }
+                }
+                // §7.2: as for a dotted name (the `Ident` arm), a member of
+                // a member-wise unpacked struct has no value of its own.
+                let mut root = base.as_ref();
+                let mut path = vec![member.name.as_str()];
+                while let ExprKind::MemberAccess { expr: b, member: m } = &root.kind {
+                    path.push(m.name.as_str());
+                    root = b;
+                }
+                if let ExprKind::Ident(h) = &root.kind
+                    && h.root.is_none()
+                {
+                    path.reverse();
+                    let full = format!("{}.{}", Self::hier_raw_cow(h), path.join("."));
+                    if self.is_member_wise_struct_name(&full) {
+                        self.bail("member_unpacked_struct");
+                        return None;
                     }
                 }
                 if let Some(r) = self.emit_expr_fallback(expr, ctx_width, "Expr_MemberAccess") {

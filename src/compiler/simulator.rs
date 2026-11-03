@@ -6750,6 +6750,9 @@ pub struct Simulator {
     /// placeholder is never maintained; the members live in `s.m` leaves —
     /// so such statements take the interpreter's leaf-wise paths.
     member_wise_struct_ids: HashSet<usize>,
+    /// The names of the member-wise unpacked-struct variables, scoped
+    /// (`dut.s`): an instance's variable has leaves but no placeholder.
+    member_wise_struct_names: HashSet<String>,
     /// §9.4.2: the leaf signal ids under each such placeholder (`q` ->
     /// `q.f0`, `q.f1`, `q.n.lo`, ...). A block sensitive to the whole
     /// variable (`always @(q)`, `always_comb cv = q;`) depends on these — a

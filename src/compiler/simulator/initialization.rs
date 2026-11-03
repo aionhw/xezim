@@ -3824,6 +3824,7 @@ impl Simulator {
             static_struct_holders: HashMap::default(),
             static_struct_names: HashSet::default(),
             member_wise_struct_ids: HashSet::default(),
+            member_wise_struct_names: HashSet::default(),
             member_wise_struct_leaves: HashMap::default(),
             bc_packed_fields: None,
             active_union_tag: HashMap::default(),
