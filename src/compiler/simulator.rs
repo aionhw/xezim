@@ -5099,6 +5099,10 @@ struct DeclShadow {
 /// One selected region of a declared packed value (§7.4.1 / §11.5.1).
 struct DeclaredPackedAccess {
     storage: String,
+    /// §23.10: the parameter table the declaration is sized against — the
+    /// instance's own parameters overlaid on the design-wide table when the
+    /// storage lives in an instantiated module; `None` for the top scope.
+    params: Option<std::rc::Rc<HashMap<String, Value>>>,
     is_signed: bool,
     static_target: Option<(String, Option<(String, String)>, String)>,
     offset: u32,
@@ -8727,6 +8731,12 @@ pub struct Simulator {
     method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
     /// Reused buffer for the `<hint>.<name>` probe in `get_signal_value_by_name` (a `&self` path).
     hint_key_scratch: std::cell::RefCell<String>,
+    /// One-entry cache of `decl_param_scope`: the instance prefix last asked
+    /// for and its overlaid parameter table (`None` when the prefix owns no
+    /// parameters). A select loop over one instance's signal rebuilds nothing.
+    #[serde(skip)]
+    decl_param_scope_cache:
+        std::cell::RefCell<Option<(String, Option<std::rc::Rc<HashMap<String, Value>>>)>>,
     /// Reused buffer for the `__vif_local__` key probes (`&self` paths).
     vif_key_scratch: std::cell::RefCell<String>,
     /// §8.25: specialization-argument texts already folded to their value

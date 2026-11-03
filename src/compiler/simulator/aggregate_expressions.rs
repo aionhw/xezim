@@ -997,17 +997,70 @@ impl Simulator {
         &self,
         dt: &DataType,
     ) -> Option<(DataType, Vec<(i64, i64)>, u32)> {
-        let width = super::elaborate::resolve_type_width(
-            dt,
-            Some(&self.module.parameters),
-            Some(&self.module.typedefs),
-        );
+        self.declared_packed_type_in(dt, &self.module.parameters)
+    }
+
+    /// §23.10: the parameter table a declaration stored under `name` is sized
+    /// against. A declaration inside an instantiated module names ITS
+    /// parameters bare (`s_t [N-1:0] par`), while the design-wide table keys
+    /// them by instance (`u.N`); evaluating the declaration against that table
+    /// misses `N` (or hits an unrelated top-level `N`). Overlay every
+    /// parameter of the signal's instance path — outer scopes first, so a
+    /// generate block's or the instance's own binding wins — on the table.
+    /// `None` for a top-scope name or a prefix that owns no parameters.
+    pub(super) fn decl_param_scope(
+        &self,
+        name: &str,
+    ) -> Option<std::rc::Rc<HashMap<String, Value>>> {
+        let (prefix, _) = name.rsplit_once('.')?;
+        if let Some((cached, scope)) = self.decl_param_scope_cache.borrow().as_ref()
+            && cached == prefix
+        {
+            return scope.clone();
+        }
+        // Every enclosing scope of the prefix, outermost first: `u.g.par`
+        // sees `u.N` as `N` and a generate-block constant `u.g.L` as `L`.
+        let scopes: Vec<&str> = prefix
+            .match_indices('.')
+            .map(|(i, _)| &prefix[..i])
+            .chain(std::iter::once(prefix))
+            .collect();
+        let mut overlay: Vec<(usize, &str, &Value)> = Vec::new();
+        for (k, v) in &self.module.parameters {
+            for (depth, scope) in scopes.iter().enumerate() {
+                if let Some(rest) = k.strip_prefix(scope).and_then(|r| r.strip_prefix('.')) {
+                    overlay.push((depth, rest, v));
+                }
+            }
+        }
+        let scope = if overlay.is_empty() {
+            None
+        } else {
+            // Innermost last, so its binding wins over an outer same-named one.
+            overlay.sort_by_key(|(depth, ..)| *depth);
+            let mut params = self.module.parameters.clone();
+            for (_, bare, v) in overlay {
+                params.insert(bare.to_string(), v.clone());
+            }
+            Some(std::rc::Rc::new(params))
+        };
+        *self.decl_param_scope_cache.borrow_mut() = Some((prefix.to_string(), scope.clone()));
+        scope
+    }
+
+    pub(super) fn declared_packed_type_in(
+        &self,
+        dt: &DataType,
+        params: &HashMap<String, Value>,
+    ) -> Option<(DataType, Vec<(i64, i64)>, u32)> {
+        let width =
+            super::elaborate::resolve_type_width(dt, Some(params), Some(&self.module.typedefs));
         if width == 0 {
             return None;
         }
         let query = super::elaborate::type_query_dims_of(
             dt,
-            Some(&self.module.parameters),
+            Some(params),
             Some(&self.module.typedefs),
             Some(&self.module.typedef_types),
         );
@@ -1021,14 +1074,8 @@ impl Simulator {
                         return None;
                     };
                     dimensions.push((
-                        super::elaborate::const_eval_i64_with_params(
-                            left,
-                            Some(&self.module.parameters),
-                        )?,
-                        super::elaborate::const_eval_i64_with_params(
-                            right,
-                            Some(&self.module.parameters),
-                        )?,
+                        super::elaborate::const_eval_i64_with_params(left, Some(params))?,
+                        super::elaborate::const_eval_i64_with_params(right, Some(params))?,
                     ));
                 }
                 su.dimensions.clear();
@@ -1129,6 +1176,7 @@ impl Simulator {
             }
             Some(DeclaredPackedAccess {
                 storage: String::new(),
+                params: None,
                 is_signed: super::elaborate::is_type_signed_resolved(
                     &dt,
                     &self.module.typedef_types,
@@ -1170,14 +1218,20 @@ impl Simulator {
                     return None;
                 }
                 let dt = self.module.var_decl_types.get(&name)?;
-                let (element_type, mut dimensions, mut width) = self.declared_packed_type(dt)?;
                 // §23.10: a declaration inside an instantiated module sizes its
-                // dimensions with THAT instance's parameters. The declaration
-                // above was evaluated against the design-wide table, where a
-                // child's `N` is stored as `<inst>.N`: a bare `N` misses (the
-                // shape collapses to a plain 2-bit vector, so `mv[1][0]` read
-                // one bit) or hits an unrelated top-level `N`. Elaboration
-                // recorded this signal's dimensions per instance; use them.
+                // dimensions with THAT instance's parameters, which the
+                // design-wide table keys as `<inst>.N`. Evaluated against that
+                // table a bare `N` misses or hits an unrelated top-level `N`:
+                // `s_t [N-1:0] par` collapsed to a 1-bit element, so
+                // `par[i].a` (1-bit first member) read and wrote bit `i` of
+                // the array (#816). Size the declaration in its own scope.
+                let scope = self.decl_param_scope(&name);
+                let (element_type, mut dimensions, mut width) = match &scope {
+                    Some(params) => self.declared_packed_type_in(dt, params)?,
+                    None => self.declared_packed_type(dt)?,
+                };
+                // Elaboration recorded a vector's dimensions per instance;
+                // prefer them (a `[N-1:0]` of an unresolvable `N` is width 0).
                 if let Some(recorded) = self.module.packed_full_dims.get(&name)
                     && matches!(
                         element_type,
@@ -1204,6 +1258,7 @@ impl Simulator {
                 };
                 Some(DeclaredPackedAccess {
                     storage: name,
+                    params: scope,
                     is_signed: super::elaborate::is_type_signed_resolved(
                         dt,
                         &self.module.typedef_types,
@@ -1344,7 +1399,11 @@ impl Simulator {
                 };
                 let mut remaining = access.width;
                 for m in &su.members {
-                    let (element, dimensions, width) = self.declared_packed_type(&m.data_type)?;
+                    // A member sized by the instance's parameters too.
+                    let (element, dimensions, width) = match &access.params {
+                        Some(params) => self.declared_packed_type_in(&m.data_type, params)?,
+                        None => self.declared_packed_type(&m.data_type)?,
+                    };
                     for d in &m.declarators {
                         if !d.dimensions.is_empty() {
                             return None;
