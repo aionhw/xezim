@@ -284,3 +284,6 @@ mod review_real_assoc_store;
 
 #[path = "collections/reduction_with_struct_field.rs"]
 mod reduction_with_struct_field;
+
+#[path = "collections/compiled_queue_last_index.rs"]
+mod compiled_queue_last_index;
