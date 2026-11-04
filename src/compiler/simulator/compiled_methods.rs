@@ -2411,23 +2411,105 @@ impl Simulator {
                                 std::sync::OnceLock::new();
                             EMPTY.get_or_init(HashMap::default)
                         });
-                    fn member_assoc_key_class(
+                    fn member_is_assoc(
                         sim: &Simulator,
                         cname: &str,
                         member: &str,
-                    ) -> Option<String> {
-                        // A member declared with a TYPEDEF'd assoc type
-                        // (`typedef bit edges_t[uvm_phase];` + `edges_t
-                        // m_successors;`): the foreach loop var iterates the
-                        // KEYS, whose class the typedef's unpacked dim
-                        // records. Walk the chain leaf-first.
+                    ) -> bool {
+                        // A member is treated as ASSOCIATIVE (so a foreach
+                        // first var iterates KEYS, not elements) when its key
+                        // is carried by the class chain's assoc-key tables,
+                        // or its typedef carries an associative unpacked dim.
                         let mut cur = Some(cname.to_string());
                         let mut seen = HashSet::default();
                         while let Some(cn) = cur {
                             if !seen.insert(cn.clone()) {
                                 break;
                             }
-                            let cd = sim.module.classes.get(&cn)?;
+                            let Some(cd) = sim.module.classes.get(&cn) else {
+                                break;
+                            };
+                            if cd.assoc_key_types.contains_key(member)
+                                || cd.static_assoc_key_types.contains_key(member)
+                            {
+                                return true;
+                            }
+                            if let Some(dt) = cd.property_types.get(member)
+                                && let crate::ast::types::DataType::TypeReference {
+                                    name: tn, ..
+                                } = dt
+                                && let Some(dims) =
+                                    sim.module.typedef_unpacked_dims.get(&tn.name.name)
+                                && dims.iter().any(|d| {
+                                    matches!(
+                                        d,
+                                        crate::ast::types::UnpackedDimension::Associative { .. }
+                                    )
+                                })
+                            {
+                                return true;
+                            }
+                            cur = cd.extends.clone();
+                        }
+                        false
+                    }
+                    fn member_assoc_key_class(
+                        sim: &Simulator,
+                        cname: &str,
+                        member: &str,
+                        handle: usize,
+                    ) -> Option<String> {
+                        // Resolves the KEY class of an associative member.
+                        // Two shapes reach here:
+                        //  * a DIRECT-decl assoc member (`T p[KEY]` /
+                        //    `uvm_phase p[]`): the foreach var iterates the
+                        //    KEYS; resolve the key type-param through the
+                        //    class chain's assoc-key tables. A NON-CLASS key
+                        //    (string/int) yields None — it must NOT become a
+                        //    handle local (`foreach (p[string]) { k }`).
+                        //  * a TYPEDEF'd assoc type (`typedef bit edges_t
+                        //    [uvm_phase];` + `edges_t m_successors;`): the
+                        //    foreach loop var iterates the KEYS, whose class
+                        //    the typedef's unpacked dim records.
+                        let mut cur = Some(cname.to_string());
+                        let mut seen = HashSet::default();
+                        while let Some(cn) = cur {
+                            if !seen.insert(cn.clone()) {
+                                break;
+                            }
+                            let Some(cd) = sim.module.classes.get(&cn) else {
+                                break;
+                            };
+                            if let Some(kt) = cd
+                                .assoc_key_types
+                                .get(member)
+                                .or_else(|| cd.static_assoc_key_types.get(member))
+                            {
+                                let dt = crate::ast::types::DataType::TypeReference {
+                                    name: crate::ast::types::TypeName {
+                                        scopes: Vec::new(),
+                                        name: crate::ast::Identifier {
+                                            name: kt.clone(),
+                                            span: crate::ast::Span::dummy(),
+                                        },
+                                        span: crate::ast::Span::dummy(),
+                                    },
+                                    dimensions: Vec::new(),
+                                    type_args: Vec::new(),
+                                    span: crate::ast::Span::dummy(),
+                                };
+                                // Class binding -> handle local; non-class
+                                // (string/int) -> not a handle local.
+                                if let Some(cls) = sim.resolve_type_param_class_for(handle, &cn, &dt)
+                                {
+                                    return Some(cls);
+                                }
+                                // The declaring class's key table is
+                                // authoritative; a shadowed redeclaration
+                                // elsewhere is resolved there, not by the
+                                // element class fallback below.
+                                return None;
+                            }
                             if let Some(dt) = cd.property_types.get(member)
                                 && let crate::ast::types::DataType::TypeReference {
                                     name: tn, ..
@@ -2453,6 +2535,7 @@ impl Simulator {
                         m: &mut HashMap<String, String>,
                         sim: &Simulator,
                         cname: &str,
+                        handle: usize,
                     ) {
                         use crate::ast::stmt::StatementKind as SK;
                         if let SK::Foreach { array, vars, .. } = &st.kind {
@@ -2461,13 +2544,18 @@ impl Simulator {
                                 && h.path.len() == 1
                                 && h.path[0].selects.is_empty()
                             {
-                                let elem_or_key = member_elem_classes
-                                    .get(h.path[0].name.name.as_str())
-                                    .cloned()
-                                    .or_else(|| {
-                                        member_assoc_key_class(sim, cname, &h.path[0].name.name)
-                                    });
-                                if let Some(cls) = elem_or_key
+                                let name = h.path[0].name.name.as_str();
+                                let cls = if member_is_assoc(sim, cname, name) {
+                                    // Assoc: the first var iterates KEYS. Only
+                                    // a class key becomes a handle local; a
+                                    // non-class key (string/int) stays a
+                                    // NON-handle (so `k.substr()`/`k.len()`
+                                    // lower to StrOps, not a class call).
+                                    member_assoc_key_class(sim, cname, name, handle)
+                                } else {
+                                    member_elem_classes.get(name).cloned()
+                                };
+                                if let Some(cls) = cls
                                     && let Some(Some(v)) = vars.first()
                                 {
                                     m.entry(v.name.clone()).or_insert_with(|| cls);
@@ -2475,7 +2563,7 @@ impl Simulator {
                             }
                         }
                         for sub in Simulator::sub_stmts(st) {
-                            walk_foreach(sub, member_elem_classes, m, sim, cname);
+                            walk_foreach(sub, member_elem_classes, m, sim, cname, handle);
                         }
                     }
                     for st in body {
@@ -2485,6 +2573,7 @@ impl Simulator {
                             &mut handle_local_types,
                             self,
                             cname,
+                            handle,
                         );
                     }
                 }
