@@ -317,8 +317,17 @@ impl Simulator {
                         .collection_elem_struct(handle, &pname)
                         .filter(Self::spreads_member_wise)
                 {
-                    self.set_queue_size(&scoped_q, items.len() as u64);
                     let base = prop_ident_expr(&pname);
+                    let mut calls = Vec::new();
+                    for (i, item) in items.iter().enumerate() {
+                        let e = item.expr();
+                        if !(matches!(e.kind, ExprKind::AssignmentPattern(_))
+                            || Self::cond_expr_is_effect_free(e, false))
+                        {
+                            calls.push((i, self.eval_expr(e)));
+                        }
+                    }
+                    self.set_queue_size(&scoped_q, items.len() as u64);
                     for (i, item) in items.iter().enumerate() {
                         let e = item.expr();
                         if matches!(e.kind, ExprKind::AssignmentPattern(_))
@@ -326,10 +335,10 @@ impl Simulator {
                         {
                             let elem = Self::index_expr(&base, i as i64);
                             self.assign_class_unpacked_elem(&elem, e, &su);
-                        } else {
-                            let v = self.eval_expr(e);
-                            self.set_signal_value_by_name(&format!("{scoped_q}[{i}]"), v);
                         }
+                    }
+                    for (i, v) in calls {
+                        self.set_signal_value_by_name(&format!("{scoped_q}[{i}]"), v);
                     }
                     continue;
                 }
