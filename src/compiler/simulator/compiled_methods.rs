@@ -530,7 +530,7 @@ impl Simulator {
         out
     }
 
-    pub(super) fn class_handle_member_types(&self) -> HashMap<String, HashMap<String, String>> {
+    pub(super) fn class_handle_member_types(&mut self) -> HashMap<String, HashMap<String, String>> {
         let mut out: HashMap<String, HashMap<String, String>> = HashMap::default();
         for (cn, _) in self.module.classes.iter() {
             let mut members: HashMap<String, String> = HashMap::default();
@@ -563,7 +563,59 @@ impl Simulator {
                     // The compiler's scalar-vs-collection paths consult the
                     // collection-name sets FIRST, so this entry is only
                     // visible to element-typed logic.
-                    if let Some(t) = self.typeref_class_name(dt) {
+                    let member_class = {
+                        let mut r = self.typeref_class_name(dt);
+                        // If `dt` is a TypeReference whose leaf is a
+                        // class-local typedef of the declaring class `cur`
+                        // (e.g. `this_type`, declared in every
+                        // parameterized UVM class), resolve it IN `cur`'s
+                        // scope. The module-level `typedef_types` table
+                        // clobbers same-named class-local typedefs — the
+                        // LAST class processed wins arbitrarily — so the
+                        // bare `typeref_class_name` above would resolve
+                        // `uvm_callbacks.m_t_inst` (`this_type`) against
+                        // some unrelated class (uvm_component_registry) and
+                        // bake a wrong static-owner into `m_get_q`.
+                        if let crate::ast::types::DataType::TypeReference {
+                            name: tn,
+                            dimensions,
+                            ..
+                        } = dt
+                            && dimensions.is_empty()
+                        {
+                            let leaf = tn.name.name.as_str();
+                            let is_class_local = {
+                                let mut cname = Some(cur.clone());
+                                let mut s = HashSet::default();
+                                let mut found = false;
+                                while let Some(cn) = cname {
+                                    if !s.insert(cn.clone()) {
+                                        break;
+                                    }
+                                    if let Some(cd) = self.module.classes.get(&cn) {
+                                        if cd.typedef_targets.contains_key(leaf) {
+                                            found = true;
+                                            break;
+                                        }
+                                        cname = cd.extends.clone();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                found
+                            };
+                            if is_class_local {
+                                self.class_context_stack.push(Some(cur.clone()));
+                                let cr = self.resolve_typeref_class_name(tn);
+                                self.class_context_stack.pop();
+                                if cr.is_some() {
+                                    r = cr;
+                                }
+                            }
+                        }
+                        r
+                    };
+                    if let Some(t) = member_class {
                         members.entry(p.clone()).or_insert(t);
                     }
                 }
