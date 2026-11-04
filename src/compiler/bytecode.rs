@@ -12444,6 +12444,24 @@ impl<'a> BytecodeCompiler<'a> {
                 };
                 let ctr = self.alloc_reg();
                 self.emit(Insn::Move(ctr, cnt));
+                // §12.7.2/§6.12.2: a signed-negative count (e.g. `repeat(-1)`)
+                // means ZERO iterations — mirrors the interpreter's
+                // `repeat_count`, which clamps signed values with `.max(0)`.
+                // Without this guard, `repeat(-1)` would read back as
+                // 0xFFFFFFFF (non-zero, non-XZ) and spin ~2^32 times.
+                let neg_test = self.alloc_reg();
+                let signed_zero = self.alloc_reg();
+                let mut zv = Value::from_u64(0, 32);
+                zv.is_signed = true;
+                self.emit(Insn::LoadConst(signed_zero, Box::new(zv)));
+                // Signed compare (both operands need is_signed for `Lt` to
+                // use signed semantics): neg = (signed ctr < 0).
+                self.emit(Insn::Lt(neg_test, ctr, signed_zero));
+                let neg_jump = self.insns.len();
+                // Skip the counted loop when the count is definitely negative
+                // (`BranchUnlessZero` jumps on a definite 1; an X count falls
+                // through to the BranchIfFalse below, which exits on X/Z).
+                self.emit(Insn::BranchUnlessZero(neg_test, 0));
                 let top = self.insns.len() as u32;
                 let branch_idx = self.insns.len();
                 // Exits when the counter is no longer definitely non-zero
@@ -12458,6 +12476,7 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit(Insn::Jump(top));
                 let end = self.insns.len() as u32;
                 self.insns[branch_idx] = Insn::BranchIfFalse(ctr, end);
+                self.insns[neg_jump] = Insn::BranchUnlessZero(neg_test, end);
                 return true;
             }
 
@@ -14161,6 +14180,23 @@ impl<'a> BytecodeCompiler<'a> {
                 let one_reg = self.alloc_reg();
                 self.emit(Insn::LoadConst(one_reg, Box::new(Value::from_u64(1, 32))));
 
+                // §12.7.2/§6.12.2: a signed-negative count (e.g. `repeat(-1)`)
+                // means ZERO iterations — mirrors the interpreter's
+                // `repeat_count`, which clamps signed values with `.max(0)`.
+                // Without this, `repeat(-1)` reads back as 0xFFFFFFFF
+                // (non-zero) and the Gt-based loop below spins ~2^32 times.
+                let neg_rs = self.alloc_reg();
+                let signed_zero_reg = self.alloc_reg();
+                let mut zsv = Value::from_u64(0, 32);
+                zsv.is_signed = true;
+                self.emit(Insn::LoadConst(signed_zero_reg, Box::new(zsv)));
+                // Signed compare: `Lt` is signed only when BOTH operands are.
+                self.emit(Insn::Lt(neg_rs, iter_reg, signed_zero_reg));
+                let neg_jmp = self.insns.len();
+                // `BranchUnlessZero` jumps on a definite 1; an X count falls
+                // through to the Gt condition below, which already exits on X.
+                self.emit(Insn::BranchUnlessZero(neg_rs, 0));
+
                 self.loop_break_patches.push(Vec::new());
                 self.loop_continue_patches.push(Vec::new());
 
@@ -14184,6 +14220,7 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Insn::BranchIfFalse(reg, _) = self.insns[br] {
                     self.insns[br] = Insn::BranchIfFalse(reg, end);
                 }
+                self.insns[neg_jmp] = Insn::BranchUnlessZero(neg_rs, end);
                 if let Some(patches) = self.loop_continue_patches.pop() {
                     for idx in patches {
                         self.insns[idx] = Insn::Jump(step_top);
