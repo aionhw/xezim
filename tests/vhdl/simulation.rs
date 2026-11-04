@@ -257,6 +257,15 @@ fn numeric_div() {
     check("numeric_div");
 }
 
+/// A non-static slice inside a scalar function (§8.5). The slice is an
+/// unpacked struct with a dynamic array. Calling the function enough times
+/// to compile it must still see that array; a zero struct reports a slice
+/// direction mismatch.
+#[test]
+fn slice_in_hot_fn() {
+    check("slice_in_hot_fn");
+}
+
 /// For-, if-/elsif-/else- and case-generate statements (§11.8): one block
 /// per iteration with its own signals, processes and instances, elaborated
 /// depth-first in iteration order (§14.5.3).

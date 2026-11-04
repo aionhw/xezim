@@ -3100,8 +3100,52 @@ impl<'a> BytecodeCompiler<'a> {
         f.contains_key(&qualified).then_some(qualified)
     }
 
-    /// Try to inline a zero-arg, non-blocking user task's body at this
-    /// call site. Returns true if successfully inlined.
+    /// A call whose result is an unpacked struct. A register holds only the
+    /// packed value; dynamic members travel on `pending_ret_struct`, which
+    /// bytecode never copies. Inlining or a scalar fallback therefore hands
+    /// the caller a zero struct. VHDL unconstrained-array slices are this
+    /// shape (bounds plus `d[]`), so a compiled `u(i downto i)` sees an empty
+    /// array and reports a direction mismatch. The enclosing statement stays
+    /// on the interpreter (a method compile is all-or-nothing).
+    fn call_returns_member_wise_struct(&self, func: &Expression) -> bool {
+        let ExprKind::Ident(h) = &func.kind else {
+            return false;
+        };
+        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return false;
+        }
+        let Some(name) = self.scoped_callee_name(h.path[0].name.name.clone()) else {
+            return false;
+        };
+        let Some(fd) = self.functions.as_ref().and_then(|m| m.get(&name)) else {
+            return false;
+        };
+        self.data_type_is_member_wise(&fd.return_type)
+    }
+
+    fn data_type_is_member_wise(&self, dt: &crate::ast::types::DataType) -> bool {
+        use crate::ast::types::{DataType, StructUnionKind};
+        let mut cur = dt;
+        let mut owner = None;
+        for _ in 0..16 {
+            match cur {
+                DataType::Struct(su) => {
+                    let untagged_union = matches!(su.kind, StructUnionKind::Union) && !su.tagged;
+                    return !su.packed && !untagged_union;
+                }
+                DataType::TypeReference { name, .. } => {
+                    let Some((key, next)) = self.typedef_type_entry(name, owner) else {
+                        return false;
+                    };
+                    cur = next;
+                    owner = Some(key);
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// Inline a call to a pure combinational function, yielding the register
     /// holding its result. Accepts only argument-contained functions: input
     /// formals and directly writable `ref` actuals, with no external reads.
@@ -3839,6 +3883,8 @@ impl<'a> BytecodeCompiler<'a> {
         true
     }
 
+    /// Try to inline a zero-arg, non-blocking user task's body at this
+    /// call site. Returns true if successfully inlined.
     fn try_inline_task(&mut self, task_name: &str) -> bool {
         self.try_inline_task_args(task_name, &[])
     }
@@ -15959,54 +16005,69 @@ impl<'a> BytecodeCompiler<'a> {
                     && h.path.len() == 1
                     && h.path[0].selects.is_empty()
                     && let Some(name) = self.scoped_callee_name(h.path[0].name.name.clone())
-                    && let Some(fd) = self.functions.and_then(|f| f.get(name.as_str()))
-                    && fd.ports.len() == args.len()
-                    && fd
-                        .ports
-                        .iter()
-                        .all(|p| matches!(p.direction, crate::ast::types::PortDirection::Input))
-                    && !args
-                        .iter()
-                        .any(|a| matches!(a.kind, ExprKind::NamedArg { .. }))
                 {
-                    let call_start = self.insns.len();
-                    let call_next = self.next_reg;
-                    let mut ok = true;
-                    let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
-                    for a in args {
-                        match self.compile_expr(a, 0) {
-                            Some(r) => arg_values.push(r),
-                            None => {
-                                ok = false;
-                                break;
+                    let ret_ty = self
+                        .functions
+                        .and_then(|f| f.get(name.as_str()))
+                        .map(|fd| fd.return_type.clone());
+                    let ports_ok = self.functions.and_then(|f| f.get(name.as_str())).is_some_and(|fd| {
+                        fd.ports.len() == args.len()
+                            && fd
+                                .ports
+                                .iter()
+                                .all(|p| matches!(p.direction, crate::ast::types::PortDirection::Input))
+                            && !args
+                                .iter()
+                                .any(|a| matches!(a.kind, ExprKind::NamedArg { .. }))
+                    });
+                    if let Some(ret_ty) = ret_ty {
+                        // The result does not fit in the destination register.
+                        // Declining here, before the args are lowered, keeps
+                        // the whole statement on the interpreter. Falling
+                        // through would emit CallFreeFunction and drop `d[]`.
+                        if self.data_type_is_member_wise(&ret_ty) {
+                            self.bail("Expr_Call_unpacked_struct");
+                            return None;
+                        }
+                        if ports_ok {
+                            let call_start = self.insns.len();
+                            let call_next = self.next_reg;
+                            let mut ok = true;
+                            let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
+                            for a in args {
+                                match self.compile_expr(a, 0) {
+                                    Some(r) => arg_values.push(r),
+                                    None => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
                             }
+                            if ok {
+                                let dest = self.alloc_reg();
+                                let n = arg_values.len() as u32;
+                                let arg_start = self.alloc_reg();
+                                for _ in 1..arg_values.len() {
+                                    self.alloc_reg();
+                                }
+                                for (i, &v) in arg_values.iter().enumerate() {
+                                    let slot = (arg_start as usize + i) as RegId;
+                                    if slot != v {
+                                        self.emit(Insn::Move(slot, v));
+                                    }
+                                }
+                                self.emit(Insn::CallFreeFunction(
+                                    dest,
+                                    Box::new(Name(name.into_boxed_str())),
+                                    arg_start,
+                                    n,
+                                ));
+                                return Some(dest);
+                            }
+                            self.truncate_insns(call_start);
+                            self.next_reg = call_next;
                         }
                     }
-                    if ok {
-                        let dest = self.alloc_reg();
-                        let n = arg_values.len() as u32;
-                        // Contiguous arg slots (same reservation discipline
-                        // as the bare-call form above).
-                        let arg_start = self.alloc_reg();
-                        for _ in 1..arg_values.len() {
-                            self.alloc_reg();
-                        }
-                        for (i, &v) in arg_values.iter().enumerate() {
-                            let slot = (arg_start as usize + i) as RegId;
-                            if slot != v {
-                                self.emit(Insn::Move(slot, v));
-                            }
-                        }
-                        self.emit(Insn::CallFreeFunction(
-                            dest,
-                            Box::new(Name(name.into_boxed_str())),
-                            arg_start,
-                            n,
-                        ));
-                        return Some(dest);
-                    }
-                    self.truncate_insns(call_start);
-                    self.next_reg = call_next;
                 }
                 // class-perf Step 9h: a CLASS-SCOPE static call —
                 // `Cls.m(args)` / `alias.m(args)` / `Tparam.m(args)` where
@@ -16140,6 +16201,13 @@ impl<'a> BytecodeCompiler<'a> {
                 // prefix (including placeholder branches) before an
                 // unsupported local lvalue makes it fall back. Do not leave
                 // that incomplete prefix in the caller's instruction stream.
+                // A member-wise struct return must not be inlined or
+                // scalar-fallback'd either: see
+                // `call_returns_member_wise_struct`.
+                if self.call_returns_member_wise_struct(func) {
+                    self.bail("Expr_Call_unpacked_struct");
+                    return None;
+                }
                 let start = self.insns.len();
                 let first_reg = self.next_reg;
                 if let Some(r) = self.compile_pure_call(func, args) {
